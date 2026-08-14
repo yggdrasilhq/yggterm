@@ -118,7 +118,9 @@ daemon) moves per-row only to **0.000322**. ⇒ **The term survives every single
 deletion.**
 
 **What it is worth.** Rows summed over the 15 census daemons = **1,953**, at
-0.000337 cores/row ⇒ **≈0.66 cores spent on row-scaled work**. ⛔ **And each
+0.000337 cores/row ⇒ **≈0.66 cores spent on row-scaled work**. ⛔ **SUPERSEDED —
+that figure is a fitted coefficient, and the quantity was later measured directly
+at 4.6–4.7 µs/row (§6h), which makes the term ≈0.033 cores.** Do not quote 0.66. ⛔ **And each
 daemon's ROWS is frozen at its birth** (the bequest carries the list forward), so
 a 261-row daemon owning 23 sessions is carrying 238 rows it does not own.
 
@@ -1083,7 +1085,15 @@ thread at microsecond resolution.
 Ordered by cores returned per unit of risk. Each carries the number it should
 move and the falsifier that would show it did nothing.
 
-### S5 — Take the row inventory off `status` (≈0.66 cores, no lifecycle risk) ⭐ DO THIS FIRST
+### ⛔ S5 — Take the row inventory off `status` — **DECIDED AGAINST, see §6h**
+
+⛔⛔ **DO NOT BUILD THIS, AND DO NOT READ THE SECTION BELOW AS A LIVE SPEC.** It
+is kept for the trail. The ≈0.66 cores it promises was derived, not measured; the
+per-row cost was later measured three independent ways at **4.6–4.7 µs/row**,
+making the whole term **0.033–0.041 cores (~1.5%)** — not worth a version-gated
+protocol change whose failure mode has already dropped rows at a handover. The
+safe half (`persisted_live_sessions`) shipped instead. **Everything from here to
+the end of this subsection is superseded.**
 
 **Why it outranks S1.** S1 is worth more but belongs to another lane, needs a
 drain, and cannot be retrofitted to the daemons that carry the cost. S5 is a

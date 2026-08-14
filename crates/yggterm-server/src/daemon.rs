@@ -885,10 +885,16 @@ struct ClientHandlerWindow {
 /// What the accept loop spends handing one connection to a thread.
 ///
 /// ⚠ This is the PARENT half. `clone()` charges most of a thread's creation to
-/// the caller, so a child-side span cannot see it — and the child-side
-/// pre-closure cost was measured at a flat 39–55 µs, which is far too small to
-/// explain a ~1.7 ms per-connection gap. This is where the rest would have to
-/// be, if it is anywhere in the request path at all.
+/// the caller, so a child-side span cannot see it.
+///
+/// ⛔ **It was built to look for a ~1.7 ms per-connection gap, and it refuted
+/// it.** Measured: **44–48 µs**, flat across row counts, with the count matching
+/// the handler count exactly. With the child's 39–55 µs pre-closure and a
+/// 61–126 µs do-nothing closure, the whole per-connection floor is
+/// **≈150–230 µs**. The 1.7 ms came from subtracting a closure span from a
+/// process counter that was charging concurrent background work to whatever
+/// connection happened to be open — **a difference of two instruments is not a
+/// measurement.**
 fn record_accept_spawn_cost(cpu_us: u64) {
     let Ok(mut window) = CLIENT_HANDLER_WINDOW.lock() else {
         return;
@@ -17747,8 +17753,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     // closure span and a process counter, which is the shape
                     // this lane keeps getting wrong, and which is unmeasurable
                     // on a live daemon anyway: an external estimator needs a
-                    // stationary baseline, and the baseline here is the bursty
-                    // per-session reader term.
+                    // stationary baseline, and a live daemon's baseline drifts
+                    // faster than this signal — substantially because the
+                    // measurer's own load generator is part of it.
                     let spawn_started_cpu_us = thread_cpu_micros();
                     spawn_unix_client_handler(
                         stream,
