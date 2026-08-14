@@ -499,6 +499,59 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔ MAIN IS RED: THE PROBE'S OWN MARKER IS COUNTED AS THE HUMAN'S DRAFT
+
+**Status:** OPEN
+
+*Found 2026-08-14 by seat 6.6 while merging main. ⛔ NOT this seat's code, and
+NOT fixed here — it belongs to the probe/submit lane and a release is on hold.*
+
+`cargo test -p yggterm-server --test pipeline_integration` fails two tests on
+**clean `origin/main`, in its own detached worktree with its own target dir**:
+
+```
+echo_verified_submit_waits_until_input_is_actually_consumed
+echo_verified_submit_refuses_when_input_never_consumed
+```
+
+### The mechanism, and the measurement agrees with it
+
+`b7b601b7` ("the readiness probe typed over the human and erased their line")
+added a `HumanTyping` refusal driven by `session_has_pending_input_draft`. That
+flag is reconstructed **from forwarded client input** in `PtySessionRuntime::write`
+— and the probe writes its marker through that same `write`:
+
+```
+write(PROBE)?;                  // sets pending_input_draft = true
+thread::sleep(PROBE_SETTLE);    // 180 ms
+if !echoed && human_is_typing() // reads the flag the PROBE just set
+    -> HumanTyping { waited_ms: 180 }
+```
+
+⇒ **The probe is mistaken for the human.** The observed verdict is
+`HumanTyping { waited_ms: 180 }` and `PROBE_SETTLE` is 180 ms — the number is
+the mechanism's own signature, not a coincidence.
+
+⚠ **Scope, stated precisely so nobody over- or under-reads it.** When the CLI IS
+already consuming input the probe echoes and the submit completes before the
+check, so healthy rows still accept submits — this seat submitted to another row
+repeatedly all session. What breaks is **exactly the case echo-verification
+exists for**: a composer that has drawn its prompt but is not yet reading. The
+first retry aborts, so the submit can never wait one out.
+
+⛔ **The fix is NOT to relax the tests.** Both assertions describe the contract
+correctly; the second one expects a successful submit and is right to. The code
+already knows the distinction it needs — the same comment says daemon-internal
+auto-responses "bypass it, so they never fabricate a draft" — so the probe's own
+writes want the same exemption.
+
+⚠ **A release is being held with this in it.** The two tests are the only thing
+currently reporting it, and they were nearly written off: this seat began
+widening the first assertion to accept `HumanTyping` before checking the second,
+which would have made main green and shipped the regression.
+⇒ **Two tests failing together are a claim about one cause; read the second
+before editing the first.**
+
 ## ⚠ [6.6] THE `server` VERB SURFACE IS DISPATCHED TWICE TOO — 9 VERBS DIVERGE, TRIAGE INSIDE
 
 **Status:** OPEN
