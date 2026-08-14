@@ -357,6 +357,31 @@ That is the shared-checkout clobber hazard, live — it surfaces as *"file modif
 on disk since you last read it"* warnings that get misattributed to one's own
 edits. RAM is the least of it.
 
+### ⛔⛔ CAUGHT IN THE ACT, 19:40 — AND `git add -A` IS THE LOADED GUN
+
+Not a prediction. `git status` in the affected worktree, while both agents were
+live:
+
+```
+ M crates/yggterm-shell/src/shell.rs      <- the OTHER agent's edit, +4 lines
+ M docs/pending-bugs.md                   <- this row's own work
+```
+
+The row committing had never opened `shell.rs`; it matches the `yggterm-shell`
+tests the left-behind agent was observed running. ⇒ **A second agent's
+half-written source was sitting uncommitted in a tree that was about to be
+committed from.**
+
+⛔ **`git add -A` would have committed another agent's in-flight work under the
+wrong authorship, inside a commit whose message describes something else, and
+pushed it to `main`.** It was caught only because `git status` was read first,
+and the habit it nearly defeated is the most reflexive one there is.
+
+⇒ **RULE: while any uuid on this host is duplicated, commit by EXPLICIT PATH.**
+`git add -A`, `git commit -a`, and `git add .` are all the same loaded gun.
+⚠ This applies to every worktree on a host with a duplicate, not only to the
+duplicated row's own — a leftover agent keeps the cwd it was started in.
+
 *Meanwhile:* the orchestrator reaped its own left-behind process after measuring
 it quiet (814 MB reclaimed, verified alive and still on the board afterwards),
 retracted the inverted instruction to the rows it had sent it to, and routed the
