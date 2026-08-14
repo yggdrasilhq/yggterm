@@ -79,17 +79,31 @@ does nothing. `status` at 264 rows is 1,385 µs against a 1,070 µs payload buil
 and the ~315 µs residual is that floor plus serialisation. **The three numbers
 close.**
 
-⚠⚠ **The kernel share here is 3–8%, not the ~94% that motivated the spec.** On a
-daemon with no sessions the handler is overwhelmingly *user* time. That locates
-the live figure rather than refuting it: whatever is 94% kernel is **not the
-connection handler on an idle daemon**. ⛔ **A named candidate the analysis lane
-supplied itself:** `TASK_COMM_LEN` is 16, `yggterm-daemon-client-…` truncates to
-`yggterm-daemon-c`, and unnamed spawned threads inherit the parent's `comm` — a
-by-name classifier can merge PTY reader threads into the handler bucket. **Open,
-and not settled by this lane.**
+⛔⛔ **The ~94% kernel figure that motivated this spec is RETRACTED by the
+analysis lane** — `/proc/<tid>/stat` floors `utime` and `stime` to a 10 ms tick
+**independently**, which annihilates the smaller component and drives the share
+to 100%. On a sandbox at 264 rows that instrument recorded **622 and 824
+consecutive dying handler threads each reading ZERO ticks** while burning ~1.4 ms
+apiece. ⇒ My 3–8% and that 94% were never measuring the same thing.
 
-**Live proof owed:** one `client_handler_cost` record from a daemon carrying real
-sessions, which is what tests the 94% claim.
+⚠ **The magnitude survives; the composition does not.** A sandbox handler is
+**~1.4 ms** and a live-daemon handler is **20–44 ms** (a truncation lower bound
+of ≥21.2 ms, plus an independent process-level subtraction — two methods agreeing
+on size). ⇒ **A real 15–30× gap that can no longer be called kernel time. What it
+IS, is open.**
+
+⛔ **And my own proposed explanation was wrong**: I offered `comm` truncation
+merging reader threads into the handler bucket, but that bucket is defined by
+**lifetime**, not name — threads that *die* in-window — and reader threads do not
+die. A correct suspicion with a wrong mechanism is still a wrong claim; it was
+sent as a candidate rather than filed as a cause, which is the only reason it
+cost nothing.
+
+**Live proof owed, and it is now load-bearing for the whole partition:** one
+`client_handler_cost` record from a daemon carrying real sessions. This
+instrument uses `getrusage(RUSAGE_THREAD)`, in microseconds, so it is not subject
+to the truncation that produced the retracted figure — **it is the thing that
+settles what the 15–30× gap actually is.**
 
 ## ⛔ [6.7] `status` SERVING IS ~1.6% OF DAEMON CPU — S5's PROTOCOL CHANGE IS NOT WORTH IT
 

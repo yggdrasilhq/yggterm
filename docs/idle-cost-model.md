@@ -808,15 +808,43 @@ the payload build it contains**, which is impossible: 3,385 `status` handlers at
 over a mixed population of verbs is not a handler cost**, and it reads low by
 whatever fraction of traffic is cheap.
 
-⚠⚠ **THE KERNEL SHARE HERE IS 3–8%, NOT THE ~94% THAT MOTIVATED §S6.** On a
-daemon with **no sessions** the handler is overwhelmingly *user* time. That does
-not refute the live figure — it locates it: whatever is 94% kernel is **not the
-connection handler on an idle daemon**, so it is either session-driven or was
-never the handler. ⚠ A named candidate, and it is one the analysis lane reported
-itself: `TASK_COMM_LEN` is 16, so `yggterm-daemon-client-…` truncates to
-`yggterm-daemon-c` and **unnamed spawned threads inherit the parent's `comm`** —
-a by-name classifier can merge reader threads into the handler bucket. ⇒ **Open,
-and not settled here.**
+⛔⛔ **THE ~94% KERNEL FIGURE THAT MOTIVATED §S6 IS RETRACTED — and the reason is
+this section's own coarse-field trap, one level down.** It came from
+`/proc/<tid>/stat` fields 14/15, where **`utime` and `stime` are each floored to
+a 10 ms tick INDEPENDENTLY**. Flooring the two components of one thread
+separately annihilates the smaller and drives the share to 100% for the larger.
+Measured against `getrusage(RUSAGE_THREAD)` on threads built with a known mix:
+
+| true mix | true kernel share | what the ticks said |
+|---|---|---|
+| 100 ms user / 100 ms kernel | 76.5% | 78.9% — fine |
+| 4 ms user / 20 ms kernel | 83.3% | **100.0% — user annihilated** |
+| 1 ms / 2 ms | — | **both components read ZERO** |
+
+⇒ A handler carrying ~1.6 ms of user time loses all of it. ⭐ **My 3–8% and that
+94% were never in conflict about the same thing:** on a sandbox at 264 rows the
+tick instrument recorded **622 and 824 consecutive dying handler threads each
+reading ZERO ticks** while genuinely burning ~1.4 ms apiece. *An instrument that
+reports nothing for 622 consecutive events is not measuring the events.*
+
+⚠ **What survives, and what does not.** The **magnitude** stands and the
+**composition** does not: truncation is a floor, so the live figure is a *lower
+bound* of ≥21.2 ms per handler, and an independent process-level subtraction
+gives 20–44 ms. Two methods agree on size. ⇒ **A sandbox handler is ~1.4 ms and a
+live-daemon handler is 20–44 ms — a real 15–30× gap — but it can no longer be
+called kernel time. What that gap IS, is open**, and this instrument's live
+record is what settles it.
+
+⛔ **And my own proposed explanation for the gap was WRONG, which is worth more
+than the guess was.** I offered `comm` truncation — `TASK_COMM_LEN` is 16, so
+`yggterm-daemon-client-…` truncates and unnamed threads inherit the parent's
+`comm`, letting a by-name classifier merge reader threads into the handler
+bucket. It does not apply: that bucket is defined by **lifetime**, not by name —
+every thread that *dies* in-window — and reader threads do not die, so they
+cannot be in a dying-thread bucket. ⇒ **The observation that actually killed the
+figure was the coarse-field one, not the mechanism I attached to it.** A correct
+suspicion with a wrong mechanism is still a wrong claim; it was right to send it
+as a candidate rather than file it as a cause.
 
 **Two harness defects fixed in the same pass, both of which report a fired
 instrument as one that did not fire:**
