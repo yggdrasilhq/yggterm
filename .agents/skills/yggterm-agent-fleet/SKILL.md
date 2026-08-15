@@ -1003,6 +1003,54 @@ by it. One session grinding at a time; the baton is explicit.
 
 ---
 
+## 5.1 Unified Cross-Harness Memory (`~/.yggterm/memory`) & `ygg-memory`
+
+Different CLI harnesses (Claude Code, Gemini/Antigravity, Grok, Codex, Muse)
+maintain local memory stores in `~/.{claude,gemini,grok,codex}/`. `~/.yggterm/memory`
+acts as the unified cross-harness memory hub with an append-only event journal
+(`journal.jsonl`) and per-harness watermark tracking (`watermarks/<harness>.json`).
+
+### The Turn-One Retrieval Ritual (<40 tokens):
+
+At the start of any session or campaign, check if other harnesses have published
+new findings or handover updates since your last sync:
+
+```sh
+# 1. Cheap status check (~25 tokens)
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py status --harness <me>
+
+# 2. View delta summaries if behind (~80 tokens)
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness <me>
+
+# 3. Impatient / selective absorption (fetch only what you need)
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py get --file <campaign-or-finding.md>
+
+# 4. Acknowledge absorbed items
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py ack --harness <me> --files <campaign-or-finding.md>
+# Or acknowledge all up to latest:
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py ack --harness <me> --all
+```
+
+### Publishing New Findings Across Harnesses:
+
+When you discover a durable finding or write a campaign handover, publish it so
+every other harness's next session is informed:
+
+```sh
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py publish --file <finding-or-campaign.md> --harness <me>
+```
+
+### The Intelligent Ingestion Trigger:
+
+Every root `MEMORY.md` starts with the steering header:
+```markdown
+> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
+```
+Whenever an agent opens or searches `MEMORY.md`, this steer prompts it to inspect
+unified memory diffs if it needs up-to-date context.
+
+---
+
 ## 6. ⛔ Succeed a session that has gone cold — HARVEST IT, never ask it
 
 **A long-running row drifts into the worst cell of a two-by-two: a COLD prompt
