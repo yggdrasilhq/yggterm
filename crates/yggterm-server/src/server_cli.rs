@@ -722,6 +722,30 @@ fn run_server_connect_list_apply(endpoint: &crate::ServerEndpoint) -> anyhow::Re
 }
 
 
+/// `server startpage ls` — for BOTH binaries.
+///
+/// The lie detector: re-derives RECENT WORK from the stores via the same
+/// `AGENT_CLIS` descriptors + `read_store_entry` the shell uses, so a new
+/// CLI cannot fall out. Output is JSON when `--json` is given.
+pub fn run_server_startpage_ls_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    crate::startpage_ls::run_server_startpage_ls(store, args)
+}
+
+/// `server titles ls` — for BOTH binaries.
+///
+/// Same durable scan, title-ranked (effective_title presence + recency).
+/// See `docs/spec-cli-integration-verification.md` §3.2.
+pub fn run_server_titles_ls_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    crate::titles_ls::run_server_titles_ls(store, args)
+}
+
+/// `server resume ls` — for BOTH binaries.
+///
+/// Probe-based resume readiness (§3.3). No timer, just facts.
+pub fn run_server_resume_ls_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    crate::resume_ls::run_server_resume_ls(store, args)
+}
+
 /// `server connect <session-path> | --list` — for BOTH binaries.
 ///
 /// ⛔ The ARGUMENT PARSING lives here too, not just the two implementations.

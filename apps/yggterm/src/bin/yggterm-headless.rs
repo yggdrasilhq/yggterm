@@ -1687,6 +1687,15 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "order" {
         return yggterm_server::server_cli::run_server_order_cli(&store, &args);
     }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "startpage" {
+        return yggterm_server::server_cli::run_server_startpage_ls_cli(&store, &args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "titles" {
+        return yggterm_server::server_cli::run_server_titles_ls_cli(&store, &args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "resume" {
+        return yggterm_server::server_cli::run_server_resume_ls_cli(&store, &args);
+    }
     if args.len() >= 2 && args[0] == "server" && args[1] == "ledger" {
         return yggterm_server::server_cli::run_server_ledger_cli(&store, &args);
     }

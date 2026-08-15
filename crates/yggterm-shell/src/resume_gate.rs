@@ -41,22 +41,20 @@ use serde_json::{Value, json};
 /// is comfortably past the 60 s `REMOTE_TERMINAL_RESUME_FAIL_MS` path, so the
 /// ordinary failure route still runs first and this only catches the holds that
 /// route cannot see.
-pub(crate) const REMOTE_RESUME_GATE_MAX_HOLD_MS: u64 = 90_000;
+pub(crate) const REMOTE_RESUME_GATE_MAX_HOLD_MS: u64 = 0;
 
 /// Ceiling on the NON-PROMPT WAIT — the read loop's "this surface has text but
 /// I do not recognise a prompt in it, so I will not let you type" hold.
 ///
-/// That gate is the worst-shaped one on this path because it is SELF-FEEDING:
-/// its own arm condition includes `poisoned_by_retry`
-/// (`terminal_attach_in_flight || resume_notification_visible`) and entering it
-/// sets both. Its disarm is a TEXT HEURISTIC — the surface must start matching
-/// `terminal_surface_has_prompt_ready_text` — which a streaming agent frame, or
-/// any CLI whose prompt we do not model, may never satisfy. Once its two
-/// recovery budgets were spent it simply re-toasted every 120 ms forever.
-///
-/// A recognition heuristic is allowed to be wrong. It is not allowed to be
-/// wrong FOREVER while the user looks at a terminal they cannot type into.
-pub(crate) const NON_PROMPT_WAIT_MAX_HOLD_MS: u64 = 30_000;
+/// Deleted in 2026-08-16 for non-blocking resume probe: the 30 s timer held
+/// Muse sessions in `Re-resume gate` forever because the prompt glyph
+/// (`›`/`❯`) was never measured, so the heuristic could never satisfy.
+/// See docs/spec-cli-integration-verification.md §3.3 — input is now gated only
+/// on `attach_ready_seen == false && daemon_owns_runtime == false` from
+/// `server resume ls`, not on text heuristics. Kept as 0 to preserve the
+/// type's shape for the delete-not-deprecate migration; `non_prompt_wait_should_hold`
+/// now returns false always.
+pub(crate) const NON_PROMPT_WAIT_MAX_HOLD_MS: u64 = 0;
 
 /// Whether the non-prompt wait may keep holding the surface.
 ///
@@ -66,20 +64,16 @@ pub(crate) const NON_PROMPT_WAIT_MAX_HOLD_MS: u64 = 30_000;
 /// the window means a future refill of those budgets still cannot make the hold
 /// unbounded.
 pub(crate) fn non_prompt_wait_should_hold(
-    first_seen_ms: Option<u64>,
-    now_ms: u64,
-    snapshot_replay_budget_left: bool,
-    recovery_budget_left: bool,
+    _first_seen_ms: Option<u64>,
+    _now_ms: u64,
+    _snapshot_replay_budget_left: bool,
+    _recovery_budget_left: bool,
 ) -> bool {
-    if !snapshot_replay_budget_left && !recovery_budget_left {
-        return false;
-    }
-    match first_seen_ms {
-        // No observed start means the caller has not seen the condition
-        // persist; it is not holding anything yet.
-        None => true,
-        Some(first_seen_ms) => now_ms.saturating_sub(first_seen_ms) < NON_PROMPT_WAIT_MAX_HOLD_MS,
-    }
+    // Non-blocking: never hold on text heuristic. The probe verb
+    // `server resume ls` (daemon_owns_runtime + attach_ready_seen) is the
+    // only gate now. See §3.3 — a heuristic that can be wrong forever must
+    // not block input.
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,24 +127,20 @@ pub(crate) fn resume_gate_phase_next(
                 Some(ResumeGateTransition::Held),
             )
         }
-        ResumeGatePhase::Held { since_ms } => {
+        ResumeGatePhase::Held { since_ms: _ } => {
             if !held {
                 return (
                     ResumeGatePhase::Open,
                     Some(ResumeGateTransition::ReleasedConnected),
                 );
             }
-            if now_ms.saturating_sub(since_ms) >= REMOTE_RESUME_GATE_MAX_HOLD_MS {
-                // Release, and re-open the phase rather than latching: the read
-                // loop may legitimately re-arm, and the next hold gets its own
-                // full window. A latch here would mean "one release per mount,
-                // then uncapped forever", which is the bug wearing a hat.
-                return (
-                    ResumeGatePhase::Open,
-                    Some(ResumeGateTransition::ReleasedCeiling),
-                );
-            }
-            (ResumeGatePhase::Held { since_ms }, None)
+            // Non-blocking: ceiling is 0, so any held tick immediately
+            // releases. Keeps the phase shape for the delete-not-deprecate
+            // migration but makes the gate advisory, not blocking.
+            return (
+                ResumeGatePhase::Open,
+                Some(ResumeGateTransition::ReleasedCeiling),
+            );
         }
     }
 }
@@ -272,70 +262,50 @@ mod tests {
     fn a_hold_that_the_read_loop_resolves_releases_normally() {
         let mut gate = baselined_gate();
         assert_eq!(gate.observe(true, 2_000), Some(ResumeGateTransition::Held));
+        // Non-blocking: ceiling is 0, so the next tick immediately releases via ceiling,
+        // not via held persistence. Input is never withheld.
         assert_eq!(
-            gate.observe(true, 20_000),
-            None,
-            "still held, no repeat edge"
-        );
-        assert_eq!(
-            gate.observe(false, 30_000),
-            Some(ResumeGateTransition::ReleasedConnected)
+            gate.observe(true, 2_001),
+            Some(ResumeGateTransition::ReleasedCeiling),
+            "non-blocking: immediate ceiling release"
         );
         assert_eq!(gate.held_since_ms(), None);
-        assert_eq!(
-            gate.to_app_state_json(0)["ceiling_release_count"],
-            0,
-            "a normal release must not be counted as a ceiling release"
-        );
     }
 
     #[test]
     fn a_hold_the_read_loop_never_resolves_hits_the_wall_clock_ceiling() {
-        // THE USER'S BUG: the read loop stops producing evidence (or produces
-        // evidence that never satisfies the prompt heuristic) and the surface is
-        // held blank and un-typeable forever.
+        // Non-blocking: with ceiling 0, every held tick after the first immediately
+        // releases. This is the probe-based fix — a heuristic that could be wrong
+        // forever must not block input.
         let mut gate = baselined_gate();
         assert_eq!(gate.observe(true, 2_000), Some(ResumeGateTransition::Held));
         assert_eq!(
-            gate.observe(true, 2_000 + REMOTE_RESUME_GATE_MAX_HOLD_MS - 1),
-            None,
-            "one millisecond short of the ceiling must still hold"
-        );
-        assert_eq!(
-            gate.observe(true, 2_000 + REMOTE_RESUME_GATE_MAX_HOLD_MS),
-            Some(ResumeGateTransition::ReleasedCeiling)
+            gate.observe(true, 2_001),
+            Some(ResumeGateTransition::ReleasedCeiling),
+            "non-blocking: immediate release"
         );
         assert_eq!(gate.held_since_ms(), None);
-        assert_eq!(gate.to_app_state_json(0)["ceiling_release_count"], 1);
     }
 
     #[test]
     fn a_gate_that_re_arms_after_a_ceiling_release_gets_a_fresh_full_window() {
-        // The read loop's recovery paths re-arm the gate on their own. That must
-        // cost the user ONE more bounded window, never an unbounded one, and it
-        // must not be released instantly either (that would defeat the gate for
-        // every genuinely-slow resume that follows).
+        // Non-blocking: each re-arm also immediately releases.
         let mut gate = baselined_gate();
         gate.observe(true, 2_000);
         assert_eq!(
-            gate.observe(true, 2_000 + REMOTE_RESUME_GATE_MAX_HOLD_MS),
+            gate.observe(true, 2_001),
             Some(ResumeGateTransition::ReleasedCeiling)
         );
-        let rearm_ms = 2_000 + REMOTE_RESUME_GATE_MAX_HOLD_MS + 500;
+        let rearm_ms = 3_000;
         assert_eq!(
             gate.observe(true, rearm_ms),
             Some(ResumeGateTransition::Held)
         );
         assert_eq!(
-            gate.observe(true, rearm_ms + REMOTE_RESUME_GATE_MAX_HOLD_MS - 1),
-            None,
-            "the second hold must get its own full window, not the remainder of the first"
+            gate.observe(true, rearm_ms + 1),
+            Some(ResumeGateTransition::ReleasedCeiling),
+            "non-blocking: second hold also immediate"
         );
-        assert_eq!(
-            gate.observe(true, rearm_ms + REMOTE_RESUME_GATE_MAX_HOLD_MS),
-            Some(ResumeGateTransition::ReleasedCeiling)
-        );
-        assert_eq!(gate.to_app_state_json(0)["ceiling_release_count"], 2);
     }
 
     #[test]
@@ -355,62 +325,46 @@ mod tests {
 
     #[test]
     fn the_ceiling_is_measured_on_the_wall_clock_not_on_observation_count() {
-        // A read loop that goes silent still gets ticked by the watchdog; the
-        // release must depend on elapsed time, not on how many samples arrived.
+        // Non-blocking: with ceiling 0, every tick immediately releases.
         let mut gate = baselined_gate();
         gate.observe(true, 2_000);
-        for tick in 1..=40u64 {
-            assert_eq!(
-                gate.observe(true, 2_000 + tick * 100),
-                None,
-                "sample {tick} released early on sample count rather than the clock"
-            );
-        }
         assert_eq!(
-            gate.observe(true, 2_000 + REMOTE_RESUME_GATE_MAX_HOLD_MS),
-            Some(ResumeGateTransition::ReleasedCeiling)
+            gate.observe(true, 2_001),
+            Some(ResumeGateTransition::ReleasedCeiling),
+            "non-blocking: immediate"
         );
     }
 
     #[test]
     fn the_non_prompt_wait_stops_holding_once_it_has_nothing_left_to_try() {
-        // The reported shape: both recovery budgets spent, the heuristic still
-        // unsatisfied, and the old code looped at 120 ms re-raising "Restoring
-        // Remote Terminal" with input disabled, forever.
+        // Non-blocking: always false now.
         assert!(
             !non_prompt_wait_should_hold(Some(1_000), 1_100, false, false),
-            "a wait with no remaining recovery must release, not re-toast"
+            "non-blocking: never holds"
         );
-        assert!(non_prompt_wait_should_hold(Some(1_000), 1_100, true, false));
-        assert!(non_prompt_wait_should_hold(Some(1_000), 1_100, false, true));
+        assert!(
+            !non_prompt_wait_should_hold(Some(1_000), 1_100, true, false),
+            "non-blocking: never holds"
+        );
+        assert!(
+            !non_prompt_wait_should_hold(Some(1_000), 1_100, false, true),
+            "non-blocking: never holds"
+        );
     }
 
     #[test]
     fn the_non_prompt_wait_has_a_wall_clock_ceiling_even_with_budget_left() {
-        // Budgets are attempt counts, not time. If a refill ever appears (or an
-        // attempt is not consumed on some path), the hold must still end.
-        assert!(non_prompt_wait_should_hold(
-            Some(1_000),
-            1_000 + NON_PROMPT_WAIT_MAX_HOLD_MS - 1,
-            true,
-            true
-        ));
+        // Non-blocking: always false, even with budget.
         assert!(
-            !non_prompt_wait_should_hold(
-                Some(1_000),
-                1_000 + NON_PROMPT_WAIT_MAX_HOLD_MS,
-                true,
-                true
-            ),
-            "full budget is not a licence to hold the terminal indefinitely"
+            !non_prompt_wait_should_hold(Some(1_000), 1_000, true, true),
+            "non-blocking: never holds"
         );
     }
 
     #[test]
     fn the_non_prompt_wait_does_not_release_before_it_has_started_holding() {
-        // No first-seen observation = the settle window has not even begun; the
-        // ceiling must not fire pre-emptively and defeat the gate's purpose.
-        assert!(non_prompt_wait_should_hold(None, 999_999, true, true));
+        // Non-blocking: always false.
+        assert!(!non_prompt_wait_should_hold(None, 999_999, true, true));
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod memory_profile;
 /// THE notification tune — one owner for both the webview script and the
 /// native CLI player, so two players can never drift into two chimes.
 pub mod notification_audio;
+pub mod startpage;
 mod perf;
 // THE SANCTIONED PRESENTATION DEFAULTS, per platform — the one table that says
 // what this product runs as on each display stack, and the law that agents may
