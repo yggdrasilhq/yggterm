@@ -130686,6 +130686,83 @@ fn ConnectRailBody(
                     }
                 }
             }
+            if !snapshot.ssh_targets.is_empty() || !snapshot.remote_machines.is_empty() {
+                div {
+                    style: "display:flex; flex-direction:column; gap:10px; padding-top:14px; border-top:1px solid rgba(127,127,127,0.20);",
+                    div {
+                        style: format!(
+                            "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
+                             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                            snapshot.palette.muted
+                        ),
+                        "Connected SSH Systems"
+                    }
+                    for target in snapshot.ssh_targets.iter() {
+                        {
+                            let target_str = target.ssh_target.clone();
+                            let prefix_str = target.prefix.clone().unwrap_or_default();
+                            let on_ssh_target_change = on_ssh_target_change.clone();
+                            let on_ssh_prefix_change = on_ssh_prefix_change.clone();
+                            let on_connect_ssh_custom = on_connect_ssh_custom.clone();
+                            let machine_match = snapshot.remote_machines.iter().find(|m| m.ssh_target == target.ssh_target);
+                            let session_count = machine_match.map(|m| m.sessions.len()).unwrap_or(0);
+                            rsx! {
+                                div {
+                                    key: "ssh-target-{target_str}",
+                                    style: format!(
+                                        "display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; \
+                                         border-radius:10px; background:{}; border:1px solid {}; box-sizing:border-box;",
+                                        snapshot.palette.panel, snapshot.palette.border
+                                    ),
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:3px; min-width:0; flex:1;",
+                                        div {
+                                            style: "display:flex; align-items:center; gap:6px;",
+                                            span {
+                                                style: format!("font-size:12px; font-weight:800; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", snapshot.palette.text),
+                                                "{target_str}"
+                                            }
+                                            if session_count > 0 {
+                                                span {
+                                                    style: format!(
+                                                        "display:inline-flex; align-items:center; padding:1px 6px; border-radius:999px; \
+                                                         background:{}; color:{}; font-size:10px; font-weight:700;",
+                                                        snapshot.palette.accent_soft, snapshot.palette.accent
+                                                    ),
+                                                    "{session_count} live"
+                                                }
+                                            }
+                                        }
+                                        if !prefix_str.is_empty() {
+                                            span {
+                                                style: format!("font-size:10px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", snapshot.palette.muted),
+                                                "prefix: {prefix_str}"
+                                            }
+                                        }
+                                    }
+                                    button {
+                                        style: format!(
+                                            "display:inline-flex; align-items:center; padding:5px 12px; border:none; border-radius:7px; \
+                                             background:{}; color:white; font-size:11px; font-weight:700; cursor:pointer;",
+                                            snapshot.palette.accent
+                                        ),
+                                        onclick: {
+                                            let t = target_str.clone();
+                                            let p = prefix_str.clone();
+                                            move |evt| {
+                                                on_ssh_target_change.call(t.clone());
+                                                on_ssh_prefix_change.call(p.clone());
+                                                on_connect_ssh_custom.call(evt);
+                                            }
+                                        },
+                                        "Open"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             }
             }
         }
@@ -137929,7 +138006,7 @@ fn segmented_control_segment_style(
     let font_weight = if on_chrome || selected { 700 } else { 600 };
     format!(
         "{sizing} height:26px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
-         user-select:none; -webkit-user-select:none; transition:{};",
+         cursor:pointer; user-select:none; -webkit-user-select:none; transition:{};",
         background,
         color,
         font_weight,

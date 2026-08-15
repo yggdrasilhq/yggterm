@@ -133,6 +133,19 @@ pub fn local_transcript_path_for_session(session_path: &str) -> Result<Option<Pa
     if let Some(id) = id_addressable_claude_code_session(session_path) {
         return Ok(yggterm_core::local_cc_session_jsonl_path(id));
     }
+    if let Some(id) = id_addressable_antigravity_session(session_path) {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let descriptor = yggterm_core::agent_cli_descriptor(yggterm_core::SessionKind::Antigravity);
+            if let Some(desc) = descriptor {
+                for root in desc.store_roots_absolute(&home) {
+                    let path = root.join(format!("{id}.db"));
+                    if path.is_file() {
+                        return Ok(Some(path));
+                    }
+                }
+            }
+        }
+    }
     Ok(None)
 }
 
@@ -162,6 +175,20 @@ pub fn id_addressable_claude_code_session(session_path: &str) -> Option<&str> {
     Some(id)
 }
 
+/// The Antigravity session id inside a runtime key (`agy-runtime://<id>`).
+pub fn id_addressable_antigravity_session(session_path: &str) -> Option<&str> {
+    let (prefix, id) = session_path.split_once("://")?;
+    let descriptor = yggterm_core::agent_scheme::scheme_for_prefix(&format!("{prefix}://"))?;
+    if descriptor.role != yggterm_core::agent_scheme::SchemeRole::RuntimeKey
+        || descriptor.kind != Some(yggterm_core::SessionKind::Antigravity)
+        || id.contains('/')
+        || id.is_empty()
+    {
+        return None;
+    }
+    Some(id)
+}
+
 /// The messages payload for `session_path`, as the page consumes it.
 pub fn messages_payload(session_path: &str) -> Result<serde_json::Value> {
     let Some(path) = local_transcript_path_for_session(session_path)? else {
@@ -170,17 +197,19 @@ pub fn messages_payload(session_path: &str) -> Result<serde_json::Value> {
     // ONE owner of "which CLI wrote this file" — the reader's own registry
     // dispatch. This used to re-answer it here, which is a second encoding of a
     // decision that has exactly one right answer.
-    let messages = yggterm_core::read_agent_transcript_messages(&path)?;
+    let messages = yggterm_core::read_agent_transcript_messages(&path).unwrap_or_default();
     let session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("session");
+    let cwd = yggterm_core::read_cc_session_identity_fields(&path)
+        .ok()
+        .flatten()
+        .map(|(_, cwd)| cwd)
+        .or_else(|| yggterm_core::local_antigravity_session_cwd(session_id));
     Ok(serde_json::json!({
         "messages": yggterm_core::transcript_view_messages(session_id, &messages),
-        "cwd": yggterm_core::read_cc_session_identity_fields(&path)
-            .ok()
-            .flatten()
-            .map(|(_, cwd)| cwd),
+        "cwd": cwd,
         "working": false,
     }))
 }
