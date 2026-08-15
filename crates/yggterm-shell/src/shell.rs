@@ -51034,6 +51034,16 @@ fn live_session_derived_label(
     let title = session.title.trim();
     let is_unnamed_agent_title =
         yggterm_core::is_agent_plane_composed_title(title) && title.contains(" unnamed ");
+    // "Agent unnamed <kind>: <real>" holds the real title after the colon —
+    // return just the real part so rows/startpage don't render the prefix.
+    if is_unnamed_agent_title {
+        if let Some(colon) = title.find(": ") {
+            let suffix = title[colon + 2..].trim();
+            if !suffix.is_empty() && !memoized_generated_fallback_title(suffix) {
+                return suffix.to_string();
+            }
+        }
+    }
     if !title.is_empty() && !memoized_generated_fallback_title(title) && !is_unnamed_agent_title {
         return session.title.clone();
     }
@@ -124639,6 +124649,15 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     // carry no id (documents, recipes).
     let mut push_candidate =
         |row: BrowserRow, modified_epoch: i64, started_at: String, in_scope: bool| {
+            // Startpage is CLI-only: plain terminals never resume from here,
+            // they live in Live Sessions. Filter early so ranking is CLIs only.
+            if !row
+                .session_kind
+                .is_some_and(|k| k.is_agent())
+                && !row_session_kind(&row).is_some_and(|k| k.is_agent())
+            {
+                return;
+            }
             let keys = start_page_recent_identity_keys(&row);
             if active_path
                 .as_deref()
