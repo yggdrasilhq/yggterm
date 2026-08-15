@@ -39937,6 +39937,80 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             session_kind: None,
         });
     }
+    // SSOT: any registered agent scheme (agy-runtime://, remote-agy://, etc.)
+    // must synthesize as Session with its kind, not fall to Document.
+    if let Some(scheme) = yggterm_core::agent_scheme::scheme_for_prefix(
+        &session_path
+            .split_once("://")
+            .map(|(p, _)| format!("{p}://"))
+            .unwrap_or_default(),
+    ) {
+        if let Some(kind) = scheme.kind {
+            let label = fallback_label_for_session_path(session_path);
+            let cwd = Path::new(session_path)
+                .parent()
+                .map(|p| p.display().to_string());
+            return Some(BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: session_path.to_string(),
+                label: label.clone(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some(label),
+                depth: 0,
+                host_label: String::new(),
+                descendant_sessions: 0,
+                expanded: false,
+                session_id: session_path
+                    .split_once("://")
+                    .map(|(_, id)| id.split('/').last().unwrap_or(id).to_string()),
+                session_cwd: cwd,
+                session_kind: Some(kind),
+            });
+        }
+    }
+    // Non-agent paths: try row_session_kind fallback before codex-only check.
+    let inferred_kind = row_session_kind(&BrowserRow {
+        kind: BrowserRowKind::Session,
+        full_path: session_path.to_string(),
+        label: String::new(),
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: None,
+        depth: 0,
+        host_label: String::new(),
+        descendant_sessions: 0,
+        expanded: false,
+        session_id: None,
+        session_cwd: None,
+        session_kind: None,
+    });
+    if let Some(kind) = inferred_kind {
+        let label = fallback_label_for_session_path(session_path);
+        let cwd = Path::new(session_path)
+            .parent()
+            .map(|p| p.display().to_string());
+        return Some(BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: session_path.to_string(),
+            label: label.clone(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some(label),
+            depth: 0,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: session_path
+                .split_once("://")
+                .map(|(_, id)| id.split('/').last().unwrap_or(id).to_string()),
+            session_cwd: cwd,
+            session_kind: Some(kind),
+        });
+    }
     let path = Path::new(session_path);
     let codex_identity = read_codex_session_identity_fields(path).ok().flatten();
     let label = fallback_label_for_session_path(session_path);
@@ -50958,7 +51032,9 @@ fn live_session_derived_label(
     short_ids: &HashMap<String, String>,
 ) -> String {
     let title = session.title.trim();
-    if !title.is_empty() && !memoized_generated_fallback_title(title) {
+    let is_unnamed_agent_title =
+        yggterm_core::is_agent_plane_composed_title(title) && title.contains(" unnamed ");
+    if !title.is_empty() && !memoized_generated_fallback_title(title) && !is_unnamed_agent_title {
         return session.title.clone();
     }
     if let Some(remote_title) = remote_session_index
