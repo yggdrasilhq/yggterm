@@ -40,7 +40,8 @@ if [ ! -e "$INDEX" ]; then
   cat > "$INDEX" <<EOF
 # Memory Index
 
-> Doors, not rooms. One line per memory: a link and a hook short enough to
+> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult \`ygg-memory status --harness <me>\` or \`ygg-memory diff\` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
+> ⛔ **Doors, not rooms.** One line per memory: a link and a hook short enough to
 > decide relevance from. The body of a memory lives in its own file.
 >
 > ⛔ This index must never hold a second copy of what is OPEN. One question, one
