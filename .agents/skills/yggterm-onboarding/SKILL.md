@@ -212,6 +212,43 @@ rather than rot:**
 
 ---
 
+## Phase 4.5 — Wire their unified cross-harness memory (`~/.yggterm/memory`)
+
+**The problem it solves:** when you run Claude Code on Monday, Grok on Tuesday, and
+Gemini/Codex on Wednesday on the same project, each CLI harness starts with an
+isolated local memory. Critical bug findings, campaign handover ledgers, and
+rules learned by one agent are invisible to the next.
+
+`~/.yggterm/memory` is the host-resident unified memory layer that tracks a live
+diff of every CLI harness's memory state.
+
+**Set it up WITH them, once per project:**
+
+1. **Bootstrap the memory tree**:
+   ```sh
+   .agents/skills/yggterm-agent-fleet/bootstrap.sh
+   ```
+   This creates `MEMORY.md` ("Doors, not rooms") with the intelligent steering header:
+   ```markdown
+   > 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
+   ```
+
+2. **Teach the turn-one retrieval ritual (<40 tokens)**:
+   Whenever an agent starts a fresh session, it checks what others learned:
+   ```sh
+   ygg-memory status --harness <me>          # ~25 tokens: check if behind
+   ygg-memory diff --harness <me>            # ~80 tokens: view delta summaries
+   ygg-memory get --file <finding-or-campaign.md>  # read on demand
+   ygg-memory ack --harness <me> --all       # mark absorbed
+   ```
+
+3. **Teach the Lore Economics (why SOTA models write doors)**:
+   - **SOTA models** (Claude Opus, Gemini Pro) find gotchas, prove them, and publish doors (`ygg-memory publish --file <finding.md>`).
+   - **Cheaper models** (Flash, Haiku, small local models) grind the execution without paying expensive re-derivation taxes.
+   - **Tooling/Verbs** automate the janitorial work and make failure modes unrepeatable.
+
+---
+
 ## Phase 5 — the steers that belong in their global instructions
 
 Global agent instructions are read every session, so **every line is a tax on all
