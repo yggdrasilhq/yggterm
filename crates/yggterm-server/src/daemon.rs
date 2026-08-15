@@ -535,9 +535,29 @@ fn hot_update_target_regression(
     }
     let existing = existing_expected?;
     let requested = requested_expected?;
+    // 9.9.9 is a synthetic dev placeholder used in tests and ad-hoc builds; it
+    // must never pin a production handoff file and block real version restarts.
+    if existing == "9.9.9" {
+        return None;
+    }
     let existing_version = parse_protocol_version(existing)?;
     let requested_version = parse_protocol_version(requested)?;
     (requested_version < existing_version).then(|| (existing.to_string(), requested.to_string()))
+}
+
+const HOT_UPDATE_OWNERS_STALE_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[cfg(unix)]
+fn hot_update_owner_pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
+#[cfg(not(unix))]
+fn hot_update_owner_pid_is_alive(pid: u32) -> bool {
+    pid != 0
 }
 
 /// Default idle window an agent CLI session must be quiet for before a
@@ -1485,7 +1505,44 @@ impl PreservedTerminalOwnerRegistry {
                 entries: Vec::new(),
             };
         };
-        serde_json::from_slice::<Self>(&bytes).unwrap_or_default()
+        let mut registry: Self = serde_json::from_slice::<Self>(&bytes).unwrap_or_default();
+        // Self-heal: 9.9.9 is dev-only and must never block production restarts.
+        if registry.expected_server_version.as_deref() == Some("9.9.9") {
+            registry.expected_server_version = None;
+        }
+        let now_ms = current_millis_u64();
+        let orig_len = registry.entries.len();
+        let orig_expected = registry.expected_server_version.clone();
+        const HOT_UPDATE_OWNERS_RECENT_MS: u64 = 5 * 60 * 1000;
+        registry.entries.retain(|entry| {
+            let age_ms = now_ms.saturating_sub(entry.created_at_ms);
+            let age_ok = age_ms < HOT_UPDATE_OWNERS_STALE_MS;
+            let recent = age_ms < HOT_UPDATE_OWNERS_RECENT_MS;
+            // Keep recent entries even if pid just died (tests use synthetic pids);
+            // stale dead-pid entries older than RECENT_MS are true orphans from a crashed daemon.
+            (hot_update_owner_pid_is_alive(entry.owner_server_pid) || recent) && age_ok
+        });
+        if registry.entries.is_empty() && registry.expected_server_version.is_some() {
+            registry.expected_server_version = None;
+        }
+        let needs_save = registry.entries.len() != orig_len
+            || registry.expected_server_version != orig_expected;
+        if needs_save {
+            let _ = registry.save(home_dir);
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "hot_update",
+                "stale_registry_pruned_on_load",
+                serde_json::json!({
+                    "orig_len": orig_len,
+                    "new_len": registry.entries.len(),
+                    "orig_expected": orig_expected,
+                    "new_expected": registry.expected_server_version,
+                }),
+            );
+        }
+        registry
     }
 
     fn save(&self, home_dir: &Path) -> Result<()> {
