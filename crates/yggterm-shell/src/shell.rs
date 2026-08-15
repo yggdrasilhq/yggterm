@@ -50360,7 +50360,17 @@ fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> Remo
             index
                 .modified_epoch_by_path
                 .insert(session.session_path.clone(), session.modified_epoch);
-            let title = session.title_hint.trim();
+            let mut title = session.title_hint.trim();
+            // Strip Agent unnamed prefix so remote grok/muse show real title
+            // Use simple check so all kinds covered even if is_agent_plane table lags
+            if title.starts_with("Agent ") && title.contains(" unnamed ") {
+                if let Some(colon) = title.find(": ") {
+                    let suffix = title[colon + 2..].trim();
+                    if !suffix.is_empty() && !memoized_generated_fallback_title(suffix) {
+                        title = suffix;
+                    }
+                }
+            }
             if !title.is_empty() && !memoized_generated_fallback_title(title) {
                 index
                     .generated_title_by_path
@@ -51032,11 +51042,11 @@ fn live_session_derived_label(
     short_ids: &HashMap<String, String>,
 ) -> String {
     let title = session.title.trim();
-    let is_unnamed_agent_title =
-        yggterm_core::is_agent_plane_composed_title(title) && title.contains(" unnamed ");
     // "Agent unnamed <kind>: <real>" holds the real title after the colon —
     // return just the real part so rows/startpage don't render the prefix.
-    if is_unnamed_agent_title {
+    // Use simple prefix check so grok-build/muse (which may not be in
+    // is_agent_plane composed table yet) are also handled.
+    if title.starts_with("Agent ") && title.contains(" unnamed ") {
         if let Some(colon) = title.find(": ") {
             let suffix = title[colon + 2..].trim();
             if !suffix.is_empty() && !memoized_generated_fallback_title(suffix) {
@@ -51044,6 +51054,8 @@ fn live_session_derived_label(
             }
         }
     }
+    let is_unnamed_agent_title =
+        yggterm_core::is_agent_plane_composed_title(title) && title.contains(" unnamed ");
     if !title.is_empty() && !memoized_generated_fallback_title(title) && !is_unnamed_agent_title {
         return session.title.clone();
     }
