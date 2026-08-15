@@ -30,6 +30,12 @@ Currently, each CLI harness maintains its own isolated memory store. When one ha
 - **Does NOT commit memory into the git repository:** Per `feedback-no-session-data-in-repo`, all memory files live exclusively in user-space (`~/.yggterm/memory/` and `~/.claude/...`) and travel between fleet hosts (`***`, `dev`, `oc`) over SSH.
 - **Does NOT parse raw LLM transcripts into memory doors:** Distillation of transcripts into memory doors is performed by the working session during its handover ritual, not by a background heuristic parser.
 
+### 1.4 Harness Isolation Law (No Cross-Harness Private Writes)
+- ⛔ **Private stores are strictly PRIVATE:** No agent harness (Gemini/Antigravity, Grok, Codex, Kimi, Muse, etc.) is permitted to write directly into another harness's private directory (`~/.claude/`, `~/.gemini/`, `~/.grok/`, `~/.codex/`).
+- ✅ **Reading is allowed; writing is forbidden:** An agent may read another harness's historical store if needed for reference, but must NEVER mutate it.
+- ⭐ **The Unified Store is the Only Conduit:** Any agent wishing to share findings, rules, or handover ledgers with the rest of the fleet must publish exclusively to the host-resident unified store via `ygg-memory publish` or commit discussions to the canonical project repository (e.g. `docs/discussions/`).
+- `sync-harness --harness <name>` is scoped strictly to `<name>`'s own private store and the unified layer.
+
 ---
 
 ## 2. Architecture & Data Layout

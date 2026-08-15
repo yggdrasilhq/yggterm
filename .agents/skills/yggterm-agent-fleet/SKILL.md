@@ -1040,14 +1040,11 @@ every other harness's next session is informed:
 python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py publish --file <finding-or-campaign.md> --harness <me>
 ```
 
-### The Intelligent Ingestion Trigger:
+### The Harness Isolation Law (No Cross-Harness Private Writes):
 
-Every root `MEMORY.md` starts with the steering header:
-```markdown
-> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
-```
-Whenever an agent opens or searches `MEMORY.md`, this steer prompts it to inspect
-unified memory diffs if it needs up-to-date context.
+- ⛔ **Private harness stores are strictly PRIVATE:** No agent (Gemini/Antigravity, Grok, Codex, Kimi, Muse, etc.) is permitted to write directly into another harness's private directory (`~/.claude/`, `~/.gemini/`, `~/.grok/`, `~/.codex/`).
+- ✅ **Reading is allowed; writing is forbidden:** An agent may read another harness's files if needed for context, but must NEVER mutate them.
+- ⭐ **The Unified Store is the Only Conduit:** Cross-harness knowledge sharing must travel through `~/.yggterm/memory/` (via `ygg-memory publish`) or canonical project repository documents (e.g. `docs/discussions/`).
 
 ---
 
