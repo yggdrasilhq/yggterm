@@ -1,7 +1,8 @@
 # Spec: Unified Cross-Harness Fleet Memory System (`~/.yggterm/memory`)
 
-**Status:** APPROVED 2026-08-15 · **Implementation in progress on `lane/dev/unified-fleet-memory`**  
+**Status:** APPROVED 2026-08-15 · **Extended with Harness-Scoped Steers**  
 **Directive:** user, 2026-08-15 — *"make a ~/.yggterm/memory system so that all agents can have a tab on every CLI harness memory ... keep a diff of each other's memory ... cheap token efficient toolcalls."*  
+**Steering Directive:** user, 2026-08-15 — *"while we sync 99% of the memory with each other there are some parts that are meant for ONLY that harness ... upgrade the design for the memory system."*  
 **Owner surfaces:** `.agents/skills/yggterm-agent-fleet/ygg-memory.py`, `.agents/skills/yggterm-agent-fleet/SKILL.md`, `~/.yggterm/memory/`, harness memory hooks/adapters.
 
 ---
@@ -18,12 +19,14 @@ Modern agentic workflows in `yggterm` utilize multiple distinct AI CLI harnesses
 
 Currently, each CLI harness maintains its own isolated memory store. When one harness (e.g., Claude Code) discovers critical bug classes, refines behavioral specs, or logs a campaign handover, a newly launched session of another harness (e.g., Grok or Antigravity) in the same project/campaign area starts with zero awareness of those recent findings.
 
-### 1.2 The Core Contract
-`~/.yggterm/memory` is the host-resident, cross-harness memory synchronization hub that tracks a live diff of every CLI harness's memory state. It enables any agent on any harness to:
-1. **Query Diffs with Minimal Tokens:** Ask "What has changed since my last sync?" in a 25-token toolcall.
-2. **Selective / Impatient Ingestion:** Ingest only the specific campaign or topic doors needed for the current turn, or perform a full sync.
-3. **Advance Watermarks:** Mark specific memory items or the entire state as acknowledged.
-4. **Publish New Doors:** Write newly discovered findings or handover notes directly into the unified layer for other harnesses to consume.
+### 1.2 The Core Contract & 99% Shared vs 1% Scoped Layering
+`~/.yggterm/memory` is the host-resident, cross-harness memory synchronization hub that tracks a live diff of every CLI harness's memory state:
+1. **99% Shared Fleet Memory (`target_harness: all`)**: Findings, specs, feedback, and campaign ledgers are synchronized across all harnesses.
+2. **1% Harness-Scoped Steering (`target_harness: <harness>`)**: CLI-specific behavioral corrections, tool-calling habits, and model quirks (e.g. `steer-gemini-*.md`, `steer-claude-*.md`) are targeted strictly to that harness, eliminating prompt conflation across different AI engines.
+3. **Query Diffs with Minimal Tokens:** Ask "What has changed since my last sync?" in a 25-token toolcall.
+4. **Selective / Impatient Ingestion:** Ingest only the specific campaign or topic doors needed for the current turn, or perform a full sync.
+5. **Advance Watermarks:** Mark specific memory items or the entire state as acknowledged.
+6. **Publish New Doors:** Write newly discovered findings, handover notes, or harness steers directly into the unified layer for relevant harnesses to consume.
 
 ### 1.3 Scope & Non-Goals (What This Spec Does NOT Cover)
 - **Does NOT replace harness-native session context:** Each CLI harness continues to manage its own active conversation window and internal prompt memory.
@@ -42,7 +45,7 @@ Currently, each CLI harness maintains its own isolated memory store. When one ha
 
 ```
 ~/.yggterm/memory/
-├── journal.jsonl                        # Global append-only log of memory operations
+├── journal.jsonl                        # Global append-only log of memory operations (with target_harness)
 ├── watermarks/                          # Per-harness checkpoint vectors
 │   ├── claude.json
 │   ├── gemini.json
@@ -54,43 +57,46 @@ Currently, each CLI harness maintains its own isolated memory store. When one ha
     │   └── ...
     └── -home-pi-gh-yggterm/             # Project-specific namespace
         ├── MEMORY.md                    # Root door index with intelligent steering block
-        ├── campaign-*.md                # Campaign ledgers and handover logs
-        ├── finding-*.md                 # Verified empirical findings
-        ├── feedback-*.md                # User directives and working rules
-        ├── spec-*.md                    # Behavior contracts
+        ├── campaign-*.md                # Campaign ledgers and handover logs (target: all)
+        ├── finding-*.md                 # Verified empirical findings (target: all)
+        ├── feedback-*.md                # User directives and universal working rules (target: all)
+        ├── spec-*.md                    # Behavior contracts (target: all)
+        ├── steer-gemini-*.md            # Gemini/Antigravity-scoped steers (target: gemini)
+        ├── steer-claude-*.md            # Claude-scoped steers (target: claude)
         └── index-*.md                   # Sub-indexes
 ```
 
-### 2.1 Door Files & Frontmatter
+### 2.1 Door Files & Frontmatter Scoping
 Memory entries are structured as individual Markdown files ("Doors, not rooms") with YAML frontmatter:
 ```markdown
 ---
-name: finding-pty-grid-ssot
-description: "PTY grid SSOT divergence on Wayland resize — daemon holds grid dimensions, client adapts."
+name: steer-gemini-ytop-pixel-test
+description: "Iterative ytop UI updates must be verified with screenshots until finished."
 metadata:
-  type: finding
-  modified: 2026-08-15T10:30:00Z
-  origin_harness: claude
-  origin_session_id: 09b58856-c5c4-4ca4-a7e8-17b66ddf3d12
+  type: steer
+  origin_harness: gemini
+  target_harness: gemini               # 'all' | 'gemini' | 'claude' | 'grok' | 'codex'
+  modified: 2026-08-15T20:45:00Z
 ---
 
-# Finding: PTY Grid SSOT Divergence
-...
+# Steer: Antigravity / Gemini ytop Pixel Testing
+When updating ytop UI components, take visual screenshots and iterate to completion.
 ```
 
 ### 2.2 Append-Only Journal (`journal.jsonl`)
-Every memory mutation (creation, update, archive) appends a single JSON record:
+Every memory mutation appends a single JSON record with `target_harness`:
 ```json
 {
   "seq": 1042,
   "ts": 1786720100,
   "iso": "2026-08-15T14:15:00Z",
   "ns": "-home-pi-gh-yggterm",
-  "file": "finding-pty-grid-ssot.md",
-  "kind": "finding",
-  "action": "upsert",
-  "harness": "claude",
-  "summary": "PTY grid SSOT divergence on Wayland resize"
+  "file": "steer-gemini-ytop-pixel-test.md",
+  "kind": "steer",
+  "action": "create",
+  "harness": "gemini",
+  "target_harness": "gemini",
+  "summary": "Iterative ytop UI updates must be verified with screenshots until finished."
 }
 ```
 
@@ -98,13 +104,14 @@ Every memory mutation (creation, update, archive) appends a single JSON record:
 Tracks the sequence number and file state absorbed by each CLI harness:
 ```json
 {
-  "harness": "grok",
-  "last_seq": 1039,
-  "last_sync_ts": "2026-08-15T12:00:00Z",
+  "harness": "gemini",
+  "last_seq": 1042,
+  "last_sync_ts": "2026-08-15T15:15:00Z",
   "namespaces": {
     "-home-pi-gh-yggterm": {
       "campaign-yggterm-unified.md": "sha256:4f8a...",
-      "finding-pty-grid-ssot.md": null
+      "finding-pty-grid-ssot.md": "sha256:1a2b...",
+      "steer-gemini-ytop-pixel-test.md": "sha256:9c8d..."
     }
   }
 }
@@ -135,43 +142,34 @@ The CLI tool lives in `.agents/skills/yggterm-agent-fleet/ygg-memory.py` and is 
 
 | Subcommand | Purpose | Typical Token Cost |
 |---|---|---|
-| `status` | Reports whether harness is behind, count of new doors, and updated topics | **~25–40 tokens** |
+| `status` | Reports whether harness is behind on shared doors + its own scoped steers | **~25–40 tokens** |
 | `diff` | Outputs compact delta list with one-line descriptions/hooks | **~80–150 tokens** |
 | `get` | Fetches full Markdown content of a specific memory door | Variable (file size) |
 | `ack` | Advances harness watermark globally (`--all`) or for specific files | **~10–20 tokens** |
-| `publish` | Ingests a new/updated memory door into `~/.yggterm/memory` & journal | **~20 tokens** |
-| `sync-harness` | Two-way sync between harness-local directory and unified store | Local filesystem |
+| `publish` | Ingests a memory door with optional `--target-harness` scope | **~20 tokens** |
+| `sync-harness` | Two-way sync between harness-local directory and matching unified doors | Local filesystem |
 | `sync-fleet` | Multi-host mesh synchronization across `***`, `dev`, `oc` over SSH | Network |
 
 ### 4.2 Example Interaction Workflows
 
 #### Fast Startup Check (Turn 1)
 ```bash
-$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py status --harness grok
-{"behind": 2, "last_seq": 1039, "latest_seq": 1041, "changed_doors": ["campaign-6.0-orchestrator-handover.md", "finding-pty-grid-ssot.md"]}
+$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py status --harness gemini
+{"behind": 2, "last_seq": 1039, "latest_seq": 1041, "changed_doors": ["campaign-6.0-orchestrator-handover.md", "steer-gemini-ytop-pixel-test.md"]}
 ```
 
 #### Scoped Diff Inspection
 ```bash
-$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness grok
+$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness gemini
 [#1040 | campaign] campaign-6.0-orchestrator-handover.md (by claude): Seat 6.0 orchestrator cluster state & dead SHA sweep
-[#1041 | finding] finding-pty-grid-ssot.md (by claude): PTY grid SSOT divergence on Wayland resize
-```
-
-#### Impatient / Selective Sync & Ack
-```bash
-# Ingest only the campaign handover
-$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py get --file campaign-6.0-orchestrator-handover.md
-# Acknowledge only that campaign
-$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py ack --harness grok --files campaign-6.0-orchestrator-handover.md
-{"status": "ok", "acked": ["campaign-6.0-orchestrator-handover.md"], "remaining_behind": 1}
+[#1041 | steer -> gemini] steer-gemini-ytop-pixel-test.md (by gemini): Iterative ytop UI updates must be verified with screenshots until finished
 ```
 
 ---
 
 ## 5. Multi-Host Fleet Synchronization Mesh
 
-Unified memory syncs across the three fleet hosts (`***`, `dev`, `oc`) following the established fleet protocol (`reference-fleet-memory-sync.md`):
+Unified memory syncs across the fleet hosts (`***`, `dev`, `oc`, `manin`) following the established fleet protocol (`reference-fleet-memory-sync.md`):
 
 1. **Snapshot First:** Local memory is snapshotted to `~/.yggterm/memory-backups/<timestamp>/` before sync.
 2. **Two-Pass Mesh:** Pull from every reachable peer, then push to every reachable peer over SSH.

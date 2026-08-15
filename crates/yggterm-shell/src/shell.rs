@@ -3253,12 +3253,30 @@ struct AppPaneSchemaState {
 /// echoing it into a schema. When a value must reach the page, the app returns
 /// an `eval` script for the GUI to run in the surface: the app computes, the GUI
 /// injects, and yggterm stores nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct AppTitlebarSwitchSegment {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct AppTitlebarSwitch {
+    pub active: String,
+    pub action: String,
+    #[serde(default)]
+    pub segments: Vec<AppTitlebarSwitchSegment>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct AppPaneSchema {
     #[serde(default)]
     title: String,
     #[serde(default)]
     widgets: Vec<AppPaneWidget>,
+    #[serde(default)]
+    titlebar_switch: Option<AppTitlebarSwitch>,
     /// Status-bar region pinned at the rail BOTTOM, under the scroll area and
     /// a separator — for "status-bar'y" data (yedit's wc + wrap toggle was the
     /// forcing consumer, 2026-07-23). Deliberately a SUBSET vocabulary today:
@@ -17510,7 +17528,7 @@ fn active_session_offers_view_toggle(snapshot: &RenderSnapshot) -> bool {
 /// reserved no space for them, so the pill drew straight over the first line of
 /// the document it was meant to control. There is now one switch, in the slot
 /// that already existed for exactly this question.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum TitlebarSurfaceSwitch {
     /// Nothing to switch. The slot keeps its footprint so the rest of the
     /// titlebar does not shuffle, but it is hidden and inert.
@@ -17519,8 +17537,11 @@ enum TitlebarSurfaceSwitch {
     /// is active is `active_view_mode`, and a copy here could only disagree
     /// with it.
     Rendered,
-    /// A libyggterm app's document surface ↔ the terminal the app runs in.
-    Document { document_visible: bool },
+    /// A libyggterm app's document surface ↔ the terminal the app runs in, or custom app segments.
+    Document {
+        document_visible: bool,
+        custom: Option<AppTitlebarSwitch>,
+    },
 }
 /// Decide which switch the titlebar slot shows for the active session.
 ///
@@ -17536,8 +17557,15 @@ fn titlebar_surface_switch(snapshot: &RenderSnapshot) -> TitlebarSurfaceSwitch {
         .as_deref()
         .and_then(|path| snapshot.document_surfaces.get(path))
     {
+        let custom = surface.schema.as_ref().and_then(|s| s.schema.titlebar_switch.clone());
+        if let Some(c) = &custom {
+            if c.segments.is_empty() {
+                return TitlebarSurfaceSwitch::None;
+            }
+        }
         return TitlebarSurfaceSwitch::Document {
             document_visible: surface.pane.visible,
+            custom,
         };
     }
     if active_session_offers_view_toggle(snapshot) {
@@ -41417,6 +41445,14 @@ fn is_claude_code_session_path(path: &str) -> bool {
     yggterm_core::agent_cli_descriptor(SessionKind::ClaudeCode)
         .is_some_and(|descriptor| descriptor.store_path_is_session_file(path))
         || path.starts_with("remote-cc://")
+        || path.starts_with("cc-runtime://")
+}
+
+fn is_antigravity_session_path(path: &str) -> bool {
+    yggterm_core::agent_cli_descriptor(SessionKind::Antigravity)
+        .is_some_and(|descriptor| descriptor.store_path_is_session_file(path))
+        || path.starts_with("remote-agy://")
+        || path.starts_with("agy-runtime://")
 }
 
 fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
@@ -41442,6 +41478,8 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
         Some(SessionKind::Codex)
     } else if is_claude_code_session_path(&row.full_path) {
         Some(SessionKind::ClaudeCode)
+    } else if is_antigravity_session_path(&row.full_path) {
+        Some(SessionKind::Antigravity)
     } else if row.full_path.starts_with("local://") {
         Some(SessionKind::Shell)
     } else if row.full_path.starts_with("ssh://") || row.full_path.starts_with("live::") {
@@ -52280,6 +52318,39 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     // live session view), so the blocking task can write the rename's
     // `custom-title` into the CC JSONL on the machine that owns it. See memory
     // finding-cc-title-storage-custom-title.
+    let remote_agy_rename: Option<(String, Option<String>, String)> = {
+        let is_agy = row.session_kind == Some(SessionKind::Antigravity)
+            || is_antigravity_session_path(&row.full_path);
+        match row
+            .full_path
+            .trim_start_matches('/')
+            .strip_prefix("remote-agy://")
+            .filter(|_| is_agy)
+        {
+            Some(rest) => {
+                let (machine_key, path_session_id) = rest
+                    .split_once('/')
+                    .map(|(m, id)| (m.to_string(), id.to_string()))
+                    .unwrap_or_else(|| (rest.to_string(), String::new()));
+                let session_id = row
+                    .session_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or(path_session_id);
+                let shell = state.read();
+                shell
+                    .server
+                    .remote_machines()
+                    .iter()
+                    .find(|machine| machine.machine_key == machine_key)
+                    .filter(|_| !session_id.trim().is_empty())
+                    .map(|machine| {
+                        (machine.ssh_target.clone(), machine.prefix.clone(), session_id.clone())
+                    })
+            }
+            None => None,
+        }
+    };
     let remote_cc_rename: Option<(String, Option<String>, String)> = {
         let is_cc = row.session_kind == Some(SessionKind::ClaudeCode)
             || is_claude_code_session_path(&row.full_path);
@@ -52335,6 +52406,7 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
         let row_for_task = row.clone();
         let trimmed_for_task = trimmed.clone();
         let remote_cc_rename_for_task = remote_cc_rename.clone();
+        let remote_agy_rename_for_task = remote_agy_rename.clone();
         let remote_folder_dir_ensure_for_task = remote_folder_dir_ensure.clone();
         let outcome = task::spawn_blocking(move || -> Result<(SessionNode, String)> {
             let store = SessionStore::open_or_init()?;
@@ -52429,6 +52501,29 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                     // See memory finding-cc-title-storage-custom-title. Local CC
                     // JSONL is written directly here; remote-cc is handled by the
                     // daemon over SSH (below, outside this blocking store task).
+                    let is_antigravity = row_for_task.session_kind
+                        == Some(SessionKind::Antigravity)
+                        || is_antigravity_session_path(&row_for_task.full_path);
+                    if let Some((ssh_target, prefix, session_id)) =
+                        remote_agy_rename_for_task.as_ref()
+                    {
+                        let _ = yggterm_server::rename_remote_antigravity_session(
+                            ssh_target,
+                            prefix.as_deref(),
+                            session_id,
+                            &trimmed_for_task,
+                        );
+                    } else if is_antigravity {
+                        if let Some(session_id) = row_for_task.session_id.as_deref() {
+                            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                                let _ = yggterm_core::update_antigravity_session_title(
+                                    &home,
+                                    session_id,
+                                    &trimmed_for_task,
+                                );
+                            }
+                        }
+                    }
                     let is_claude_code = row_for_task.session_kind
                         == Some(SessionKind::ClaudeCode)
                         || is_claude_code_session_path(&row_for_task.full_path);
@@ -85706,6 +85801,15 @@ fn app() -> Element {
                                     }
                                 });
                             },
+                            on_document_action: move |(path, pane_id, action, value): (String, String, String, Option<String>)| {
+                                spawn(document_pane_run_action(
+                                    state,
+                                    path,
+                                    pane_id,
+                                    action,
+                                    value,
+                                ));
+                            },
                             on_toggle_session_menu: move |_| state.with_mut_counted(|shell| shell.toggle_titlebar_session_menu()),
                             on_toggle_new_menu: move |_| state.with_mut_counted(|shell| shell.toggle_titlebar_new_menu()),
                             on_toggle_overflow_menu: move |_| state.with_mut_counted(|shell| shell.toggle_titlebar_overflow_menu()),
@@ -86700,6 +86804,7 @@ fn Titlebar(
     /// slot was drawn for one particular path, and a second derivation is a
     /// second chance to pick a different one.
     on_set_document_surface_visible: EventHandler<(String, bool)>,
+    on_document_action: EventHandler<(String, String, String, Option<String>)>, 
     on_toggle_session_menu: EventHandler<()>,
     on_toggle_new_menu: EventHandler<()>,
     on_toggle_overflow_menu: EventHandler<()>,
@@ -86950,59 +87055,105 @@ fn Titlebar(
                             },
                         ),
                         onmousedown: |evt| evt.stop_propagation(),
-                        if let (TitlebarSurfaceSwitch::Document { document_visible }, Some(switch_path)) =
-                            (surface_switch, snapshot.active_session_path.clone())
+                        if let (TitlebarSurfaceSwitch::Document { document_visible, custom }, Some(switch_path)) =
+                            (surface_switch.clone(), snapshot.active_session_path.clone())
                         {
-                            // A libyggterm app's document surface. The app cannot
-                            // draw this switch itself — half of its job is to
-                            // bring back a surface the app is not rendering.
-                            button {
-                                class: "yggterm-titlebar-view-toggle-segment",
-                                "data-titlebar-surface-switch-segment": "document",
-                                style: segmented_control_segment_style(
-                                    snapshot.palette,
-                                    document_visible,
-                                    false,
-                                    true,
-                                ),
-                                title: if document_visible {
-                                    "The app's document view (you are here)"
-                                } else {
-                                    "Show the app's document view"
-                                },
-                                ondoubleclick: |evt| evt.stop_propagation(),
-                                onclick: {
-                                    let switch_path = switch_path.clone();
-                                    move |_| {
-                                        on_set_document_surface_visible
-                                            .call((switch_path.clone(), true))
+                            if let Some(app_switch) = custom {
+                                for segment in app_switch.segments.into_iter() {
+                                    {
+                                        let is_active = segment.id == app_switch.active;
+                                        let action = app_switch.action.clone();
+                                        let seg_id = segment.id.clone();
+                                        let label = segment.label.clone();
+                                        let title = if !segment.title.is_empty() {
+                                            segment.title.clone()
+                                        } else {
+                                            format!("Switch to {label}")
+                                        };
+                                        rsx! {
+                                            button {
+                                                key: "{seg_id}",
+                                                class: "yggterm-titlebar-view-toggle-segment",
+                                                "data-titlebar-surface-switch-segment": "{seg_id}",
+                                                style: segmented_control_segment_style(
+                                                    snapshot.palette,
+                                                    is_active,
+                                                    false,
+                                                    true,
+                                                ),
+                                                title: "{title}",
+                                                ondoubleclick: |evt| evt.stop_propagation(),
+                                                onclick: {
+                                                    let switch_path = switch_path.clone();
+                                                    let seg_id = seg_id.clone();
+                                                    let action = action.clone();
+                                                    let on_document_action = on_document_action.clone();
+                                                    let on_set_document_surface_visible = on_set_document_surface_visible.clone();
+                                                    move |_| {
+                                                        on_set_document_surface_visible
+                                                            .call((switch_path.clone(), true));
+                                                        on_document_action.call((
+                                                            switch_path.clone(),
+                                                            "topo".to_string(),
+                                                            action.clone(),
+                                                            Some(seg_id.clone()),
+                                                        ));
+                                                    }
+                                                },
+                                                "{label}"
+                                            }
+                                        }
                                     }
-                                },
-                                "📄\u{fe0e} Document"
-                            }
-                            button {
-                                class: "yggterm-titlebar-view-toggle-segment",
-                                "data-titlebar-surface-switch-segment": "terminal",
-                                style: segmented_control_segment_style(
-                                    snapshot.palette,
-                                    !document_visible,
-                                    false,
-                                    true,
-                                ),
-                                title: if document_visible {
-                                    "Show the terminal (the app keeps running)"
-                                } else {
-                                    "Showing the terminal (the app keeps running)"
-                                },
-                                ondoubleclick: |evt| evt.stop_propagation(),
-                                onclick: {
-                                    let switch_path = switch_path.clone();
-                                    move |_| {
-                                        on_set_document_surface_visible
-                                            .call((switch_path.clone(), false))
-                                    }
-                                },
-                                "⌨\u{fe0e} Terminal"
+                                }
+                            } else {
+                                button {
+                                    class: "yggterm-titlebar-view-toggle-segment",
+                                    "data-titlebar-surface-switch-segment": "document",
+                                    style: segmented_control_segment_style(
+                                        snapshot.palette,
+                                        document_visible,
+                                        false,
+                                        true,
+                                    ),
+                                    title: if document_visible {
+                                        "The app's document view (you are here)"
+                                    } else {
+                                        "Show the app's document view"
+                                    },
+                                    ondoubleclick: |evt| evt.stop_propagation(),
+                                    onclick: {
+                                        let switch_path = switch_path.clone();
+                                        move |_| {
+                                            on_set_document_surface_visible
+                                                .call((switch_path.clone(), true))
+                                        }
+                                    },
+                                    "📄\u{fe0e} Document"
+                                }
+                                button {
+                                    class: "yggterm-titlebar-view-toggle-segment",
+                                    "data-titlebar-surface-switch-segment": "terminal",
+                                    style: segmented_control_segment_style(
+                                        snapshot.palette,
+                                        !document_visible,
+                                        false,
+                                        true,
+                                    ),
+                                    title: if document_visible {
+                                        "Show the terminal (the app keeps running)"
+                                    } else {
+                                        "Showing the terminal (the app keeps running)"
+                                    },
+                                    ondoubleclick: |evt| evt.stop_propagation(),
+                                    onclick: {
+                                        let switch_path = switch_path.clone();
+                                        move |_| {
+                                            on_set_document_surface_visible
+                                                .call((switch_path.clone(), false))
+                                        }
+                                    },
+                                    "⌨\u{fe0e} Terminal"
+                                }
                             }
                         } else {
                             // An agent CLI's rendered transcript ↔ its PTY.
@@ -89232,6 +89383,8 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
                 "session"
             } else if is_claude_code_session_path(&row.full_path) {
                 "claude-code"
+            } else if is_antigravity_session_path(&row.full_path) {
+                "antigravity"
             } else if row.full_path.starts_with("local://") {
                 "terminal"
             } else if row.full_path.starts_with("ssh://") {
@@ -122534,13 +122687,15 @@ mod yedit_gutter_and_surface_switch_tests {
         assert_eq!(
             titlebar_surface_switch(&document_session(false)),
             TitlebarSurfaceSwitch::Document {
-                document_visible: true
+                document_visible: true,
+                custom: None,
             }
         );
         assert_eq!(
             titlebar_surface_switch(&document_session(true)),
             TitlebarSurfaceSwitch::Document {
-                document_visible: false
+                document_visible: false,
+                custom: None,
             },
             "hiding the surface must keep the SAME switch, with Terminal active — \
              never degrade it to a lone button"
@@ -127819,7 +127974,7 @@ fn DocumentSurfaceBody(
     state: Signal<ShellState>,
     session_path: String,
 ) -> Element {
-    let doc = DocTheme::from_terminal(&snapshot.terminal_palette);
+    let doc = DocTheme::from_palette(&snapshot.palette);
     let Some(surface) = snapshot.document_surfaces.get(&session_path).cloned() else {
         return rsx! {};
     };
@@ -140485,6 +140640,7 @@ mod tests {
         let schema = AppPaneSchema {
             title: "Doc".to_string(),
             widgets: Vec::new(),
+            titlebar_switch: None,
             footer: Vec::new(),
             split_ratio: None,
         };
@@ -142150,6 +142306,7 @@ mod tests {
     fn document_editor_schema(value_key: &str, value: &str) -> AppPaneSchema {
         AppPaneSchema {
             title: "Doc".to_string(),
+            titlebar_switch: None,
             widgets: vec![AppPaneWidget::TextInput {
                 id: "editor".into(),
                 label: String::new(),

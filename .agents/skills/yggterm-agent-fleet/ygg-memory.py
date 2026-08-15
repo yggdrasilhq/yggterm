@@ -10,6 +10,7 @@ etc.) to:
   - Ingest selective/impatient or full memory diffs
   - Advance harness watermarks
   - Publish new memory findings/campaign ledgers
+  - Support harness-scoped steering (`target_harness`) to avoid cross-harness conflation
   - Bidirectionally sync with harness-native memory stores
   - Mesh sync with peer hosts (***, dev, oc) over SSH
 """
@@ -35,7 +36,7 @@ LOCK_FILE = DEFAULT_MEMORY_ROOT / ".ygg-memory.lock"
 STEERING_HEADER = """# Memory Index
 
 > 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
-> ⛔ **Doors, not rooms.** Rules (`feedback-/spec-/reference-/user-`) · ledgers (`campaign-/project-`) · findings (`finding-/bug-class-`).
+> ⛔ **Doors, not rooms.** Rules (`feedback-/spec-/reference-/user-`) · ledgers (`campaign-/project-`) · findings (`finding-/bug-class-`) · steers (`steer-<harness>-`).
 > One line, one door. Detail belongs in the target file, never here.
 """
 
@@ -68,9 +69,20 @@ def _flock_close(f):
             pass
 
 
+def normalize_harness_name(name: str) -> str:
+    if not name:
+        return "unknown"
+    n = name.strip().lower()
+    if n in ("agy", "antigravity", "gemini"):
+        return "gemini"
+    if n in ("cc", "claude_code", "claude"):
+        return "claude"
+    return n
+
+
 def detect_harness(override: str = None) -> str:
     if override:
-        return override.strip().lower()
+        return normalize_harness_name(override)
     if os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("CLAUDE_SESSION_ID"):
         return "claude"
     if os.environ.get("GEMINI_CLI") or os.environ.get("ANTIGRAVITY_SESSION"):
@@ -105,14 +117,15 @@ def get_namespace_dir(root: Path, namespace: str) -> Path:
 def get_watermark_path(root: Path, harness: str) -> Path:
     d = root / "watermarks"
     d.mkdir(parents=True, exist_ok=True)
-    return d / f"{harness}.json"
+    return d / f"{normalize_harness_name(harness)}.json"
 
 
 def load_watermark(root: Path, harness: str) -> dict:
-    p = get_watermark_path(root, harness)
+    h = normalize_harness_name(harness)
+    p = get_watermark_path(root, h)
     if not p.exists():
         return {
-            "harness": harness,
+            "harness": h,
             "last_seq": 0,
             "last_sync_ts": None,
             "namespaces": {},
@@ -122,7 +135,7 @@ def load_watermark(root: Path, harness: str) -> dict:
             return json.load(f)
     except Exception:
         return {
-            "harness": harness,
+            "harness": h,
             "last_seq": 0,
             "last_sync_ts": None,
             "namespaces": {},
@@ -130,7 +143,8 @@ def load_watermark(root: Path, harness: str) -> dict:
 
 
 def save_watermark(root: Path, watermark: dict):
-    p = get_watermark_path(root, watermark["harness"])
+    h = normalize_harness_name(watermark["harness"])
+    p = get_watermark_path(root, h)
     temp = p.with_suffix(".tmp")
     with open(temp, "w", encoding="utf-8") as f:
         json.dump(watermark, f, indent=2)
@@ -142,7 +156,18 @@ def get_journal_path(root: Path) -> Path:
     return root / "journal.jsonl"
 
 
-def read_journal_entries(root: Path, after_seq: int = 0, namespace: str = None) -> list:
+def matches_target_harness(entry_target: str, query_harness: str) -> bool:
+    """Check if entry target matches query harness."""
+    if not query_harness or query_harness == "all":
+        return True
+    if not entry_target or entry_target in ("all", "*", ""):
+        return True
+    ent = normalize_harness_name(entry_target)
+    qh = normalize_harness_name(query_harness)
+    return ent == qh
+
+
+def read_journal_entries(root: Path, after_seq: int = 0, namespace: str = None, target_harness: str = None) -> list:
     jpath = get_journal_path(root)
     if not jpath.exists():
         return []
@@ -155,8 +180,13 @@ def read_journal_entries(root: Path, after_seq: int = 0, namespace: str = None) 
             try:
                 rec = json.loads(line)
                 if rec.get("seq", 0) > after_seq:
-                    if namespace is None or rec.get("ns") == namespace:
-                        entries.append(rec)
+                    if namespace is not None and rec.get("ns") != namespace:
+                        continue
+                    if target_harness is not None:
+                        ent_target = rec.get("target_harness", "all")
+                        if not matches_target_harness(ent_target, target_harness):
+                            continue
+                    entries.append(rec)
             except Exception:
                 continue
     return entries
@@ -180,7 +210,7 @@ def get_latest_seq(root: Path) -> int:
     return latest
 
 
-def append_journal_entry(root: Path, ns: str, filename: str, kind: str, action: str, harness: str, summary: str) -> dict:
+def append_journal_entry(root: Path, ns: str, filename: str, kind: str, action: str, harness: str, summary: str, target_harness: str = "all") -> dict:
     jpath = get_journal_path(root)
     latest = get_latest_seq(root)
     next_seq = latest + 1
@@ -194,7 +224,8 @@ def append_journal_entry(root: Path, ns: str, filename: str, kind: str, action: 
         "file": filename,
         "kind": kind,
         "action": action,
-        "harness": harness,
+        "harness": normalize_harness_name(harness),
+        "target_harness": normalize_harness_name(target_harness) if target_harness != "all" else "all",
         "summary": summary,
     }
     with open(jpath, "a", encoding="utf-8") as f:
@@ -202,10 +233,29 @@ def append_journal_entry(root: Path, ns: str, filename: str, kind: str, action: 
     return record
 
 
-def extract_metadata_and_summary(content: str) -> tuple:
-    """Extract frontmatter kind, description/summary, or first line hook."""
+def extract_metadata_and_summary(content: str, filename: str = "") -> tuple:
+    """Extract frontmatter kind, description/summary, and target_harness."""
     kind = "other"
     summary = ""
+    target_harness = "all"
+
+    # Infer from filename prefix first (e.g. steer-gemini-*.md, steer-claude-*.md)
+    if filename:
+        lower_name = filename.lower()
+        if lower_name.startswith("steer-"):
+            parts = lower_name.split("-", 2)
+            if len(parts) >= 2:
+                candidate = parts[1]
+                if candidate in ("gemini", "agy", "antigravity"):
+                    target_harness = "gemini"
+                    kind = "steer"
+                elif candidate in ("claude", "cc"):
+                    target_harness = "claude"
+                    kind = "steer"
+                elif candidate in ("grok", "codex", "muse"):
+                    target_harness = candidate
+                    kind = "steer"
+
     if content.startswith("---"):
         parts = content.split("---", 2)
         if len(parts) >= 3:
@@ -216,6 +266,9 @@ def extract_metadata_and_summary(content: str) -> tuple:
                     kind = line.split(":", 1)[1].strip()
                 elif line.startswith("description:"):
                     summary = line.split(":", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("target_harness:") or line.startswith("scope:"):
+                    raw_val = line.split(":", 1)[1].strip().strip('"').strip("'")
+                    target_harness = normalize_harness_name(raw_val) if raw_val != "all" else "all"
             content_body = parts[2]
         else:
             content_body = content
@@ -232,7 +285,7 @@ def extract_metadata_and_summary(content: str) -> tuple:
                 summary = line[:120]
                 break
 
-    return kind, summary or "Updated memory door"
+    return kind, summary or "Updated memory door", target_harness
 
 
 def file_sha256(path: Path) -> str:
@@ -255,7 +308,7 @@ def cmd_status(args):
     last_seq = watermark.get("last_seq", 0)
     latest_seq = get_latest_seq(root)
 
-    new_entries = read_journal_entries(root, after_seq=last_seq, namespace=ns)
+    new_entries = read_journal_entries(root, after_seq=last_seq, namespace=ns, target_harness=harness)
     # Deduplicate changed door filenames
     changed_doors = list(dict.fromkeys([e["file"] for e in new_entries if e.get("file")]))
 
@@ -289,10 +342,10 @@ def cmd_diff(args):
     watermark = load_watermark(root, harness)
     last_seq = watermark.get("last_seq", 0)
 
-    entries = read_journal_entries(root, after_seq=last_seq, namespace=ns)
+    entries = read_journal_entries(root, after_seq=last_seq, namespace=ns, target_harness=harness)
     if args.filter:
         flt = args.filter.lower()
-        entries = [e for e in entries if flt in e.get("kind", "").lower() or flt in e.get("file", "").lower()]
+        entries = [e for e in entries if flt in e.get("kind", "").lower() or flt in e.get("file", "").lower() or flt in e.get("summary", "").lower()]
 
     if args.json:
         print(json.dumps({"harness": harness, "namespace": ns, "diff_entries": entries}))
@@ -308,8 +361,10 @@ def cmd_diff(args):
         kind = e.get("kind", "door")
         fname = e.get("file", "unknown")
         author = e.get("harness", "unknown")
+        target = e.get("target_harness", "all")
+        target_str = f" -> {target}" if target != "all" else ""
         summ = e.get("summary", "")
-        print(f"[#{seq} | {kind}] {fname} (by {author}): {summ}")
+        print(f"[#{seq} | {kind}{target_str}] {fname} (by {author}): {summ}")
 
 
 def cmd_get(args):
@@ -337,10 +392,13 @@ def cmd_ack(args):
         if args.all:
             watermark["last_seq"] = latest_seq
             watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            # Record current hashes of all doors in ns
+            # Record current hashes of all doors in ns matching this harness
             ns_dir = get_namespace_dir(root, ns)
             for fpath in ns_dir.glob("*.md"):
-                ns_map[fpath.name] = file_sha256(fpath)
+                content = fpath.read_text(encoding="utf-8")
+                _, _, target_h = extract_metadata_and_summary(content, fpath.name)
+                if matches_target_harness(target_h, harness):
+                    ns_map[fpath.name] = file_sha256(fpath)
             save_watermark(root, watermark)
             if args.json:
                 print(json.dumps({"status": "ok", "acked": "all", "seq": latest_seq}))
@@ -383,17 +441,24 @@ def cmd_publish(args):
         dest_path = ns_dir / dest_filename
 
         content = source_path.read_text(encoding="utf-8")
-        kind, summary = extract_metadata_and_summary(content)
+        kind, summary, extracted_target = extract_metadata_and_summary(content, dest_filename)
+
         if args.summary:
             summary = args.summary.strip()
         if args.kind:
             kind = args.kind.strip()
 
+        target_harness = extracted_target
+        if args.target_harness:
+            raw_target = args.target_harness.strip()
+            target_harness = normalize_harness_name(raw_target) if raw_target != "all" else "all"
+
         is_new = not dest_path.exists()
         action = "create" if is_new else "update"
 
-        shutil.copy2(source_path, dest_path)
-        record = append_journal_entry(root, ns, dest_filename, kind, action, harness, summary)
+        if source_path != dest_path:
+            shutil.copy2(source_path, dest_path)
+        record = append_journal_entry(root, ns, dest_filename, kind, action, harness, summary, target_harness=target_harness)
 
         # Update publisher's own watermark for this file
         watermark = load_watermark(root, harness)
@@ -415,7 +480,8 @@ def cmd_publish(args):
         if args.json:
             print(json.dumps({"status": "ok", "record": record}))
         else:
-            print(f"Published '{dest_filename}' to namespace '{ns}' (seq #{record['seq']}).")
+            target_info = f" [target: {target_harness}]" if target_harness != "all" else ""
+            print(f"Published '{dest_filename}' to namespace '{ns}' (seq #{record['seq']}){target_info}.")
     finally:
         _flock_close(lock)
 
@@ -456,13 +522,19 @@ def cmd_sync_harness(args):
             dest_file = ns_dir / loc_file.name
             if not dest_file.exists() or loc_file.stat().st_mtime > dest_file.stat().st_mtime:
                 content = loc_file.read_text(encoding="utf-8")
-                kind, summary = extract_metadata_and_summary(content)
+                kind, summary, target_h = extract_metadata_and_summary(content, loc_file.name)
                 shutil.copy2(loc_file, dest_file)
-                append_journal_entry(root, ns, loc_file.name, kind, "upsert", harness, summary)
+                append_journal_entry(root, ns, loc_file.name, kind, "upsert", harness, summary, target_harness=target_h)
                 in_count += 1
 
-        # Pass 2: Propagate from unified root -> local harness (if unified newer or local missing)
+        # Pass 2: Propagate from unified root -> local harness (matching target_harness only!)
         for uni_file in ns_dir.glob("*.md"):
+            content = uni_file.read_text(encoding="utf-8")
+            _, _, target_h = extract_metadata_and_summary(content, uni_file.name)
+            if not matches_target_harness(target_h, harness):
+                # Skip doors explicitly targeted to another harness!
+                continue
+
             dest_file = local_dir / uni_file.name
             if not dest_file.exists() or uni_file.stat().st_mtime > dest_file.stat().st_mtime:
                 shutil.copy2(uni_file, dest_file)
@@ -610,7 +682,7 @@ def main():
 
     # diff
     p_diff = subparsers.add_parser("diff", parents=[common_parser], help="View delta doors since last sync")
-    p_diff.add_argument("--filter", default=None, help="Filter diffs by kind or topic keyword")
+    p_diff.add_argument("--filter", default=None, help="Filter diffs by kind, topic, or keyword")
 
     # get
     p_get = subparsers.add_parser("get", parents=[common_parser], help="Retrieve body of a specific memory door")
@@ -624,8 +696,9 @@ def main():
     # publish
     p_pub = subparsers.add_parser("publish", parents=[common_parser], help="Publish a local file into unified memory")
     p_pub.add_argument("--file", required=True, help="Source markdown file to publish")
-    p_pub.add_argument("--kind", default=None, help="Kind (finding, campaign, spec, feedback)")
+    p_pub.add_argument("--kind", default=None, help="Kind (finding, campaign, spec, feedback, steer)")
     p_pub.add_argument("--summary", default=None, help="One-line summary description")
+    p_pub.add_argument("--target-harness", "--scope", dest="target_harness", default=None, help="Target harness scope ('all' or specific: gemini, claude, grok, codex)")
 
     # sync-harness
     p_sync_h = subparsers.add_parser("sync-harness", parents=[common_parser], help="Bi-directional sync with local harness store")
