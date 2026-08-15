@@ -2219,11 +2219,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
-        // `~/.antigravitycli/<uuid>.json`, one flat file per conversation,
-        // carrying `id`, `name` and `projectResources.resources[].gitFolder
-        // .folderUri` as a `file://` URI. Verified on guihost 2026-08-08.
-        session_store_globs: &[".antigravitycli/*.json"],
-        store_excluded_name_fragments: &[],
+        // `~/.gemini/antigravity-cli/conversations/<uuid>.db`, with summaries in
+        // `~/.gemini/antigravity-cli/conversation_summaries.db`.
+        session_store_globs: &[".gemini/antigravity-cli/conversations/*.db"],
+        store_excluded_name_fragments: &["-shm", "-wal"],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: None,
@@ -2574,31 +2573,78 @@ fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
 }
 
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let session_id = value.get("id")?.as_str()?.to_string();
-    let cwd = value
-        .get("projectResources")?
-        .get("resources")?
-        .as_array()?
-        .iter()
-        .find_map(|resource| {
-            resource
-                .get("gitFolder")?
-                .get("folderUri")?
-                .as_str()?
-                .strip_prefix("file://")
-                .map(|path| path.to_string())
-        })?;
-    if session_id.is_empty() || cwd.is_empty() {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let session_id = value.get("id")?.as_str()?.to_string();
+        let cwd = value
+            .get("projectResources")?
+            .get("resources")?
+            .as_array()?
+            .iter()
+            .find_map(|resource| {
+                resource
+                    .get("gitFolder")?
+                    .get("folderUri")?
+                    .as_str()?
+                    .strip_prefix("file://")
+                    .map(|path| path.to_string())
+            })?;
+        if session_id.is_empty() || cwd.is_empty() {
+            return None;
+        }
+        let title = value
+            .get("name")
+            .and_then(|name| name.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != cwd)
+            .map(|name| name.to_string());
+        return Some(AgentStoreEntry {
+            session_id,
+            cwd,
+            modified_epoch_ms: modified_epoch_ms_of(path),
+            title,
+            detail: None,
+        });
+    }
+
+    let session_id = path.file_stem()?.to_str()?.to_string();
+    if session_id.is_empty() || session_id.ends_with("-shm") || session_id.ends_with("-wal") {
         return None;
     }
-    let title = value
-        .get("name")
-        .and_then(|name| name.as_str())
-        .map(str::trim)
-        .filter(|name| !name.is_empty() && *name != cwd)
-        .map(|name| name.to_string());
+    let home = dirs::home_dir()?;
+    let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    let mut title = None;
+    let mut cwd = None;
+    if db_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT title, preview, workspace_uris FROM conversation_summaries WHERE conversation_id = ?1;",
+            ) {
+                if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
+                    if let Ok(Some(row)) = rows.next() {
+                        let t: String = row.get(0).unwrap_or_default();
+                        let p: String = row.get(1).unwrap_or_default();
+                        let uris: String = row.get(2).unwrap_or_default();
+                        let t = t.trim();
+                        let p = p.trim();
+                        if !t.is_empty() {
+                            title = Some(t.to_string());
+                        } else if !p.is_empty() {
+                            title = Some(p.to_string());
+                        }
+                        cwd = crate::parse_antigravity_workspace_uris(&uris);
+                    }
+                }
+            }
+        }
+    }
+    let cwd = cwd.unwrap_or_else(|| home.display().to_string());
     Some(AgentStoreEntry {
         session_id,
         cwd,

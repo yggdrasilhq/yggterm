@@ -1867,6 +1867,12 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
         sessions.extend(scanned);
         count
     };
+    let antigravity_sessions = {
+        let scanned = scan_local_antigravity_sessions();
+        let count = scanned.len();
+        sessions.extend(scanned);
+        count
+    };
 
     let mut projects = BTreeMap::<String, Vec<LocalAgentSessionSummary>>::new();
     for session in sessions {
@@ -1918,6 +1924,7 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     perf.annotate(serde_json::json!({
         "codex_sessions": codex_sessions,
         "claude_code_sessions": claude_code_sessions,
+        "antigravity_sessions": antigravity_sessions,
         "cwd_buckets": bucket_count,
     }));
     Ok(codex_browser_tree_to_session_node(&root))
@@ -1995,6 +2002,268 @@ pub fn scan_local_claude_code_sessions() -> Vec<LocalAgentSessionSummary> {
         }
     }
     sessions
+}
+
+/// Parse workspace URIs JSON array stored by Antigravity (e.g. `["file:///home/user/repo"]`),
+/// extracting the first valid file path.
+pub fn parse_antigravity_workspace_uris(uris_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(uris_json).ok()?;
+    let uris = value.as_array()?;
+    for uri in uris {
+        if let Some(uri_str) = uri.as_str() {
+            let path_str = uri_str.strip_prefix("file://").unwrap_or(uri_str);
+            let trimmed = path_str.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn local_antigravity_conversations_dir() -> Option<PathBuf> {
+    agent_cli_descriptor(SessionKind::Antigravity)?
+        .store_roots_absolute(&dirs::home_dir()?)
+        .into_iter()
+        .next()
+}
+
+pub fn local_antigravity_dir() -> Option<PathBuf> {
+    local_antigravity_conversations_dir().and_then(|conv| conv.parent().map(Path::to_path_buf))
+}
+
+pub fn local_antigravity_summaries_db_path() -> Option<PathBuf> {
+    local_antigravity_dir().map(|d| d.join("conversation_summaries.db"))
+}
+
+/// Scan local Antigravity session files and return unified summaries
+/// ready for the cwd tree builder. Per [[spec-cwd-tree-agent-cli-unified]].
+pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let Some(descriptor) = agent_cli_descriptor(SessionKind::Antigravity) else {
+        return Vec::new();
+    };
+    let Some(conv_dir) = descriptor.store_roots_absolute(&home).into_iter().next() else {
+        return Vec::new();
+    };
+    let db_path = conv_dir
+        .parent()
+        .map(|p| p.join("conversation_summaries.db"))
+        .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
+    let mut sessions = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+
+    if db_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT conversation_id, title, preview, workspace_uris, last_modified_time FROM conversation_summaries WHERE killed = 0;",
+            ) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let title: String = row.get(1)?;
+                    let preview: String = row.get(2)?;
+                    let uris: String = row.get(3)?;
+                    let modified: String = row.get(4)?;
+                    Ok((id, title, preview, uris, modified))
+                }) {
+                    for row in rows.flatten() {
+                        let (session_id, raw_title, raw_preview, uris, raw_modified) = row;
+                        if session_id.trim().is_empty() {
+                            continue;
+                        }
+                        seen_ids.insert(session_id.clone());
+                        let t = raw_title.trim();
+                        let p = raw_preview.trim();
+                        let title = if !t.is_empty() {
+                            Some(t.to_string())
+                        } else if !p.is_empty() {
+                            Some(p.to_string())
+                        } else {
+                            None
+                        };
+                        let cwd = parse_antigravity_workspace_uris(&uris)
+                            .unwrap_or_else(|| home.display().to_string());
+                        let file_path = conv_dir.join(format!("{session_id}.db"));
+                        let modified_epoch_ms = if let Ok(dt) = time::OffsetDateTime::parse(
+                            &raw_modified,
+                            &time::format_description::well_known::Rfc3339,
+                        ) {
+                            (dt.unix_timestamp_nanos() / 1_000_000) as u128
+                        } else {
+                            fs::metadata(&file_path)
+                                .ok()
+                                .and_then(|meta| meta.modified().ok())
+                                .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|duration| duration.as_millis())
+                                .unwrap_or_default()
+                        };
+                        sessions.push(LocalAgentSessionSummary {
+                            kind: SessionKind::Antigravity,
+                            file_path,
+                            session_id,
+                            cwd,
+                            title,
+                            detail: None,
+                            modified_epoch_ms,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(&conv_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !descriptor.store_path_is_session_file(&path.display().to_string()) {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(ToString::to_string) {
+                if !seen_ids.contains(&stem) {
+                    let modified_epoch_ms = fs::metadata(&path)
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or_default();
+                    sessions.push(LocalAgentSessionSummary {
+                        kind: SessionKind::Antigravity,
+                        file_path: path,
+                        session_id: stem,
+                        cwd: home.display().to_string(),
+                        title: None,
+                        detail: None,
+                        modified_epoch_ms,
+                    });
+                }
+            }
+        }
+    }
+
+    sessions
+}
+
+/// Read an Antigravity conversation title from `conversation_summaries.db`.
+///
+/// Antigravity stores an auto-generated title in `preview` after the first turn,
+/// and a user-edited rename in `title`. If `title` is set (non-empty), it takes
+/// precedence over `preview`.
+pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<Option<String>> {
+    let Some(conv_dir) = agent_cli_descriptor(SessionKind::Antigravity)
+        .and_then(|d| d.store_roots_absolute(home).into_iter().next())
+    else {
+        return Ok(None);
+    };
+    let db_path = conv_dir
+        .parent()
+        .map(|p| p.join("conversation_summaries.db"))
+        .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ).with_context(|| format!("failed to open antigravity summaries db at {}", db_path.display()))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?1;",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![session_id])?;
+    if let Some(row) = rows.next()? {
+        let title: String = row.get(0).unwrap_or_default();
+        let preview: String = row.get(1).unwrap_or_default();
+        let title = title.trim();
+        let preview = preview.trim();
+        if !title.is_empty() {
+            return Ok(Some(title.to_string()));
+        }
+        if !preview.is_empty() {
+            return Ok(Some(preview.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// The CWD of a local Antigravity session from `conversation_summaries.db`.
+pub fn local_antigravity_session_cwd(session_id: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let conv_dir = agent_cli_descriptor(SessionKind::Antigravity)?
+        .store_roots_absolute(&home)
+        .into_iter()
+        .next()?;
+    let db_path = conv_dir
+        .parent()
+        .map(|p| p.join("conversation_summaries.db"))
+        .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ).ok()?;
+    let mut stmt = conn.prepare(
+        "SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ?1;",
+    ).ok()?;
+    let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+    if let Ok(Some(row)) = rows.next() {
+        let uris: String = row.get(0).unwrap_or_default();
+        return parse_antigravity_workspace_uris(&uris);
+    }
+    None
+}
+
+/// Update an Antigravity conversation title in `conversation_summaries.db`.
+///
+/// This writes directly to Antigravity's own SQLite store so both yggterm and the
+/// Antigravity CLI see the custom renamed title.
+pub fn update_antigravity_session_title(
+    home: &Path,
+    session_id: &str,
+    title: &str,
+) -> Result<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("refusing to write an empty Antigravity title");
+    }
+    let conv_dir = agent_cli_descriptor(SessionKind::Antigravity)
+        .and_then(|d| d.store_roots_absolute(home).into_iter().next())
+        .ok_or_else(|| anyhow::anyhow!("antigravity store root not found"))?;
+    let db_path = conv_dir
+        .parent()
+        .map(|p| p.join("conversation_summaries.db"))
+        .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
+    if !db_path.exists() {
+        anyhow::bail!("antigravity conversation summaries db not found at {}", db_path.display());
+    }
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open antigravity summaries db for writing at {}", db_path.display()))?;
+    let updated = conn.execute(
+        "UPDATE conversation_summaries SET title = ?1 WHERE conversation_id = ?2;",
+        rusqlite::params![title, session_id],
+    )?;
+    if updated == 0 {
+        let default_uri = format!("file://{}", home.display());
+        let uris = serde_json::json!([default_uri]).to_string();
+        let now = OffsetDateTime::now_utc().to_string();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO conversation_summaries (conversation_id, title, preview, workspace_uris, last_modified_time, app_data_dir) VALUES (?1, ?2, '', ?3, ?4, 'antigravity-cli');",
+            rusqlite::params![session_id, title, uris, now],
+        );
+    }
+    Ok(())
 }
 
 /// The codex arm of the store read.
@@ -2809,6 +3078,48 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_title_reading_and_rename_round_trip() {
+        let dir = std::env::temp_dir().join(format!("ygg-test-agy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let descriptor = agent_cli_descriptor(SessionKind::Antigravity).unwrap();
+        let conv_dir = descriptor.store_roots_absolute(&dir).into_iter().next().unwrap();
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        let db_path = conv_dir.parent().unwrap().join("conversation_summaries.db");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                preview TEXT NOT NULL DEFAULT '',
+                workspace_uris TEXT NOT NULL DEFAULT '[]',
+                last_modified_time DATETIME NOT NULL DEFAULT '',
+                app_data_dir TEXT NOT NULL DEFAULT 'antigravity-cli',
+                step_count INTEGER NOT NULL DEFAULT 0,
+                killed NUMERIC NOT NULL DEFAULT 0
+            );",
+        ).unwrap();
+
+        let session_id = "test-session-uuid-1234";
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, title, preview, workspace_uris, last_modified_time) VALUES (?1, '', 'Generated Title Preview', '[\"file:///home/user/example-project\"]', '2026-08-15 12:00:00+00:00');",
+            rusqlite::params![session_id],
+        ).unwrap();
+
+        // 1. Initial read should return preview as fallback title
+        let initial_title = read_antigravity_session_title(&dir, session_id).unwrap();
+        assert_eq!(initial_title, Some("Generated Title Preview".to_string()));
+
+        // 2. Updating title should set title column and win over preview
+        update_antigravity_session_title(&dir, session_id, "3. Custom Renamed Title").unwrap();
+        let updated_title = read_antigravity_session_title(&dir, session_id).unwrap();
+        assert_eq!(updated_title, Some("3. Custom Renamed Title".to_string()));
+
+        // Clean up test dir
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// No hand-written store path may survive in this crate outside the
     /// registry. The structural half of phase 1b: eleven copies of
