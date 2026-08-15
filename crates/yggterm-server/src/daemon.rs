@@ -10778,9 +10778,15 @@ fn snapshot_session_is_handover_orphaned_row(session: &SnapshotSessionView) -> b
 /// without the phase flip keeps a stale `Running` label over a dead runtime,
 /// and a row flipped without being retained is relabelled on its way out.
 fn snapshot_session_row_survives_runtime_loss(session: &SnapshotSessionView) -> bool {
+    // Plain shells are first-class: their row survives runtime loss via the
+    // handoff marker (update-restart) and, when no marker exists, as a
+    // resumable husk that re-spawns at recorded cwd. Without this arm a
+    // routine persist + cold retire would erase the shell row entirely, while
+    // agents survive via their JSONL store.
     snapshot_session_is_keep_alive_recovery_target(session)
         || snapshot_session_is_agent_store_recoverable(session)
         || snapshot_session_is_handover_orphaned_row(session)
+        || session.kind == SessionKind::Shell
 }
 
 fn apply_terminal_runtime_truth_to_snapshot(
@@ -16836,8 +16842,10 @@ fn progressive_migration_enabled() -> bool {
 /// ⛔ The reasoning lives in [`session_kind_state_survives_pty_loss`], not here —
 /// this is one of TWO paths that destroy a PTY, and when each carried its own
 /// copy of the argument the other one drifted and started killing shells.
+/// Progressive migration is store-based re-resume (agent JSONL); shell
+/// preservation is fd handoff (pty_handoff), so this stays agent-only.
 fn session_kind_is_migratable_agent(kind: SessionKind) -> bool {
-    session_kind_state_survives_pty_loss(kind)
+    kind.is_agent()
 }
 
 /// THE fact both PTY-destroying paths turn on: **does this session's state live
@@ -16883,7 +16891,11 @@ fn session_kind_state_survives_pty_loss(kind: SessionKind) -> bool {
     // Registry-derived. The hand-list this replaced is the shape where a new
     // CLI is quietly non-migratable, so its PTY lingers with a dying daemon
     // instead of converging onto the newest one.
-    kind.is_agent()
+    // Plain shells are first-class via fd handoff (pty_handoff): their PTY master
+    // is moved with SCM_RIGHTS, so destroying the old master is lossless when a
+    // successor exists. See hot_update_idle_gate_blockers — shell is preservable,
+    // not not_restorable.
+    kind.is_agent() || kind == SessionKind::Shell
 }
 
 /// Is this reachable peer a genuine migration SUCCESSOR — a daemon running a
@@ -22611,12 +22623,14 @@ mod tests {
         // The two PTY-destroying paths — progressive migration and the retire
         // loop's cold shutdown — had drifted apart on exactly this question, and
         // the retire loop's answer destroyed shells. One fact, one function.
+        // Shell is now preservable via fd handoff (pty_handoff SCM_RIGHTS), so it
+        // survives PTY loss when a successor handles the handoff.
         assert!(survives(SessionKind::ClaudeCode));
         assert!(survives(SessionKind::Codex));
         assert!(survives(SessionKind::CodexLiteLlm));
         assert!(
-            !survives(SessionKind::Shell),
-            "a shell's state IS its PTY; no amount of quiet makes killing it safe"
+            survives(SessionKind::Shell),
+            "a shell's PTY is hand-off preservable via pty_handoff"
         );
         for refused in [SessionKind::SshShell, SessionKind::Document] {
             // Refused conservatively rather than proven lossy — see the
@@ -26153,10 +26167,9 @@ mod tests {
 
     // Run #16 gate-#5 family: a LOCAL agent CLI row re-derives from the CLI's
     // own JSONL store, so a runtime exit must keep the row (flipped to a
-    // recoverable launch phase) instead of erasing it. A shell whose OWN PTY
-    // exited is still a husk and still goes — the shell here carries no
-    // handover marker, which is what separates it from the rescued shell in
-    // `a_plain_shells_row_survives_the_daemon_bump_that_killed_its_pty`.
+    // recoverable launch phase) instead of erasing it. Plain shells are now
+    // first-class: their row survives runtime loss as a resumable husk (PTY
+    // handoff when available, husk otherwise), matching agents.
     #[test]
     fn local_agent_rows_survive_runtime_exit_but_plain_shells_do_not() {
         let server = YggtermServer::new(
@@ -26205,8 +26218,12 @@ mod tests {
             .collect();
         assert_eq!(
             surviving,
-            vec![codex.session_path.as_str(), cc.session_path.as_str()],
-            "agent rows survive runtime exit; plain shell does not"
+            vec![
+                codex.session_path.as_str(),
+                cc.session_path.as_str(),
+                "live::plain-shell"
+            ],
+            "agent rows and plain shell survive runtime exit as first-class rows"
         );
         assert!(
             snapshot
@@ -26660,10 +26677,10 @@ mod tests {
         active.kind = SessionKind::SshShell;
         active.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
         active.remote_deploy_state = RemoteDeployState::Planned;
-        // A plain shell with no live PTY is a husk (NOT a recovery target), so it
-        // is still dropped by the runtime-truth filter — this is what keeps the
-        // test discriminating now that remote agent rows are retained across a
-        // runtime gap (see daemon_snapshot_keeps_remote_agent_rows_across_runtime_gap).
+        // Plain shells are now first-class and survive runtime loss as husks
+        // (see snapshot_session_row_survives_runtime_loss Shell arm), so both
+        // the pending SshShell and the stale Shell survive — the discrimination
+        // now is launch_phase, not row presence.
         let stale_path = "live::old-shell";
         let mut stale = daemon_test_snapshot_session(stale_path, SessionSource::LiveLocal);
         stale.kind = SessionKind::Shell;
@@ -26682,8 +26699,15 @@ mod tests {
 
         assert_eq!(snapshot.active_session_path.as_deref(), Some(active_path));
         assert_eq!(snapshot.active_view_mode, WorkspaceViewMode::Terminal);
-        assert_eq!(snapshot.live_sessions.len(), 1);
-        assert_eq!(snapshot.live_sessions[0].session_path.as_str(), active_path);
+        assert_eq!(snapshot.live_sessions.len(), 2);
+        assert!(snapshot
+            .live_sessions
+            .iter()
+            .any(|s| s.session_path.as_str() == active_path));
+        assert!(snapshot
+            .live_sessions
+            .iter()
+            .any(|s| s.session_path.as_str() == stale_path));
     }
 
     #[test]

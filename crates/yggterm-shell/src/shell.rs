@@ -197,8 +197,8 @@ use yggterm_server::{
     ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteScannedSession,
-    ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
-    RemoteRuntimeAfterRemoval, SessionPreviewBlock, SessionRemovalEvidence,
+    RowSeatRequest, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
+    SessionMetadataEntry, RemoteRuntimeAfterRemoval, SessionPreviewBlock, SessionRemovalEvidence,
     SessionRenderedSection, SessionSource,
     SessionTeardownProcess, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
@@ -221,8 +221,8 @@ use yggterm_server::{
     stage_remote_clipboard_png, start_command_session_placed,
     start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance, start_local_session_placed,
-    start_remote_claude_session_placed, start_remote_codex_session_placed,
-    start_ssh_session_placed, status,
+    start_remote_agent_session_seated, start_remote_claude_session_placed,
+    start_remote_codex_session_placed, start_ssh_session_placed, status,
     take_next_app_control_request,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write,
@@ -598,57 +598,26 @@ const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
 const STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES: u32 = 3;
 const RETAINED_EMPTY_SURFACE_RECOVERY_REARM_MS: u64 = 900;
 // ⛔ THE INPUT GATE HAS ~20 REMOVAL SITES AND HAD NO RELEASE OF ITS OWN.
-// `remote_resume_input_ready` is cleared on every open of a row and restored
-// only when the new open attempt reaches Ready. When the mount that would have
-// produced Ready is skipped as redundant (the host is already live), the only
-// remaining route is fast-ready on the first MEANINGFUL output byte — which an
-// agent sitting idle at its prompt never emits. The row then renders perfectly
-// and accepts no keystrokes for the rest of its life, and nothing says why.
-// This deadline is the release: past it, a surface that is demonstrably live
-// gets its readiness back. It is a restoration of the one owner
-// (`terminal_resume_ready_paths`), NOT a second answer layered over it.
-const INPUT_GATE_STUCK_RESTORE_AFTER_MS: u64 = 5_000;
-// Same deadline for a row whose `terminal_attach_in_flight` marker is the thing
-// that never cleared. An attach genuinely in flight is the gate doing its job,
-// so this waits far longer — and still only for a host that is mounted, has
-// been ready before in this life, and whose PTY the daemon owns right now.
-// ⚠ It must also sit BEYOND the retained-fault recovery budget (measured at
-// ~35 s to `retained_fault_recovery_exhausted`, which resolves the attempt
-// itself). A deadline inside that window would hand the keyboard to a session
-// whose resume was still replaying — the thing the gate is for.
-const INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS: u64 = 45_000;
-// How long the gate may refuse a row we CANNOT prove live before we say so in
-// telemetry. Reported once per stuck episode, not once per tick.
-const INPUT_GATE_STUCK_REPORT_AFTER_MS: u64 = 15_000;
-// ⛔ THE LAST RESORT, AND THE REASON IT HAD TO EXIST.
-//
-// Reporting was the whole of the unprovable branch: it said
-// `input_gate_stuck_unrestorable` once and then returned, so every later tick
-// took the same branch and returned again. **There was no path out of it.** The
-// restore arm below — the escape hatch — sits past a test the stuck row cannot
-// pass, so the hatch could never fire for precisely the rows that were stuck.
-// Measured on the desktop host: 11 episodes across **8 distinct sessions**,
-// refused for up to **160 s**, every one of them with an attach in flight.
-// Owner-reported as "once in a while a session stops responding to inputs …
-// one of the worst annoyances".
-//
-// ⚠ WHAT MAKES IT SAFE TO OPEN THE GATE HERE. The reusability test is a
-// conjunction of three things, and they are not of equal standing:
-// `host_id.is_some()` and `daemon_owns_session_runtime()` are FACTS about the
-// world — a surface exists and the daemon holds a live PTY for it right now —
-// while `was_ever_ready()` is this CLIENT's memory of having seen a transition.
-// A client that missed it (restart, remount, a re-resume that never announced
-// ready) has no live PTY to protect, only its own amnesia, and condemning the
-// row for that is what the owner experiences as the bug. So past this deadline
-// the two facts are enough and the memory is not required.
-//
-// ⛔ It still refuses when the daemon does NOT own the runtime: there is no PTY
-// to receive the keystrokes, and opening the gate would swallow them silently —
-// worse than refusing. Those rows need a re-attach, not a gate.
-//
-// Set beyond INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS on purpose: a PROVEN
-// live surface gets its keyboard back sooner than an unproven one.
-const INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS: u64 = 60_000;
+// Deleted for ALL-sessions non-blocking fix 2026-08-16: the old LLM gate held
+// every agent row 5s-60s waiting for a prompt heuristic that idle agents never
+// emit. PTY is live throughout — worst case of not gating is an unechoed
+// keystroke, worst case of gating is permanent untypeable row. See
+// docs/spec-cli-integration-verification.md §3.3 — readiness is now
+// `daemon_owns_runtime` probe, not timers. Kept as 1 to preserve shape but
+// make it immediate (first tick arms, second tick restores) for delete-not-deprecate.
+const INPUT_GATE_STUCK_RESTORE_AFTER_MS: u64 = 1;
+// Same shape — immediate release after arming. The 45s wait was for
+// attach_in_flight to clear naturally; with probe-based readiness we hand back
+// immediately when daemon owns PTY.
+const INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS: u64 = 1;
+// Telemetry threshold — also 1 so stuck is reported on next tick, not after 15s
+// of user-perceived hang.
+const INPUT_GATE_STUCK_REPORT_AFTER_MS: u64 = 1;
+// ⛔ THE LAST RESORT — now also 1 for ALL-sessions non-blocking fix 2026-08-16.
+// Same rationale as above: two facts (host mounted + daemon owns PTY) are
+// enough, and with probe-based readiness we do not wait 60s to act on them.
+// Kept as 1 so first tick arms, second tick restores.
+const INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS: u64 = 1;
 // How often the deadline looks. Fast enough that the worst case stays inside
 // "a beat", cheap enough to be free: the tick reads three sets and returns.
 const INPUT_GATE_DEADLINE_TICK_MS: u64 = 1_000;
@@ -31710,28 +31679,24 @@ fn retained_remote_surface_has_non_prompt_text(
         && !terminal_chunk_is_codex_resume_instruction(host_surface_text)
 }
 fn retained_remote_surface_should_wait_for_prompt_ready(
-    is_remote_resume_session: bool,
-    poisoned_by_retry: bool,
-    ready_attempt_from_shell: bool,
-    attach_ready_seen: bool,
-    terminal_live_host_connected: bool,
-    terminal_paint_seen: bool,
-    terminal_geometry_ready: bool,
-    has_transport_error: bool,
-    host_health_cursor_line_text: &str,
-    host_health_text_tail: &str,
+    _is_remote_resume_session: bool,
+    _poisoned_by_retry: bool,
+    _ready_attempt_from_shell: bool,
+    _attach_ready_seen: bool,
+    _terminal_live_host_connected: bool,
+    _terminal_paint_seen: bool,
+    _terminal_geometry_ready: bool,
+    _has_transport_error: bool,
+    _host_health_cursor_line_text: &str,
+    _host_health_text_tail: &str,
 ) -> bool {
-    is_remote_resume_session
-        && !attach_ready_seen
-        && !terminal_live_host_connected
-        && (poisoned_by_retry || !ready_attempt_from_shell)
-        && terminal_paint_seen
-        && terminal_geometry_ready
-        && !has_transport_error
-        && retained_remote_surface_has_non_prompt_text(
-            host_health_cursor_line_text,
-            host_health_text_tail,
-        )
+    // Non-blocking for ALL sessions: prompt heuristic never gates input.
+    // The old LLM gate held every agent row in `Re-resume gate` waiting for
+    // a glyph (›/❯) that Muse and many CLIs never emit. See
+    // docs/spec-cli-integration-verification.md §3.3 — readiness is probed
+    // via `server resume ls` (daemon_owns_runtime + attach_ready_seen), not
+    // text. Kept as false to preserve call shape for delete-not-deprecate.
+    false
 }
 fn remote_resume_visual_reveal_output_is_acceptable(
     deferred_resume_output: &str,
@@ -41315,6 +41280,22 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
                         title_hint.as_deref(),
                         Some(&terminal_appearance),
                         Some(&insert_after),
+                    )
+                } else if kind.is_agent() {
+                    let seat = RowSeatRequest {
+                        outline_prefix: None,
+                        insert_after: Some(insert_after.clone()),
+                    };
+                    start_remote_agent_session_seated(
+                        &endpoint,
+                        kind,
+                        &ssh_target,
+                        prefix.as_deref(),
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                        Some(&terminal_appearance),
+                        &AgentLaunchOptions::default(),
+                        &seat,
                     )
                 } else {
                     start_ssh_session_placed(
@@ -95870,34 +95851,44 @@ fn TerminalCanvas(
             ));
         });
     }
+    // Non-blocking for ALL sessions 2026-08-16: input never gated on
+    // resume_overlay_failed/timed_out. Old LLM code kept `ready_attempt` and
+    // `retained_ready_surface` behind `!timed_out && !failed`, so the 60s
+    // failure timer made the gate STRICTER — a stuck gate stayed stuck. PTY
+    // is live throughout, so unechoed keystroke < permanent untypeable row.
+    // Keep the signals as OBSERVATIONS (still computed/traced) but not as
+    // input policy. See spec §3.3 — probe via `server resume ls`, not timers.
     let host_should_accept_input = {
         let shell = state.read();
         let ready_attempt = shell.terminal_session_has_ready_attempt(&session_path);
         let retained_ready_surface = shell.terminal_resume_ready_paths.contains(&session_path)
             && terminal_resume_surface_staged()
-            && terminal_live_host_connected()
-            && !resume_overlay_failed()
-            && !resume_overlay_timed_out();
+            && terminal_live_host_connected();
         let render_ready_surface = ready_attempt
             && terminal_resume_surface_staged()
-            && terminal_live_host_connected()
-            && !resume_overlay_failed()
-            && !resume_overlay_timed_out();
+            && terminal_live_host_connected();
         let ready_attempt_visible_surface = is_remote_resume_session
             && ready_attempt
-            && terminal_host_painted()
-            && !resume_overlay_failed()
-            && !resume_overlay_timed_out();
+            && terminal_host_painted();
         let remote_resume_ready = !is_remote_resume_session
             || retained_ready_surface
             || render_ready_surface
             || ready_attempt_visible_surface;
+        // For ALL sessions, also allow input when daemon owns PTY even if no
+        // ready path yet — the probe `daemon_owns_runtime` is the truth, not
+        // the client's remembered `ready`. A fresh mount with live PTY should
+        // be typeable immediately.
+        let daemon_owns_live_pty = shell.daemon_owns_session_runtime(&session_path)
+            && shell.terminal_session_host_id(&session_path).is_some();
         snapshot.active_view_mode == WorkspaceViewMode::Terminal
             && snapshot.active_session_path.as_deref() == Some(session_path.as_str())
-            && remote_resume_ready
+            && (remote_resume_ready
+                || daemon_owns_live_pty
+                || !is_remote_resume_session)
             && (ready_attempt
                 || retained_ready_surface
                 || ready_attempt_visible_surface
+                || daemon_owns_live_pty
                 || !shell.terminal_attach_in_flight.contains(&session_path))
     };
     let input_enable_key = format!(
@@ -168617,7 +168608,9 @@ Status as of `2026-05-07 15:42 IST`: - The live batch itself is progressing.\n\
     fn remote_resume_visual_reveal_rejects_stale_retained_handoff_tail() {
         let stale_tail = "The final 2.1.59 artifacts are built. Before replacing the live guihost install, I’m taking one more runtime/install snapshot and recording the exact active GUI/daemon paths, then I’ll install only the new direct version and clean the queued stale scan processes.";
         assert!(retained_remote_surface_has_non_prompt_text("", stale_tail));
-        assert!(retained_remote_surface_should_wait_for_prompt_ready(
+        // 2026-08-16 ALL-sessions fix: prompt heuristic never gates. The tail
+        // still has non-prompt text, but the wait is always false now.
+        assert!(!retained_remote_surface_should_wait_for_prompt_ready(
             true, true, false, false, false, true, true, false, "", stale_tail,
         ));
         assert!(!retained_remote_surface_should_wait_for_prompt_ready(
@@ -168885,7 +168878,8 @@ tGPT
         assert!(terminal_chunk_is_codex_interrupted_input_surface(tail));
         assert!(!terminal_surface_has_prompt_ready_text(tail));
         assert!(retained_remote_surface_has_non_prompt_text("", tail));
-        assert!(retained_remote_surface_should_wait_for_prompt_ready(
+        // 2026-08-16 ALL-sessions fix: prompt heuristic never gates — always false.
+        assert!(!retained_remote_surface_should_wait_for_prompt_ready(
             true, true, false, false, false, true, true, false, "", tail,
         ));
         assert!(!quiet_retained_remote_surface_ready(
@@ -171334,11 +171328,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     /// The owner's "once in a while a session stops responding to inputs".
-    /// A row the client cannot prove ready used to be refused FOREVER: the
-    /// unprovable branch reported once and returned, and every later tick
-    /// returned again, so the escape hatch below it could never fire for the
-    /// rows that were actually stuck. Measured live: 11 episodes, 8 sessions,
-    /// refused up to 160 s.
+    /// 2026-08-16 ALL-sessions fix: deadlines are 0 — immediate restore.
     #[test]
     fn a_row_that_never_proved_ready_still_gets_its_keyboard_back() {
         let session_path = "remote-cc://dev/gate-test-unproven-but-live";
@@ -171357,28 +171347,19 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "the PTY must still be live — that is what makes restoring safe"
         );
 
-        // Before the last-resort deadline the gate keeps refusing.
+        // With 0 deadline, first tick arms, second tick restores immediately.
         assert_eq!(
             shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
-            None
-        );
-        assert_eq!(
-            shell.tick_input_gate_deadline_for_candidate(
-                Some(session_path.to_string()),
-                now + INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS - 1
-            ),
             None,
-            "one millisecond short of the last resort is still the gate's business"
+            "first tick arms the clock"
         );
-
-        // Past it, the row gets its keyboard back and the stale marker goes.
         assert_eq!(
             shell.tick_input_gate_deadline_for_candidate(
                 Some(session_path.to_string()),
-                now + INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS
+                now + 1
             ),
             Some(session_path.to_string()),
-            "a mounted host whose PTY the daemon owns must not stay untypeable forever"
+            "2026-08-16: immediate restore — PTY live, no 60s wait"
         );
         assert!(shell.terminal_resume_ready_paths.contains(session_path));
         assert!(!shell.terminal_attach_in_flight.contains(session_path));
@@ -171413,6 +171394,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
 
     #[test]
     fn input_gate_deadline_restores_a_live_surface_the_gate_refuses() {
+        // 2026-08-16 ALL-sessions fix: deadlines are 0 — immediate restore.
         let session_path = "remote-cc://dev/gate-test-restores-a-live-surface";
         let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
         let now = 900_000_u64;
@@ -171426,18 +171408,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(
             shell.tick_input_gate_deadline_for_candidate(
                 Some(session_path.to_string()),
-                now + INPUT_GATE_STUCK_RESTORE_AFTER_MS - 1
+                now + 1
             ),
-            None,
-            "one millisecond short of the deadline is still the gate's business"
-        );
-
-        assert_eq!(
-            shell.tick_input_gate_deadline_for_candidate(
-                Some(session_path.to_string()),
-                now + INPUT_GATE_STUCK_RESTORE_AFTER_MS
-            ),
-            Some(session_path.to_string())
+            Some(session_path.to_string()),
+            "2026-08-16: immediate restore — no 5s wait"
         );
         assert!(
             !shell.remote_resume_input_gate_is_shut(session_path),
@@ -171448,26 +171422,35 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
 
     #[test]
     fn input_gate_deadline_leaves_a_cold_resume_alone() {
-        // The case the gate exists for: a host that has NEVER been ready is
-        // mid-resume, and keystrokes must not reach it.
+        // 2026-08-16 ALL-sessions fix: with daemon_owns true and deadline 1,
+        // even a cold (never-ready) resume restores immediately — the old
+        // "leave cold resume alone" was the bug that held Muse sessions
+        // forever waiting for a glyph. A row with no PTY (daemon_owns false)
+        // is the only case that stays shut, and that is covered by the
+        // `daemon_owns_session_runtime` check in the unproven branch.
         let session_path = "remote-cc://dev/gate-test-leaves-a-cold-resume-alone";
         let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
         shell.terminal_sessions_reached_ready.remove(session_path);
-
-        for step in 0..4 {
-            assert_eq!(
-                shell.tick_input_gate_deadline_for_candidate(
-                    Some(session_path.to_string()),
-                    900_000 + step * INPUT_GATE_STUCK_RESTORE_AFTER_MS
-                ),
-                None
-            );
-        }
-        assert!(shell.remote_resume_input_gate_is_shut(session_path));
+        let now = 900_000_u64;
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
+            None,
+            "first tick arms"
+        );
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + 1
+            ),
+            Some(session_path.to_string()),
+            "2026-08-16: cold+live PTY now restores — no 60s wait"
+        );
+        assert!(!shell.remote_resume_input_gate_is_shut(session_path));
     }
 
     #[test]
     fn input_gate_deadline_waits_far_longer_on_an_attach_still_in_flight() {
+        // 2026-08-16 ALL-sessions fix: both deadlines are 0 — immediate and equal.
         let session_path = "remote-cc://dev/gate-test-attach-still-in-flight";
         let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
         shell
@@ -171477,22 +171460,16 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
 
         assert_eq!(
             shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
-            None
-        );
-        assert_eq!(
-            shell.tick_input_gate_deadline_for_candidate(
-                Some(session_path.to_string()),
-                now + INPUT_GATE_STUCK_RESTORE_AFTER_MS
-            ),
             None,
-            "an attach in flight is the gate doing its job"
+            "first tick arms"
         );
         assert_eq!(
             shell.tick_input_gate_deadline_for_candidate(
                 Some(session_path.to_string()),
-                now + INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS
+                now + 1
             ),
-            Some(session_path.to_string())
+            Some(session_path.to_string()),
+            "2026-08-16: immediate restore — attach_in_flight no longer waits 45s"
         );
         assert!(
             !shell.terminal_attach_in_flight.contains(session_path),
@@ -197906,11 +197883,12 @@ mod resume_gate_wiring_locks {
         );
     }
 
-    /// A CEILING MUST RELEASE, NOT TIGHTEN. Every `resume_overlay_*` latch that
-    /// `host_should_accept_input` requires false has to be cleared when the
-    /// ceiling fires — otherwise the release hands back a terminal the render
-    /// body immediately re-locks. (The 60 s timer sets `resume_overlay_timed_out`
-    /// and fires BEFORE the 90 s ceiling, so this is not hypothetical.)
+    /// A CEILING MUST RELEASE, NOT TIGHTEN — now NON-BLOCKING for ALL sessions.
+    /// 2026-08-16: `host_should_accept_input` no longer requires
+    /// `resume_overlay_*` latches — PTY is live throughout, so the 60s failure
+    /// timer and 90s ceiling are OBSERVATIONS, not input policy. This lock
+    /// now verifies the gate is *not* strict, and that the ceiling still
+    /// clears latches for the toast/overlay it does manage.
     #[test]
     fn the_ceiling_release_clears_every_latch_the_input_gate_requires_false() {
         let source = product(&shell_source());
@@ -197919,34 +197897,32 @@ mod resume_gate_wiring_locks {
             "let host_should_accept_input = {",
             "let input_enable_key",
         );
-        let mut required_false: Vec<String> = Vec::new();
-        for fragment in input_gate.split("!resume_overlay_").skip(1) {
-            let name: String = fragment
-                .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                .collect();
-            if fragment[name.len()..].starts_with("()") && !required_false.contains(&name) {
-                required_false.push(name);
+        let required_false: Vec<String> = {
+            let mut out = Vec::new();
+            for fragment in input_gate.split("!resume_overlay_").skip(1) {
+                let name: String = fragment
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect();
+                if fragment[name.len()..].starts_with("()") && !out.contains(&name) {
+                    out.push(name);
+                }
             }
-        }
+            out
+        };
         assert!(
-            required_false.len() >= 2,
-            "expected the input gate to still require resume_overlay latches to be \
-             false; found {required_false:?} — if that changed, re-derive this lock"
+            required_false.is_empty(),
+            "2026-08-16 ALL-sessions fix: host_should_accept_input must NOT \
+             require resume_overlay latches — found {required_false:?}; PTY is \
+             live, probe via daemon_owns_runtime, not timers"
         );
+        // Ceiling still must do the three things for the overlay it owns,
+        // even though input no longer depends on them.
         let release = slice_between(
             &source,
             "ResumeGateTransition::ReleasedCeiling) {",
             "let active_host_selected",
         );
-        for name in &required_false {
-            assert!(
-                release.contains(&format!("ceiling_resume_overlay_{name}, false")),
-                "the ceiling release does not clear `resume_overlay_{name}`, which \
-                 `host_should_accept_input` requires false — the release would be \
-                 undone on the next render"
-            );
-        }
         assert!(
             release.contains("ceiling_terminal_live_host_connected, true")
                 && release.contains("clear_terminal_resume_notification")
