@@ -51820,6 +51820,14 @@ fn remote_scanned_session_label(
     short_ids: &HashMap<String, String>,
 ) -> String {
     let title = session.title_hint.trim();
+    if title.starts_with("Agent ") && title.contains(" unnamed ") {
+        if let Some(colon) = title.find(": ") {
+            let suffix = title[colon + 2..].trim();
+            if !suffix.is_empty() && !memoized_generated_fallback_title(suffix) {
+                return suffix.to_string();
+            }
+        }
+    }
     if !title.is_empty() && !memoized_generated_fallback_title(title) {
         return session.title_hint.clone();
     }
