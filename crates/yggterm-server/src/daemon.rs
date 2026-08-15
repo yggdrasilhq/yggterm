@@ -10599,14 +10599,87 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::Shutdown => {
-                // DELIBERATELY Codex-only, unlike the three ROW-close sites.
-                // Those close one row the user asked to close; this stops the
-                // whole daemon, and per the constitution a daemon going away
-                // must not destroy work that is still running. Remote Claude
-                // Code rows are daemon-owned on their own host precisely so they
-                // survive this. Do not "unify" it with
-                // `remote_agent_pty_target_for_path` without deciding that
-                // question first.
+                // DESIGN CHANGE (2026-08-16): the inner process MUST survive a daemon
+                // restart. The old `shutdown_all` killed the PTY master unconditionally,
+                // so a `server shutdown` + `ping` (the standard restart probe) yeeted
+                // the user's current shell even though the terminal surface restored.
+                // `HotRestart` already solves this via `PreservedTerminalOwnerRegistry`
+                // + `HotUpdateHandoff` (old daemon lingers as preserved owner, new
+                // daemon adopts via fd handoff). A plain `Shutdown` with live local PTYs
+                // now takes the same preserving path: write handoff, persist state, and
+                // return `HotUpdateHandoff` so `daemon_request_outcome_for_response`
+                // lingers (`should_shutdown:false, start_migration_drain:true`) instead
+                // of exiting and closing the masters.
+                let runtime_status = self.status();
+                let owned_keys = runtime_status.owned_terminal_session_keys.clone();
+                if !owned_keys.is_empty() {
+                    let remote_targets = self.server.remote_shutdown_targets();
+                    let mut remote_errors = Vec::new();
+                    let mut remote_stopped = 0usize;
+                    for (machine, session_id) in remote_targets {
+                        match terminate_remote_codex_session(&machine, &session_id) {
+                            Ok(()) => remote_stopped += 1,
+                            Err(error) => remote_errors.push(format!(
+                                "{}:{}: {}",
+                                machine.machine_key, session_id, error
+                            )),
+                        }
+                    }
+                    let owned_set = owned_keys.iter().cloned().collect::<HashSet<_>>();
+                    let state = self
+                        .server
+                        .persisted_state_for_update_restart_with_runtime_keys(&owned_set);
+                    write_persisted_state(&self.state_path, &state)?;
+                    self.mark_update_restart_state_written();
+                    let owner_endpoint = default_endpoint(self.store.home_dir());
+                    let represented_preserved_owner_keys = runtime_status
+                        .preserved_terminal_owner_keys
+                        .iter()
+                        .cloned()
+                        .collect::<HashSet<_>>();
+                    let owned_terminal_session_key_set =
+                        owned_keys.iter().cloned().collect::<HashSet<_>>();
+                    let preserved_owner_status_cache = self.preserved_owner_status_cache();
+                    let existing_entries = preserved_owner_entries_live_for_handoff(
+                        &self.preserved_terminal_owners.entries,
+                        &owned_terminal_session_key_set,
+                        &represented_preserved_owner_keys,
+                        &preserved_owner_status_cache,
+                    );
+                    let registry = PreservedTerminalOwnerRegistry::write_handoff(
+                        self.store.home_dir(),
+                        &owner_endpoint,
+                        &runtime_status,
+                        None,
+                        owned_keys.clone(),
+                        existing_entries,
+                    )?;
+                    let msg = if remote_errors.is_empty() {
+                        format!(
+                            "shutdown preserving {} live terminal runtime(s) on {} ({} remote stopped, daemon lingering as preserved owner)",
+                            registry.entries.len(),
+                            owner_endpoint_label(&owner_endpoint),
+                            remote_stopped
+                        )
+                    } else {
+                        format!(
+                            "shutdown preserving {} live terminal runtime(s) on {} ({} remote stopped, {} remote errors, daemon lingering)",
+                            registry.entries.len(),
+                            owner_endpoint_label(&owner_endpoint),
+                            remote_stopped,
+                            remote_errors.len()
+                        )
+                    };
+                    return Ok(ServerResponse::HotUpdateHandoff {
+                        message: Some(msg),
+                        owner_endpoint: owner_endpoint_label(&owner_endpoint),
+                        owner_server_version: runtime_status.server_version,
+                        owner_server_pid: runtime_status.server_pid,
+                        target_server_version: None,
+                        runtime_keys: registry.keys(),
+                    });
+                }
+                // No live local PTYs — cold shutdown as before.
                 let remote_targets = self.server.remote_shutdown_targets();
                 let mut remote_errors = Vec::new();
                 let mut remote_stopped = 0usize;
@@ -15920,7 +15993,13 @@ pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
         _ => None,
     };
     let Some(pid) = legacy_pid else {
-        return expect_ack(send_request(endpoint, &ServerRequest::Shutdown)?);
+        let response = send_request(endpoint, &ServerRequest::Shutdown)?;
+        return match response {
+            ServerResponse::Ack { message } => Ok(message),
+            ServerResponse::HotUpdateHandoff { message, .. } => Ok(message),
+            ServerResponse::Error { message } => anyhow::bail!(message),
+            other => anyhow::bail!("unexpected ack response: {:?}", other),
+        };
     };
     let message = retire_daemon(endpoint, Some("legacy_shutdown_would_type_into_prompts"))?;
     for _ in 0..20 {
