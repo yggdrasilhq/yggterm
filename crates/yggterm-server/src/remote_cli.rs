@@ -1,7 +1,7 @@
 use crate::{
     ManagedCliRefreshMode, ManagedCliTool, run_remote_ensure_managed_cli,
     run_remote_generation_context,
-    run_remote_cc_rename, run_remote_local_codex_identities, run_remote_preview,
+    run_remote_antigravity_rename, run_remote_cc_rename, run_remote_local_codex_identities, run_remote_preview,
     run_remote_preview_head,
     run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
     run_remote_resume_agent, run_remote_resume_cc, run_remote_resume_codex,
@@ -72,6 +72,12 @@ pub enum RemoteServerCommand {
     /// on this (remote) machine — the SSH-invoked half of yggterm's CC rename
     /// write-back. See memory finding-cc-title-storage-custom-title.
     CcRename {
+        session_id: String,
+        title: String,
+    },
+    /// Update an Antigravity conversation title in `conversation_summaries.db`
+    /// on this (remote) machine.
+    AntigravityRename {
         session_id: String,
         title: String,
     },
@@ -253,6 +259,12 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
             session_id: args[3].clone(),
             title: args[4].clone(),
         },
+        "agy-rename" | "antigravity-rename" if args.len() == 5 => {
+            RemoteServerCommand::AntigravityRename {
+                session_id: args[3].clone(),
+                title: args[4].clone(),
+            }
+        }
         "preview-head" if args.len() >= 4 => RemoteServerCommand::PreviewHead {
             session_id: args[3].clone(),
             blocks: args
@@ -355,6 +367,9 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::LocalCodexIdentities => run_remote_local_codex_identities(),
         RemoteServerCommand::CcRename { session_id, title } => {
             run_remote_cc_rename(&session_id, &title)
+        }
+        RemoteServerCommand::AntigravityRename { session_id, title } => {
+            run_remote_antigravity_rename(&session_id, &title)
         }
         RemoteServerCommand::PreviewHead { session_id, blocks } => {
             run_remote_preview_head(&session_id, blocks)
@@ -499,6 +514,27 @@ mod tests {
             RemoteServerCommand::CcRename {
                 session_id: "654669a2-f2d4-4d40-a19c-ad1d4ba3d833".to_string(),
                 title: "My Renamed Session".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_antigravity_rename_command() {
+        let args = vec![
+            "server".to_string(),
+            "remote".to_string(),
+            "agy-rename".to_string(),
+            "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d".to_string(),
+            "Example Refactor Task".to_string(),
+        ];
+        let command = parse_remote_server_command(&args)
+            .expect("parse command")
+            .expect("remote command");
+        assert_eq!(
+            command,
+            RemoteServerCommand::AntigravityRename {
+                session_id: "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d".to_string(),
+                title: "Example Refactor Task".to_string(),
             }
         );
     }

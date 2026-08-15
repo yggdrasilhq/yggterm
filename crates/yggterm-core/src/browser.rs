@@ -802,7 +802,7 @@ mod tests {
             "/home/user/.qwen/projects/-home-user-gh-yggterm/chats/abc.jsonl"
         ));
         assert!(!selected_path_should_expand_ancestors(
-            "/home/user/.antigravitycli/abc.json"
+            "/home/user/.gemini/antigravity-cli/conversations/abc.db"
         ));
         // A real directory still expands — the exclusion is stores, not
         // dotfiles.

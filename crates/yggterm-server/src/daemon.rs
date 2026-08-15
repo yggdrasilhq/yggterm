@@ -11219,6 +11219,57 @@ fn collect_live_cc_title_syncs(
     updates
 }
 
+/// Collect title syncs for local Antigravity sessions from `conversation_summaries.db`.
+fn collect_live_antigravity_title_syncs(
+    live_sessions: &[ManagedSessionView],
+    working_paths: &HashSet<String>,
+) -> Vec<BackgroundCopyUpdate> {
+    let mut updates = Vec::new();
+    let Ok(home) = crate::resolve_yggterm_home().or_else(|_| dirs::home_dir().context("home")) else {
+        return updates;
+    };
+    for session in live_sessions {
+        if session.kind != SessionKind::Antigravity
+            || !(session.session_path.starts_with("local://")
+                || session.session_path.starts_with("agy-runtime://"))
+        {
+            continue;
+        }
+        if !working_paths.contains(&session.session_path)
+            && !looks_like_generated_fallback_title(&session.title)
+            && session.title != session.id
+        {
+            continue;
+        }
+        let Some(title) = yggterm_core::read_antigravity_session_title(&home, &session.id)
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let title = title.trim().to_string();
+        if !title.is_empty() && title != session.title {
+            append_trace_event(
+                &home,
+                "daemon",
+                "title_trigger",
+                "antigravity_title_pickup",
+                serde_json::json!({
+                    "session_path": session.session_path,
+                    "previous_title": session.title,
+                    "new_title": title,
+                }),
+            );
+            updates.push(BackgroundCopyUpdate {
+                session_path: session.session_path.clone(),
+                title: Some(title),
+                summary: None,
+            });
+        }
+    }
+    updates
+}
+
 /// Local Claude Code rows that are MID-TURN and yet have no transcript of
 /// their own — the "stuck launch hint" `collect_live_cc_title_syncs` names in
 /// its comment and, being a title poll, correctly has nothing to do with.
@@ -11520,9 +11571,10 @@ fn build_background_copy_updates(
     generation_enabled: bool,
 ) -> Result<Vec<BackgroundCopyUpdate>> {
     let mut updates = collect_live_cc_title_syncs(live_sessions, working_paths);
-    // LLM title/summary generation is opt-in (env-gated); the CC title sync
-    // above is a cheap local-file read and always runs — CC's JSONL is the
-    // SSOT for CC titles and needs no LLM.
+    updates.extend(collect_live_antigravity_title_syncs(live_sessions, working_paths));
+    // LLM title/summary generation is opt-in (env-gated); the CC and Antigravity title syncs
+    // above are cheap local-file/db reads and always run — their own stores are the
+    // SSOT for their titles and need no LLM.
     if !generation_enabled {
         return Ok(updates);
     }

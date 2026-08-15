@@ -20351,6 +20351,28 @@ pub fn run_remote_cc_rename(session_id: &str, title: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+pub fn rename_remote_antigravity_session(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    session_id: &str,
+    title: &str,
+) -> anyhow::Result<()> {
+    run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "agy-rename", session_id, title],
+        None,
+    )?;
+    Ok(())
+}
+
+pub fn run_remote_antigravity_rename(session_id: &str, title: &str) -> anyhow::Result<()> {
+    let home = dirs::home_dir().context("home dir not found")?;
+    yggterm_core::update_antigravity_session_title(&home, session_id, title)?;
+    println!("renamed {session_id}");
+    Ok(())
+}
+
 pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
     run_remote_terminate_agent(session_id, SessionKind::Codex)
 }
