@@ -1062,6 +1062,13 @@ def report_watcher_health():
 def cmd_list(a):
     subs = load_subs()
     report_watcher_health()
+    rl = _booter().rate_limit_hold()
+    if rl:
+        if rl.get("indefinite"):
+            log(f"⏸ QUOTA HOLD INDEFINITE — it will NEVER lift by itself ({rl.get('reason','')}) — ⛔ NO WAKE OR ESCALATION DELIVERED WHILE THIS IS UP")
+        else:
+            left_m = int(((rl.get("until") or 0) - time.time()) // 60)
+            log(f"⏸ QUOTA HOLD {left_m}m left — ({rl.get('reason','')}) — ⛔ NO WAKE OR ESCALATION DELIVERED WHILE THIS IS UP")
     if not subs:
         log("no subscribers")
         return 0
@@ -1511,6 +1518,16 @@ def tick(a):
     # audit. This is the check that would have surfaced a 6.1 MB row going cold
     # while its orchestrator believed the fleet was healthy.
     fishy_audit(load_subs(), a.dry_run)
+    # ⛔ Check fleet-wide quota hold before proceeding to any wake/escalate actions
+    rl = _booter().rate_limit_hold()
+    if rl:
+        reason = rl.get("reason", "")
+        if rl.get("indefinite"):
+            log(f"⏸ QUOTA HOLD INDEFINITE ({reason}) — all wakeups and escalations SUPPRESSED this tick")
+        else:
+            left_m = int(((rl.get("until") or 0) - time.time()) // 60)
+            log(f"⏸ QUOTA HOLD ({left_m}m left, {reason}) — all wakeups and escalations SUPPRESSED this tick")
+        return 0
     # ⛔⛔ SCREEN BEFORE THE LOOP, BECAUSE THIS LOOP TYPES. `wake()` sends a
     #    message and then a lone CR, and a CR into a row somebody is using
     #    SUBMITS whatever they had half-written. The audit above has warned about
