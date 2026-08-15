@@ -11235,8 +11235,14 @@ fn collect_live_antigravity_title_syncs(
         {
             continue;
         }
+        // "Agent unnamed ..." is authored (is_agent_plane_composed_title) so
+        // looks_like_generated_fallback_title is false and idle rows stuck forever
+        // on the birth title. Treat unnamed agent-plane titles as needing sync.
+        let is_unnamed_agent_title = yggterm_core::is_agent_plane_composed_title(&session.title)
+            && session.title.contains(" unnamed ");
         if !working_paths.contains(&session.session_path)
             && !looks_like_generated_fallback_title(&session.title)
+            && !is_unnamed_agent_title
             && session.title != session.id
         {
             continue;
