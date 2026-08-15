@@ -488,6 +488,35 @@ def cmd_sync_harness(args):
         _flock_close(lock)
 
 
+def _merge_journals(local_path: Path, peer_content: str):
+    records_by_key = {}
+    if local_path.exists():
+        for line in local_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    d = json.loads(line)
+                    k = (d.get("seq", 0), d.get("ns", ""), d.get("file", ""))
+                    records_by_key[k] = d
+                except Exception:
+                    pass
+    for line in peer_content.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                d = json.loads(line)
+                k = (d.get("seq", 0), d.get("ns", ""), d.get("file", ""))
+                if k not in records_by_key:
+                    records_by_key[k] = d
+            except Exception:
+                pass
+    sorted_records = sorted(records_by_key.values(), key=lambda r: (r.get("seq", 0), r.get("ts", 0)))
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(local_path, "w", encoding="utf-8") as f:
+        for r in sorted_records:
+            f.write(json.dumps(r) + "\n")
+
+
 def cmd_sync_fleet(args):
     """Mesh synchronize ~/.yggterm/memory across reachable fleet hosts over SSH."""
     root = Path(args.root)
@@ -522,24 +551,44 @@ def cmd_sync_fleet(args):
 
         pulled = 0
         pushed = 0
+        journal_file = root / "journal.jsonl"
+
+        # Deploy ygg-memory binary & scripts to peer hosts
+        script_dir = Path(__file__).resolve().parent
+        for peer in live_peers:
+            subprocess.run(ssh_cmd + [peer, "mkdir -p ~/.yggterm/memory/namespaces ~/.yggterm/bin ~/.local/bin"], capture_output=True)
+            # Copy tool scripts
+            subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(script_dir / "ygg-memory.py"), str(script_dir / "ygg-memory"), f"{peer}:.local/bin/"], capture_output=True)
+            subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(script_dir / "ygg-memory.py"), str(script_dir / "ygg-memory"), f"{peer}:.yggterm/bin/"], capture_output=True)
+            subprocess.run(ssh_cmd + [peer, "chmod +x ~/.local/bin/ygg-memory ~/.local/bin/ygg-memory.py ~/.yggterm/bin/ygg-memory ~/.yggterm/bin/ygg-memory.py"], capture_output=True)
+
+        ns_local_dir = str(root / "namespaces") + "/"
 
         # Two-pass rsync with newest-wins per file
         for peer in live_peers:
-            # Create remote memory dir if missing
-            subprocess.run(ssh_cmd + [peer, "mkdir -p ~/.yggterm/memory/namespaces"], capture_output=True)
-            # Pass 1: Pull from peer
+            ns_peer_dir = f"{peer}:~/.yggterm/memory/namespaces/"
+            # Pass 1: Pull namespaces from peer
             r_pull = subprocess.run([
                 "rsync", "-az", "-u", "--itemize-changes", "-e", " ".join(ssh_cmd),
-                f"{peer}:.yggterm/memory/namespaces/", str(root / "namespaces/")
+                ns_peer_dir, ns_local_dir
             ], capture_output=True, text=True)
             pulled += len([ln for ln in r_pull.stdout.splitlines() if ln.startswith(">") or ln.startswith("<")])
 
-            # Pass 2: Push union back out
+            # Merge journals
+            r_jread = subprocess.run(ssh_cmd + [peer, "cat ~/.yggterm/memory/journal.jsonl 2>/dev/null || true"], capture_output=True, text=True)
+            if r_jread.stdout:
+                _merge_journals(journal_file, r_jread.stdout)
+
+            # Pass 2: Push unified namespaces back out
             r_push = subprocess.run([
                 "rsync", "-az", "-u", "--itemize-changes", "-e", " ".join(ssh_cmd),
-                str(root / "namespaces/"), f"{peer}:.yggterm/memory/namespaces/"
+                ns_local_dir, ns_peer_dir
             ], capture_output=True, text=True)
             pushed += len([ln for ln in r_push.stdout.splitlines() if ln.startswith(">") or ln.startswith("<")])
+
+            # Push merged journal back out
+            if journal_file.exists():
+                subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(journal_file), f"{peer}:.yggterm/memory/journal.jsonl"], capture_output=True)
 
         print(f"Fleet memory sync complete across {len(live_peers)} peers ({', '.join(live_peers)}): {pulled} pulled, {pushed} pushed.")
     finally:
