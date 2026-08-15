@@ -8149,7 +8149,19 @@ impl YggtermServer {
             .find(|machine| machine.machine_key == machine_key)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))?;
-        let session_path = remote_scanned_session_path(&machine_key, session_id);
+        let scanned_for_path = machine
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)
+            .cloned();
+        let session_path = scanned_for_path
+            .as_ref()
+            .map(|s| s.session_path.clone())
+            .unwrap_or_else(|| remote_scanned_session_path(&machine_key, session_id));
+        let derived_kind = scanned_for_path
+            .as_ref()
+            .and_then(|s| parse_remote_agent_session_path_with_kind(&s.session_path).map(|(_, _, k)| k))
+            .unwrap_or(SessionKind::Codex);
         let target = SshConnectTarget {
             label: machine.label.clone(),
             kind: SessionKind::SshShell,
@@ -8307,7 +8319,7 @@ impl YggtermServer {
         self.insert_live_session_with_launch(
             &session_path,
             session_id,
-            SessionKind::Codex,
+            derived_kind,
             &target,
             Some(resolved_title.clone()),
             launch_terminal,
@@ -28366,16 +28378,19 @@ fn synthesize_remote_scanned_session_view(
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
+    let derived_kind = parse_remote_agent_session_path_with_kind(&scanned.session_path)
+        .map(|(_, _, kind)| kind)
+        .unwrap_or(SessionKind::Codex);
     let target = SshConnectTarget {
         label: machine.label.clone(),
-        kind: SessionKind::Codex,
+        kind: derived_kind,
         ssh_target: machine.ssh_target.clone(),
         prefix: machine.prefix.clone(),
         cwd: Some(scanned.cwd.clone()),
     };
     let mut session = build_live_session(
         &scanned.session_id,
-        SessionKind::Codex,
+        derived_kind,
         &target,
         backend,
         theme,
@@ -28418,13 +28433,16 @@ fn synthesize_remote_scanned_preview_session_view(
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
+    let derived_kind = parse_remote_agent_session_path_with_kind(&scanned.session_path)
+        .map(|(_, _, kind)| kind)
+        .unwrap_or(SessionKind::Codex);
     let resolved_title = if scanned.title_hint.trim().is_empty() {
         short_session_id(&scanned.session_id)
     } else {
         scanned.title_hint.clone()
     };
     let mut session = build_session(
-        SessionKind::Codex,
+        derived_kind,
         &scanned.session_path,
         Some(&scanned.session_id),
         Some(&scanned.cwd),

@@ -41615,10 +41615,11 @@ fn session_kind_action_label(kind: SessionKind) -> &'static str {
     }
 }
 fn is_live_sidebar_row(row: &BrowserRow) -> bool {
-    row.full_path.starts_with("ssh://")
-        || row.full_path.starts_with("local://")
-        || row.full_path.starts_with("codex://")
-        || row.full_path.starts_with("codex-litellm://")
+    // Registry-derived: every live row scheme plus the generic live hosts.
+    // Was a hand-list of 4 prefixes (ssh/local/codex/codex-litellm), so a
+    // remote-pi/opencode/qwen/... row never took the fast `focus_live` path
+    // and fell through to `open_remote_session` which hard-coded Codex → gate.
+    is_hot_terminal_sidebar_path(&row.full_path)
 }
 
 fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
@@ -105482,7 +105483,7 @@ fn remote_preview_should_update_from_terminal_output(
     frame_budgeted_terminal_output: bool,
 ) -> bool {
     saw_meaningful_output
-        && session_path.starts_with("remote-session://")
+        && session_path_is_remote_agent_row(session_path)
         && !frame_budgeted_terminal_output
 }
 
