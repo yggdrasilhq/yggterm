@@ -3503,9 +3503,24 @@ fn login_shell_path_dirs() -> Vec<PathBuf> {
 /// Resolve a binary the way the launched session will: daemon `PATH` first (cheap,
 /// already in-process), then the cached login-shell `PATH`. Existence check only —
 /// no `--version` subprocess.
+///
+/// Managed npm bin dir (`~/.yggterm/npm/bin` where `grok` lives) is checked
+/// first so a CLI present via yggterm's own `npm install` is found even when
+/// no login-shell `PATH` carries it — otherwise `grok` was reported absent and
+/// required a `~/.local/bin/grok` symlink that then broke `grok update`'s
+/// `npm i -g` (EEXIST).
 fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
-    launch_search_dirs()
-        .into_iter()
+    let managed_dir = ManagedCliPaths::resolve()
+        .ok()
+        .map(|paths| paths.bin_dir);
+    let mut dirs = Vec::new();
+    if let Some(dir) = managed_dir {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs.extend(launch_search_dirs());
+    dirs.into_iter()
         .map(|base| base.join(binary_name))
         .find(|candidate| candidate.is_file())
 }
