@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
-# Wrapper to execute ygg-memory.py with the system python3
-exec python3 "$(dirname "$0")/ygg-memory.py" "$@"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec python3 "$SCRIPT_DIR/ygg-memory.py" "$@"
