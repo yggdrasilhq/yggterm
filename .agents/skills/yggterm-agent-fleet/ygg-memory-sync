@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# ygg-memory-sync — fast session-start sync (blocking current ns, background fleet)
+# Called from hooks: does blocking local<->unified for current/critical ns,
+# then triggers background full sync via systemd-run or fallback setsid.
+set -uo pipefail
+
+# Determine harness and namespace
+HARNESS="${1:-}"
+NS="${2:-}"
+
+if [ -z "$HARNESS" ]; then
+  # Auto-detect harness from env
+  if [ -n "${CLAUDE_SESSION_ID:-}" ] || [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then HARNESS=claude
+  elif [ -n "${MUSE_SESSION:-}" ]; then HARNESS=muse
+  elif [ -n "${GEMINI_CLI:-}" ] || [ -n "${ANTIGRAVITY_SESSION:-}" ]; then HARNESS=gemini
+  elif [ -n "${CODEX_SESSION:-}" ] || [ -n "${CODEX_HOME:-}" ]; then HARNESS=codex
+  else HARNESS=claude
+  fi
+fi
+
+# Auto-detect namespace from cwd if not provided
+if [ -z "$NS" ]; then
+  NS=$(pwd | sed 's|/|-|g')
+  # Handle empty case
+  [ -z "$NS" ] && NS="-home-pi"
+fi
+
+YGG_MEM="${HOME}/.local/bin/ygg-memory"
+[ -x "$YGG_MEM" ] || YGG_MEM="ygg-memory"
+if ! command -v "$YGG_MEM" >/dev/null 2>&1 && [ ! -x "$YGG_MEM" ]; then
+  YGG_MEM="$(dirname "$0")/ygg-memory.py"
+fi
+
+# Blocking: sync current namespace + yggterm (fast, <500ms)
+# These are the "at least these regions" you asked for
+CRITICAL_NS=("-home-pi-gh-yggterm" "$NS")
+seen=" "
+for cns in "${CRITICAL_NS[@]}"; do
+  case "$seen" in *" $cns "*) continue;; esac
+  seen="$seen$cns "
+  "$YGG_MEM" sync-harness --harness "$HARNESS" --ns="$cns" >/dev/null 2>&1 || true
+done
+
+# Background: full sync for all namespaces + fleet mesh
+# Use systemd-run if available (kernel-optimized, coalesced), fallback to setsid
+TRIGGER_CMD="\"$YGG_MEM\" sync-harness --harness \"$HARNESS\" --all >/dev/null 2>&1; \"$YGG_MEM\" sync-fleet --mesh \"*** dev oc\" >/dev/null 2>&1"
+
+if command -v systemd-run >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1; then
+  systemd-run --user --on-active=2 --unit="ygg-memory-sync-${HARNESS}-$$" --quiet \
+    bash -c "$TRIGGER_CMD" 2>/dev/null || {
+    # Fallback if systemd-run fails
+    setsid bash -c "sleep 2; $TRIGGER_CMD" </dev/null >>/tmp/ygg-memory-sync.log 2>&1 &
+  }
+else
+  setsid bash -c "sleep 2; $TRIGGER_CMD" </dev/null >>/tmp/ygg-memory-sync.log 2>&1 &
+fi
+
+exit 0

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# One-time wiring for an agent memory system. Idempotent: it creates what is
-# missing and touches nothing that exists, so re-running it can never overwrite
-# a memory someone wrote.
+# One-time wiring for an agent memory system + fleet timers. Idempotent: it creates
+# what is missing and touches nothing that exists, so re-running it can never
+# overwrite a memory someone wrote or clobber a tuned timer.
 #
 # The point is that this costs ZERO agent turns. Wiring a memory directory by
 # hand, every time a new machine or a new user starts, is turns spent on
@@ -10,6 +10,7 @@
 #   ./bootstrap.sh                 # default location, derived from the cwd
 #   ./bootstrap.sh --dir <path>    # somewhere else
 #   ./bootstrap.sh --campaign <slug>
+#   ./bootstrap.sh --with-timers   # also install ygg-memory/tick timers (Linux systemd --user)
 set -euo pipefail
 
 DIR=""
@@ -105,4 +106,49 @@ if [ "$created" -eq 0 ]; then
   echo "memory already wired at $DIR — nothing to do"
 else
   echo "bootstrapped $created file(s) under $DIR"
+fi
+
+# --- Fleet timers (opt-in via --with-timers, or auto on first bootstrap) ---
+WITH_TIMERS=false
+for arg in "$@"; do
+  case "$arg" in --with-timers) WITH_TIMERS=true ;; esac
+done
+# Also auto-install timers on first-ever bootstrap in this repo (created>0)
+# so a new user gets fleet sync without asking. Re-runs are no-ops.
+if [ "$WITH_TIMERS" = true ] || [ "$created" -gt 0 ]; then
+  if command -v systemctl >/dev/null 2>&1 && [ -d "$HOME/.config/systemd/user" ] || mkdir -p "$HOME/.config/systemd/user" 2>/dev/null; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # Install ygg-memory fleet/harness + booter/monitor timers if not already enabled
+    for pair in "ygg-memory-fleet" "ygg-memory-harness" "ygg-booter-tick" "ygg-monitor-tick"; do
+      if [ -f "$SCRIPT_DIR/../yggterm-agent-fleet/ygg-memory.py" ] || [ -f "$HOME/.local/bin/ygg-memory" ]; then
+        # Timers are created by the skill's timer definitions; ensure they exist and are enabled
+        if [ -f "$HOME/.config/systemd/user/${pair}.timer" ]; then
+          systemctl --user daemon-reload >/dev/null 2>&1 || true
+          systemctl --user enable --now "${pair}.timer" >/dev/null 2>&1 || true
+          note "enabled ${pair}.timer (kernel-coalesced, idle-nice)"
+        fi
+      fi
+    done
+  fi
+  # Ensure ygg-memory and ygg-memory-sync are on PATH for hooks
+  if [ -f "$SCRIPT_DIR/ygg-memory" ] && [ ! -x "$HOME/.local/bin/ygg-memory" ]; then
+    mkdir -p "$HOME/.local/bin"
+    cp "$SCRIPT_DIR/ygg-memory" "$HOME/.local/bin/ygg-memory" 2>/dev/null || true
+    cp "$SCRIPT_DIR/ygg-memory.py" "$HOME/.local/bin/ygg-memory.py" 2>/dev/null || true
+    cp "$SCRIPT_DIR/ygg-memory-sync" "$HOME/.local/bin/ygg-memory-sync" 2>/dev/null || true
+    chmod +x "$HOME/.local/bin/ygg-memory"* 2>/dev/null || true
+    note "installed ygg-memory to ~/.local/bin"
+  fi
+  # Backfill Muse/Gemini/Codex from unified if they are empty (new user with only Claude)
+  if command -v ygg-memory >/dev/null 2>&1 || [ -x "$HOME/.local/bin/ygg-memory" ]; then
+    YM="$HOME/.local/bin/ygg-memory"; [ -x "$YM" ] || YM="ygg-memory"
+    for h in muse gemini codex grok; do
+      # Count local projects for this harness
+      cnt=$(find "$HOME/.${h}/projects" -maxdepth 2 -name "memory" -type d 2>/dev/null | wc -l)
+      if [ "$cnt" -le 1 ]; then
+        $YM sync-harness --harness "$h" --all >/dev/null 2>&1 || true
+        note "backfilled $h from unified fleet memory ($cnt -> all)"
+      fi
+    done
+  fi
 fi
