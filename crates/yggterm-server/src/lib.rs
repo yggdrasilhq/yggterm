@@ -2729,8 +2729,7 @@ fn remote_scanned_session_from_live_codex(
         assistant_message_count: 0,
         title_hint,
         recent_context: String::new(),
-        cached_precis: summary_metadata_value(&session.preview.summary, "Precis")
-            .or_else(|| session_metadata_value(session, "Precis")),
+        cached_precis: None,
         cached_summary: summary_metadata_value(&session.preview.summary, "Summary")
             .or_else(|| session_metadata_value(session, "Summary")),
         live_runtime,
@@ -5032,9 +5031,6 @@ impl YggtermServer {
             {
                 existing.title_hint = scanned.title_hint;
             }
-            if scanned.cached_precis.is_some() {
-                existing.cached_precis = scanned.cached_precis;
-            }
             if scanned.cached_summary.is_some() {
                 existing.cached_summary = scanned.cached_summary;
             }
@@ -5384,20 +5380,7 @@ impl YggtermServer {
         applied
     }
 
-    pub fn set_session_precis_hint(&mut self, session_path: &str, precis: &str) {
-        if let Some(session) = self.sessions.get_mut(session_path) {
-            upsert_session_metadata(&mut session.preview.summary, "Precis", precis.to_string());
-            upsert_session_metadata(&mut session.metadata, "Precis", precis.to_string());
-        }
-        for machine in &mut self.remote_machines {
-            for scanned in &mut machine.sessions {
-                if scanned.session_path == session_path {
-                    scanned.cached_precis = Some(precis.to_string());
-                    return;
-                }
-            }
-        }
-    }
+    pub fn set_session_precis_hint(&mut self, _session_path: &str, _precis: &str) {}
 
     pub fn set_session_summary_hint(&mut self, session_path: &str, summary: &str) {
         self.apply_session_summary_hint(session_path, Some(summary));
@@ -9980,7 +9963,7 @@ impl YggtermServer {
             );
         }
         let remote_stored_session =
-            parse_remote_scanned_session_path(&path).and_then(|(machine_key, session_id)| {
+            parse_remote_agent_session_path(&path).and_then(|(machine_key, session_id)| {
                 self.sessions.get(&path).and_then(|session| {
                     (session.source == SessionSource::Stored).then(|| {
                         (
@@ -10910,9 +10893,6 @@ impl YggtermServer {
         if !scanned.title_hint.trim().is_empty() {
             self.set_session_title_hint_passive(&path, &scanned.title_hint);
         }
-        if let Some(precis) = scanned.cached_precis.as_deref() {
-            self.set_session_precis_hint(&path, precis);
-        }
         if let Some(summary) = scanned.cached_summary.as_deref() {
             self.set_session_summary_hint(&path, summary);
         }
@@ -11373,6 +11353,12 @@ fn remote_scanned_row_path(
 
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("remote-session://")?;
+    let (machine_key, session_id) = rest.split_once('/')?;
+    Some((machine_key, session_id))
+}
+
+fn parse_remote_muse_session_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("remote-muse://")?;
     let (machine_key, session_id) = rest.split_once('/')?;
     Some((machine_key, session_id))
 }
@@ -11965,7 +11951,7 @@ fn remote_resume_seed_fallback_text(session: &ManagedSessionView) -> Option<Stri
         }
     }
 
-    for label in ["Summary", "Precis"] {
+    for label in ["Summary"] {
         if let Some(text) = session
             .preview
             .summary
@@ -12039,7 +12025,7 @@ fn local_resume_match_fragments(session: &ManagedSessionView) -> Vec<String> {
         }
     }
 
-    for label in ["Summary", "Precis"] {
+    for label in ["Summary"] {
         if let Some(text) = session
             .preview
             .summary
@@ -13558,8 +13544,6 @@ struct RemoteSummaryLine {
     #[serde(default)]
     title_hint: Option<String>,
     #[serde(default)]
-    cached_precis: Option<String>,
-    #[serde(default)]
     cached_summary: Option<String>,
     #[serde(default)]
     live_runtime: bool,
@@ -13569,8 +13553,6 @@ struct RemoteSummaryLine {
 pub struct RemotePreviewPayload {
     #[serde(default)]
     title_hint: Option<String>,
-    #[serde(default)]
-    cached_precis: Option<String>,
     #[serde(default)]
     cached_summary: Option<String>,
     preview: SnapshotPreview,
@@ -14075,9 +14057,6 @@ fn apply_remote_scanned_session_preview(
     if let Some(goal) = primary_goals.first() {
         upsert_session_metadata(&mut session.preview.summary, "Goal", goal.clone());
     }
-    if let Some(precis) = &scanned.cached_precis {
-        upsert_session_metadata(&mut session.preview.summary, "Precis", precis.clone());
-    }
     if let Some(summary) = &scanned.cached_summary {
         upsert_session_metadata(&mut session.preview.summary, "Summary", summary.clone());
     }
@@ -14338,7 +14317,6 @@ fn apply_remote_preview_payload_for_path_with_hydration(
 ) -> bool {
     let mut applied = false;
     let refreshed_title = payload.title_hint.clone();
-    let refreshed_precis = payload.cached_precis.clone();
     let refreshed_summary = payload.cached_summary.clone();
     if let Some(session) = server.sessions.get_mut(session_path) {
         apply_remote_preview_payload(session, payload);
@@ -14359,9 +14337,6 @@ fn apply_remote_preview_payload_for_path_with_hydration(
     if applied {
         if let Some(title) = refreshed_title.as_deref() {
             server.set_session_title_hint_passive(session_path, title);
-        }
-        if let Some(precis) = refreshed_precis.as_deref() {
-            server.set_session_precis_hint(session_path, precis);
         }
         // Same store-scan answer as the sibling above: carry the absence.
         server.apply_session_summary_hint(session_path, refreshed_summary.as_deref());
@@ -14498,9 +14473,6 @@ fn build_remote_preview_payload_from_messages(
     }
     Ok(RemotePreviewPayload {
         title_hint,
-        cached_precis: title_store
-            .get_precis(session_id)?
-            .filter(|value| !value.trim().is_empty()),
         cached_summary: title_store
             .get_summary(session_id)?
             .filter(|value| !value.trim().is_empty()),
@@ -14616,7 +14588,6 @@ pub fn apply_remote_preview_payload_for_path(
 ) -> bool {
     let mut applied = false;
     let refreshed_title = payload.title_hint.clone();
-    let refreshed_precis = payload.cached_precis.clone();
     let refreshed_summary = payload.cached_summary.clone();
     if let Some(session) = server.sessions.get_mut(session_path) {
         apply_remote_preview_payload(session, payload);
@@ -14625,9 +14596,6 @@ pub fn apply_remote_preview_payload_for_path(
     if applied {
         if let Some(title) = refreshed_title.as_deref() {
             server.set_session_title_hint_passive(session_path, title);
-        }
-        if let Some(precis) = refreshed_precis.as_deref() {
-            server.set_session_precis_hint(session_path, precis);
         }
         // The payload's summary comes straight from the owning host's title
         // store, so `None` is an ANSWER — "there is none" — not a gap. Passing
@@ -14738,7 +14706,6 @@ fn remote_summary_for_path(
         assistant_message_count,
         recent_context: summarize_recent_context(&recent_messages),
         title_hint: title_store.get_title(&session_id)?,
-        cached_precis: title_store.get_precis(&session_id)?,
         cached_summary: title_store.get_summary(&session_id)?,
         live_runtime: false,
     }))
@@ -14768,9 +14735,6 @@ fn remote_preview_payload_for_path(
     );
     Ok(Some(RemotePreviewPayload {
         title_hint,
-        cached_precis: title_store
-            .get_precis(&session_id)?
-            .filter(|value| !value.trim().is_empty()),
         cached_summary: title_store
             .get_summary(&session_id)?
             .filter(|value| !value.trim().is_empty()),
@@ -14870,18 +14834,15 @@ from pathlib import Path
 
 def load_generated_copy():
     titles = {}
-    precis = {}
     summaries = {}
     db_path = Path(os.path.expanduser("~/.yggterm/session-titles.db"))
     if not db_path.exists():
-        return titles, precis, summaries
+        return titles, summaries
     conn = None
     try:
         conn = sqlite3.connect(str(db_path))
         for session_id, title in conn.execute("SELECT session_id, title FROM session_titles"):
             titles[session_id] = title
-        for session_id, value in conn.execute("SELECT session_id, precis FROM session_precis"):
-            precis[session_id] = value
         for session_id, value in conn.execute("SELECT session_id, summary FROM session_summaries"):
             summaries[session_id] = value
     except Exception:
@@ -14889,9 +14850,9 @@ def load_generated_copy():
     finally:
         if conn is not None:
             conn.close()
-    return titles, precis, summaries
+    return titles, summaries
 
-GENERATED_TITLES, GENERATED_PRECIS, GENERATED_SUMMARIES = load_generated_copy()
+GENERATED_TITLES, GENERATED_SUMMARIES = load_generated_copy()
 
 def summarize(path):
     session_id = "unknown"
@@ -15033,7 +14994,7 @@ def summarize(path):
         "assistant_message_count": assistant_count,
         "recent_context": "\n".join(snippets[-6:]),
         "title_hint": GENERATED_TITLES.get(session_id),
-        "cached_precis": GENERATED_PRECIS.get(session_id),
+
         "cached_summary": GENERATED_SUMMARIES.get(session_id),
     }
 
@@ -15089,14 +15050,6 @@ conn.executescript(
     CREATE TABLE IF NOT EXISTS session_titles (
         session_id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
-        cwd TEXT,
-        source TEXT,
-        model TEXT,
-        updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS session_precis (
-        session_id TEXT PRIMARY KEY,
-        precis TEXT NOT NULL,
         cwd TEXT,
         source TEXT,
         model TEXT,
@@ -15229,20 +15182,6 @@ if title:
             (session_id, title, cwd, source, model, updated_at),
         )
 
-precis = payload.get("precis")
-if precis:
-    conn.execute(
-        """INSERT INTO session_precis (session_id, precis, cwd, source, model, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(session_id) DO UPDATE SET
-             precis = excluded.precis,
-             cwd = excluded.cwd,
-             source = excluded.source,
-             model = excluded.model,
-             updated_at = excluded.updated_at""",
-        (session_id, precis, cwd, source, model, updated_at),
-    )
-
 summary = payload.get("summary")
 if summary:
     if payload.get("reset_summary_history"):
@@ -15285,7 +15224,6 @@ struct RemoteGeneratedCopyPayload {
     session_id: String,
     cwd: String,
     title: Option<String>,
-    precis: Option<String>,
     summary: Option<String>,
     model: String,
     source: String,
@@ -15397,8 +15335,7 @@ fn mirror_remote_machine_sessions(
                 session.user_message_count as i64,
                 session.assistant_message_count as i64,
                 session.title_hint,
-                session.recent_context,
-                session.cached_precis,
+                session.recent_context,                session.cached_precis,
                 session.cached_summary,
                 session.storage_path,
                 synced_at,
@@ -15496,15 +15433,7 @@ fn overlay_mirrored_remote_sessions(
                         && !mirrored.recent_context.trim().is_empty()
                     {
                         session.recent_context = mirrored.recent_context.clone();
-                    }
-                    if mirrored
-                        .cached_precis
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty())
-                    {
-                        session.cached_precis = mirrored.cached_precis.clone();
-                    }
-                    // Summary precedence, for the same reason as the title rule
+                    }            // Summary precedence, for the same reason as the title rule
                     // above and caught the same way. The summary a scan carries
                     // was read from the owning host's title store — the ONE
                     // owner of that question — so the SCAN is the SSOT,
@@ -15559,15 +15488,7 @@ fn dedupe_remote_scanned_sessions(
                     && !looks_like_generated_fallback_title(&other.title_hint)
                 {
                     merged.title_hint = other.title_hint;
-                }
-                if merged
-                    .cached_precis
-                    .as_ref()
-                    .is_none_or(|value| value.trim().is_empty())
-                {
-                    merged.cached_precis = other.cached_precis;
-                }
-                if merged
+                }                if merged
                     .cached_summary
                     .as_ref()
                     .is_none_or(|value| value.trim().is_empty())
@@ -15601,7 +15522,6 @@ fn update_remote_generated_copy_in_mirror(
     machine_key: &str,
     session_id: &str,
     title: Option<&str>,
-    precis: Option<&str>,
     summary: Option<&str>,
 ) -> anyhow::Result<()> {
     let conn = open_remote_metadata_mirror_store()?;
@@ -15612,16 +15532,7 @@ fn update_remote_generated_copy_in_mirror(
              WHERE machine_key = ?1 AND session_id = ?2",
             params![machine_key, session_id, title],
         )?;
-    }
-    if let Some(precis) = precis {
-        conn.execute(
-            "UPDATE remote_session_metadata
-             SET cached_precis = ?3
-             WHERE machine_key = ?1 AND session_id = ?2",
-            params![machine_key, session_id, precis],
-        )?;
-    }
-    if let Some(summary) = summary {
+    }    if let Some(summary) = summary {
         conn.execute(
             "UPDATE remote_session_metadata
              SET cached_summary = ?3
@@ -17396,9 +17307,7 @@ fn scan_remote_machine_sessions(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| short_session_id(&summary.id)),
             recent_context: sanitized_recent_context,
-            cached_precis: summary
-                .cached_precis
-                .filter(|value| !value.trim().is_empty()),
+            cached_precis: None,
             cached_summary: summary
                 .cached_summary
                 .filter(|value| !value.trim().is_empty()),
@@ -17467,8 +17376,8 @@ fn scan_remote_machine_sessions(
                             user_message_count: 0,
                             assistant_message_count: 0,
                             recent_context: summary.context,
-                            cached_precis: None,
-                            cached_summary: None,
+        cached_precis: None,
+        cached_summary: None,
                             live_runtime: false,
                             title_is_explicit: false,
                             storage_path: summary.path,
@@ -17558,8 +17467,8 @@ fn scan_remote_machine_sessions(
                             user_message_count: 0,
                             assistant_message_count: 0,
                             recent_context: summary.context,
-                            cached_precis: None,
-                            cached_summary: None,
+        cached_precis: None,
+        cached_summary: None,
                             live_runtime: false,
                             title_is_explicit: false,
                             storage_path: summary.path,
@@ -27090,14 +26999,6 @@ pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()
             model TEXT,
             updated_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS session_precis (
-            session_id TEXT PRIMARY KEY,
-            precis TEXT NOT NULL,
-            cwd TEXT,
-            source TEXT,
-            model TEXT,
-            updated_at TEXT NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS session_summaries (
             session_id TEXT PRIMARY KEY,
             summary TEXT NOT NULL,
@@ -27158,30 +27059,6 @@ pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()
                 ],
             )?;
         }
-    }
-    if let Some(precis) = payload
-        .precis
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        conn.execute(
-            "INSERT INTO session_precis (session_id, precis, cwd, source, model, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(session_id) DO UPDATE SET
-               precis = excluded.precis,
-               cwd = excluded.cwd,
-               source = excluded.source,
-               model = excluded.model,
-               updated_at = excluded.updated_at",
-            params![
-                payload.session_id,
-                precis,
-                payload.cwd,
-                payload.source,
-                payload.model,
-                payload.updated_at,
-            ],
-        )?;
     }
     if let Some(summary) = payload
         .summary
@@ -27247,12 +27124,11 @@ pub fn persist_remote_generated_copy(
     session_id: &str,
     cwd: &str,
     title: Option<&str>,
-    precis: Option<&str>,
     summary: Option<&str>,
     model: &str,
 ) -> anyhow::Result<()> {
     persist_remote_generated_copy_with_options(
-        machine, session_id, cwd, title, precis, summary, model, false,
+        machine, session_id, cwd, title, summary, model, false,
     )
 }
 
@@ -27261,7 +27137,6 @@ pub fn persist_remote_generated_copy_with_options(
     session_id: &str,
     cwd: &str,
     title: Option<&str>,
-    precis: Option<&str>,
     summary: Option<&str>,
     model: &str,
     reset_summary_history: bool,
@@ -27272,7 +27147,6 @@ pub fn persist_remote_generated_copy_with_options(
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         title: title.map(ToOwned::to_owned),
-        precis: precis.map(ToOwned::to_owned),
         summary: summary.map(ToOwned::to_owned),
         model: model.to_string(),
         source: "interface-llm".to_string(),
@@ -27302,7 +27176,6 @@ pub fn persist_remote_generated_copy_with_options(
         &machine.machine_key,
         session_id,
         title,
-        precis,
         summary,
     ) {
         warn!(machine_key=%machine.machine_key, session_id, error=%error, "failed to update local remote metadata mirror");
@@ -32158,8 +32031,8 @@ mod tests {
                 assistant_message_count: 4,
                 title_hint: "Remote Test".to_string(),
                 recent_context: "USER: test".to_string(),
-                cached_precis: Some("precis".to_string()),
-                cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                 live_runtime,
                 title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/test.jsonl".to_string(),
@@ -32848,8 +32721,8 @@ mod tests {
                 assistant_message_count: 2,
                 title_hint: "Widget Cache Investigation".to_string(),
                 recent_context: "USER: trace the stale cache key".to_string(),
-                cached_precis: None,
-                cached_summary: Some("a summary the store has since dropped".to_string()),
+        cached_precis: None,
+        cached_summary: Some("a summary the store has since dropped".to_string()),
                 live_runtime: false,
                 title_is_explicit: false,
                 storage_path: String::new(),
@@ -35729,7 +35602,6 @@ mod tests {
     fn remote_preview_payload_terminal_prefill_is_disabled_for_live_terminal() {
         let payload = RemotePreviewPayload {
             title_hint: None,
-            cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
                 older_available: false,
@@ -36535,7 +36407,7 @@ terminal_window_id: None,
             assistant_message_count: 5,
             title_hint: "Deploy Fix".to_string(),
             recent_context: "USER: test\nASSISTANT: reply".to_string(),
-            cached_precis: Some("Short precis".to_string()),
+            cached_precis: None,
             cached_summary: Some("Longer summary text".to_string()),
             live_runtime: false,
             title_is_explicit: false,
@@ -37009,8 +36881,8 @@ terminal_window_id: None,
                 assistant_message_count: 4,
                 title_hint: "Passthrough Gpus Dev Set Intel".to_string(),
                 recent_context: "USER: preview".to_string(),
-                cached_precis: Some("precis".to_string()),
-                cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                 live_runtime: false,
                 title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/preview.jsonl".to_string(),
@@ -37062,8 +36934,8 @@ terminal_window_id: None,
                 assistant_message_count: 4,
                 title_hint: "Cached Remote Title".to_string(),
                 recent_context: "cached scan context".to_string(),
-                cached_precis: Some("cached precis".to_string()),
-                cached_summary: Some("cached summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("cached summary".to_string()),
                 live_runtime: true,
                 title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/preview.jsonl".to_string(),
@@ -37458,8 +37330,8 @@ terminal_window_id: None,
                 title_hint: "Passthrough Gpus Dev Set Intel".to_string(),
                 recent_context: "USER: stale summary-like first turn\nASSISTANT: stale reply"
                     .to_string(),
-                cached_precis: Some("Short precis".to_string()),
-                cached_summary: Some("Longer summary text".to_string()),
+            cached_precis: None,
+            cached_summary: Some("Longer summary text".to_string()),
                 live_runtime: false,
                 title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/test.jsonl".to_string(),
@@ -37731,7 +37603,6 @@ terminal_window_id: None,
 
         let payload = RemotePreviewPayload {
             title_hint: Some("Test Session".to_string()),
-            cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
                 older_available: false,
@@ -37819,7 +37690,6 @@ terminal_window_id: None,
             session,
             RemotePreviewPayload {
                 title_hint: Some("Remote Generated Title".to_string()),
-                cached_precis: None,
                 cached_summary: None,
                 preview: SnapshotPreview {
                     older_available: false,
@@ -37855,7 +37725,6 @@ terminal_window_id: None,
             path,
             RemotePreviewPayload {
                 title_hint: Some("Generated Hydration Title".to_string()),
-                cached_precis: None,
                 cached_summary: None,
                 preview: SnapshotPreview {
                     older_available: false,
@@ -38259,8 +38128,8 @@ terminal_window_id: None,
                 assistant_message_count: 5,
                 title_hint: "Continue widgets campaign".to_string(),
                 recent_context: String::new(),
-                cached_precis: None,
-                cached_summary: None,
+        cached_precis: None,
+        cached_summary: None,
                 live_runtime: false,
                 title_is_explicit: false,
                 storage_path: "/home/user/.claude/projects/x/abc.jsonl".to_string(),
@@ -38587,7 +38456,6 @@ terminal_window_id: None,
 
         let payload = RemotePreviewPayload {
             title_hint: Some("Test Scaffold".to_string()),
-            cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
                 older_available: false,
@@ -38655,7 +38523,6 @@ terminal_window_id: None,
 
         let payload = RemotePreviewPayload {
             title_hint: Some("Test Rendered Sections".to_string()),
-            cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
                 older_available: false,
@@ -39129,8 +38996,8 @@ terminal_window_id: None,
                 assistant_message_count: 2,
                 title_hint: "Qabc123".to_string(),
                 recent_context: "short".to_string(),
-                cached_precis: None,
-                cached_summary: None,
+        cached_precis: None,
+        cached_summary: None,
                 live_runtime: false,
                 title_is_explicit: false,
                 storage_path: "/one.jsonl".to_string(),
@@ -39146,8 +39013,8 @@ terminal_window_id: None,
                 assistant_message_count: 4,
                 title_hint: "Container Mount Fix".to_string(),
                 recent_context: "much longer context payload".to_string(),
-                cached_precis: Some("precis".to_string()),
-                cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                 live_runtime: false,
                 title_is_explicit: false,
                 storage_path: "/two.jsonl".to_string(),
@@ -39158,7 +39025,6 @@ terminal_window_id: None,
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].session_id, "abc123");
         assert_eq!(deduped[0].title_hint, "Container Mount Fix");
-        assert_eq!(deduped[0].cached_precis.as_deref(), Some("precis"));
         assert_eq!(deduped[0].cached_summary.as_deref(), Some("summary"));
         assert_eq!(deduped[0].storage_path, "/two.jsonl");
     }
@@ -39242,8 +39108,8 @@ terminal_window_id: None,
                         assistant_message_count: 4,
                         title_hint: "Restore Live Remote".to_string(),
                         recent_context: "USER: restore".to_string(),
-                        cached_precis: Some("precis".to_string()),
-                        cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                         live_runtime: true,
                         title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
@@ -39306,8 +39172,8 @@ terminal_window_id: None,
                     assistant_message_count: 4,
                     title_hint: "Restore Live Remote".to_string(),
                     recent_context: "USER: restore".to_string(),
-                    cached_precis: Some("precis".to_string()),
-                    cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                     live_runtime: true,
                     title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
@@ -39561,8 +39427,8 @@ terminal_window_id: None,
                 assistant_message_count: 4,
                 title_hint: "Restore Live Remote".to_string(),
                 recent_context: "USER: restore".to_string(),
-                cached_precis: Some("precis".to_string()),
-                cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                 live_runtime: true,
                 title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
@@ -41045,8 +40911,8 @@ terminal_window_id: None,
                             assistant_message_count: 4,
                             title_hint: "First remote".to_string(),
                             recent_context: "USER: one".to_string(),
-                            cached_precis: Some("first precis".to_string()),
-                            cached_summary: Some("first summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("first summary".to_string()),
                             live_runtime: true,
                             title_is_explicit: false,
                             storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
@@ -41062,8 +40928,8 @@ terminal_window_id: None,
                             assistant_message_count: 4,
                             title_hint: "Second remote".to_string(),
                             recent_context: "USER: two".to_string(),
-                            cached_precis: Some("second precis".to_string()),
-                            cached_summary: Some("second summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("second summary".to_string()),
                             live_runtime: true,
                             title_is_explicit: false,
                             storage_path: "/home/user/.codex/sessions/def456.jsonl".to_string(),
@@ -42246,7 +42112,6 @@ terminal_window_id: None,
         // remote reader really sends it.
         let payload = RemotePreviewPayload {
             title_hint: None,
-            cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
                 older_available: false,
@@ -42583,8 +42448,8 @@ terminal_window_id: None,
                 assistant_message_count: 4,
                 title_hint: "Remote Session".to_string(),
                 recent_context: "USER: test".to_string(),
-                cached_precis: None,
-                cached_summary: None,
+        cached_precis: None,
+        cached_summary: None,
                 live_runtime: true,
                 title_is_explicit: false,
                 storage_path: "/tmp/abc123.jsonl".to_string(),
@@ -43303,8 +43168,8 @@ terminal_window_id: None,
                 assistant_message_count: 0,
                 title_hint: "Yggterm".to_string(),
                 recent_context: String::new(),
-                cached_precis: None,
-                cached_summary: None,
+        cached_precis: None,
+        cached_summary: None,
                 live_runtime: true,
                 title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/fresh-codex.jsonl".to_string(),
@@ -43500,8 +43365,8 @@ terminal_window_id: None,
                     assistant_message_count: 5,
                     title_hint: "Live 1".to_string(),
                     recent_context: "USER: live one".to_string(),
-                    cached_precis: Some("precis".to_string()),
-                    cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                     live_runtime: true,
                     title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/live-1.jsonl".to_string(),
@@ -43517,8 +43382,8 @@ terminal_window_id: None,
                     assistant_message_count: 5,
                     title_hint: "Live 2".to_string(),
                     recent_context: "USER: live two".to_string(),
-                    cached_precis: Some("precis".to_string()),
-                    cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                     live_runtime: true,
                     title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/live-2.jsonl".to_string(),
@@ -43604,8 +43469,8 @@ terminal_window_id: None,
                 assistant_message_count: 5,
                 title_hint: "Cached".to_string(),
                 recent_context: "USER: cached".to_string(),
-                cached_precis: Some("precis".to_string()),
-                cached_summary: Some("summary".to_string()),
+        cached_precis: None,
+        cached_summary: Some("summary".to_string()),
                 live_runtime: false,
                 title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/cached-1.jsonl".to_string(),

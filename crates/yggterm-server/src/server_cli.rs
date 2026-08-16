@@ -488,6 +488,14 @@ fn parse_remote_scanned_connect_path(path: &str) -> Option<(String, String)> {
 fn connect_session_kind_for_path(path: &str) -> yggterm_core::SessionKind {
     if path.starts_with("remote-cc://") || path.contains("/.claude/projects/") {
         yggterm_core::SessionKind::ClaudeCode
+    } else if path.starts_with("remote-muse://") || path.contains("/.local/share/muse/sessions/") {
+        yggterm_core::SessionKind::Muse
+    } else if path.starts_with("remote-agy://") {
+        yggterm_core::SessionKind::Antigravity
+    } else if path.starts_with("remote-grok://") {
+        yggterm_core::SessionKind::GrokBuild
+    } else if path.starts_with("remote-kimi://") {
+        yggterm_core::SessionKind::Kimi
     } else {
         yggterm_core::SessionKind::Codex
     }

@@ -224,6 +224,7 @@ pub struct SessionStore {
 pub struct SessionCopyRegenerationReport {
     pub scanned: usize,
     pub title_generated: usize,
+    #[serde(default)]
     pub precis_generated: usize,
     pub summary_generated: usize,
     pub summary_history_reset: usize,
@@ -841,19 +842,6 @@ impl SessionStore {
         Ok(Some(identity.session_id))
     }
 
-    pub fn resolve_precis_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
-        let path = PathBuf::from(session_path);
-        if !path.exists() || !is_codex_session_file(&path) {
-            return Ok(None);
-        }
-
-        let Some(identity) = read_codex_session_identity(&path)? else {
-            return Ok(None);
-        };
-        let resolver = SessionTitleResolver::new(&self.home)?;
-        resolver.resolve_precis_for_session(&identity.session_id)
-    }
-
     /// One resolver, for callers that read generated copy in a LOOP. Each
     /// `resolve_*_for_session_id` wrapper below opens its own sqlite
     /// connection and re-runs the whole schema batch, which is the right
@@ -868,11 +856,6 @@ impl SessionStore {
     pub fn resolve_title_for_session_id(&self, session_id: &str) -> Result<Option<String>> {
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.resolve_for_session(session_id)
-    }
-
-    pub fn resolve_precis_for_session_id(&self, session_id: &str) -> Result<Option<String>> {
-        let resolver = SessionTitleResolver::new(&self.home)?;
-        resolver.resolve_precis_for_session(session_id)
     }
 
     pub fn resolve_title_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
@@ -920,15 +903,6 @@ impl SessionStore {
         resolver.resolve_summary_for_session(&identity.session_id)
     }
 
-    pub fn precis_needs_refresh_for_session_id(
-        &self,
-        session_id: &str,
-        source_updated_at: OffsetDateTime,
-    ) -> Result<bool> {
-        let resolver = SessionTitleResolver::new(&self.home)?;
-        resolver.precis_needs_refresh(session_id, source_updated_at)
-    }
-
     pub fn summary_needs_refresh_for_session_id(
         &self,
         session_id: &str,
@@ -952,41 +926,34 @@ impl SessionStore {
         )
     }
 
-    pub fn generate_precis_for_session_path(
-        &self,
-        settings: &AppSettings,
-        session_path: &str,
-        force: bool,
-    ) -> Result<Option<String>> {
-        let path = PathBuf::from(session_path);
-        if !path.exists() || !is_codex_session_file(&path) {
-            return Ok(None);
-        }
 
-        let Some(identity) = read_codex_session_identity(&path)? else {
-            return Ok(None);
-        };
-        let resolver = SessionTitleResolver::new(&self.home)?;
-        resolver.generate_precis_for_session(
-            settings,
-            &identity.session_id,
-            &identity.cwd,
-            &path,
-            force,
-        )
+    #[deprecated(note="precis removed, use summary")]
+    pub fn resolve_precis_for_session_path(&self, _session_path: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
-    pub fn generate_precis_for_context(
-        &self,
-        settings: &AppSettings,
-        session_id: &str,
-        cwd: &str,
-        context: &str,
-        force: bool,
-    ) -> Result<Option<String>> {
-        let resolver = SessionTitleResolver::new(&self.home)?;
-        resolver.generate_precis_for_context(settings, session_id, cwd, context, force)
+    #[deprecated(note="precis removed")]
+    pub fn resolve_precis_for_session_id(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
+
+    #[deprecated(note="precis removed")]
+    pub fn precis_needs_refresh_for_session_id(&self, _session_id: &str, _source_updated_at: time::OffsetDateTime) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    #[deprecated(note="precis removed")]
+    pub fn generate_precis_for_session_path(&self, _settings: &crate::AppSettings, _session_path: &str, _force: bool) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    #[deprecated(note="precis removed")]
+    pub fn generate_precis_for_context(&self, _settings: &crate::AppSettings, _session_id: &str, _cwd: &str, _context: &str, _force: bool) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    #[deprecated(note="precis removed, use summary")]
+    pub fn precis_generated(&self) -> usize { 0 }
 
     pub fn generate_summary_for_session_path(
         &self,
@@ -1093,34 +1060,6 @@ impl SessionStore {
                         session_id: session.session_id.clone(),
                         path: path.clone(),
                         stage: "title".to_string(),
-                        error: error.to_string(),
-                    }),
-                }
-            }
-
-            let precis_was_missing = resolver
-                .resolve_precis_for_session(&session.session_id)
-                .ok()
-                .flatten()
-                .as_deref()
-                .is_none_or(looks_like_low_signal_generated_copy);
-            if force || precis_was_missing {
-                match resolver.generate_precis_for_session(
-                    settings,
-                    &session.session_id,
-                    &session.cwd,
-                    &session.file_path,
-                    force,
-                ) {
-                    Ok(Some(_)) => {
-                        report.precis_generated += 1;
-                        touched = true;
-                    }
-                    Ok(None) => {}
-                    Err(error) => report.failed.push(SessionCopyRegenerationFailure {
-                        session_id: session.session_id.clone(),
-                        path: path.clone(),
-                        stage: "precis".to_string(),
                         error: error.to_string(),
                     }),
                 }

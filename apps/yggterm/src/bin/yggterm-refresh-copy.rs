@@ -539,7 +539,6 @@ fn refresh_remote_copy(
                 &scanned.session_id,
                 &scanned.cwd,
                 title.as_deref(),
-                precis.as_deref(),
                 body_summary.as_deref(),
                 &settings.interface_llm_model,
             )?;
@@ -547,9 +546,6 @@ fn refresh_remote_copy(
         summary.refreshed += 1;
         if title.is_some() {
             summary.titles += 1;
-        }
-        if precis.is_some() {
-            summary.precis += 1;
         }
         if body_summary.is_some() {
             summary.summaries += 1;

@@ -32823,7 +32823,6 @@ fn spawn_title_generation_for_target(
                         &target_for_task.cwd,
                         Some(title_text),
                         None,
-                        None,
                         &settings_for_task.interface_llm_model,
                     )?;
                 }
@@ -33124,7 +33123,6 @@ fn spawn_precis_generation_for_target(
                         &target_for_task.session_id,
                         &target_for_task.cwd,
                         None,
-                        Some(precis_text),
                         None,
                         &settings_for_task.interface_llm_model,
                     )?;
@@ -33365,7 +33363,6 @@ fn spawn_summary_generation_for_target(
                         machine,
                         &target_for_task.session_id,
                         &target_for_task.cwd,
-                        None,
                         None,
                         Some(summary_text),
                         &settings_for_task.interface_llm_model,
