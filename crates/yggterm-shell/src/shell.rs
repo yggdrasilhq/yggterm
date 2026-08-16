@@ -89472,6 +89472,16 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
                 "claude-code"
             } else if is_antigravity_session_path(&row.full_path) {
                 "antigravity"
+            } else if row.full_path.starts_with("remote-cc://") {
+                "claude-code"
+            } else if row.full_path.starts_with("remote-muse://") {
+                "muse"
+            } else if row.full_path.starts_with("remote-agy://") {
+                "antigravity"
+            } else if row.full_path.starts_with("remote-grok://") {
+                "grok"
+            } else if row.full_path.starts_with("remote-kimi://") {
+                "kimi"
             } else if row.full_path.starts_with("local://") {
                 "terminal"
             } else if row.full_path.starts_with("ssh://") {
@@ -89519,6 +89529,16 @@ fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
             }
             if is_claude_code_session_path(&row.full_path) {
                 Some("*_")
+            } else if row.full_path.starts_with("remote-cc://") {
+                Some("*_")
+            } else if row.full_path.starts_with("remote-muse://") {
+                Some("M_")
+            } else if row.full_path.starts_with("remote-agy://") {
+                Some("A_")
+            } else if row.full_path.starts_with("remote-grok://") {
+                Some("G_")
+            } else if row.full_path.starts_with("remote-kimi://") {
+                Some("K_")
             } else if row.full_path.starts_with("codex-litellm://")
                 || is_codex_litellm_storage_session_path(&row.full_path)
                 || row.full_path.starts_with("codex://")

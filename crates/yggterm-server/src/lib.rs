@@ -17130,14 +17130,131 @@ fn remote_cc_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-cc://{machine_key}/{session_id}")
 }
 
+const REMOTE_MUSE_SCAN_SCRIPT: &str = r#"
+import json, os, sys, sqlite3
+from pathlib import Path
+
+def scan_muse_session(path_str):
+    p = Path(path_str)
+    s = str(p)
+    if "/subagent/" in s or "/tool-outputs/" in s:
+        return None
+    session_id = p.parent.name.strip()
+    if not session_id or len(session_id) < 8 or "-" not in session_id:
+        return None
+    home = Path(os.path.expanduser("~"))
+    db_path = home / ".local/share/muse/session-index.db"
+    cwd = None
+    title = ""
+    mtime = 0
+    try:
+        mtime = int(os.path.getmtime(s))
+    except:
+        mtime = 0
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            cur = conn.cursor()
+            cur.execute("SELECT workspace_root, title, updated_at_us FROM sessions WHERE session_id=?", (session_id,))
+            row = cur.fetchone()
+            if row:
+                ws, t, updated_us = row
+                if ws and ws.strip():
+                    cwd = ws.strip()
+                if t and t.strip() and t.strip() != session_id:
+                    if not (cwd and t.strip() == cwd):
+                        title = t.strip()[:120]
+                if updated_us and updated_us > 0:
+                    mtime = int(updated_us // 1000000)
+            conn.close()
+        except:
+            pass
+    if not cwd:
+        try:
+            with open(s, 'r', errors='ignore') as f:
+                for i, line in enumerate(f):
+                    if i >= 16:
+                        break
+                    line=line.strip()
+                    if not line:
+                        continue
+                    try:
+                        v=json.loads(line)
+                    except:
+                        continue
+                    if v.get("payload_type")=="runtime.session.route_facts":
+                        rec=v.get("payload",{}).get("record",{})
+                        c=rec.get("cwd")
+                        if c and c.strip():
+                            cwd=c.strip()
+                            break
+            if not cwd:
+                cwd=str(home)
+        except:
+            cwd=str(home)
+    if not cwd:
+        cwd=str(home)
+    return {
+        'session_id': session_id,
+        'cwd': cwd,
+        'title': title,
+        'context': '',
+        'mtime': mtime,
+        'path': s,
+    }
+
+home = Path(os.path.expanduser("~"))
+seen=set()
+for pattern in [a for a in sys.argv[1:] if a.strip()]:
+    for p in home.glob(pattern):
+        key=str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        data=scan_muse_session(str(p))
+        if data:
+            print(json.dumps(data, ensure_ascii=False))
+"#;
+
+pub(crate) fn remote_muse_scan_args() -> Vec<String> {
+    yggterm_core::agent_cli_descriptor(yggterm_core::SessionKind::Muse)
+        .map(|descriptor| {
+            descriptor
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteMuseSummaryLine {
+    session_id: String,
+    cwd: String,
+    title: String,
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    mtime: i64,
+    #[serde(default)]
+    path: String,
+}
+
+fn remote_muse_session_path(machine_key: &str, session_id: &str) -> String {
+    format!("remote-muse://{machine_key}/{session_id}")
+}
+
 /// Whether a session path's CLI lives on THIS machine (so the local managed
 /// codex/claude toolchain is relevant on the attach path). Remote agent
-/// sessions — codex `remote-session://` and Claude Code `remote-cc://` — run
-/// their CLI on the remote machine via the resume/start lane, so the local
+/// sessions — codex `remote-session://`, Claude Code `remote-cc://` and Muse
+/// `remote-muse://` — run their CLI on the remote machine via the resume/start lane, so the local
 /// `<cli> --version` probe is pure waste for them. See
 /// `ensure_managed_cli_for_session_path`.
 fn session_path_uses_local_managed_cli(path: &str) -> bool {
-    !(path.starts_with("remote-session://") || path.starts_with("remote-cc://"))
+    !(path.starts_with("remote-session://")
+        || path.starts_with("remote-cc://")
+        || path.starts_with("remote-muse://"))
 }
 
 /// Does this row's launch — its `cd`, its exec, its cwd — happen on THIS
@@ -17295,6 +17412,7 @@ fn scan_remote_machine_sessions(
     // yggterm scan failed (e.g. lock busy), because CC sessions live in ~/.claude/,
     // not ~/.codex/, and don't require the remote scan lock.
     let mut cc_found = false;
+    let mut muse_found = false;
     match run_remote_python_lines(
         &target.ssh_target,
         target.prefix.as_deref(),
@@ -17380,8 +17498,98 @@ fn scan_remote_machine_sessions(
         }
     }
 
+    // Step 3: Muse session scan — independent like CC, reads remote
+    // `~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db`.
+    {
+        let _muse_args = remote_muse_scan_args();
+        tracing::info!(ssh_target = %target.ssh_target, muse_args = ?_muse_args, "muse scan starting");
+    }
+    match run_remote_python_lines(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        REMOTE_MUSE_SCAN_SCRIPT,
+        &remote_muse_scan_args(),
+    ) {
+        Err(ref muse_err) => {
+            tracing::warn!(ssh_target = %target.ssh_target, error = %muse_err, "muse scan failed");
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "remote_machine",
+                    "muse_scan_failed",
+                    serde_json::json!({
+                        "ssh_target": target.ssh_target,
+                        "error": muse_err.to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(muse_lines) => {
+            tracing::info!(ssh_target = %target.ssh_target, lines = muse_lines.len(), "muse scan done");
+            let existing_ids: std::collections::HashSet<String> =
+                sessions.iter().map(|s| s.session_id.clone()).collect();
+            let mut muse_sessions: Vec<RemoteScannedSession> = Vec::new();
+            let mut parse_errors = 0usize;
+            let mut id_collisions = 0usize;
+            for line in &muse_lines {
+                match serde_json::from_str::<RemoteMuseSummaryLine>(line) {
+                    Err(_) => {
+                        parse_errors += 1;
+                        continue;
+                    }
+                    Ok(summary) => {
+                        if existing_ids.contains(&summary.session_id) {
+                            id_collisions += 1;
+                            continue;
+                        }
+                        muse_sessions.push(RemoteScannedSession {
+                            session_path: remote_muse_session_path(&machine_key, &summary.session_id),
+                            title_hint: if summary.title.trim().is_empty() {
+                                short_session_id(&summary.session_id)
+                            } else {
+                                summary.title
+                            },
+                            session_id: summary.session_id,
+                            cwd: summary.cwd,
+                            started_at: String::new(),
+                            modified_epoch: summary.mtime,
+                            event_count: 0,
+                            user_message_count: 0,
+                            assistant_message_count: 0,
+                            recent_context: summary.context,
+                            cached_precis: None,
+                            cached_summary: None,
+                            live_runtime: false,
+                            title_is_explicit: false,
+                            storage_path: summary.path,
+                        });
+                    }
+                }
+            }
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "remote_machine",
+                    "muse_scan_done",
+                    serde_json::json!({
+                        "ssh_target": target.ssh_target,
+                        "lines": muse_lines.len(),
+                        "parsed": muse_sessions.len(),
+                        "parse_errors": parse_errors,
+                        "id_collisions": id_collisions,
+                        "sample_storage_path": muse_sessions.first().map(|s| s.storage_path.clone()).unwrap_or_default(),
+                    }),
+                );
+            }
+            muse_found = !muse_sessions.is_empty();
+            sessions.extend(muse_sessions);
+        }
+    }
+
     // Only propagate the deferred yggterm error if we have nothing to show at all.
-    if sessions.is_empty() && !cc_found {
+    if sessions.is_empty() && !cc_found && !muse_found {
         if let Some(err) = deferred_error {
             return Err(err);
         }

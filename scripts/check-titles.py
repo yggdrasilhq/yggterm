@@ -66,12 +66,12 @@ CLI_STORES = [
     {
         "slug": "qwen",
         "globs": [".qwen/projects/*/chats/*.jsonl"],
-        "exclude": [],
+        "exclude": [".runtime."],
         "kind": "qwen",
     },
     {
         "slug": "antigravity",
-        "globs": [".gemini/antigravity-cli/conversations/*.db"],
+        "globs": [".gemini/antigravity-cli/conversations/*.db", ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"],
         "exclude": ["-shm", "-wal"],
         "kind": "antigravity",
     },
