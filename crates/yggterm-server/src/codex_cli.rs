@@ -346,19 +346,63 @@ impl ManagedCliPaths {
     /// not control and which may fail, be killed, or simply never clean up. A
     /// sweep that only ran on the happy path would miss exactly the cases that
     /// leak most.
+    ///
+    /// ⛔ Root-owned leaks: the upstream `codex-litellm` `preinstall` creates
+    /// `codex-litellm-*` in `os.tmpdir()` and never removes it. When that
+    /// `tmpdir` is `/tmp` (tmpfs) the 78 MB tarball is RAM, and when the
+    /// installer runs as `root` the directory is `root:root 0700` so a
+    /// `pi`-owned sweep sees it as unreadable and `du` counts 0. The
+    /// disk-backed `TMPDIR=cli-staging` relocation (above) prevents new
+    /// pi-owned leaks, but legacy root-owned dirs in `/tmp` survive it.
+    /// This sweep therefore also reaps `/tmp/codex-litellm-*` via `sudo -n`
+    /// when available, and falls back to a best-effort `remove_dir_all` as `pi`.
     fn sweep_staging(&self) {
         let staging = self.staging_dir();
-        let Ok(entries) = fs::read_dir(&staging) else {
+        if let Ok(entries) = fs::read_dir(&staging) {
+            for entry in entries.flatten() {
+                // Anything here is a leftover by construction: the directory exists
+                // only as scratch for an installer that has already exited.
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        // Legacy tmpfs leaks: root-owned `codex-litellm-*` dirs left in /tmp
+        // before TMPDIR was relocated. Best-effort, never fails the install.
+        Self::sweep_legacy_tmp_codex_litellm();
+    }
+
+    fn sweep_legacy_tmp_codex_litellm() {
+        let tmp = std::path::Path::new("/tmp");
+        let Ok(entries) = fs::read_dir(tmp) else {
             return;
         };
         for entry in entries.flatten() {
-            // Anything here is a leftover by construction: the directory exists
-            // only as scratch for an installer that has already exited.
             let path = entry.path();
-            if path.is_dir() {
-                let _ = fs::remove_dir_all(&path);
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("codex-litellm-") {
+                continue;
+            }
+            // Try as pi first; if permission denied, try passwordless sudo.
+            let removed = if path.is_dir() {
+                fs::remove_dir_all(&path).is_ok()
             } else {
-                let _ = fs::remove_file(&path);
+                fs::remove_file(&path).is_ok()
+            };
+            if !removed {
+                let _ = std::process::Command::new("sudo")
+                    .arg("-n")
+                    .arg("rm")
+                    .arg("-rf")
+                    .arg(&path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
             }
         }
     }
