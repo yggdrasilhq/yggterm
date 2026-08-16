@@ -75,6 +75,60 @@ wrong models are common and the interview is what catches them.
 
 ---
 
+## Phase 0.5 — what a fleet is and why you would want one
+
+**Say this in plain language before you ask about their machines — most people have
+never been offered the choice.**
+
+A **fleet** is just yggterm running on more than one machine that trust each other
+(`***`, `dev`, `oc` in this fleet — aliases over `ssh` to real hosts). Every row
+knows which machine its terminal lives on, and clicking a row does the `ssh` + `cd`
++ `resume` for you. From your chair there is one sidebar; behind it are several
+computers acting as one.
+
+**Pitch the *why* at their pain, not the mechanism:**
+
+- **Cool laptop, hot work elsewhere.** The GUI lives on the laptop you touch;
+  the heavy agents run on the server that has the cores, the RAM, the GPUs, the
+  repo checkouts. Jojo stays cool and quiet even with six agents grinding on dev/oc,
+  because the timers are `Nice=10` + `IOSchedulingClass=idle` and coalesced by the
+  kernel — they wake, do 200ms, and exit. No resident Python loop burning your fan.
+- **Right tool on the right host.** A browser-automation agent that needs the screen
+  runs where the screen is; a build agent runs where the build cache is; a GPU job
+  runs where the GPU is. Yggterm files that "which host" per-row, so you never re-type
+  `ssh dev cd ~/gh/foo` again.
+- **Memory that follows you.** With fleet memory (`~/.yggterm/memory` + `ygg-memory`),
+  a finding Claude proves on *** is visible to Muse on oc ten minutes later, via
+  a background `sync-fleet` mesh over ssh. No hand-copying, no stale host re-breaking
+  what another fixed. Deletes propagate via tombstones, not resurrection.
+- **One machine is a complete yggterm.** You do not *need* a fleet to get value.
+  Start with one; add a second when "my laptop is hot" or "my builds are slow on
+  wi-fi" becomes real. The fleet is an *upgrade path*, not a prerequisite.
+
+**Then the handholding promise — this is the USP to name out loud:**
+
+> "All the advanced dances — which machine a job deploys on, which harness's memory
+> is authoritative, which timer wakes when, how a relay hands off without losing
+> context — look like choreography from the outside, but from your side they are
+> child's play. **You just tell the agent what you want in plain language, and it
+> wires or re-wires yggterm for you.** 'Make fleet sync every 5 minutes', 'keep my
+> laptop off battery sync', 'sync only yggterm, not everything' — one sentence, one
+> timer line changed, shown to you. That conversation *is* the product. You are never
+> locked into the setup we do today."
+
+**Name the flexibility explicitly, so they know to ask:**
+
+- Intervals: `ygg-memory-fleet 10m` → `5m`, `ygg-booter-tick 7m` → `3m` — one `systemctl --user edit` line, show `list-timers`.
+- Scope: `all namespaces` vs `just yggterm + cwd` — one hook flag.
+- Deletes: propagate vs archive — tombstone vs `~/.yggterm/memory-archive`.
+- Harnesses: `claude muse gemini codex grok` — comment out what they don't use.
+- Power: `ConditionACPower=true` for laptops on battery.
+
+If they are single-machine, say so: *"You get everything above, one host is the whole
+fleet, and adding a second later is the same command plus an ssh alias."*
+
+---
+
 ## Phase 1 — the fleet shape
 
 Establish, with them, what their world contains. Write the answers down somewhere
@@ -87,6 +141,9 @@ durable as you go; this becomes the seed of their fabric skill in Phase 4.
 - **Where the agent CLIs live** on each, and whether they are the same version.
 - **Which machine's GUI is the one that matters** — the surface where a change is
   *proven*, as opposed to merely compiled.
+- **Fleet or not?** After the "why a fleet" pitch above, ask: *"Does any of that
+  sound worth it for you now, or is one machine the right start?"* Respect a "one
+  is enough" — it is a complete setup.
 
 ⭐ **The rule that saves the most pain later: deploy every job on the host that
 owns the thing it touches.** Building on the wrong machine deploys to nobody, and
