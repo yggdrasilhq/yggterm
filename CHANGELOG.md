@@ -4,6 +4,8 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Muse Code sessions now appear in Startpage, cwd-tree and title pickers.** Muse has been installed fleet-wide since 2026-08-08 but its store (`~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db`) was not scanned, so the last five sessions were Muse and the tree showed no `M_` rows. It now scans with `session-index.db` `workspace_root→cwd` and `route_facts.cwd` fallback, excludes `/subagent/` and `/tool-outputs/`, and renders `M_ #86198f`. New `server cwdtree ls` groups the same scan by `cwd`; `server titles/startpage/cwdtree ls` now report pre-limit `durable_count` and `group_count`, and the `check-titles`/`check-cwdtree`/`check-startpage` oracles pass.
+
 - **`--limit` on the trace commands was ignored, so every request returned the
   same 200 lines.** Asking for 50 and asking for 2000 both gave 200, with no
   error to say so, which left about **four seconds** of history to diagnose

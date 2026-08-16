@@ -1,0 +1,30 @@
+{
+  "bundle_version": 1,
+  "app_id": "yggterm",
+  "feature_id": "muse-cwdtree-titles",
+  "title": "Muse startpage/cwdtree/titles integration",
+  "status": "unreleased",
+  "category": "agent-cli",
+  "user_value": "Muse Code sessions now appear in Startpage Recent Work, cwd-tree folders, and title pickers with correct M_ icon and workspace cwd, instead of being invisible.",
+  "source_repo": "yggdrasilhq/yggterm",
+  "links": {
+    "changelog_section": "Unreleased",
+    "site_demo_path": "/demos/yggterm/muse-cwdtree-titles"
+  },
+  "macro": {
+    "script": "scripts/check-titles.py",
+    "args": ["--host", "local", "--verbose"]
+  },
+  "proof": {
+    "screenshots": true,
+    "recording": false,
+    "trace": true,
+    "app_state": true,
+    "summary_artifact": "artifacts/demos/unreleased/muse-cwdtree-titles/trace/titles_jojo.json"
+  },
+  "changelog": {
+    "section": "Fixed",
+    "summary": "Muse Code sessions visible in startpage, cwd-tree and title picker with correct icon and SQLite-backed cwd/title; cwdtree/titles verbs now truthful and oracles pass"
+  },
+  "tags": ["muse", "agent-cli", "cwdtree", "startpage", "titles", "proof-bundle"]
+}
