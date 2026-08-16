@@ -31,7 +31,14 @@ from collections import defaultdict
 
 # Maps AGENT_CLIS descriptor to its store globs (from crates/yggterm-core/src/agent_cli.rs)
 # Keep in sync — this is the Python oracle's own list, deliberately not imported.
+# Muse: session_id is parent dir name, cwd/title from session-index.db fallback to route_facts.
 CLI_STORES = [
+    {
+        "slug": "muse",
+        "globs": [".local/share/muse/sessions/**/session.jsonl"],
+        "exclude": ["/subagent/", "/tool-outputs/"],
+        "kind": "muse",
+    },
     {
         "slug": "codex",
         "globs": [".codex/sessions/**/rollout-*.jsonl"],
@@ -119,7 +126,9 @@ def run_on_host(host, cmd, timeout=15):
         return "", str(e)
 
 def verb_on_host(host):
-    cmd = "yggterm-headless server startpage ls --json 2>&1 || yggterm server startpage ls --json 2>&1"
+    # Use large limit so verb returns the full durable set — default 200 truncates
+    # and would make the oracle's full walk (10000) always mismatch.
+    cmd = "yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm server startpage ls --json --limit 10000 2>&1"
     out, err = run_on_host(host, cmd)
     if err:
         return None, err, out
@@ -152,20 +161,23 @@ def manual_walk_on_host(host):
                 lit.append(seg)
             prefix = "/".join(lit)
             base = f"{home}/{prefix}" if prefix else home
-            # Build find command
-            # Handle .db case separately
+            # Build find command — no head limit: Rust walks the full tree
+            # and earlier oracles truncated at 500/1000 which hid half the Muse
+            # store (2833 files on oc, 2611 subagent). Keep head only as safety
+            # at 10000, well above any fleet host.
             if pattern == "*.db":
-                find_cmd = f"find {shlex.quote(base)} -type f -name '*.db' 2>/dev/null | head -n 500"
+                find_cmd = f"find {shlex.quote(base)} -type f -name '*.db' 2>/dev/null | head -n 10000"
             elif pattern == "summary.json":
-                find_cmd = f"find {shlex.quote(base)} -type f -name 'summary.json' 2>/dev/null | head -n 500"
+                find_cmd = f"find {shlex.quote(base)} -type f -name 'summary.json' 2>/dev/null | head -n 10000"
             else:
-                # rollout-*.jsonl or *.jsonl
+                # rollout-*.jsonl / *.jsonl / session.jsonl
                 find_pat = pattern.replace("*", "*")
-                find_cmd = f"find {shlex.quote(base)} -type f -name {shlex.quote(find_pat)} 2>/dev/null | head -n 1000"
+                find_cmd = f"find {shlex.quote(base)} -type f -name {shlex.quote(find_pat)} 2>/dev/null | head -n 10000"
             out, _ = run_on_host(host, find_cmd)
             files = [l.strip() for l in out.splitlines() if l.strip()]
             for f in files:
-                if any(ex in os.path.basename(f) for ex in cli["exclude"]):
+                # Exclude by path fragment when fragment contains '/', else file name only — mirrors Rust store_path_is_session_file
+                if any((ex in f) if "/" in ex else (ex in os.path.basename(f)) for ex in cli["exclude"]):
                     continue
                 # Quick stat for mtime
                 stat_out, _ = run_on_host(host, f"stat -c %Y {shlex.quote(f)} 2>/dev/null || stat -f %m {shlex.quote(f)} 2>/dev/null")
@@ -224,6 +236,38 @@ def parse_file_on_host(host, path, cli_slug):
             }
         except:
             return {"raw": out[:500] if out else ""}
+    elif cli_slug == "muse":
+        # Muse: session_id is parent dir name, cwd/title from index DB with route_facts fallback.
+        if "/subagent/" in path or "/tool-outputs/" in path:
+            return {"session_id": None, "raw": ""}
+        session_id = Path(path).parent.name
+        home_out,_ = run_on_host(host, "echo $HOME")
+        home = home_out.strip() if home_out else os.path.expanduser("~")
+        db = f"{home}/.local/share/muse/session-index.db"
+        cmd_db = f"sqlite3 {shlex.quote(db)} \"SELECT workspace_root, title FROM sessions WHERE session_id='{session_id}' LIMIT 1;\" 2>/dev/null | head -n 1"
+        out_db, _ = run_on_host(host, cmd_db)
+        cwd = title = None
+        if out_db and out_db.strip():
+            parts = out_db.strip().split("|")
+            if parts[0].strip():
+                cwd = parts[0].strip()
+            if len(parts) > 1 and parts[1].strip():
+                title = parts[1].strip()
+        if not cwd:
+            cmd2 = f"grep -m1 'route_facts' {shlex.quote(path)} 2>/dev/null | head -c 4000"
+            out2, _ = run_on_host(host, cmd2)
+            if out2:
+                import re
+                m = re.search(r'\"cwd\"\s*:\s*\"([^\"]+)\"', out2)
+                if m:
+                    cand = m.group(1)
+                    if len(cand) >= 8:
+                        cwd = cand
+                    elif not title:
+                        title = cand
+        if not cwd:
+            cwd = home
+        return {"session_id": session_id, "cwd": cwd, "title": title, "raw": (out_db[:500] if out_db else out2[:500] if 'out2' in locals() and out2 else "")}
     elif cli_slug == "claude-code":
         # Claude: filename IS the session id; cwd/title need full scan but we
         # can get id instantly and cwd from a deeper grep. This avoids missing

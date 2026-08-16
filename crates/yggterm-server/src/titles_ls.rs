@@ -40,6 +40,7 @@ pub fn run_server_titles_ls(store: &yggterm_core::SessionStore, args: &[String])
 
     let mut rows = scan_all_durable_sessions(&system_home);
     let warnings = collect_warnings(&system_home, &rows);
+    let total = rows.len();
     // Title rank: effective_title present first, then recency. For now reuse
     // startpage order (modified_epoch desc) which already puts most-recent
     // with title at top; a dedicated title rank can be added to yggterm-core
@@ -65,7 +66,7 @@ pub fn run_server_titles_ls(store: &yggterm_core::SessionStore, args: &[String])
     let output = TitlesLsOutput {
         host,
         home: system_home.display().to_string(),
-        durable_count: rows.len(),
+        durable_count: total,
         live_count,
         rows,
         live_session_paths,

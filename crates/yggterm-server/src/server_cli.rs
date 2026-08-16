@@ -746,6 +746,14 @@ pub fn run_server_resume_ls_cli(store: &SessionStore, args: &[String]) -> anyhow
     crate::resume_ls::run_server_resume_ls(store, args)
 }
 
+/// `server cwdtree ls` — for BOTH binaries.
+///
+/// Cwd-tree grouping: same `scan_all_durable_sessions` the startpage uses,
+/// grouped by `cwd` the GUI groups by, with `session_kind`-driven icons.
+pub fn run_server_cwdtree_ls_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    crate::cwdtree_ls::run_server_cwdtree_ls(store, args)
+}
+
 /// `server connect <session-path> | --list` — for BOTH binaries.
 ///
 /// ⛔ The ARGUMENT PARSING lives here too, not just the two implementations.
