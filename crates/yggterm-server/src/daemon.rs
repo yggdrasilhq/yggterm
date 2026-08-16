@@ -1270,7 +1270,7 @@ fn preserved_owner_saved_session_mismatch_should_detach(
 ) -> bool {
     runtime_output_mismatches_path
         && !temporary_update_restore
-        && !(path.starts_with("remote-session://") && keep_alive_runtime)
+        && !(yggterm_core::is_remote_agent_session_path(path) && keep_alive_runtime)
 }
 
 fn remove_session_should_detach_keep_alive_runtime(keep_alive_runtime: bool) -> bool {
@@ -4189,7 +4189,7 @@ impl DaemonRuntime {
         let mut restored_stored_sessions = 0usize;
         let mut restored_live_sessions = 0usize;
         let mut restored_remote_machines = 0usize;
-        let mut live_row_tombstones = crate::live_row_tombstones::LiveRowTombstones::load(
+        let live_row_tombstones = crate::live_row_tombstones::LiveRowTombstones::load(
             store.home_dir(),
             crate::live_row_tombstones::now_secs(),
         );
@@ -6165,6 +6165,7 @@ impl DaemonRuntime {
         );
     }
 
+    #[allow(dead_code)]
     fn prune_unrepresented_preserved_owner_runtime_sessions(&mut self, reason: &'static str) {
         let endpoint_groups = self.preserved_terminal_owners.endpoint_groups();
         if endpoint_groups.is_empty() {
@@ -6768,7 +6769,7 @@ impl DaemonRuntime {
         path: &str,
         runtime_key: &str,
     ) -> Option<(ServerEndpoint, ServerRuntimeStatus)> {
-        if !path.starts_with("remote-session://")
+        if !yggterm_core::is_remote_agent_session_path(path)
             || !self.server.live_session_keep_alive(path)
             || self.terminals.has_session(runtime_key)
             || !self.server.represents_terminal_runtime_key(runtime_key)
@@ -9282,7 +9283,7 @@ impl DaemonRuntime {
             ServerRequest::UpdateSessionCopy {
                 path,
                 title,
-                precis,
+                precis: _,
                 summary,
                 title_is_explicit,
             } => {
@@ -12268,14 +12269,14 @@ fn current_millis_u64() -> u64 {
 }
 
 fn terminal_ensure_should_seed_remote_snapshot(path: &str, seed_remote_snapshot: bool) -> bool {
-    path.starts_with("remote-session://") && seed_remote_snapshot
+    yggterm_core::is_remote_agent_session_path(path) && seed_remote_snapshot
 }
 
 fn startup_prewarm_should_seed_remote_snapshot(
     path: &str,
     active_terminal_path: Option<&str>,
 ) -> bool {
-    path.starts_with("remote-session://") && active_terminal_path == Some(path)
+    yggterm_core::is_remote_agent_session_path(path) && active_terminal_path == Some(path)
 }
 
 fn mark_daemon_activity(last_activity_ms: &AtomicU64) {
@@ -17001,6 +17002,7 @@ fn session_kind_state_survives_pty_loss(kind: SessionKind) -> bool {
 /// newest build, so an older or same-version peer is not somewhere to converge
 /// to. An unparseable version is never a successor (fail closed: releasing a
 /// live PTY to a daemon we cannot identify strands the user's session).
+#[allow(dead_code)]
 fn daemon_version_is_newer_successor(peer_version: &str) -> bool {
     let Some(peer) = parse_daemon_version_triple(peer_version.trim()) else {
         return false;

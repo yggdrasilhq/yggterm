@@ -308,7 +308,7 @@ const ARMS: &[Arm] = &[
         // and THIS TEST is what forced the second copy to move with the first.
         resume_selector_token: "resume",
         re_roots_with_cwd: false,
-        store_globs: &[],
+        store_globs: &[".local/share/muse/sessions/**/session.jsonl"],
     },
     Arm {
         kind: SessionKind::Muse,
@@ -322,7 +322,7 @@ const ARMS: &[Arm] = &[
         // Same measurement as the local arm above: `muse resume <uuid>`.
         resume_selector_token: "resume",
         re_roots_with_cwd: false,
-        store_globs: &[],
+        store_globs: &[".local/share/muse/sessions/**/session.jsonl"],
     },
     Arm {
         kind: SessionKind::Antigravity,

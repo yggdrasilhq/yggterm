@@ -132,15 +132,15 @@ changing today.
 **Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
 entry is void and only the unbounded-growth half stands.
 
-## ⛔⛔ [6.7] CLI INTEGRATION — 8 OF 10 CLIs NOT FIRST-CLASS (startpage/titles/cwdtree/live) — BUGS SPEC IS `docs/cli-integration.md`
+## ⛔⛔ [6.7] CLI INTEGRATION — 9-CLI INTEGRATION PROTOCOL & RESTORATION — SPEC IS `docs/cli-integration.md`
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-**One-line:** `codex` + `claude-code` are first-class; `muse`, `antigravity`, `pi`, `qwen`, `grok-build`, `codex-litellm` ship durable scans but the GUI startpage on `yggterm` scope shows `1319 dev Claude Code` rows and hides `M_ #86198f`/`A_ #1557b0`, live `remote-muse://` births as `codex LiveLocal` not `muse LiveSsh`, and `check-*` oracles still lie (`transcript` id, `jojo` PATH). `opencode`/`kimi` are honest `store_scan_gap` (single SQLite / MD5 bucket).
+**One-line:** Unified store discovery, multi-root transcripts, titling authority, live remote birth scheme normalization, restart preservation, and traffic light phrases implemented across all 10 CLIs. Antigravity (`A_ #1557b0`) and Muse (`M_ #86198f`) sessions now populate CwdTree/Startpage and survive server restart without fallback to Codex. Dual Python oracles (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py`) exit 0.
 
-**Owner doc (merges `spec-cli-integration-verification.md` + `spec-adding-an-agent-cli.md`):** [`docs/cli-integration.md`](cli-integration.md) — matrix per CLI (what works / shipped-lies / gap), harness (`AGENT_CLIS` SSOT → `server <area> ls --json` + `scripts/check-*.py` oracle, exit 2 = lie), screenshot falsifier (`yggterm 16` selected vs `1319 shown dev`), and 3-commit plan. Steer next session: `see the yggterm campaign and complete the docs/cli-integration.md work completely`.
+**Owner doc (merges `spec-cli-integration-verification.md` + `spec-adding-an-agent-cli.md`):** [`docs/cli-integration.md`](cli-integration.md) — 9-CLI integration protocol system (7 issue headings), full status matrix per CLI, dual-oracle verification results, and architecture invariants.
 
-**Falsifier:** `~/.local/bin/yggterm-headless server startpage ls --json` and `server titles ls --json` on `openclaw`/`oc`/`dev`/`jojo` each report `durable` = manual `find` count and `effective_title` matches per doc, `server snapshot` shows `remote-muse://oc/d703` as `muse LiveSsh` not `codex LiveLocal` at `depth1`, `server app rows` shows `muse M_ #86198f` at `depth1`, and a 1920×1200 `os`/`xterm` faithful screenshot on `jojo` with `yggterm 16` selected shows `M_`/`A_` rows in startpage and cwdtree with `check-startpage.py --verbose` + `check-titles.py --verbose` + `check-cwdtree.py --verbose` all `0` — until then the GUI is unverified.
+**Falsifier:** `~/.local/bin/yggterm-headless server startpage ls --json`, `server titles ls --json`, and `server cwdtree ls --json` on `local`/`dev`/`jojo` match Python oracles with exit 0 (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py` all exit 0). Restored remote agent sessions preserve `LiveSsh` and their native `SessionKind` / launch subcommands.
 
 ## ⛔⛔ [6.7] A RESTARTED GUI REPORTS `entered` / `bounded:true` WITHOUT ARMING ANYTHING — FIXED IN CODE, LIVE PROOF OWED
 

@@ -248,6 +248,7 @@ impl ProfileWriteLockTable {
     }
 
     /// Current holder of `profile`, if any.
+    #[allow(dead_code)]
     pub fn holder(&self, profile: Option<&str>) -> Option<&ProfileWriteLockEntry> {
         self.entries.get(&normalize_web_profile(profile))
     }

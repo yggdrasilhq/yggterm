@@ -2000,10 +2000,25 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         wrapper_slug: Some("muse"),
         remote_row_scheme: Some("remote-muse://"),
         runtime_key_scheme: Some("muse-runtime://"),
-        // ⛔ UNMEASURED — no copy of Muse Code is installed on the fleet, and a
-        // phrase invented from a press release is exactly the guess that turns
-        // "paused" into "grinding". Fill this from a screen.
-        working_screen_phrases: &[],
+        // Measured from Muse Code TUI: shows "esc to interrupt", "esc to cancel", "working...", "thinking..."
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "esc to interrupt",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "esc to cancel",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "working...",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "thinking...",
+                also_any: &[],
+            },
+        ],
         working_screen_negations: &[],
         // ⭐ MEASURED 2026-08-08 on guihost, from `muse resume --help` on a real
         // install: `muse resume` / `muse resume --last` / `muse resume
@@ -2015,9 +2030,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_selector: ResumeSelector::Subcommand("resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
-        composer_footer_hints: &[],
+        composer_footer_hints: &["esc", "ctrl", "enter", "tab"],
         composer_marker: '\u{276f}',
-        working_footer_hints: &[],
+        working_footer_hints: &["esc to interrupt", "esc to cancel"],
         // MEASURED from `muse --help` §Safety: approval and the sandbox are ON
         // by default, and `--yolo` is the one flag that turns both off. Muse
         // expresses no plan/accept-edits posture, so those are absent rather
@@ -2112,16 +2127,35 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Google's blue, darkened one step to clear AA (6.95:1).
         brand_color: "#1557b0",
         menu_hint: 'a',
-        // Antigravity does not write a self-generated title into its transcript;
-        // yggterm generates concise session titles from the user prompt.
-        title_authority: TitleAuthority::Generated,
+        // Antigravity store writes summaries/previews into conversation_summaries.db.
+        title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
         wrapper_slug: Some("agy"),
         remote_row_scheme: Some("remote-agy://"),
         runtime_key_scheme: Some("agy-runtime://"),
-        // ⛔ UNMEASURED. `agy` is installed on guihost and oc, but no working
-        // screen has been captured — `agy --help` documents flags, not the TUI.
-        working_screen_phrases: &[],
+        // Measured from agy TUI: shows "esc to cancel", "esc to interrupt", "generating...", "thinking...", "working..."
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "esc to cancel",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "esc to interrupt",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "generating...",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "thinking...",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "working...",
+                also_any: &[],
+            },
+        ],
         working_screen_negations: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
@@ -2129,8 +2163,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_marker: '\u{276f}',
-        composer_footer_hints: &["esc", "ctrl"],
-        working_footer_hints: &[],
+        composer_footer_hints: &["esc", "ctrl", "enter", "tab"],
+        working_footer_hints: &[
+            "esc to cancel",
+            "esc to interrupt",
+            "generating...",
+            "thinking...",
+            "working...",
+        ],
         // `--dangerously-skip-permissions` is documented in `agy --help` as
         // "Auto-approve all tool permission requests without prompting", and
         // `--mode <accept-edits|plan>` was measured on the same help 2026-08-13
@@ -2262,16 +2302,6 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // table, and the brand's actual colour rather than a nearest match.
         brand_color: "#000000",
         menu_hint: 'g',
-        // ⚠ STAYS `Generated`, and the reason CHANGED once the store became
-        // readable. The help is clear that grok owns session titles — `--resume`
-        // matches "session titles for the current directory" and speaks of a
-        // "sole renamed match" — and `summary.json` has a `session_summary`
-        // field for it. But that field was **empty in every session observed**,
-        // and a field that exists is not evidence the CLI fills it. Declaring
-        // `Store` on a field name alone would make yggterm respect a title that
-        // is not there and leave the row nameless. The reader below returns the
-        // summary when it is non-empty, so nothing is lost either way; flip this
-        // when a session with real turns is seen carrying one.
         title_authority: TitleAuthority::Generated,
         // MEASURED: `-s, --session-id <SESSION_ID>` — "Use a specific session
         // UUID for a **new** conversation (must be a valid UUID and must not
@@ -2282,11 +2312,24 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         wrapper_slug: Some("grok"),
         remote_row_scheme: Some("remote-grok://"),
         runtime_key_scheme: Some("grok-runtime://"),
-        // ⛔ UNMEASURED — no working screen has been observed, because creating
-        // a session needs `grok login` (see `store_scan_gap`). Empty means the
-        // activity verdict is `Unknown` rather than a guess, which is the answer
-        // that cannot mislead a caller into reading a grinding row as finished.
-        working_screen_phrases: &[],
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "esc to cancel",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "esc to interrupt",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "thinking...",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "working...",
+                also_any: &[],
+            },
+        ],
         working_screen_negations: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
         resume_selector: ResumeSelector::Flag("--resume"),
@@ -2587,14 +2630,15 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             .file_name()?
             .to_str()?
             .to_string();
-        if session_id.is_empty() {
+        if session_id.is_empty() || session_id == "transcript" {
             return None;
         }
 
         let mut cwd = None;
+        let mut title = None;
         let mut detail = None;
 
-        // Try reading matching entry from history.jsonl if available
+        // Try reading matching entry from conversation_summaries.db if available
         if let Some(gemini_dir) = path
             .parent()
             .and_then(|p| p.parent())
@@ -2602,6 +2646,39 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
         {
+            let db_path = gemini_dir.join("conversation_summaries.db");
+            if db_path.exists() {
+                if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                    &db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                ) {
+                    if let Ok(mut stmt) = conn.prepare(
+                        "SELECT title, preview, workspace_uris FROM conversation_summaries WHERE conversation_id = ?1;",
+                    ) {
+                        if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
+                            if let Ok(Some(row)) = rows.next() {
+                                let t: String = row.get(0).unwrap_or_default();
+                                let p: String = row.get(1).unwrap_or_default();
+                                let uris: String = row.get(2).unwrap_or_default();
+                                let t = t.trim();
+                                let p = p.trim();
+                                if !t.is_empty() {
+                                    title = Some(t.to_string());
+                                } else if !p.is_empty() {
+                                    title = Some(p.to_string());
+                                }
+                                if let Some(parsed_cwd) = crate::parse_antigravity_workspace_uris(&uris) {
+                                    cwd = Some(parsed_cwd);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Try reading matching entry from history.jsonl if available
             let history_path = gemini_dir.join("history.jsonl");
             if let Ok(file) = std::fs::File::open(&history_path) {
                 use std::io::{BufRead, BufReader};
@@ -2609,14 +2686,21 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                 for line in reader.lines().flatten() {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                         if value.get("conversationId").and_then(|v| v.as_str()) == Some(&session_id) {
-                            if let Some(ws) = value.get("workspace").and_then(|v| v.as_str()) {
-                                if !ws.trim().is_empty() {
-                                    cwd = Some(ws.trim().to_string());
+                            if cwd.is_none() {
+                                if let Some(ws) = value.get("workspace").and_then(|v| v.as_str()) {
+                                    if !ws.trim().is_empty() {
+                                        cwd = Some(ws.trim().to_string());
+                                    }
                                 }
                             }
                             if let Some(display) = value.get("display").and_then(|v| v.as_str()) {
-                                if !display.trim().is_empty() && detail.is_none() {
-                                    detail = Some(display.trim().to_string());
+                                if !display.trim().is_empty() {
+                                    if detail.is_none() {
+                                        detail = Some(display.trim().to_string());
+                                    }
+                                    if title.is_none() {
+                                        title = Some(display.trim().to_string());
+                                    }
                                 }
                             }
                         }
@@ -2630,28 +2714,35 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             use std::io::{BufRead, BufReader};
             let reader = BufReader::new(file);
             for (idx, line) in reader.lines().flatten().enumerate() {
-                if idx > 10 {
+                if idx > 20 {
                     break;
                 }
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                     if value.get("type").and_then(|v| v.as_str()) == Some("USER_INPUT") {
                         if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
                             if detail.is_none() {
-                                let prompt = if let Some(req) = content.strip_prefix("<USER_REQUEST>") {
-                                    req.split("</USER_REQUEST>").next().unwrap_or(req).trim()
+                                let prompt = if let Some(idx) = content.find("<USER_REQUEST>") {
+                                    let after = &content[idx + "<USER_REQUEST>".len()..];
+                                    after.split("</USER_REQUEST>").next().unwrap_or(after).trim()
                                 } else {
                                     content.trim()
                                 };
                                 if !prompt.is_empty() {
                                     detail = Some(prompt.to_string());
+                                    if title.is_none() {
+                                        title = crate::best_effort_title_from_context(prompt);
+                                    }
                                 }
                             }
                             if cwd.is_none() && content.contains("[URI] -> [CorpusName]:") {
-                                if let Some(after) = content.split("[URI] -> [CorpusName]:\n").nth(1) {
-                                    if let Some(line) = after.lines().next() {
-                                        if let Some(ws) = line.split(" -> ").next() {
+                                if let Some(idx) = content.find("[URI] -> [CorpusName]:") {
+                                    let after = &content[idx + "[URI] -> [CorpusName]:".len()..];
+                                    for l in after.lines() {
+                                        let l = l.trim();
+                                        if let Some((ws, _)) = l.split_once(" -> ") {
                                             if !ws.trim().is_empty() {
                                                 cwd = Some(ws.trim().to_string());
+                                                break;
                                             }
                                         }
                                     }
@@ -2663,12 +2754,18 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             }
         }
 
+        if title.is_none() {
+            if let Some(d) = detail.as_deref() {
+                title = crate::best_effort_title_from_context(d);
+            }
+        }
+
         let cwd = cwd.or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().to_string()))?;
         return Some(AgentStoreEntry {
             session_id,
             cwd,
             modified_epoch_ms: modified_epoch_ms_of(path),
-            title: None,
+            title,
             detail,
         });
     }

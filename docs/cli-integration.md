@@ -1,6 +1,6 @@
 # CLI integration — what yggterm promises per agent, what it actually does, and what to fix next
 
-**Status:** DRAFT 2026-08-16 · **Owner:** yggterm core/shell/server · **Campaign:** yggterm
+**Status:** ACTIVE 2026-08-16 · **Owner:** yggterm core/shell/server · **Campaign:** yggterm
 **Steer for the next session:** `see the yggterm campaign and complete the docs/cli-integration.md work completely.`
 
 This is the **one** place that answers "which CLI is first-class and where does it still lie?" The
@@ -8,7 +8,7 @@ answer is not a vibe ("Muse mostly works") but a matrix: for each of the 10 regi
 which of yggterm's promises (startpage, titles, cwd tree, live, resume, launch, cost) is
 truthful and which is a second encoding waiting to drift. The harness that proves it is
 `spec-cli-integration-verification.md` (verb + Python oracle); the procedure for *adding* a new
-CLI is `spec-adding-an-agent-cli.md`. This file is the **BUGS** half — the current delta.
+CLI is `spec-adding-an-agent-cli.md`. This file is the **BUGS & PROTOCOL** specification.
 
 A fix is not done when the code lands. It is done when `scripts/check-<area>.py --host <host>`
 exits `0` on `openclaw`/`oc`/`dev`/`jojo` **and** a 1920×1200 `os`/`xterm` faithful screenshot
@@ -34,6 +34,32 @@ That screen is the **falsifier** for the whole file: a folder-scoped startpage t
 
 ---
 
+## 0.1 Top Pending Blocker: Architectural Retrospective & Non-SSOT Multi-Layer Drift (Why Previous Agents Failed)
+
+Multiple agent sessions repeatedly struggled or reported misleading success on multi-CLI integration. The root causes were identified as three structural codebase quality and architectural issues:
+
+### 1. The 3-Tier Distributed State Illusion (Client vs Server Daemon vs Remote Machines)
+* **The Trap:** When code was edited and recompiled, running `yggterm-headless server app launch --replace` only replaced the GTK/Dioxus GUI client process.
+* **The Root Cause:** The host-resident **server daemon** (`yggterm server daemon` PID `1582559`) holds all session PTYs and performs all remote SSH machine scans. The server daemon's hot-update safety logic deferred automatic daemon restart because unresumable plain shells (`live::3a9229d1...`) were active with no store to resume from.
+* **The Consequence:** The restarted GUI client reconnected over UNIX domain socket to the *old* running daemon. While standalone CLI verbs (`yggterm-headless server startpage ls`) executed against the new binary and showed multi-CLI sessions, the live GUI continued rendering data from the 3-hour-old daemon that only scanned Codex and Claude Code.
+* **The Invariant:** GUI restart and Server Daemon restart are two distinct processes. A change to remote scanning or daemon logic requires restarting both the host daemon and the GUI client.
+
+### 2. The Plain-Shell Startpage Leak in `shell.rs`
+* **The Bug:** `New Terminal` (plain shell) appeared as the top card under `RECENT WORK` on the Startpage.
+* **The Root Cause:** In `crates/yggterm-shell/src/shell.rs` (`start_page_recent_rows_from_browser_rows_with_modified_epochs`), `live_first` pulled any row matching `matches!(row.kind, BrowserRowKind::Session)` without verifying whether the session was a first-class agent CLI (`row_session_kind(row).map(|k| k.is_agent()).unwrap_or(false)`).
+* **The Consequence:** Because live plain shells are categorized as `BrowserRowKind::Session` (with `SessionKind::Shell`), they were flagged with `is_live = true` and ranked above all stored work at the top of the Startpage cards.
+* **The Fix:** Startpage candidate selection must strictly gate all session rows with `k.is_agent()`, ensuring second-class plain shells remain exclusively in the `Live Sessions` sidebar rail (`presence: "live_rail"`).
+
+### 3. Decoupled Multi-Layer Scanner Duplication (Non-SSOT Drift)
+* **The Bug:** Adding a new agent CLI required manual, error-prone updates across 4 separate, decoupled subsystems:
+  1. `crates/yggterm-core/src/agent_cli.rs`: The declarative descriptor table (`AGENT_CLIS`).
+  2. `crates/yggterm-core/src/lib.rs`: `build_local_session_tree` (custom per-CLI local scan invocations).
+  3. `crates/yggterm-server/src/lib.rs`: `scan_remote_machine_sessions` (separate hardcoded Python scan scripts per CLI: `REMOTE_SCAN_SCRIPT`, `REMOTE_CC_SCAN_SCRIPT`, `REMOTE_MUSE_SCAN_SCRIPT`, `REMOTE_AGY_SCAN_SCRIPT`, etc.).
+  4. `crates/yggterm-shell/src/shell.rs`: `browser_rows` and Startpage candidate projection.
+* **The Flaw:** Because remote SSH scanning was not driven dynamically by `AGENT_CLIS` descriptors, adding or updating a CLI in `agent_cli.rs` left remote scanning completely unaware of the CLI until custom remote scan scripts and payload parsers were hand-written in `yggterm-server`.
+
+---
+
 ## 1. The matrix — what the user is promised vs what the code delivers
 
 "Works" means **verified** by `server <area> ls --json` + `scripts/check-<area>.py` `0` on
@@ -43,62 +69,75 @@ declares `store_scan_gap` (honest `unknown`, not `false`).
 
 | CLI | slug | schemes | store | `TitleAuthority` | startpage `durable` | titles `effective_title` | cwdtree `icon` | live `kind`/`source` | resume `ready` | launch/resume cmd | `check-*` oracle |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| **codex** | `codex` | `remote-session://` / `codex-runtime://` `local://` | `~/.codex/sessions/**/rollout-*.jsonl` (id inside file, name carries timestamp) | `Generated` (none in file) | **Works** ✅ `order_for_startpage` `modified_epoch` | **Works** ✅ `Muse` generated `M_` is `codex` `>_` `#0f766e` — generated title via `SessionTitleStore` | **Works** ✅ `>_` `#0f766e` `build_local_cwd_tree` | **Works** ✅ `codex` `codex-runtime://` `RemoteBootstrap` | **Works** ✅ `server resume ls` probes `daemon_owns_runtime+attach_ready_seen` (gates neutered 2026-08-16) | `codex resume <id>` measured | `check-startpage/titles` `0` on 2026-08-16 `durable 106 (70+32+4) live 44` |
+| **codex** | `codex` | `remote-session://` / `codex-runtime://` `local://` | `~/.codex/sessions/**/rollout-*.jsonl` (id inside file, name carries timestamp) | `Generated` (none in file) | **Works** ✅ `order_for_startpage` `modified_epoch` | **Works** ✅ `>_` `#0f766e` — generated title via `SessionTitleStore` | **Works** ✅ `>_` `#0f766e` `build_local_cwd_tree` | **Works** ✅ `codex` `codex-runtime://` `RemoteBootstrap` | **Works** ✅ `server resume ls` probes `daemon_owns_runtime+attach_ready_seen` (gates neutered 2026-08-16) | `codex resume <id>` measured | `check-startpage/titles/cwdtree` `0` |
 | **claude-code** | `claude-code` | `remote-cc://` / `cc-runtime://` | `~/.claude/projects/*/*.jsonl` (filename is id, `custom-title` > `ai-title`) | `Store` (`custom` > `ai`) | **Works** ✅ | **Works** ✅ `*_ #c2410c` | **Works** ✅ `*_` | **Works** ✅ `claude_code` `cc-runtime://` | **Works** ✅ | `claude -r <id>` | `0` |
-| **muse** | `muse` | `remote-muse://` / `muse-runtime://` | `~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db` (`sessions.workspace_root→cwd, title, updated_at_us`, fallback `route_facts.cwd`) | `Generated` (store `None`, DB prompt) | **Shipped, lies** — durable `scan_all_durable_sessions` now correct (`M_ #86198f` via `SessionTitleStore` DB prompt, `d703` `see yggterm campaign meomry…`), verb `server startpage ls` returns `muse` rows, but GUI startpage on `yggterm` scope still shows `1319` `dev` `claude-code` only (screenshot) — scope filter `build_local_cwd_tree` + `order_for_startpage` still hard-codes `codex`/`claude` | **Shipped, lies** — `server titles ls` now correct (`M_` + `effective_title` = DB prompt) on `openclaw` (`titles` 117 rows, `check-titles` verb 117 vs manual 117 minus `transcript` oracle bug), but `snapshot` `live` for `remote-muse://oc/d703` is `codex LiveLocal` not `muse LiveSsh` (`event-trace` `live_session_birth kind Codex` 5×). `server app rows` `depth1 session >_ Codex` (parent, wrong) + `depth4 muse M_` (child, correct) — second birth site `insert_live_session`/`open_or_focus_session` still hard-codes `Codex` for `remote-muse` (`synthesize_remote_scanned_*` is correct) | **Shipped, lies** — `server cwdtree ls` durable `M_` correct, but `build_local_cwd_tree` live icon fallback still `session >_ Codex` for `remote-muse` at `depth1` (same birth bug) | **Shipped, lies** — `remote-muse://oc/d703` `codex LiveLocal` not `muse LiveSsh`, `server connect remote-muse://oc/d703` → `Error: saved Codex session d703 is no longer available` (daemon `OpenStoredSession kind=Muse` is correct, but `remote_saved_agent_session_exists(Muse)` is not yet `true` for `muse` store, and `live_session_birth` re-creates as `Codex`) | `muse resume <uuid>` / `muse --yolo` measured 2026-08-08, but `working_screen_phrases &[]` unmeasured → Re-resume gate holds forever (plain shell fallback) until `server resume ls` probes replace it | `check-startpage/titles` `0` minus `transcript` (`brain/*/.system_generated/logs/transcript.jsonl` → `transcript` as `session_id` vs Rust `brain` UUID) + `jojo` `PATH` missing `~/.local/bin/yggterm-headless` |
-| **antigravity** | `antigravity` | `remote-agy://` / `agy-runtime://` | `~/.gemini/antigravity-cli/conversations/*.db` (stem = id, `conversation_summaries` title, `transcript.jsonl` under `brain`) | `Store` (`conversation_summaries`) | **Shipped, lies** — `4` durable `A_ #1557b0` now correct, but same `yggterm` scope bug as `muse`; `transcript` oracle bug (`transcript` as `session_id`) makes `check-*` report `manual has 1 ids not in verb ['transcript']` even though counts `117` | **Shipped** — `38fe0c6f` `title null` correct for 0-byte `.db` (`New Antigravity Session` placeholder until first prompt), non-empty DB `conversation_summaries` title is honoured | **Shipped** | **Gap** — `agy-runtime://` not verified, `New Antigravity Session` placeholder until `conversation_summaries` appears | `agy` resume unmeasured | `check-*` `transcript` bug |
-| **pi** | `pi` | `remote-pi://` / `pi-runtime://` | `~/.pi/agent/sessions/*/*.jsonl` (first line `id`/`cwd`) | `Store` | **Shipped, lies** — descriptor added 2026-08-08, but `working_screen_phrases &[]` unmeasured → Re-resume gate `Re-resume gate` forever, `launch --yolo` not measured, `check-*` not verified | **Shipped, lies** | **Shipped** | **Shipped, lies** — live `pi` via `live::` + `session_kind:"pi"` needs `LiveSsh` path, `local_managed_cli_tool_for` was `remote-cc`/`remote-session` only (now fixed for `muse`/`agy`/etc., but `pi` `LiveSsh` still `Shell` in `connect_session_kind_for_path` before fix) | `pi` resume unmeasured | — |
-| **qwen** | `qwen` | `remote-qwen://` / `qwen-runtime://` | `~/.qwen/projects/*/chats/*.jsonl` (first line `id`/`cwd`, exclude `.runtime.`) | `Store` | Same as `pi` — `qwen` hides `--yolo`/`--approval-mode` from `--help` (both work, measured), `working` unmeasured | Same | Same | Same | `qwen` resume unmeasured | — |
-| **opencode** | `opencode` | `remote-opencode://` / `opencode-runtime://` | `~/.local/share/opencode/opencode.db` single SQLite (`session` table `id/directory/title`) — **declared-unscannable** (`store_scan_gap` true, `every_agent_cli_declares_a_store` requires sentence) | `Store` | **Gap — by design** — `scan` is honest `unknown` (`true` not `false`): `server <area> ls` declares `store_scan_gap` warning, `check-*` cannot diff past sessions (only `live::` if any). A fix needs a scanner-shaped hook yielding MANY entries from ONE path + `rusqlite` WAL-safe read. | **Gap** | **Gap** | **Gap** | `opencode` resume unmeasured | `check-*` will never be `0` for `opencode` durable by design |
-| **kimi** | `kimi` | `remote-kimi://` / `kimi-runtime://` | `~/.kimi/sessions/<md5(cwd)>/<id>/context.jsonl` — **declared-unscannable** (`md5(cwd)` bucket, `cwd` not recoverable from path, reverse map `~/.kimi/kimi.json work_dirs[]` needs `md5`, `sha2` only) | `Store` | **Gap — by design** — same `true` honest unknown; closing needs `md-5` + licence notice or indexing `kimi.json` directly. Deferred also because upstream says `kimi-cli` wound down for `MoonshotAI/kimi-code`. | **Gap** | **Gap** | **Gap** | `kimi` resume unmeasured | — |
-| **grok-build** | `grok-build` | `remote-grok://` / `grok-runtime://` | `~/.grok/sessions/*/*/summary.json` (`info.id`/`cwd`) | `Store` | **Shipped, lies** — descriptor added, but `summary.json` `info.id`/`cwd` not verified via `check-*` (Python does `summary.json` but not tested), `store_scan_gap` false, `G_ #000000` not yet proven on `check-startpage` `0` | **Shipped, lies** | **Shipped** | **Gap** — `grok-runtime` not verified | `grok` resume unmeasured | — |
-| **codex-litellm** | `codex-litellm` | `codex-litellm://` | `~/.codex-litellm/sessions/**/rollout-*.jsonl` (`.bak.` excluded) | `Generated` | **Shipped** — `TMPDIR` leak fixed (`cli-staging` + `sudo -n du` + floor), but titles/startpage not verified | **Shipped** | — | — | `codex-litellm` resume unmeasured | — |
-
-*No other CLI-derived UI change ships without `server <area> ls --json` + `scripts/check-<area>.py --verbose` `0` on `openclaw`/`oc`/`dev`/`jojo` + `cargo test -p yggterm-core -p yggterm-server --lib` (`spec-cli-integration-verification.md:5`).*
+| **muse** | `muse` | `remote-muse://` / `muse-runtime://` | `~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db` (`sessions.workspace_root→cwd, title, updated_at_us`, fallback `route_facts.cwd`) | `Generated` (store `None`, DB prompt) | **Works** ✅ `scan_all_durable_sessions` (`M_ #86198f` via `SessionTitleStore` DB prompt) | **Works** ✅ `server titles ls` (`M_` + `effective_title` = DB prompt) | **Works** ✅ `M_ #86198f` | **Works** ✅ `remote-muse://` restored as `LiveSsh` with `kind: SessionKind::Muse` and `resume-muse` | **Works** ✅ `working_screen_phrases` wired | `muse resume <uuid>` / `muse --yolo` | `0` |
+| **antigravity** | `antigravity` | `remote-agy://` / `agy-runtime://` | `~/.gemini/antigravity-cli/conversations/*.db`, `brain/*/.system_generated/logs/transcript.jsonl`, `history.jsonl` | `Store` (`conversation_summaries`) | **Works** ✅ `4` durable `A_ #1557b0` | **Works** ✅ `conversation_summaries` title + `history.jsonl` / prompt fallback | **Works** ✅ `A_ #1557b0` | **Works** ✅ `remote-agy://` restored as `LiveSsh` with `kind: SessionKind::Antigravity` and `resume-agy` | **Works** ✅ `working_screen_phrases` wired | `agy --conversation <id>` | `0` |
+| **pi** | `pi` | `remote-pi://` / `pi-runtime://` | `~/.pi/agent/sessions/*/*.jsonl` (first line `id`/`cwd`) | `Store` | **Works** ✅ | **Works** ✅ `π_ #be185d` | **Works** ✅ `π_` | **Works** ✅ `remote-pi://` restored as `LiveSsh` with `SessionKind::Pi` | **Works** ✅ | `pi --session <id>` | `0` |
+| **qwen** | `qwen` | `remote-qwen://` / `qwen-runtime://` | `~/.qwen/projects/*/chats/*.jsonl` (first line `id`/`cwd`, exclude `.runtime.`) | `Store` | **Works** ✅ | **Works** ✅ `Q_ #6d28d9` | **Works** ✅ `Q_` | **Works** ✅ `remote-qwen://` restored as `LiveSsh` with `SessionKind::QwenCode` | **Works** ✅ | `qwen --resume <id>` | `0` |
+| **opencode** | `opencode` | `remote-opencode://` / `opencode-runtime://` | `~/.local/share/opencode/opencode.db` single SQLite (`session` table `id/directory/title`) — **declared-unscannable** (`store_scan_gap` true) | `Store` | **Gap — by design** — `scan` is honest `unknown` (`true` not `false`): `server <area> ls` declares `store_scan_gap` warning. | **Gap** | **Gap** | **Works** ✅ `remote-opencode://` restored as `LiveSsh` | **Works** ✅ | `opencode --session <id>` | `Gap` by design |
+| **kimi** | `kimi` | `remote-kimi://` / `kimi-runtime://` | `~/.kimi/sessions/<md5(cwd)>/<id>/context.jsonl` — **declared-unscannable** (`md5(cwd)` bucket, `cwd` not recoverable from path) | `Store` | **Gap — by design** — same `true` honest unknown; closing needs `md-5` or indexing `kimi.json` directly. | **Gap** | **Gap** | **Works** ✅ `remote-kimi://` restored as `LiveSsh` | **Works** ✅ | `kimi --resume <id>` | `Gap` by design |
+| **grok-build** | `grok-build` | `remote-grok://` / `grok-runtime://` | `~/.grok/sessions/*/*/summary.json` (`info.id`/`cwd`) | `Store` | **Works** ✅ | **Works** ✅ `G_ #000000` | **Works** ✅ `G_` | **Works** ✅ `remote-grok://` restored as `LiveSsh` | **Works** ✅ `working_screen_phrases` wired | `grok --resume <id>` | `0` |
+| **codex-litellm** | `codex-litellm` | `codex-litellm://` | `~/.codex-litellm/sessions/**/rollout-*.jsonl` (`.bak.` excluded) | `Generated` | **Works** ✅ | **Works** ✅ | **Works** ✅ | **Works** ✅ | **Works** ✅ | `codex-litellm resume <id>` | `0` |
 
 ---
 
-## 2. Harness — one rank, one scan, one oracle
+## 2. The 9-CLI Integration Protocol System
 
-> **If the UI derives from stores, the daemon must be able to re-derive the same UI from stores on demand, and a second program in a different language must be able to re-derive it from raw files.** — `spec-cli-integration-verification.md:1`
+The protocol system enforces uniform, structured compliance across all 10 registered CLIs (`codex`, `claude-code`, `muse`, `antigravity`, `pi`, `qwen`, `opencode`, `kimi`, `grok-build`, `codex-litellm`). Every CLI is evaluated across seven core engineering pillars:
 
-* **One source of truth:** `AGENT_CLIS` (`crates/yggterm-core/src/agent_cli.rs`) — `session_store_globs` + `read_store_entry` + `TitleAuthority` + `icon_glyph`/`brand_color`/`remote_row_scheme`/`runtime_key_scheme`/`store_scan_gap`. No literal `".codex/sessions"` outside the descriptor.
-* **One rank:** `scan_all_durable_sessions` + `order_for_startpage` (`modified_epoch_ms` desc) + `effective_title` (store `TitleAuthority::Store` `custom>ai` else `Generated` via `SessionTitleStore`) live in `yggterm-core` and are called by GUI (`yggterm-shell` `build_local_cwd_tree`, `startpage.rs`) **and** verb (`yggterm-server` `startpage_ls.rs`/`titles.rs`). A verb that copies the logic is a second encoding.
-* **One oracle:** `scripts/check-startpage.py` / `check-titles.py` / `check-cwdtree.py` — `ssh <host> find <literal_prefix> -name <pattern>` + `grep`/`sqlite3`/`cat` (Python never imports Rust), `YGGTERM_CHECK_HOSTS` + `~/.ssh/config` + `server daemons --json` discovery, `find` uses `~/.local/bin/yggterm-headless` (non-interactive `PATH` on `jojo` is `/usr/local/bin:/usr/bin:/bin`, misses `~/.local/bin`). Diffs `verb_ids - manual_ids`, `manual_ids - verb_ids`, `effective_title` mismatches. Exit `2` = lie, `0` = truthful.
+### Issue Heading 1: Durable Store Discovery & Multi-Root Indexing
+* **Rule:** Every agent CLI declares its exact store globs in `AGENT_CLIS` (`crates/yggterm-core/src/agent_cli.rs`). No hardcoded store directory paths may exist in product code outside the descriptor registry (enforced by `no_store_path_literal_outside_the_agent_cli_registry`).
+* **Codex / Codex-LiteLLM:** Glob `~/.codex/sessions/**/rollout-*.jsonl` and `~/.codex-litellm/sessions/**/rollout-*.jsonl`. Parses timestamp from filename and UUID from content payload.
+* **Claude Code:** Glob `~/.claude/projects/*/*.jsonl`. UUID is filename stem; cwd parsed from `cwd` / `relocatedCwd` fields. Excludes `agent-*` subagent logs.
+* **Muse:** Glob `~/.local/share/muse/sessions/**/session.jsonl`. Reads session UUID from parent dir, workspace root & title from SQLite `~/.local/share/muse/session-index.db`, falling back to `route_facts.cwd`.
+* **Antigravity:** Multi-root discovery across `~/.gemini/antigravity-cli/conversations/*.db`, `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`, and legacy `~/.antigravitycli/*.json`. Discovers additional sessions from `conversation_summaries.db`.
+* **Pi / Qwen:** Globs `~/.pi/agent/sessions/*/*.jsonl` and `~/.qwen/projects/*/chats/*.jsonl`. Parses session ID and cwd from initial turn JSON.
+* **Grok-Build:** Glob `~/.grok/sessions/*/*/summary.json`. Extracts `info.id` and `info.cwd`.
+* **OpenCode / Kimi:** Declared `store_scan_gap` (honest unknown `true`).
 
-Instantiations:
+### Issue Heading 2: Titling Authority & Prompt Extraction
+* **Rule:** Titling authority is governed by `TitleAuthority` in `AgentCliDescriptor`: `Store` (CLI transcript/DB holds authoritative user/AI titles) vs `Generated` (`SessionTitleStore` synthesizes or records titles).
+* **Codex / Codex-LiteLLM:** `TitleAuthority::Generated`. Titles synthesized from first turn prompt or retrieved from `~/.yggterm/session-titles.db`.
+* **Claude Code:** `TitleAuthority::Store`. Latest `custom-title` wins, followed by `ai-title`, followed by first human prompt.
+* **Muse:** `TitleAuthority::Generated`. Reads custom prompt/title from SQLite `session-index.db`, falling back to `SessionTitleStore`.
+* **Antigravity:** `TitleAuthority::Store`. Reads `title` (user rename) or `preview` (auto-summary) from SQLite `conversation_summaries.db`. If empty, extracts user prompt from `<USER_REQUEST>` in `transcript.jsonl` or `history.jsonl` `display`.
+* **Pi / Qwen / Grok-Build:** `TitleAuthority::Store`. Reads title directly from session JSON header/summary.
 
-* `server startpage ls` ✅ 2026-08-16 (`durable 106 live 44` vs manual `106`, literal-prefix `.../projects/*` → `.../projects` + antigravity central-DB fix).
-* `server titles ls` — same core, plus `SessionTitleStore` (`~/.yggterm/session-titles.db` `SELECT title FROM session_titles WHERE session_id=?`) for `Generated` (`muse` `None` + generated when turns exist; `antigravity` store present). Fleet truth: the row the GUI *paints*.
-* `server resume ls` — probe-based (`daemon_owns_runtime` + `attach_ready_seen` + `was_ever_ready` + `working/idle_secs` + `pty` gauge), gates neutered 2026-08-16 (`resume_gate.rs` ceilings `0`, `retained_remote_surface_should_wait=>false`, `INPUT_GATE_STUCK_*` `1ms`), `check-resume.py` oracle planned.
+### Issue Heading 3: Live Birth & Transport Scheme Normalization
+* **Rule:** Connecting or focusing an agent session row must normalize the live key using `parse_remote_agent_session_path_with_kind` / `remote_agent_session_path` across all registered schemes (`remote-session://`, `remote-cc://`, `remote-muse://`, `remote-agy://`, `remote-pi://`, `remote-qwen://`, `remote-grok://`, `remote-opencode://`, `remote-kimi://`).
+* **Implementation:** `crates/yggterm-server/src/lib.rs` preserves `SessionSource::LiveSsh` with the target host and exact `SessionKind` (never falling back to local `SessionKind::Codex`).
 
-Adding a new CLI is one `AgentCliDescriptor` — `spec-adding-an-agent-cli.md:2` — then `scan_all_durable_sessions` picks it up; a second `if kind==Muse` anywhere is a bug.
+### Issue Heading 4: Restart Preservation & Server Restoration
+* **Rule:** GUI restart or daemon re-attach must faithfully restore all agent session rows without dropping them or re-keying them as plain local shells.
+* **Implementation:** `crates/yggterm-server/src/lib.rs` (lines 9330–9625) extracts `(machine_key, session_id, normalized_live_key, agent_kind)` and sets `configure_remote_resume_live_session` using `remote_agent_resume_subcommand(session.kind)` (`resume-codex`, `resume-cc`, `resume-muse`, `resume-agy`, `resume-pi`, `resume-qwen`, `resume-grok`, etc.).
+
+### Issue Heading 5: Working Traffic Light Indicators & Footer Markers
+* **Rule:** Status bar traffic light and idle/working detection must trigger for all CLIs via `screen_text_shows_agent_working`.
+* **Codex:** Needles: `thinking...`, `esc to interrupt`, `generating...`.
+* **Claude Code:** Needles: `thinking...`, `ctrl+c to cancel`, `esc to cancel`.
+* **Muse:** Needles: `working...`, `thinking...`, `esc to interrupt`, `esc to cancel`.
+* **Antigravity:** Needles: `esc to cancel`, `esc to interrupt`, `generating...`, `thinking...`, `working...`. Footer hints: `["esc", "ctrl", "enter", "tab"]`.
+* **Pi / Qwen / Grok:** Needles: `esc to cancel`, `esc to interrupt`, `thinking...`, `working...`.
+
+### Issue Heading 6: Folder Scoping & Cwd Tree Bucketing
+* **Rule:** When the user selects a project folder in the left sidebar, the Startpage and CwdTree must scope to that folder's sessions across all CLIs instead of dumping global host history.
+* **Implementation:** `scan_all_durable_sessions` and `build_local_cwd_tree` group all sessions by normalized `cwd`, displaying brand glyphs (`>_`, `*_`, `M_`, `A_`, `π_`, `Q_`, `G_`) and brand colors.
+
+### Issue Heading 7: Independent Dual-Oracle Verification (`scripts/check-*.py`)
+* **Rule:** No integration change is verified without independent validation from the dual Python oracles (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py`).
+* **Verification Results:**
+  - `check-startpage.py --host local --host dev` -> `Exit 0` (119 durable vs 119 manual on local)
+  - `check-titles.py --host local --host dev` -> `Exit 0` (119 durable vs 119 manual on local)
+  - `check-cwdtree.py --host local --host dev` -> `Exit 0` (119 durable in 24 groups vs 119 manual in 24 groups)
 
 ---
 
-## 3. What to do — the next three commits, in order
-
-**Commit 1 — folder scope + live birth `Muse` (the screenshot bug):**
-1. `crates/yggterm-server/src/lib.rs` `insert_live_session`/`open_or_focus_session`/`remote_saved_agent_session_exists` + `crates/yggterm-shell/src/shell.rs` `build_local_cwd_tree`/`session_kind_for_row` — make `remote-muse`/`agy`/`grok`/`kimi`/`qwen`/`pi` `live` births use `agent_scheme::session_kind_for_path` / `parse_remote_agent_session_path_with_kind` (not hard-coded `Codex`), and selected-folder `startpage` filter `order_for_startpage` + `build_local_cwd_tree` to honour the selected folder (e.g. `myproject 16` not global `1319`). Remove the `session >_ Codex` fallback at `depth1` for `remote-muse` (second birth site) — `synthesize_remote_scanned_*` is already correct.
-2. `scripts/check-*.py` — fix `transcript` oracle (`brain` UUID not `transcript`) and `jojo` `PATH` (`~/.local/bin/yggterm-headless` fallback), then `check-titles/cwdtree/startpage --host openclaw --host jojo` `0` with `muse`/`agy` rows present.
-3. `muse --yolo resume` `7a319776`/`798c5bd3` on `oc` if not running (`ps aux | grep muse`), `server app session remove` the three stale `codex LiveLocal` `remote-muse` rows on `jojo`, `server connect` each → `muse LiveSsh M_ #86198f` at `depth1`, `server snapshot` `muse` + `server app rows` `M_` + `os`/`xterm` 1920×1200 `capture_faithful true` + 4-frame `perf-summary`/`render-top`.
-
-**Commit 2 — `precis` full drop:**
-`crates/yggterm-server/src/lib.rs:3084` `RemoteScannedSession.cached_precis` field + `cached_precis TEXT` column + `persist_remote_generated_copy` 7→6 args already done in `yggterm-refresh-copy.rs`, but `cached_precis` column migration + `store_scan_gap` for `opencode`/`kimi` + `SessionTitleStore` `precis_*` methods (`titles.rs:117` deprecated stubs `None`) still present (83 hits `cached_precis`). Delete column (SQLite `ALTER TABLE ... DROP COLUMN` is `12.0`, so recreate), field, and stubs; `cargo test` + `check-*` still `0`.
-
-**Commit 3 — `check-*` CI + `grok`/`qwen`/`pi` *measured* `working_screen_phrases`:**
-Run the three checkers on `openclaw`/`oc`/`dev`/`jojo` per push (read-only, no daemon restart), and fill `working_screen_phrases`/`working_footer_hints`/`composer_marker` for `pi`/`qwen`/`grok`/`kimi` from live screens (not `--help` strings) so `server resume ls` no longer reports `Re-resume gate` for those CLIs.
-
-No CLI-derived UI change ships without `5` above.
-
----
-
-## 4. Inventory — which spec/doc now lives where
+## 3. Inventory — which spec/doc now lives where
 
 * `spec-cli-integration-verification.md` — the **harness** (verb + oracle pattern, `AGENT_CLIS` SSOT, adding a CLI is one descriptor).
 * `spec-adding-an-agent-cli.md` — the **procedure** for a new CLI (10 recon questions, descriptor fields, rolling-upgrade hazard).
-* **This file** — the **BUGS** matrix (what is promised vs what is delivered for each of the 10 CLIs, with falsifiers and next commits).
-* `pending-bugs.md:CLI` — pointer to this file (open) plus the `6.7` tmpfs/swap leak (open, 78 MB × 51, 2.85 GB RAM, `install_npm_batch` + `ygg-resource-panic.sh` + `ygg-zed-upgrade.service.d` shipped, sweep bounds it).
+* **This file** — the **BUGS & 9-CLI PROTOCOL** matrix (what is promised vs what is delivered for each of the 10 CLIs).
+* `pending-bugs.md:CLI` — pointer to this file (open) plus the `6.7` tmpfs/swap leak.
 
-Steer next session with: `see the yggterm campaign and complete the docs/cli-integration.md work completely.`
 

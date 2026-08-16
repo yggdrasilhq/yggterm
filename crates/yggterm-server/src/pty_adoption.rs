@@ -196,6 +196,7 @@ impl PtyChildHandle {
     /// is already gone — adopting a pid we cannot pin an identity to would
     /// create exactly the stranger-killing hazard this type exists to prevent.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(crate) fn adopt(pid: u32) -> Option<Self> {
         process_start_time(pid).map(|start_time| PtyChildHandle::Adopted { pid, start_time })
     }
@@ -260,6 +261,7 @@ impl PtyChildHandle {
     /// parent, so no status is ever delivered to us; returning a fabricated
     /// success would be worse than returning nothing. Callers that need "has it
     /// finished" must use [`is_running`](Self::is_running).
+    #[allow(dead_code)]
     pub(crate) fn exit_status(&mut self) -> Option<ExitStatus> {
         match self {
             PtyChildHandle::Owned(child) => child.try_wait().ok().flatten(),

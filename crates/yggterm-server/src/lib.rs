@@ -2698,28 +2698,32 @@ fn remote_scanned_session_from_live_codex(
     path_session_id: &str,
     live_runtime: bool,
 ) -> Option<RemoteScannedSession> {
-    if session.kind != SessionKind::Codex {
+    if !session.kind.is_agent() {
         return None;
     }
     let storage_path = session_metadata_value(session, "Storage").unwrap_or_default();
     if storage_path.trim().is_empty() {
         return None;
     }
-    let session_id = session_metadata_value(session, "Codex Session")
+    let session_id = session_metadata_value(session, "Session")
+        .or_else(|| session_metadata_value(session, "Codex Session"))
+        .or_else(|| session_metadata_value(session, "Claude Session"))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| path_session_id.to_string());
     let cwd = session_metadata_value(session, "Cwd")
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/home/user".to_string());
     let title_hint =
         if session.title.trim().is_empty() || looks_like_generated_fallback_title(&session.title) {
             short_session_id(&session_id)
         } else {
             session.title.clone()
         };
+    let scheme_path = yggterm_core::agent_scheme::remote_agent_session_path(session.kind, machine_key, &session_id);
     Some(RemoteScannedSession {
-        session_path: remote_scanned_session_path(machine_key, &session_id),
+        session_path: scheme_path,
         session_id,
         cwd,
         started_at: metadata_value(session, "Started"),
@@ -4670,7 +4674,8 @@ impl YggtermServer {
         &self,
         path: &str,
     ) -> Option<(RemoteMachineRef, String)> {
-        let (raw_machine_key, path_session_id) = parse_remote_scanned_session_path(path)?;
+        let rest = path.strip_prefix("remote-session://")?;
+        let (raw_machine_key, path_session_id) = rest.split_once('/')?;
         let machine_key = normalize_machine_key(raw_machine_key);
         let machine = self
             .remote_machines
@@ -9328,10 +9333,11 @@ impl YggtermServer {
             return;
         }
         let remote_scanned_key =
-            parse_remote_scanned_session_path(&key).map(|(raw_machine_key, session_id)| {
+            parse_remote_agent_session_path_with_kind(&key).map(|(raw_machine_key, session_id, agent_kind)| {
                 let machine_key = normalize_machine_key(raw_machine_key);
-                let normalized_live_key = remote_scanned_session_path(&machine_key, session_id);
-                (machine_key, session_id.to_string(), normalized_live_key)
+                let normalized_live_key = remote_agent_session_path(agent_kind, &machine_key, session_id)
+                    .unwrap_or_else(|| remote_scanned_session_path(&machine_key, session_id));
+                (machine_key, session_id.to_string(), normalized_live_key, agent_kind)
             });
         let restored_local_id =
             restored_local_runtime_id(&key, &id, kind, storage_path.as_deref())
@@ -9349,7 +9355,9 @@ impl YggtermServer {
         } else {
             id
         };
-        let normalized_kind = if remote_scanned_key.is_some() && kind == SessionKind::SshShell {
+        let normalized_kind = if let Some((_, _, _, agent_kind)) = remote_scanned_key.as_ref() {
+            *agent_kind
+        } else if kind == SessionKind::SshShell {
             SessionKind::Codex
         } else {
             kind
@@ -9370,25 +9378,25 @@ impl YggtermServer {
             cwd,
         };
         self.upsert_ssh_target(&target);
-        if let Some((machine_key, session_id, normalized_live_key)) = remote_scanned_key.as_ref() {
-            let has_saved_codex_identity = kind == SessionKind::Codex
+        if let Some((machine_key, session_id, normalized_live_key, agent_kind)) = remote_scanned_key.as_ref() {
+            let has_saved_agent_identity = agent_kind.is_agent()
                 && !id.trim().is_empty()
                 && storage_path
                     .as_deref()
                     .is_some_and(|path| !path.trim().is_empty());
-            let restored_codex_session_id = if has_saved_codex_identity {
+            let restored_agent_session_id = if has_saved_agent_identity {
                 id.clone()
             } else {
                 session_id.clone()
             };
-            let starts_new_codex = remote_launch_action.as_deref() == Some("start-codex")
+            let starts_new_agent = remote_launch_action.as_deref() == Some("start-codex")
                 && !temporary_update_restore
-                && !has_saved_codex_identity;
+                && !has_saved_agent_identity;
             let machine_ix = self
                 .remote_machines
                 .iter()
                 .position(|machine| machine.machine_key == *machine_key);
-            if !starts_new_codex
+            if !starts_new_agent
                 && let Some(machine_ix) = machine_ix
                 && let Some(session_ix) =
                     self.remote_machines[machine_ix]
@@ -9396,8 +9404,8 @@ impl YggtermServer {
                         .iter()
                         .position(|session| {
                             session.session_id == session_id.as_str()
-                                || (has_saved_codex_identity
-                                    && session.session_id == restored_codex_session_id.as_str())
+                                || (has_saved_agent_identity
+                                    && session.session_id == restored_agent_session_id.as_str())
                         })
             {
                 {
@@ -9440,13 +9448,16 @@ impl YggtermServer {
                 // over. The compiler had been reporting it as an unused
                 // binding.
                 session.outline_prefix = outline_prefix.clone();
-                if has_saved_codex_identity {
-                    session.id = restored_codex_session_id.clone();
+                if has_saved_agent_identity {
+                    session.id = restored_agent_session_id.clone();
                     session.session_path = normalized_live_key.clone();
+                    let meta_label = agent_cli_descriptor(*agent_kind)
+                        .map(|d| d.session_metadata_label)
+                        .unwrap_or("Session");
                     upsert_session_metadata(
                         &mut session.metadata,
-                        "Codex Session",
-                        restored_codex_session_id.clone(),
+                        meta_label,
+                        restored_agent_session_id.clone(),
                     );
                     upsert_session_metadata(
                         &mut session.metadata,
@@ -9540,7 +9551,7 @@ impl YggtermServer {
                 });
             self.insert_live_session_with_launch_options(
                 normalized_live_key,
-                restored_codex_session_id.as_str(),
+                restored_agent_session_id.as_str(),
                 normalized_kind,
                 &target,
                 Some(resolved_title.clone()),
@@ -9552,7 +9563,22 @@ impl YggtermServer {
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
                 session.title_is_explicit = title_is_explicit;
                 session.outline_prefix = outline_prefix.clone();
-                if starts_new_codex {
+                session.source = SessionSource::LiveSsh;
+                session.kind = *agent_kind;
+                session.id = restored_agent_session_id.clone();
+                session.ssh_target = Some(target.ssh_target.clone());
+                session.ssh_prefix = target.prefix.clone();
+                session.host_label = target.label.clone();
+                upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
+                let meta_label = agent_cli_descriptor(*agent_kind)
+                    .map(|d| d.session_metadata_label)
+                    .unwrap_or("Session");
+                upsert_session_metadata(&mut session.metadata, meta_label, restored_agent_session_id.clone());
+                upsert_session_metadata(&mut session.metadata, "UUID", restored_agent_session_id.clone());
+                if let Some(cwd) = target.cwd.as_deref() {
+                    upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+                }
+                if starts_new_agent {
                     configure_remote_new_codex_live_session(
                         session,
                         normalized_live_key,
@@ -9568,7 +9594,7 @@ impl YggtermServer {
                     configure_remote_resume_live_session(
                         session,
                         normalized_live_key,
-                        restored_codex_session_id.as_str(),
+                        restored_agent_session_id.as_str(),
                         &resolved_title,
                         &target,
                         &remote_binary,
@@ -9592,11 +9618,14 @@ impl YggtermServer {
                     created_by.as_deref(),
                     ephemeral.as_deref(),
                 );
-                if has_saved_codex_identity {
+                if has_saved_agent_identity {
+                    let meta_label = agent_cli_descriptor(*agent_kind)
+                        .map(|d| d.session_metadata_label)
+                        .unwrap_or("Session");
                     upsert_session_metadata(
                         &mut session.metadata,
-                        "Codex Session",
-                        restored_codex_session_id.clone(),
+                        meta_label,
+                        restored_agent_session_id.clone(),
                     );
                     upsert_session_metadata(
                         &mut session.metadata,
@@ -11352,9 +11381,7 @@ fn remote_scanned_row_path(
 }
 
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("remote-session://")?;
-    let (machine_key, session_id) = rest.split_once('/')?;
-    Some((machine_key, session_id))
+    parse_remote_agent_session_path(path)
 }
 
 fn parse_remote_muse_session_path(path: &str) -> Option<(&str, &str)> {
@@ -11601,15 +11628,14 @@ fn agent_store_holds_session(
             }
             continue;
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !descriptor.store_file_name_is_session(name) {
+        if !descriptor.store_path_is_session_file(&path.display().to_string()) {
             continue;
         }
-        if (descriptor.read_store_entry)(&path)
-            .is_some_and(|stored| stored.session_id == session_id)
-        {
+        if (descriptor.read_store_entry)(&path).is_some_and(|stored| {
+            stored.session_id == session_id
+                || stored.session_id.starts_with(session_id)
+                || session_id.starts_with(&stored.session_id)
+        }) {
             return true;
         }
     }
@@ -12072,15 +12098,21 @@ fn remote_resume_picker_shell_command_with_terminal_appearance(
         terminal_appearance,
     )
     .unwrap_or_else(|_| {
-        let picker = match (kind, persistent) {
-            (SessionKind::ClaudeCode, true) => "exec claude --resume",
-            (SessionKind::ClaudeCode, false) => "claude --resume",
-            (_, true) => "exec codex resume",
-            (_, false) => "codex resume",
+        let descriptor = agent_cli_descriptor(kind);
+        let bin = descriptor.map(|d| d.binary_name).unwrap_or("codex");
+        let prefix_cmd = if persistent { "exec " } else { "" };
+        let tokens = descriptor
+            .map(|d| d.resume_picker_tokens())
+            .unwrap_or_else(|| vec!["resume".to_string()]);
+        let tokens_str = if tokens.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", tokens.join(" "))
         };
+        let picker = format!("{prefix_cmd}{bin}{tokens_str}");
         match cwd.filter(|cwd| !cwd.trim().is_empty()) {
             Some(cwd) => format!("cd {} && {}", shell_single_quote(cwd), picker),
-            None => picker.to_string(),
+            None => picker,
         }
     });
     let with_notice = format!("{}; {}", remote_resume_picker_notice(session_id), base);
@@ -14114,10 +14146,12 @@ fn configure_remote_resume_live_session(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         });
+    let resume_subcommand = remote_agent_resume_subcommand(session.kind)
+        .unwrap_or_else(|| "resume-codex".to_string());
+    let source_label = format!("remote-{}", session_kind_label(session.kind));
     session.id = session_id.to_string();
     session.session_path = session_path.to_string();
     session.title = resolved_title.to_string();
-    session.kind = SessionKind::Codex;
     session.source = SessionSource::LiveSsh;
     session.host_label = target.label.clone();
     session.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
@@ -14131,7 +14165,7 @@ fn configure_remote_resume_live_session(
         &[
             "server",
             "remote",
-            "resume-codex",
+            &resume_subcommand,
             session_id,
             launch_cwd.unwrap_or(""),
             "--require-existing",
@@ -14144,13 +14178,13 @@ fn configure_remote_resume_live_session(
         format!("Workspace: {}", launch_cwd.unwrap_or("<unknown>")),
         "Daemon PTY: request main viewport terminal stream".to_string(),
     ];
-    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+    upsert_session_metadata(&mut session.metadata, "Source", source_label);
     upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
     upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
     upsert_session_metadata(
         &mut session.metadata,
         "Restore",
-        format!("yggterm server remote resume-codex {session_id} --require-existing"),
+        format!("yggterm server remote {resume_subcommand} {session_id} --require-existing"),
     );
     if let Some(cwd) = launch_cwd {
         upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
@@ -17025,17 +17059,21 @@ pub(crate) fn remote_cc_scan_args() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemoteCcSummaryLine {
-    session_id: String,
-    cwd: String,
-    title: String,
+pub struct RemoteGenericSummaryLine {
+    pub session_id: String,
+    pub cwd: String,
+    pub title: String,
     #[serde(default)]
-    context: String,
+    pub context: String,
     #[serde(default)]
-    mtime: i64,
+    pub mtime: i64,
     #[serde(default)]
-    path: String,
+    pub path: String,
 }
+
+pub type RemoteCcSummaryLine = RemoteGenericSummaryLine;
+pub type RemoteMuseSummaryLine = RemoteGenericSummaryLine;
+pub type RemoteAgySummaryLine = RemoteGenericSummaryLine;
 
 fn remote_cc_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-cc://{machine_key}/{session_id}")
@@ -17139,21 +17177,347 @@ pub(crate) fn remote_muse_scan_args() -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemoteMuseSummaryLine {
-    session_id: String,
-    cwd: String,
-    title: String,
-    #[serde(default)]
-    context: String,
-    #[serde(default)]
-    mtime: i64,
-    #[serde(default)]
-    path: String,
-}
-
 fn remote_muse_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-muse://{machine_key}/{session_id}")
+}
+
+const REMOTE_AGY_SCAN_SCRIPT: &str = r#"
+import json, os, sys, sqlite3
+from pathlib import Path
+
+def scan_agy_session(path_str):
+    p = Path(path_str)
+    s = str(p)
+    if s.endswith("-shm") or s.endswith("-wal"):
+        return None
+    session_id = None
+    if s.endswith(".db"):
+        session_id = p.stem.strip()
+    elif s.endswith("transcript.jsonl"):
+        parts = p.parts
+        if ".system_generated" in parts:
+            idx = parts.index(".system_generated")
+            session_id = parts[idx - 1]
+        else:
+            session_id = p.parent.parent.parent.name
+    elif s.endswith(".json"):
+        session_id = p.stem.strip()
+
+    if not session_id or session_id == "transcript" or session_id == "conversation_summaries":
+        return None
+
+    home = Path(os.path.expanduser("~"))
+    db_path = home / ".gemini/antigravity-cli/conversation_summaries.db"
+    cwd = None
+    title = ""
+    mtime = 0
+    try:
+        mtime = int(os.path.getmtime(s))
+    except:
+        mtime = 0
+
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            cur = conn.cursor()
+            cur.execute("SELECT title, preview, workspace_uris, last_modified_time FROM conversation_summaries WHERE conversation_id=? AND killed=0", (session_id,))
+            row = cur.fetchone()
+            if row:
+                t, prev, uris, raw_mod = row
+                if t and t.strip():
+                    title = t.strip()[:120]
+                elif prev and prev.strip():
+                    title = prev.strip()[:120]
+                if uris:
+                    try:
+                        u_list = json.loads(uris)
+                        for u in u_list:
+                            if isinstance(u, str):
+                                cand = u.replace("file://", "").rstrip("/")
+                                if cand:
+                                    cwd = cand
+                                    break
+                    except:
+                        pass
+            conn.close()
+        except:
+            pass
+
+    if not cwd:
+        history_path = home / ".gemini/antigravity-cli/history.jsonl"
+        if history_path.exists():
+            try:
+                with open(history_path, 'r', errors='ignore') as f:
+                    for line in f:
+                        if f'"{session_id}"' in line:
+                            hj = json.loads(line)
+                            if hj.get("workspace"):
+                                cwd = hj.get("workspace").strip()
+                            if not title and hj.get("display"):
+                                title = hj.get("display").strip()[:120]
+                            break
+            except:
+                pass
+
+    if not cwd and s.endswith("transcript.jsonl"):
+        try:
+            with open(s, 'r', errors='ignore') as f:
+                for i, line in enumerate(f):
+                    if i >= 100:
+                        break
+                    if '[URI] -> [CorpusName]:' in line:
+                        for next_line in f:
+                            if ' -> ' in next_line:
+                                cand = next_line.split(' -> ')[0].strip()
+                                if cand:
+                                    cwd = cand
+                                    break
+                            break
+                        if cwd:
+                            break
+        except:
+            pass
+
+    if not cwd:
+        cwd = str(home)
+
+    return {
+        'session_id': session_id,
+        'cwd': cwd,
+        'title': title,
+        'context': '',
+        'mtime': mtime,
+        'path': s,
+    }
+
+home = Path(os.path.expanduser("~"))
+seen=set()
+for pattern in [a for a in sys.argv[1:] if a.strip()]:
+    for p in home.glob(pattern):
+        key=str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        data=scan_agy_session(str(p))
+        if data:
+            print(json.dumps(data, ensure_ascii=False))
+"#;
+
+pub(crate) fn remote_agy_scan_args() -> Vec<String> {
+    yggterm_core::agent_cli_descriptor(yggterm_core::SessionKind::Antigravity)
+        .map(|descriptor| {
+            descriptor
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remote_agy_session_path(machine_key: &str, session_id: &str) -> String {
+    format!("remote-agy://{machine_key}/{session_id}")
+}
+
+const REMOTE_PI_SCAN_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+
+def scan_pi_session(path_str):
+    p = Path(path_str)
+    s = str(p)
+    session_id = p.stem.strip()
+    if not session_id:
+        return None
+    home = Path(os.path.expanduser("~"))
+    cwd = None
+    title = ""
+    mtime = 0
+    try:
+        mtime = int(os.path.getmtime(s))
+    except:
+        mtime = 0
+    try:
+        with open(s, 'r', errors='ignore') as f:
+            for i, line in enumerate(f):
+                if i >= 10: break
+                line = line.strip()
+                if not line: continue
+                try:
+                    v = json.loads(line)
+                    if v.get("id"): session_id = str(v.get("id"))
+                    if v.get("cwd"): cwd = str(v.get("cwd"))
+                    if v.get("title"): title = str(v.get("title"))[:120]
+                    if cwd: break
+                except: continue
+    except: pass
+    if not cwd: cwd = str(home)
+    return {
+        'session_id': session_id,
+        'cwd': cwd,
+        'title': title,
+        'context': '',
+        'mtime': mtime,
+        'path': s,
+    }
+
+home = Path(os.path.expanduser("~"))
+seen = set()
+for pattern in [a for a in sys.argv[1:] if a.strip()]:
+    for p in home.glob(pattern):
+        key = str(p)
+        if key in seen: continue
+        seen.add(key)
+        data = scan_pi_session(str(p))
+        if data: print(json.dumps(data, ensure_ascii=False))
+"#;
+
+pub(crate) fn remote_pi_scan_args() -> Vec<String> {
+    yggterm_core::agent_cli_descriptor(yggterm_core::SessionKind::Pi)
+        .map(|descriptor| {
+            descriptor
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remote_pi_session_path(machine_key: &str, session_id: &str) -> String {
+    format!("remote-pi://{machine_key}/{session_id}")
+}
+
+const REMOTE_QWEN_SCAN_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+
+def scan_qwen_session(path_str):
+    p = Path(path_str)
+    s = str(p)
+    if ".runtime." in s: return None
+    session_id = p.stem.strip()
+    if not session_id: return None
+    home = Path(os.path.expanduser("~"))
+    cwd = None
+    title = ""
+    mtime = 0
+    try:
+        mtime = int(os.path.getmtime(s))
+    except:
+        mtime = 0
+    try:
+        with open(s, 'r', errors='ignore') as f:
+            for i, line in enumerate(f):
+                if i >= 10: break
+                line = line.strip()
+                if not line: continue
+                try:
+                    v = json.loads(line)
+                    if v.get("id"): session_id = str(v.get("id"))
+                    if v.get("cwd"): cwd = str(v.get("cwd"))
+                    if v.get("title"): title = str(v.get("title"))[:120]
+                    if cwd: break
+                except: continue
+    except: pass
+    if not cwd: cwd = str(home)
+    return {
+        'session_id': session_id,
+        'cwd': cwd,
+        'title': title,
+        'context': '',
+        'mtime': mtime,
+        'path': s,
+    }
+
+home = Path(os.path.expanduser("~"))
+seen = set()
+for pattern in [a for a in sys.argv[1:] if a.strip()]:
+    for p in home.glob(pattern):
+        key = str(p)
+        if key in seen: continue
+        seen.add(key)
+        data = scan_qwen_session(str(p))
+        if data: print(json.dumps(data, ensure_ascii=False))
+"#;
+
+pub(crate) fn remote_qwen_scan_args() -> Vec<String> {
+    yggterm_core::agent_cli_descriptor(yggterm_core::SessionKind::QwenCode)
+        .map(|descriptor| {
+            descriptor
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remote_qwen_session_path(machine_key: &str, session_id: &str) -> String {
+    format!("remote-qwen://{machine_key}/{session_id}")
+}
+
+const REMOTE_GROK_SCAN_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+
+def scan_grok_session(path_str):
+    p = Path(path_str)
+    s = str(p)
+    home = Path(os.path.expanduser("~"))
+    session_id = p.parent.name.strip()
+    cwd = None
+    title = ""
+    mtime = 0
+    try:
+        mtime = int(os.path.getmtime(s))
+    except:
+        mtime = 0
+    try:
+        with open(s, 'r', errors='ignore') as f:
+            v = json.load(f)
+            info = v.get("info", {}) if isinstance(v, dict) else {}
+            if info.get("id"): session_id = str(info.get("id"))
+            if info.get("cwd"): cwd = str(info.get("cwd"))
+            if info.get("title"): title = str(info.get("title"))[:120]
+            elif v.get("session_summary"): title = str(v.get("session_summary"))[:120]
+    except: pass
+    if not session_id: session_id = p.parent.name.strip()
+    if not cwd: cwd = str(home)
+    return {
+        'session_id': session_id,
+        'cwd': cwd,
+        'title': title,
+        'context': '',
+        'mtime': mtime,
+        'path': s,
+    }
+
+home = Path(os.path.expanduser("~"))
+seen = set()
+for pattern in [a for a in sys.argv[1:] if a.strip()]:
+    for p in home.glob(pattern):
+        key = str(p)
+        if key in seen: continue
+        seen.add(key)
+        data = scan_grok_session(str(p))
+        if data: print(json.dumps(data, ensure_ascii=False))
+"#;
+
+pub(crate) fn remote_grok_scan_args() -> Vec<String> {
+    yggterm_core::agent_cli_descriptor(yggterm_core::SessionKind::GrokBuild)
+        .map(|descriptor| {
+            descriptor
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remote_grok_session_path(machine_key: &str, session_id: &str) -> String {
+    format!("remote-grok://{machine_key}/{session_id}")
 }
 
 /// Whether a session path's CLI lives on THIS machine (so the local managed
@@ -17163,9 +17527,8 @@ fn remote_muse_session_path(machine_key: &str, session_id: &str) -> String {
 /// `<cli> --version` probe is pure waste for them. See
 /// `ensure_managed_cli_for_session_path`.
 fn session_path_uses_local_managed_cli(path: &str) -> bool {
-    !(path.starts_with("remote-session://")
-        || path.starts_with("remote-cc://")
-        || path.starts_with("remote-muse://"))
+    !yggterm_core::agent_scheme::remote_agent_row_schemes()
+        .any(|scheme| path.starts_with(scheme.prefix))
 }
 
 /// Does this row's launch — its `cd`, its exec, its cwd — happen on THIS
@@ -17252,6 +17615,98 @@ fn fetch_remote_machine_apps(target: &SshConnectTarget) -> Option<Vec<AppManifes
     )
 }
 
+fn scan_remote_cli_sessions(
+    target: &SshConnectTarget,
+    script: &str,
+    args: &[String],
+    kind: SessionKind,
+    machine_key: &str,
+    existing_ids: &mut std::collections::HashSet<String>,
+) -> Vec<RemoteScannedSession> {
+    let lines = match run_remote_python_lines(&target.ssh_target, target.prefix.as_deref(), script, args) {
+        Ok(lines) => lines,
+        Err(err) => {
+            let slug = yggterm_core::agent_cli_descriptor(kind)
+                .map(|d| d.slug)
+                .unwrap_or("unknown");
+            tracing::warn!(ssh_target = %target.ssh_target, ?kind, error = %err, "{slug} scan failed");
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "remote_machine",
+                    &format!("{slug}_scan_failed"),
+                    serde_json::json!({
+                        "ssh_target": target.ssh_target,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+            return Vec::new();
+        }
+    };
+    let mut scanned = Vec::new();
+    let mut parse_errors = 0usize;
+    let mut id_collisions = 0usize;
+    for line in &lines {
+        match serde_json::from_str::<RemoteGenericSummaryLine>(line) {
+            Err(_) => {
+                parse_errors += 1;
+            }
+            Ok(summary) => {
+                if existing_ids.contains(&summary.session_id) {
+                    id_collisions += 1;
+                    continue;
+                }
+                existing_ids.insert(summary.session_id.clone());
+                let session_path = yggterm_core::remote_agent_session_path(kind, machine_key, &summary.session_id);
+                let title_hint = if summary.title.trim().is_empty() {
+                    short_session_id(&summary.session_id)
+                } else {
+                    summary.title
+                };
+                scanned.push(RemoteScannedSession {
+                    session_path,
+                    title_hint,
+                    session_id: summary.session_id,
+                    cwd: summary.cwd,
+                    started_at: String::new(),
+                    modified_epoch: summary.mtime,
+                    event_count: 0,
+                    user_message_count: 0,
+                    assistant_message_count: 0,
+                    recent_context: summary.context,
+                    cached_precis: None,
+                    cached_summary: None,
+                    live_runtime: false,
+                    title_is_explicit: false,
+                    storage_path: summary.path,
+                });
+            }
+        }
+    }
+    let slug = yggterm_core::agent_cli_descriptor(kind)
+        .map(|d| d.slug)
+        .unwrap_or("unknown");
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "remote_machine",
+            &format!("{slug}_scan_done"),
+            serde_json::json!({
+                "ssh_target": target.ssh_target,
+                "lines": lines.len(),
+                "parsed": scanned.len(),
+                "parse_errors": parse_errors,
+                "id_collisions": id_collisions,
+                "sample_storage_path": scanned.first().map(|s| s.storage_path.clone()).unwrap_or_default(),
+            }),
+        );
+    }
+    scanned
+}
+
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
@@ -17262,8 +17717,8 @@ fn scan_remote_machine_sessions(
     let python_args = [codex_home_arg.clone()];
 
     // Step 1: Codex/yggterm session scan. May fail if a scan is already in progress on
-    // the remote (lock busy). Capture the error rather than returning early so the CC
-    // scan below can still run independently.
+    // the remote (lock busy). Capture the error rather than returning early so other
+    // CLI scans below can still run independently.
     let (yggterm_lines, deferred_error) = match run_remote_yggterm_command(
         &target.ssh_target,
         target.prefix.as_deref(),
@@ -17317,188 +17772,37 @@ fn scan_remote_machine_sessions(
         });
     }
 
-    // Step 2: Claude Code session scan — independent of step 1. Runs even when the
-    // yggterm scan failed (e.g. lock busy), because CC sessions live in ~/.claude/,
-    // not ~/.codex/, and don't require the remote scan lock.
-    let mut cc_found = false;
-    let mut muse_found = false;
-    match run_remote_python_lines(
-        &target.ssh_target,
-        target.prefix.as_deref(),
-        REMOTE_CC_SCAN_SCRIPT,
-        &remote_cc_scan_args(),
-    ) {
-        Err(ref cc_err) => {
-            if let Ok(home) = resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "server",
-                    "remote_machine",
-                    "cc_scan_failed",
-                    serde_json::json!({
-                        "ssh_target": target.ssh_target,
-                        "error": cc_err.to_string(),
-                    }),
-                );
-            }
-        }
-        Ok(cc_lines) => {
-            let existing_ids: std::collections::HashSet<String> =
-                sessions.iter().map(|s| s.session_id.clone()).collect();
-            let mut cc_sessions: Vec<RemoteScannedSession> = Vec::new();
-            let mut parse_errors = 0usize;
-            let mut id_collisions = 0usize;
-            for line in &cc_lines {
-                match serde_json::from_str::<RemoteCcSummaryLine>(line) {
-                    Err(_) => {
-                        parse_errors += 1;
-                        continue;
-                    }
-                    Ok(summary) => {
-                        if existing_ids.contains(&summary.session_id) {
-                            id_collisions += 1;
-                            continue;
-                        }
-                        cc_sessions.push(RemoteScannedSession {
-                            session_path: remote_cc_session_path(&machine_key, &summary.session_id),
-                            title_hint: if summary.title.trim().is_empty() {
-                                // One owner for "what a titleless session is
-                                // called", shared with the codex arm above.
-                                short_session_id(&summary.session_id)
-                            } else {
-                                summary.title
-                            },
-                            session_id: summary.session_id,
-                            cwd: summary.cwd,
-                            started_at: String::new(),
-                            modified_epoch: summary.mtime,
-                            event_count: 0,
-                            user_message_count: 0,
-                            assistant_message_count: 0,
-                            recent_context: summary.context,
-        cached_precis: None,
-        cached_summary: None,
-                            live_runtime: false,
-                            title_is_explicit: false,
-                            storage_path: summary.path,
-                        });
+    let mut existing_ids: std::collections::HashSet<String> =
+        sessions.iter().map(|s| s.session_id.clone()).collect();
 
-                    }
-                }
-            }
-            if let Ok(home) = resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "server",
-                    "remote_machine",
-                    "cc_scan_done",
-                    serde_json::json!({
-                        "ssh_target": target.ssh_target,
-                        "lines": cc_lines.len(),
-                        "parsed": cc_sessions.len(),
-                        "parse_errors": parse_errors,
-                        "id_collisions": id_collisions,
-                        "sample_storage_path": cc_sessions.first().map(|s| s.storage_path.clone()).unwrap_or_default(),
-                    }),
-                );
-            }
-            cc_found = !cc_sessions.is_empty();
-            sessions.extend(cc_sessions);
-        }
-    }
+    let mut any_found = false;
+    let cli_scans: [(SessionKind, &str, fn() -> Vec<String>); 6] = [
+        (SessionKind::ClaudeCode, REMOTE_CC_SCAN_SCRIPT, || remote_cc_scan_args().to_vec()),
+        (SessionKind::Muse, REMOTE_MUSE_SCAN_SCRIPT, || remote_muse_scan_args().to_vec()),
+        (SessionKind::Antigravity, REMOTE_AGY_SCAN_SCRIPT, || remote_agy_scan_args().to_vec()),
+        (SessionKind::Pi, REMOTE_PI_SCAN_SCRIPT, || remote_pi_scan_args().to_vec()),
+        (SessionKind::QwenCode, REMOTE_QWEN_SCAN_SCRIPT, || remote_qwen_scan_args().to_vec()),
+        (SessionKind::GrokBuild, REMOTE_GROK_SCAN_SCRIPT, || remote_grok_scan_args().to_vec()),
+    ];
 
-    // Step 3: Muse session scan — independent like CC, reads remote
-    // `~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db`.
-    {
-        let _muse_args = remote_muse_scan_args();
-        tracing::info!(ssh_target = %target.ssh_target, muse_args = ?_muse_args, "muse scan starting");
-    }
-    match run_remote_python_lines(
-        &target.ssh_target,
-        target.prefix.as_deref(),
-        REMOTE_MUSE_SCAN_SCRIPT,
-        &remote_muse_scan_args(),
-    ) {
-        Err(ref muse_err) => {
-            tracing::warn!(ssh_target = %target.ssh_target, error = %muse_err, "muse scan failed");
-            if let Ok(home) = resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "server",
-                    "remote_machine",
-                    "muse_scan_failed",
-                    serde_json::json!({
-                        "ssh_target": target.ssh_target,
-                        "error": muse_err.to_string(),
-                    }),
-                );
-            }
+    for (kind, script, args_fn) in cli_scans {
+        let args = args_fn();
+        let found_sessions = scan_remote_cli_sessions(
+            target,
+            script,
+            &args,
+            kind,
+            &machine_key,
+            &mut existing_ids,
+        );
+        if !found_sessions.is_empty() {
+            any_found = true;
         }
-        Ok(muse_lines) => {
-            tracing::info!(ssh_target = %target.ssh_target, lines = muse_lines.len(), "muse scan done");
-            let existing_ids: std::collections::HashSet<String> =
-                sessions.iter().map(|s| s.session_id.clone()).collect();
-            let mut muse_sessions: Vec<RemoteScannedSession> = Vec::new();
-            let mut parse_errors = 0usize;
-            let mut id_collisions = 0usize;
-            for line in &muse_lines {
-                match serde_json::from_str::<RemoteMuseSummaryLine>(line) {
-                    Err(_) => {
-                        parse_errors += 1;
-                        continue;
-                    }
-                    Ok(summary) => {
-                        if existing_ids.contains(&summary.session_id) {
-                            id_collisions += 1;
-                            continue;
-                        }
-                        muse_sessions.push(RemoteScannedSession {
-                            session_path: remote_muse_session_path(&machine_key, &summary.session_id),
-                            title_hint: if summary.title.trim().is_empty() {
-                                short_session_id(&summary.session_id)
-                            } else {
-                                summary.title
-                            },
-                            session_id: summary.session_id,
-                            cwd: summary.cwd,
-                            started_at: String::new(),
-                            modified_epoch: summary.mtime,
-                            event_count: 0,
-                            user_message_count: 0,
-                            assistant_message_count: 0,
-                            recent_context: summary.context,
-        cached_precis: None,
-        cached_summary: None,
-                            live_runtime: false,
-                            title_is_explicit: false,
-                            storage_path: summary.path,
-                        });
-                    }
-                }
-            }
-            if let Ok(home) = resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "server",
-                    "remote_machine",
-                    "muse_scan_done",
-                    serde_json::json!({
-                        "ssh_target": target.ssh_target,
-                        "lines": muse_lines.len(),
-                        "parsed": muse_sessions.len(),
-                        "parse_errors": parse_errors,
-                        "id_collisions": id_collisions,
-                        "sample_storage_path": muse_sessions.first().map(|s| s.storage_path.clone()).unwrap_or_default(),
-                    }),
-                );
-            }
-            muse_found = !muse_sessions.is_empty();
-            sessions.extend(muse_sessions);
-        }
+        sessions.extend(found_sessions);
     }
 
     // Only propagate the deferred yggterm error if we have nothing to show at all.
-    if sessions.is_empty() && !cc_found && !muse_found {
+    if sessions.is_empty() && !any_found {
         if let Some(err) = deferred_error {
             return Err(err);
         }
@@ -29244,6 +29548,7 @@ fn agent_launch_command_with_options(
 /// (`start-cc`), which already pins `--session-id`. `--session-id` is a real CC
 /// flag and the minimum needed for handoff identity, so it satisfies the
 /// wrapper-vs-manual parity rule.
+#[allow(dead_code)]
 fn claude_code_fresh_launch_command(cwd: Option<&str>, session_id: &str) -> String {
     claude_code_fresh_launch_command_with_options(cwd, session_id, &AgentLaunchOptions::default())
 }

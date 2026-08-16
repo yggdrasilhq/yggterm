@@ -94,6 +94,10 @@ pub use agent_cli::{
     store_home_dir_name_is_any, store_literal_scan_coverage, store_path_is_under_any,
     unregistered_store_literals,
 };
+pub use agent_scheme::{
+    is_remote_agent_session_path, is_remote_row_path, remote_agent_session_path,
+    session_kind_for_path,
+};
 pub use app_registry::{
     APP_REGISTRY_DIRNAME, AppManifest, AppVerb, app_registry_dir, scan_app_registry,
     write_app_manifest,
@@ -2034,17 +2038,19 @@ pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
     let Some(descriptor) = agent_cli_descriptor(SessionKind::Antigravity) else {
         return Vec::new();
     };
-    let Some(conv_dir) = descriptor.store_roots_absolute(&home).into_iter().next() else {
-        return Vec::new();
-    };
-    let db_path = conv_dir
-        .parent()
-        .map(|p| p.join("conversation_summaries.db"))
-        .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
-    let mut sessions = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
+    let mut sessions = scan_local_agent_cli_sessions(descriptor);
+    let seen_ids: std::collections::HashSet<String> = sessions
+        .iter()
+        .map(|s| s.session_id.clone())
+        .collect();
 
-    if db_path.exists() {
+    let roots = descriptor.store_roots_absolute(&home);
+    let conv_dir = roots.into_iter().next();
+    let db_path = conv_dir
+        .as_ref()
+        .and_then(|p| p.parent().map(|parent| parent.join("conversation_summaries.db")));
+
+    if let Some(db_path) = db_path.filter(|p| p.exists()) {
         if let Ok(conn) = rusqlite::Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -2064,10 +2070,9 @@ pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
                 }) {
                     for row in rows.flatten() {
                         let (session_id, raw_title, raw_preview, uris, raw_modified) = row;
-                        if session_id.trim().is_empty() {
+                        if session_id.trim().is_empty() || seen_ids.contains(&session_id) {
                             continue;
                         }
-                        seen_ids.insert(session_id.clone());
                         let t = raw_title.trim();
                         let p = raw_preview.trim();
                         let title = if !t.is_empty() {
@@ -2079,7 +2084,10 @@ pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
                         };
                         let cwd = parse_antigravity_workspace_uris(&uris)
                             .unwrap_or_else(|| home.display().to_string());
-                        let file_path = conv_dir.join(format!("{session_id}.db"));
+                        let file_path = conv_dir
+                            .as_ref()
+                            .map(|d| d.join(format!("{session_id}.db")))
+                            .unwrap_or_else(|| home.join(format!("{session_id}.db")));
                         let modified_epoch_ms = if let Ok(dt) = time::OffsetDateTime::parse(
                             &raw_modified,
                             &time::format_description::well_known::Rfc3339,
@@ -2108,109 +2116,162 @@ pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
         }
     }
 
-    if let Ok(entries) = fs::read_dir(&conv_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !descriptor.store_path_is_session_file(&path.display().to_string()) {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(ToString::to_string) {
-                if !seen_ids.contains(&stem) {
-                    let modified_epoch_ms = fs::metadata(&path)
-                        .ok()
-                        .and_then(|meta| meta.modified().ok())
-                        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_millis())
-                        .unwrap_or_default();
-                    sessions.push(LocalAgentSessionSummary {
-                        kind: SessionKind::Antigravity,
-                        file_path: path,
-                        session_id: stem,
-                        cwd: home.display().to_string(),
-                        title: None,
-                        detail: None,
-                        modified_epoch_ms,
-                    });
-                }
-            }
-        }
-    }
-
     sessions
 }
 
-/// Read an Antigravity conversation title from `conversation_summaries.db`.
+/// Read an Antigravity conversation title from `conversation_summaries.db`, `history.jsonl`, or transcript.
 ///
 /// Antigravity stores an auto-generated title in `preview` after the first turn,
 /// and a user-edited rename in `title`. If `title` is set (non-empty), it takes
 /// precedence over `preview`.
 pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<Option<String>> {
-    let Some(conv_dir) = agent_cli_descriptor(SessionKind::Antigravity)
-        .and_then(|d| d.store_roots_absolute(home).into_iter().next())
-    else {
-        return Ok(None);
-    };
+    let descriptor = agent_cli_descriptor(SessionKind::Antigravity);
+    let conv_dir = descriptor.and_then(|d| d.store_roots_absolute(home).into_iter().next());
     let db_path = conv_dir
-        .parent()
-        .map(|p| p.join("conversation_summaries.db"))
-        .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
-    if !db_path.exists() {
-        return Ok(None);
-    }
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ).with_context(|| format!("failed to open antigravity summaries db at {}", db_path.display()))?;
+        .as_ref()
+        .and_then(|p| p.parent().map(|parent| parent.join("conversation_summaries.db")));
 
-    let mut stmt = conn.prepare(
-        "SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?1;",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![session_id])?;
-    if let Some(row) = rows.next()? {
-        let title: String = row.get(0).unwrap_or_default();
-        let preview: String = row.get(1).unwrap_or_default();
-        let title = title.trim();
-        let preview = preview.trim();
-        if !title.is_empty() {
-            return Ok(Some(title.to_string()));
-        }
-        if !preview.is_empty() {
-            return Ok(Some(preview.to_string()));
+    if let Some(db_path) = db_path.filter(|p| p.exists()) {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?1;",
+            ) {
+                if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
+                    if let Ok(Some(row)) = rows.next() {
+                        let title: String = row.get(0).unwrap_or_default();
+                        let preview: String = row.get(1).unwrap_or_default();
+                        let title = title.trim();
+                        let preview = preview.trim();
+                        if !title.is_empty() {
+                            return Ok(Some(title.to_string()));
+                        }
+                        if !preview.is_empty() {
+                            return Ok(Some(preview.to_string()));
+                        }
+                    }
+                }
+            }
         }
     }
+
+    // Check history.jsonl
+    let history_path = conv_dir
+        .as_ref()
+        .and_then(|p| p.parent().map(|parent| parent.join("history.jsonl")));
+    if let Some(history_path) = history_path.filter(|p| p.exists()) {
+        if let Ok(file) = std::fs::File::open(&history_path) {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(file);
+            for line in reader.lines().flatten() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if value.get("conversationId").and_then(|v| v.as_str()) == Some(session_id) {
+                        if let Some(display) = value.get("display").and_then(|v| v.as_str()) {
+                            let trimmed = display.trim();
+                            if !trimmed.is_empty() {
+                                return Ok(Some(trimmed.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check store transcripts from descriptor roots
+    if let Some(desc) = descriptor {
+        for root in desc.store_roots_absolute(home) {
+            let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");
+            if candidate.exists() {
+                if let Some(entry) = (desc.read_store_entry)(&candidate) {
+                    if let Some(t) = entry.title.filter(|t| !t.trim().is_empty()) {
+                        return Ok(Some(t));
+                    }
+                    if let Some(d) = entry.detail.filter(|d| !d.trim().is_empty()) {
+                        if let Some(t) = crate::best_effort_title_from_context(&d) {
+                            return Ok(Some(t));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(None)
 }
 
-/// The CWD of a local Antigravity session from `conversation_summaries.db`.
+/// The CWD of a local Antigravity session from `conversation_summaries.db`, `history.jsonl`, or transcript.
 pub fn local_antigravity_session_cwd(session_id: &str) -> Option<String> {
     let home = dirs::home_dir()?;
-    let conv_dir = agent_cli_descriptor(SessionKind::Antigravity)?
-        .store_roots_absolute(&home)
-        .into_iter()
-        .next()?;
+    let descriptor = agent_cli_descriptor(SessionKind::Antigravity);
+    let conv_dir = descriptor.and_then(|d| d.store_roots_absolute(&home).into_iter().next());
     let db_path = conv_dir
-        .parent()
-        .map(|p| p.join("conversation_summaries.db"))
-        .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
-    if !db_path.exists() {
-        return None;
+        .as_ref()
+        .and_then(|p| p.parent().map(|parent| parent.join("conversation_summaries.db")));
+
+    if let Some(db_path) = db_path.filter(|p| p.exists()) {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ?1;",
+            ) {
+                if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
+                    if let Ok(Some(row)) = rows.next() {
+                        let uris: String = row.get(0).unwrap_or_default();
+                        if let Some(cwd) = parse_antigravity_workspace_uris(&uris) {
+                            return Some(cwd);
+                        }
+                    }
+                }
+            }
+        }
     }
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ).ok()?;
-    let mut stmt = conn.prepare(
-        "SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ?1;",
-    ).ok()?;
-    let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
-    if let Ok(Some(row)) = rows.next() {
-        let uris: String = row.get(0).unwrap_or_default();
-        return parse_antigravity_workspace_uris(&uris);
+
+    // Check history.jsonl
+    let history_path = conv_dir
+        .as_ref()
+        .and_then(|p| p.parent().map(|parent| parent.join("history.jsonl")));
+    if let Some(history_path) = history_path.filter(|p| p.exists()) {
+        if let Ok(file) = std::fs::File::open(&history_path) {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(file);
+            for line in reader.lines().flatten() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if value.get("conversationId").and_then(|v| v.as_str()) == Some(session_id) {
+                        if let Some(ws) = value.get("workspace").and_then(|v| v.as_str()) {
+                            let trimmed = ws.trim();
+                            if !trimmed.is_empty() {
+                                return Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    // Check store transcripts from descriptor roots
+    if let Some(desc) = descriptor {
+        for root in desc.store_roots_absolute(&home) {
+            let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");
+            if candidate.exists() {
+                if let Some(entry) = (desc.read_store_entry)(&candidate) {
+                    if !entry.cwd.trim().is_empty() {
+                        return Some(entry.cwd);
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 

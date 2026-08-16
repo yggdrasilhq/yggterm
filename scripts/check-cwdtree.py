@@ -88,7 +88,7 @@ def run_on_host(host, cmd, timeout=15):
 
 
 def verb_on_host(host):
-    cmd = "yggterm-headless server cwdtree ls --json --limit 10000 2>&1 || yggterm server cwdtree ls --json --limit 10000 2>&1"
+    cmd = "~/.local/bin/yggterm-headless server cwdtree ls --json --limit 10000 2>&1 || yggterm-headless server cwdtree ls --json --limit 10000 2>&1 || yggterm server cwdtree ls --json --limit 10000 2>&1"
     out, err = run_on_host(host, cmd)
     if err:
         return None, err, out
@@ -108,14 +108,15 @@ def parse_cwd_from_file(host, path, cli_slug):
         home_out, _ = run_on_host(host, "echo $HOME")
         home = home_out.strip() if home_out else os.path.expanduser("~")
         # Extract session_id from parent dir name
-        sid = Path(path).parent.name
-        # Query session-index.db workspace_root
-        # workspace_root is cwdForTitle in DB; we use same as Rust
-        cmd = f"sqlite3 {shlex.quote(home + '/.local/share/muse/session-index.db')} \"SELECT workspace_root FROM sessions WHERE session_id='{sid}' LIMIT 1;\" 2>/dev/null | head -n 1"
-        out, _ = run_on_host(host, cmd)
-        if out and out.strip():
-            return out.strip(), None
-        # Fallback: grep route_facts cwd
+        session_id = Path(path).parent.name
+        db = f"{home}/.local/share/muse/session-index.db"
+        cmd_db = f"sqlite3 {shlex.quote(db)} \"SELECT workspace_root, title FROM sessions WHERE session_id='{session_id}' LIMIT 1;\" 2>/dev/null | head -n 1"
+        out_db, _ = run_on_host(host, cmd_db)
+        if out_db and out_db.strip():
+            parts = out_db.strip().split("|")
+            if parts[0].strip():
+                return parts[0].strip(), (parts[1].strip() if len(parts) > 1 and parts[1].strip() else None)
+        # Fallback: grep route_facts in JSONL
         cmd2 = f"grep -m1 'route_facts' {shlex.quote(path)} 2>/dev/null | head -c 4000"
         out2, _ = run_on_host(host, cmd2)
         if out2:
@@ -127,6 +128,53 @@ def parse_cwd_from_file(host, path, cli_slug):
                     return None, cwd
                 return cwd, None
         # Last fallback: HOME
+        return home, None
+    elif cli_slug == "antigravity":
+        if path.endswith("transcript.jsonl"):
+            parts = Path(path).parts
+            if ".system_generated" in parts:
+                idx = parts.index(".system_generated")
+                session_id = parts[idx - 1]
+            else:
+                session_id = Path(path).parent.parent.parent.name
+        else:
+            session_id = Path(path).stem
+        if not session_id or session_id == "transcript" or session_id.endswith("-shm") or session_id.endswith("-wal"):
+            return None, None
+        home_out, _ = run_on_host(host, "echo $HOME")
+        home = home_out.strip() if home_out else os.path.expanduser("~")
+        db = f"{home}/.gemini/antigravity-cli/conversation_summaries.db"
+        cmd = f"sqlite3 {shlex.quote(db)} \"SELECT workspace_uris FROM conversation_summaries WHERE conversation_id='{session_id}' AND killed=0;\" 2>/dev/null | head -n 1"
+        out, _ = run_on_host(host, cmd)
+        if out and out.strip():
+            try:
+                import json
+                uris = json.loads(out.strip())
+                for u in uris:
+                    if isinstance(u, str):
+                        p = u.replace("file://", "").rstrip("/")
+                        if p:
+                            return p, None
+            except:
+                pass
+        # Fallback to history.jsonl
+        hcmd = f"grep -F '\"{session_id}\"' {shlex.quote(home)}/.gemini/antigravity-cli/history.jsonl 2>/dev/null | head -n 1"
+        hout, _ = run_on_host(host, hcmd)
+        if hout:
+            try:
+                hj = json.loads(hout)
+                if hj.get("workspace"):
+                    return hj.get("workspace").strip(), None
+            except:
+                pass
+        # Fallback to transcript grep for [URI] -> [CorpusName]:
+        if path.endswith("transcript.jsonl"):
+            tcmd = f"grep -A 2 -F '[URI] -> [CorpusName]:' {shlex.quote(path)} 2>/dev/null | tail -n 1"
+            tout, _ = run_on_host(host, tcmd)
+            if tout and " -> " in tout:
+                ws = tout.split(" -> ")[0].strip()
+                if ws:
+                    return ws, None
         return home, None
     elif cli_slug == "claude-code":
         # Mirror Rust's read_cc_session_identity_fields: scan the whole file,
@@ -164,42 +212,38 @@ def parse_cwd_from_file(host, path, cli_slug):
         # Else last cwd overall
         return cwds[-1], None
     elif cli_slug in ("codex", "codex-litellm"):
-        # Rust's read_codex_session_identity walks the whole file and
-        # recurses into payload (find_string_field), so top-level j.get("cwd")
-        # misses the real cwd at payload.cwd. Mirror that recursion here.
-        def find_cwd_rec(v):
-            if isinstance(v, dict):
-                for kk, vv in v.items():
-                    if kk == "cwd" and isinstance(vv, str) and vv.strip():
-                        return vv.strip()
-                    r = find_cwd_rec(vv)
-                    if r:
-                        return r
-            elif isinstance(v, list):
-                for it in v:
-                    r = find_cwd_rec(it)
-                    if r:
-                        return r
-            return None
-        # Walk enough lines — Rust walks until both id and cwd found.
-        cmd = f"cat {shlex.quote(path)} 2>/dev/null | head -c 50000"
+        cmd = f"grep -m1 -o '\"cwd\":[ ]*\"[^\"]*\"' {shlex.quote(path)} 2>/dev/null"
         out, _ = run_on_host(host, cmd)
-        for line in out.splitlines():
+        if out:
+            m = re.search(r'\"cwd\":[ ]*\"([^\"]+)\"', out)
+            if m:
+                cand = m.group(1).strip()
+                if cand:
+                    return cand.rstrip("/") if cand != "/" else "/", None
+        # Fallback: scan lines
+        cmd2 = f"cat {shlex.quote(path)} 2>/dev/null | head -c 50000"
+        out2, _ = run_on_host(host, cmd2)
+        for line in out2.splitlines():
             line=line.strip()
             if not line: continue
             try:
                 j=json.loads(line)
+                def find_cwd_rec(v):
+                    if isinstance(v, dict):
+                        for kk, vv in v.items():
+                            if kk == "cwd" and isinstance(vv, str) and vv.strip():
+                                return vv.strip()
+                            r = find_cwd_rec(vv)
+                            if r: return r
+                    elif isinstance(v, list):
+                        for it in v:
+                            r = find_cwd_rec(it)
+                            if r: return r
+                    return None
                 cwd = find_cwd_rec(j)
                 if cwd:
-                    return cwd, None
+                    return cwd.rstrip("/") if cwd != "/" else "/", None
             except: continue
-        # Fallback grep for files where json is truncated by head -c
-        cmd2 = f"grep -m1 '\"cwd\"' {shlex.quote(path)} 2>/dev/null | head -c 2000"
-        out2, _ = run_on_host(host, cmd2)
-        if out2:
-            m = re.search(r'\"cwd\"\s*:\s*\"([^\"]+)\"', out2)
-            if m:
-                return m.group(1), None
         return None, None
     else:
         # pi/qwen/grok/antigravity: minimal
@@ -263,8 +307,17 @@ def manual_walk_on_host(host):
                 elif cli["slug"] == "grok":
                     # grok: .grok/sessions/<encoded-cwd>/<uuid>/summary.json -> id is parent dir
                     session_id = Path(f).parent.name
+                elif cli["slug"] == "antigravity" and f.endswith("transcript.jsonl"):
+                    parts = Path(f).parts
+                    if ".system_generated" in parts:
+                        idx = parts.index(".system_generated")
+                        session_id = parts[idx - 1]
+                    else:
+                        session_id = Path(f).parent.parent.parent.name
                 else:
                     session_id = Path(f).stem
+                    if cli["slug"] == "claude-code" and session_id.startswith("agent-"):
+                        continue
                     if cli["slug"] in ("codex", "codex-litellm"):
                         # stem is rollout-<timestamp>-<uuid>
                         if session_id.startswith("rollout-"):
