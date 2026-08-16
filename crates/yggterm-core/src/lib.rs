@@ -576,7 +576,7 @@ impl Default for AppSettings {
             litellm_endpoint: String::new(),
             litellm_api_key: String::new(),
             interface_llm_model: String::new(),
-            agent_cli_extra_args: BTreeMap::new(),
+            agent_cli_extra_args: default_agent_cli_extra_args(),
             default_agent_profile: AgentSessionProfile::Codex,
             in_app_notifications: true,
             system_notifications: false,
@@ -1276,9 +1276,13 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.interface_llm_model =
             serde_json::from_value(value.clone()).context("failed to parse interface_llm_model")?;
     }
-    if let Some(value) = object.get("agent_cli_extra_args") {
-        settings.agent_cli_extra_args = serde_json::from_value(value.clone())
-            .context("failed to parse agent_cli_extra_args")?;
+    let explicit_map: Option<BTreeMap<String, String>> = match object.get("agent_cli_extra_args") {
+        Some(value) => Some(serde_json::from_value(value.clone())
+            .context("failed to parse agent_cli_extra_args")?),
+        None => None,
+    };
+    if let Some(map) = explicit_map.as_ref() {
+        settings.agent_cli_extra_args = map.clone();
     }
     // The two legacy keys are read ONLY here, and only to seed a slug the map
     // does not already answer for.
@@ -1294,10 +1298,13 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         if legacy.trim().is_empty() {
             continue;
         }
-        settings
-            .agent_cli_extra_args
-            .entry(slug.to_string())
-            .or_insert(legacy);
+        if let Some(map) = explicit_map.as_ref() {
+            if !map.contains_key(slug) {
+                settings.agent_cli_extra_args.insert(slug.to_string(), legacy);
+            }
+        } else {
+            settings.agent_cli_extra_args.insert(slug.to_string(), legacy);
+        }
     }
     if let Some(value) = object.get("default_agent_profile") {
         settings.default_agent_profile = serde_json::from_value(value.clone())
@@ -1367,6 +1374,35 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
             .context("failed to parse start_page_app_choice")?;
     }
     Ok(settings)
+}
+
+/// Default launch flags map across all agent CLIs, seeding each CLI's default
+/// permission preset (the "yolo" / "skip checks" flag).
+pub fn default_agent_cli_extra_args() -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for descriptor in agent_cli::AGENT_CLIS {
+        if descriptor.owns_its_extra_args_box() {
+            if let Some(preset) = descriptor.default_permission_preset() {
+                map.insert(descriptor.extra_args_slug.to_string(), preset.args.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// The effective launch flags for a CLI kind: user's configured flags if present,
+/// otherwise the CLI descriptor's default permission preset ("yolo" mode).
+pub fn agent_cli_effective_extra_args(settings: &AppSettings, kind: SessionKind) -> String {
+    let Some(slug) = agent_cli_extra_args_key(kind) else {
+        return String::new();
+    };
+    if let Some(configured) = settings.agent_cli_extra_args.get(slug) {
+        return configured.clone();
+    }
+    agent_cli::agent_cli_descriptor(kind)
+        .and_then(|descriptor| descriptor.default_permission_preset())
+        .map(|preset| preset.args.to_string())
+        .unwrap_or_default()
 }
 
 /// The stored key a session kind's launch flags live under, or `None` for a
@@ -1874,6 +1910,18 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
         sessions.extend(scanned);
         count
     };
+    for descriptor in crate::agent_cli::AGENT_CLIS {
+        if descriptor.kind == SessionKind::Codex
+            || descriptor.kind == SessionKind::CodexLiteLlm
+            || descriptor.kind == SessionKind::ClaudeCode
+            || descriptor.kind == SessionKind::Antigravity
+            || descriptor.session_store_globs.is_empty()
+        {
+            continue;
+        }
+        let scanned = scan_local_agent_cli_sessions(descriptor);
+        sessions.extend(scanned);
+    }
 
     let mut projects = BTreeMap::<String, Vec<LocalAgentSessionSummary>>::new();
     for session in sessions {
@@ -1955,44 +2003,27 @@ pub fn scan_local_codex_sessions(
     Ok(sessions)
 }
 
-/// Scan local Claude Code session JSONL files (~/.claude/projects) and
-/// return them as `LocalAgentSessionSummary` records. Mirrors
-/// `scan_local_codex_sessions` so both flow through the same tree builder.
-/// Per [[spec-cwd-tree-agent-cli-unified]] this replaces the prior
-/// post-hoc `inject_file_backed_cc_session_rows` injection path.
-/// Where CC keeps its sessions, and which files are sessions, are the
-/// descriptor's answers (harness spec §3) — not this function's.
-pub fn scan_local_claude_code_sessions() -> Vec<LocalAgentSessionSummary> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
+fn scan_agent_store_directory(
+    descriptor: &AgentCliDescriptor,
+    dir: &Path,
+    depth: usize,
+    sessions: &mut Vec<LocalAgentSessionSummary>,
+) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
     };
-    let Some(descriptor) = agent_cli_descriptor(SessionKind::ClaudeCode) else {
-        return Vec::new();
-    };
-    let mut sessions = Vec::new();
-    for projects_dir in descriptor.store_roots_absolute(&home) {
-        let Ok(project_entries) = fs::read_dir(&projects_dir) else {
-            continue;
-        };
-        for project_entry in project_entries.flatten() {
-            let project_path = project_entry.path();
-            if !project_path.is_dir() {
-                continue;
-            }
-            let Ok(session_entries) = fs::read_dir(&project_path) else {
-                continue;
-            };
-            for session_entry in session_entries.flatten() {
-                let file_path = session_entry.path();
-                if !descriptor.store_path_is_session_file(&file_path.display().to_string()) {
-                    continue;
-                }
-                let Some(entry) = (descriptor.read_store_entry)(&file_path) else {
-                    continue;
-                };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_agent_store_directory(descriptor, &path, depth + 1, sessions);
+        } else if descriptor.store_path_is_session_file(&path.display().to_string()) {
+            if let Some(entry) = (descriptor.read_store_entry)(&path) {
                 sessions.push(LocalAgentSessionSummary {
-                    kind: SessionKind::ClaudeCode,
-                    file_path,
+                    kind: descriptor.kind,
+                    file_path: path,
                     session_id: entry.session_id,
                     cwd: entry.cwd,
                     title: entry.title,
@@ -2000,6 +2031,24 @@ pub fn scan_local_claude_code_sessions() -> Vec<LocalAgentSessionSummary> {
                     modified_epoch_ms: entry.modified_epoch_ms,
                 });
             }
+        }
+    }
+}
+
+/// Scan local sessions for any agent CLI using its declared store roots and entry reader.
+pub fn scan_local_agent_cli_sessions(
+    descriptor: &AgentCliDescriptor,
+) -> Vec<LocalAgentSessionSummary> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    if descriptor.session_store_globs.is_empty() {
+        return Vec::new();
+    }
+    let mut sessions = Vec::new();
+    for root in descriptor.store_roots_absolute(&home) {
+        if root.exists() {
+            scan_agent_store_directory(descriptor, &root, 0, &mut sessions);
         }
     }
     sessions
@@ -2265,6 +2314,20 @@ pub fn update_antigravity_session_title(
         );
     }
     Ok(())
+}
+
+/// Scan local Claude Code session JSONL files (~/.claude/projects) and
+/// return them as  records. Mirrors
+///  so both flow through the same tree builder.
+/// Per [[spec-cwd-tree-agent-cli-unified]] this replaces the prior
+/// post-hoc  injection path.
+/// Where CC keeps its sessions, and which files are sessions, are the
+/// descriptor's answers (harness spec §3) — not this function's.
+pub fn scan_local_claude_code_sessions() -> Vec<LocalAgentSessionSummary> {
+    let Some(descriptor) = agent_cli_descriptor(SessionKind::ClaudeCode) else {
+        return Vec::new();
+    };
+    scan_local_agent_cli_sessions(descriptor)
 }
 
 /// The codex arm of the store read.

@@ -2113,9 +2113,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Google's blue, darkened one step to clear AA (6.95:1).
         brand_color: "#1557b0",
         menu_hint: 'a',
-        // The conversation file carries a `name` field, which is the CLI's own
-        // title; on a fresh conversation it is still the cwd.
-        title_authority: TitleAuthority::Store,
+        // Antigravity does not write a self-generated title into its transcript;
+        // yggterm generates concise session titles from the user prompt.
+        title_authority: TitleAuthority::Generated,
         id_assigned_at_birth: false,
         wrapper_slug: Some("agy"),
         remote_row_scheme: Some("remote-agy://"),
@@ -2221,7 +2221,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         content_rederives_on_resume: true,
         // `~/.gemini/antigravity-cli/conversations/<uuid>.db`, with summaries in
         // `~/.gemini/antigravity-cli/conversation_summaries.db`.
-        session_store_globs: &[".gemini/antigravity-cli/conversations/*.db"],
+        // Also supports brain transcript layout `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`
+        // and legacy `~/.antigravitycli/*.json`.
+        session_store_globs: &[
+            ".gemini/antigravity-cli/conversations/*.db",
+            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
+            ".antigravitycli/*.json",
+        ],
         store_excluded_name_fragments: &["-shm", "-wal"],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
@@ -2573,23 +2579,120 @@ fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
 }
 
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+        // Layout: ~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl
+        let session_id = path
+            .parent()?
+            .parent()?
+            .parent()?
+            .file_name()?
+            .to_str()?
+            .to_string();
+        if session_id.is_empty() {
+            return None;
+        }
+
+        let mut cwd = None;
+        let mut detail = None;
+
+        // Try reading matching entry from history.jsonl if available
+        if let Some(gemini_dir) = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            let history_path = gemini_dir.join("history.jsonl");
+            if let Ok(file) = std::fs::File::open(&history_path) {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten() {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if value.get("conversationId").and_then(|v| v.as_str()) == Some(&session_id) {
+                            if let Some(ws) = value.get("workspace").and_then(|v| v.as_str()) {
+                                if !ws.trim().is_empty() {
+                                    cwd = Some(ws.trim().to_string());
+                                }
+                            }
+                            if let Some(display) = value.get("display").and_then(|v| v.as_str()) {
+                                if !display.trim().is_empty() && detail.is_none() {
+                                    detail = Some(display.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check first few lines of transcript.jsonl for prompt and workspace URI
+        if let Ok(file) = std::fs::File::open(path) {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(file);
+            for (idx, line) in reader.lines().flatten().enumerate() {
+                if idx > 10 {
+                    break;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if value.get("type").and_then(|v| v.as_str()) == Some("USER_INPUT") {
+                        if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                            if detail.is_none() {
+                                let prompt = if let Some(req) = content.strip_prefix("<USER_REQUEST>") {
+                                    req.split("</USER_REQUEST>").next().unwrap_or(req).trim()
+                                } else {
+                                    content.trim()
+                                };
+                                if !prompt.is_empty() {
+                                    detail = Some(prompt.to_string());
+                                }
+                            }
+                            if cwd.is_none() && content.contains("[URI] -> [CorpusName]:") {
+                                if let Some(after) = content.split("[URI] -> [CorpusName]:\n").nth(1) {
+                                    if let Some(line) = after.lines().next() {
+                                        if let Some(ws) = line.split(" -> ").next() {
+                                            if !ws.trim().is_empty() {
+                                                cwd = Some(ws.trim().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let cwd = cwd.or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().to_string()))?;
+        return Some(AgentStoreEntry {
+            session_id,
+            cwd,
+            modified_epoch_ms: modified_epoch_ms_of(path),
+            title: None,
+            detail,
+        });
+    }
+
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         let raw = std::fs::read_to_string(path).ok()?;
         let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
         let session_id = value.get("id")?.as_str()?.to_string();
         let cwd = value
-            .get("projectResources")?
-            .get("resources")?
-            .as_array()?
-            .iter()
-            .find_map(|resource| {
-                resource
-                    .get("gitFolder")?
-                    .get("folderUri")?
-                    .as_str()?
-                    .strip_prefix("file://")
-                    .map(|path| path.to_string())
-            })?;
+            .get("projectResources")
+            .and_then(|r| r.get("resources"))
+            .and_then(|r| r.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|resource| {
+                    resource
+                        .get("gitFolder")?
+                        .get("folderUri")?
+                        .as_str()?
+                        .strip_prefix("file://")
+                        .map(|path| path.to_string())
+                })
+            })
+            .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().to_string()))?;
         if session_id.is_empty() || cwd.is_empty() {
             return None;
         }

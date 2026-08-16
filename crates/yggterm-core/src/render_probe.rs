@@ -1898,6 +1898,7 @@ drm-engine-compute:\t3434919 ns\n";
             .spawn()
             .expect("spawn probe child");
         let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let comm = parse_proc_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).unwrap())
             .expect("child stat parses")
             .comm;
