@@ -39,8 +39,8 @@ CLI_STORES = [
     {"slug": "codex-litellm", "globs": [".codex-litellm/sessions/**/rollout-*.jsonl"], "exclude": [".bak."], "kind": "codex-litellm", "glyph": ">_", "color": "#0369a1"},
     {"slug": "claude-code", "globs": [".claude/projects/*/*.jsonl"], "exclude": [], "kind": "claude-code", "glyph": "*_", "color": "#c2410c"},
     {"slug": "pi", "globs": [".pi/agent/sessions/*/*.jsonl"], "exclude": [], "kind": "pi", "glyph": "π_", "color": "#be185d"},
-    {"slug": "qwen", "globs": [".qwen/projects/*/chats/*.jsonl"], "exclude": [], "kind": "qwen", "glyph": "Q_", "color": "#6d28d9"},
-    {"slug": "antigravity", "globs": [".gemini/antigravity-cli/conversations/*.db"], "exclude": ["-shm", "-wal"], "kind": "antigravity", "glyph": "A_", "color": "#1557b0"},
+    {"slug": "qwen", "globs": [".qwen/projects/*/chats/*.jsonl"], "exclude": [".runtime."], "kind": "qwen", "glyph": "Q_", "color": "#6d28d9"},
+    {"slug": "antigravity", "globs": [".gemini/antigravity-cli/conversations/*.db", ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"], "exclude": ["-shm", "-wal"], "kind": "antigravity", "glyph": "A_", "color": "#1557b0"},
     {"slug": "grok", "globs": [".grok/sessions/*/*/summary.json"], "exclude": [], "kind": "grok-build", "glyph": "G_", "color": "#000000"},
     {"slug": "muse", "globs": [".local/share/muse/sessions/**/session.jsonl"], "exclude": ["/subagent/", "/tool-outputs/"], "kind": "muse", "glyph": "M_", "color": "#86198f"},
 ]
@@ -138,7 +138,7 @@ def parse_cwd_from_file(host, path, cli_slug):
         def cc_encode(cwd):
             return "".join(c if c.isalnum() or c == "-" else "-" for c in cwd)
         # Collect all cwds in order via grep -o for speed, then pick per Rust rules
-        cmd = f"grep -o '\"cwd\":\"[^\"]*\"' {shlex.quote(path)} 2>/dev/null | head -n 200"
+        cmd = f"grep -o '\"cwd\":\"[^\"]*\"' {shlex.quote(path)} 2>/dev/null | head -n 2000"
         out, _ = run_on_host(host, cmd)
         cwds = []
         if out:
@@ -259,6 +259,9 @@ def manual_walk_on_host(host):
                     cwd = home
                 # session_id: for Muse parent dir, for others stem/parsed
                 if cli["slug"] == "muse":
+                    session_id = Path(f).parent.name
+                elif cli["slug"] == "grok":
+                    # grok: .grok/sessions/<encoded-cwd>/<uuid>/summary.json -> id is parent dir
                     session_id = Path(f).parent.name
                 else:
                     session_id = Path(f).stem
