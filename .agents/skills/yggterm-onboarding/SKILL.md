@@ -214,38 +214,91 @@ rather than rot:**
 
 ## Phase 4.5 — Wire their unified cross-harness memory (`~/.yggterm/memory`)
 
-**The problem it solves:** when you run Claude Code on Monday, Grok on Tuesday, and
-Gemini/Codex on Wednesday on the same project, each CLI harness starts with an
-isolated local memory. Critical bug findings, campaign handover ledgers, and
-rules learned by one agent are invisible to the next.
+**The problem it solves:** when you run Claude Code on Monday, Muse on Tuesday, and
+Gemini/Codex on Wednesday on the same project — possibly from different machines
+(jojo/dev/oc) — each harness and each host starts isolated. Critical bug findings,
+campaign handover ledgers, and rules learned by one agent are invisible to the next.
 
-`~/.yggterm/memory` is the host-resident unified memory layer that tracks a live
-diff of every CLI harness's memory state.
+`~/.yggterm/memory` is the host-resident **unified fleet memory**: one SSOT that every
+harness on every host converges through. It is why a Muse session on `oc` sees what
+Claude learned on `jojo` yesterday, without anyone hand-copying files.
 
-**Set it up WITH them, once per project:**
+**Why this saves them real time and money:**
 
-1. **Bootstrap the memory tree**:
+- **No re-derivation tax.** A finding proven once (`finding-*.md` with a code citation)
+  is read in 20 tokens via `ygg-memory diff` instead of re-debugged for 15k tokens.
+- **No fleet drift.** Without it, `~/.claude/projects/<ns>/memory` on jojo and dev
+  diverge silently — the same bug gets fixed twice, then re-broken by a stale host.
+- **No resident watcher cost.** Sync is not a forever Python loop; it is
+  kernel-coalesced timers (`systemd --user` on Linux, `launchd` on macOS, Task Scheduler
+  on Windows) that wake, do a 200ms local catch-up, and exit. CPU > RAM > SPACE.
+
+**Set it up WITH them, once per project — and once per fleet:**
+
+1. **Bootstrap the memory tree (zero-turn wiring)**:
    ```sh
    .agents/skills/yggterm-agent-fleet/bootstrap.sh
+   # also wires ~/.yggterm/memory/namespaces/<ns> if missing
    ```
-   This creates `MEMORY.md` ("Doors, not rooms") with the intelligent steering header:
+   This creates `MEMORY.md` ("Doors, not rooms") with the steering header:
    ```markdown
-   > 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
+   > 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, Gemini, or Muse. Ingest full or partial diffs as needed.
    ```
 
-2. **Teach the turn-one retrieval ritual (<40 tokens)**:
-   Whenever an agent starts a fresh session, it checks what others learned:
+2. **Wire auto-sync so they never have to remember it** (do it *with* them, show the timers):
+   ```sh
+   # Fast path: current project + yggterm at session start (blocking <500ms)
+   ~/.local/bin/ygg-memory-sync claude        # hook does this; also: muse/gemini/codex/grok
+   # Slow path: full fleet mesh in background (systemd-run, 2s delay, coalesced)
+   #   ygg-memory sync-harness --all + ygg-memory sync-fleet --mesh "jojo dev oc"
+
+   # Persistent timers (installed by onboarding, kernel-optimized):
+   systemctl --user enable --now ygg-memory-fleet.timer     # 10m, RandomizedDelaySec=45
+   systemctl --user enable --now ygg-memory-harness.timer   # 15m catch-up
+   systemctl --user enable --now ygg-booter-tick.timer      # 7m (was resident 5m loop)
+   systemctl --user enable --now ygg-monitor-tick.timer     # 6m (was resident 3m loop)
+   ```
+   Explain: `AccuracySec=1m` lets the kernel batch wakes; `Persistent=true` does one
+   catch-up after sleep instead of N; `Nice=10 IOSchedulingClass=idle` keeps it off
+   their hot path. On macOS show the `launchd` plist equivalent; on Windows the
+   Task Scheduler repetition. **The timers replace resident `watch` loops** — that is
+   why jojo stops running hot when work is on dev/oc.
+
+3. **Teach the turn-one retrieval ritual (<40 tokens, but now mostly automatic)**:
+   Auto-sync already pulled `yggterm` + cwd. Teach the manual fallback for cross-project recall:
    ```sh
    ygg-memory status --harness <me>          # ~25 tokens: check if behind
    ygg-memory diff --harness <me>            # ~80 tokens: view delta summaries
    ygg-memory get --file <finding-or-campaign.md>  # read on demand
    ygg-memory ack --harness <me> --all       # mark absorbed
+   ygg-memory sync-harness --harness <me> --all   # force full pull (rare)
    ```
 
-3. **Teach the Lore Economics (why SOTA models write doors)**:
-   - **SOTA models** (Claude Opus, Gemini Pro) find gotchas, prove them, and publish doors (`ygg-memory publish --file <finding.md>`).
+4. **Teach the knobs they can tune as they talk with agents** (flexibility, not dogma):
+   - **"Sync everywhere or just yggterm?"** Default is yggterm + cwd fast, full fleet background.
+     If they want instant full: change hook to `ygg-memory sync-harness --all` blocking.
+     If they want leaner: keep only fleet timer, drop harness timer.
+   - **"How often?"** Timers are `10m/15m/7m/6m` — show `systemctl --user list-timers` and
+     `journalctl --user -u ygg-memory-fleet -n 20`. Let them say "make fleet 5m" — it is
+     one `systemctl --user edit` line.
+   - **"Deletes should propagate?"** Now yes via tombstone (`action=delete` in `journal.jsonl`).
+     If they archive instead of delete, use `~/.yggterm/memory-archive` + publish with `kind: archive`.
+   - **"Which harnesses?"** `for h in claude muse gemini codex grok` — comment out what they don't use.
+   - **"Battery / metered?"** Add `ConditionACPower=true` to timers, or keep background `systemd-run` only.
+
+5. **Teach the Lore Economics (why SOTA models write doors)**:
+   - **SOTA models** (Claude Opus, Muse Spark xhigh, Gemini Pro) find gotchas, prove them, and publish doors (`ygg-memory publish --file <finding.md>`).
    - **Cheaper models** (Flash, Haiku, small local models) grind the execution without paying expensive re-derivation taxes.
    - **Tooling/Verbs** automate the janitorial work and make failure modes unrepeatable.
+
+**What to say out loud while wiring it:**
+
+> "This is the one setup that keeps paying you back. Without it every new session
+> re-learns what the last one already knew — on a different harness or a different
+> laptop — and you pay for it in tokens. With it, the first thing a fresh session
+> does is ask 'what did the fleet learn since I last looked' — 25 tokens — and the
+> timers keep the fleet identical while you sleep. If you ever want it tighter or
+> lazier, just tell the agent: it's one timer line."
 
 ---
 

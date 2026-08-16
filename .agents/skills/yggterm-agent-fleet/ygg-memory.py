@@ -35,7 +35,7 @@ LOCK_FILE = DEFAULT_MEMORY_ROOT / ".ygg-memory.lock"
 
 STEERING_HEADER = """# Memory Index
 
-> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
+> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, Gemini, or Muse. Ingest full or partial diffs as needed.
 > ⛔ **Doors, not rooms.** Rules (`feedback-/spec-/reference-/user-`) · ledgers (`campaign-/project-`) · findings (`finding-/bug-class-`) · steers (`steer-<harness>-`).
 > One line, one door. Detail belongs in the target file, never here.
 """
@@ -486,76 +486,151 @@ def cmd_publish(args):
         _flock_close(lock)
 
 
+def _sync_single_namespace(root: Path, harness: str, ns: str) -> tuple:
+    """Sync one namespace. Returns (in_count, out_count). Handles tombstone deletes."""
+    # Determine local harness memory dir
+    if harness == "claude":
+        local_dir = Path.home() / ".claude" / "projects" / ns / "memory"
+    elif harness == "gemini":
+        local_dir = Path.home() / ".gemini" / "projects" / ns / "memory"
+    else:
+        local_dir = Path.home() / f".{harness}" / "projects" / ns / "memory"
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    ns_dir = get_namespace_dir(root, ns)
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = BACKUP_ROOT / ns / stamp
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for f in local_dir.glob("*.md"):
+        shutil.copy2(f, backup_dir)
+
+    in_count = 0
+    out_count = 0
+    del_count = 0
+
+    # Collect journal tombstones for this ns since last sync
+    # We load watermark once and keep reference for mutation — caller will reload and save, so we must persist deletes directly
+    watermark_for_deletes = load_watermark(root, harness)
+    delete_entries = [e for e in read_journal_entries(root, after_seq=0, namespace=ns) if e.get("action") == "delete"]
+    deleted_files = {e.get("file") for e in delete_entries}
+
+    # Apply tombstone deletes locally (unified -> local delete propagation)
+    for del_file in deleted_files:
+        local_target = local_dir / del_file
+        if local_target.exists():
+            if not (ns_dir / del_file).exists():
+                local_target.unlink()
+                del_count += 1
+        # Also ensure watermark no longer tracks this deleted file (clean stale watermark entry)
+        if del_file in watermark_for_deletes.get("namespaces", {}).get(ns, {}):
+            watermark_for_deletes["namespaces"][ns].pop(del_file, None)
+            save_watermark(root, watermark_for_deletes)
+
+    # Detect local deletes (file was in watermark but now missing locally -> intentional delete)
+    ns_watermark_files = watermark_for_deletes.get("namespaces", {}).get(ns, {})
+    for fname in list(ns_watermark_files.keys()):
+        if fname not in deleted_files and not (local_dir / fname).exists() and (ns_dir / fname).exists():
+            tombstone_src = ns_dir / fname
+            try:
+                tombstone_src.unlink()
+            except FileNotFoundError:
+                pass
+            content_backup = ""
+            try:
+                content_backup = backup_dir.joinpath(fname).read_text(encoding="utf-8") if (backup_dir / fname).exists() else ""
+            except Exception:
+                pass
+            kind, summary, target_h = extract_metadata_and_summary(content_backup, fname)
+            append_journal_entry(root, ns, fname, kind, "delete", harness, f"deleted {fname}", target_harness=target_h)
+            del_count += 1
+            watermark_for_deletes.get("namespaces", {}).get(ns, {}).pop(fname, None)
+            save_watermark(root, watermark_for_deletes)
+
+    # Pass 1: Ingest from local harness -> unified root (if local newer or unified missing)
+    for loc_file in local_dir.glob("*.md"):
+        if loc_file.name in deleted_files:
+            continue
+        dest_file = ns_dir / loc_file.name
+        if not dest_file.exists() or loc_file.stat().st_mtime > dest_file.stat().st_mtime:
+            content = loc_file.read_text(encoding="utf-8")
+            kind, summary, target_h = extract_metadata_and_summary(content, loc_file.name)
+            shutil.copy2(loc_file, dest_file)
+            append_journal_entry(root, ns, loc_file.name, kind, "upsert", harness, summary, target_harness=target_h)
+            in_count += 1
+
+    # Pass 2: Propagate from unified root -> local harness (matching target_harness only!)
+    for uni_file in ns_dir.glob("*.md"):
+        content = uni_file.read_text(encoding="utf-8")
+        _, _, target_h = extract_metadata_and_summary(content, uni_file.name)
+        if not matches_target_harness(target_h, harness):
+            continue
+        dest_file = local_dir / uni_file.name
+        if not dest_file.exists() or uni_file.stat().st_mtime > dest_file.stat().st_mtime:
+            shutil.copy2(uni_file, dest_file)
+            out_count += 1
+
+    # Ensure steering header in local MEMORY.md
+    loc_mem = local_dir / "MEMORY.md"
+    if loc_mem.exists():
+        txt = loc_mem.read_text(encoding="utf-8")
+        if "UNIFIED FLEET MEMORY" not in txt:
+            loc_mem.write_text(STEERING_HEADER + "\n" + txt, encoding="utf-8")
+
+    return in_count, out_count, del_count
+
+
 def cmd_sync_harness(args):
     """Bidirectional sync between harness-local directory and ~/.yggterm/memory."""
     root = Path(args.root)
     harness = detect_harness(args.harness)
-    ns = detect_namespace(override=args.ns)
     lock = _flock_open(LOCK_FILE)
 
     try:
-        # Determine local harness memory dir
-        if args.local_dir:
-            local_dir = Path(args.local_dir).resolve()
-        elif harness == "claude":
-            local_dir = Path.home() / ".claude" / "projects" / ns / "memory"
-        elif harness == "gemini":
-            local_dir = Path.home() / ".gemini" / "projects" / ns / "memory"
-        else:
-            local_dir = Path.home() / f".{harness}" / "projects" / ns / "memory"
+        if getattr(args, "all", False):
+            # Discover all namespaces from unified + all harness local dirs
+            all_ns = set()
+            for d in (root / "namespaces").glob("*"):
+                if d.is_dir():
+                    all_ns.add(d.name)
+            for h in ["claude", "muse", "gemini", "codex", "grok"]:
+                base = Path.home() / f".{h}" / "projects"
+                if h == "claude":
+                    base = Path.home() / ".claude" / "projects"
+                elif h == "gemini":
+                    base = Path.home() / ".gemini" / "projects"
+                if base.exists():
+                    for d in base.glob("*/memory"):
+                        ns = d.parent.name
+                        all_ns.add(ns)
+            # Also include any -home-pi* style from filesystem
+            total_in = total_out = total_del = 0
+            for ns in sorted(all_ns):
+                inc, outc, delc = _sync_single_namespace(root, harness, ns)
+                total_in += inc
+                total_out += outc
+                total_del += delc
+            watermark = load_watermark(root, harness)
+            watermark["last_seq"] = get_latest_seq(root)
+            watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            save_watermark(root, watermark)
+            if args.json:
+                print(json.dumps({"status": "ok", "harness": harness, "namespaces": len(all_ns), "pulled_in": total_in, "pushed_out": total_out, "deleted": total_del}))
+            else:
+                print(f"Harness sync completed ({harness} all {len(all_ns)} ns): {total_in} ingested, {total_out} propagated, {total_del} deleted.")
+            return
 
-        local_dir.mkdir(parents=True, exist_ok=True)
-        ns_dir = get_namespace_dir(root, ns)
-
-        # Snapshot local first
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_dir = BACKUP_ROOT / ns / stamp
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        for f in local_dir.glob("*.md"):
-            shutil.copy2(f, backup_dir)
-
-        in_count = 0
-        out_count = 0
-
-        # Pass 1: Ingest from local harness -> unified root (if local newer or unified missing)
-        for loc_file in local_dir.glob("*.md"):
-            dest_file = ns_dir / loc_file.name
-            if not dest_file.exists() or loc_file.stat().st_mtime > dest_file.stat().st_mtime:
-                content = loc_file.read_text(encoding="utf-8")
-                kind, summary, target_h = extract_metadata_and_summary(content, loc_file.name)
-                shutil.copy2(loc_file, dest_file)
-                append_journal_entry(root, ns, loc_file.name, kind, "upsert", harness, summary, target_harness=target_h)
-                in_count += 1
-
-        # Pass 2: Propagate from unified root -> local harness (matching target_harness only!)
-        for uni_file in ns_dir.glob("*.md"):
-            content = uni_file.read_text(encoding="utf-8")
-            _, _, target_h = extract_metadata_and_summary(content, uni_file.name)
-            if not matches_target_harness(target_h, harness):
-                # Skip doors explicitly targeted to another harness!
-                continue
-
-            dest_file = local_dir / uni_file.name
-            if not dest_file.exists() or uni_file.stat().st_mtime > dest_file.stat().st_mtime:
-                shutil.copy2(uni_file, dest_file)
-                out_count += 1
-
-        # Ensure steering header in local MEMORY.md
-        loc_mem = local_dir / "MEMORY.md"
-        if loc_mem.exists():
-            txt = loc_mem.read_text(encoding="utf-8")
-            if "UNIFIED FLEET MEMORY" not in txt:
-                loc_mem.write_text(STEERING_HEADER + "\n" + txt, encoding="utf-8")
-
+        ns = detect_namespace(override=args.ns)
+        inc, outc, delc = _sync_single_namespace(root, harness, ns)
         watermark = load_watermark(root, harness)
         watermark["last_seq"] = get_latest_seq(root)
         watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         save_watermark(root, watermark)
-
         if args.json:
-            print(json.dumps({"status": "ok", "harness": harness, "namespace": ns, "pulled_in": in_count, "pushed_out": out_count}))
+            print(json.dumps({"status": "ok", "harness": harness, "namespace": ns, "pulled_in": inc, "pushed_out": outc, "deleted": delc}))
         else:
-            print(f"Harness sync completed ({harness} <-> {ns}): {in_count} ingested, {out_count} propagated.")
+            extra = f", {delc} deleted" if delc else ""
+            print(f"Harness sync completed ({harness} <-> {ns}): {inc} ingested, {outc} propagated{extra}.")
     finally:
         _flock_close(lock)
 
@@ -703,6 +778,7 @@ def main():
     # sync-harness
     p_sync_h = subparsers.add_parser("sync-harness", parents=[common_parser], help="Bi-directional sync with local harness store")
     p_sync_h.add_argument("--local-dir", default=None, help="Explicit local harness memory directory")
+    p_sync_h.add_argument("--all", action="store_true", help="Sync all namespaces (unified + all harness local dirs)")
 
     # sync-fleet
     p_sync_f = subparsers.add_parser("sync-fleet", parents=[common_parser], help="Mesh sync ~/.yggterm/memory across SSH peers")
