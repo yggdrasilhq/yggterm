@@ -108,18 +108,26 @@ impl StartpageDurableRow {
                 }
             }
         };
-        // Resolve generated copy when the CLI itself stores no title.
-        // This is what the shell's `detail` pipeline does — do it here so
-        // `effective_title` is what the startpage actually paints, not what
-        // the store file alone contains.
+        // Resolve generated copy based on title authority.
+        // Store-authoritative CLIs (Claude, Qwen, Kimi) use the store title when present;
+        // Generated CLIs (Muse, Codex, Antigravity...) prefer the generated copy.
         let raw_title = entry.title.clone();
-        let generated_title = if raw_title.is_none() {
-            // Try to load from titles.db; failure means no generated copy yet.
-            Self::load_generated_title(&entry.session_id)
+        let descriptor = crate::agent_cli::agent_cli_descriptor(kind);
+        let is_store_authoritative = descriptor.map(|d| d.title_is_store_authoritative()).unwrap_or(false);
+        let generated_title = if is_store_authoritative {
+            if raw_title.is_none() {
+                Self::load_generated_title(&entry.session_id)
+            } else {
+                None
+            }
         } else {
-            None
+            Self::load_generated_title(&entry.session_id)
         };
-        let effective_title = raw_title.clone().or_else(|| generated_title.clone());
+        let effective_title = if is_store_authoritative {
+            raw_title.clone().or_else(|| generated_title.clone())
+        } else {
+            generated_title.clone().or_else(|| raw_title.clone())
+        };
         Self {
             session_id: entry.session_id,
             cwd: entry.cwd,

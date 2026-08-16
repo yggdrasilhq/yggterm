@@ -77,14 +77,6 @@ impl SessionTitleStore {
                 model TEXT,
                 updated_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS session_precis (
-                session_id TEXT PRIMARY KEY,
-                precis TEXT NOT NULL,
-                cwd TEXT,
-                source TEXT,
-                model TEXT,
-                updated_at TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS session_summaries (
                 session_id TEXT PRIMARY KEY,
                 summary TEXT NOT NULL,
@@ -121,29 +113,25 @@ impl SessionTitleStore {
         }
     }
 
-    pub fn get_precis(&self, session_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .get_precis_record(session_id)?
-            .map(|record| record.value))
+
+    #[deprecated(note="precis removed")]
+    pub fn get_precis(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
-    pub(crate) fn get_precis_record(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<GeneratedCopyRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT precis, updated_at FROM session_precis WHERE session_id = ?1")?;
-        let mut rows = stmt.query(params![session_id])?;
-        if let Some(row) = rows.next()? {
-            let updated_at = row.get::<_, String>(1)?;
-            Ok(Some(GeneratedCopyRecord {
-                value: row.get(0)?,
-                updated_at: parse_copy_timestamp(&updated_at)?,
-            }))
-        } else {
-            Ok(None)
-        }
+    #[deprecated(note="precis removed")]
+    pub(crate) fn get_precis_record(&self, _session_id: &str) -> anyhow::Result<Option<GeneratedCopyRecord>> {
+        Ok(None)
+    }
+
+    #[deprecated(note="precis removed")]
+    pub fn put_precis(&self, _session_id: &str, _cwd: &str, _precis: &str, _model: &str, _source: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[deprecated(note="precis removed")]
+    pub fn delete_precis(&self, _session_id: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 
     pub fn get_summary(&self, session_id: &str) -> Result<Option<String>> {
@@ -273,30 +261,6 @@ impl SessionTitleStore {
         Ok(true)
     }
 
-    pub fn put_precis(
-        &self,
-        session_id: &str,
-        cwd: &str,
-        precis: &str,
-        model: &str,
-        source: &str,
-    ) -> Result<()> {
-        let updated_at =
-            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
-        self.conn.execute(
-            "INSERT INTO session_precis (session_id, precis, cwd, source, model, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(session_id) DO UPDATE SET
-               precis = excluded.precis,
-               cwd = excluded.cwd,
-               source = excluded.source,
-               model = excluded.model,
-               updated_at = excluded.updated_at",
-            params![session_id, precis, cwd, source, model, updated_at],
-        )?;
-        Ok(())
-    }
-
     pub fn put_summary(
         &self,
         session_id: &str,
@@ -388,14 +352,6 @@ impl SessionTitleStore {
         Ok(())
     }
 
-    pub fn delete_precis(&self, session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM session_precis WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        Ok(())
-    }
-
     pub fn delete_summary(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM session_summaries WHERE session_id = ?1",
@@ -438,10 +394,6 @@ impl SessionTitleResolver {
         self.store.delete_title(session_id)
     }
 
-    pub fn resolve_precis_for_session(&self, session_id: &str) -> Result<Option<String>> {
-        self.store.get_precis(session_id)
-    }
-
     pub fn resolve_summary_for_session(&self, session_id: &str) -> Result<Option<String>> {
         self.store.get_summary(session_id)
     }
@@ -458,16 +410,25 @@ impl SessionTitleResolver {
         self.store.reset_summary_timeline(session_id)
     }
 
-    pub fn precis_needs_refresh(
-        &self,
-        session_id: &str,
-        source_updated_at: OffsetDateTime,
-    ) -> Result<bool> {
-        let Some(record) = self.store.get_precis_record(session_id)? else {
-            return Ok(true);
-        };
-        Ok(looks_like_low_signal_generated_copy(&record.value)
-            || source_updated_at - record.updated_at > TimeDuration::days(3))
+
+    #[deprecated(note="precis removed")]
+    pub fn precis_needs_refresh(&self, _session_id: &str, _source_updated_at: time::OffsetDateTime) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    #[deprecated(note="precis removed")]
+    pub fn resolve_precis_for_session(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    #[deprecated(note="precis removed")]
+    pub fn generate_precis_for_session(&self, _settings: &crate::AppSettings, _session_id: &str, _cwd: &str, _file_path: &std::path::Path, _force: bool) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    #[deprecated(note="precis removed")]
+    pub fn generate_precis_for_context(&self, _settings: &crate::AppSettings, _session_id: &str, _cwd: &str, _context: &str, _force: bool) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
     pub fn summary_needs_refresh(
@@ -642,120 +603,6 @@ impl SessionTitleResolver {
             "litellm",
         )?;
         Ok(Some(title))
-    }
-
-    pub fn generate_precis_for_session(
-        &self,
-        settings: &AppSettings,
-        session_id: &str,
-        cwd: &str,
-        file_path: &Path,
-        force: bool,
-    ) -> Result<Option<String>> {
-        if !force {
-            if let Some(precis) = self.store.get_precis(session_id)? {
-                if !looks_like_low_signal_generated_copy(&precis) {
-                    return Ok(Some(precis));
-                }
-                let _ = self.store.delete_precis(session_id);
-            }
-        } else {
-            let _ = self.store.delete_precis(session_id);
-        }
-
-        let context = extract_tail_context(file_path)?;
-        if context.is_empty() {
-            return Ok(None);
-        }
-        if !settings_ready(settings) {
-            if let Some(precis) = heuristic_precis_from_context(&context) {
-                self.store
-                    .put_precis(session_id, cwd, &precis, "heuristic", "heuristic")?;
-                return Ok(Some(precis));
-            }
-            return Ok(None);
-        }
-        let precis = request_litellm_precis(settings, &context)?;
-        let Some(precis) = sanitize_generated_precis(&precis) else {
-            return Ok(None);
-        };
-        let precis = if looks_like_low_signal_generated_copy(&precis) {
-            if let Some(heuristic) = heuristic_precis_from_context(&context) {
-                if looks_like_low_signal_generated_copy(&heuristic) {
-                    return Ok(None);
-                }
-                heuristic
-            } else {
-                return Ok(None);
-            }
-        } else {
-            precis
-        };
-        self.store.put_precis(
-            session_id,
-            cwd,
-            &precis,
-            &settings.interface_llm_model,
-            "litellm",
-        )?;
-        Ok(Some(precis))
-    }
-
-    pub fn generate_precis_for_context(
-        &self,
-        settings: &AppSettings,
-        session_id: &str,
-        cwd: &str,
-        context: &str,
-        force: bool,
-    ) -> Result<Option<String>> {
-        if !force {
-            if let Some(precis) = self.store.get_precis(session_id)? {
-                if !looks_like_low_signal_generated_copy(&precis) {
-                    return Ok(Some(precis));
-                }
-                let _ = self.store.delete_precis(session_id);
-            }
-        } else {
-            let _ = self.store.delete_precis(session_id);
-        }
-
-        if context.trim().is_empty() {
-            return Ok(None);
-        }
-        if !settings_ready(settings) {
-            if let Some(precis) = heuristic_precis_from_context(context) {
-                self.store
-                    .put_precis(session_id, cwd, &precis, "heuristic", "heuristic")?;
-                return Ok(Some(precis));
-            }
-            return Ok(None);
-        }
-
-        let precis = request_litellm_precis(settings, context)?;
-        let Some(precis) = sanitize_generated_precis(&precis) else {
-            return Ok(None);
-        };
-        let precis = if looks_like_low_signal_generated_copy(&precis) {
-            if let Some(heuristic) = heuristic_precis_from_context(context) {
-                if looks_like_low_signal_generated_copy(&heuristic) {
-                    return Ok(None);
-                }
-                heuristic
-            } else {
-                return Ok(None);
-            }
-        } else {
-            precis
-        };
-        self.store.put_precis(
-            session_id,
-            cwd,
-            &precis,
-            &settings.interface_llm_model,
-            "litellm",
-        )?;
-        Ok(Some(precis))
     }
 
     pub fn generate_summary_for_session(
@@ -988,71 +835,6 @@ fn parse_copy_timestamp(value: &str) -> Result<OffsetDateTime> {
         .with_context(|| format!("invalid generated-copy timestamp: {value}"))
 }
 
-fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<String> {
-    let url = completions_url(&settings.litellm_endpoint);
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("failed to build LiteLLM client")?;
-    let body = serde_json::json!({
-        "model": settings.interface_llm_model,
-        "temperature": 0.2,
-        "max_tokens": 768,
-        "messages": [
-            {
-                "role": "system",
-                "content": "Generate a short desktop-header precis for a long-running coding or terminal session. State the current task and the most important current progress in one or two crisp sentences. Prefer the overarching task over subordinate screenshot or image-inspection substeps. Ignore boilerplate, launch/bootstrap notes, policy text, and metadata scaffolding unless they are central to the work. Write like a strong engineer updating another engineer, not like a transcript. No markdown, no bullets, no quotes."
-            },
-            {
-                "role": "user",
-                "content": format!("Create a concise UI precis from this structured session context.\nFocus on what the operator is currently trying to achieve and what has already been established.\nIf there is a temporary screenshot or image-reading turn inside a longer workflow, do not center the precis on that substep.\nAvoid low-value scaffold copy like raw Target/Command metadata.\nGood precis example: 'Investigating the Yggterm memory leak and hardening the daemon lifecycle. Stale deleted-binary daemons were identified and cleanup plus stress coverage has been added.'\n\n{context}")
-            }
-        ]
-    });
-
-    let response = match client
-        .post(url)
-        .bearer_auth(settings.litellm_api_key.trim())
-        .json(&body)
-        .send()
-    {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => response,
-            Err(error) => {
-                // 429 is transient — never persist a heuristic over it (see title arm).
-                if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
-                    return Err(error).context("LiteLLM rate limited (429)");
-                }
-                if let Some(precis) = heuristic_precis_from_context(context) {
-                    return Ok(precis);
-                }
-                return Err(error).context("LiteLLM returned an error status");
-            }
-        },
-        Err(error) => {
-            if let Some(precis) = heuristic_precis_from_context(context) {
-                return Ok(precis);
-            }
-            return Err(error).context("LiteLLM request failed");
-        }
-    };
-
-    let value: Value = match response.json() {
-        Ok(value) => value,
-        Err(error) => {
-            if let Some(precis) = heuristic_precis_from_context(context) {
-                return Ok(precis);
-            }
-            return Err(error).context("failed to parse LiteLLM response");
-        }
-    };
-    let precis = extract_completion_text(&value)
-        .or_else(|| extract_reasoning_title(&value))
-        .or_else(|| heuristic_precis_from_context(context))
-        .context("LiteLLM response did not contain a precis")?;
-    Ok(precis)
-}
-
 fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<String> {
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
@@ -1203,28 +985,6 @@ fn sanitize_generated_title(raw: &str) -> Option<String> {
     Some(shortened)
 }
 
-fn sanitize_generated_precis(raw: &str) -> Option<String> {
-    let compact = raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let sanitized = compact
-        .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
-        .trim();
-    if sanitized.is_empty() {
-        return None;
-    }
-    let without_aux = strip_auxiliary_image_sentences(sanitized);
-    let final_text = if without_aux.is_empty() {
-        sanitized
-    } else {
-        without_aux.as_str()
-    };
-    Some(final_text.chars().take(180).collect::<String>())
-}
-
 fn sanitize_generated_summary(raw: &str) -> Option<String> {
     let compact = raw
         .lines()
@@ -1295,7 +1055,7 @@ fn strip_auxiliary_image_sentences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_SUMMARY_CONTEXT_CHARS, SessionTitleResolver, SessionTitleStore, best_effort_precis_from_context,
+        MIN_SUMMARY_CONTEXT_CHARS, SessionTitleResolver, SessionTitleStore,
         best_effort_summary_from_context, best_effort_title_from_context, extract_tail_context,
         heuristic_title_from_context, looks_like_generated_fallback_title,
         looks_like_low_signal_generated_title, sanitize_generated_summary,
@@ -1716,10 +1476,8 @@ mod tests {
         ]
         .join("\n");
         let title = best_effort_title_from_context(&context).expect("title");
-        let precis = best_effort_precis_from_context(&context).expect("precis");
         let summary = best_effort_summary_from_context(&context).expect("summary");
         assert_eq!(title, "Investigate Samplenotes Extraction Workflow");
-        assert!(precis.contains("SAMPLENOTES extraction workflow") || precis.contains("Investigate"));
         assert!(summary.contains("SAMPLENOTES") || summary.contains("Investigate"));
     }
 
@@ -3315,27 +3073,6 @@ fn looks_like_shell_command_copy(text: &str) -> bool {
     })
 }
 
-fn heuristic_precis_from_context(context: &str) -> Option<String> {
-    let candidates = copy_candidate_entries(context);
-    let objective = candidates
-        .iter()
-        .find(|candidate| candidate.is_objective)
-        .or_else(|| candidates.first())?;
-    let progress = candidates
-        .iter()
-        .find(|candidate| candidate.is_progress && candidate.line != objective.line);
-    let precis = if let Some(progress) = progress {
-        format!(
-            "{} {}",
-            sentence_case_line(&objective.line),
-            sentence_case_line(&progress.line)
-        )
-    } else {
-        sentence_case_line(&objective.line)
-    };
-    sanitize_generated_precis(&precis)
-}
-
 fn heuristic_summary_from_context(context: &str) -> Option<String> {
     if let Some(summary) = themed_summary_from_context(context) {
         return Some(summary);
@@ -3377,16 +3114,14 @@ pub fn best_effort_context_from_session_path(file_path: &Path) -> Result<String>
     extract_tail_context(file_path)
 }
 
-pub fn best_effort_precis_from_context(context: &str) -> Option<String> {
-    let precis = heuristic_precis_from_context(context)?;
-    let precis = sanitize_generated_precis(&precis)?;
-    (!looks_like_low_signal_generated_copy(&precis)).then_some(precis)
-}
-
 pub fn best_effort_summary_from_context(context: &str) -> Option<String> {
     let summary = heuristic_summary_from_context(context)?;
     let summary = sanitize_generated_summary(&summary)?;
     (!looks_like_low_signal_generated_copy(&summary)).then_some(summary)
+}
+
+pub fn best_effort_precis_from_context(_context: &str) -> Option<String> {
+    None
 }
 
 fn title_case_word(word: &str) -> String {

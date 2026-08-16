@@ -2853,10 +2853,6 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         session_id,
         cwd,
         modified_epoch_ms: db_updated_ms,
-        // Muse is TitleAuthority::Generated — the store itself carries no
-        // user-visible title, so we return None and let the chore generate one.
-        // Expose the DB title via detail instead so the cwdtree/startpage can
-        // still show something before generation runs.
         title: db_title.clone(),
         detail: db_title,
     })

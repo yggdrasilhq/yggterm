@@ -165,7 +165,6 @@ fn spawn_remote_generated_copy_persist(
     session_id: String,
     cwd: String,
     title: Option<String>,
-    precis: Option<String>,
     summary: Option<String>,
     model: &'static str,
 ) {
@@ -178,7 +177,6 @@ fn spawn_remote_generated_copy_persist(
                 &session_id,
                 &cwd,
                 title.as_deref(),
-                precis.as_deref(),
                 summary.as_deref(),
                 model,
             ) {
@@ -9296,16 +9294,13 @@ impl DaemonRuntime {
                         self.server.set_session_title_hint(&path, title);
                     }
                 }
-                if let Some(precis) = precis.as_deref() {
-                    self.server.set_session_precis_hint(&path, precis);
-                }
                 if let Some(summary) = summary.as_deref() {
                     self.server.set_session_summary_hint(&path, summary);
                 }
                 self.persist()?;
                 if let Some((machine, session_id, cwd)) = remote_copy_target {
                     spawn_remote_generated_copy_persist(
-                        machine, session_id, cwd, title, precis, summary, "manual",
+                        machine, session_id, cwd, title, summary, "manual",
                     );
                 }
                 ServerResponse::Ack { message: None }
@@ -11860,7 +11855,6 @@ fn build_background_copy_updates(
                         &candidate.session_id,
                         &candidate.cwd,
                         title.as_deref(),
-                        None,
                         summary.as_deref(),
                         &settings.interface_llm_model,
                     )?;

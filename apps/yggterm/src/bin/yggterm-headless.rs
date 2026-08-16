@@ -781,7 +781,6 @@ fn regenerate_remote_machine_copy(
             &scanned.session_id,
             &scanned.cwd,
             title.as_deref(),
-            precis.as_deref(),
             summary.as_deref(),
             &settings.interface_llm_model,
             reset_summary_history,
