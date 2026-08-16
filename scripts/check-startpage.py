@@ -128,7 +128,7 @@ def run_on_host(host, cmd, timeout=15):
 def verb_on_host(host):
     # Use large limit so verb returns the full durable set — default 200 truncates
     # and would make the oracle's full walk (10000) always mismatch.
-    cmd = "yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm server startpage ls --json --limit 10000 2>&1"
+    cmd = "~/.local/bin/yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm server startpage ls --json --limit 10000 2>&1"
     out, err = run_on_host(host, cmd)
     if err:
         return None, err, out
@@ -202,13 +202,17 @@ def parse_file_on_host(host, path, cli_slug):
     """Parse a single store file on host via ssh cat + python logic."""
     # We cat first line or whole file depending on cli
     if cli_slug == "antigravity":
-        # Per-conversation .db files don't hold the title — summaries.db does.
-        # For lie detection we just need the session_id (file stem) to match
-        # the verb's list; title is verified separately via summaries.db.
-        session_id = Path(path).stem
-        if session_id.endswith("-shm") or session_id.endswith("-wal"):
+        if path.endswith("transcript.jsonl"):
+            parts = Path(path).parts
+            if ".system_generated" in parts:
+                idx = parts.index(".system_generated")
+                session_id = parts[idx - 1]
+            else:
+                session_id = Path(path).parent.parent.parent.name
+        else:
+            session_id = Path(path).stem
+        if not session_id or session_id == "transcript" or session_id.endswith("-shm") or session_id.endswith("-wal"):
             return {"session_id": None, "raw": ""}
-        # Query the central summaries.db for this id's title
         home_out,_ = run_on_host(host, "echo $HOME")
         home = home_out.strip() if home_out else os.path.expanduser("~")
         db = f"{home}/.gemini/antigravity-cli/conversation_summaries.db"
@@ -221,6 +225,15 @@ def parse_file_on_host(host, path, cli_slug):
                 title = parts[0].strip()
             elif len(parts)>1 and parts[1].strip():
                 title = parts[1].strip()
+        if not title:
+            hcmd = f"grep -F '\"{session_id}\"' {shlex.quote(home)}/.gemini/antigravity-cli/history.jsonl 2>/dev/null | head -n 1"
+            hout, _ = run_on_host(host, hcmd)
+            if hout:
+                try:
+                    hj = json.loads(hout)
+                    title = hj.get("display")
+                except:
+                    pass
         return {"session_id": session_id, "title": title, "raw": out[:500] if out else ""}
     elif cli_slug == "grok":
         cmd = f"cat {shlex.quote(path)} 2>/dev/null | head -c 4000"
@@ -269,11 +282,9 @@ def parse_file_on_host(host, path, cli_slug):
             cwd = home
         return {"session_id": session_id, "cwd": cwd, "title": title, "raw": (out_db[:500] if out_db else out2[:500] if 'out2' in locals() and out2 else "")}
     elif cli_slug == "claude-code":
-        # Claude: filename IS the session id; cwd/title need full scan but we
-        # can get id instantly and cwd from a deeper grep. This avoids missing
-        # sessions where the first 5 lines have no cwd (they carry sessionId
-        # but not cwd until later attachment records).
         session_id = Path(path).stem
+        if session_id.startswith("agent-"):
+            return {"session_id": None, "raw": ""}
         # Try to get cwd via a single grep for "cwd" (independent of first 5)
         cmd = f"grep -m1 '\"cwd\"' {shlex.quote(path)} 2>/dev/null | head -c 2000"
         out, _ = run_on_host(host, cmd)
@@ -291,6 +302,12 @@ def parse_file_on_host(host, path, cli_slug):
                     cwd = m2.group(1)
             except:
                 pass
+        if not cwd:
+            parent_name = Path(path).parent.name
+            if parent_name.startswith("-"):
+                cwd = "/" + parent_name[1:].replace("-", "/")
+            else:
+                cwd = home
         # Title precedence per Rust read_cc_session_title: latest custom-title wins,
         # else latest ai-title, else first human prompt (we approximate with custom then ai).
         title = None

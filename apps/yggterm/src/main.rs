@@ -3936,6 +3936,7 @@ fn unregister_signal_client_instance(
     Ok(remaining_pids.len())
 }
 
+#[allow(dead_code)]
 fn compatible_signal_client_count(
     home_dir: &std::path::Path,
     endpoint: &yggterm_server::ServerEndpoint,
@@ -3991,6 +3992,7 @@ fn signal_env_var(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[allow(dead_code)]
 fn signal_client_scope_matches_pid(
     pid: u32,
     path: &std::path::Path,
@@ -4018,6 +4020,7 @@ fn read_signal_process_start_ticks_from_record(path: &std::path::Path) -> Option
         .and_then(serde_json::Value::as_u64)
 }
 
+#[allow(dead_code)]
 fn read_signal_client_scope_from_record(path: &std::path::Path) -> Option<SignalClientScope> {
     let payload = fs::read(path).ok()?;
     let value = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
@@ -4061,6 +4064,7 @@ fn read_signal_client_scope_from_record(path: &std::path::Path) -> Option<Signal
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn read_signal_client_scope_from_proc(pid: u32) -> Option<SignalClientScope> {
     let payload = fs::read(format!("/proc/{pid}/environ")).ok()?;
     let mut scope = SignalClientScope {

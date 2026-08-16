@@ -420,6 +420,29 @@ pub fn session_kind_for_path(path: &str) -> Option<SessionKind> {
         .and_then(|scheme| scheme.kind)
 }
 
+/// Builds the canonical remote session path for an agent kind, machine key, and session id.
+pub fn remote_agent_session_path(kind: SessionKind, machine_key: &str, session_id: &str) -> String {
+    let prefix = remote_agent_row_schemes()
+        .find(|scheme| scheme.kind == Some(kind))
+        .map(|scheme| scheme.prefix)
+        .unwrap_or("remote-session://");
+    format!("{prefix}{machine_key}/{session_id}")
+}
+
+/// Returns true if the path begins with any registered remote agent row scheme
+/// (e.g. `remote-session://`, `remote-cc://`, `remote-agy://`, `remote-muse://`, etc.).
+pub fn is_remote_agent_session_path(path: &str) -> bool {
+    let trimmed = path.trim_start();
+    remote_agent_row_schemes().any(|scheme| trimmed.starts_with(scheme.prefix))
+}
+
+/// Returns true if the path begins with any registered remote row scheme (agent or ssh).
+pub fn is_remote_row_path(path: &str) -> bool {
+    let trimmed = path.trim_start();
+    remote_row_schemes().any(|scheme| trimmed.starts_with(scheme.prefix))
+}
+
+
 /// One recorded, dated hole: a predicate that does not yet cover a scheme the
 /// registry says it must. THE burn-down list (spec §7.2 is its source; each
 /// row here was RE-VERIFIED against main on the recorded date). The lock

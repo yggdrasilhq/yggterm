@@ -3247,6 +3247,7 @@ fn join_invocation_tokens(tokens: &[String]) -> String {
 /// ⛔ The launch options are NEVER written back to settings. A delegate asking
 /// for bypass must not mutate `claude_code_extra_args`, which the user owns;
 /// that requirement is what made the pre-flag workaround not acceptable.
+#[allow(dead_code)]
 pub(crate) fn composed_cli_extra_args(
     kind: SessionKind,
     launch: &AgentLaunchOptions,
@@ -3272,6 +3273,7 @@ pub(crate) fn composed_cli_extra_args_with(
     Ok(shell_join_tokens(&tokens))
 }
 
+#[allow(dead_code)]
 fn configured_cli_extra_args(kind: SessionKind) -> String {
     shell_join_tokens(&configured_cli_extra_arg_tokens(kind))
 }

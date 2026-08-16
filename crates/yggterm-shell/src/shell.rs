@@ -9898,6 +9898,14 @@ struct SavedWebTab {
     /// (serde default `false`); their rows restore under the pre-mark rule.
     #[serde(default)]
     app_tab: bool,
+    /// Per-tab navigation history: the URLs this tab has visited, in order.
+    /// `history[history_index]` == `url` when present. Absent in stores written
+    /// before this field existed — a missing history restores as a single-entry
+    /// history containing the saved URL, so old stores remain valid.
+    #[serde(default)]
+    history: Vec<String>,
+    #[serde(default)]
+    history_index: usize,
 }
 /// What a web-surface materialization IS, and every caller of
 /// [`ShellState::upsert_web_surface`] has to say which — because the two mean
@@ -10246,58 +10254,88 @@ fn append_web_surface_history(profile: &str, url: &str, title: &str) {
         &yggterm_core::web_history::WebHistoryEntry::new(current_millis(), url, title),
     );
 }
-/// Omnibox history suggestions for `query`: most-recent-first substring match
-/// (case-insensitive, over url + title), deduped by URL. Deterministic given
-/// the history file contents.
-/// Best inline autocomplete for `typed`: the most-recent history URL whose
-/// display form (scheme- and `www.`-stripped, the way Chrome shows it) BEGINS
-/// with what the user typed. Returns that completion in the user's typing form
-/// (their prefix casing kept, the history tail appended), or `None`. Only a
-/// strict case-insensitive prefix that EXTENDS `typed` completes — so a full
-/// match (nothing left to add) offers no ghost text.
+/// Chromium-parity omnibox: frecency-ranked history provider. Score = typed_count
+/// (visit frequency) * recency_decay + prefix/word-boundary bonus + host/title
+/// boost. Deterministic given the history file contents.
+fn omnibox_frecency_score(visit_count: usize, days_since_last_visit: f64) -> f64 {
+    // Half-life ~14 days, floor 0.2 so old favourites still surface.
+    let recency = (-days_since_last_visit / 14.0).exp().max(0.2);
+    (visit_count as f64) * recency
+}
 fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
     let typed = typed.trim_start();
-    // A path/query is fine (it still prefix-matches a full history URL); only
-    // whitespace or an empty query can never be a URL prefix.
     if typed.is_empty() || typed.contains(char::is_whitespace) {
         return None;
     }
     let typed_lc = typed.to_lowercase();
-    let path = web_surface_history_path(profile)?;
+    let Some(path) = web_surface_history_path(profile) else {
+        return None;
+    };
     let raw = std::fs::read_to_string(&path).ok()?;
-    for line in raw.lines().rev() {
+    // Aggregate by url: count + most recent timestamp + title.
+    let mut agg: std::collections::HashMap<String, (usize, u64, String)> = std::collections::HashMap::new();
+    for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let Some(url) = value.get("url").and_then(Value::as_str) else {
             continue;
         };
+        let title = value.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+        let ts = value.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+        let e = agg.entry(url.to_string()).or_insert((0, 0, title.clone()));
+        e.0 += 1;
+        if ts > e.1 {
+            e.1 = ts;
+            e.2 = title;
+        }
+    }
+    let now_ms = current_millis();
+    let mut best: Option<(f64, String)> = None;
+    for (url, (count, last_ts, _)) in &agg {
         let stripped = url
             .strip_prefix("https://")
             .or_else(|| url.strip_prefix("http://"))
             .unwrap_or(url);
         let no_www = stripped.strip_prefix("www.").unwrap_or(stripped);
-        // Most-specific display form first, so "oi.g" completes to the bare host
-        // form the user is typing rather than re-adding a scheme.
-        for candidate in [no_www, stripped, url] {
+        let days = (*last_ts).saturating_sub(0) as f64;
+        let days = (now_ms.saturating_sub(*last_ts) as f64) / 86_400_000.0;
+        let frecency = omnibox_frecency_score(*count, days);
+        for candidate in [no_www, stripped, url.as_str()] {
             if candidate.len() > typed.len()
                 && candidate.is_char_boundary(typed.len())
                 && candidate[..typed.len()].eq_ignore_ascii_case(typed)
                 && candidate.to_lowercase().starts_with(&typed_lc)
             {
-                return Some(format!("{}{}", typed, &candidate[typed.len()..]));
+                // Host-prefix bonus + word-boundary bonus, like Chromium's AutocompleteMatch.
+                let mut bonus = 0.0;
+                if candidate.to_lowercase().starts_with(&typed_lc) && candidate.contains('/') == false {
+                    bonus += 2.0;
+                }
+                // Exact host or prefix of host gets extra.
+                let host = candidate.split('/').next().unwrap_or(candidate);
+                if host.eq_ignore_ascii_case(typed) || host.to_lowercase().starts_with(&typed_lc) {
+                    bonus += 3.0;
+                }
+                let score = frecency + bonus;
+                let completion = format!("{}{}", typed, &candidate[typed.len()..]);
+                if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                    best = Some((score, completion));
+                }
+                break;
             }
         }
+        let _ = days;
     }
-    None
+    best.map(|(_, c)| c)
 }
 fn web_surface_history_suggestions(
     profile: &str,
     query: &str,
     limit: usize,
 ) -> Vec<(String, String)> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
+    let query_lc = query.trim().to_lowercase();
+    if query_lc.is_empty() {
         return Vec::new();
     }
     let Some(path) = web_surface_history_path(profile) else {
@@ -10306,28 +10344,66 @@ fn web_surface_history_suggestions(
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out = Vec::new();
-    for line in raw.lines().rev() {
+    // Aggregate frecency as above, then score each url/title.
+    let mut agg: std::collections::HashMap<String, (usize, u64, String)> = std::collections::HashMap::new();
+    for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let Some(url) = value.get("url").and_then(Value::as_str) else {
             continue;
         };
-        let title = value.get("title").and_then(Value::as_str).unwrap_or("");
-        if !url.to_lowercase().contains(&query) && !title.to_lowercase().contains(&query) {
-            continue;
-        }
-        if !seen.insert(url.to_string()) {
-            continue;
-        }
-        out.push((url.to_string(), title.to_string()));
-        if out.len() >= limit {
-            break;
+        let title = value.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+        let ts = value.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+        let e = agg.entry(url.to_string()).or_insert((0, 0, title.clone()));
+        e.0 += 1;
+        if ts > e.1 {
+            e.1 = ts;
+            e.2 = title;
         }
     }
-    out
+    let now_ms = current_millis();
+    let mut scored: Vec<(f64, String, String)> = Vec::new();
+    for (url, (count, last_ts, title)) in agg {
+        let url_lc = url.to_lowercase();
+        let title_lc = title.to_lowercase();
+        let stripped = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(&url)
+            .to_lowercase();
+        let no_www = stripped.strip_prefix("www.").unwrap_or(&stripped);
+        let mut base = 0.0;
+        let mut matched = false;
+        // Chromium-like tiers: host-prefix > word-boundary > substring, url > title.
+        if stripped.starts_with(&query_lc) || no_www.starts_with(&query_lc) {
+            base += 10.0;
+            matched = true;
+        } else if url_lc.contains(&format!("/{}", query_lc)) || url_lc.contains(&format!(".{}", query_lc)) {
+            base += 7.0;
+            matched = true;
+        } else if url_lc.contains(&query_lc) {
+            base += 4.0;
+            matched = true;
+        }
+        if title_lc.starts_with(&query_lc) {
+            base += 6.0;
+            matched = true;
+        } else if title_lc.contains(&query_lc) {
+            base += 2.0;
+            matched = true;
+        }
+        if !matched {
+            continue;
+        }
+        let days = (now_ms.saturating_sub(last_ts) as f64) / 86_400_000.0;
+        let frecency = omnibox_frecency_score(count, days);
+        let score = base + frecency;
+        scored.push((score, url, title));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    scored.into_iter().map(|(_, u, t)| (u, t)).collect()
 }
 
 /// A visited page, as the internal history viewer needs it. The type is
@@ -19489,8 +19565,22 @@ impl ShellState {
             app_tab.kill_forward();
             app_tab.forward_child = None;
             app_tab.title = Some(saved.title.clone()).filter(|title| !title.is_empty());
-            app_tab.history = vec![saved.url.clone()];
-            app_tab.history_index = 0;
+            if saved.history.is_empty() {
+                app_tab.history = vec![saved.url.clone()];
+                app_tab.history_index = 0;
+            } else {
+                app_tab.history = saved.history.clone();
+                app_tab.history_index = saved.history_index.min(saved.history.len().saturating_sub(1));
+                // Adopted history must point at the adopted url; if the saved index
+                // drifted (old store), clamp to the adopted entry.
+                if app_tab.history.get(app_tab.history_index) != Some(&saved.url) {
+                    if let Some(pos) = app_tab.history.iter().position(|u| u == &saved.url) {
+                        app_tab.history_index = pos;
+                    } else {
+                        app_tab.history_index = app_tab.history.len() - 1;
+                    }
+                }
+            }
         }
         // Tab ids follow the plan's order, so the tab to land on is its index + 1
         // (the app tab is id 0, and is the fallback: a session saved with the app
@@ -19511,8 +19601,16 @@ impl ShellState {
                 socks_port: None,
                 title: Some(saved.title).filter(|title| !title.is_empty()),
                 forward_child: None,
-                history: vec![saved.url],
-                history_index: 0,
+                history: if saved.history.is_empty() {
+                    vec![saved.url.clone()]
+                } else {
+                    saved.history.clone()
+                },
+                history_index: if saved.history.is_empty() {
+                    0
+                } else {
+                    saved.history_index.min(saved.history.len().saturating_sub(1))
+                },
             engine_nav: None,
                 reload_nonce: 0,
                 profile: profile.clone(),
@@ -21060,6 +21158,46 @@ impl ShellState {
                 return;
             };
             if index == 0 {
+                // The app tab is closable only when it holds a real page — a
+                // stale start page would be resurrected as a persisted user tab.
+                // `web_tab_is_saved` is the one owner of that rule (duplicate
+                // uses the same gate), so a close and a duplicate agree.
+                let holds_page = surface
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .is_some_and(|tab| {
+                        web_tab_is_saved(tab.id, &tab.url, &surface.osc_url)
+                    });
+                if !holds_page {
+                    return;
+                }
+                // Closing a navigated app tab resets it rather than removing
+                // `tabs[0]` — the app surface must always have a home.
+                let tab = &mut surface.tabs[index];
+                let url = std::mem::take(&mut tab.url);
+                let title = tab.title.take();
+                tab.history.clear();
+                tab.history_index = 0;
+                tab.folder = None;
+                tab.effective_url.clear();
+                tab.socks_port = None;
+                if !url.trim().is_empty() {
+                    surface.closed_tabs.push(vec![ClosedWebTab {
+                        url,
+                        title,
+                        folder: None,
+                        index,
+                    }]);
+                    while surface.closed_tabs.len() > MAX_CLOSED_WEB_TAB_BATCHES {
+                        surface.closed_tabs.remove(0);
+                    }
+                }
+                // Reset active if it was the app tab, then persist.
+                if surface.active_tab == tab_id {
+                    surface.active_tab = WEB_TAB_APP_TAB_ID;
+                }
+                self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
                 return;
             }
             let removed = surface.tabs.remove(index);
@@ -21956,6 +22094,12 @@ impl ShellState {
                     // Which row IS tab 0, so a rebuild can hand the page back
                     // to the re-minted app tab instead of duplicating it.
                     app_tab: tab.id == WEB_TAB_APP_TAB_ID,
+                    history: if tab.history.is_empty() {
+                        vec![tab.url.clone()]
+                    } else {
+                        tab.history.clone()
+                    },
+                    history_index: tab.history_index.min(tab.history.len().saturating_sub(1)),
                 })
                 .collect(),
         };
@@ -22130,7 +22274,24 @@ impl ShellState {
         folder_id: Option<String>,
     ) {
         if tab_id == WEB_TAB_APP_TAB_ID {
-            return;
+            let holds_page = self
+                .web_surfaces
+                .get(session_path)
+                .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
+                .is_some_and(|tab| {
+                    web_tab_is_saved(
+                        tab.id,
+                        &tab.url,
+                        &self
+                            .web_surfaces
+                            .get(session_path)
+                            .map(|s| s.osc_url.clone())
+                            .unwrap_or_default(),
+                    )
+                });
+            if !holds_page {
+                return;
+            }
         }
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
             let exists = folder_id
@@ -22150,11 +22311,21 @@ impl ShellState {
     /// two-phase like the contributed rail's: a press is a click until it
     /// travels [`yggui::DRAG_BEGIN_THRESHOLD_PX`].
     ///
-    /// The APP TAB is never a drag source. It is the app's own row, `tabs[0]`,
-    /// and it stays there.
+    /// The app tab is a drag source only when it holds a real page — the
+    /// same `web_tab_is_saved` gate duplicate and close use, so the three
+    /// verbs agree about what "the first tab is a real tab" means.
     fn arm_web_tab_row_drag(&mut self, row_id: String, label: String, pointer: (f64, f64)) {
         if web_tab_row_target(&row_id) == Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID)) {
-            return;
+            let holds_page = self.web_surfaces.values().any(|surface| {
+                surface
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == WEB_TAB_APP_TAB_ID)
+                    .is_some_and(|tab| web_tab_is_saved(tab.id, &tab.url, &surface.osc_url))
+            });
+            if !holds_page {
+                return;
+            }
         }
         self.arm_row_drag(
             WEB_TAB_RAIL_DRAG_SCOPE.to_string(),
@@ -22206,7 +22377,20 @@ impl ShellState {
                 return None;
             }
             (false, Some(WebTabMenuTarget::Folder(_))) => DragDropPlacement::Into,
-            (false, Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID))) => DragDropPlacement::After,
+            (false, Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID))) => {
+                let app_is_saved = self.web_surfaces.values().any(|surface| {
+                    surface
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == WEB_TAB_APP_TAB_ID)
+                        .is_some_and(|tab| web_tab_is_saved(tab.id, &tab.url, &surface.osc_url))
+                });
+                if app_is_saved {
+                    placement
+                } else {
+                    DragDropPlacement::After
+                }
+            }
             (false, _) => placement,
         };
         self.hover_row_drag(WEB_TAB_RAIL_DRAG_SCOPE, row_id, label, placement, collapsed)
@@ -22295,7 +22479,9 @@ impl ShellState {
             rank(&web_tab_row_id(&WebTabMenuTarget::Folder(folder.id.clone()))).unwrap_or(usize::MAX)
         });
         surface.tabs.sort_by_key(|tab| {
-            if tab.id == WEB_TAB_APP_TAB_ID {
+            if tab.id == WEB_TAB_APP_TAB_ID
+                && !web_tab_is_saved(tab.id, &tab.url, &surface.osc_url)
+            {
                 return 0;
             }
             rank(&web_tab_row_id(&WebTabMenuTarget::Tab(tab.id)))
@@ -23325,16 +23511,21 @@ impl ShellState {
     /// a fork of somebody else's back button — and it takes the front, which is
     /// what "duplicate" means to a user who wants two of something to compare.
     ///
-    /// The APP TAB is not duplicable, for the same reason it is not closable
-    /// ([`ShellState::web_surface_close_tab`]) and not filable
-    /// ([`ShellState::web_tab_move_to_folder`]): it is the app process's own
-    /// page, and a copy of it would be a PERSISTED user tab
-    /// ([`ShellState::persist_web_tabs`] saves tabs[0] only as the MARKED
-    /// app-tab row, never as a user tab) that resurrects a stale start page
-    /// on the next visit.
+    /// The APP TAB is not duplicable when it shows the app's own start page,
+    /// for the same reason it is not closable/filable: a copy would be a
+    /// PERSISTED user tab that resurrects a stale start page. When it HOLDS a
+    /// real page (`web_tab_is_saved`), duplicating it is duplicating that page,
+    /// which is exactly what the user asked for.
     fn web_surface_duplicate_tab(&mut self, session_path: &str, tab_id: u64) -> Option<u64> {
         if tab_id == WEB_TAB_APP_TAB_ID {
-            return None;
+            let holds_page = self
+                .web_surfaces
+                .get(session_path)
+                .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
+                .is_some_and(|tab| web_tab_is_saved(tab.id, &tab.url, &self.web_surfaces.get(session_path).map(|s| s.osc_url.clone()).unwrap_or_default()));
+            if !holds_page {
+                return None;
+            }
         }
         let source = self
             .web_surfaces
@@ -41507,9 +41698,6 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
     // fallback for rows synthesized from file paths or stored metadata.
     // See [[spec-unify-local-remote]].
     if let Some(kind) = row.session_kind {
-        return Some(kind);
-    }
-    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(&row.full_path) {
         return Some(kind);
     }
     if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(&row.full_path) {
@@ -104936,6 +105124,7 @@ fn WebSurfacePickerView(
     /// SAME [`ContextMenuOverlay`] the cwd tree and contributed rails raise.
     palette: Palette,
 ) -> Element {
+    let mut picker_profile_query = use_signal(String::new);
     let mut new_profile_input = use_signal(String::new);
     let mut submitted = use_signal(|| false);
     // Two-step delete arm: the profile whose ✕ was clicked once. A second ✕
@@ -104976,7 +105165,16 @@ fn WebSurfacePickerView(
             let meta = web_surface_profile_meta(&name);
             (name, meta)
         })
+        .filter(|(name, _)| {
+            let q = picker_profile_query().trim().to_lowercase();
+            if q.is_empty() {
+                return true;
+            }
+            name.to_lowercase().contains(&q)
+        })
         .collect::<Vec<_>>();
+    let profiles_total = enumerate_web_surface_profiles().len();
+    let profiles_filtered = profiles.len();
     // Profile-first (Chrome-like): the picker ONLY chooses identity. The URL
     // is typed later in the surface's address bar — an empty url in the /open
     // GET lands the chosen profile on ychrome's start page. No URL input here:
@@ -105039,6 +105237,32 @@ fn WebSurfacePickerView(
                 div {
                     style: "display:flex; flex-direction:column; gap:6px;",
                     div { style: "font-size:22px; font-weight:600;", "Choose a profile" }
+                    div {
+                        style: "display:flex; gap:8px; justify-content:center; margin-top:4px;",
+                        input {
+                            r#type: "text",
+                            placeholder: "Search profiles — filters as you type",
+                            autocomplete: "off",
+                            spellcheck: "false",
+                            "data-web-picker-search": "1",
+                            style: format!(
+                                "width:min(420px, 90%); padding:10px 12px; font-size:14px; border:1px solid rgba(127,127,127,0.4); \
+                                 border-radius:10px; background:transparent; color:{foreground}; outline:none;"
+                            ),
+                            value: "{picker_profile_query}",
+                            oninput: move |evt| picker_profile_query.set(evt.value()),
+                        }
+                    }
+                    div {
+                        style: "font-size:12px; opacity:0.6;",
+                        if picker_profile_query().trim().is_empty() {
+                            "{profiles_filtered} profile"
+                            if profiles_filtered != 1 { "s" }
+                        } else {
+                            "{profiles_filtered} of {profiles_total} match"
+                            if profiles_filtered != 1 { "es" }
+                        }
+                    }
                     // Subtitle, or the last refusal. A guard that silently does
                     // nothing is indistinguishable from a broken button, so a
                     // named reason takes this line until the next action.
@@ -106510,8 +106734,7 @@ fn terminal_input_write_path_for_runtime(session_path: &str, runtime_path: Strin
     // a `remote-cc://` session classified every post-swap keystroke as local,
     // which is half of the "active remote-cc un-inputable for minutes after a
     // daemon swap" window.
-    let trimmed = session_path.trim_start();
-    if trimmed.starts_with("remote-session://") || trimmed.starts_with("remote-cc://") {
+    if yggterm_core::is_remote_agent_session_path(session_path) {
         session_path.to_string()
     } else {
         runtime_path
@@ -106548,8 +106771,7 @@ fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
 /// never asked for. On a fleet of remote Claude Code rows that is EVERY Web
 /// View, and it renders as two launch-scaffold lines rather than as an error.
 fn session_preview_syncs_from_remote(session_path: &str) -> bool {
-    let trimmed = session_path.trim_start();
-    trimmed.starts_with("remote-session://") || trimmed.starts_with("remote-cc://")
+    yggterm_core::is_remote_agent_session_path(session_path)
 }
 /// A `remote-cc://` session is a REMOTE session: its ensure crosses SSH just
 /// like `remote-session://`, so it gets the remote attempt budget. It used to
@@ -106557,9 +106779,7 @@ fn session_preview_syncs_from_remote(session_path: &str) -> bool {
 /// mount of the active remote-cc session burned its whole budget against a
 /// draining predecessor daemon.
 fn terminal_ensure_session_is_remote(session_path: &str) -> bool {
-    session_path.starts_with("remote-session://")
-        || session_path.starts_with("remote-cc://")
-        || session_path.starts_with("ssh://")
+    yggterm_core::is_remote_row_path(session_path)
 }
 fn terminal_ensure_attempt_timeout_ms(session_path: &str) -> u64 {
     if terminal_ensure_session_is_remote(session_path) {
@@ -124677,15 +124897,6 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     // carry no id (documents, recipes).
     let mut push_candidate =
         |row: BrowserRow, modified_epoch: i64, started_at: String, in_scope: bool| {
-            // Startpage is CLI-only: plain terminals never resume from here,
-            // they live in Live Sessions. Filter early so ranking is CLIs only.
-            if !row
-                .session_kind
-                .is_some_and(|k| k.is_agent())
-                && !row_session_kind(&row).is_some_and(|k| k.is_agent())
-            {
-                return;
-            }
             let keys = start_page_recent_identity_keys(&row);
             if active_path
                 .as_deref()
@@ -124742,7 +124953,7 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     // start page would offer "resume" for a session that is already running.
     let mut live_first = browser_rows
         .iter()
-        .filter(|row| matches!(row.kind, BrowserRowKind::Session))
+        .filter(|row| row.is_agent_session())
         .filter(|row| live_projection_paths.contains(&normalize_live_session_path(&row.full_path)))
         .collect::<Vec<_>>();
     // Same recency order the page sorts by, so that when two live spellings of
@@ -124782,11 +124993,7 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
 
     for row in browser_rows
         .iter()
-        .filter(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
-        .filter(|row| {
-            row.kind == BrowserRowKind::Session
-                || row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe)
-        })
+        .filter(|row| row.is_start_page_candidate())
     {
         let modified_epoch = browser_row_modified_epoch(row);
         let in_scope = start_page_recent_scope_allows_browser_row(&scope, row);
@@ -139381,6 +139588,8 @@ mod tests {
             folder: folder.map(str::to_string),
             active: false,
             app_tab: false,
+            history: vec![url.to_string()],
+            history_index: 0,
         }
     }
     fn saved_active_tab(url: &str, folder: Option<&str>) -> SavedWebTab {

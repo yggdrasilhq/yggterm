@@ -36,6 +36,45 @@ pub struct BrowserRow {
     pub session_kind: Option<SessionKind>,
 }
 
+impl BrowserRow {
+    /// Whether this row represents a first-class agent CLI session (Codex, Claude Code, Muse, etc.)
+    pub fn is_agent_session(&self) -> bool {
+        if self.kind != BrowserRowKind::Session {
+            return false;
+        }
+        if let Some(kind) = self.session_kind {
+            return kind.is_agent();
+        }
+        crate::agent_scheme::session_kind_for_path(&self.full_path)
+            .map(|k| k.is_agent())
+            .unwrap_or(false)
+    }
+
+    /// Whether this row is a second-class plain shell terminal (Shell or SshShell).
+    pub fn is_plain_shell(&self) -> bool {
+        if self.kind != BrowserRowKind::Session {
+            return false;
+        }
+        if let Some(kind) = self.session_kind {
+            return matches!(kind, SessionKind::Shell | SessionKind::SshShell);
+        }
+        matches!(
+            crate::agent_scheme::session_kind_for_path(&self.full_path),
+            Some(SessionKind::Shell | SessionKind::SshShell)
+        ) || self.full_path.starts_with("local://")
+            || self.full_path.starts_with("live::")
+            || self.full_path.starts_with("ssh://")
+    }
+
+    /// Whether this row is a resumable startpage candidate (first-class agent or terminal recipe).
+    pub fn is_start_page_candidate(&self) -> bool {
+        if self.kind == BrowserRowKind::Document {
+            return self.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe);
+        }
+        self.is_agent_session()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionBrowserState {
     root: SessionNode,

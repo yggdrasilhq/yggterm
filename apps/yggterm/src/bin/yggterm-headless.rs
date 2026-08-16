@@ -18,6 +18,7 @@ use yggterm_core::{
 };
 use yggterm_server::server_cli::{cli_server_endpoint, ensure_local_server_ready_for_cli};
 use yggterm_server::{
+    hot_restart_detailed,
     AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ScreenshotPostProcess, SessionKind, SshConnectTarget, control_endpoint_for_runtime_key,
@@ -1175,6 +1176,75 @@ fn main() -> Result<()> {
         let endpoint = default_endpoint(store.home_dir());
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "daemon" {
+        let subcommand = args[2].as_str();
+        match subcommand {
+            "run" => {
+                let endpoint = default_endpoint(store.home_dir());
+                let host = detect_ghostty_host();
+                return run_daemon(&endpoint, host);
+            }
+            "restart" => {
+                let endpoint = default_endpoint(store.home_dir());
+                let force = args.iter().any(|arg| arg == "--force" || arg == "-f");
+                let reason = cli_flag_value(&args, "--reason").unwrap_or("headless-cli-restart");
+                match hot_restart_detailed(&endpoint, &current_exe, None, None, Some(reason), force) {
+                    Ok(result) => {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "restarting",
+                            "force": force,
+                            "result": format!("{:?}", result),
+                        }))?);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        eprintln!("Error triggering daemon restart: {err}");
+                        return Err(err);
+                    }
+                }
+            }
+            "status" => {
+                let endpoint = default_endpoint(store.home_dir());
+                match status(&endpoint) {
+                    Ok(st) => {
+                        println!("{}", serde_json::to_string_pretty(&st)?);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "running": false,
+                            "error": err.to_string()
+                        }))?);
+                        return Ok(());
+                    }
+                }
+            }
+            "help" | "--help" | "-h" => {
+                println!("Usage: yggterm-headless server daemon [run | restart [--force] | status]");
+                return Ok(());
+            }
+            other => {
+                anyhow::bail!("unsupported server daemon subcommand: {other}");
+            }
+        }
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "stack" && args[2] == "restart" {
+        let endpoint = default_endpoint(store.home_dir());
+        let force = args.iter().any(|arg| arg == "--force" || arg == "-f");
+        let reason = cli_flag_value(&args, "--reason").unwrap_or("headless-stack-restart");
+        eprintln!("1. Restarting server daemon (force={force})...");
+        let _ = hot_restart_detailed(&endpoint, &current_exe, None, None, Some(reason), force);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        eprintln!("2. Relaunching/replacing GUI client...");
+        let replace_args = vec!["server".to_string(), "app".to_string(), "launch".to_string(), "--replace".to_string()];
+        let _ = run_app_launch_via_gui_companion(&current_exe, &replace_args, &install_context);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "status": "stack_restarted",
+            "daemon_restarted": true,
+            "gui_restarted": true,
+        }))?);
+        return Ok(());
     }
     // ⛔ The forced command behind a phone's ssh key. This is the binary the
     // phone actually invokes (`~/.yggterm/bin/yggterm-headless`), so the arm has
