@@ -982,13 +982,19 @@ impl AgentCliDescriptor {
     }
 
     /// Whether `path` is a session FILE of this CLI: under a store root, glob
-    /// matched, and not an excluded name.
+    /// matched, and not an excluded name. A fragment that contains `/` is
+    /// matched against the whole `path` (so `"/subagent/"` excludes Muse
+    /// sub-agent sessions that live under the parent's directory); otherwise
+    /// the match is against the file name only (so `".bak."` excludes Codex
+    /// backups without anchoring to a directory).
     pub fn store_path_is_session_file(&self, path: &str) -> bool {
-        if self
-            .store_excluded_name_fragments
-            .iter()
-            .any(|fragment| file_name_of(path).contains(fragment))
-        {
+        if self.store_excluded_name_fragments.iter().any(|fragment| {
+            if fragment.contains('/') {
+                path.contains(fragment)
+            } else {
+                file_name_of(path).contains(fragment)
+            }
+        }) {
             return false;
         }
         self.session_store_globs.iter().any(|glob| {
@@ -2079,23 +2085,16 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
-        session_store_globs: &[],
-        store_excluded_name_fragments: &[],
-        // None of the 2026-08-08 intake relocates its home with an env var.
+        // Muse stores sessions as `~/.local/share/muse/sessions/YYYY/MM/DD/<uuid>/session.jsonl`
+        // (XDG_DATA_HOME) plus a SQLite index `~/.local/share/muse/session-index.db`.
+        // Verified 2026-08-16 on ***: `session-index.db.sessions(workspace_root→cwd, title,
+        // updated_at_us)` carries the cwd/title the cwd tree and startpage need, and
+        // `route_facts.cwd` in the JSONL is the fallback when the DB is absent.
+        session_store_globs: &[".local/share/muse/sessions/**/session.jsonl"],
+        store_excluded_name_fragments: &["/subagent/", "/tool-outputs/"],
         store_home_env_override: None,
-        store_scan_gap: Some(
-            "Muse Code IS installed on guihost since 2026-08-08 (yggterm provisioned it \
-             from the vendor installer), so `resume_selector`, `model_flag` and \
-             `permission_modes` are now MEASURED from a real `muse --help` — and the \
-             resume selector the placeholder guessed was WRONG (a flag; it is a \
-             subcommand). What is still UNOBSERVED needs a running SESSION, which \
-             needs a Meta login only the owner holds (docs/owner-attention.md): the \
-             on-disk session store (`session_store_globs` is still empty, and \
-             `--no-session-log` in --help proves there IS one), the composer glyph, \
-             and the working-screen phrases. Those three are still PLACEHOLDERS and \
-             must be replaced from a real screen, not from this help text.",
-        ),
-        read_store_entry: read_no_store_entry,
+        store_scan_gap: None,
+        read_store_entry: read_muse_store_entry,
     },
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
@@ -2754,6 +2753,112 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         modified_epoch_ms: modified_epoch_ms_of(path),
         title,
         detail: None,
+    })
+}
+
+fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    // Exclude subagent and tool-output sessions — they live under the parent
+    // session's directory and share no cwd/title of their own; including them
+    // would 10× the durable count with title-less rows.
+    let path_str = path.display().to_string();
+    if path_str.contains("/subagent/") || path_str.contains("/tool-outputs/") {
+        return None;
+    }
+    // Muse lays out `~/.local/share/muse/sessions/YYYY/MM/DD/<uuid>/session.jsonl`
+    // so the session_id is the parent directory name, not the file stem.
+    let session_id = path
+        .parent()?
+        .file_name()?
+        .to_str()?
+        .trim()
+        .to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    // Validate that it looks like a UUID (36 chars with dashes) — avoid
+    // picking up tui-history.jsonl or other files that happen to match globs.
+    if session_id.len() < 8 || !session_id.contains('-') {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    // Prefer the SQLite index for cwd/title/mtime — it is the same source
+    // `muse resume` lists from, and it contains the workspace_root and
+    // already-extracted title without scanning multi-MB JSONL.
+    let (db_cwd, db_title, db_updated_ms) = 'db_block: {
+        let db_path = home.join(".local/share/muse/session-index.db");
+        if db_path.exists() {
+            if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT workspace_root, title, updated_at_us FROM sessions WHERE session_id=?1",
+                ) {
+                    if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
+                        if let Ok(Some(row)) = rows.next() {
+                            let ws: Option<String> = row.get(0).ok();
+                            let title: Option<String> = row.get(1).ok();
+                            let updated_us: Option<i64> = row.get(2).ok();
+                            let mtime = updated_us
+                                .filter(|v| *v > 0)
+                                .map(|v| (v / 1000) as u128)
+                                .unwrap_or_else(|| modified_epoch_ms_of(path));
+                            let cwd = ws
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            let title = title
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty() && s != &session_id);
+                            // A title that equals the workspace_root is the placeholder
+                            // Muse writes when it has not yet titled the session.
+                            let title = match (&cwd, &title) {
+                                (Some(cwd), Some(t)) if t == cwd => None,
+                                _ => title,
+                            };
+                            break 'db_block (cwd, title, mtime);
+                        }
+                    }
+                }
+            }
+        }
+        (None, None, modified_epoch_ms_of(path))
+    };
+    // Fallback cwd from route_facts if DB absent or empty.
+    let cwd = db_cwd.or_else(|| {
+        use std::io::{BufRead, BufReader};
+        let file = std::fs::File::open(path).ok()?;
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten().take(16) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if value.get("payload_type").and_then(|v| v.as_str()) == Some("runtime.session.route_facts") {
+                    if let Some(cwd) = value
+                        .get("payload")
+                        .and_then(|p| p.get("record"))
+                        .and_then(|r| r.get("cwd"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        return Some(cwd.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }).unwrap_or_else(|| home.display().to_string());
+
+    Some(AgentStoreEntry {
+        session_id,
+        cwd,
+        modified_epoch_ms: db_updated_ms,
+        // Muse is TitleAuthority::Generated — the store itself carries no
+        // user-visible title, so we return None and let the chore generate one.
+        // Expose the DB title via detail instead so the cwdtree/startpage can
+        // still show something before generation runs.
+        title: db_title.clone(),
+        detail: db_title,
     })
 }
 

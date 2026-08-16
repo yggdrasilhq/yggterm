@@ -89,6 +89,7 @@ mod remote_runtime;
 pub mod startpage_ls;
 pub mod titles_ls;
 pub mod resume_ls;
+pub mod cwdtree_ls;
 pub mod row_sanity;
 pub use row_sanity::{load_sweep_records, print_row_sanity_report, save_sweep_records};
 pub mod session_tenancy;

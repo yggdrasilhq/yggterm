@@ -1696,6 +1696,9 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "resume" {
         return yggterm_server::server_cli::run_server_resume_ls_cli(&store, &args);
     }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "cwdtree" {
+        return yggterm_server::server_cli::run_server_cwdtree_ls_cli(&store, &args);
+    }
     if args.len() >= 2 && args[0] == "server" && args[1] == "ledger" {
         return yggterm_server::server_cli::run_server_ledger_cli(&store, &args);
     }

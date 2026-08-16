@@ -1225,6 +1225,9 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "resume" {
         return yggterm_server::server_cli::run_server_resume_ls_cli(&store, &args);
     }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "cwdtree" {
+        return yggterm_server::server_cli::run_server_cwdtree_ls_cli(&store, &args);
+    }
     // `yggterm server ledger [--scope <scope>]` — dump the durable row-order
     // ledger (per-client-scope memory of row slots, including rows that are
     // not currently live). Read-only.

@@ -44,6 +44,7 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
     // Durable sessions — ground truth from the stores, via the descriptors.
     let mut rows = scan_all_durable_sessions(&system_home);
     let warnings = collect_warnings(&system_home, &rows);
+    let total = rows.len();
     rows = order_for_startpage(rows);
     if rows.len() > limit {
         rows.truncate(limit);
@@ -60,7 +61,7 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
     let output = StartpageLsOutput {
         host,
         home: system_home.display().to_string(),
-        durable_count: rows.len(),
+        durable_count: total,
         live_count,
         rows,
         live_session_paths,
