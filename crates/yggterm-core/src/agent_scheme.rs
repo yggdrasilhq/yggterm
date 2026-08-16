@@ -410,6 +410,16 @@ pub fn scheme_for_prefix(prefix: &str) -> Option<&'static SchemeDescriptor> {
         .find(|scheme| scheme.prefix == prefix)
 }
 
+/// Resolve the session kind from a session path or scheme prefix, if it matches any registered scheme.
+pub fn session_kind_for_path(path: &str) -> Option<SessionKind> {
+    let trimmed = path.trim_start();
+    SESSION_PATH_SCHEMES
+        .iter()
+        .filter(|scheme| scheme.agent)
+        .find(|scheme| trimmed.starts_with(scheme.prefix))
+        .and_then(|scheme| scheme.kind)
+}
+
 /// One recorded, dated hole: a predicate that does not yet cover a scheme the
 /// registry says it must. THE burn-down list (spec §7.2 is its source; each
 /// row here was RE-VERIFIED against main on the recorded date). The lock

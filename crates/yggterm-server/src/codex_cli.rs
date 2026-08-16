@@ -3296,54 +3296,7 @@ fn configured_cli_extra_arg_tokens(kind: SessionKind) -> Vec<String> {
     {
         return split_extra_args(&forwarded);
     }
-    // ⛔ EVERY OTHER CLI'S FORWARDED FLAGS ARRIVE AS A PARAMETER, NEVER FROM
-    // THIS PROCESS'S ENVIRONMENT — `composed_cli_extra_args_with` takes them as
-    // `configured_override`, and the two wrapper entrypoints that know which
-    // CLI they were invoked for (`run_remote_resume_agent`,
-    // `run_remote_start_agent`) read `YGGTERM_AGENT_EXTRA_ARGS` there and pass
-    // it on as a request field. Reading it HERE as well was a second encoding
-    // of the same question, and the wrong one, because this function is handed
-    // a `kind` while the variable carries none:
-    //
-    // - It is KIND-BLIND. One variable answered for all nine CLIs, so a value
-    //   exported for one of them was returned verbatim for any other — the
-    //   cross-CLI inheritance the slug-keyed settings map exists to prevent
-    //   ("an absent key yields nothing", below). A permission flag belonging to
-    //   one CLI reached a binary that has never heard of it.
-    // - Nothing ever SETS it on a request. Claude Code's lane round-trips
-    //   through the environment deliberately (the daemon `set_var`s it from the
-    //   request, which is why the arm above is legitimate — and it is guarded
-    //   on `kind`, so it can only ever answer for the CLI it belongs to). This
-    //   variable has no such setter anywhere, so an ambient value could only
-    //   ever be POLLUTION inherited from whichever process spawned this one —
-    //   an agent session, or a daemon started from inside one.
-    //
-    // Measured 2026-08-14 on a live daemon carrying an inherited value: a Codex
-    // resume composed as `codex '<a claude flag>' resume …`, which also
-    // displaced the resume subcommand and is what made the two launch-command
-    // tests read as flaky rather than as the regression they were reporting.
-    // The local lane's one owner is the settings store, below.
-    let settings = SessionStore::open_or_init()
-        .and_then(|store| store.load_settings())
-        .ok();
-    // ⭐ DESCRIPTOR-DERIVED, and this is the leak the 2026-08-13 intake closed.
-    // This was a hand-written `match kind` over a settings store with exactly
-    // two extra-args fields, so its only honest answer for SEVEN of nine
-    // first-class agent CLIs was `None` — every one of them launched with no
-    // permission flag and stopped on a prompt the spawner could not answer,
-    // and adding a tenth CLI meant adding a tenth arm that answered `None` too.
-    // The store now keys flags by `extra_args_slug`, which is also what makes
-    // `codex-anything` read CODEX's box rather than growing one of its own.
-    //
-    // ⛔ A CLI still never inherits ANOTHER CLI's flags by accident: an absent
-    // key yields nothing. Giving a new CLI codex's flags is how
-    // `--sandbox workspace-write` would reach a binary that has never heard of
-    // it and refuse to start.
-    let raw = yggterm_core::agent_cli_extra_args_key(kind)
-        .and_then(|slug| {
-            settings.and_then(|settings| settings.agent_cli_extra_args.get(slug).cloned())
-        })
-        .unwrap_or_default();
+    let raw = crate::configured_extra_args_for_kind(kind);
     split_extra_args(&raw)
 }
 

@@ -175,7 +175,7 @@ pub use daemon::{
     start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
     start_local_session_placed, start_local_session_seated,
-    start_local_session_with_launch_options, start_remote_agent_session_seated,
+    start_local_session_with_launch_options, start_remote_agent_session_placed, start_remote_agent_session_seated,
     start_remote_claude_session_seated, start_remote_codex_session_seated, start_ssh_session_seated,
     start_remote_claude_session_at_with_terminal_appearance, start_remote_claude_session_placed,
     start_remote_claude_session_with_launch_options, start_remote_codex_session_at,
@@ -805,7 +805,7 @@ fn live_local_prefix_metadata_value(kind: SessionKind) -> &'static str {
 }
 
 fn is_remote_scanned_live_session_path(path: &str) -> bool {
-    path.starts_with("remote-session://")
+    parse_remote_agent_session_path(path).is_some()
 }
 
 /// A local row worth restoring after a daemon swap: a plain shell (its PTY may
@@ -2974,8 +2974,9 @@ fn live_session_uses_remote_runtime(session: &ManagedSessionView) -> bool {
 }
 
 fn remote_live_session_starts_new_codex(session: &ManagedSessionView) -> bool {
-    session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL).as_deref()
-        == Some("start-codex")
+    session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL)
+        .map(|action| action.starts_with("start-"))
+        .unwrap_or(false)
 }
 
 fn session_is_temporary_update_restore(session: &ManagedSessionView) -> bool {
@@ -7439,6 +7440,11 @@ impl YggtermServer {
         }
         upsert_session_metadata(&mut session.metadata, "Host", ssh_target.clone());
         upsert_session_metadata(&mut session.metadata, "UUID", uuid.clone());
+        upsert_session_metadata(
+            &mut session.metadata,
+            REMOTE_LAUNCH_ACTION_METADATA_LABEL,
+            start_verb.clone(),
+        );
         // The rail's per-CLI row. Claude Code keeps its exact shipped spelling
         // ("Claude Code Session") because that is what its descriptor carries,
         // and the label is not decoration: predicates READ "Codex Session" to
@@ -10362,15 +10368,44 @@ impl YggtermServer {
                         };
                     session.remote_deploy_state = remote_deploy_state;
                     session.launch_command =
-                        if is_remote_scanned_live_session_path(&session.session_path) {
+                        if session.kind.is_agent() {
                             let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
-                            if remote_live_session_starts_new_codex(session) {
-                                remote_ssh_launch_command(
-                                    &ssh_target,
-                                    ssh_prefix.as_deref(),
-                                    &remote_binary,
-                                    &["server", "remote", "start-codex", &session.id, &cwd],
-                                )
+                            let starts_new = remote_live_session_starts_new_codex(session);
+                            let verb = if starts_new {
+                                remote_agent_start_subcommand(session.kind)
+                            } else {
+                                remote_agent_resume_subcommand(session.kind)
+                            };
+                            let extra_exports = if session.kind == SessionKind::ClaudeCode {
+                                claude_extra_args_remote_exports()
+                            } else {
+                                configured_extra_args_remote_exports(session.kind)
+                            };
+                            if let Some(verb) = verb {
+                                if starts_new {
+                                    remote_ssh_launch_command_with_extra_exports(
+                                        &ssh_target,
+                                        ssh_prefix.as_deref(),
+                                        &remote_binary,
+                                        &["server", "remote", verb.as_str(), &session.id, &cwd],
+                                        &extra_exports,
+                                    )
+                                } else {
+                                    remote_ssh_launch_command_with_extra_exports(
+                                        &ssh_target,
+                                        ssh_prefix.as_deref(),
+                                        &remote_binary,
+                                        &[
+                                            "server",
+                                            "remote",
+                                            verb.as_str(),
+                                            &session.id,
+                                            &cwd,
+                                            "--require-existing",
+                                        ],
+                                        &extra_exports,
+                                    )
+                                }
                             } else {
                                 remote_ssh_launch_command(
                                     &ssh_target,
@@ -10378,11 +10413,10 @@ impl YggtermServer {
                                     &remote_binary,
                                     &[
                                         "server",
-                                        "remote",
-                                        "resume-codex",
+                                        "attach",
                                         &session.id,
                                         &cwd,
-                                        "--require-existing",
+                                        crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
                                     ],
                                 )
                             }
@@ -13240,7 +13274,7 @@ fn refresh_remote_codex_terminal_identity_launch_command(
     let extra_exports = if session.kind == SessionKind::ClaudeCode {
         claude_extra_args_remote_exports()
     } else {
-        Vec::new()
+        configured_extra_args_remote_exports(session.kind)
     };
     let launch_command = remote_ssh_launch_command_with_extra_exports(
         &ssh_target,
@@ -29024,14 +29058,15 @@ fn legacy_agent_launch_command(
             None => String::new(),
             Some(descriptor) => {
                 let binary = descriptor.binary_name;
+                let extra_args = shell_join_extra_args(&configured_extra_args_for_kind(kind));
                 match session_id {
-                    None => format!("{cwd_prefix}{binary}"),
+                    None => format!("{cwd_prefix}{binary}{extra_args}"),
                     Some(session_id) => {
                         let tokens = descriptor.resume_tokens(
                             &shell_single_quote(session_id),
                             !cwd_prefix.is_empty(),
                         );
-                        format!("{cwd_prefix}{binary} {}", tokens.join(" "))
+                        format!("{cwd_prefix}{binary}{extra_args} {}", tokens.join(" "))
                     }
                 }
             }
@@ -29039,20 +29074,20 @@ fn legacy_agent_launch_command(
     }
 }
 
-/// The user's configured launch flags for `kind`, raw, off the ONE per-CLI map.
+/// The user's configured launch flags for `kind`, raw, off the ONE per-CLI map,
+/// falling back to the descriptor's default preset ("yolo" mode) when unconfigured.
 ///
 /// Every caller that used to reach into a named settings field goes through
 /// here, so "which box does this CLI read" has a single answer and a tenth CLI
 /// needs no new reader.
 pub(crate) fn configured_extra_args_for_kind(kind: SessionKind) -> String {
-    let Some(slug) = yggterm_core::agent_cli_extra_args_key(kind) else {
-        return String::new();
-    };
-    SessionStore::open_or_init()
+    let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
-        .ok()
-        .and_then(|settings| settings.agent_cli_extra_args.get(slug).cloned())
-        .unwrap_or_default()
+        .ok();
+    match settings {
+        Some(ref settings) => yggterm_core::agent_cli_effective_extra_args(settings, kind),
+        None => yggterm_core::agent_cli_effective_extra_args(&yggterm_core::AppSettings::default(), kind),
+    }
 }
 
 fn legacy_codex_extra_args() -> String {
@@ -34854,8 +34889,9 @@ mod tests {
         );
         assert!(command.contains("__yggterm_requested='/root/project'"));
         assert!(command.contains("dirname -- \"$__yggterm_cwd\""));
+        assert!(command.contains("codex"));
         assert!(
-            command.contains("codex resume -C \"$PWD\" '019caa6f-b32c-7a73-b4d3-db83225663dc'")
+            command.contains("resume -C \"$PWD\" '019caa6f-b32c-7a73-b4d3-db83225663dc'")
         );
     }
 

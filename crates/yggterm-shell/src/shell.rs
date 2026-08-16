@@ -221,7 +221,7 @@ use yggterm_server::{
     stage_remote_clipboard_png, start_command_session_placed,
     start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance, start_local_session_placed,
-    start_remote_agent_session_seated, start_remote_claude_session_placed,
+    start_remote_agent_session_placed, start_remote_agent_session_seated, start_remote_claude_session_placed,
     start_remote_codex_session_placed, start_ssh_session_placed, status,
     take_next_app_control_request,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart_with_size,
@@ -41261,19 +41261,10 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
             // poll (unlike Codex / local CC). See [[finding-uuidv4-codex-session-drift]].
             let terminal_appearance = terminal_appearance.clone();
             spawn_server_snapshot_action(state, pending, move |endpoint| {
-                if matches!(kind, SessionKind::ClaudeCode) {
-                    start_remote_claude_session_placed(
+                if kind.is_agent() {
+                    start_remote_agent_session_placed(
                         &endpoint,
-                        &ssh_target,
-                        prefix.as_deref(),
-                        cwd.as_deref(),
-                        title_hint.as_deref(),
-                        Some(&terminal_appearance),
-                        Some(&insert_after),
-                    )
-                } else if matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
-                    start_remote_codex_session_placed(
-                        &endpoint,
+                        kind,
                         &ssh_target,
                         prefix.as_deref(),
                         cwd.as_deref(),
@@ -41519,6 +41510,12 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
     // fallback for rows synthesized from file paths or stored metadata.
     // See [[spec-unify-local-remote]].
     if let Some(kind) = row.session_kind {
+        return Some(kind);
+    }
+    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(&row.full_path) {
+        return Some(kind);
+    }
+    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(&row.full_path) {
         return Some(kind);
     }
     if row.full_path.starts_with("codex-litellm://")
@@ -48818,9 +48815,11 @@ fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> 
     })
 }
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("remote-session://")?;
-    let (machine_key, session_id) = rest.split_once('/')?;
-    Some((machine_key, session_id))
+    yggterm_core::agent_scheme::remote_agent_row_schemes().find_map(|scheme| {
+        let rest = path.strip_prefix(scheme.prefix)?;
+        let (machine_key, session_id) = rest.split_once('/')?;
+        Some((machine_key, session_id))
+    })
 }
 fn stage_local_clipboard_png(home: &PathBuf, png_bytes: &[u8]) -> Result<String> {
     let clipboard_dir = home.join("clipboard");
@@ -125073,7 +125072,9 @@ fn start_page_live_projection_paths(snapshot: &RenderSnapshot) -> HashSet<String
 }
 
 fn remote_scanned_session_is_start_page_durable(session: &RemoteScannedSession) -> bool {
-    !session.storage_path.trim().is_empty() || session.session_path.starts_with("remote-cc://")
+    !session.storage_path.trim().is_empty()
+        || yggterm_core::agent_scheme::remote_agent_row_schemes()
+            .any(|scheme| session.session_path.starts_with(scheme.prefix))
 }
 
 fn start_page_browser_row_modified_epoch(row: &BrowserRow) -> i64 {
@@ -125253,6 +125254,8 @@ fn browser_row_for_remote_scanned_session(
     short_ids: &HashMap<String, String>,
 ) -> BrowserRow {
     let label = remote_scanned_session_label(session, short_ids);
+    let session_kind = yggterm_core::agent_scheme::session_kind_for_path(&session.session_path)
+        .or(Some(SessionKind::Codex));
     BrowserRow {
         kind: BrowserRowKind::Session,
         full_path: session.session_path.clone(),
@@ -125272,7 +125275,7 @@ fn browser_row_for_remote_scanned_session(
         expanded: true,
         session_id: Some(session.session_id.clone()),
         session_cwd: Some(session.cwd.clone()),
-        session_kind: None,
+        session_kind,
     }
 }
 

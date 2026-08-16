@@ -14827,6 +14827,32 @@ pub fn start_remote_agent_session_seated(
     )?)
 }
 
+pub fn start_remote_agent_session_placed(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    insert_after: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteAgentSession {
+            session_kind: kind,
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: insert_after.map(ToOwned::to_owned),
+            outline_prefix: None,
+            launch_options: None,
+        },
+    )?)
+}
+
 pub fn refresh_remote_machine(
     endpoint: &ServerEndpoint,
     machine_key: &str,
@@ -16052,8 +16078,7 @@ pub struct RetireStaleDaemonOutcome {
 /// and the local attachment respawns on the next ensure — the same thing that
 /// already happens on every deploy.
 fn terminal_runtime_key_is_remote_hosted(key: &str) -> bool {
-    crate::is_remote_scanned_live_session_path(key)
-        || crate::parse_remote_cc_session_path(key).is_some()
+    crate::is_remote_scanned_live_session_path(key) || key.starts_with("ssh://")
 }
 
 /// Per [[bug-class-old-daemon-never-retires]]: session-safe coverage rule for

@@ -336,7 +336,11 @@ const ARMS: &[Arm] = &[
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08).
         resume_selector_token: "--conversation",
         re_roots_with_cwd: false,
-        store_globs: &[".gemini/antigravity-cli/conversations/*.db"],
+        store_globs: &[
+            ".gemini/antigravity-cli/conversations/*.db",
+            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
+            ".antigravitycli/*.json",
+        ],
     },
     Arm {
         kind: SessionKind::Antigravity,
@@ -349,7 +353,11 @@ const ARMS: &[Arm] = &[
         binary: "agy",
         resume_selector_token: "--conversation",
         re_roots_with_cwd: false,
-        store_globs: &[".gemini/antigravity-cli/conversations/*.db"],
+        store_globs: &[
+            ".gemini/antigravity-cli/conversations/*.db",
+            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
+            ".antigravitycli/*.json",
+        ],
     },
     Arm {
         kind: SessionKind::GrokBuild,
