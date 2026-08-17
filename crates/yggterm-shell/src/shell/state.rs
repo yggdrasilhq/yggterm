@@ -53166,7 +53166,50 @@ fn apply_row_set_drop(
             shell.row_set_effective_parent(&target_path)
         }
     };
+    // Compute precise index for Before/After inside a set and for Into (top).
+    // `None` previously meant "append", which made every precise drop land at
+    // the bottom of the set and made the last set appear un-reorderable.
+    let head_index: Option<usize> = match (&head, target.placement) {
+        (Some(_), DragDropPlacement::Into) => Some(0),
+        (Some(head_path), DragDropPlacement::Before) => {
+            let members = shell.row_arrangement.sets.members_of(head_path);
+            let drag_set: std::collections::HashSet<String> = drag_paths
+                .iter()
+                .map(|p| normalize_live_session_path(p))
+                .collect();
+            // Members before the target, excluding dragged rows, determine
+            // where the batch lands — same rule `drag_tree` uses for
+            // `TopOfGroup`/`AfterPath`.
+            let filtered: Vec<&String> = members
+                .iter()
+                .filter(|m| !drag_set.contains(*m))
+                .collect();
+            filtered
+                .iter()
+                .position(|m| *m == &target_path)
+        }
+        (Some(head_path), DragDropPlacement::After) => {
+            let members = shell.row_arrangement.sets.members_of(head_path);
+            let drag_set: std::collections::HashSet<String> = drag_paths
+                .iter()
+                .map(|p| normalize_live_session_path(p))
+                .collect();
+            let filtered: Vec<&String> = members
+                .iter()
+                .filter(|m| !drag_set.contains(*m))
+                .collect();
+            filtered
+                .iter()
+                .position(|m| *m == &target_path)
+                .map(|pos| pos + 1)
+                .or(Some(filtered.len()))
+        }
+        _ => None,
+    };
     let mut changed = false;
+    // Insert batch in order at increasing offsets from the computed base.
+    let mut insert_offset = 0usize;
+    let base_index = head_index;
     for path in drag_paths {
         let member = normalize_live_session_path(path);
         if member == target_path {
@@ -53174,8 +53217,14 @@ fn apply_row_set_drop(
         }
         match &head {
             Some(head) if head != &member => {
-                if shell.row_arrangement.attach(head, &member, None).is_ok() {
+                let index = base_index.map(|base| base + insert_offset);
+                if shell.row_arrangement.attach(head, &member, index).is_ok() {
                     changed = true;
+                    // Only advance offset when the attach targeted this head; a
+                    // top-level detach does not consume a slot.
+                    if base_index.is_some() {
+                        insert_offset += 1;
+                    }
                 }
             }
             // Dropped beside a top-level row — it leaves whatever held it, and
