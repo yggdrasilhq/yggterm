@@ -21172,74 +21172,88 @@ impl ShellState {
                 if !holds_page {
                     return;
                 }
-                // Closing a navigated app tab resets it rather than removing
-                // `tabs[0]` — the app surface must always have a home.
-                let tab = &mut surface.tabs[index];
-                let url = std::mem::take(&mut tab.url);
-                let title = tab.title.take();
-                tab.history.clear();
-                tab.history_index = 0;
-                tab.folder = None;
-                tab.effective_url.clear();
-                tab.socks_port = None;
-                if !url.trim().is_empty() {
+                // User-requested: the first tab must despawn on close, not just
+                // navigate home to Brave. When it holds a saved page it is a
+                // real tab like any other — remove `tabs[0]` and let the next
+                // tab slide to the front. The surface keeps its home via the
+                // app's next heartbeat re-declaring `tabs[0]` if needed; the
+                // closed entry goes to the undo stack.
+                let removed = surface.tabs.remove(index);
+                removed.kill_forward();
+                removed_tab = true;
+                if !removed.url.trim().is_empty() {
                     surface.closed_tabs.push(vec![ClosedWebTab {
-                        url,
-                        title,
-                        folder: None,
+                        url: removed.url.clone(),
+                        title: removed.title.clone(),
+                        folder: removed.folder.clone(),
                         index,
                     }]);
                     while surface.closed_tabs.len() > MAX_CLOSED_WEB_TAB_BATCHES {
                         surface.closed_tabs.remove(0);
                     }
                 }
-                // Reset active if it was the app tab, then persist.
+                for tab in &mut surface.tabs {
+                    if tab.opener == Some(tab_id) {
+                        tab.opener = removed.opener;
+                    }
+                }
                 if surface.active_tab == tab_id {
-                    surface.active_tab = WEB_TAB_APP_TAB_ID;
+                    surface.active_tab = surface
+                        .tabs
+                        .get(index)
+                        .or_else(|| surface.tabs.get(index.saturating_sub(1)))
+                        .map(|tab| tab.id)
+                        .unwrap_or(WEB_TAB_APP_TAB_ID);
+                    surface.address_draft = None;
                 }
-                self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
-                return;
-            }
-            let removed = surface.tabs.remove(index);
-            removed.kill_forward();
-            removed_tab = true;
-            // UNDO. Recorded here, in the one removal path, so every close verb
-            // in the product is undoable by construction rather than by each of
-            // them remembering to record. A tab that never went anywhere has
-            // nothing to reopen, so only a tab with a URL is kept.
-            if !removed.url.trim().is_empty() {
-                surface.closed_tabs.push(vec![ClosedWebTab {
-                    url: removed.url.clone(),
-                    title: removed.title.clone(),
-                    folder: removed.folder.clone(),
-                    index,
-                }]);
-                while surface.closed_tabs.len() > MAX_CLOSED_WEB_TAB_BATCHES {
-                    surface.closed_tabs.remove(0);
+                // If the removal left no tabs, latch the last-content close so
+                // the app knows the user closed the last page (same latch the
+                // non-app path sets below).
+                if surface.tabs.is_empty() {
+                    surface.last_content_tab_closed = true;
                 }
-            }
-            // The closed tab's children inherit ITS opener, so a group survives
-            // losing a tab in the middle of it and no tab is ever left pointing
-            // at an id that is gone. A dangling opener would not error — it
-            // would quietly turn the next open in that group into an append,
-            // which is precisely the non-determinism this model exists to kill.
-            for tab in &mut surface.tabs {
-                if tab.opener == Some(tab_id) {
-                    tab.opener = removed.opener;
+            } else {
+                let removed = surface.tabs.remove(index);
+                removed.kill_forward();
+                removed_tab = true;
+                // UNDO. Recorded here, in the one removal path, so every close verb
+                // in the product is undoable by construction rather than by each of
+                // them remembering to record. A tab that never went anywhere has
+                // nothing to reopen, so only a tab with a URL is kept.
+                if !removed.url.trim().is_empty() {
+                    surface.closed_tabs.push(vec![ClosedWebTab {
+                        url: removed.url.clone(),
+                        title: removed.title.clone(),
+                        folder: removed.folder.clone(),
+                        index,
+                    }]);
+                    while surface.closed_tabs.len() > MAX_CLOSED_WEB_TAB_BATCHES {
+                        surface.closed_tabs.remove(0);
+                    }
                 }
-            }
-            if surface.active_tab == tab_id {
-                // The RIGHT neighbour, which is whatever shifted into the closed
-                // tab's slot — every browser's rule, and the one that keeps a
-                // close from throwing the user onto the app tab's page. Falls
-                // back to the left only when the closed tab was the last one.
-                surface.active_tab = surface
-                    .tabs
-                    .get(index)
-                    .or_else(|| surface.tabs.get(index - 1))
-                    .map(|tab| tab.id)
-                    .unwrap_or(WEB_TAB_APP_TAB_ID);
-                surface.address_draft = None;
+                // The closed tab's children inherit ITS opener, so a group survives
+                // losing a tab in the middle of it and no tab is ever left pointing
+                // at an id that is gone. A dangling opener would not error — it
+                // would quietly turn the next open in that group into an append,
+                // which is precisely the non-determinism this model exists to kill.
+                for tab in &mut surface.tabs {
+                    if tab.opener == Some(tab_id) {
+                        tab.opener = removed.opener;
+                    }
+                }
+                if surface.active_tab == tab_id {
+                    // The RIGHT neighbour, which is whatever shifted into the closed
+                    // tab's slot — every browser's rule, and the one that keeps a
+                    // close from throwing the user onto the app tab's page. Falls
+                    // back to the left only when the closed tab was the last one.
+                    surface.active_tab = surface
+                        .tabs
+                        .get(index)
+                        .or_else(|| surface.tabs.get(index - 1))
+                        .map(|tab| tab.id)
+                        .unwrap_or(WEB_TAB_APP_TAB_ID);
+                    surface.address_draft = None;
+                }
             }
         }
         if removed_tab {
