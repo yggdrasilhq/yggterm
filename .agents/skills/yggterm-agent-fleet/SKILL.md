@@ -2567,6 +2567,20 @@ launch — do not route around it.
 
 ---
 
+### Muse
+
+**Like Codex: no title system — yggterm generates it.** `title_authority: Generated` (fixed 2026-08-17). A fresh Muse session (`muse --yolo` or bare `muse`) composes its own title only from the cwd, so `session_title` stays empty until the first turn; the heuristic (`extract_tail_context` → `heuristic_title_from_context`) and the LLM chore own the display name. No observed startup gate beyond the normal composer readiness — but probe with `input-check` (20s) and `server snapshot → terminal_lines` before assuming, and record here if a trust/menu gate appears like Claude's.
+
+**Launch:** `muse --yolo` is the fleet's standard; `id_assigned_at_birth: false` so the `local://` → `remote-muse://` rebind poll runs (§7.5). No model flag quirk known — re-verify after a `--model` launch and append.
+
+### Antigravity (agy)
+
+**Like Claude Code: Store-authoritative.** `title_authority: Store` (already correct). `agy` writes `conversation_summaries.db` (`conversation_summaries.title`) and yggterm respects it, writing back only on explicit rename. `install: Manual` (`agy update` self-updates, measured `agy --help` 2026-08-08) — yggterm provisions by invoking `agy update`, not `npm`.
+
+**No standalone trust gate observed** — but `agy` is Manual-install and can be absent (`not_supported_on_platform` probe), and `id_assigned_at_birth: false` so remote rebind applies. If a first-run gate appears, drive it with `terminal send --data $'\r'` after confirming `❯` like Claude §11.1 and record the tell here.
+
+---
+
 ### Any CLI — quirks that are about the ROW, not the program
 
 These bite regardless of which agent CLI is inside the row, and they have each
