@@ -1,0 +1,18 @@
+{
+  "proof": "ytop dash fallback 55e374a - sanitized",
+  "shell_document_surfaces": [
+    {
+      "app_name": "Ytop Dash",
+      "error": null,
+      "has_schema": true,
+      "pane_id": "topo",
+      "session_path": "local://a64c6ce9-36ac-4301-8438-b40c8d8f3bc9",
+      "stale": false,
+      "visible": true
+    }
+  ],
+  "session_view_contract_violations": [],
+  "active_session_path": "local://a64c6ce9-36ac-4301-8438-b40c8d8f3bc9",
+  "active_view_mode": "Terminal",
+  "note": "Redacted: kept only ytop dash surface proof"
+}
