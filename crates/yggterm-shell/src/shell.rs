@@ -104720,6 +104720,7 @@ fn TerminalCanvas(
                                 let tab_label = tab.label.clone();
                                 let tab_active = tab.active;
                                 let is_app_tab = tab.is_app_tab;
+                                let holds_saved_page = tab.holds_saved_page;
                                 let tab_loading = tab.loading;
                                 let tab_loading_dot = web_tab_loading_dot_style(tab_loading);
                                 let select_path = web_surface_session_path.clone();
@@ -104765,11 +104766,11 @@ fn TerminalCanvas(
                                             style: "flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
                                             "{tab_label}"
                                         }
-                                        // No ✕ on the app tab: it used to QUIT the
-                                        // app while this tab's own row menu refused
-                                        // to close it. One row, one answer — and
-                                        // quitting is not a tab verb.
-                                        if !is_app_tab {
+                                        // All tabs show ✕ on hover when closable: the app
+                                        // tab is closable only when it holds a saved
+                                        // page (same `holds_saved_page` gate the rail
+                                        // and `web_surface_close_tab` use).
+                                        if !is_app_tab || holds_saved_page {
                                             button {
                                                 style: format!(
                                                     "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; line-height:1; padding:2px 4px; border-radius:6px; flex:0 0 auto;",
@@ -118172,16 +118173,57 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }} catch (_error) {{}}
         }};
+        let lastForeignActiveElementSeenAtMs = 0;
         const inputDriftWatchdog = window.setInterval(() => {{
             const recoveryState = passiveFocusRecoveryState();
             recordPassiveFocusRecoveryState(recoveryState);
-            if (recoveryState !== 'recoverable') {{
+            const now = Date.now();
+            const deadMs = inputDeadSinceMs ? Math.max(0, now - inputDeadSinceMs) : 0;
+            const allowForeignRecovery = recoveryState === 'foreign_active_element'
+                && deadMs >= 1_200
+                && inputEnabled
+                && hostOwnsActiveTerminalInput();
+            if (recoveryState !== 'recoverable' && !allowForeignRecovery) {{
+                if (recoveryState === 'foreign_active_element') {{
+                    if (lastForeignActiveElementSeenAtMs === 0) {{
+                        lastForeignActiveElementSeenAtMs = now;
+                    }}
+                }} else {{
+                    lastForeignActiveElementSeenAtMs = 0;
+                }}
                 return;
             }}
+            lastForeignActiveElementSeenAtMs = 0;
+            if (allowForeignRecovery) {{
+                try {{
+                    const active = document.activeElement;
+                    if (active && active !== document.body && active !== document.documentElement
+                        && typeof active.blur === 'function') {{
+                        active.blur();
+                    }}
+                }} catch (_error) {{}}
+            }}
             passiveFocusRecoveryCount += 1;
-            lastPassiveFocusRecoveryAtMs = Date.now();
+            lastPassiveFocusRecoveryAtMs = now;
             focusTerminal();
         }}, {terminal_passive_focus_watchdog_ms});
+        let lastSeenActiveSessionPathForFocus = activeTerminalSessionPath();
+        const sessionSwitchFocusPoll = window.setInterval(() => {{
+            try {{
+                const cur = activeTerminalSessionPath();
+                if (cur === lastSeenActiveSessionPathForFocus) {{
+                    return;
+                }}
+                lastSeenActiveSessionPathForFocus = cur;
+                if (!hostOwnsActiveTerminalInput() || !inputEnabled) {{
+                    return;
+                }}
+                const st = passiveFocusRecoveryState();
+                if (st === 'foreign_active_element' || st === 'recoverable') {{
+                    focusTerminal();
+                }}
+            }} catch (_error) {{}}
+        }}, 320);
         // Screen-restore (vacuum fix): periodically persist the rendered transcript
         // to localStorage so a full GUI+daemon restart can restore it. The
         // event-driven persists (scroll/intent/snapshot) never fire for an IDLE
@@ -127403,16 +127445,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     let tab = tabs.get(&tab_id).cloned();
                     let loading = tab.as_ref().is_some_and(|tab| tab.loading);
                     let (select_path, close_path) = (session_path.clone(), session_path.clone());
-                    // The app tab's ✕ is a "go home", and it exists only while
-                    // this tab is actually holding a page. `app_home` is Some
-                    // ONLY on the app tab, so it doubles as the branch: a user
-                    // tab closes, the app tab navigates.
+                    // The app tab's ✕ is shown only while it holds a saved page;
+                    // when closable it despawns like any tab (user request: first
+                    // tab must despawn, not navigate home to Brave).
                     let app_tab_can_go_home =
                         tab.as_ref().is_some_and(|tab| tab.holds_saved_page);
-                    let app_home = tab
-                        .as_ref()
-                        .filter(|_| app_tab_can_go_home)
-                        .and_then(|tab| tab.app_home_url.clone());
 
                     (
                         tab.as_ref().map(|tab| tab.label.clone()).unwrap_or_default(),
@@ -127444,43 +127481,26 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         //
                         // Both are avoidable, because the app tab has TWO
                         // states and only one of them is "the app". While it
-                        // shows a real page it gets a ✕ that CLOSES THE PAGE —
-                        // it navigates the tab home rather than destroying the
-                        // row, which the surface could not survive anyway.
+                        // shows a real page it is a real tab — it gets a ✕ that
+                        // despawns the row (user request: first tab must close
+                        // and despawn, not just navigate home to Brave). The
+                        // surface keeps its home via the next heartbeat if
+                        // needed; the closed entry goes to the undo stack.
                         // Quitting the app still lives where quitting an app
                         // lives.
                         (!is_app_tab || app_tab_can_go_home).then(|| rsx! {
                             button {
                                 "data-web-tab-close": "{tab_id}",
                                 style: session_row_action_button_style(palette.text),
-                                title: if is_app_tab { "Close page" } else { "Close tab" },
+                                title: "Close tab",
                                 onmousedown: |evt: MouseEvent| evt.stop_propagation(),
                                 onclick: move |evt: MouseEvent| {
                                     evt.stop_propagation();
                                     let close_path = close_path.clone();
-                                    if let Some(home) = app_home.clone() {
-                                        // Same ssh target the omnibox would
-                                        // use — read from the session rather
-                                        // than captured, so a surface that
-                                        // moved hosts cannot be navigated
-                                        // through a stale tunnel.
-                                        let ssh_target = state.with(|shell| {
-                                            shell.web_surface_session_ssh_target(&close_path)
-                                        });
-                                        navigate_web_surface_tab(
-                                            state,
-                                            close_path,
-                                            tab_id,
-                                            home,
-                                            ssh_target,
-                                            None,
-                                        );
-                                    } else {
-                                        state.with_mut_counted(|shell| {
-                                            shell.web_surface_close_tab(&close_path, tab_id);
-                                            shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
-                                        });
-                                    }
+                                    state.with_mut_counted(|shell| {
+                                        shell.web_surface_close_tab(&close_path, tab_id);
+                                        shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
+                                    });
                                 },
                                 "✕"
                             }
@@ -194191,6 +194211,7 @@ mod webtabs_menu_switcher_locks {
             let before = product[at.saturating_sub(8)..at].join("\n");
             assert!(
                 before.contains("if !is_app_tab {")
+                    || before.contains("if !is_app_tab || holds_saved_page {")
                     || before.contains("(!is_app_tab).then(|| rsx! {")
                     || before.contains("(!is_app_tab || app_tab_can_go_home).then(|| rsx! {"),
                 "{what} must be gated on the app tab's STATE, never drawn \
