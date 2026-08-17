@@ -305,11 +305,11 @@ mod tests {
     }
     #[test]
     fn governor_respects_env_disable() {
-        std::env::set_var("YGGTERM_GOVERNOR", "0");
+        unsafe { std::env::set_var("YGGTERM_GOVERNOR", "0"); }
         let mut gov = ResourceGovernor::new(std::path::PathBuf::from("/tmp"));
         let rows = vec![("local://x".to_string(), Some(1u32))];
         let out = gov.tick(&rows, &|_| false, &|_| false);
         assert!(out.is_empty(), "disabled governor should not act");
-        std::env::remove_var("YGGTERM_GOVERNOR");
+        unsafe { std::env::remove_var("YGGTERM_GOVERNOR"); }
     }
 }
