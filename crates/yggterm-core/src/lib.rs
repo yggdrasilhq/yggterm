@@ -4178,7 +4178,7 @@ mod tests {
         // Coverage floor: a split that matched nothing would make every
         // assertion below vacuously true.
         assert!(
-            body.contains("scan_local_claude_code_sessions()") && body.len() > 500,
+            body.contains("scan_all_durable_sessions") && body.len() > 500,
             "scanner did not capture the tree-build body ({} bytes)",
             body.len()
         );
