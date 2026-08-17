@@ -6936,7 +6936,7 @@ fn TerminalCanvas(
                                         }
                                     }
                                     "open" | "heartbeat" | "seen" => {
-                                        let (touched, recently_closed) = state.with_mut_counted(|shell| {
+                                        let touched = state.with_mut_counted(|shell| {
                                             // TOUCH BEFORE SWEEP. This heartbeat is proof THIS
                                             // session's app is alive right now, so refresh its
                                             // last_seen first — otherwise the sweep below would
@@ -6953,32 +6953,31 @@ fn TerminalCanvas(
                                             // survives, unstashes in place, keeps its page.
                                             let touched =
                                                 shell.touch_web_surface(&surface_session_path, now_ms);
-                                            let recently_closed = shell
-                                                .web_surface_recently_deliberately_closed(
-                                                    &surface_session_path,
-                                                    now_ms,
-                                                );
                                             shell.sweep_stale_web_surfaces(now_ms);
-                                            (touched, recently_closed)
+                                            touched
                                         });
                                         // A heartbeat is LIVENESS, not intent: normally it
                                         // may refresh an existing surface but must not
                                         // CREATE one, so an in-flight heartbeat racing a
                                         // GUI-side close (Ctrl+C sent, app dying) cannot
-                                        // resurrect a ghost overlay. But that ban only
-                                        // holds inside the close-ghost grace window: after
-                                        // a GUI RESTART the surface is gone with NO recent
-                                        // deliberate close on record, so the heartbeat is
-                                        // allowed to REBUILD it (without this, ychrome came
-                                        // back as a bare terminal after every restart).
-                                        // `seen` — the daemon's attach-replay spelling of a
-                                        // consumed `open` (the daemon replays retained
-                                        // declare bytes on a cursor-0 attach; only the
-                                        // action is rewritten) — is the same liveness, so
-                                        // it obeys the same close-ghost ban.
+                                        // resurrect a ghost overlay.
+                                        //
+                                        // `heartbeat` / `seen` must NEVER create a fresh
+                                        // surface through the live OSC path — creation is
+                                        // the `open` action's job, and the DAEMON-REBUILD
+                                        // path (`rebuild_web_surface_from_daemon_declare`)
+                                        // is the only place a `seen` is allowed to
+                                        // rehydrate a surface after a GUI restart, where
+                                        // it is age-checked (`DECLARE_REBUILD_MAX_AGE_MS`)
+                                        // and cannot resurrect a stale scrollback
+                                        // artefact when merely navigating to a dormant
+                                        // session. Without this, a cursor-0 attach replay
+                                        // of a consumed `open` (rewritten to `seen`) would
+                                        // mint a webview on every visit to a session
+                                        // whose scrollback still holds the old declare —
+                                        // the "weird webview on agent navigation" report.
                                         let heartbeat_for_gone_surface = !touched
-                                            && (action == "heartbeat" || action == "seen")
-                                            && recently_closed;
+                                            && (action == "heartbeat" || action == "seen");
                                         let fresh_url = url
                                             .filter(|_| !heartbeat_for_gone_surface)
                                             .filter(|url| web_surface_url_scheme_allowed(url))
