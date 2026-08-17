@@ -5445,11 +5445,20 @@ fn TerminalCanvas(
     let bootstrap_owner_identity =
         format!("{}:{}", bootstrap_identity, bootstrap_owner_instance_id);
     let bootstrap_lease_identity = bootstrap_identity.clone();
-    let bootstrap_identity_changed = *bootstrap_task_identity.borrow() != bootstrap_identity;
+    // Include open_request in the dedup key so a repeat selection of the SAME row
+    // at the SAME mount epoch is still a candidate (the old key was bootstrap_identity
+    // alone, so the second click was silently dropped and the row refused keystrokes).
+    // Previously the code cleared `bootstrap_task_identity` on lease-acquire failure
+    // to force the next render to be a candidate again — but that made EVERY render
+    // a candidate while the lease was held (67×/s, 397 shellstate_mut in 7.6s on jojo,
+    // 100% CPU). Keeping the combined key removes the spin while preserving the
+    // repeat-click fix.
+    let combined_bootstrap_key = format!("{}:{}", bootstrap_identity, latest_open_request_id);
+    let bootstrap_identity_changed = *bootstrap_task_identity.borrow() != combined_bootstrap_key;
     let bootstrap_schedule_candidate =
         !wait_for_mount_epoch_sync && should_bootstrap_host && bootstrap_identity_changed;
     if bootstrap_schedule_candidate {
-        *bootstrap_task_identity.borrow_mut() = bootstrap_identity.clone();
+        *bootstrap_task_identity.borrow_mut() = combined_bootstrap_key.clone();
     }
     let should_schedule_bootstrap = bootstrap_schedule_candidate
         && state.with_mut_counted(|shell| {
@@ -5460,12 +5469,9 @@ fn TerminalCanvas(
                 &bootstrap_owner_identity,
             )
         });
-    if bootstrap_schedule_candidate && !should_schedule_bootstrap {
-        *bootstrap_task_identity.borrow_mut() = String::new();
-    }
     if !wait_for_mount_epoch_sync
         && should_bootstrap_host
-        && bootstrap_identity_changed
+        && bootstrap_schedule_candidate
         && !should_schedule_bootstrap
     {
         // ⛔ THE OPEN REQUEST IS PART OF THE KEY, AND THAT IS THE WHOLE FIX FOR
@@ -9972,6 +9978,8 @@ fn TerminalCanvas(
                                         input_echo_read_burst_remaining =
                                             input_echo_read_burst_remaining.saturating_sub(1);
                                         TERMINAL_INPUT_ECHO_READ_POLL_MS
+                                    } else if terminal_input_hot_until_ms() > current_millis() {
+                                        TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS
                                     } else if current_millis()
                                         < inline_status_animation_hot_until_ms
                                         && state.with(|shell| {
@@ -10693,20 +10701,42 @@ fn TerminalCanvas(
                                             last_forwarded_output_at_ms = now_ms;
                                         }
                                         if forward_terminal_protocol_only_output {
-                                            let _ = safe_shell_mut(
-                                                state,
-                                                "terminal_open_attempt_first_protocol_only_output",
-                                                |shell| {
-                                                    shell
-                                                        .mark_terminal_open_attempt_first_output_for_session(
-                                                            &session_path,
-                                                            "protocol_only_output",
-                                                            data.len(),
-                                                            false,
-                                                            true,
-                                                        );
-                                                },
-                                            );
+                                            // Guard the write: after the first protocol output the latch is set,
+                                            // and every further forward is 14/s per live session. Without a
+                                            // read-only precheck the storm autopsy sees
+                                            // `terminal_open_attempt_first_protocol_only_output 105` in 7s
+                                            // and the render storm re-renders for a signal write that mutates
+                                            // nothing. This was the secondary 100% CPU contributor on jojo
+                                            // (primary was the bootstrap lease spin at 5455).
+                                            let already_latched = state.with(|shell| {
+                                                shell
+                                                    .terminal_open_attempt_by_session
+                                                    .get(&session_path)
+                                                    .and_then(|id| {
+                                                        shell.terminal_open_attempts.get(id)
+                                                    })
+                                                    .is_some_and(|a| {
+                                                        a.first_output_at_ms.is_some()
+                                                            && a.first_protocol_only_output_at_ms
+                                                                .is_some()
+                                                    })
+                                            });
+                                            if !already_latched {
+                                                let _ = safe_shell_mut(
+                                                    state,
+                                                    "terminal_open_attempt_first_protocol_only_output",
+                                                    |shell| {
+                                                        shell
+                                                            .mark_terminal_open_attempt_first_output_for_session(
+                                                                &session_path,
+                                                                "protocol_only_output",
+                                                                data.len(),
+                                                                false,
+                                                                true,
+                                                            );
+                                                    },
+                                                );
+                                            }
                                             if last_forward_protocol_only_trace_ms == 0
                                                 || now_ms.saturating_sub(
                                                     last_forward_protocol_only_trace_ms,
@@ -12190,13 +12220,19 @@ fn TerminalCanvas(
                                         terminal_active_visible_for_session(shell, &session_path),
                                     )
                                 });
-                                if current_millis() < inline_status_animation_hot_until_ms
+                                if terminal_input_hot_until_ms() <= current_millis()
+                                    && current_millis() < inline_status_animation_hot_until_ms
                                     && window_focused_for_output_poll
                                     && active_visible_terminal_for_output_poll
                                 {
                                     read_poll_ms = terminal_inline_status_animation_read_poll_ms(
                                         terminal_write_bridge.frame_ms(),
                                     );
+                                } else if terminal_input_hot_until_ms() > current_millis()
+                                    && window_focused_for_output_poll
+                                    && active_visible_terminal_for_output_poll
+                                {
+                                    read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
                                 } else if frame_budgeted_terminal_output {
                                     read_poll_ms = terminal_frame_budgeted_read_poll_ms(
                                         terminal_write_bridge.frame_ms(),
