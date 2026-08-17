@@ -84,6 +84,7 @@ mod pty_adoption;
 mod pty_handoff;
 mod pty_handoff_wire;
 mod protocol;
+pub mod resource_governor;
 mod remote_cli;
 mod remote_runtime;
 pub mod startpage_ls;

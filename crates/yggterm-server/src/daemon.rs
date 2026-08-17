@@ -3969,7 +3969,7 @@ struct CachedClaudeCodeRuntimeIdentity {
 /// frame.
 const PROXIED_WORKING_REFRESH_MS: u128 = 1_500;
 
-struct DaemonRuntime {
+pub(crate) struct DaemonRuntime {
     support: GhosttyHostSupport,
     state_path: PathBuf,
     store: SessionStore,
@@ -4774,6 +4774,33 @@ impl DaemonRuntime {
             // A pre-4.0 daemon lacks the field entirely; its status deserializes
             // `false`, and a Shadow client fails closed against it (D7).
             role_enforcement: true,
+        }
+    }
+
+    /// Snapshot for the resource governor: all live rows with their shell pids.
+    /// Pub(crate) so the governor (sibling module) can sample without holding
+    /// the daemon's private `terminals` field directly.
+    pub(crate) fn governor_row_snapshot(&self) -> Vec<(String, Option<u32>)> {
+        self.terminals
+            .session_keys()
+            .into_iter()
+            .map(|k| {
+                let pid = self.terminals.session_process_id(&k);
+                (k, pid)
+            })
+            .collect()
+    }
+
+    /// Park one row's reader (SSH detach path). Returns true if parked.
+    pub(crate) fn governor_park_reader(&mut self, key: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.terminals.park_reader(key).is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = key;
+            false
         }
     }
 
@@ -18472,6 +18499,15 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             })
             .ok();
     }
+    // Resource governor — per-row CPU/memory sampling, ytrace complaints, and
+    // resource-aware actions (SSH detach/reattach, telemetry). File-first so
+    // Dash notebooks and any agent via `ytrace incidents` can see it without
+    // a live daemon. Enabled by default; YGGTERM_GOVERNOR=0 disables, and
+    // YGGTERM_GOVERNOR_SSH_DETACH=1 enables actual detach (default: log only).
+    crate::resource_governor::spawn_row_resource_governor(
+        home_dir.clone(),
+        runtime.clone(),
+    );
     match RemoteRuntimeRegistry::open(&home_dir) {
         Ok(registry) => append_trace_event(
             &home_dir,
