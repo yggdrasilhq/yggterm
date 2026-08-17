@@ -756,7 +756,7 @@ pub fn settings_ready(settings: &AppSettings) -> bool {
 /// recognises none of a file's record types reports no error. Generation then
 /// fell through to whatever the terminal was showing, and the model wrote a
 /// confident timeline entry about a project that does not exist.
-fn extract_tail_context(path: &Path) -> Result<String> {
+pub(crate) fn extract_tail_context(path: &Path) -> Result<String> {
     Ok(generation_context_from_messages(
         &read_agent_transcript_messages_tail_limited(path, 96)?,
     ))
@@ -2585,7 +2585,7 @@ fn themed_summary_from_context(context: &str) -> Option<String> {
     None
 }
 
-fn heuristic_title_from_context(context: &str) -> Option<String> {
+pub(crate) fn heuristic_title_from_context(context: &str) -> Option<String> {
     if let Some(title) = themed_title_from_context(context) {
         return Some(title);
     }

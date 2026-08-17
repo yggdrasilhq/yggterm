@@ -15618,15 +15618,31 @@ mod tests {
         ) || source.contains(
             "terminal_inline_status_animation_read_poll_ms(\n                                            terminal_write_bridge.frame_ms(),",
         );
+        // Input-hot suppresses the animation cadence so typing stays at 16 ms
+        // while the spinner is live; the animation branch must therefore be
+        // gated on `terminal_input_hot_until_ms() <= current_millis()` and a
+        // counterpart `input_hot` branch must exist.
+        let has_input_hot_guard = source
+            .contains("terminal_input_hot_until_ms() > current_millis()")
+            && source.contains("TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS");
+        let has_animation_branch = source.contains(
+            "} else if current_millis()\n                                        < inline_status_animation_hot_until_ms",
+        ) || source.contains(
+            "terminal_input_hot_until_ms() <= current_millis()\n                                    && current_millis() < inline_status_animation_hot_until_ms",
+        );
         assert!(
-            source.contains(
-                "} else if current_millis()\n                                        < inline_status_animation_hot_until_ms"
-            ) && source.contains(
-                "shell.window_focused\n                                                && terminal_active_visible_for_session"
-            ) && has_animation_read_poll && source.contains(
-                "if current_millis() < inline_status_animation_hot_until_ms\n                                    && window_focused_for_output_poll\n                                    && active_visible_terminal_for_output_poll"
-            ),
-            "focused visible inline status animations should keep polling PTY output near the animation cadence even when they are not bulk-frame budgeted"
+            has_animation_branch
+                && source.contains(
+                    "shell.window_focused\n                                                && terminal_active_visible_for_session"
+                )
+                && has_animation_read_poll
+                && (source.contains(
+                    "if current_millis() < inline_status_animation_hot_until_ms\n                                    && window_focused_for_output_poll\n                                    && active_visible_terminal_for_output_poll"
+                ) || source.contains(
+                    "terminal_input_hot_until_ms() <= current_millis()\n                                    && current_millis() < inline_status_animation_hot_until_ms"
+                ))
+                && has_input_hot_guard,
+            "focused visible inline status animations should keep polling PTY output near the animation cadence even when they are not bulk-frame budgeted, but input-hot must cap it to the active cadence"
         );
     }
 
