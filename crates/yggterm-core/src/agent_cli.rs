@@ -1995,7 +1995,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Nearest available (8.24:1).
         brand_color: "#86198f",
         menu_hint: 'm',
-        title_authority: TitleAuthority::Generated,
+        title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
         wrapper_slug: Some("muse"),
         remote_row_scheme: Some("remote-muse://"),
@@ -2907,7 +2907,9 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                                 .filter(|s| !s.is_empty());
                             let title = title
                                 .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty() && s != &session_id);
+                                .filter(|s| !s.is_empty() && s != &session_id)
+                                .filter(|s| !crate::looks_like_generated_fallback_title(s))
+                                .filter(|s| !crate::looks_like_low_signal_generated_copy(s));
                             // A title that equals the workspace_root is the placeholder
                             // Muse writes when it has not yet titled the session.
                             let title = match (&cwd, &title) {
@@ -2946,12 +2948,17 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         None
     }).unwrap_or_else(|| home.display().to_string());
 
+    // If DB title is missing or looks generated, try transcript heuristic (Store authority fallback).
+    let effective_title = db_title.clone().filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s)).or_else(|| {
+        crate::titles::extract_tail_context(path).ok().and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx)).filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+    });
+    let effective_detail = db_title.filter(|s| !crate::looks_like_low_signal_generated_copy(s));
     Some(AgentStoreEntry {
         session_id,
         cwd,
         modified_epoch_ms: db_updated_ms,
-        title: db_title.clone(),
-        detail: db_title,
+        title: effective_title,
+        detail: effective_detail,
     })
 }
 

@@ -12,6 +12,29 @@ use std::path::{Path, PathBuf};
 use crate::agent_cli::{AGENT_CLIS, AgentStoreEntry};
 use crate::SessionKind;
 
+/// Whether a session file is noise (empty or no agent turn) and should be deleted on sight.
+/// Guard: files younger than 60s are kept to avoid deleting a CLI mid-write.
+/// Mirrors the spec heading 8 (2026-08-17) and is called from both startpage and cwd tree.
+pub fn is_noise_session_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if meta.len() < 20 { return true }
+    // Quick check: file contains an agent turn? If it does, not noise.
+    // We reuse extract_tail_context — if it is <20 chars after trimming, treat as noise.
+    if let Ok(ctx) = crate::titles::extract_tail_context(path) {
+        if ctx.trim().len() >= 20 {
+            return false;
+        }
+    } else {
+        // If we cannot read context, check raw file for "agent" markers
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if content.to_lowercase().contains("agent") || content.len() > 200 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// One session as the startpage sees it — durable, from a store file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StartpageDurableRow {
@@ -83,8 +106,93 @@ fn walk_and_collect(
             if !seen.insert(path.clone()) {
                 continue;
             }
+            // Noise deletion (heading 8) — mtime guard 60s, then DELETE file + title store entry.
+            if is_noise_session_file(&path) {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(elapsed) = mtime.elapsed() {
+                            if elapsed.as_secs() < 60 {
+                                // Too young — keep for now, skip push but don't delete.
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&path);
+                // Best-effort: remove any generated title for this id.
+                if let Some(entry) = (descriptor.read_store_entry)(&path) {
+                    if let Some(home) = dirs::home_dir() {
+                        if let Ok(store) = crate::SessionTitleStore::open(&home.join(".yggterm")) {
+                            let _ = store.delete_title(&entry.session_id);
+                        }
+                        if let Ok(store) = crate::SessionTitleStore::open(&home) {
+                            let _ = store.delete_title(&entry.session_id);
+                        }
+                    }
+                } else if let Some(home) = dirs::home_dir() {
+                    // Fallback: derive id from filename/parent for Muse etc.
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        if let Ok(store) = crate::SessionTitleStore::open(&home.join(".yggterm")) {
+                            let _ = store.delete_title(stem);
+                        }
+                    }
+                    if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+                        if let Ok(store) = crate::SessionTitleStore::open(&home.join(".yggterm")) {
+                            let _ = store.delete_title(parent);
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(entry) = (descriptor.read_store_entry)(&path) {
-                out.push(StartpageDurableRow::from_entry(entry, descriptor.kind, &path));
+                let mut row = StartpageDurableRow::from_entry(entry, descriptor.kind, &path);
+                // Weird-title filtering on sight (heading 9): if title/detail looks generated, try heuristic.
+                if let Some(ref tt) = row.title {
+                    if crate::looks_like_generated_fallback_title(tt) || crate::looks_like_low_signal_generated_copy(tt) {
+                        if let Ok(ctx) = crate::titles::extract_tail_context(&path) {
+                            if let Some(heu) = crate::titles::heuristic_title_from_context(&ctx) {
+                                if !crate::looks_like_generated_fallback_title(&heu) && !crate::looks_like_low_signal_generated_copy(&heu) {
+                                    row.title = Some(heu.clone());
+                                    row.effective_title = Some(heu.clone());
+                                } else {
+                                    row.title = None;
+                                    row.effective_title = row.generated_title.clone();
+                                }
+                            } else {
+                                row.title = None;
+                                row.effective_title = row.generated_title.clone();
+                            }
+                        } else {
+                            row.title = None;
+                            row.effective_title = row.generated_title.clone();
+                        }
+                    }
+                }
+                if let Some(ref d) = row.detail {
+                    if crate::looks_like_low_signal_generated_copy(d) {
+                        row.detail = None;
+                    } else if crate::looks_like_generated_fallback_title(d) {
+                        row.detail = None;
+                    }
+                }
+                if let Some(ref et) = row.effective_title {
+                    if crate::looks_like_generated_fallback_title(et) || crate::looks_like_low_signal_generated_copy(et) {
+                        if let Ok(ctx) = crate::titles::extract_tail_context(&path) {
+                            if let Some(heu) = crate::titles::heuristic_title_from_context(&ctx) {
+                                if !crate::looks_like_generated_fallback_title(&heu) && !crate::looks_like_low_signal_generated_copy(&heu) {
+                                    row.effective_title = Some(heu);
+                                } else {
+                                    row.effective_title = row.generated_title.clone();
+                                }
+                            } else {
+                                row.effective_title = row.generated_title.clone();
+                            }
+                        } else {
+                            row.effective_title = row.generated_title.clone();
+                        }
+                    }
+                }
+                out.push(row);
             }
         }
     }
@@ -123,18 +231,25 @@ impl StartpageDurableRow {
         } else {
             Self::load_generated_title(&entry.session_id)
         };
+        // Filter weird titles (heading 9) before choosing effective.
+        let filtered_raw = raw_title.clone().filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s));
+        let filtered_generated = generated_title.clone().filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s));
         let effective_title = if is_store_authoritative {
-            raw_title.clone().or_else(|| generated_title.clone())
+            filtered_raw.clone().or_else(|| filtered_generated.clone()).or_else(|| {
+                // Fallback heuristic when store title is weird/empty.
+                crate::titles::extract_tail_context(path).ok().and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx)).filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+            })
         } else {
-            generated_title.clone().or_else(|| raw_title.clone())
+            filtered_generated.clone().or_else(|| filtered_raw.clone())
         };
+        let detail = entry.detail.filter(|d| !crate::looks_like_low_signal_generated_copy(d) && !crate::looks_like_generated_fallback_title(d));
         Self {
             session_id: entry.session_id,
             cwd: entry.cwd,
-            title: raw_title,
-            generated_title,
+            title: filtered_raw,
+            generated_title: filtered_generated,
             effective_title,
-            detail: entry.detail,
+            detail,
             kind,
             modified_epoch_ms: entry.modified_epoch_ms,
             storage_path,

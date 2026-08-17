@@ -74,7 +74,7 @@ impl BrowserRow {
         if self.kind == BrowserRowKind::Document {
             return self.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe);
         }
-        self.kind == BrowserRowKind::Session
+        self.is_agent_session()
     }
 }
 

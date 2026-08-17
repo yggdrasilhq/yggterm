@@ -307,7 +307,6 @@ def manual_walk_on_host(host):
                 elif cli["slug"] == "grok":
                     # grok: .grok/sessions/<encoded-cwd>/<uuid>/summary.json -> id is parent dir
                     session_id = Path(f).parent.name
-<<<<<<< Updated upstream
                 elif cli["slug"] == "antigravity" and f.endswith("transcript.jsonl"):
                     parts = Path(f).parts
                     if ".system_generated" in parts:
