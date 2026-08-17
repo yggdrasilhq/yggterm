@@ -18,19 +18,51 @@ use crate::SessionKind;
 pub fn is_noise_session_file(path: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else { return false };
     if meta.len() < 20 { return true }
-    // Quick check: file contains an agent turn? If it does, not noise.
-    // We reuse extract_tail_context — if it is <20 chars after trimming, treat as noise.
+    let path_str = path.display().to_string();
+    // Muse sessions use a different JSON schema; extract_tail_context is Codex/Claude-centric
+    // and returns empty for them. For Muse, a large file with payload_type is not noise.
+    if path_str.contains("muse/sessions") && meta.len() > 5000 {
+        // Quick heuristic: Muse files contain payload_type and are not noise if large.
+        // We avoid reading the whole 50M file: just check tail context fallback.
+        if let Ok(ctx) = crate::titles::extract_tail_context(path) {
+            if ctx.trim().len() >= 20 {
+                return false;
+            }
+        }
+        // If tail context is empty, Muse file is still not noise if it has session markers.
+        // Check a small sample from the file head instead of full read.
+        if let Ok(file) = std::fs::File::open(path) {
+            use std::io::{BufRead, BufReader};
+            let mut reader = BufReader::new(file);
+            let mut buf = String::new();
+            for _ in 0..5 {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
+                buf.push_str(&line);
+                if buf.len() > 2000 { break; }
+            }
+            if buf.contains("payload_type") && buf.contains("session_id") {
+                return false;
+            }
+        }
+        if meta.len() > 10000 {
+            return false;
+        }
+    }
     if let Ok(ctx) = crate::titles::extract_tail_context(path) {
         if ctx.trim().len() >= 20 {
             return false;
         }
     } else {
-        // If we cannot read context, check raw file for "agent" markers
         if let Ok(content) = std::fs::read_to_string(path) {
             if content.to_lowercase().contains("agent") || content.len() > 200 {
                 return false;
             }
         }
+    }
+    // Large files are not noise even if tail context is thin
+    if meta.len() > 5000 {
+        return false;
     }
     true
 }
