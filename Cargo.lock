@@ -6969,6 +6969,7 @@ dependencies = [
  "yggterm-gtk-glue",
  "yggterm-platform",
  "yggui-contract",
+ "ytrace",
 ]
 
 [[package]]
@@ -7079,7 +7080,7 @@ dependencies = [
 [[package]]
 name = "ytrace"
 version = "0.1.0"
-source = "git+https://github.com/yggdrasilhq/ytrace?branch=main#ad5b643f78f726fb185f57b547e6d3fcb51878c3"
+source = "git+https://github.com/yggdrasilhq/ytrace?branch=main#e1a67c782530491936a9f638f3756327056ca8d7"
 dependencies = [
  "serde",
  "serde_json",
