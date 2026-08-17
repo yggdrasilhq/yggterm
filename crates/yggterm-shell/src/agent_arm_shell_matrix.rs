@@ -908,7 +908,7 @@ fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() 
 fn the_screen_fallback_call_site_passes_the_agent_cli_answer_not_the_codex_one() {
     const POLICY: &str = "retained_rehydrate_allow_screen_fallback(";
     const DECISION: &str = "terminal_reveal_seed_allows_authoritative_screen(";
-    let shell_src = include_str!("shell.rs");
+    let shell_src = crate::shell::SHELL_SOURCE;
 
     let mut policy_call_sites = 0usize;
     let mut cursor = 0usize;
