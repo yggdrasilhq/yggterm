@@ -19430,6 +19430,28 @@ fn local_daemon_allowed_binary_paths_from_current(current_exe: &Path) -> Vec<Pat
             }
         }
     }
+    // The daemon and the `server attach` client are commonly installed at
+    // two different roots on the same host: `~/.local/bin` (direct install
+    // for the GUI daemon) and `~/.yggterm/bin` (managed copy used for
+    // `ssh <host> yggterm server attach`). Both are first-class installs of
+    // the same version and must be considered current; otherwise an attach
+    // client at one root treats a daemon at the other as "stale" and burns
+    // ~24 s holding the spawn lock before failing with "did not become
+    // reachable" — the exact downgrade that destroys the workaround sessions.
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            let yggterm_bin = PathBuf::from(&home).join(".yggterm/bin");
+            let local_bin = PathBuf::from(&home).join(".local/bin");
+            for dir in [yggterm_bin, local_bin] {
+                for name in ["yggterm", "yggterm-headless"] {
+                    let candidate = dir.join(name);
+                    if candidate.is_file() {
+                        push_unique_path(&mut allowed, candidate);
+                    }
+                }
+            }
+        }
+    }
     allowed
 }
 
