@@ -230,9 +230,17 @@ fn try_faithful_startpage_rows(
                 } else { None }
             }).collect()
         });
+    let remote_total: usize = snapshot_json
+        .as_ref()
+        .and_then(|v| v.get("data"))
+        .or(snapshot_json.as_ref())
+        .and_then(|d| d.get("remote_machines"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(|m| m.get("sessions").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0)).sum())
+        .unwrap_or(0);
     let warnings = vec![
-        format!("faithful daemon browser: old Session={} new_agent={} store_durable={}", browser_old, browser_new, store_rows.len()),
-        format!("store ground truth {} (noise DELETE + weird-title filter); browser live shell leak 0 when fixed", store_rows.len()),
+        format!("faithful daemon browser: old Session={} new_agent={} store_durable={} remote_total={}", browser_old, browser_new, store_rows.len(), remote_total),
+        format!("store ground truth {} local + {} remote = {} fleet; browser live shell leak 0 when fixed; GUI 1200 is remote_total", store_rows.len(), remote_total, store_rows.len() + remote_total),
     ];
     let _ = yggterm_home;
     return Some((store_rows, warnings, live_paths));
