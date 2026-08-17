@@ -4100,6 +4100,26 @@ impl YggtermServer {
         });
         entry.kind = kind;
         entry.backend = self.backend;
+        if kind == SessionKind::SshShell || path.starts_with("ssh://") {
+            entry.source = SessionSource::LiveSsh;
+            if let Some(rest) = path.strip_prefix("ssh://") {
+                if let Some((target, _)) = rest.split_once('/') {
+                    entry.ssh_target = Some(target.to_string());
+                } else if !rest.is_empty() {
+                    entry.ssh_target = Some(rest.to_string());
+                }
+            }
+            if !self.live_session_order.iter().any(|k| k == path) {
+                self.live_session_order.push(path.to_string());
+            }
+        } else if (kind == SessionKind::Shell || path.starts_with("local://"))
+            && entry.source == SessionSource::Stored
+        {
+            entry.source = SessionSource::LiveLocal;
+            if !self.live_session_order.iter().any(|k| k == path) {
+                self.live_session_order.push(path.to_string());
+            }
+        }
         // AGENT CLI SESSIONS ARE KEEP-ALIVE AT BIRTH — at THIS birth site too.
         // This is the constructor behind `open_or_focus_session` (a click on a
         // scanned/stored row, `server connect`), a SECOND birth site beside
@@ -17520,6 +17540,44 @@ fn remote_grok_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-grok://{machine_key}/{session_id}")
 }
 
+const REMOTE_DAEMON_SHELL_SCAN_SCRIPT: &str = r#"
+import json, os, glob
+from pathlib import Path
+
+home = Path(os.path.expanduser("~"))
+ygg_dir = home / ".yggterm"
+state_files = [ygg_dir / "server-state.json", ygg_dir / "server-state.previous.json"]
+results = {}
+
+def add_session(s, mtime=0):
+    sid = s.get("id") or (s.get("key", "").replace("local://", "") if s.get("key", "").startswith("local://") else None)
+    k = s.get("kind")
+    if sid and (k in ("shell", "ssh_shell", "Shell", "SshShell") or str(k).lower() == "shell"):
+        if sid not in results:
+            results[sid] = {
+                "session_id": sid,
+                "cwd": s.get("cwd") or str(home),
+                "title": s.get("title") or "Terminal",
+                "context": "",
+                "mtime": mtime,
+                "path": s.get("key") or ("local://" + sid),
+            }
+
+for state_file in state_files:
+    if state_file.exists():
+        try:
+            mtime = int(os.path.getmtime(state_file))
+            with open(state_file, "r", errors="ignore") as f:
+                data = json.load(f)
+                for s in data.get("live_sessions", []):
+                    add_session(s, mtime)
+        except Exception:
+            pass
+
+for r in results.values():
+    print(json.dumps(r, ensure_ascii=False))
+"#;
+
 /// Whether a session path's CLI lives on THIS machine (so the local managed
 /// codex/claude toolchain is relevant on the attach path). Remote agent
 /// sessions — codex `remote-session://`, Claude Code `remote-cc://` and Muse
@@ -17799,6 +17857,48 @@ fn scan_remote_machine_sessions(
             any_found = true;
         }
         sessions.extend(found_sessions);
+    }
+
+    let daemon_shell_lines = match run_remote_python_lines(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        REMOTE_DAEMON_SHELL_SCAN_SCRIPT,
+        &[],
+    ) {
+        Ok(lines) => lines,
+        Err(_) => Vec::new(),
+    };
+    for line in daemon_shell_lines {
+        if let Ok(summary) = serde_json::from_str::<RemoteGenericSummaryLine>(&line) {
+            if existing_ids.contains(&summary.session_id) {
+                continue;
+            }
+            existing_ids.insert(summary.session_id.clone());
+            let session_path = format!("ssh://{machine_key}/{}", summary.session_id);
+            let title_hint = if summary.title.trim().is_empty() {
+                short_session_id(&summary.session_id)
+            } else {
+                summary.title
+            };
+            sessions.push(RemoteScannedSession {
+                session_path,
+                title_hint,
+                session_id: summary.session_id,
+                cwd: summary.cwd,
+                started_at: String::new(),
+                modified_epoch: summary.mtime,
+                event_count: 0,
+                user_message_count: 0,
+                assistant_message_count: 0,
+                recent_context: summary.context,
+                cached_precis: None,
+                cached_summary: None,
+                live_runtime: true,
+                title_is_explicit: false,
+                storage_path: summary.path,
+            });
+            any_found = true;
+        }
     }
 
     // Only propagate the deferred yggterm error if we have nothing to show at all.
