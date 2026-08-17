@@ -45,6 +45,9 @@ impl BrowserRow {
         if let Some(kind) = self.session_kind {
             return kind.is_agent();
         }
+        if self.full_path.ends_with(".jsonl") {
+            return true;
+        }
         crate::agent_scheme::session_kind_for_path(&self.full_path)
             .map(|k| k.is_agent())
             .unwrap_or(false)
@@ -71,7 +74,7 @@ impl BrowserRow {
         if self.kind == BrowserRowKind::Document {
             return self.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe);
         }
-        self.is_agent_session()
+        self.kind == BrowserRowKind::Session
     }
 }
 
