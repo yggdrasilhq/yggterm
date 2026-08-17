@@ -92,6 +92,18 @@ fn trace_writers() -> &'static Mutex<HashMap<PathBuf, TraceWriter>> {
     WRITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+static YTRACE_TRACE_PROVIDER: OnceLock<ytrace::Provider> = OnceLock::new();
+fn ytrace_trace_provider() -> &'static ytrace::Provider {
+    YTRACE_TRACE_PROVIDER.get_or_init(|| {
+        let p = ytrace::Provider::new("yggterm", crate::current_version());
+        // Trace events are the narrative log (session, daemon, gui) — always keep for Dash stories.
+        p.register("trace/session", ytrace::Clock::Wall, ytrace::Sample::always());
+        p.register("trace/daemon", ytrace::Clock::Wall, ytrace::Sample::always());
+        p.register("trace/gui", ytrace::Clock::Wall, ytrace::Sample::always());
+        p
+    })
+}
+
 pub fn append_trace_event(
     home: &Path,
     component: impl Into<String>,
@@ -99,22 +111,28 @@ pub fn append_trace_event(
     name: impl Into<String>,
     payload: Value,
 ) {
+    let component_s = component.into();
+    let category_s = category.into();
+    let name_s = name.into();
     let record = EventTraceRecord {
         ts_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or_default(),
         pid: std::process::id(),
-        component: component.into(),
-        category: category.into(),
-        name: name.into(),
-        payload,
+        component: component_s.clone(),
+        category: category_s.clone(),
+        name: name_s.clone(),
+        payload: payload.clone(),
     };
     let Ok(mut line) = serde_json::to_vec(&record) else {
         return;
     };
     line.push(b'\n');
     write_trace_line(home, &line);
+    // Mirror to ytrace for Dash notebooks — Top stays trace-file-free in the book metaphor,
+    // but the wire is dual-written so Dash can query via ytrace without reading the old file.
+    ytrace_trace_provider().event(component_s, category_s, name_s, payload);
 }
 
 fn write_trace_line(home: &Path, line: &[u8]) {
