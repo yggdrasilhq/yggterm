@@ -17445,7 +17445,8 @@ fn terminal_geometry_resize_should_send(
     terminal_geometry_is_usable(cols, rows) && (last_cols != cols || last_rows != rows)
 }
 fn created_remote_terminal_should_prewarm(session_path: &str) -> bool {
-    session_path.starts_with("remote-session://") || session_path.starts_with("ssh://")
+    yggterm_core::agent_scheme::is_remote_agent_session_path(session_path)
+        || yggterm_core::agent_scheme::is_remote_row_path(session_path)
 }
 fn active_remote_recovery_snapshot_probe_should_start(
     is_remote_resume_session: bool,
@@ -40274,7 +40275,11 @@ fn viewport_entry_references_closed(entry: &ViewportHistoryEntry, closed_paths: 
     }
 }
 fn daemon_runtime_key_for_session_path(session_path: &str) -> String {
-    if session_path.starts_with("codex-runtime://") {
+    // Any daemon-owned runtime scheme (codex-runtime://, cc-runtime://,
+    // muse-runtime://, agy-runtime:// ...) is already canonical.
+    if yggterm_core::agent_scheme::agent_runtime_key_schemes()
+        .any(|scheme| session_path.starts_with(scheme.prefix))
+    {
         return session_path.to_string();
     }
     if let Some(id) = session_path.strip_prefix("local://") {
@@ -41831,8 +41836,14 @@ fn should_show_remote_loading_notice(row: &BrowserRow, retained_live_terminal: b
     !retained_live_terminal
         && (is_remote_scanned_sidebar_row(row)
             || row.full_path.starts_with("ssh://")
-            || row.full_path.starts_with("codex://")
-            || row.full_path.starts_with("codex-litellm://"))
+            || row
+                .full_path
+                .starts_with("codex://")
+            || row.full_path.starts_with("codex-litellm://")
+            // Keep legacy prefixes for old persists; new CLIs are covered by
+            // the registry-derived predicate above. Adding a literal per CLI
+            // here is how Muse/agy lost their loading notice.
+            || yggterm_core::agent_scheme::is_remote_agent_session_path(&row.full_path))
 }
 fn is_remote_machine_group_row(row: &BrowserRow) -> bool {
     row.kind == BrowserRowKind::Group && row.full_path.starts_with("__remote_machine__/")
@@ -41865,8 +41876,8 @@ fn is_local_stored_session_path(path: &str) -> bool {
     !path.trim().is_empty()
         && !path.starts_with("__")
         && !is_local_live_session_path(path)
-        && !path.starts_with("remote-session://")
-        && !path.starts_with("ssh://")
+        && !yggterm_core::agent_scheme::is_remote_agent_session_path(path)
+        && !yggterm_core::agent_scheme::is_remote_row_path(path)
 }
 fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
     if session.kind.self_generates_copy() {
@@ -41876,9 +41887,8 @@ fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
         || session.kind == SessionKind::SshShell
         || is_local_live_session_path(&session.session_path)
         || is_local_stored_session_path(&session.session_path)
-        || session.session_path.starts_with("codex://")
-        || session.session_path.starts_with("remote-session://")
-        || session.session_path.starts_with("ssh://")
+        || yggterm_core::agent_scheme::is_remote_agent_session_path(&session.session_path)
+        || yggterm_core::agent_scheme::is_remote_row_path(&session.session_path)
 }
 fn copy_generation_target_for_session(
     server: &YggtermServer,

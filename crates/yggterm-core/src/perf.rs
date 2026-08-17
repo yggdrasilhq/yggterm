@@ -13,7 +13,11 @@ use std::time::Instant;
 static YTRACE_PROVIDER: OnceLock<ytrace::Provider> = OnceLock::new();
 fn ytrace_provider() -> &'static ytrace::Provider {
     YTRACE_PROVIDER.get_or_init(|| {
-        let p = ytrace::Provider::new("yggterm", crate::current_version());
+        let p = ytrace::Provider::with_home(
+            "yggterm",
+            crate::current_version(),
+            ytrace::compat::resolve_home("yggterm"),
+        );
         // Pre-register hot paths with ytrace sampling so Dash notebooks get sampled counts.
         for probe in [
             "daemon_request/status",

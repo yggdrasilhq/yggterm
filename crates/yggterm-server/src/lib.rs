@@ -4730,14 +4730,31 @@ impl YggtermServer {
         &self,
         path: &str,
     ) -> Option<(RemoteMachineRef, String, SessionKind)> {
-        // The Codex arm prefers the transcript id recorded in metadata over the
-        // one in the path (`docs/sessions.md` §Identity); everything else about
-        // the resolution — which machine, which kind — belongs to the ONE
-        // scheme table in `remote_agent_row_target`.
-        if let Some((machine, session_id)) = self.remote_shutdown_target_for_path(path) {
-            return Some((machine, session_id, SessionKind::Codex));
-        }
-        remote_agent_row_target(&self.remote_machines, path)
+        // Registry-derived: every remote agent scheme, not just codex/cc.
+        // Previously this forced Codex for the first branch (remote-session://
+        // only) and fell through to generic for CC; now both branches are
+        // generic so the kind comes from the scheme itself. Keep the Codex
+        // metadata preference (path id vs transcript id) via the shared
+        // `remote_shutdown_target_for_path` which already does per-kind label
+        // lookup, but return its true kind instead of forcing Codex.
+        let (raw_machine_key, path_session_id, kind) =
+            parse_remote_agent_session_path_with_kind(path)?;
+        let machine_key = normalize_machine_key(raw_machine_key);
+        let machine = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)?;
+        let label = yggterm_core::agent_cli::agent_cli_descriptor(kind)
+            .map(|descriptor| descriptor.session_metadata_label)
+            .unwrap_or("Codex Session");
+        let session_id = self
+            .resolve_session_storage_key(path)
+            .and_then(|key| self.sessions.get(key))
+            .and_then(|session| session_metadata_value(session, label))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(path_session_id.to_string());
+        Some((machine.routing_ref(), session_id, kind))
     }
 
     pub fn refresh_terminal_identity_launch_commands(&mut self) -> usize {
@@ -13353,13 +13370,34 @@ fn refresh_remote_codex_terminal_identity_launch_command(
 }
 
 fn parse_remote_runtime_agent_session_key(path: &str) -> Option<&str> {
-    parse_remote_runtime_codex_session_key(path).or_else(|| parse_remote_runtime_cc_session_key(path))
+    // Registry-derived: every daemon-owned runtime key, not just codex/cc.
+    // Previously this was a hand-list of two prefixes, so a muse-runtime://
+    // or agy-runtime:// key parsed to None everywhere at once — no refresh,
+    // no liveness probe, no hot-restart protection for that CLI.
+    yggterm_core::agent_scheme::agent_runtime_key_schemes()
+        .find_map(|scheme| path.strip_prefix(scheme.prefix))
 }
 
 fn restored_remote_runtime_codex_session_id(
     key: &str,
     session: &ManagedSessionView,
 ) -> Option<String> {
+    // Registry-derived label: the CLI's own `session_metadata_label`
+    // (Codex Session / Muse Code Session / Antigravity Session ...).
+    // Previously this was hardcoded to "Codex Session", so a restored
+    // muse-runtime:// or agy-runtime:// row looked for the wrong label
+    // and fell through to a None that left the launch unrepaired.
+    if let Some(descriptor) = agent_cli_descriptor(session.kind) {
+        let label = descriptor.session_metadata_label;
+        if let Some(session_id) = session_metadata_value(session, label)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(session_id);
+        }
+    }
+    // Fallback for legacy rows that were persisted before the label was
+    // kind-specific — keep the old Codex check so old persists still repair.
     if let Some(session_id) = session_metadata_value(session, "Codex Session")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
