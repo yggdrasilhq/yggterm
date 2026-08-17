@@ -14,9 +14,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED (sweep + upstream finally)
 
-⚠ Our half is shipped; the leak itself is in a package this repo does not own.
+⚠ Our half is shipped; the upstream finally is patched on *** (2026-08-17) and in sweep as fallback.
 
 *Owner-reported 2026-08-14 as memory pressure; measured on the desktop host*
 
@@ -1696,14 +1696,10 @@ and if so this is a control-plane-wide clause and not a `rename` note.
 
 ## ⛔⛔⛔ [6.9→6.7] THE HANDLER SPAN MEASURES 9% OF THE HANDLER, IN THE WRONG UNIT
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED (S6 live on *** 2026-08-17)
 
 ⛔ **THE SPEC BELOW IS BUILT — read "S6 — THE HANDLER NOW REPORTS CPU, END
-TO END, PER VERB" for what it measures and what it found.** What is still
-open here is only the live record. ⚠ And the ~94% kernel figure that motivated
-it is RETRACTED: per-thread `utime`/`stime` are floored to a 10 ms tick
-**independently**, which annihilates the smaller component. The magnitude gap
-survives; the composition does not.
+TO END, PER VERB" for what it measures and what it found.** S6's `client_handler_cost` is live: `ping 430µs`, `status 1.4ms` at 264 rows (vs 2.4ms wall), whole closure measured via `CLOCK_THREAD_CPUTIME_ID` at `spawn_unix_client_handler`. The ~94% kernel figure is RETRACTED: per-thread `utime`/`stime` floored to 10 ms independently.
 
 *measured 2026-08-14; instrument, controls and the two refuted candidates in
 [`idle-cost-model.md`](idle-cost-model.md) §6j — spec is §S6*
