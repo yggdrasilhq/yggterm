@@ -4,8 +4,33 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
+
+// ytrace provider — same probe names, same sampling, but file-first for Dash notebooks.
+// Top stays probe-free; Dash is exclusively ytrace (book pages). The wire is v:1.
+static YTRACE_PROVIDER: OnceLock<ytrace::Provider> = OnceLock::new();
+fn ytrace_provider() -> &'static ytrace::Provider {
+    YTRACE_PROVIDER.get_or_init(|| {
+        let p = ytrace::Provider::new("yggterm", crate::current_version());
+        // Pre-register hot paths with ytrace sampling so Dash notebooks get sampled counts.
+        for probe in [
+            "daemon_request/status",
+            "daemon_request/ping",
+            "daemon_request/terminal_read",
+            "daemon_request/terminal_write",
+            "daemon_request/terminal_snapshot",
+            "daemon_request/working_flags",
+        ] {
+            p.register(probe, ytrace::Clock::Wall, ytrace::Sample::noisy());
+        }
+        p.register("render/gui", ytrace::Clock::Cpu, ytrace::Sample::always());
+        p.register("render/web_content", ytrace::Clock::Cpu, ytrace::Sample::always());
+        p
+    })
+}
+
 
 /// Process-global gate for the app profiling system. Default ON to preserve the
 /// pre-toggle always-on behavior; the daemon and GUI both push
@@ -157,9 +182,16 @@ pub fn append_perf_event(home: &Path, category: &str, name: &str, payload: Value
         "pid": std::process::id(),
         "category": category,
         "name": name,
-        "payload": payload,
+        "payload": payload.clone(),
     });
     crate::retention::append_retained_jsonl_record(&path, PERF_TELEMETRY_RETENTION, &event);
+    // Mirror to ytrace for Dash notebooks — Top stays probe-free.
+    let _ = if category == crate::render_probe::RENDER_PERF_CATEGORY {
+        ytrace::Clock::Cpu
+    } else {
+        ytrace::Clock::Wall
+    };
+    ytrace_provider().event("perf", category.to_string(), name.to_string(), payload);
 }
 
 fn rotate_jsonl_if_needed(path: &Path, rotated_filename: &str, max_bytes: u64, incoming_len: u64) {
