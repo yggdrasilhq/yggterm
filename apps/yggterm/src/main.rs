@@ -4149,7 +4149,9 @@ fn install_panic_logging(home_dir: &std::path::Path) {
                 "payload": payload,
             }),
         );
-        eprintln!("{message}");
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(message.as_bytes());
+        let _ = stderr.write_all(b"\n");
         if let Ok(mut file) = fs::OpenOptions::new()
             .create(true)
             .append(true)

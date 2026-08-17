@@ -496,8 +496,18 @@ fn connect_session_kind_for_path(path: &str) -> yggterm_core::SessionKind {
         yggterm_core::SessionKind::GrokBuild
     } else if path.starts_with("remote-kimi://") {
         yggterm_core::SessionKind::Kimi
+    } else if path.starts_with("remote-pi://") {
+        yggterm_core::SessionKind::Pi
+    } else if path.starts_with("remote-opencode://") {
+        yggterm_core::SessionKind::OpenCode
+    } else if path.starts_with("remote-qwen://") {
+        yggterm_core::SessionKind::QwenCode
+    } else if path.starts_with("ssh://") {
+        yggterm_core::SessionKind::SshShell
+    } else if path.starts_with("local://") {
+        yggterm_core::SessionKind::Shell
     } else {
-        yggterm_core::SessionKind::Codex
+        yggterm_core::agent_scheme::session_kind_for_path(path).unwrap_or(yggterm_core::SessionKind::Codex)
     }
 }
 
