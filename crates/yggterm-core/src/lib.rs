@@ -1820,51 +1820,25 @@ struct CodexBrowserTreeNode {
 /// injection pass. To add a new CLI: write a `scan_local_<cli>_sessions()`
 /// that returns `Vec<LocalAgentSessionSummary>` and call it here.
 fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionNode> {
-    // This walk reads every agent transcript on the machine and runs on every
-    // daemon chore tick and inside every title generation, but had no span of
-    // its own — so `daemon/background_copy_chore` reported a p50 of 0.0 ms
-    // while this was the bulk of its cost. Nothing can be claimed about the
-    // scanners until their cost has a row of its own.
-    //
-    // A `PerfGuard`, not a `PerfSpan`: the two `?` below are the scanners
-    // themselves, so an unreadable sessions root or a mid-walk IO error is
-    // exactly the run worth having a duration for — and an explicit
-    // `finish` at the bottom is the one that never runs on those.
     let mut perf = PerfGuard::new(home, "background", "local_tree_scan");
-    let title_resolver = SessionTitleResolver::new(home).ok();
-
-    let mut sessions: Vec<LocalAgentSessionSummary> = Vec::new();
-    let codex_root = resolve_codex_sessions_root()?;
-    let mut codex_sessions = 0usize;
-    if codex_root.exists() {
-        let scanned = scan_local_codex_sessions(&codex_root, title_resolver.as_ref())?;
-        codex_sessions = scanned.len();
-        sessions.extend(scanned);
-    }
-    let claude_code_sessions = {
-        let scanned = scan_local_claude_code_sessions();
-        let count = scanned.len();
-        sessions.extend(scanned);
-        count
-    };
-    let antigravity_sessions = {
-        let scanned = scan_local_antigravity_sessions();
-        let count = scanned.len();
-        sessions.extend(scanned);
-        count
-    };
-    for descriptor in crate::agent_cli::AGENT_CLIS {
-        if descriptor.kind == SessionKind::Codex
-            || descriptor.kind == SessionKind::CodexLiteLlm
-            || descriptor.kind == SessionKind::ClaudeCode
-            || descriptor.kind == SessionKind::Antigravity
-            || descriptor.session_store_globs.is_empty()
-        {
-            continue;
-        }
-        let scanned = scan_local_agent_cli_sessions(descriptor);
-        sessions.extend(scanned);
-    }
+    // Unified scan — single source of truth for all CLIs (see spec-cli-integration-verification).
+    // Previously this was a hand-rolled per-CLI fan-out that drifted from startpage's walk;
+    // now both surfaces call scan_all_durable_sessions so a CLI added to AGENT_CLIS automatically
+    // appears in the cwd tree without a second encoding.
+    let durable = crate::startpage::scan_all_durable_sessions(home);
+    let sessions: Vec<LocalAgentSessionSummary> = durable
+        .into_iter()
+        .map(|row| LocalAgentSessionSummary {
+            kind: row.kind,
+            file_path: PathBuf::from(row.storage_path),
+            session_id: row.session_id,
+            cwd: normalize_codex_cwd(row.cwd),
+            title: row.effective_title,
+            detail: row.detail,
+            modified_epoch_ms: row.modified_epoch_ms,
+        })
+        .collect();
+    let total_sessions = sessions.len();
 
     let mut projects = BTreeMap::<String, Vec<LocalAgentSessionSummary>>::new();
     for session in sessions {
@@ -1914,9 +1888,7 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     compress_codex_browser_tree(&mut root, false);
 
     perf.annotate(serde_json::json!({
-        "codex_sessions": codex_sessions,
-        "claude_code_sessions": claude_code_sessions,
-        "antigravity_sessions": antigravity_sessions,
+        "total_sessions": total_sessions,
         "cwd_buckets": bucket_count,
     }));
     Ok(codex_browser_tree_to_session_node(&root))
