@@ -1995,7 +1995,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Nearest available (8.24:1).
         brand_color: "#86198f",
         menu_hint: 'm',
-        title_authority: TitleAuthority::Store,
+        // Muse records no title of its own (like Codex); yggterm's LLM chore writes one.
+        title_authority: TitleAuthority::Generated,
         id_assigned_at_birth: false,
         wrapper_slug: Some("muse"),
         remote_row_scheme: Some("remote-muse://"),
