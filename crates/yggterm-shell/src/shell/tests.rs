@@ -44597,9 +44597,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut plain_shell = test_live_shell_session(shell_path);
         plain_shell.id = "plain-shell".to_string();
         plain_shell.title = "widgets".to_string();
+        plain_shell.kind = SessionKind::Codex;
         plain_shell.metadata = vec![SessionMetadataEntry {
             label: "Source",
-            value: "local-shell".to_string(),
+            value: "codex".to_string(),
         }];
 
         shell.server.apply_snapshot(ServerUiSnapshot {
@@ -44619,7 +44620,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         snapshot.selected_row = None;
         snapshot.rows = vec![
             test_browser_session_row(app_path, "New Ychrome", "local", Some("/home/user")),
-            test_browser_session_row(shell_path, "widgets", "local", Some("/home/user")),
+            {
+                let mut row = test_browser_session_row(shell_path, "widgets", "local", Some("/home/user"));
+                row.session_kind = Some(SessionKind::Codex);
+                row
+            },
         ];
 
         let paths = start_page_recent_rows(&snapshot)
@@ -45167,7 +45172,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let live_terminal_path = "live::remote-shell";
         let mut live_terminal = test_live_shell_session(live_terminal_path);
         live_terminal.id = "remote-shell".to_string();
-        live_terminal.kind = SessionKind::SshShell;
+        live_terminal.kind = SessionKind::Codex;
         live_terminal.source = SessionSource::LiveSsh;
         live_terminal.host_label = "samplenotes-webapp".to_string();
         live_terminal.ssh_target = Some("pi@samplenotes-webapp".to_string());
@@ -45209,12 +45214,16 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         });
         snapshot.rows = vec![
             snapshot.selected_row.clone().unwrap(),
-            test_browser_session_row(
-                live_terminal_path,
-                "samplenotes-webapp",
-                "samplenotes-webapp",
-                Some("/home/user"),
-            ),
+            {
+                let mut row = test_browser_session_row(
+                    live_terminal_path,
+                    "samplenotes-webapp",
+                    "samplenotes-webapp",
+                    Some("/home/user"),
+                );
+                row.session_kind = Some(SessionKind::Codex);
+                row
+            },
             test_browser_session_row(
                 "remote-session://samplenotes-webapp/durable",
                 "Durable Codex",
@@ -45260,6 +45269,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let live_path = "local://shared-session-id";
         let mut live = test_live_shell_session(live_path);
         live.id = "shared-session-id".to_string();
+        live.kind = SessionKind::Codex;
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: None,
             active_session: None,
@@ -45278,6 +45288,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut live_row =
             test_browser_session_row(live_path, "Shared", "local", Some("/home/user"));
         live_row.session_id = Some("shared-session-id".to_string());
+        live_row.session_kind = Some(SessionKind::Codex);
         let mut stored_row = test_browser_session_row(
             "/home/user/.codex/sessions/shared-session-id.jsonl",
             "Shared",

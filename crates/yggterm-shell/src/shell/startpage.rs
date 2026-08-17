@@ -298,14 +298,11 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     // the list, exactly as it did when everything else was thrown away — the
     // difference is that "further down" replaced "gone", and a row the owner is
     // looking for can now be FOUND rather than only remembered.
-    // Scope > liveness > recency (tightened 2026-08-17): folder-scoped startpage must
-    // show in-scope work first even when live rows exist, otherwise the page showed 1319
-    // global Claude Code rows from another host while the selected yggterm folder had 16.
     candidates.sort_by(|left, right| {
         right
-            .2
-            .cmp(&left.2)
-            .then_with(|| right.1.cmp(&left.1))
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
             .then_with(|| right.3.cmp(&left.3))
             .then_with(|| right.4.cmp(&left.4))
             .then_with(|| left.5.cmp(&right.5))
