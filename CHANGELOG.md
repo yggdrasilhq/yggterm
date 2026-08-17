@@ -4,6 +4,9 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A heartbeat no longer creates a web surface.** The viewport's `heartbeat`/`seen` path could mint a fresh webview via the live OSC declare while replaying scrollback (cursor-0 `open→seen` on a dormant session), dropping the user into an unexpected webview when an agent navigated. Only `open` may create a surface now; the daemon-rebuild path is age-checked (30s) and `f2857e8b` keeps the palette `.clone()` fix. Verified `cargo test -p yggterm-shell --lib web_surface` 74 passed.
+- **yggtopo Dash now shows the fleet on Yggdrasil hosts.** On `jojo` the relay `seat-membership.json` was `{}` so Dash reported `0 live` while the daemon held 53 `live_sessions`. It now falls back to the daemon ground truth (`server snapshot` per `yggterm-diagnostics`, 54/54 on jojo) and renders the 5-min Ring sparkline `▁▂▃▄▅▆▇█` (1s bucket, `Last 60s` table) — proof bundle `artifacts/demos/unreleased/ytop-dash-fallback-55e374a` with `--backend os` screenshots. Companion `yggtopo` commits `55e374a`/`017ef16` (Top `Daemon Cost` 4.5× sharing win + ZFS IOSTAT live).
+
 - **Muse Code sessions now appear in Startpage, cwd-tree and title pickers.** Muse has been installed fleet-wide since 2026-08-08 but its store (`~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db`) was not scanned, so the last five sessions were Muse and the tree showed no `M_` rows. It now scans with `session-index.db` `workspace_root→cwd` and `route_facts.cwd` fallback, excludes `/subagent/` and `/tool-outputs/`, and renders `M_ #86198f`. New `server cwdtree ls` groups the same scan by `cwd`; `server titles/startpage/cwdtree ls` now report pre-limit `durable_count` and `group_count`, and the `check-titles`/`check-cwdtree`/`check-startpage` oracles pass.
 
 - **`--limit` on the trace commands was ignored, so every request returned the
