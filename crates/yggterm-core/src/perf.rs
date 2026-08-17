@@ -185,13 +185,19 @@ pub fn append_perf_event(home: &Path, category: &str, name: &str, payload: Value
         "payload": payload.clone(),
     });
     crate::retention::append_retained_jsonl_record(&path, PERF_TELEMETRY_RETENTION, &event);
-    // Mirror to ytrace for Dash notebooks — Top stays probe-free.
-    let _ = if category == crate::render_probe::RENDER_PERF_CATEGORY {
+    // Mirror to ytrace for Dash notebooks — Top stays probe-free, Dash is exclusively ytrace.
+    // Emit as a ytrace *span* so `ytrace query --category render` etc see duration_ms and count correctly.
+    let clock = if category == crate::render_probe::RENDER_PERF_CATEGORY {
         ytrace::Clock::Cpu
     } else {
         ytrace::Clock::Wall
     };
-    ytrace_provider().event("perf", category.to_string(), name.to_string(), payload);
+    if let Some(dur) = payload.get("duration_ms").and_then(|v| v.as_f64()) {
+        let meta = payload.get("meta").cloned().unwrap_or(serde_json::Value::Null);
+        ytrace_provider().emit_span("perf", category.to_string(), name.to_string(), clock, dur, meta);
+    } else {
+        ytrace_provider().event("perf", category.to_string(), name.to_string(), payload);
+    }
 }
 
 fn rotate_jsonl_if_needed(path: &Path, rotated_filename: &str, max_bytes: u64, incoming_len: u64) {
