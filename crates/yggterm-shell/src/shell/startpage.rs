@@ -389,13 +389,13 @@ fn start_page_app_items(apps: &[AppManifest]) -> Vec<SplitButtonItem> {
 /// which is the reference the owner named.
 fn start_page_split_palette(palette: &Palette) -> SplitButtonPalette {
     SplitButtonPalette::new(
-        palette.text.clone(),
-        palette.muted.clone(),
-        palette.panel_alt.clone(),
+        palette.text,
+        palette.muted,
+        palette.panel_alt,
         overlay_surface(*palette),
         "rgba(120,142,166,0.16)",
-        palette.panel.clone(),
-        palette.accent.clone(),
+        palette.panel,
+        palette.accent,
         "#ffffff",
     )
 }
