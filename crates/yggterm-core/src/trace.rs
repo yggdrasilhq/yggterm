@@ -95,7 +95,11 @@ fn trace_writers() -> &'static Mutex<HashMap<PathBuf, TraceWriter>> {
 static YTRACE_TRACE_PROVIDER: OnceLock<ytrace::Provider> = OnceLock::new();
 fn ytrace_trace_provider() -> &'static ytrace::Provider {
     YTRACE_TRACE_PROVIDER.get_or_init(|| {
-        let p = ytrace::Provider::new("yggterm", crate::current_version());
+        let p = ytrace::Provider::with_home(
+            "yggterm",
+            crate::current_version(),
+            ytrace::compat::resolve_home("yggterm"),
+        );
         // Trace events are the narrative log (session, daemon, gui) — always keep for Dash stories.
         p.register("trace/session", ytrace::Clock::Wall, ytrace::Sample::always());
         p.register("trace/daemon", ytrace::Clock::Wall, ytrace::Sample::always());
