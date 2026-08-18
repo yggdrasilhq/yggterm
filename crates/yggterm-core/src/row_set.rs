@@ -46,6 +46,14 @@ pub enum RowSetRefusal {
     /// `head` is already somewhere beneath `member`, so this would close a loop.
     /// Carries the path that would have been re-entered.
     WouldCycle { through: String },
+    /// `member` is itself a head with children — nesting it would move its
+    /// entire subtree. Guard against the 53-row accident where campaign heads
+    /// (6.0 → 14 children, 2.0 → 6, etc.) were bulk-nested under one ether row.
+    /// The caller must pass `--with-children` to do this deliberately.
+    WouldNestHead {
+        member: String,
+        descendant_count: usize,
+    },
 }
 
 /// The containment relation over row paths, plus each set's collapsed flag.
@@ -204,6 +212,20 @@ impl RowSets {
         member: &str,
         index: Option<usize>,
     ) -> Result<(), RowSetRefusal> {
+        self.insert_member_with_children(head, member, index, false)
+    }
+
+    /// Same as `insert_member` but `allow_nest` controls whether a member that
+    /// is itself a head with descendants may be moved. When false, a member
+    /// with `descendant_count > 0` is refused as `WouldNestHead` — the guard
+    /// against bulk-nesting 6.0 (14 children) or journal (20) under one ether row.
+    pub fn insert_member_with_children(
+        &mut self,
+        head: &str,
+        member: &str,
+        index: Option<usize>,
+        allow_nest: bool,
+    ) -> Result<(), RowSetRefusal> {
         if head == member {
             return Err(RowSetRefusal::SelfParent);
         }
@@ -212,6 +234,16 @@ impl RowSets {
         // state neither the caller nor the store ever agreed to be in.
         if let Some(through) = self.first_ancestor_at_or_below(head, member) {
             return Err(RowSetRefusal::WouldCycle { through });
+        }
+        // Guard: nesting a head moves its whole subtree (the 53-row accident).
+        if !allow_nest {
+            let descendants = self.descendant_count(member);
+            if descendants > 0 {
+                return Err(RowSetRefusal::WouldNestHead {
+                    member: member.to_string(),
+                    descendant_count: descendants,
+                });
+            }
         }
         self.detach(member);
         let slot = self.members.entry(head.to_string()).or_default();

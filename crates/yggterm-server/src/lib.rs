@@ -23975,6 +23975,7 @@ pub fn run_app_control_arrange_row_set(
     into_path: Option<&str>,
     dissolve: bool,
     reset: bool,
+    allow_nest: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -23985,6 +23986,7 @@ pub fn run_app_control_arrange_row_set(
             into_path: into_path.map(str::to_string),
             dissolve,
             reset,
+            allow_nest,
         },
         timeout_ms,
     )?;

@@ -84,7 +84,18 @@ impl RowArrangement {
         member: &str,
         index: Option<usize>,
     ) -> Result<(), RowSetRefusal> {
-        self.sets.insert_member(head, member, index)?;
+        self.attach_with_children(head, member, index, false)
+    }
+
+    pub fn attach_with_children(
+        &mut self,
+        head: &str,
+        member: &str,
+        index: Option<usize>,
+        allow_nest: bool,
+    ) -> Result<(), RowSetRefusal> {
+        self.sets
+            .insert_member_with_children(head, member, index, allow_nest)?;
         self.detached.remove(member);
         Ok(())
     }
