@@ -1159,6 +1159,11 @@ pub enum AppControlCommand {
         /// ⛔ The way back: `into` and `out` are both sticky by design.
         #[serde(default)]
         reset: bool,
+        /// Allow nesting a head that itself has descendants — the 53-row guard.
+        /// Without this, `WouldNestHead` is refused and the caller is told to
+        /// use `sessions reorder` for peers or add `--with-children`.
+        #[serde(default)]
+        allow_nest: bool,
     },
     SetTreeSelection {
         paths: Vec<String>,

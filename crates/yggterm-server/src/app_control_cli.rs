@@ -214,7 +214,7 @@ pub fn server_app_usage_block(binary: &str) -> String {
   {binary} server app desktop-identity
   {binary} server app state [--pid <pid>]
   {binary} server app rows [--pid <pid>]
-  {binary} server app row-set <row-path> [--into <head>|--out|--dissolve|--reset]
+  {binary} server app row-set <row-path> [--into <head> [--with-children]|--out|--dissolve|--reset]
     arranges a live row into or out of a ROW SET — the verb twin of dragging a
     row onto another and of right-click un-group. `--into <head>` NESTS <row>
     (and its ENTIRE subtree) as a CHILD of <head> — depth+1, NOT a peer reorder;
@@ -224,10 +224,10 @@ pub fn server_app_usage_block(binary: &str) -> String {
     members to where the head sat. `--reset` forgets the hand's answer so the
     row's SEAT decides again — the way back, because `--into` and `--out` are
     both sticky by design. ⛔ It writes MEMBERSHIP, never a seat: grouping never
-    renumbers a row, so un-numbered rows group like any other. ⛔ Grouping a
-    head that itself has children (child_count>1 in `server app rows`) nests the
-    WHOLE subtree — check child_count before `--into`; use `sessions reorder` if
-    you meant peers on top.
+    renumbers a row, so un-numbered rows group like any other. ⛔ Nesting a head
+    that itself has children (child_count>1 in `server app rows`) is REFUSED
+    unless you add `--with-children` — this is the 53-row guard; use `sessions
+    reorder` if you meant peers on top. Leaf rows (child_count 1) attach without it.
   {binary} server app drag <begin|hover|drop|clear> [row-path] [--placement before|into|after]
     the SYNTHETIC drag twin of a hand dragging a sidebar row. `begin <row-path>`
     arms the gesture, `hover <target> --placement <p>` moves the drop indicator
@@ -521,6 +521,7 @@ pub fn run_app_control_cli(
             let dissolve = args.iter().any(|arg| arg == "--dissolve");
             let out = args.iter().any(|arg| arg == "--out");
             let reset = args.iter().any(|arg| arg == "--reset");
+            let allow_nest = args.iter().any(|arg| arg == "--with-children");
             // Named rather than defaulted: guessing between "file this
             // under something" and "take it out" would silently do the
             // opposite of what the caller meant half the time.
@@ -533,7 +534,10 @@ pub fn run_app_control_cli(
             if into.is_some() && (dissolve || out || reset) {
                 anyhow::bail!("--into cannot be combined with --out, --dissolve or --reset");
             }
-            run_app_control_arrange_row_set(row_path, into, dissolve, reset, timeout_ms)
+            if allow_nest && into.is_none() {
+                anyhow::bail!("--with-children only makes sense with --into <head>");
+            }
+            run_app_control_arrange_row_set(row_path, into, dissolve, reset, allow_nest, timeout_ms)
         }
         "row-expanded" => {
             let positional = cli_positional_args(&args, 3);

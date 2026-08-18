@@ -80969,6 +80969,7 @@ async fn process_pending_app_control_requests(
             into_path,
             dissolve,
             reset,
+            allow_nest,
         } => {
             let target = state.with(|shell| resolve_app_control_row(shell, &row_path));
             match target {
@@ -80983,7 +80984,29 @@ async fn process_pending_app_control_requests(
                             (true, json!({ "reset": path }), None)
                         } else if let Some(head) = into_path.as_deref() {
                             let head = normalize_live_session_path(head);
-                            match shell.row_arrangement.attach(&head, &path, None) {
+                            // Guard against nesting a head that already owns rows.
+                            // Use the effective sidebar sets (outline + hand) — a
+                            // head like `6.0` (14 children) or journal (20) must
+                            // not be bulk-nested under one ether row without
+                            // explicit `--with-children`. Leaf `child_count 1` passes.
+                            if !allow_nest {
+                                let effective = shell.sidebar_row_sets_now();
+                                if effective.is_head(&path) {
+                                    let total_descendants = effective.descendant_count(&path);
+                                    let direct = effective.members_of(&path).len();
+                                    let msg = format!(
+                                        "WouldNestHead {{ member: \"{path}\", descendant_count: {total_descendants}, direct_members: {direct} }} — \
+                                         row '{path}' is a head with {total_descendants} descendant row(s) ({direct} direct); nesting it would move its whole subtree ({} rows total) under '{head}'. \
+                                         Use 'server app sessions reorder' for peers on top, or add --with-children to nest deliberately.",
+                                        total_descendants + 1
+                                    );
+                                    return (false, json!({ "into": head }), Some(msg));
+                                }
+                            }
+                            match shell
+                                .row_arrangement
+                                .attach_with_children(&head, &path, None, allow_nest)
+                            {
                                 Ok(()) => (true, json!({ "into": head }), None),
                                 // Named, not swallowed: a refused arrangement is
                                 // a different mistake from a row that could not
