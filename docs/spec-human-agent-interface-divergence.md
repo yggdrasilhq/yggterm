@@ -1,7 +1,7 @@
 # Spec: Human vs Agent interfaces — where they diverge and what to read
 
 **Status:** LIVE CONTRACT  
-**Last verified:** daemon 3.1.3 (build 1787028817, commit 6efedc200515-dirty), `server snapshot`/`app state`/`app rows`/`terminal tenants`/`app screenshot capture_faithful:true` on 2026-08-18 — `active_terminal_surface.problem: null`, `snapshot live_sessions 42` `daemon owned 42`, paint probe `rows_in_stack && host_in_stack` ancestor fix deployed  
+**Last verified:** daemon 3.1.3 (build 1787033587, commit 9125ff0a6dd4), `server snapshot`/`app state`/`app rows`/`terminal tenants`/`app screenshot capture_faithful:true` on 2026-08-18 — `active_terminal_surface.problem: null` (dom_paint_hit_test.problem ''), `snapshot live_sessions 27` `daemon owned 1` (preserved 8), paint probe `rows_in_stack && host_in_stack` ancestor fix deployed, `server app terminal adopt --target-pid` (also --outer-pid/--pid) with `app_control_pid_flag` adopt-aware, `server app open` switches viewport faithfully, adopted row `local://b445b5bc-7e57-41db-8176-cc111a26ad94` "adopted-muse-pts29" draggable true live_rail, reptyr ptrace blocked for muse node (PR_SET_DUMPABLE) — verb reports adopt_refused, plain shell PTYs adoptable  
 **Owners:** `libyggterm-surfaces` (four human surfaces), `yggterm-diagnostics` (instrument authority), `yggterm-agent-fleet` §7 (verbs report request not effect)  
 **Non-goal:** this file owns the *map*, not the *fix* — the four divergences below are named here, fixed elsewhere.
 
