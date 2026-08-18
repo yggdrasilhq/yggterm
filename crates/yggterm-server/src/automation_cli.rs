@@ -89,11 +89,20 @@ pub fn delegate_launch_usage_block(binary: &str) -> String {
 }
 
 pub fn automation_usage_block(binary: &str) -> String {
+    let kinds = {
+        let mut kinds = vec!["shell"];
+        kinds.extend(
+            yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .map(|descriptor| descriptor.slug),
+        );
+        kinds.join("|")
+    };
     format!(
         "automations (scheduled agent-CLI sessions — see docs/automations.md):
   {binary} automation list [--json]
   {binary} automation show <id> [--json]
-  {binary} automation create --id <slug> --kind <shell|codex|claude-code> --cwd <dir>
+  {binary} automation create --id <slug> --kind <{kinds}> --cwd <dir>
       --machine-key <host> (--prompt <text>|--prompt-stdin) --calendar <expr>
       [--every-n-weeks <n>] [--grace <secs>] [--idle-ttl <secs>] [--deadline <secs>]
       [--attach] [--title <t>] [--disabled]
@@ -109,7 +118,8 @@ pub fn automation_usage_block(binary: &str) -> String {
   and cadence guards, which is what \"Run now\" and a test both want.
   `sync` reconciles the generated unit files against the store — the store
   always wins, and a hand-edited unit is REPORTED, never silently overwritten.
-  --prune removes unit files we generated that no automation claims any more."
+  --prune removes unit files we generated that no automation claims any more.",
+        kinds = kinds,
     )
 }
 
