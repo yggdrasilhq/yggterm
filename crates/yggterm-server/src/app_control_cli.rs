@@ -350,7 +350,8 @@ pub fn server_app_usage_block(binary: &str) -> String {
       [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
       [--prompt <text>|--prompt-stdin]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
-  {binary} server app terminal adopt --pid <pid> [--title <title>] [--machine-key <key>] [--cwd <dir>] [--no-activate]
+  {binary} server app terminal adopt --target-pid <pid> [--title <title>] [--machine-key <key>] [--cwd <dir>] [--no-activate]
+    (also --outer-pid <pid> or legacy --pid <pid>; --pid alone is the outer PTY, not the GUI target — use --target-pid to avoid the GUI --pid collision)
     attach an existing outer PTY (for example a `muse --yolo` on /dev/pts/N) into a new daemon-owned yggterm row. The row is a shell that then `reptyr -T <pid>`s the target (Linux-only, needs ptrace; if the kernel refuses the verb reports `adopt_refused` with the `reptyr` stderr instead of leaving a blank shell). The new row is `local-shell` on the target machine and appears as `remote-*://` on other hosts — the same visibility path as any `terminal new`.
 {delegate_usage}
   {binary} server app keytips <audit [--json]|show|hide>
@@ -1478,13 +1479,16 @@ pub fn run_app_control_cli(
                     let pid = args
                         .windows(2)
                         .find_map(|window| {
-                            if window[0] == "--pid" {
+                            if window[0] == "--target-pid"
+                                || window[0] == "--outer-pid"
+                                || window[0] == "--pid"
+                            {
                                 Some(window[1].as_str())
                             } else {
                                 None
                             }
                         })
-                        .ok_or_else(|| anyhow::anyhow!("missing --pid for server app terminal adopt"))?;
+                        .ok_or_else(|| anyhow::anyhow!("missing --target-pid for server app terminal adopt (use --target-pid <pid> or legacy --pid <pid>)"))?;
                     let pid_num: u32 = pid
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--pid must be an integer"))?;

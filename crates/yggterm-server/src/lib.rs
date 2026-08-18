@@ -21394,7 +21394,47 @@ fn requested_app_control_pid_from_env() -> Option<u32> {
 }
 
 /// The `--pid <pid>` flag of a `server app` invocation, if present and sane.
+/// `terminal adopt` uses `--target-pid`/`--outer-pid` for the outer PTY so `--pid`
+/// stays the GUI target (the 2026-08-18 collision: `adopt --pid 163343` was read
+/// as "route to GUI pid 163343" and refused before the verb ran). When the verb
+/// IS `terminal adopt` we skip a `--pid` that names the outer PTY.
 fn app_control_pid_flag(args: &[String]) -> Option<u32> {
+    // If this is `server app terminal adopt ... --pid <outer>` the `--pid` is NOT a GUI target.
+    // The adopt verb uses `--target-pid`/`--outer-pid`; keep `--pid` backward-compat but
+    // do not let `apply_app_control_target_overrides` steal it as a GUI route.
+    let is_adopt = args.windows(2).any(|w| w[0] == "terminal" && w[1] == "adopt")
+        || args.iter().any(|a| a == "adopt");
+    if is_adopt {
+        // Only a `--pid` that is NOT the adopt's outer pid counts as a GUI target.
+        // Adopt's outer pid is spelled `--target-pid`/`--outer-pid` now; if the
+        // caller still uses legacy `--pid <outer>` we treat THAT `--pid` as outer
+        // and return None so the GUI route is not set. An explicit GUI target
+        // for adopt must then be spelled `--pid <gui>` BEFORE the adopt verb
+        // or via env `YGGTERM_APP_CONTROL_PID`.
+        let adopt_outer_pid = args.windows(2).find_map(|w| {
+            if w[0] == "--target-pid" || w[0] == "--outer-pid" {
+                w[1].parse::<u32>().ok()
+            } else {
+                None
+            }
+        });
+        if adopt_outer_pid.is_some() {
+            // New spelling present: any `--pid` is a real GUI target.
+            return args
+                .windows(2)
+                .find_map(|window| {
+                    (window[0] == "--pid")
+                        .then(|| window[1].parse::<u32>().ok())
+                        .flatten()
+                })
+                .filter(|pid| *pid > 0);
+        }
+        // Legacy `--pid <outer>` with no `--target-pid`: do NOT treat it as GUI target.
+        // The verb will read it as outer pid itself.
+        if args.windows(2).any(|w| w[0] == "--pid") {
+            return None;
+        }
+    }
     args.windows(2)
         .find_map(|window| {
             (window[0] == "--pid")
