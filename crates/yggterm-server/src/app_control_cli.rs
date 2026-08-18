@@ -216,13 +216,18 @@ pub fn server_app_usage_block(binary: &str) -> String {
   {binary} server app rows [--pid <pid>]
   {binary} server app row-set <row-path> [--into <head>|--out|--dissolve|--reset]
     arranges a live row into or out of a ROW SET — the verb twin of dragging a
-    row onto another and of right-click un-group. `--into` files it under that
-    head, `--out` takes it to the top level, `--dissolve` breaks up the set this
-    row heads and promotes its members to where the head sat. `--reset` forgets
-    the hand's answer so the row's SEAT decides again — the way back, because
-    `--into` and `--out` are both sticky by design. ⛔ It writes MEMBERSHIP,
-    never a seat: grouping never renumbers a row, so un-numbered rows group like
-    any other.
+    row onto another and of right-click un-group. `--into <head>` NESTS <row>
+    (and its ENTIRE subtree) as a CHILD of <head> — depth+1, NOT a peer reorder;
+    to place rows contiguously on top as peers without nesting, use
+    `server app sessions reorder <order.json>` instead. `--out` takes it to the
+    top level, `--dissolve` breaks up the set this row heads and promotes its
+    members to where the head sat. `--reset` forgets the hand's answer so the
+    row's SEAT decides again — the way back, because `--into` and `--out` are
+    both sticky by design. ⛔ It writes MEMBERSHIP, never a seat: grouping never
+    renumbers a row, so un-numbered rows group like any other. ⛔ Grouping a
+    head that itself has children (child_count>1 in `server app rows`) nests the
+    WHOLE subtree — check child_count before `--into`; use `sessions reorder` if
+    you meant peers on top.
   {binary} server app drag <begin|hover|drop|clear> [row-path] [--placement before|into|after]
     the SYNTHETIC drag twin of a hand dragging a sidebar row. `begin <row-path>`
     arms the gesture, `hover <target> --placement <p>` moves the drop indicator
@@ -247,9 +252,12 @@ pub fn server_app_usage_block(binary: &str) -> String {
     way clicking its disclosure control does. Row-set heads are ordinary session
     rows: `server app rows` marks one with a `child_count` above 1.
   {binary} server app sessions reorder <order.json>
-    sets the order on the GUI — the process that RENDERS it — and answers with
-    the resulting `rendered_order`. `server sessions reorder` writes to whichever
-    daemon the CLI resolved, which is not always the one the GUI reads.
+    PEER reorder — moves rows contiguously without changing membership. Sets the
+    order on the GUI — the process that RENDERS it — and answers with the
+    resulting `rendered_order`. Use this to put rows on top as peers. For NESTING
+    as child/parent, use `row-set --into`. `server sessions reorder` writes to
+    whichever daemon the CLI resolved, which is not always the one the GUI reads
+    — prefer `server app sessions reorder`.
   {binary} server app sessions restore <session-path>... [--dry-run] [--include-closed]
     puts NAMED rows back through the same open a click takes, one at a time, and
     REFUSES any the user closed — the deny-list is consulted once for the batch
@@ -502,7 +510,7 @@ pub fn run_app_control_cli(
         // `server app row-set <row-path> [--into <head>|--out|--dissolve]`
         // — the verb twin of the inside-band drag and the right-click
         // un-group. DESIGN.md: both halves exist or neither is real.
-        "row-set" => {
+        "row-set" | "row-group" => {
             let positional = cli_positional_args(&args, 3);
             let row_path = positional.first().ok_or_else(|| {
                 anyhow::anyhow!(
