@@ -223,6 +223,25 @@ pub fn server_app_usage_block(binary: &str) -> String {
     `--into` and `--out` are both sticky by design. ⛔ It writes MEMBERSHIP,
     never a seat: grouping never renumbers a row, so un-numbered rows group like
     any other.
+  {binary} server app drag <begin|hover|drop|clear> [row-path] [--placement before|into|after]
+    the SYNTHETIC drag twin of a hand dragging a sidebar row. `begin <row-path>`
+    arms the gesture, `hover <target> --placement <p>` moves the drop indicator
+    to before/into/after that target, `drop` commits the membership + precise
+    position, `clear`/`cancel` aborts. `before` lands before the target inside
+    its set, `after` after it, `into` as first child (the three 12px/24px bands
+    the pointer hit-tests in the sidebar). This is how an agent verifies a
+    reorder without touching the screen — read `server app rows` before/after and
+    `drag_paths`/`drag_hover_target` in `server app state`.
+  {binary} server app pointer <move|down|up|click|drag|scroll> [--x <px> --y <px>] [--start-x <px> --start-y <px> --end-x <px> --end-y <px>] [--button left|right|middle] [--count n] [--steps n] [--step-delay-ms n]
+    synthetic pointer gesture for Wayland/KWin where OS-level `xdotool`/`wtype`
+    cannot be trusted (and where a real pointer would steal focus). Prefer `drag`
+    for row-sets — this is the low-level fallback for pixel work and for probes
+    that need an explicit coordinate.
+  {binary} server app grid <show|hide|click|hover> [cell] [--cols n --rows n] [--region terminal|full] [--target main|surface|auto] [--ttl-secs n] [--button left|right] [--count n] [--refine] [--keep]
+    labelled grid overlay composited into the RETURNED PNG only — the live page
+    is never touched. `show` paints a `cols×rows` grid (default 12×8) and `click`
+    resolves a cell label to a server-side coordinate hit-test. Safer than
+    guessing pixels off a screenshot; composes with `--region`/`--crop`/`--scale`.
   {binary} server app row-expanded <row-path> <true|false>
     opens or shuts a container — a folder, a machine, or a ROW SET's head — the
     way clicking its disclosure control does. Row-set heads are ordinary session
