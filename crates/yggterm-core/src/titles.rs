@@ -2890,7 +2890,17 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "local shell stay alive daemon"
             | "command bin bash"
             | "daemon pty request main viewport"
+            | "new session"
+            | "new muse code session"
+            | "new antigravity session"
+            | "new ychrome"
+            | "new terminal"
+            | "new ychrome session"
     );
+    let yggterm_prefixed_title = lower.starts_with("yggterm ");
+    let new_muse_placeholder = lower.starts_with("new muse code session")
+        || lower.starts_with("new antigravity session")
+        || lower == "new session";
     prefixed_session_uuid
         || prefixed_hash
         || bare_hash
@@ -2898,6 +2908,8 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         || remote_codex_litellm_runtime_title
         || remote_claude_code_runtime_title
         || generic_runtime_title
+        || yggterm_prefixed_title
+        || new_muse_placeholder
         || looks_like_low_signal_generated_title(compact)
 }
 

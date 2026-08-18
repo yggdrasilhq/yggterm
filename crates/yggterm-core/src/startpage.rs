@@ -19,51 +19,79 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else { return false };
     if meta.len() < 20 { return true }
     let path_str = path.display().to_string();
-    // Muse sessions use a different JSON schema; extract_tail_context is Codex/Claude-centric
-    // and returns empty for them. For Muse, a large file with payload_type is not noise.
-    if path_str.contains("muse/sessions") && meta.len() > 5000 {
-        // Quick heuristic: Muse files contain payload_type and are not noise if large.
-        // We avoid reading the whole 50M file: just check tail context fallback.
-        if let Ok(ctx) = crate::titles::extract_tail_context(path) {
-            if ctx.trim().len() >= 20 {
-                return false;
+    // Muse: a session with no prompts is noise even if the bootstrap is >7k.
+    // Query session-index.db for prompt_count; a zero-prompt session that is
+    // older than the 60s guard is the exact "New session" placeholder the
+    // detector used to keep via the >5000 bypass.
+    if path_str.contains("muse/sessions") {
+        if let Some(home) = dirs::home_dir() {
+            let db_path = home.join(".local/share/muse/session-index.db");
+            if db_path.exists() {
+                if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                    &db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                ) {
+                    // session_id is parent dir name for muse
+                    if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+                        if let Ok(mut stmt) = conn.prepare(
+                            "SELECT prompt_count, title FROM sessions WHERE session_id=?1",
+                        ) {
+                            if let Ok(mut rows) = stmt.query(rusqlite::params![parent]) {
+                                if let Ok(Some(row)) = rows.next() {
+                                    let prompt_count: i64 = row.get(0).unwrap_or(1);
+                                    let title: String = row.get(1).unwrap_or_default();
+                                    let title_lower = title.trim().to_ascii_lowercase();
+                                    // "New session" placeholder with no prompts is noise.
+                                    if prompt_count == 0
+                                        && (title_lower == "new session"
+                                            || title_lower.is_empty()
+                                            || title_lower == "new muse code session")
+                                    {
+                                        return true;
+                                    }
+                                    // Even with prompt_count>0, a single "hi" / slash prompt is noise.
+                                    if prompt_count <= 1 && title_lower.len() <= 8 {
+                                        let lower = title_lower.as_str();
+                                        if matches!(lower, "hi" | "hello" | "hey" | "/" | "/status" | "/help" | "/context" | "/clear" | "test") {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        // If tail context is empty, Muse file is still not noise if it has session markers.
-        // Check a small sample from the file head instead of full read.
-        if let Ok(file) = std::fs::File::open(path) {
-            use std::io::{BufRead, BufReader};
-            let mut reader = BufReader::new(file);
-            let mut buf = String::new();
-            for _ in 0..5 {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
-                buf.push_str(&line);
-                if buf.len() > 2000 { break; }
-            }
-            if buf.contains("payload_type") && buf.contains("session_id") {
-                return false;
-            }
-        }
-        if meta.len() > 10000 {
-            return false;
-        }
+        // For muse, if prompt_count check didn't declare noise, fall through to
+        // generic tail-context check below — do not early-return false on size alone.
     }
+    // Generic tail-context check: if we can extract substantive context (>=20 chars
+    // and not low-signal), this is not noise. Otherwise it is.
     if let Ok(ctx) = crate::titles::extract_tail_context(path) {
-        if ctx.trim().len() >= 20 {
+        let trimmed = ctx.trim();
+        if trimmed.len() >= 20 && !crate::looks_like_low_signal_generated_copy(trimmed) {
+            // Additionally, a context that is only a single "hi" or slash command
+            // is still noise — treat ultra-short prompt after stripping header.
+            let lower = trimmed.to_ascii_lowercase();
+            // If the only USER line is a single word hi/slash, the context will be just that.
+            if lower == "hi" || lower == "hello" || lower == "hey" || lower.starts_with("user: hi") || lower.contains("user: /status") {
+                return true;
+            }
             return false;
         }
-    } else {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if content.to_lowercase().contains("agent") || content.len() > 200 {
-                return false;
-            }
+        // ctx exists but is empty/short/low-signal => noise candidate, continue to final verdict
+    } else if let Ok(content) = std::fs::read_to_string(path) {
+        // Fallback for unreadable tail: if file contains agent marker and is substantial, keep.
+        // But a small file (<500) with no substantive marker is noise.
+        if content.len() > 500 && content.to_lowercase().contains("agent") {
+            return false;
         }
     }
-    // Large files are not noise even if tail context is thin
-    if meta.len() > 5000 {
-        return false;
-    }
+    // No size-based keep-alive: a 7k muse bootstrap with 12 lines and no agent turn
+    // must be deleted. Large-file bypass was the bug.
     true
 }
 

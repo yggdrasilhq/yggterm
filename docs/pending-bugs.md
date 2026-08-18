@@ -12547,7 +12547,8 @@ SSOT the intake built.
 ✅ The help half is fixed: both usage blocks said `--kind <shell|codex|claude-code>`
 while the parser accepted nine, and they now say `<shell|<agent-cli>>` and point
 at the refusal string, which is generated from the registry and has always been
-correct.
+correct. **Verified live 2026-08-18 on *** (build 1787043819, GUI pid 1040230):**
+`server app --help` now shows `shell|codex|codex-litellm|claude-code|pi|opencode|qwen-code|kimi|muse|antigravity|grok-build` on both `terminal new` lines and `automation create`, dynamically generated from `AGENT_CLIS` so future CLIs appear without a help edit. Daemon still on old build 1787035942 (hot-restart pending) — help is served by the GUI/headless CLI, not the daemon, so it is live.
 
 ## TESTS ARE FLAKY UNDER PARALLEL EXECUTION — they pass alone and fail in the suite
 

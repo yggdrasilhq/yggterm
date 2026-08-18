@@ -1301,12 +1301,12 @@ fn the_terminal_identity_env_has_exactly_one_test_guard() {
     // The scan must be able to FIND something, or it is a lock that can only
     // pass — this crate has shipped one of those before. Prove the traversal
     // reaches real source by requiring the guard's own declaration.
-    let this_file = crate_src.join("codex_cli.rs");
-    let text = std::fs::read_to_string(&this_file).expect("read codex_cli.rs");
+    let this_file = crate_src.join("managed_cli/mod.rs");
+    let text = std::fs::read_to_string(&this_file).expect("read managed_cli/mod.rs");
     assert!(
         text.contains("static ENV_TEST_LOCK: std::sync::Mutex<()>"),
         "the scan did not find env_test_guard's own lock, so it is not reading \
-         the source it claims to police",
+         the source it claims to police (looked in managed_cli/mod.rs)",
     );
 }
 

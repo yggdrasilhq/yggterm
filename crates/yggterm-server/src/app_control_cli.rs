@@ -202,6 +202,15 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
 /// delegate-launch planes were already rendered by their owners here; this
 /// extends that to the surface around them.
 pub fn server_app_usage_block(binary: &str) -> String {
+    let kinds = {
+        let mut kinds = vec!["shell"];
+        kinds.extend(
+            yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .map(|descriptor| descriptor.slug),
+        );
+        kinds.join("|")
+    };
     format!(
         "usage:
   {binary} server app audio play [--tone info|success|warning|error] [--repeat n]
@@ -330,7 +339,7 @@ pub fn server_app_usage_block(binary: &str) -> String {
   {binary} server app terminal scroll <session> --to <top|bottom|±N>
   {binary} server app theme <light|dark>
   {binary} server app web-view layout <chat|graph|overview>
-  {binary} server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
+  {binary} server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <{kinds}>] [--title <title>] [--purpose <what-for>] [--no-activate]
       [--outline <prefix> | --insert-after <session-path>]
     with no --title the row is named for the driving agent and its purpose.
     --outline seats the row at a stored number that survives restarts and
@@ -353,7 +362,7 @@ pub fn server_app_usage_block(binary: &str) -> String {
     become queued messages. Use `terminal submit` for a brief, or
     --allow-multiline to fire N separate submits deliberately. Shell rows are
     unaffected — there N lines are N commands.
-  {binary} server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
+  {binary} server app terminal new [--kind <{kinds}>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
       [--prompt <text>|--prompt-stdin]
@@ -391,6 +400,7 @@ targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   with one GUI and no target it routes there automatically.
   {binary} server app theme <light|dark>",
         binary = binary,
+        kinds = kinds,
         web_usage = crate::web_usage_block(binary),
         delegate_usage = crate::delegate_launch_usage_block(binary),
     )
@@ -1504,12 +1514,21 @@ pub fn run_app_control_cli(
                     let pid_num: u32 = pid
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--pid must be an integer"))?;
+                    // For remote adopts the local /proc check is wrong — the pid lives on the target machine.
+                    let machine_key_early = args.windows(2).find_map(|window| {
+                        if window[0] == "--machine-key" {
+                            Some(window[1].as_str())
+                        } else {
+                            None
+                        }
+                    });
+                    let is_remote_adopt = machine_key_early.is_some_and(|k| k != "localhost" && k != "local");
                     // Validate pid exists and is a PTY leader; report adopt_refused early instead of creating a blank shell.
                     // One-shape trap 2026-08-18: `accepted:true` + `capture_faithful:true` + `problem None`
                     // prove the host Shell was created and paints, NOT that the outer PTY's history
                     // was transplanted. Verify history via `server snapshot` `terminal_lines` / `app terminal read-buffer`.
                     #[cfg(target_os = "linux")]
-                    {
+                    if !is_remote_adopt {
                         let stat = std::fs::read_to_string(format!("/proc/{pid_num}/stat"))
                             .map_err(|_| anyhow::anyhow!("adopt_refused: pid {} not found or unreadable (/proc/{}/stat)", pid_num, pid_num))?;
                         if !stat.contains(&format!(" {} ", pid_num)) && !stat.is_empty() {
