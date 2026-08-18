@@ -66,21 +66,48 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
         for r in &rows { uniq.insert(r.cwd.as_str()); }
         uniq.len()
     };
-    // Cwdtree groups by cwd, sessions within each group sorted by recency
+    // Cwdtree: groups by cwd, sessions within groups and groups themselves by recency.
+    // Recency is live > modified_epoch (so a running session's group leads even if mtime is 0).
+    let live_set: std::collections::HashSet<String> = match crate::snapshot(&crate::server_cli::cli_server_endpoint(&home)) {
+        Ok((snap, _)) => {
+            let mut s = std::collections::HashSet::new();
+            for sess in &snap.live_sessions { s.insert(sess.session_path.clone()); }
+            // Also index by session_id for display/storage path matching
+            for row in &rows { s.insert(row.session_id.clone()); }
+            s
+        },
+        Err(_) => std::collections::HashSet::new(),
+    };
+    // Helper: effective epoch with live promotion (live sessions use current time as epoch when mtime==0)
+    let effective_epoch = |row: &yggterm_core::startpage::StartpageDurableRow| -> (bool, u128) {
+        let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || live_set.contains(&row.session_id);
+        let epoch = if is_live && row.modified_epoch_ms == 0 {
+            // Live but no mtime yet — treat as most recent
+            u128::MAX
+        } else {
+            row.modified_epoch_ms
+        };
+        (is_live, epoch)
+    };
     rows.sort_by(|a, b| {
-        a.cwd.cmp(&b.cwd)
-            .then_with(|| b.modified_epoch_ms.cmp(&a.modified_epoch_ms))
+        let (a_live, a_epoch) = effective_epoch(a);
+        let (b_live, b_epoch) = effective_epoch(b);
+        b_live.cmp(&a_live)
+            .then_with(|| b_epoch.cmp(&a_epoch))
+            .then_with(|| a.cwd.cmp(&b.cwd))
     });
-    // Global recency for group ordering: most recent session's mtime per group
     let mut groups_map: BTreeMap<String, Vec<yggterm_core::startpage::StartpageDurableRow>> = BTreeMap::new();
     for row in rows {
         groups_map.entry(row.cwd.clone()).or_default().push(row);
     }
     let mut groups: Vec<(String, Vec<yggterm_core::startpage::StartpageDurableRow>)> = groups_map.into_iter().collect();
     groups.sort_by(|a, b| {
-        let a_max = a.1.iter().map(|r| r.modified_epoch_ms).max().unwrap_or(0);
-        let b_max = b.1.iter().map(|r| r.modified_epoch_ms).max().unwrap_or(0);
-        b_max.cmp(&a_max)
+        let a_max_live = a.1.iter().any(|r| effective_epoch(r).0);
+        let b_max_live = b.1.iter().any(|r| effective_epoch(r).0);
+        let a_max = a.1.iter().map(|r| effective_epoch(r).1).max().unwrap_or(0);
+        let b_max = b.1.iter().map(|r| effective_epoch(r).1).max().unwrap_or(0);
+        b_max_live.cmp(&a_max_live)
+            .then_with(|| b_max.cmp(&a_max))
     });
 
     let warnings = collect_warnings(&system_home);
@@ -94,7 +121,11 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
     let mut out_groups = Vec::new();
     for (cwd, mut sessions) in groups {
         if remaining == 0 { break; }
-        sessions.sort_by(|a, b| b.modified_epoch_ms.cmp(&a.modified_epoch_ms));
+        sessions.sort_by(|a, b| {
+            let (a_live, a_epoch) = effective_epoch(a);
+            let (b_live, b_epoch) = effective_epoch(b);
+            b_live.cmp(&a_live).then_with(|| b_epoch.cmp(&a_epoch))
+        });
         if sessions.len() > remaining { sessions.truncate(remaining); }
         remaining -= sessions.len();
         let cwdtree_rows = sessions.into_iter().map(|r| CwdtreeRow {
