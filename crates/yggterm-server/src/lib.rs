@@ -61,7 +61,11 @@ mod clipboard_sweep;
 // failed connect.
 #[cfg(unix)]
 mod socket_sweep;
-mod codex_cli;
+mod managed_cli;
+#[allow(deprecated)]
+mod codex_cli {
+    pub use crate::managed_cli::*;
+}
 mod daemon;
 pub mod daemon_bridge;
 pub mod grid_overlay;
@@ -7418,11 +7422,21 @@ impl YggtermServer {
             .find(|machine| machine.machine_key == machine_key)
             .and_then(|machine| machine.remote_binary_expr.clone())
             .unwrap_or_else(preferred_remote_binary_fallback);
+        let launch_args: Vec<&str> = if let Some(descriptor) = agent_cli_descriptor(kind) {
+            if !descriptor.id_assigned_at_birth {
+                // opencode/muse must mint via their own RPC; yggterm's UUID is row identity only, not CLI session ID
+                vec!["server", "remote", &start_verb, &cwd_display]
+            } else {
+                vec!["server", "remote", &start_verb, &uuid, &cwd_display]
+            }
+        } else {
+            vec!["server", "remote", &start_verb, &uuid, &cwd_display]
+        };
         let launch_command = remote_ssh_launch_command_with_extra_exports(
             &ssh_target,
             prefix.as_deref(),
             &remote_binary,
-            &["server", "remote", &start_verb, &uuid, &cwd_display],
+            &launch_args,
             &remote_agent_start_exports(kind, launch),
         );
         let title = title_hint
@@ -28735,20 +28749,35 @@ fn build_live_session_with_launch_options(
             //
             // ⚠ Claude Code keeps its own arm because it is BORN with its id
             // (`--session-id <uuid>`), and that flag is measured for CC only.
-            // `id_assigned_at_birth` is true for pi, qwen and kimi as well, but
-            // the descriptor records the FACT and not the SPELLING (pi/qwen say
-            // `--session-id`, kimi says `-r`), so a birth id here would be an
-            // invented flag. Their rows rebind to the CLI's own id via the
-            // identity poll instead (spec §7.5) until the descriptor carries
-            // the flag.
-            _ => (
-                agent_launch_command_with_options(kind, Some(&default_cwd), None, launch),
-                local_live_runtime_key(uuid),
-                live_local_source_metadata_value(kind),
-                default_cwd.clone(),
-                live_local_prefix_metadata_value(kind).to_string(),
-                RemoteDeployState::NotRequired,
-            ),
+            // `id_assigned_at_birth` is true for pi, kimi, qwen, grok as well,
+            // but the descriptor records the FACT and not the SPELLING.
+            // Pi (`--session`) and Kimi (`--resume`/`-r`) use the SAME flag for
+            // birth and resume, so a birth id CAN be emitted via resume shape.
+            // Qwen (`--session-id` at birth vs `--resume` at resume) and Grok
+            // (`--session-id` at birth vs `--resume` at resume) differ, so they
+            // stay on the poll path until a birth flag is recorded.
+            // For CLIs with `id_assigned_at_birth=false` (codex, opencode, muse,
+            // agy), birth must NOT mint an id — they create their own via RPC
+            // or sqlite, and a synthetic id would be Invalid session ID.
+            _ => {
+                let birth_session_id = match kind {
+                    SessionKind::Pi | SessionKind::Kimi => Some(uuid as &str),
+                    _ => None,
+                };
+                (
+                    agent_launch_command_with_options(
+                        kind,
+                        Some(&default_cwd),
+                        birth_session_id,
+                        launch,
+                    ),
+                    local_live_runtime_key(uuid),
+                    live_local_source_metadata_value(kind),
+                    default_cwd.clone(),
+                    live_local_prefix_metadata_value(kind).to_string(),
+                    RemoteDeployState::NotRequired,
+                )
+            }
         };
     let preview_intro = match kind {
         SessionKind::Shell => {
