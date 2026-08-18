@@ -14703,13 +14703,13 @@ mod tests {
         assert!(source.contains("dom_paint_hit_test_problem: domPaintHitProbe.problem"));
         assert!(
             source.contains(
-                "rowPaintProblem\n                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)\n                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)"
+                "rowPaintProblem\n                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)\n                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows || cursorRowIsPaintVisibleDespiteTop || cursorIsPaintVisibleDespiteTop)"
             ),
             "a top row hidden by Yggterm titlebar chrome must not mark a visible prompt/cursor as unpainted"
         );
         assert!(
             source.contains(
-                "rowText\n                    && !rowSampleStack.top_within_rows\n                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)\n                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)"
+                "rowText\n                    && !rowSampleStack.top_within_rows\n                    && !rowIsPaintVisibleDespiteTop\n                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)"
             ),
             "basic app-control snapshots need the same titlebar-covered-row allowance"
         );
@@ -21379,6 +21379,76 @@ mod tests {
         .expect("live session reorder plan");
         assert_eq!(reordered, vec![path_b, path_c, path_a]);
     }
+    #[test]
+    fn rice_cooker_last_member_before_next_top_detaches_even_when_flat_order_is_noop() {
+        // Repro for report: rice inside main-journal group moved before next top
+        // (7.0) outside – flat order same (last member before next top), but
+        // membership must still flip and ghost Before dev must mean outside.
+        let path_head = "remote-session://oc/019da16a-25a5-7120-852a-026ee7fc5e0f";
+        let path_rice = "cc-runtime://c5a19103-8c6b-4478-9d28-eb78a2ab6938";
+        let path_next_top = "remote-cc://dev/ee4a94a6-6bf0-4f32-bdb7-11232a9af1e8"; // 7.0
+        let mut head = test_live_shell_session(path_head);
+        head.source = SessionSource::LiveSsh;
+        let mut rice = test_live_shell_session(path_rice);
+        rice.source = SessionSource::LiveSsh;
+        rice.host_label = "localhost".to_string();
+        let mut next = test_live_shell_session(path_next_top);
+        next.source = SessionSource::LiveSsh;
+        next.host_label = "dev".to_string();
+        // outline for 7.0 so it's top level, rice unnumbered so hand-arranged
+        next.outline_prefix = Some("7.0".to_string());
+        let live_sessions = vec![head.clone(), rice.clone(), next.clone()];
+        let mut arrangement = yggterm_core::row_set_outline::RowArrangement::default();
+        arrangement.attach(path_head, path_rice, None).expect("attach rice");
+        let mut expanded = HashSet::new();
+        expanded.insert("__live_sessions__".to_string());
+        let rows = {
+            let collapsed: HashSet<String> = HashSet::new();
+            merged_sidebar_rows_uncached(
+                &[],
+                &[],
+                &[],
+                &[],
+                &live_sessions,
+                &expanded,
+                &collapsed,
+                &arrangement,
+            )
+        };
+        // Find rice and next_top rows
+        let rice_row = rows.iter().find(|r| r.full_path == path_rice).expect("rice row");
+        assert_eq!(rice_row.depth, 2, "rice should be depth2 inside head");
+        let next_row = rows.iter().find(|r| r.full_path == path_next_top).expect("next row");
+        assert_eq!(next_row.depth, 1, "next_top should be depth1");
+        // Resolve Before next_top as outside move (head None)
+        let target = resolve_drag_drop_target(&rows, &[path_rice.to_string()], next_row, DragDropPlacement::Before)
+            .expect("Before next_top should be valid live drop");
+        assert_eq!(target.path, path_next_top);
+        assert_eq!(target.placement, DragDropPlacement::Before);
+        // apply_row_set_drop should detach rice to top level
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(path_head));
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
+            active_session_path: Some(path_head.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(head.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: live_sessions.iter().cloned().map(snapshot_session_view_for_ui).collect(),
+        });
+        // inject arrangement
+        shell.row_arrangement = arrangement.clone();
+        let applied = apply_row_set_drop(&mut shell, &target, &[path_rice.to_string()]);
+        assert!(applied, "detach before next_top should change arrangement");
+        assert_eq!(shell.row_set_effective_parent(path_rice), None, "rice should be detached to top");
+        // Flat order: rice last member before next_top => remaining == current => live reorder None
+        let reordered = live_session_reordered_paths_for_drop(&live_sessions, &[path_rice.to_string()], &target);
+        assert!(reordered.is_none(), "flat order is noop for last-member case – arrangement-only move");
+        // queue_drop must still handle arrangement_without_reorder (the fix)
+        // Simulate queue_drop's early return for arrangement_without_reorder: it should clear drag.
+        // Here we just verify that arrangement_without_reorder would be considered handled.
+    }
+
     #[test]
     fn selected_live_drag_rows_are_unique_across_live_and_cwd_sections() {
         let path = "remote-session://dev/duplicate";

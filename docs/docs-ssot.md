@@ -20,7 +20,7 @@ never copy the answer.
 | What is waiting on the OWNER? | `docs/owner-attention.md` | link to it |
 | What shipped, and when? | git history + `CHANGELOG.md` | link to it |
 | Which instruments lie? What traps cost time? | `docs/agent-field-guide.md` | link to it |
-| How is the product SUPPOSED to behave? | the spec docs + `DESIGN.md` | link to it |
+| How is the product SUPPOSED to behave? | the spec docs + `DESIGN.md` + `docs/spec-human-agent-interface-divergence.md` (human vs agent surface map) | link to it |
 | Why was a call decided this way? | the campaign memory | link to it |
 | What happened in the past? | `docs/archive/` + `~/.claude/memory-archive/` | **do not load it; search it** |
 

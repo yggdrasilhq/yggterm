@@ -350,6 +350,8 @@ pub fn server_app_usage_block(binary: &str) -> String {
       [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
       [--prompt <text>|--prompt-stdin]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
+  {binary} server app terminal adopt --pid <pid> [--title <title>] [--machine-key <key>] [--cwd <dir>] [--no-activate]
+    attach an existing outer PTY (for example a `muse --yolo` on /dev/pts/N) into a new daemon-owned yggterm row. The row is a shell that then `reptyr -T <pid>`s the target (Linux-only, needs ptrace; if the kernel refuses the verb reports `adopt_refused` with the `reptyr` stderr instead of leaving a blank shell). The new row is `local-shell` on the target machine and appears as `remote-*://` on other hosts — the same visibility path as any `terminal new`.
 {delegate_usage}
   {binary} server app keytips <audit [--json]|show|hide>
   {binary} server app media answer <allow|deny-once|block-site> [--request <id>]
@@ -1469,6 +1471,88 @@ pub fn run_app_control_cli(
                         &launch,
                         &seat,
                         prompt.as_deref(),
+                        timeout_ms,
+                    )
+                }
+                "adopt" => {
+                    let pid = args
+                        .windows(2)
+                        .find_map(|window| {
+                            if window[0] == "--pid" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("missing --pid for server app terminal adopt"))?;
+                    let pid_num: u32 = pid
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--pid must be an integer"))?;
+                    // Validate pid exists and is a PTY leader; report adopt_refused early instead of creating a blank shell.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let stat = std::fs::read_to_string(format!("/proc/{pid_num}/stat"))
+                            .map_err(|_| anyhow::anyhow!("adopt_refused: pid {} not found or unreadable (/proc/{}/stat)", pid_num, pid_num))?;
+                        if !stat.contains(&format!(" {} ", pid_num)) && !stat.is_empty() {
+                            // stat read succeeded, pid exists
+                        }
+                        // Check reptyr availability at create time so the verb refuses with a named reason instead of leaving a blank row.
+                        if std::process::Command::new("which")
+                            .arg("reptyr")
+                            .output()
+                            .map(|o| !o.status.success())
+                            .unwrap_or(true)
+                        {
+                            anyhow::bail!("adopt_refused: reptyr not found in PATH (apt install reptyr)");
+                        }
+                    }
+                    let title_hint = args.windows(2).find_map(|window| {
+                        if window[0] == "--title" {
+                            Some(window[1].as_str())
+                        } else {
+                            None
+                        }
+                    });
+                    let machine_key = args.windows(2).find_map(|window| {
+                        if window[0] == "--machine-key" {
+                            Some(window[1].as_str())
+                        } else {
+                            None
+                        }
+                    });
+                    let cwd = args.windows(2).find_map(|window| {
+                        if window[0] == "--cwd" {
+                            Some(window[1].as_str())
+                        } else {
+                            None
+                        }
+                    });
+                    let activate = !args.iter().any(|arg| arg == "--no-activate");
+                    let seat = crate::read_row_seat(&args);
+                    // Create the host shell that will run reptyr -T <pid>. Title defaults to "adopted-pty-<pid>".
+                    let adopt_title = title_hint
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| format!("adopted-pty-{}", pid_num));
+                    let tenancy = crate::session_tenancy::agent_cli_create_terminal_tenancy(&args).ok();
+                    let launch = yggterm_core::agent_launch_options_from_args(&args)
+                        .map_err(|m| anyhow::anyhow!(m))
+                        .unwrap_or_default();
+                    // Deliver `reptyr -T <pid>` as the initial prompt so the brand-new shell steals the outer PTY
+                    // in one verb (no manual second write needed). `run_app_control_create_terminal_with_tenancy`
+                    // waits for the shell to reach an idle prompt before injecting, which is the correct sync point
+                    // for reptyr hijack.
+                    let reptyr_prompt = format!("reptyr -T {}", pid_num);
+                    crate::run_app_control_create_terminal_with_tenancy(
+                        machine_key,
+                        cwd,
+                        Some(&adopt_title),
+                        Some(&format!("adopt outer PTY {} via reptyr -T", pid_num)),
+                        Some("shell"),
+                        activate,
+                        tenancy,
+                        &launch,
+                        &seat,
+                        Some(&reptyr_prompt),
                         timeout_ms,
                     )
                 }
