@@ -200,6 +200,8 @@ def manual_walk_on_host(host):
 
 def parse_file_on_host(host, path, cli_slug):
     """Parse a single store file on host via ssh cat + python logic."""
+    home_out,_ = run_on_host(host, "echo $HOME")
+    home = home_out.strip() if home_out else os.path.expanduser("~")
     # We cat first line or whole file depending on cli
     if cli_slug == "antigravity":
         if path.endswith("transcript.jsonl"):
@@ -326,6 +328,8 @@ def parse_file_on_host(host, path, cli_slug):
         return {"session_id": session_id, "cwd": cwd, "title": title, "raw": out[:500] if out else ""}
     else:
         # jsonl — read first and last lines
+        home_out,_ = run_on_host(host, "echo $HOME")
+        home = home_out.strip() if home_out else os.path.expanduser("~")
         cmd = f"head -n 5 {shlex.quote(path)} 2>/dev/null | head -c 8000"
         out, _ = run_on_host(host, cmd)
         # Try to extract id/cwd/title from jsonl
