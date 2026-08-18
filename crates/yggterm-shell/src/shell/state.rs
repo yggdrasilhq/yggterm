@@ -54565,9 +54565,7 @@ fn apply_workspace_reorder_plan(
     Ok(moved_paths)
 }
 fn is_tree_drag_source_row(row: &BrowserRow) -> bool {
-    is_workspace_row(row)
-        || (row.kind == BrowserRowKind::Session
-            && (!is_hot_terminal_sidebar_path(&row.full_path) || row.depth <= 1))
+    is_workspace_row(row) || row.kind == BrowserRowKind::Session
 }
 fn is_workspace_row(row: &BrowserRow) -> bool {
     match row.kind {

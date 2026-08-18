@@ -905,6 +905,72 @@ look lighter for no reason, and then reorder themselves" report: nothing ended
 a drag released outside a row, so the row stayed dimmed and the next pointer
 move re-armed a drop target.
 
+### ★★★ Testing a drag WITHOUT touching the screen — `server app drag` / `pointer` / `grid` (AGENT-ONLY, never hand-moused)
+
+**Do not use `xdotool`/`wtype`/`ydotool` on Wayland — and do not hand-edit
+`~/.yggterm/settings.json` to fake a drag.** The live gesture has a synthetic
+twin the agent must use, which is exactly what a hand does (same hit-test bands,
+same membership rules) but without stealing focus or needing a display server.
+
+```bash
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
+
+# 1. See the order before (the truth, not a screenshot):
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app rows" | python3 -m json.tool | head -n 120
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | jq .drag_paths,.drag_hover_target
+
+# 2. Arm the drag on the ROW YOU WANT TO MOVE (any depth — depth-2 members are
+#    draggable since 3.1.4; before that they answered `row_not_draggable`):
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app drag begin <row-path>"        # e.g. cc-runtime://c5a19103-...
+
+# 3. Hover the DROP TARGET with a precise placement:
+#    before = land immediately before that row inside its set
+#    after  = land immediately after it
+#    into   = become first child of that row (the centred ring)
+#    The three are the 12px / 24px bands `drag_drop_placement_from_pointer`
+#    hit-tests for a real pointer.
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app drag hover <target-path> --placement before"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app drag hover <target-path> --placement into"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app drag hover <target-path> --placement after"
+
+# 4. Commit or abort:
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app drag drop"   # commits — moves membership + position
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app drag clear"  # aborts — `drag clear` is `cancel`
+
+# 5. Verify (read back, not just `accepted`):
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app rows" | python3 -c "import json,sys; ..."
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | jq .drag_paths  # should be null after drop
+# Telemetry: `row_set_arranged` in `~/.yggterm/event-trace.jsonl` for Into/Before/After.
+
+# Row-SET shortcut vs. drag twin:
+# `server app row-set <row> --into <head>` is the SAME membership change as
+# dragging Into, but it ALWAYS appends. For a precise reorder inside a set use
+# the drag verb with `before`/`after` — or `row-set` will put the row at the bottom
+# and the last set will look un-reorderable.
+```
+
+**Why `server app drag` was invisible until 2026-08-18** — the two-layer hide:
+1. `crates/yggterm-server/src/app_control_cli.rs::server_app_usage_block` (the
+   single `server app --help` string both binaries print) never listed `drag`,
+   `pointer` or `grid` — the dispatcher handled them but the help did not name
+   them, so `server app --help | grep drag` was empty and even `head -n 100`
+   sampling missed them.
+2. This skill never mentioned them either — the only drag steering was a one-liner
+   `pointer move --x` for agent presence; the sidebar's `drag_paths` fields were
+   described as diagnostics, not as the readback for a gesture you SHOULD drive.
+
+⚠ **`server app drag` is the ONLY faithful replay of a hand drag for row-sets.**
+`server app row-set --into` is not: it appends by design, so a Before/After test
+using it will always land at the tail and mask the placement bug (exactly the
+failure that made `Rice cooker` at the bottom appear stuck). Prefer the drag verb;
+fall back to `row-set` only for a one-shot Into-at-tail.
+
+Fallback instruments you still have:
+- `server app pointer move --x <px> --y <px>` / `drag --start-x ... --end-x ...`
+  — synthetic pointer for pixel work on Wayland where `xdotool` fails.
+- `server app grid show` + `screenshot --grid` — labelled overlay composited into
+  the RETURNED PNG only.
+
 ## Session recovery — reconnect stranded sessions, fix row order (v2.9.63+)
 
 These are **daemon-direct** commands (`server …`, not `server app …`): they need no
