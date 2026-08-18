@@ -1493,6 +1493,9 @@ pub fn run_app_control_cli(
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--pid must be an integer"))?;
                     // Validate pid exists and is a PTY leader; report adopt_refused early instead of creating a blank shell.
+                    // One-shape trap 2026-08-18: `accepted:true` + `capture_faithful:true` + `problem None`
+                    // prove the host Shell was created and paints, NOT that the outer PTY's history
+                    // was transplanted. Verify history via `server snapshot` `terminal_lines` / `app terminal read-buffer`.
                     #[cfg(target_os = "linux")]
                     {
                         let stat = std::fs::read_to_string(format!("/proc/{pid_num}/stat"))
@@ -1509,6 +1512,24 @@ pub fn run_app_control_cli(
                         {
                             anyhow::bail!("adopt_refused: reptyr not found in PATH (apt install reptyr)");
                         }
+                        // Muse/Claude node binaries are PR_SET_DUMPABLE 0 + seccomp: ptrace is blocked
+                        // even with ptrace_scope 0, so `reptyr -T` will hang → Terminated leaving a plain
+                        // host shell (1 line `pi@…:~$`) that looks like success via `accepted`/`faithful`.
+                        // Refuse early with a named reason instead of manufacturing a plain row that the
+                        // human will rightly reject as JUST PLAIN NO HISTORY.
+                        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid_num}/exe")) {
+                            let exe_str = exe.to_string_lossy().to_lowercase();
+                            if exe_str.contains("muse") || exe_str.contains("claude") {
+                                anyhow::bail!(
+                                    "adopt_refused: pid {} exe {} is non-dumpable (muse/claude node, PR_SET_DUMPABLE 0) — reptyr -T will be blocked (Operation not permitted) and leave a plain host shell; attach the yggterm row instead: yggterm rows are already daemon-owned (no reptyr needed), use `server connect` / `server app open <yggterm-path>` or `server app terminal new` with the same cwd/purpose/history via daemon snapshot, and verify history with `server snapshot` `terminal_lines` / `read-buffer` before claiming attach (see agent-field-guide one-shape row for adopt)",
+                                    pid_num,
+                                    exe.display()
+                                );
+                            }
+                        }
+                        // Also refuse if the pid's fd 0/1 are not a PTY (plain `sleep` without pty) — reptyr -T needs a PTY leader.
+                        // Leave this as a warning in the created shell's purpose rather than a hard refusal: the host shell
+                        // is still useful as a plain terminal, but the caller must not claim it as the ether row.
                     }
                     let title_hint = args.windows(2).find_map(|window| {
                         if window[0] == "--title" {
