@@ -60,6 +60,30 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
     let system_home = dirs::home_dir().unwrap_or_else(|| home.clone());
 
     let mut rows = scan_all_durable_sessions(&system_home);
+    // Also include remote durable rows when daemon has snapshot (so cwdtree matches GUI's fleet view)
+    let (snapshot_opt, live_set) = match crate::snapshot(&crate::server_cli::cli_server_endpoint(&home)) {
+        Ok((snap, _)) => {
+            let mut s = std::collections::HashSet::new();
+            for sess in &snap.live_sessions { s.insert(sess.session_path.clone()); s.insert(sess.id.clone()); }
+            for row in &rows { s.insert(row.session_id.clone()); s.insert(row.display_path.clone()); }
+            // Also add remote session_ids for live promotion
+            for m in &snap.remote_machines { for sess in &m.sessions { s.insert(sess.session_id.clone()); s.insert(sess.session_path.clone()); } }
+            (Some(snap), s)
+        },
+        Err(_) => (None, std::collections::HashSet::new()),
+    };
+    let mut remote_rows: Vec<yggterm_core::startpage::StartpageDurableRow> = Vec::new();
+    if let Some(snap) = snapshot_opt.as_ref() {
+        if let Ok(snap_json) = serde_json::to_value(snap) {
+            let (rrows, _) = build_remote_durable_rows_for_cwdtree(&Some(snap_json));
+            remote_rows = rrows;
+        }
+    }
+    // Merge local + remote, dedup by session_id
+    {
+        let mut seen: std::collections::HashSet<String> = rows.iter().map(|r| r.session_id.clone()).collect();
+        for r in remote_rows { if seen.insert(r.session_id.clone()) { rows.push(r); } }
+    }
     let total_durable = rows.len();
     let total_groups_pre_limit = {
         let mut uniq: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -68,16 +92,6 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
     };
     // Cwdtree: groups by cwd, sessions within groups and groups themselves by recency.
     // Recency is live > modified_epoch (so a running session's group leads even if mtime is 0).
-    let live_set: std::collections::HashSet<String> = match crate::snapshot(&crate::server_cli::cli_server_endpoint(&home)) {
-        Ok((snap, _)) => {
-            let mut s = std::collections::HashSet::new();
-            for sess in &snap.live_sessions { s.insert(sess.session_path.clone()); }
-            // Also index by session_id for display/storage path matching
-            for row in &rows { s.insert(row.session_id.clone()); }
-            s
-        },
-        Err(_) => std::collections::HashSet::new(),
-    };
     // Helper: effective epoch with live promotion (live sessions use current time as epoch when mtime==0)
     let effective_epoch = |row: &yggterm_core::startpage::StartpageDurableRow| -> (bool, u128) {
         let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || live_set.contains(&row.session_id);
@@ -188,6 +202,45 @@ fn collect_warnings(home: &PathBuf) -> Vec<String> {
 trait KindLabel { fn kind_label(&self) -> &'static str; }
 impl KindLabel for yggterm_core::startpage::StartpageDurableRow {
     fn kind_label(&self) -> &'static str { yggterm_core::agent_cli::session_kind_label(self.kind) }
+}
+
+fn build_remote_durable_rows_for_cwdtree(snapshot_json: &Option<serde_json::Value>) -> (Vec<yggterm_core::startpage::StartpageDurableRow>, usize) {
+    let mut rows = Vec::new();
+    let mut total = 0;
+    let Some(machines) = snapshot_json.as_ref().and_then(|v| v.get("data")).or(snapshot_json.as_ref()).and_then(|d| d.get("remote_machines")).and_then(|v| v.as_array()) else {
+        return (rows, total);
+    };
+    for machine in machines {
+        let Some(sessions) = machine.get("sessions").and_then(|v| v.as_array()) else { continue; };
+        total += sessions.len();
+        for sess in sessions {
+            let session_id = sess.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if session_id.is_empty() { continue; }
+            let cwd = sess.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title_hint = sess.get("title_hint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let modified_epoch = sess.get("modified_epoch").and_then(|v| v.as_i64()).unwrap_or(0);
+            let storage_path = sess.get("storage_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let session_path = sess.get("session_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = if yggterm_core::looks_like_generated_fallback_title(&title_hint) || yggterm_core::looks_like_low_signal_generated_copy(&title_hint) {
+                None
+            } else if title_hint.trim().is_empty() { None } else { Some(title_hint.clone()) };
+            let kind = yggterm_core::agent_scheme::session_kind_for_path(&session_path).unwrap_or(yggterm_core::SessionKind::Codex);
+            let display_path = if session_path.is_empty() { format!("remote-session://{}", session_id) } else { session_path.clone() };
+            rows.push(yggterm_core::startpage::StartpageDurableRow {
+                session_id: session_id.clone(),
+                cwd: if cwd.is_empty() { "/".to_string() } else { cwd },
+                title: title.clone(),
+                generated_title: None,
+                effective_title: title.clone(),
+                detail: None,
+                kind,
+                modified_epoch_ms: (modified_epoch as u128) * 1000,
+                storage_path: if storage_path.is_empty() { display_path.clone() } else { storage_path },
+                display_path,
+            });
+        }
+    }
+    (rows, total)
 }
 
 fn hostname() -> anyhow::Result<String> {

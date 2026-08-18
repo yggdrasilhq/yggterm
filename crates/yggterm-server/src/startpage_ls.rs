@@ -62,25 +62,47 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
         None => {
             // Headless fallback — ground truth from the stores, via the descriptors.
             // Must use the same ranking as the GUI (live > scope > recency), not
-            // recency-only, otherwise headless 0-epoch rows sort alphabetical.
+            // recency-only. Also include remote sessions from snapshot when available
+            // so headless matches GUI's fleet view (otherwise 73 vs 0).
             let mut rows = scan_all_durable_sessions(&system_home);
-            let warnings = collect_warnings(&system_home, &rows);
-            let total = rows.len();
-            // No GUI state in this branch, so in_scope=true for all and live from
-            // snapshot (best effort). This keeps headless ordering faithful to
-            // order_candidates_for_startpage.
-            let live_paths_headless = match snapshot(&crate::server_cli::cli_server_endpoint(&home)) {
-                Ok((snap, _)) => snap.live_sessions.into_iter().map(|s| s.session_path).collect::<Vec<_>>(),
-                Err(_) => Vec::new(),
+            // Also pull remote durable rows from snapshot if daemon has them
+            let (snapshot_opt, live_paths_headless) = match snapshot(&crate::server_cli::cli_server_endpoint(&home)) {
+                Ok((snap, _)) => {
+                    let live = snap.live_sessions.iter().map(|s| s.session_path.clone()).collect::<Vec<_>>();
+                    (Some(snap), live)
+                },
+                Err(_) => (None, Vec::new()),
             };
+            let mut remote_rows = Vec::new();
+            let mut remote_total = 0;
+            if let Some(snap) = snapshot_opt.as_ref() {
+                // Build snapshot_json for reuse by helper
+                let snap_json = serde_json::to_value(snap).ok();
+                let (rrows, rtotal) = build_remote_durable_rows(&snap_json);
+                remote_rows = rrows;
+                remote_total = rtotal;
+            }
+            let warnings = collect_warnings(&system_home, &rows);
+            let total = rows.len() + remote_total;
             let live_set: std::collections::HashSet<String> = live_paths_headless.iter().cloned().collect();
-            // Build candidates: (row, is_live, in_scope, modified_epoch, started_at, idx)
-            // Use StartpageDurableRow's modified_epoch_ms as epoch (already mtime ms),
-            // and empty started_at since durable rows have no started_at in this path.
+            // Also collect remote epochs for ordering
+            let mut remote_epoch_by_id: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            if let Some(snap) = snapshot_opt.as_ref() {
+                for m in &snap.remote_machines {
+                    for s in &m.sessions {
+                        remote_epoch_by_id.insert(s.session_id.clone(), s.modified_epoch);
+                    }
+                }
+            }
+            let mut all_rows_map: std::collections::HashMap<String, yggterm_core::startpage::StartpageDurableRow> = std::collections::HashMap::new();
+            for row in rows { all_rows_map.insert(row.session_id.clone(), row); }
+            for row in remote_rows { all_rows_map.entry(row.session_id.clone()).or_insert(row); }
+            let all_rows: Vec<yggterm_core::startpage::StartpageDurableRow> = all_rows_map.into_values().collect();
             let mut candidates: Vec<(yggterm_core::startpage::StartpageDurableRow, bool, bool, i64, String, usize)> = Vec::new();
-            for (idx, row) in rows.into_iter().enumerate() {
-                let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path);
-                let epoch = i64::try_from(row.modified_epoch_ms / 1000).unwrap_or(0);
+            for (idx, row) in all_rows.into_iter().enumerate() {
+                let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || remote_epoch_by_id.contains_key(&row.session_id);
+                let epoch_ms = remote_epoch_by_id.get(&row.session_id).map(|e| (*e as u128) * 1000).unwrap_or(row.modified_epoch_ms);
+                let epoch = i64::try_from(epoch_ms / 1000).unwrap_or(0);
                 candidates.push((row, is_live, true, epoch, String::new(), idx));
             }
             let mut rows = yggterm_core::startpage::order_candidates_for_startpage(candidates);
@@ -252,41 +274,53 @@ fn try_faithful_startpage_rows(
             true
         })
         .count();
-    // Store ground truth — single-sourced via scan_all_durable_sessions
+    // Store ground truth — single-sourced via scan_all_durable_sessions + remote
     let mut store_rows = yggterm_core::startpage::scan_all_durable_sessions(system_home);
-    // Also compute remote_total from already-fetched snapshot_json
-    let remote_total: usize = snapshot_json
-        .as_ref()
-        .and_then(|v| v.get("data"))
-        .or(snapshot_json.as_ref())
-        .and_then(|d| d.get("remote_machines"))
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().map(|m| m.get("sessions").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0)).sum())
-        .unwrap_or(0);
+    // Also compute remote_total and build remote durable rows from snapshot
+    let (remote_rows, remote_total) = build_remote_durable_rows(&snapshot_json);
     // Faithful ordering: is_live > in_scope > modified_epoch > started_at > idx
-    // Reuse snapshot's remote epoch + live_set; derive in_scope from app_state when available
-    // Scope: match shell's start_page_recent_scope — selected row's machine_key/cwd
     let in_scope_checker = {
-        // app_state may contain selected_browser_path; we approximate scope from it
         let selected_path = app_state.as_ref()
             .and_then(|v| v.get("data")).or(app_state.as_ref())
             .and_then(|d| d.get("selected_browser_path")).and_then(|v| v.as_str()).map(|s| s.to_string())
             .or_else(|| app_state.as_ref().and_then(|v| v.get("data")).or(app_state.as_ref()).and_then(|d| d.get("selected_row")).and_then(|r| r.get("full_path")).and_then(|v| v.as_str()).map(|s| s.to_string()));
-        // Very small scope predicate: if selected_path is a remote machine/folder, only that machine/cwd is in scope.
-        // For now, keep in_scope=true for all when we cannot determine — preserves live>recency which is the bork fix.
         move |row: &yggterm_core::startpage::StartpageDurableRow| {
             let _ = &selected_path;
             let _ = row;
             true
         }
     };
+    // Merge local + remote, dedup by session_id (same session may appear as both local file and remote scan)
+    let mut all_rows_map: std::collections::HashMap<String, yggterm_core::startpage::StartpageDurableRow> = std::collections::HashMap::new();
+    for row in store_rows { all_rows_map.insert(row.session_id.clone(), row); }
+    for row in remote_rows {
+        all_rows_map.entry(row.session_id.clone()).or_insert(row);
+    }
+    let mut all_rows: Vec<yggterm_core::startpage::StartpageDurableRow> = all_rows_map.into_values().collect();
+    // Keep browser counts for warnings (must be computed before draining)
+    let browser_old = browser_rows
+        .iter()
+        .filter(|r| r.get("kind").and_then(|k| k.as_str()).map(|k| k == "Session").unwrap_or(false))
+        .count();
+    let browser_new = browser_rows
+        .iter()
+        .filter(|r| {
+            if r.get("kind").and_then(|k| k.as_str()) != Some("Session") { return false; }
+            if r.get("document_kind").and_then(|d| d.as_str()).is_some() { return false; }
+            let host = r.get("host_label").and_then(|s| s.as_str()).unwrap_or("");
+            let icon = r.get("icon_kind").and_then(|s| s.as_str()).unwrap_or("");
+            if host == "local-shell" { return false; }
+            if icon == "terminal" { return false; }
+            true
+        })
+        .count();
     let mut candidates: Vec<(yggterm_core::startpage::StartpageDurableRow, bool, bool, i64, String, usize)> = Vec::new();
-    for (idx, row) in store_rows.drain(..).enumerate() {
-        let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || remote_epoch_by_id.contains_key(&row.session_id);
-        // Prefer remote epoch when available (durable scan's mtime may be 0 for remote rows mirrored locally)
+    for (idx, row) in all_rows.drain(..).enumerate() {
+        let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || remote_epoch_by_id.contains_key(&row.session_id) || live_set.contains(&format!("remote-cc://{}", row.session_id)) || live_set.contains(&format!("remote-session://{}", row.session_id));
         let epoch_ms = remote_epoch_by_id.get(&row.session_id).map(|e| (*e as u128) * 1000).unwrap_or(row.modified_epoch_ms);
         let epoch = i64::try_from(epoch_ms / 1000).unwrap_or(0);
         let in_scope = in_scope_checker(&row);
+        // started_at for remote rows is available via remote map, but we use String::new for now (ordering tie-break)
         candidates.push((row, is_live, in_scope, epoch, String::new(), idx));
     }
     let ordered_rows = yggterm_core::startpage::order_candidates_for_startpage(candidates);
@@ -296,6 +330,51 @@ fn try_faithful_startpage_rows(
     ];
     let _ = yggterm_home;
     return Some((ordered_rows, warnings, live_paths));
+}
+
+fn build_remote_durable_rows(snapshot_json: &Option<serde_json::Value>) -> (Vec<yggterm_core::startpage::StartpageDurableRow>, usize) {
+    let mut rows = Vec::new();
+    let mut total = 0;
+    let Some(machines) = snapshot_json.as_ref().and_then(|v| v.get("data")).or(snapshot_json.as_ref()).and_then(|d| d.get("remote_machines")).and_then(|v| v.as_array()) else {
+        return (rows, total);
+    };
+    for machine in machines {
+        let Some(sessions) = machine.get("sessions").and_then(|v| v.as_array()) else { continue; };
+        total += sessions.len();
+        for sess in sessions {
+            let session_id = sess.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if session_id.is_empty() { continue; }
+            let cwd = sess.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title_hint = sess.get("title_hint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let modified_epoch = sess.get("modified_epoch").and_then(|v| v.as_i64()).unwrap_or(0);
+            let storage_path = sess.get("storage_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let session_path = sess.get("session_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // Title filtering: same as local — drop generated fallback/low-signal
+            let title = if yggterm_core::looks_like_generated_fallback_title(&title_hint) || yggterm_core::looks_like_low_signal_generated_copy(&title_hint) {
+                None
+            } else if title_hint.trim().is_empty() {
+                None
+            } else {
+                Some(title_hint.clone())
+            };
+            let kind = yggterm_core::agent_scheme::session_kind_for_path(&session_path).unwrap_or(yggterm_core::SessionKind::Codex);
+            let display_path = if session_path.is_empty() { format!("remote-session://{}", session_id) } else { session_path.clone() };
+            let effective_title = title.clone();
+            rows.push(yggterm_core::startpage::StartpageDurableRow {
+                session_id: session_id.clone(),
+                cwd: if cwd.is_empty() { "/".to_string() } else { cwd },
+                title: title.clone(),
+                generated_title: None,
+                effective_title,
+                detail: None,
+                kind,
+                modified_epoch_ms: (modified_epoch as u128) * 1000,
+                storage_path: if storage_path.is_empty() { display_path.clone() } else { storage_path },
+                display_path,
+            });
+        }
+    }
+    (rows, total)
 }
 
 fn hostname() -> anyhow::Result<String> {
