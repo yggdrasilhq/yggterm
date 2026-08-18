@@ -2540,16 +2540,43 @@ fn read_qwen_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     if session_id.is_empty() || cwd.is_empty() {
         return None;
     }
+    // Qwen persists `custom_title` as a record appended later and re-appended near EOF.
+    // The identity scan must surface it so Store authority respects it directly
+    // (reference: codex's Generated vs claude's Store). Tail is bounded: last 64k.
+    let title = read_qwen_custom_title_tail(path);
     Some(AgentStoreEntry {
         session_id,
         cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
-        // Qwen's title is a `custom_title` record appended LATER (and
-        // re-appended near EOF as the file grows). Reading it is a tail scan,
-        // which the identity pass deliberately is not; the title sync owns it.
-        title: None,
-        detail: None,
+        title: title.clone(),
+        detail: title,
     })
+}
+
+fn read_qwen_custom_title_tail(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let file_len = meta.len();
+    // Tail 64k — enough for final custom_title record without scanning multi-MB file.
+    let tail_start = file_len.saturating_sub(64 * 1024);
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(tail_start)).ok()?;
+    let mut last_title: Option<String> = None;
+    for line in reader.lines().flatten() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            if value.get("type").and_then(|v| v.as_str()) == Some("custom_title") {
+                if let Some(t) = value.get("title").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    // Qwen re-appends same title near EOF; last wins.
+                    last_title = Some(t.to_string());
+                } else if let Some(t) = value.get("customTitle").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    last_title = Some(t.to_string());
+                }
+            }
+        }
+    }
+    last_title
+        .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
 }
 
 /// `agy` — one flat JSON object per conversation.

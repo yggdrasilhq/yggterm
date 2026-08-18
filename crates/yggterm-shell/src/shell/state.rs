@@ -198,8 +198,9 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteScannedSession,
     RowSeatRequest, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
-    SessionMetadataEntry, RemoteRuntimeAfterRemoval, SessionPreviewBlock, SessionRemovalEvidence,
-    SessionRenderedSection, SessionSource,
+    SessionMetadataEntry, RemoteRuntimeAfterRemoval, SessionPreview, SessionPreviewBlock,
+    SessionRemovalEvidence, SessionRenderedSection, SessionSource, SnapshotPreview,
+    SnapshotPreviewBlock, SnapshotRenderedSection,
     SessionTeardownProcess, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
     WebElementRef, WebFillMechanism, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs,
@@ -17045,6 +17046,81 @@ fn clear_stored_only_active_session(snapshot: &mut ServerUiSnapshot) {
 // blocks / rendered_sections) is left untouched, so the in-development codex web view
 // is not disturbed; non-live (Stored/Document) sessions are also left alone (only
 // LiveLocal/LiveSsh require a terminal runtime).
+//
+// FIX 2026-08-18: fresh live sessions synthesize 2 placeholder preview blocks
+// ("This Grok session stays attached..." + "Launch command prepared:") so raw
+// `is_empty()` is false and the coerce never fired — a brand-new Grok/Opencode/
+// Muse row showed the bugged webview (synthetic intro + search bar) instead of
+// its terminal until real transcript content arrived. Treat scaffold-only preview
+// and placeholder rendered_sections as EMPTY for this judgement.
+fn snapshot_preview_blocks_effectively_empty(preview: &SnapshotPreview) -> bool {
+    if preview.blocks.is_empty() {
+        return true;
+    }
+    preview.blocks.iter().all(|block| {
+        // Snapshot blocks lack the managed `preview_block_is_scaffold_only` helper,
+        // so check the same predicate inline: every non-empty line is scaffold.
+        let block_is_scaffold = {
+            let mut saw_line = false;
+            let mut all_scaffold = true;
+            for line in &block.lines {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                saw_line = true;
+                if !is_preview_scaffold_line(t) {
+                    all_scaffold = false;
+                    break;
+                }
+            }
+            saw_line && all_scaffold
+        };
+        block_is_scaffold
+            || preview_text_looks_like_loading_placeholder(&block.lines.join("\n"))
+            || block.lines.iter().all(|line| {
+                let t = line.trim();
+                t.is_empty() || is_preview_scaffold_line(t)
+            })
+    })
+}
+fn snapshot_rendered_sections_effectively_empty(sections: &[SnapshotRenderedSection]) -> bool {
+    if sections.is_empty() {
+        return true;
+    }
+    sections.iter().all(|section| {
+        is_placeholder_rendered_section_title(&section.title)
+            || section.lines.iter().all(|line| {
+                let t = line.trim();
+                t.is_empty() || is_preview_scaffold_line(t)
+            })
+            || preview_text_looks_like_loading_placeholder(&section.lines.join("\n"))
+    })
+}
+// Kept for the managed-session path (used elsewhere); the snapshot path above is
+// the one the auto-webview sanitizer actually calls.
+fn preview_blocks_effectively_empty(preview: &SessionPreview) -> bool {
+    if preview.blocks.is_empty() {
+        return true;
+    }
+    preview.blocks.iter().all(|block| {
+        preview_block_is_scaffold_only(block)
+            || preview_text_looks_like_loading_placeholder(&block.lines.join("\n"))
+            || block.lines.iter().all(|line| {
+                let t = line.trim();
+                t.is_empty() || is_preview_scaffold_line(t)
+            })
+    })
+}
+fn rendered_sections_effectively_empty(sections: &[SessionRenderedSection]) -> bool {
+    if sections.is_empty() {
+        return true;
+    }
+    sections.iter().all(|section| {
+        is_placeholder_rendered_section_title(&section.title)
+            || !rendered_section_has_readable_preview_content(section)
+    })
+}
 fn auto_rendered_terminal_session_should_coerce(
     view_mode: WorkspaceViewMode,
     source: SessionSource,
@@ -17064,8 +17140,8 @@ fn sanitize_auto_rendered_terminal_session(snapshot: &mut ServerUiSnapshot) -> b
         Some(session) => auto_rendered_terminal_session_should_coerce(
             WorkspaceViewMode::Rendered,
             session.source,
-            session.rendered_sections.is_empty(),
-            session.preview.blocks.is_empty(),
+            snapshot_rendered_sections_effectively_empty(&session.rendered_sections),
+            snapshot_preview_blocks_effectively_empty(&session.preview),
         ),
         // STRAND: active_session_path set without an active_session, showing the empty
         // webview placeholder (the live auto-webview bug). The start page is
@@ -26429,7 +26505,8 @@ impl ShellState {
         let previous_active_session = self.server.active_session().cloned();
         match result {
             Ok((snapshot, message)) => {
-                let snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
+                let mut snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
+                sanitize_auto_rendered_terminal_session(&mut snapshot);
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -45763,6 +45840,13 @@ fn is_preview_scaffold_line(line: &str) -> bool {
         || lower.contains("<turn_aborted>")
         || lower.contains("the user interrupted the previous turn on purpose")
         || lower.contains("any running unified exec processes were terminated")
+        || lower.contains("stays attached to the daemon")
+        || lower.contains("opens inline in the main terminal viewport")
+        || lower.contains("is launched locally")
+        || lower.contains("stay alive in the daemon")
+        || lower.contains("should stay alive in the daemon")
+        || lower.contains("uses the same pty/runtime path")
+        || lower.contains("stay alive while you browse")
         || trimmed.starts_with("Open live terminal")
         || trimmed.starts_with("Launch command prepared")
         || trimmed.starts_with("Daemon PTY:")

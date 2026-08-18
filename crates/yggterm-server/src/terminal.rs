@@ -352,6 +352,15 @@ impl TerminalProtocolFilter {
         data: &str,
         profile: TerminalProtocolProfile,
     ) -> TerminalProtocolFilterResult {
+        self.process_with_cursor(data, profile, None)
+    }
+
+    fn process_with_cursor(
+        &mut self,
+        data: &str,
+        profile: TerminalProtocolProfile,
+        cursor_position: Option<(u16, u16)>,
+    ) -> TerminalProtocolFilterResult {
         if data.is_empty() && self.pending.is_empty() {
             return TerminalProtocolFilterResult::default();
         }
@@ -404,8 +413,62 @@ impl TerminalProtocolFilter {
             visible.push_str(&combined[cursor..]);
         }
 
+        // CSI DSR/DA queries: filter them from visible and synthesize responses.
+        // These are the queries that cause prompt_toolkit's CPR timeout when the
+        // client xterm is not mounted (background session). The daemon answers
+        // them directly from its own vt100 model so the TUI never waits 2 s.
+        // Known queries:
+        //   ESC[6n  -> CPR (cursor position report) -> ESC[row;colR (1-based)
+        //   ESC[5n  -> DSR status -> ESC[0n (ready)
+        //   ESC[c / ESC[0c -> DA primary -> ESC[?1;2c (VT100)
+        let osc_visible = visible;
+        let mut filtered_visible = String::with_capacity(osc_visible.len());
+        let mut i = 0usize;
+        while i < osc_visible.len() {
+            if osc_visible[i..].starts_with("\u{1b}[") {
+                let rest = &osc_visible[i + 2..];
+                if let Some(term_offset) = rest.find(|c: char| c.is_ascii_alphabetic()) {
+                    let seq_end = i + 2 + term_offset + 1;
+                    let seq = &osc_visible[i..seq_end];
+                    // DSR 6n - cursor position report
+                    if seq == "\u{1b}[6n" {
+                        let (r, c) = cursor_position.unwrap_or((0, 0));
+                        // vt100 parser is 0-based, DSR is 1-based
+                        let row = r.saturating_add(1).max(1);
+                        let col = c.saturating_add(1).max(1);
+                        responses.push(format!("\u{1b}[{row};{col}R"));
+                        i = seq_end;
+                        continue;
+                    }
+                    // DSR 5n - device status report
+                    if seq == "\u{1b}[5n" {
+                        responses.push("\u{1b}[0n".to_string());
+                        i = seq_end;
+                        continue;
+                    }
+                    // DA - device attributes (primary)
+                    if seq == "\u{1b}[c" || seq == "\u{1b}[0c" {
+                        responses.push("\u{1b}[?1;2c".to_string());
+                        i = seq_end;
+                        continue;
+                    }
+                    // Keep other CSI as visible
+                    filtered_visible.push_str(seq);
+                    i = seq_end;
+                    continue;
+                }
+                // Incomplete CSI - treat rest as pending? For now keep as visible
+                filtered_visible.push_str(&osc_visible[i..]);
+                break;
+            } else {
+                let ch = osc_visible[i..].chars().next().unwrap();
+                filtered_visible.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+
         TerminalProtocolFilterResult {
-            data: visible,
+            data: filtered_visible,
             responses,
             answered_queries,
         }
@@ -842,7 +905,43 @@ impl TerminalManager {
             );
             let _ = runtime.shutdown(None);
         }
-        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, initial_size)?;
+        // Clamp PTY size for TUIs that don't fill a wide viewport (grok, opencode,
+        // qwen, kimi) - they render at a fixed width (e.g. 100 cols) and leave
+        // large dead margins on a 173-col viewport. Limiting the PTY makes the
+        // TUI fill the available area and reduces blank_rows_below_cursor.
+        // Check both launch_command and key (session_path) because Runtime keys like
+        // opencode-runtime:// contain the slug even when launch_command is wrapped.
+        let effective_initial_size = initial_size.map(|(cols, rows)| {
+            let is_narrow_tui = !launch_command.trim_start().starts_with("ssh ")
+                && (launch_command.contains("grok")
+                    || launch_command.contains("opencode")
+                    || launch_command.contains("qwen")
+                    || launch_command.contains("kimi")
+                    || launch_command.contains("muse")
+                    || launch_command.contains("agy")
+                    || launch_command.contains("pi")
+                    || key.contains("grok")
+                    || key.contains("opencode")
+                    || key.contains("qwen")
+                    || key.contains("kimi")
+                    || key.contains("muse")
+                    || key.contains("agy")
+                    || key.contains("pi"));
+            if is_narrow_tui {
+                trace_terminal_event(
+                    "pty_size_clamped",
+                    serde_json::json!({
+                        "path": key,
+                        "from": (cols, rows),
+                        "to": (cols.min(120), rows.min(40)),
+                    }),
+                );
+                (cols.min(120), rows.min(40))
+            } else {
+                (cols, rows)
+            }
+        });
+        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, effective_initial_size)?;
         self.sessions.insert(key.to_string(), runtime);
         Ok(())
     }
@@ -1539,7 +1638,37 @@ impl TerminalManager {
             let rows = runtime.current_rows.load(Ordering::SeqCst);
             (cols > 0 && rows > 0).then_some((cols, rows))
         });
-        let effective_initial_size = initial_size.or(preserved_size);
+        let mut effective_initial_size = initial_size.or(preserved_size);
+        // Clamp narrow TUIs (grok, opencode, qwen, kimi, muse) to a smaller grid so they
+        // fill the viewport without large dead margins (see ensure_session_with_size).
+        if let Some((cols, rows)) = effective_initial_size {
+            let is_narrow_tui = !launch_command.trim_start().starts_with("ssh ")
+                && (launch_command.contains("grok")
+                    || launch_command.contains("opencode")
+                    || launch_command.contains("qwen")
+                    || launch_command.contains("kimi")
+                    || launch_command.contains("muse")
+                    || launch_command.contains("agy")
+                    || launch_command.contains("pi")
+                    || key.contains("grok")
+                    || key.contains("opencode")
+                    || key.contains("qwen")
+                    || key.contains("kimi")
+                    || key.contains("muse")
+                    || key.contains("agy")
+                    || key.contains("pi"));
+            if is_narrow_tui {
+                trace_terminal_event(
+                    "pty_size_clamped_restart",
+                    serde_json::json!({
+                        "path": key,
+                        "from": (cols, rows),
+                        "to": (cols.min(120), rows.min(40)),
+                    }),
+                );
+                effective_initial_size = Some((cols.min(120), rows.min(40)));
+            }
+        }
         let (initial_cols, initial_rows) =
             effective_initial_size.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
         trace_terminal_event(
@@ -2490,8 +2619,15 @@ impl PtySessionRuntime {
                     match read_result {
                         Ok(0) => {
                             let raw_data = flush_terminal_utf8_pending(&mut pending_utf8);
-                            let protocol_result =
-                                protocol_filter.process(&raw_data, terminal_protocol_profile);
+                            let cursor_pos = reader_screen_state
+                                .lock()
+                                .ok()
+                                .map(|state| state.parser.screen().cursor_position());
+                            let protocol_result = protocol_filter.process_with_cursor(
+                                &raw_data,
+                                terminal_protocol_profile,
+                                cursor_pos,
+                            );
                             enqueue_terminal_protocol_responses(
                                 &reader_writer_tx,
                                 &key_label,
@@ -2559,8 +2695,15 @@ impl PtySessionRuntime {
                             if stripped_attach_ready_marker {
                                 reader_attach_ready_seen.store(true, Ordering::SeqCst);
                             }
-                            let protocol_result =
-                                protocol_filter.process(&data, terminal_protocol_profile);
+                            let cursor_pos = reader_screen_state
+                                .lock()
+                                .ok()
+                                .map(|state| state.parser.screen().cursor_position());
+                            let protocol_result = protocol_filter.process_with_cursor(
+                                &data,
+                                terminal_protocol_profile,
+                                cursor_pos,
+                            );
                             enqueue_terminal_protocol_responses(
                                 &reader_writer_tx,
                                 &key_label,
