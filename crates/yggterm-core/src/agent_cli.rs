@@ -2456,6 +2456,62 @@ fn modified_epoch_ms_of(path: &Path) -> u128 {
         .unwrap_or_default()
 }
 
+fn muse_title_from_session_jsonl(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().flatten().take(64) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            // Muse's user prompt lives in payload.model_messages[0].content[0].text
+            // under payload_type runtime.user_intent.accepted / materialized.
+            let pt = value.get("payload_type").and_then(|v| v.as_str()).unwrap_or("");
+            if pt == "runtime.user_intent.accepted" || pt == "runtime.user_intent.materialized" {
+                if let Some(text) = value
+                    .get("payload")
+                    .and_then(|p| p.get("model_messages"))
+                    .and_then(|m| m.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|msg| msg.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        if let Some(title) = crate::best_effort_title_from_context(trimmed) {
+                            return Some(title);
+                        }
+                        // Fallback: first line
+                        let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+                        if !first_line.is_empty() && first_line.len() <= 120 {
+                            return Some(first_line.to_string());
+                        }
+                        return Some(trimmed.chars().take(80).collect());
+                    }
+                }
+                // Fallback inside refill_blocks
+                if let Some(text) = value
+                    .get("payload")
+                    .and_then(|p| p.get("refill_blocks"))
+                    .and_then(|r| r.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|b| b.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        if let Some(title) = crate::best_effort_title_from_context(trimmed) {
+                            return Some(title);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Codex keeps no title in its own transcript — the generated-copy store
 /// answers for those, which is why `title` is always `None` here and the
 /// scanner layers a resolver on top.
@@ -2976,11 +3032,21 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         None
     }).unwrap_or_else(|| home.display().to_string());
 
-    // If DB title is missing or looks generated, try transcript heuristic (Store authority fallback).
-    let effective_title = db_title.clone().filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s)).or_else(|| {
+    // If DB title is missing or looks generated, try Muse-native title
+    // extraction before the Codex-shaped heuristic. Muse's JSONL is
+    // payload_type runtime.user_intent.accepted with model_messages[0].content[0].text,
+    // not a Codex rollout — extract_tail_context would return empty and the
+    // session would fall back to the short id (the `1230f99` bug).
+    let muse_jsonl_title = if db_title.is_none() {
+        muse_title_from_session_jsonl(path)
+            .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+    } else {
+        None
+    };
+    let effective_title = db_title.clone().filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s)).or_else(|| muse_jsonl_title.clone()).or_else(|| {
         crate::titles::extract_tail_context(path).ok().and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx)).filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
     });
-    let effective_detail = db_title.filter(|s| !crate::looks_like_low_signal_generated_copy(s));
+    let effective_detail = db_title.clone().filter(|s| !crate::looks_like_low_signal_generated_copy(s)).or(muse_jsonl_title);
     Some(AgentStoreEntry {
         session_id,
         cwd,

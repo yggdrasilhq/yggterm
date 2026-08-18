@@ -24,6 +24,12 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
     // older than the 60s guard is the exact "New session" placeholder the
     // detector used to keep via the >5000 bypass.
     if path_str.contains("muse/sessions") {
+        // Muse's JSONL is NOT codex-shaped, so the generic extract_tail_context
+        // below would misclassify every real Muse session as noise (empty context
+        // → large-file bypass removed). Decide SOLELY from the DB when the DB
+        // has an entry — that is the source `muse resume` lists from.
+        let mut muse_db_decided = false;
+        let mut muse_is_noise: bool = false;
         if let Some(home) = dirs::home_dir() {
             let db_path = home.join(".local/share/muse/session-index.db");
             if db_path.exists() {
@@ -33,29 +39,26 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
                         | rusqlite::OpenFlags::SQLITE_OPEN_URI
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 ) {
-                    // session_id is parent dir name for muse
                     if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
                         if let Ok(mut stmt) = conn.prepare(
                             "SELECT prompt_count, title FROM sessions WHERE session_id=?1",
                         ) {
                             if let Ok(mut rows) = stmt.query(rusqlite::params![parent]) {
                                 if let Ok(Some(row)) = rows.next() {
+                                    muse_db_decided = true;
                                     let prompt_count: i64 = row.get(0).unwrap_or(1);
                                     let title: String = row.get(1).unwrap_or_default();
                                     let title_lower = title.trim().to_ascii_lowercase();
-                                    // "New session" placeholder with no prompts is noise.
                                     if prompt_count == 0
                                         && (title_lower == "new session"
                                             || title_lower.is_empty()
                                             || title_lower == "new muse code session")
                                     {
-                                        return true;
-                                    }
-                                    // Even with prompt_count>0, a single "hi" / slash prompt is noise.
-                                    if prompt_count <= 1 && title_lower.len() <= 8 {
+                                        muse_is_noise = true;
+                                    } else if prompt_count <= 1 && title_lower.len() <= 8 {
                                         let lower = title_lower.as_str();
                                         if matches!(lower, "hi" | "hello" | "hey" | "/" | "/status" | "/help" | "/context" | "/clear" | "test") {
-                                            return true;
+                                            muse_is_noise = true;
                                         }
                                     }
                                 }
@@ -65,8 +68,49 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
                 }
             }
         }
-        // For muse, if prompt_count check didn't declare noise, fall through to
-        // generic tail-context check below — do not early-return false on size alone.
+        if muse_db_decided {
+            return muse_is_noise;
+        }
+        // No DB entry (old file or DB absent) — fall through to generic check.
+        // Do not early-return false on size alone; the generic tail will decide.
+    }
+    // Antigravity: its JSONL is payload_type USER_INPUT or conversation_summaries.db,
+    // not Codex-shaped. Using the generic Codex tail would mark every real AGY
+    // session as noise. Prefer transcript presence when the DB is absent.
+    if path_str.contains("antigravity") || path_str.contains(".gemini") {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            // AGY transcript with a USER_INPUT and a non-whitespace prompt is not noise.
+            if content.contains("USER_INPUT") {
+                // Find a prompt line with substantive text (>10 chars after trimming tags)
+                for line in content.lines().take(32) {
+                    if line.contains("USER_INPUT") {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(c) = value.get("content").and_then(|v| v.as_str()) {
+                                let prompt = if let Some(s) = c.find("<USER_REQUEST>") {
+                                    let after = &c[s + "<USER_REQUEST>".len()..];
+                                    after.split("</USER_REQUEST>").next().unwrap_or(after)
+                                } else {
+                                    c
+                                };
+                                if prompt.trim().len() >= 10 {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Has USER_INPUT but no extractable prompt — still not noise (has turn)
+                return false;
+            }
+            if content.len() > 500 && content.contains("conversation_id") {
+                return false;
+            }
+        }
+        // For AGY .db files, stat-based size already handled; fall through to false
+        // only if file is truly empty. A .db with tables is not noise.
+        if path.extension().and_then(|e| e.to_str()) == Some("db") {
+            return false;
+        }
     }
     // Generic tail-context check: if we can extract substantive context (>=20 chars
     // and not low-signal), this is not noise. Otherwise it is.

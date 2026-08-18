@@ -2573,6 +2573,12 @@ launch — do not route around it.
 
 **Launch:** `muse --yolo` is the fleet's standard; `id_assigned_at_birth: false` so the `local://` → `remote-muse://` rebind poll runs (§7.5). No model flag quirk known — re-verify after a `--model` launch and append.
 
+**2026-08-18 — Muse JSONL is NOT codex-shaped — found live.** `is_noise_session_file` used the generic `extract_tail_context` (Codex rollout tail) for Muse’s `session.jsonl` (`payload_type: runtime.user_intent.accepted` with `payload.model_messages[0].content[0].text`), so every real Muse session with `prompt_count>0` was marked noise (empty Codex tail) and would be deleted. Fixed: Muse now decides noise **solely from `session-index.db` `prompt_count/title`** when the DB has an entry; generic tail is only for DB-missing files. Title fallback now tries `muse_title_from_session_jsonl` (first `runtime.user_intent.accepted` text → `best_effort_title_from_context`) before the Codex heuristic, preventing the `1230f99` short-id bug.
+
+**2026-08-18 — Antigravity transcript is not codex-shaped either.** `USER_INPUT` with `<USER_REQUEST>` and `conversation_summaries.db` are the sources; generic tail would mark every AGY transcript as noise. Added early return for `antigravity/.gemini` paths: presence of `USER_INPUT` with `≥10-char` prompt or `conversation_id` means not noise, `.db` files never noise.
+
+**2026-08-18 — Terminal in cwdtree (depth-3 `ssh://` Data Shell).** `REMOTE_DAEMON_SHELL_SCAN_SCRIPT` in `yggterm-server/src/lib.rs:17596` pushed `ssh://` shells into `RemoteScannedSession` → `__remote_folder__/oc/...` as scanned sessions, duplicating the live rail. `Plain SSH terminals remain Live Sessions only` (state.rs:50340) — removed the daemon shell scan’s push (now `let _ = REMOTE_DAEMON_SHELL_SCAN_SCRIPT`) so shells appear only in `__live_sessions__`.
+
 ### Antigravity (agy)
 
 **Like Claude Code: Store-authoritative.** `title_authority: Store` (already correct). `agy` writes `conversation_summaries.db` (`conversation_summaries.title`) and yggterm respects it, writing back only on explicit rename. `install: Manual` (`agy update` self-updates, measured `agy --help` 2026-08-08) — yggterm provisions by invoking `agy update`, not `npm`.

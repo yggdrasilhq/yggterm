@@ -17912,47 +17912,14 @@ fn scan_remote_machine_sessions(
         sessions.extend(found_sessions);
     }
 
-    let daemon_shell_lines = match run_remote_python_lines(
-        &target.ssh_target,
-        target.prefix.as_deref(),
-        REMOTE_DAEMON_SHELL_SCAN_SCRIPT,
-        &[],
-    ) {
-        Ok(lines) => lines,
-        Err(_) => Vec::new(),
-    };
-    for line in daemon_shell_lines {
-        if let Ok(summary) = serde_json::from_str::<RemoteGenericSummaryLine>(&line) {
-            if existing_ids.contains(&summary.session_id) {
-                continue;
-            }
-            existing_ids.insert(summary.session_id.clone());
-            let session_path = format!("ssh://{machine_key}/{}", summary.session_id);
-            let title_hint = if summary.title.trim().is_empty() {
-                short_session_id(&summary.session_id)
-            } else {
-                summary.title
-            };
-            sessions.push(RemoteScannedSession {
-                session_path,
-                title_hint,
-                session_id: summary.session_id,
-                cwd: summary.cwd,
-                started_at: String::new(),
-                modified_epoch: summary.mtime,
-                event_count: 0,
-                user_message_count: 0,
-                assistant_message_count: 0,
-                recent_context: summary.context,
-                cached_precis: None,
-                cached_summary: None,
-                live_runtime: true,
-                title_is_explicit: false,
-                storage_path: summary.path,
-            });
-            any_found = true;
-        }
-    }
+    // ⛔ Shell sessions are Live Sessions only — they have no durable transcript
+    // to back a cwd-tree row. The daemon shell scan used to push ssh://
+    // Data Shell entries into machine.scanned_sessions, which then rendered
+    // as depth 3 ssh:// Data Shell under __remote_folder__/oc/... — the
+    // “terminal in cwdtree” bug. Live shells are already in the Live Sessions
+    // rail via is_promoted_live_session; a scanned duplicate in the folder
+    // tree is the duplicate that is wrong. Keep the scan out of the cwd tree.
+    let _ = REMOTE_DAEMON_SHELL_SCAN_SCRIPT;
 
     // Only propagate the deferred yggterm error if we have nothing to show at all.
     if sessions.is_empty() && !any_found {
