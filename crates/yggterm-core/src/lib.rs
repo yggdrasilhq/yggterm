@@ -1850,9 +1850,15 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
 
     let mut buckets = Vec::new();
     for (cwd, mut project_sessions) in projects {
+        // Cwdtree recency: live sessions with no mtime (0) are most recent (MAX) so a
+        // running shell does not sink to the bottom — same is_live>recency fix as
+        // startpage's order_candidates_for_startpage but without live_set. Zero is
+        // the only reliable live signal here; when a live set is available the
+        // caller should use the live-aware helper `order_cwdtree_sessions_with_live`.
+        let effective = |m: u128| if m == 0 { u128::MAX } else { m };
         project_sessions.sort_by(|a, b| {
-            b.modified_epoch_ms
-                .cmp(&a.modified_epoch_ms)
+            effective(b.modified_epoch_ms)
+                .cmp(&effective(a.modified_epoch_ms))
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
         buckets.push(LocalAgentProjectBucket {
