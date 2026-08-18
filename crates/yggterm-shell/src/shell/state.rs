@@ -53252,11 +53252,41 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
             .drag_hover_target
             .clone()
             .filter(|target| {
-                target.path != "__live_sessions__"
-                    && shell.live_row_paths_for_arrangement().contains(&normalize_live_session_path(&target.path))
+                if target.path == "__live_sessions__" {
+                    return false;
+                }
+                if shell
+                    .live_row_paths_for_arrangement()
+                    .contains(&normalize_live_session_path(&target.path))
+                {
+                    return true;
+                }
+                // Edge: dragging a live row before the first machine/cwd Group
+                // immediately after Live Sessions (gap after last live). The
+                // ghost shows Before machine (depth0 Group) but live_paths
+                // doesn't contain that target, so arrangement would be skipped
+                // and the drop would fall through to workspace ignored. Treat
+                // it as a live arrangement detach (outside its row set) so the
+                // drop commits at the live tail.
+                if target.placement == DragDropPlacement::Before
+                    && (target.path.starts_with("__remote_machine__")
+                        || target.path.starts_with("__remote_folder__")
+                        || target.path == "local")
+                    && !shell.drag_paths.is_empty()
+                    && shell.drag_paths.iter().all(|path| {
+                        shell
+                            .live_row_paths_for_arrangement()
+                            .contains(&normalize_live_session_path(path))
+                    })
+                {
+                    return true;
+                }
+                false
             })
             .map(|target| (target, shell.drag_paths.clone()))
     };
+    let mut arrangement_changed = false;
+    let mut arrangement_target: Option<DragDropTarget> = None;
     if let Some((target, drag_paths)) = arrangement_drop {
         let mut changed = false;
         state.with_mut_counted(|shell| {
@@ -53277,6 +53307,8 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
                 shell.sync_browser_settings();
             }
         });
+        arrangement_changed = changed;
+        arrangement_target = Some(target.clone());
         // ⛔ ONLY an INTO drop ends here. Before/After also carries a POSITION —
         // `DESIGN.md`: *a member dragged out leaves the set and lands where it
         // was dropped* — so it falls through to the reorder below, which is the
@@ -53384,6 +53416,33 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
             });
         }
         return;
+    }
+    // If the arrangement detached a member to the top level (Before/After
+    // outside its group) but the flat live order was already before the next
+    // top row (last-member case), `live_session_reordered_paths_for_drop`
+    // returns None because the order is unchanged. The visible move is still
+    // real (depth 2→1 at the same gap) and the ghost showed Before dev
+    // outside – so treat this as handled rather than falling through to the
+    // workspace "drop_placement_unresolved" path which reads as "did not move".
+    if arrangement_changed {
+        if let Some(target) = arrangement_target {
+            if target.placement == DragDropPlacement::Before
+                || target.placement == DragDropPlacement::After
+            {
+                state.with_mut_counted(|shell| {
+                    shell.record_ui_telemetry(
+                        "row_set_arranged_outside_without_reorder",
+                        json!({
+                            "target": target.path,
+                            "placement": format!("{:?}", target.placement).to_ascii_lowercase(),
+                            "drag_paths": shell.drag_paths.clone(),
+                        }),
+                    );
+                    shell.clear_drag_state();
+                });
+                return;
+            }
+        }
     }
     let (placement, target_label) = {
         let shell = state.read();
@@ -54293,6 +54352,38 @@ fn live_session_drop_target(
             placement,
         });
     }
+    // Edge: the gap after the last Live Session and before the first
+    // machine/cwd top-level Group. `After last_live(depth2)` and `Before
+    // machine(depth0)` are the same Y line but only the former was live-aware,
+    // so `Before machine` ghosted (via workspace engine) but `live_reorder`
+    // was None and the drop no-oped. Treat `Before` a post-live machine top
+    // as a live drop to the end of the live order when dragging a live row.
+    if placement == DragDropPlacement::Before
+        && row.depth == 0
+        && row.kind == BrowserRowKind::Group
+        && (row.full_path.starts_with("__remote_machine__")
+            || row.full_path.starts_with("__remote_folder__")
+            || row.full_path == "local")
+    {
+        // Is this machine row immediately after the Live Sessions region?
+        // Find the Live Sessions head and the first depth0 after it – that's
+        // the boundary.
+        if let Some(live_head_idx) = rows.iter().position(|r| r.full_path == "__live_sessions__") {
+            let first_post_live = rows[live_head_idx + 1..]
+                .iter()
+                .position(|r| r.depth == 0)
+                .map(|off| live_head_idx + 1 + off);
+            if let Some(boundary_idx) = first_post_live {
+                let target_idx = rows.iter().position(|r| r.full_path == row.full_path);
+                if target_idx == Some(boundary_idx) {
+                    return Some(DragDropTarget {
+                        path: row.full_path.clone(),
+                        placement: DragDropPlacement::Before,
+                    });
+                }
+            }
+        }
+    }
     None
 }
 
@@ -54352,6 +54443,17 @@ fn live_session_reordered_paths_for_drop(
         || target.placement == DragDropPlacement::Into
     {
         0
+    } else if target.placement == DragDropPlacement::Before
+        && (target.path.starts_with("__remote_machine__")
+            || target.path.starts_with("__remote_folder__")
+            || target.path == "local")
+    {
+        // Edge: Before first post-live machine Group. The target is not a
+        // live session, so current_by_normalized has no entry. Treat Before
+        // machine as "append to end of live order" – the live tail before the
+        // machine list. Without this the gap after the last live row and
+        // before the first machine row ghosts but never commits.
+        remaining.len()
     } else {
         let target_key = current_by_normalized
             .get(&normalize_live_session_path(&target.path))
@@ -54565,7 +54667,9 @@ fn apply_workspace_reorder_plan(
     Ok(moved_paths)
 }
 fn is_tree_drag_source_row(row: &BrowserRow) -> bool {
-    is_workspace_row(row) || row.kind == BrowserRowKind::Session
+    is_workspace_row(row)
+        || (row.kind == BrowserRowKind::Session
+            && (row.depth <= 2 || !is_hot_terminal_sidebar_path(&row.full_path)))
 }
 fn is_workspace_row(row: &BrowserRow) -> bool {
     match row.kind {
@@ -58515,8 +58619,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     },
                     top_within_host: Boolean(top && host && (top === host || host.contains(top))),
                     top_within_rows: Boolean(top && rowsLayer && (top === rowsLayer || rowsLayer.contains(top))),
-                    rows_in_stack: Boolean(rowsLayer && nodes.some((node) => node === rowsLayer || rowsLayer.contains(node))),
-                    host_in_stack: Boolean(host && nodes.some((node) => node === host || host.contains(node))),
+                    rows_in_stack: Boolean(rowsLayer && nodes.some((node) => node === rowsLayer || rowsLayer.contains(node) || (node.contains && node.contains(rowsLayer)))),
+                    host_in_stack: Boolean(host && nodes.some((node) => node === host || host.contains(node) || (node.contains && node.contains(host)))),
                     stack: nodes.slice(0, 8).map((node) => summarizePaintStackNode(node, host, rowsLayer)).filter(Boolean),
                 };
             };
@@ -58552,13 +58656,27 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     }
                     return false;
                 };
-                const rowPaintProblem = Boolean(rowText && rowSampleRect && !rowSampleStack.top_within_rows);
-                const cursorRowPaintProblem = Boolean(cursorRowText && cursorRowRect && !cursorRowStack.top_within_rows);
-                const cursorPaintProblem = Boolean(cursorText && cursorSampleRect && !cursorSampleStack.top_within_rows);
+                // Fix for fresh-shell top-edge false positive: when the top hit is an ancestor
+                // (xterm-screen / yggterm-term-focused) that contains rowsLayer, the row is still
+                // paint-visible — the visible pixel is the row span seen through its transparent
+                // container. rows_in_stack proves the row layer is at that point, chrome check
+                // already excludes true occlusion.
+                const rowIsPaintVisibleDespiteTop = Boolean(
+                    rowSampleStack.rows_in_stack && rowSampleStack.host_in_stack
+                );
+                const cursorRowIsPaintVisibleDespiteTop = Boolean(
+                    cursorRowStack.rows_in_stack && cursorRowStack.host_in_stack
+                );
+                const cursorIsPaintVisibleDespiteTop = Boolean(
+                    cursorSampleStack.rows_in_stack && cursorSampleStack.host_in_stack
+                );
+                const rowPaintProblem = Boolean(rowText && rowSampleRect && !rowSampleStack.top_within_rows && !rowIsPaintVisibleDespiteTop);
+                const cursorRowPaintProblem = Boolean(cursorRowText && cursorRowRect && !cursorRowStack.top_within_rows && !cursorRowIsPaintVisibleDespiteTop);
+                const cursorPaintProblem = Boolean(cursorText && cursorSampleRect && !cursorSampleStack.top_within_rows && !cursorIsPaintVisibleDespiteTop);
                 const rowSampleCoveredByShellChrome = Boolean(
                     rowPaintProblem
                     && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)
-                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)
+                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows || cursorRowIsPaintVisibleDespiteTop || cursorIsPaintVisibleDespiteTop)
                 );
                 let problem = '';
                 if (rowPaintProblem && !rowSampleCoveredByShellChrome) {
@@ -60462,8 +60580,8 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     },
                     top_within_host: Boolean(top && host && (top === host || host.contains(top))),
                     top_within_rows: Boolean(top && rowsLayer && (top === rowsLayer || rowsLayer.contains(top))),
-                    rows_in_stack: Boolean(rowsLayer && nodes.some((node) => node === rowsLayer || rowsLayer.contains(node))),
-                    host_in_stack: Boolean(host && nodes.some((node) => node === host || host.contains(node))),
+                    rows_in_stack: Boolean(rowsLayer && nodes.some((node) => node === rowsLayer || rowsLayer.contains(node) || (node.contains && node.contains(rowsLayer)))),
+                    host_in_stack: Boolean(host && nodes.some((node) => node === host || host.contains(node) || (node.contains && node.contains(host)))),
                     stack: nodes.slice(0, 8).map((node) => summarizeBasicPaintStackNode(node, host, rowsLayer)).filter(Boolean),
                 };
             };
@@ -60499,18 +60617,29 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     }
                     return false;
                 };
+                // Same fresh-shell ancestor-visible fix as terminalDomPaintHitProbe.
+                const rowIsPaintVisibleDespiteTop = Boolean(
+                    rowSampleStack.rows_in_stack && rowSampleStack.host_in_stack
+                );
+                const cursorRowIsPaintVisibleDespiteTop = Boolean(
+                    cursorRowStack.rows_in_stack && cursorRowStack.host_in_stack
+                );
+                const cursorIsPaintVisibleDespiteTop = Boolean(
+                    cursorSampleStack.rows_in_stack && cursorSampleStack.host_in_stack
+                );
                 const rowSampleCoveredByShellChrome = Boolean(
                     rowText
                     && !rowSampleStack.top_within_rows
+                    && !rowIsPaintVisibleDespiteTop
                     && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)
-                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)
+                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows || cursorRowIsPaintVisibleDespiteTop || cursorIsPaintVisibleDespiteTop)
                 );
                 let problem = '';
-                if (rowText && !rowSampleStack.top_within_rows && !rowSampleCoveredByShellChrome) {
+                if (rowText && !rowSampleStack.top_within_rows && !rowIsPaintVisibleDespiteTop && !rowSampleCoveredByShellChrome) {
                     problem = 'xterm row sample is not topmost at its visible text point';
-                } else if (cursorRowText && !cursorRowStack.top_within_rows) {
+                } else if (cursorRowText && !cursorRowStack.top_within_rows && !cursorRowIsPaintVisibleDespiteTop) {
                     problem = 'xterm cursor row is not topmost at its visible text point';
-                } else if (cursorText && !cursorSampleStack.top_within_rows) {
+                } else if (cursorText && !cursorSampleStack.top_within_rows && !cursorIsPaintVisibleDespiteTop) {
                     problem = 'xterm cursor sample is not topmost at its visible cursor point';
                 }
                 return {
