@@ -227,7 +227,7 @@ mod tests {
         );
         assert_eq!(
             humanized_terminal_title(SessionKind::Codex, "/home/user", Some("dev")),
-            Some("User Home Codex".to_string())
+            None
         );
     }
 }

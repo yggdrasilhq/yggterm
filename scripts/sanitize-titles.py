@@ -49,14 +49,20 @@ CLI_STORES = [
 # From crates/yggterm-core/src/titles.rs + lib.rs low-signal checks (replicated)
 WEIRD_PATTERNS = [
     (re.compile(r"^[0-9a-fA-F]{7,8}$"), "shorthash 7-8 hex"),
+    (re.compile(r"(?i)^remote\s+[a-z-]+\s+[0-9a-f]{7,8}$"), "remote breed shorthash"),
+    (re.compile(r"(?i)^[0-9a-f]{7,8}\s*[-·/]"), "shorthash prefix"),
     (re.compile(r"^local::"), "raw scheme local::"),
     (re.compile(r"^live::"), "raw scheme live::"),
     (re.compile(r"^document::"), "raw scheme document::"),
     (re.compile(r"^codex::"), "raw scheme codex::"),
+    (re.compile(r"^codex-litellm::"), "raw scheme codex-litellm::"),
     (re.compile(r"/home/"), "raw absolute path"),
     (re.compile(r"^/home"), "raw absolute path"),
-    (re.compile(r"(?i)^new session$"), "New session placeholder"),
-    (re.compile(r"(?i)^new muse"), "New Muse placeholder"),
+    (re.compile(r"^/"), "raw absolute path"),
+    (re.compile(r"(?i)\bhome\s+(codex|claude|claude-code|claude code|muse|antigravity|pi|qwen|grok|opencode|kimi|shell|terminal)\b"), "user home breed concatenation"),
+    (re.compile(r"(?i)^local\s+(codex|claude|claude-code|claude code|muse|antigravity|pi|qwen|grok|opencode|kimi|shell|terminal|session)$"), "local breed concatenation"),
+    (re.compile(r"(?i)^(codex|claude|claude-code|claude code|muse|antigravity|pi|qwen|grok|opencode|kimi)\s+session$"), "generic breed session"),
+    (re.compile(r"(?i)^new\s+(session|terminal|ychrome|muse|antigravity|codex|claude|pi|qwen|grok|kimi|opencode)(\s+session)?$"), "New session placeholder"),
     (re.compile(r"(?i)^untitled"), "Untitled placeholder"),
     (re.compile(r"(?i)^unknown"), "Unknown placeholder"),
     (re.compile(r"(?i)^(hi|hello|hey|test|/status|/help|/context|/clear)$"), "single-word low-signal"),
@@ -224,10 +230,8 @@ def extract_tail_context(host, path, cli_slug, limit_chars=6000):
         return (out or "").strip()[:limit_chars]
 
 def request_litellm_title(endpoint, api_key, model, context):
-    try:
-        import requests  # type: ignore
-    except ImportError:
-        return None, "requests not installed (pip install requests)"
+    import urllib.request
+    import urllib.error
     url = endpoint.rstrip("/") + "/chat/completions"
     if url.endswith("/v1/chat/completions"):
         pass
@@ -244,39 +248,53 @@ def request_litellm_title(endpoint, api_key, model, context):
             {"role":"user","content": f"Create a concise session title from this structured session context.\nPrioritize: 1) the main user goal, 2) the active system/repo, and 3) the concrete engineering work happening now.\nIf the latest turns are screenshot inspection or modal polish inside a longer debugging effort, title the larger effort.\nUse a noun phrase that can sit on a sidebar row. Do not echo raw metadata, shell paths, existing sidebar labels, screenshot labels, quoted bad generated titles, question words, or cute placeholder labels.\nReturn the title only.\n\n{context}"}
         ]
     }
-    headers = {"Content-Type":"application/json"}
+    headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=30)
-        if r.status_code == 429:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            res_body = response.read().decode("utf-8")
+            j = json.loads(res_body)
+            choices = j.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                msg = choices[0].get("message", {}) or choices[0].get("delta", {})
+                txt = msg.get("content")
+                if txt and txt.strip():
+                    title = txt.strip().strip('"').strip("'").strip()
+                    title = re.sub(r"\s+", " ", title).strip(" .")
+                    words = title.split()
+                    if len(words) > 6:
+                        title = " ".join(words[:6])
+                    return title, None
+            return None, f"no choices in response: {str(j)[:500]}"
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
             return None, "rate limited 429 — retry next tick, do not persist heuristic"
-        if r.status_code == 500 and model == "chatgpt/gpt-5.6-luna":
-            # Fallback: endpoint's chatgpt mapping may be temporarily on responses API; try gemini
+        if e.code == 500 and model == "chatgpt/gpt-5.6-luna":
             fallback = "antigravity/gemini-3.7-flash"
             body["model"] = fallback
-            r = requests.post(url, json=body, headers=headers, timeout=30)
-            if r.status_code == 429:
-                return None, "rate limited 429 — retry next tick, do not persist heuristic"
-            if r.status_code == 500:
-                return None, f"500 from both {model} and fallback {fallback} — endpoint may be on responses API, not chat"
-        r.raise_for_status()
-        j = r.json()
-        # OpenAI-compatible: choices[0].message.content
-        choices = j.get("choices", [])
-        if choices and isinstance(choices[0], dict):
-            msg = choices[0].get("message", {}) or choices[0].get("delta", {})
-            txt = msg.get("content")
-            if txt and txt.strip():
-                # sanitize: strip quotes, trim, 2-6 words
-                title = txt.strip().strip('"').strip("'").strip()
-                title = re.sub(r"\s+", " ", title).strip(" .")
-                # enforce 2-6 words heuristic
-                words = title.split()
-                if len(words) > 6:
-                    title = " ".join(words[:6])
-                return title, None
-        return None, f"no choices in response: {str(j)[:500]}"
+            data_fb = json.dumps(body).encode("utf-8")
+            req_fb = urllib.request.Request(url, data=data_fb, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req_fb, timeout=30) as fb_resp:
+                    res_body = fb_resp.read().decode("utf-8")
+                    j = json.loads(res_body)
+                    choices = j.get("choices", [])
+                    if choices and isinstance(choices[0], dict):
+                        msg = choices[0].get("message", {}) or choices[0].get("delta", {})
+                        txt = msg.get("content")
+                        if txt and txt.strip():
+                            title = txt.strip().strip('"').strip("'").strip()
+                            title = re.sub(r"\s+", " ", title).strip(" .")
+                            words = title.split()
+                            if len(words) > 6:
+                                title = " ".join(words[:6])
+                            return title, None
+            except Exception as ex:
+                return None, f"fallback error: {ex}"
+        return None, f"HTTP error {e.code}: {e.reason}"
     except Exception as e:
         return None, str(e)
 
