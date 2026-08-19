@@ -4583,14 +4583,22 @@ fn TerminalCanvas(
                     && shell.server.active_session_path() == Some(session_path_for_task.as_str())
             });
             if !still_active {
+                let _inactive_payload = json!({
+                        "session_path": session_path_for_task.clone(),
+                    });
                 append_trace_event(
                     &trace_home,
                     "ui",
                     "terminal_mount",
                     "retained_rehydrate_skipped_inactive",
-                    json!({
-                        "session_path": session_path_for_task,
-                    }),
+                    _inactive_payload.clone(),
+                );
+                // Mirror to ytrace so Dash `terminal_mount/retained_rehydrate_skipped_inactive` is queryable.
+                yggterm_core::perf::ytrace_emit_event(
+                    "ui",
+                    "terminal_mount",
+                    "retained_rehydrate_skipped_inactive",
+                    _inactive_payload,
                 );
                 return;
             }
@@ -4677,30 +4685,45 @@ fn TerminalCanvas(
                     return;
                 }
             }
+            let _rehydrate_begin_payload = json!({
+                    "session_path": session_path_for_task.clone(),
+                    "mode": retained_rehydrate_mode.as_key(),
+                });
             append_trace_event(
                 &trace_home,
                 "ui",
                 "terminal_mount",
                 "retained_rehydrate_begin",
-                json!({
-                    "session_path": session_path_for_task.clone(),
-                    "mode": retained_rehydrate_mode.as_key(),
-                }),
+                _rehydrate_begin_payload.clone(),
+            );
+            yggterm_core::perf::ytrace_emit_event(
+                "ui",
+                "terminal_mount",
+                "retained_rehydrate_begin",
+                _rehydrate_begin_payload,
             );
             if retained_rehydrate_should_skip_before_read(
                 retained_rehydrate_mode,
                 terminal_live_host_connected(),
                 terminal_retained_snapshot_staged(),
             ) {
+                let _skipped_payload = json!({
+                        "session_path": session_path_for_task.clone(),
+                        "mode": retained_rehydrate_mode.as_key(),
+                    });
                 append_trace_event(
                     &trace_home,
                     "ui",
                     "terminal_mount",
                     "retained_rehydrate_skipped_live_connected",
-                    json!({
-                        "session_path": session_path_for_task,
-                        "mode": retained_rehydrate_mode.as_key(),
-                    }),
+                    _skipped_payload.clone(),
+                );
+                // Mirror session-only branch to ytrace — the keyboard+viewport starvation probe.
+                yggterm_core::perf::ytrace_emit_event(
+                    "ui",
+                    "terminal_mount",
+                    "retained_rehydrate_skipped_live_connected",
+                    _skipped_payload,
                 );
                 return;
             } else if terminal_live_host_connected() {
@@ -4793,19 +4816,27 @@ fn TerminalCanvas(
                             last_resize_seq,
                         )
                     {
-                        append_trace_event(
-                            &trace_home,
-                            "ui",
-                            "terminal_mount",
-                            "retained_rehydrate_skipped_pre_resize",
-                            json!({
-                                "session_path": session_path_for_task,
+                        let _pre_resize_payload = json!({
+                                "session_path": session_path_for_task.clone(),
                                 "mode": retained_rehydrate_mode.as_key(),
                                 "running": running,
                                 "runtime_output_seen": runtime_output_seen,
                                 "post_resize_output_seen": post_resize_output_seen,
                                 "last_resize_seq": last_resize_seq,
-                            }),
+                            });
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "retained_rehydrate_skipped_pre_resize",
+                            _pre_resize_payload.clone(),
+                        );
+                        // Mirror geometry-fence skip to ytrace — the other single-branch suspect.
+                        yggterm_core::perf::ytrace_emit_event(
+                            "ui",
+                            "terminal_mount",
+                            "retained_rehydrate_skipped_pre_resize",
+                            _pre_resize_payload,
                         );
                         return;
                     }
