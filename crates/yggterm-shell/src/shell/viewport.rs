@@ -316,27 +316,19 @@ fn MainSurface(
             let rendered_rows =
                 visible_rows[preview_window.start_index..preview_window.end_index].to_vec();
             let grouped_runs = group_preview_runs(&rendered_rows);
-            let preview_context_available =
-                !grouped_runs.is_empty() || !rendered_sections.is_empty();
-            let terminal_resume_context_fallback =
-                terminal_resume_context_fallback(snapshot.as_ref(), &session);
-            let visible_terminal_resume_context_fallback = (!preview_context_available)
-                .then(|| terminal_resume_context_fallback.clone())
-                .flatten();
-            let fallback_context_visible = visible_terminal_resume_context_fallback.is_some();
             let effective_preview_layer_style = preview_layer_style.clone();
             let show_failure_placeholder = preview_should_show_blocking_failure_placeholder(
                 preview_failure.is_some(),
                 grouped_runs.is_empty(),
                 rendered_sections.is_empty(),
-                fallback_context_visible,
+                false,
             );
             let show_loading_placeholder = preview_should_show_blocking_loading_placeholder(
                 snapshot.preview_loading,
                 show_failure_placeholder,
                 grouped_runs.is_empty(),
                 rendered_sections.is_empty(),
-                fallback_context_visible,
+                false,
             );
             let terminal_canvas_snapshot =
                 TerminalCanvasSnapshot::from_render_snapshot(snapshot.as_ref());
@@ -642,7 +634,6 @@ fn MainSurface(
                                         session: session.clone(),
                                         provider: conversation_provider.clone(),
                                         rendered_sections: rendered_sections.clone(),
-                                        visible_terminal_resume_context_fallback: visible_terminal_resume_context_fallback.clone(),
                                         show_loading_placeholder,
                                         preview_failure: preview_failure.clone(),
                                         show_failure_placeholder,
@@ -994,7 +985,6 @@ fn ConversationWebView(
     session: ManagedSessionView,
     provider: ConversationProviderModel,
     rendered_sections: Vec<SessionRenderedSection>,
-    visible_terminal_resume_context_fallback: Option<(String, String)>,
     show_loading_placeholder: bool,
     preview_failure: Option<String>,
     show_failure_placeholder: bool,
@@ -1048,14 +1038,6 @@ fn ConversationWebView(
             ConversationColumn {
             tokens,
             surface_id: session.session_path.clone(),
-            if let Some((fallback_title, fallback_summary)) = visible_terminal_resume_context_fallback.clone() {
-                TerminalResumeContextFallback {
-                    title: fallback_title,
-                    summary: fallback_summary,
-                    host_label: session.host_label.clone(),
-                    palette,
-                }
-            }
             if show_loading_placeholder {
                 PreviewLoadingPlaceholder {
                     session: session.clone(),
@@ -2263,68 +2245,7 @@ pub(crate) fn terminal_reveal_seed_allows_authoritative_screen(
 ) -> bool {
     retained_rehydrate_allow_screen_fallback(mode, agent_cli_session(kind))
 }
-#[component]
-fn TerminalResumeContextFallback(
-    title: String,
-    summary: String,
-    host_label: String,
-    palette: Palette,
-) -> Element {
-    rsx! {
-        div {
-            "data-preview-fallback-context": "1",
-            style: "display:flex; flex-direction:column; gap:14px; width:min(920px, 100%); margin:0 auto; padding:18px 20px 22px 20px; border-radius:24px; \
-                    background:linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(247,250,255,0.99) 100%); \
-                    box-shadow:0 22px 46px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(170,190,212,0.16);",
-            div {
-                style: "display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap;",
-                div {
-                    LoadingStateChip {
-                            label: "Saved conversation context".to_string(),
-                            palette,
-                        }
-                }
-                div {
-                    style: format!(
-                        "display:inline-flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px; \
-                         background:rgba(255,255,255,0.86); color:{}; font-size:11px; font-weight:700; \
-                         box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16); text-transform:uppercase; letter-spacing:0.08em;",
-                        palette.text
-                    ),
-                    div {
-                        style: format!(
-                            "width:8px; height:8px; border-radius:999px; background:{}; box-shadow:0 0 0 5px rgba(59,130,246,0.08);",
-                            palette.accent
-                        )
-                    }
-                    "{host_label}"
-                }
-            }
-            div {
-                style: format!(
-                    "font-size:24px; line-height:1.25; font-weight:760; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;",
-                    palette.text
-                ),
-                "{title}"
-            }
-            div {
-                "data-preview-fallback-summary": "1",
-                style: format!(
-                    "font-size:13px; line-height:1.78; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; max-width:820px;",
-                    palette.muted
-                ),
-                "{summary}"
-            }
-                div {
-                    style: format!(
-                        "font-size:11px; line-height:1.6; color:{}; max-width:760px;",
-                        palette.muted
-                    ),
-                    "Web View reads stored transcript and metadata. Terminal mode owns live PTY interaction."
-                }
-        }
-    }
-}
+
 #[component]
 fn AgentModeSelector(
     selected: SessionKind,

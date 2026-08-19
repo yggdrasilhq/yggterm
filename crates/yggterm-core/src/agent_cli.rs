@@ -2747,6 +2747,31 @@ fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     })
 }
 
+fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
+    let mut text = raw.trim();
+    if let Some(idx) = text.find("<USER_REQUEST>") {
+        let after = &text[idx + "<USER_REQUEST>".len()..];
+        text = after.split("</USER_REQUEST>").next().unwrap_or(after).trim();
+    }
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty()
+            || l.starts_with("```")
+            || l.starts_with('#')
+            || l.starts_with("<ADDITIONAL_METADATA>")
+            || l.starts_with("<USER_SETTINGS_CHANGE>")
+            || l.starts_with("{{ CHECKPOINT")
+            || l.starts_with("<USER_REQUEST>")
+        {
+            continue;
+        }
+        if !crate::looks_like_generated_fallback_title(l) {
+            return Some(l.to_string());
+        }
+    }
+    None
+}
+
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
         // Layout: ~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl
@@ -2826,7 +2851,7 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                                         detail = Some(display.trim().to_string());
                                     }
                                     if title.is_none() {
-                                        title = Some(display.trim().to_string());
+                                        title = clean_agy_prompt_first_line(display);
                                     }
                                 }
                             }
@@ -2857,7 +2882,7 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                                 if !prompt.is_empty() {
                                     detail = Some(prompt.to_string());
                                     if title.is_none() {
-                                        title = crate::best_effort_title_from_context(prompt);
+                                        title = clean_agy_prompt_first_line(content);
                                     }
                                 }
                             }
@@ -2883,7 +2908,7 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
 
         if title.is_none() {
             if let Some(d) = detail.as_deref() {
-                title = crate::best_effort_title_from_context(d);
+                title = clean_agy_prompt_first_line(d).or_else(|| crate::best_effort_title_from_context(d));
             }
         }
 
