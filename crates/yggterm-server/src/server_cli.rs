@@ -485,30 +485,27 @@ fn parse_remote_scanned_connect_path(path: &str) -> Option<(String, String)> {
 
 /// Session kind for a path we are opening as a stored session — the CLI twin of
 /// the GUI's `session_kind_for_row`.
+///
+/// Registry-derived: every `remote-<slug>://` maps via `agent_scheme`, so a
+/// new CLI never needs a hand-list entry here (the hand-list is how
+/// `remote-agy://oc/…` fell through to `Codex` in the live `4083ede2` daemon).
 fn connect_session_kind_for_path(path: &str) -> yggterm_core::SessionKind {
-    if path.starts_with("remote-cc://") || path.contains("/.claude/projects/") {
-        yggterm_core::SessionKind::ClaudeCode
-    } else if path.starts_with("remote-muse://") || path.contains("/.local/share/muse/sessions/") {
-        yggterm_core::SessionKind::Muse
-    } else if path.starts_with("remote-agy://") {
-        yggterm_core::SessionKind::Antigravity
-    } else if path.starts_with("remote-grok://") {
-        yggterm_core::SessionKind::GrokBuild
-    } else if path.starts_with("remote-kimi://") {
-        yggterm_core::SessionKind::Kimi
-    } else if path.starts_with("remote-pi://") {
-        yggterm_core::SessionKind::Pi
-    } else if path.starts_with("remote-opencode://") {
-        yggterm_core::SessionKind::OpenCode
-    } else if path.starts_with("remote-qwen://") {
-        yggterm_core::SessionKind::QwenCode
-    } else if path.starts_with("ssh://") {
-        yggterm_core::SessionKind::SshShell
-    } else if path.starts_with("local://") {
-        yggterm_core::SessionKind::Shell
-    } else {
-        yggterm_core::agent_scheme::session_kind_for_path(path).unwrap_or(yggterm_core::SessionKind::Codex)
+    if path.starts_with("ssh://") {
+        return yggterm_core::SessionKind::SshShell;
     }
+    if path.starts_with("local://") {
+        return yggterm_core::SessionKind::Shell;
+    }
+    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(path) {
+        return kind;
+    }
+    if path.contains("/.claude/projects/") {
+        return yggterm_core::SessionKind::ClaudeCode;
+    }
+    if path.contains("/.local/share/muse/sessions/") {
+        return yggterm_core::SessionKind::Muse;
+    }
+    yggterm_core::SessionKind::Codex
 }
 
 /// The scanned `(cwd, title)` for a session id, looked up from the daemon's

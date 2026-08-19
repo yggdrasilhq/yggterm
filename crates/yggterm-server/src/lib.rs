@@ -11686,6 +11686,15 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
                     }
                 }
             }
+            // Antigravity's store is a per-host SQLite DB; a `remote-agy://oc/<id>`
+            // names a session on `oc`, not on this host. A local DB miss is
+            // therefore not proof of absence — the scan already proved it exists
+            // on the remote, and the CLI itself is the real authority for a
+            // remote id. Return `true` to avoid the `store_scan_gap` false-death
+            // (`yggterm: saved Codex session … is no longer available` measured
+            // 2026-08-19 for `remote-agy://oc/2cc9…`). A bad remote id then fails
+            // loudly at `agy --conversation` time, not as a phantom Codex miss.
+            return Ok(true);
         }
         _ => {}
     }
