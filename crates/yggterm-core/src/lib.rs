@@ -90,9 +90,9 @@ pub use agent_cli::{
     AgentPermissionMode, AgentStoreEntry, CODEX_FAMILY, FlagArity, OverriddenBy,
     RecordedStoreLiteral, ResumeSelector, agent_cli_descriptor, agent_cli_for_store_path,
     agent_cli_for_store_session_file, agent_launch_options_from_args,
-    all_agent_cli_store_path_fragments, session_kind_label, session_kind_label_is_known,
-    store_home_dir_name_is_any, store_literal_scan_coverage, store_path_is_under_any,
-    unregistered_store_literals,
+    all_agent_cli_store_path_fragments, clean_agy_prompt_first_line, session_kind_label,
+    session_kind_label_is_known, store_home_dir_name_is_any, store_literal_scan_coverage,
+    store_path_is_under_any, unregistered_store_literals,
 };
 pub use agent_scheme::{
     is_remote_agent_session_path, is_remote_row_path, remote_agent_session_path,
@@ -2123,13 +2123,11 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
                     if let Ok(Some(row)) = rows.next() {
                         let title: String = row.get(0).unwrap_or_default();
                         let preview: String = row.get(1).unwrap_or_default();
-                        let title = title.trim();
-                        let preview = preview.trim();
-                        if !title.is_empty() {
-                            return Ok(Some(title.to_string()));
+                        if let Some(t) = clean_agy_prompt_first_line(&title) {
+                            return Ok(Some(t));
                         }
-                        if !preview.is_empty() {
-                            return Ok(Some(preview.to_string()));
+                        if let Some(p) = clean_agy_prompt_first_line(&preview) {
+                            return Ok(Some(p));
                         }
                     }
                 }
@@ -2149,9 +2147,8 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                     if value.get("conversationId").and_then(|v| v.as_str()) == Some(session_id) {
                         if let Some(display) = value.get("display").and_then(|v| v.as_str()) {
-                            let trimmed = display.trim();
-                            if !trimmed.is_empty() {
-                                return Ok(Some(trimmed.to_string()));
+                            if let Some(t) = clean_agy_prompt_first_line(display) {
+                                return Ok(Some(t));
                             }
                         }
                     }
@@ -2160,7 +2157,6 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
         }
     }
 
-    // Check store transcripts from descriptor roots
     if let Some(desc) = descriptor {
         for root in desc.store_roots_absolute(home) {
             let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");
@@ -2170,7 +2166,7 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
                         return Ok(Some(t));
                     }
                     if let Some(d) = entry.detail.filter(|d| !d.trim().is_empty()) {
-                        if let Some(t) = crate::best_effort_title_from_context(&d) {
+                        if let Some(t) = clean_agy_prompt_first_line(&d).or_else(|| crate::best_effort_title_from_context(&d)) {
                             return Ok(Some(t));
                         }
                     }
@@ -2236,7 +2232,6 @@ pub fn local_antigravity_session_cwd(session_id: &str) -> Option<String> {
         }
     }
 
-    // Check store transcripts from descriptor roots
     if let Some(desc) = descriptor {
         for root in desc.store_roots_absolute(&home) {
             let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");

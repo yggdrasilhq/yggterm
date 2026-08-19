@@ -91,6 +91,10 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
             scan_kimi_sessions(home, &mut out, &mut seen_paths);
             continue;
         }
+        if descriptor.kind == crate::SessionKind::Antigravity {
+            scan_antigravity_sessions(home, &mut out, &mut seen_paths);
+            continue;
+        }
         if descriptor.session_store_globs.is_empty() {
             continue;
         }
@@ -316,6 +320,95 @@ fn scan_kimi_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>, seen: &mu
                 display_path,
             });
         }
+    }
+}
+
+fn scan_antigravity_sessions(
+    home: &Path,
+    out: &mut Vec<StartpageDurableRow>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::Antigravity);
+    if let Some(desc) = descriptor {
+        for root in desc.store_roots_absolute(home) {
+            if root.exists() {
+                walk_and_collect(desc, &root, out, seen);
+            }
+        }
+    }
+
+    let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT conversation_id, title, preview, workspace_uris, last_modified_time FROM conversation_summaries WHERE killed=0",
+    ) else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let title: String = row.get(1).unwrap_or_default();
+        let preview: String = row.get(2).unwrap_or_default();
+        let uris: String = row.get(3).unwrap_or_default();
+        let raw_mod: String = row.get(4).unwrap_or_default();
+        Ok((id, title, preview, uris, raw_mod))
+    }) else {
+        return;
+    };
+    let mut existing_ids: HashSet<String> = out.iter().map(|r| r.session_id.clone()).collect();
+    let epoch_ms = std::fs::metadata(&db_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    for row in rows.flatten() {
+        let (session_id, raw_title, raw_preview, uris, _raw_mod) = row;
+        if session_id.trim().is_empty() || existing_ids.contains(&session_id) {
+            continue;
+        }
+        existing_ids.insert(session_id.clone());
+        let cwd = crate::parse_antigravity_workspace_uris(&uris)
+            .unwrap_or_else(|| home.display().to_string());
+        let title_cand = if !raw_title.trim().is_empty() {
+            crate::agent_cli::clean_agy_prompt_first_line(&raw_title)
+        } else if !raw_preview.trim().is_empty() {
+            crate::agent_cli::clean_agy_prompt_first_line(&raw_preview)
+        } else {
+            None
+        };
+        let filtered_title = title_cand.filter(|t| {
+            !crate::looks_like_generated_fallback_title(t)
+                && !crate::looks_like_low_signal_generated_copy(t)
+        });
+        let generated_title = StartpageDurableRow::load_generated_title(&session_id).filter(|s| {
+            !crate::looks_like_generated_fallback_title(s)
+                && !crate::looks_like_low_signal_generated_copy(s)
+        });
+        let effective_title = filtered_title.clone().or(generated_title.clone());
+        let display_path = format!("agy-runtime://{session_id}");
+        out.push(StartpageDurableRow {
+            session_id: session_id.clone(),
+            cwd,
+            title: filtered_title,
+            generated_title,
+            effective_title,
+            detail: None,
+            kind: crate::SessionKind::Antigravity,
+            modified_epoch_ms: epoch_ms,
+            storage_path: db_path.display().to_string(),
+            display_path,
+        });
     }
 }
 
