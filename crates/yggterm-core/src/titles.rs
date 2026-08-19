@@ -2861,6 +2861,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         && compact.starts_with('Q')
         && compact.chars().skip(1).all(|ch| ch.is_ascii_hexdigit());
     let home_breed_placeholder = words.len() >= 2
+        && words.len() <= 4
         && words.iter().any(|w| w.eq_ignore_ascii_case("home"))
         && matches!(
             words.last().copied().unwrap_or("").to_ascii_lowercase().as_str(),

@@ -59,7 +59,7 @@ WEIRD_PATTERNS = [
     (re.compile(r"/home/"), "raw absolute path"),
     (re.compile(r"^/home"), "raw absolute path"),
     (re.compile(r"^/"), "raw absolute path"),
-    (re.compile(r"(?i)\bhome\s+(codex|claude|claude-code|claude code|muse|antigravity|pi|qwen|grok|opencode|kimi|shell|terminal)\b"), "user home breed concatenation"),
+    (re.compile(r"(?i)^([a-z0-9_-]+\s+)?home\s+(codex|claude|claude-code|claude code|muse|antigravity|pi|qwen|grok|opencode|kimi|shell|terminal)$"), "user home breed concatenation"),
     (re.compile(r"(?i)^local\s+(codex|claude|claude-code|claude code|muse|antigravity|pi|qwen|grok|opencode|kimi|shell|terminal|session)$"), "local breed concatenation"),
     (re.compile(r"(?i)^(codex|claude|claude-code|claude code|muse|antigravity|pi|qwen|grok|opencode|kimi)\s+session$"), "generic breed session"),
     (re.compile(r"(?i)^new\s+(session|terminal|ychrome|muse|antigravity|codex|claude|pi|qwen|grok|kimi|opencode)(\s+session)?$"), "New session placeholder"),
@@ -175,63 +175,90 @@ def get_litellm_config(host="local"):
         # Final: leave empty — caller must set env or settings.json litellm_endpoint
         if not endpoint:
             endpoint = ""
-    if not endpoint.endswith("/v1"):
+    if endpoint and not endpoint.endswith("/v1"):
         endpoint = endpoint.rstrip("/") 
         if not endpoint.endswith("/v1"):
             endpoint = endpoint + "/v1"
     return endpoint, api_key or "", model
 
 def extract_tail_context(host, path, cli_slug, limit_chars=6000):
-    # Use yggterm's own extraction when available: generation_context_from_messages tail 96
-    # Fallback: cat last 96 jsonl lines via tail, or heuristic_title path
-    if cli_slug == "muse":
-        # Muse JSONL is payload_type runtime.user_intent + model_messages
-        cmd = f"python3 -c '\nimport json\npath={shlex.quote(path)}\ntry:\n with open(path) as f:\n  lines=f.readlines()[-200:]\n ctx=[]\n for l in lines:\n  try:\n   j=json.loads(l)\n   pt=j.get(\"payload_type\") or j.get(\"type\")\n   if pt==\"runtime.user_intent\" and j.get(\"payload\",{{}}).get(\"accepted\"):\n    txt=j[\"payload\"].get(\"text\",\"\")\n    if txt: ctx.append(\"USER: \"+txt[:500])\n   mm=j.get(\"payload\",{{}}).get(\"model_messages\") if isinstance(j.get(\"payload\"),dict) else None\n   if mm and isinstance(mm, list) and mm:\n    m0=mm[0]\n    if isinstance(m0,dict):\n     c=m0.get(\"content\")\n     if isinstance(c,list) and c:\n      t=c[0].get(\"text\") if isinstance(c[0],dict) else None\n      if t: ctx.append(\"USER: \"+t[:500])\n  except: pass\n print(\"\\n\".join(ctx[-6:]))\nexcept Exception as e:\n print(\"\")\n' 2>&1 | head -c 8000"
-        out, _ = run_on_host(host, cmd)
-        return (out or "").strip()[:limit_chars]
-    elif cli_slug == "antigravity":
-        cmd = f"cat {shlex.quote(path)} 2>/dev/null | tail -n 100 | head -c 8000"
-        out, _ = run_on_host(host, cmd)
-        return (out or "").strip()[:limit_chars]
-    else:
-        # Generic: use yggterm title helper's extract_tail_context via headless if available,
-        # else fallback to tail of jsonl -> recent_context
-        cmd = f"tail -n 96 {shlex.quote(path)} 2>/dev/null | head -c 8000"
-        out, _ = run_on_host(host, cmd)
-        # Try to parse as jsonl recent_context
-        snippets = []
-        for line in (out or "").splitlines()[-20:]:
-            line=line.strip()
-            if not line:
-                continue
-            try:
-                j=json.loads(line)
-                # Codex rollout has payload.type message role content
-                p=j.get("payload",{{}} ) if isinstance(j.get("payload"),dict) else {{}} 
-                if p.get("type")=="message":
-                    role=p.get("role","")
-                    content=p.get("content",[])
-                    if isinstance(content, list):
-                        txt=" ".join([c.get("text","") for c in content if isinstance(c,dict)][:1])
-                        if txt.strip():
-                            label="USER" if role=="user" else "ASSISTANT"
-                            snippets.append(f"{label}: {txt[:300]}")
-                # Claude cc has type human/assistant
-                if j.get("type") in ("human","assistant"):
-                    txt=j.get("message",{{}}).get("content","") if isinstance(j.get("message"),dict) else j.get("content","")
-                    if isinstance(txt, list):
-                        txt=" ".join([x.get("text","") for x in txt if isinstance(x,dict)][:1])
-                    if isinstance(txt,str) and txt.strip():
-                        snippets.append(f"{'USER' if j['type']=='human' else 'ASSISTANT'}: {txt[:300]}")
-            except:
-                continue
-        if snippets:
-            return "\n".join(snippets[-6:])[:limit_chars]
-        return (out or "").strip()[:limit_chars]
+    cmd = f"""python3 -c "
+import json, shlex, os
+path = {shlex.quote(path)}
+snippets = []
+try:
+    with open(path) as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()][-200:]
+    for line in lines:
+        try:
+            j = json.loads(line)
+            if j.get('type') == 'USER_INPUT':
+                c = j.get('content', '')
+                if '<USER_REQUEST>' in c:
+                    c = c.split('<USER_REQUEST>')[1].split('</USER_REQUEST>')[0].strip()
+                if c:
+                    snippets.append('USER: ' + c[:400])
+            elif j.get('type') in ('PLANNER_RESPONSE', 'MODEL'):
+                c = j.get('content', '')
+                if c:
+                    snippets.append('ASSISTANT: ' + c[:400])
+            p = j.get('payload') if isinstance(j.get('payload'), dict) else {{}}
+            if p.get('type') in ('message', 'user_message', 'agent_message'):
+                c = p.get('message') or p.get('content', '')
+                if isinstance(c, list):
+                    c = ' '.join([x.get('text', '') for x in c if isinstance(x, dict)])
+                if c:
+                    snippets.append(('USER: ' if p.get('role') == 'user' or p.get('type') == 'user_message' else 'ASSISTANT: ') + str(c)[:400])
+            if j.get('type') in ('human', 'user', 'assistant') and 'message' in j:
+                m = j.get('message')
+                if isinstance(m, dict):
+                    c = m.get('content', '')
+                    if isinstance(c, list):
+                        c = ' '.join([x.get('text', '') for x in c if isinstance(x, dict)])
+                    if c:
+                        snippets.append(('USER: ' if j.get('type') in ('human', 'user') else 'ASSISTANT: ') + str(c)[:400])
+        except Exception:
+            pass
+    print('\\n'.join(snippets[-8:]))
+except Exception:
+    print('')
+" 2>/dev/null | head -c 8000"""
+    out, _ = run_on_host(host, cmd)
+    return (out or "").strip()[:limit_chars]
+
+def heuristic_rescue_title(context, cli_slug="", cwd=""):
+    for line in context.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("USER:") or line.startswith("ASSISTANT:"):
+            line = line.split(":", 1)[1].strip()
+        if not line or line.startswith("<") or line.startswith("```") or line.startswith("#") or line.startswith("{"):
+            continue
+        if line.lower().startswith(("kind:", "kind ", "cwd:", "cwd ", "title:", "title ", "session_id:", "session_id ", "parentuuid")):
+            continue
+        words = [w.strip('"\',:;()[]{}') for w in line.split() if w.strip('"\',:;()[]{}')]
+        if words and len(words) >= 2:
+            candidate = " ".join(words[:6]).strip(".,;:-")
+            if not looks_like_weird_title(candidate) and not candidate.startswith("{"):
+                return candidate
+    return None
+
+def write_title_db(host, sid, title, cwd, model="sanitizer"):
+    import base64
+    payload = base64.b64encode(json.dumps([sid, title, cwd, model]).encode("utf-8")).decode("ascii")
+    py = f"""python3 -c "import sqlite3, os, base64, json; args = json.loads(base64.b64decode('{payload}').decode('utf-8')); sid, title, cwd, model = args; db = os.path.expanduser('~/.yggterm/session-titles.db'); os.makedirs(os.path.dirname(db), exist_ok=True); conn = sqlite3.connect(db); conn.execute('CREATE TABLE IF NOT EXISTS session_titles (session_id TEXT PRIMARY KEY, title TEXT NOT NULL, cwd TEXT NOT NULL, source TEXT NOT NULL, model TEXT NOT NULL, updated_at TEXT NOT NULL)'); conn.execute('INSERT OR REPLACE INTO session_titles (session_id, title, cwd, source, model, updated_at) VALUES (?, ?, ?, \\'sanitizer\\', ?, datetime(\\'now\\'))', (sid, title, cwd, model)); conn.commit(); print('OK')" """
+    out, err = run_on_host(host, py)
+    return (out or err or "").strip()
 
 def request_litellm_title(endpoint, api_key, model, context):
     import urllib.request
     import urllib.error
+    if not endpoint:
+        h = heuristic_rescue_title(context)
+        if h:
+            return h, None
+        return None, "no litellm endpoint configured and no heuristic candidate found"
     url = endpoint.rstrip("/") + "/chat/completions"
     if url.endswith("/v1/chat/completions"):
         pass
@@ -445,13 +472,8 @@ def main():
                     continue
                 print(f"LLM: {title!r}")
                 if args.write and title:
-                    # Write via yggterm headless title store on that host
-                    # Use sqlite directly: ~/.yggterm/session-titles.db
-                    cwd_esc = w["cwd"].replace("'", "''") if w["cwd"] else ""
-                    title_esc = title.replace("'", "''")
-                    cmd = f"sqlite3 ~/.yggterm/session-titles.db \"INSERT OR REPLACE INTO session_titles (session_id, title, cwd, source, model, updated_at) VALUES ('{sid}', '{title_esc}', '{cwd_esc}', 'litellm', '{model}', datetime('now')); SELECT changes();\" 2>&1 | head -n 5"
-                    out, err2 = run_on_host(host, cmd)
-                    print(f"    write: {out.strip()[:100] if out else err2}")
+                    res = write_title_db(host, sid, title, w.get("cwd", ""), model=model)
+                    print(f"    write: {res}")
                 w["rescued_title"] = title
                 w["rescue_error"] = err
 
