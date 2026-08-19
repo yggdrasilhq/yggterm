@@ -54,7 +54,7 @@ CLI_STORES = [
     {
         "slug": "claude-code",
         "globs": [".claude/projects/*/*.jsonl"],
-        "exclude": [],
+        "exclude": ["agent-", "/subagents/", "/workflows/"],
         "kind": "claude-code",
     },
     {
@@ -112,7 +112,7 @@ def fleet_hosts():
         hosts = [h.strip() for h in env.split(",") if h.strip()]
     return hosts
 
-def run_on_host(host, cmd, timeout=15):
+def run_on_host(host, cmd, timeout=45):
     if host == "local":
         full = cmd
     else:

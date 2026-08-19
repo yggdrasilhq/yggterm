@@ -865,6 +865,44 @@ fn dup_master_for_poll(master: &(dyn MasterPty + Send)) -> Option<std::os::fd::O
     (duped >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(duped) })
 }
 
+fn is_narrow_tui_session(key: &str, launch_command: &str) -> bool {
+    if launch_command.trim_start().starts_with("ssh ") {
+        return false;
+    }
+    const SCHEME_PREFIXES: &[&str] = &[
+        "remote-grok://",
+        "grok-runtime://",
+        "remote-opencode://",
+        "opencode-runtime://",
+        "remote-qwen://",
+        "qwen-runtime://",
+        "remote-kimi://",
+        "kimi-runtime://",
+        "remote-muse://",
+        "muse-runtime://",
+        "remote-agy://",
+        "agy-runtime://",
+        "remote-pi://",
+        "pi-runtime://",
+    ];
+    if SCHEME_PREFIXES.iter().any(|prefix| key.starts_with(prefix)) {
+        return true;
+    }
+    const CLI_BINARIES: &[&str] = &[
+        "grok", "opencode", "qwen", "kimi", "muse", "agy", "antigravity", "pi",
+    ];
+    for token in launch_command.split_whitespace() {
+        let binary_name = std::path::Path::new(token)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if CLI_BINARIES.contains(&binary_name) {
+            return true;
+        }
+    }
+    false
+}
+
 impl TerminalManager {
     pub fn new() -> Self {
         Self {
@@ -909,25 +947,8 @@ impl TerminalManager {
         // qwen, kimi) - they render at a fixed width (e.g. 100 cols) and leave
         // large dead margins on a 173-col viewport. Limiting the PTY makes the
         // TUI fill the available area and reduces blank_rows_below_cursor.
-        // Check both launch_command and key (session_path) because Runtime keys like
-        // opencode-runtime:// contain the slug even when launch_command is wrapped.
         let effective_initial_size = initial_size.map(|(cols, rows)| {
-            let is_narrow_tui = !launch_command.trim_start().starts_with("ssh ")
-                && (launch_command.contains("grok")
-                    || launch_command.contains("opencode")
-                    || launch_command.contains("qwen")
-                    || launch_command.contains("kimi")
-                    || launch_command.contains("muse")
-                    || launch_command.contains("agy")
-                    || launch_command.contains("pi")
-                    || key.contains("grok")
-                    || key.contains("opencode")
-                    || key.contains("qwen")
-                    || key.contains("kimi")
-                    || key.contains("muse")
-                    || key.contains("agy")
-                    || key.contains("pi"));
-            if is_narrow_tui {
+            if is_narrow_tui_session(key, launch_command) {
                 trace_terminal_event(
                     "pty_size_clamped",
                     serde_json::json!({
@@ -1642,22 +1663,7 @@ impl TerminalManager {
         // Clamp narrow TUIs (grok, opencode, qwen, kimi, muse) to a smaller grid so they
         // fill the viewport without large dead margins (see ensure_session_with_size).
         if let Some((cols, rows)) = effective_initial_size {
-            let is_narrow_tui = !launch_command.trim_start().starts_with("ssh ")
-                && (launch_command.contains("grok")
-                    || launch_command.contains("opencode")
-                    || launch_command.contains("qwen")
-                    || launch_command.contains("kimi")
-                    || launch_command.contains("muse")
-                    || launch_command.contains("agy")
-                    || launch_command.contains("pi")
-                    || key.contains("grok")
-                    || key.contains("opencode")
-                    || key.contains("qwen")
-                    || key.contains("kimi")
-                    || key.contains("muse")
-                    || key.contains("agy")
-                    || key.contains("pi"));
-            if is_narrow_tui {
+            if is_narrow_tui_session(key, launch_command) {
                 trace_terminal_event(
                     "pty_size_clamped_restart",
                     serde_json::json!({

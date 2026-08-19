@@ -279,15 +279,33 @@ fn try_faithful_startpage_rows(
     // Also compute remote_total and build remote durable rows from snapshot
     let (remote_rows, remote_total) = build_remote_durable_rows(&snapshot_json);
     // Faithful ordering: is_live > in_scope > modified_epoch > started_at > idx
-    let in_scope_checker = {
+    // Parse selected scope like GUI does (machine_key + cwd)
+    let (scope_machine, scope_cwd, scope_is_live_sessions) = {
         let selected_path = app_state.as_ref()
             .and_then(|v| v.get("data")).or(app_state.as_ref())
             .and_then(|d| d.get("selected_browser_path")).and_then(|v| v.as_str()).map(|s| s.to_string())
             .or_else(|| app_state.as_ref().and_then(|v| v.get("data")).or(app_state.as_ref()).and_then(|d| d.get("selected_row")).and_then(|r| r.get("full_path")).and_then(|v| v.as_str()).map(|s| s.to_string()));
-        move |row: &yggterm_core::startpage::StartpageDurableRow| {
-            let _ = &selected_path;
-            let _ = row;
-            true
+        if let Some(path) = selected_path {
+            if path == "__live_sessions__" {
+                (None, None, true)
+            } else if let Some(rest) = path.strip_prefix("__remote_folder__/") {
+                if let Some((machine, cwd_tail)) = rest.split_once('/') {
+                    let cwd = format!("/{}", cwd_tail);
+                    (Some(machine.to_string()), Some(cwd), false)
+                } else {
+                    (Some(rest.to_string()), None, false)
+                }
+            } else if let Some(machine) = path.strip_prefix("__remote_machine__/") {
+                (Some(machine.to_string()), None, false)
+            } else if path == "local" || path.starts_with('/') || path.starts_with("local://") {
+                // local scope — cwd may be path itself if it's a folder path
+                let cwd = if path.starts_with('/') { Some(path) } else { None };
+                (Some("__local__".to_string()), cwd, false)
+            } else {
+                (None, None, false)
+            }
+        } else {
+            (None, None, false)
         }
     };
     // Merge local + remote, dedup by session_id (same session may appear as both local file and remote scan)
@@ -295,6 +313,64 @@ fn try_faithful_startpage_rows(
     for row in store_rows { all_rows_map.insert(row.session_id.clone(), row); }
     for row in remote_rows {
         all_rows_map.entry(row.session_id.clone()).or_insert(row);
+    }
+    // Inject live sessions that have no durable transcript yet (dual presence)
+    // Use browser rows' session_cwd as authoritative cwd for live sessions
+    {
+        use yggterm_core::SessionKind;
+        for brow in &browser_rows {
+            if brow.get("kind").and_then(|v| v.as_str()) != Some("Session") { continue; }
+            // Skip app/terminal rows
+            if brow.get("document_kind").and_then(|v| v.as_str()).is_some() { continue; }
+            let host_label = brow.get("host_label").and_then(|v| v.as_str()).unwrap_or("");
+            let icon_kind = brow.get("icon_kind").and_then(|v| v.as_str()).unwrap_or("");
+            if host_label == "local-shell" || icon_kind == "terminal" { continue; }
+            let full_path = brow.get("full_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // Check if this browser row corresponds to a live session
+            let is_live_browser = live_set.contains(&full_path)
+                || brow.get("live_member").and_then(|v| v.as_bool()).unwrap_or(false)
+                || brow.get("live_keep_alive").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !is_live_browser { continue; }
+            let sid = brow.get("session_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if sid.is_empty() || all_rows_map.contains_key(&sid) { continue; }
+            let cwd = brow.get("session_cwd").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_else(|| "/home/user".to_string()));
+            let label = brow.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty());
+            // Map icon_kind to SessionKind
+            let kind = match icon_kind {
+                "claude-code" => SessionKind::ClaudeCode,
+                "codex" => SessionKind::Codex,
+                "muse" => SessionKind::Muse,
+                "antigravity" => SessionKind::Antigravity,
+                "pi" => SessionKind::Pi,
+                "opencode" => SessionKind::OpenCode,
+                "qwen" => SessionKind::QwenCode,
+                "kimi" => SessionKind::Kimi,
+                "grok" => SessionKind::GrokBuild,
+                _ => {
+                    // Fallback: try to infer from full_path scheme
+                    if full_path.starts_with("remote-cc://") || full_path.contains("claude") { SessionKind::ClaudeCode }
+                    else if full_path.starts_with("remote-session://") { SessionKind::Codex }
+                    else if full_path.starts_with("local://") { SessionKind::Muse }
+                    else { SessionKind::ClaudeCode }
+                }
+            };
+            let display_path = full_path.clone();
+            let storage_path = brow.get("session_cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            let row = yggterm_core::startpage::StartpageDurableRow {
+                session_id: sid.clone(),
+                cwd: cwd.clone(),
+                title: label.clone(),
+                generated_title: None,
+                effective_title: label.clone(),
+                detail: None,
+                kind,
+                modified_epoch_ms: now_ms,
+                storage_path: if storage_path.is_empty() { display_path.clone() } else { storage_path },
+                display_path,
+            };
+            all_rows_map.insert(sid, row);
+        }
     }
     let mut all_rows: Vec<yggterm_core::startpage::StartpageDurableRow> = all_rows_map.into_values().collect();
     // Keep browser counts for warnings (must be computed before draining)
@@ -316,10 +392,36 @@ fn try_faithful_startpage_rows(
         .count();
     let mut candidates: Vec<(yggterm_core::startpage::StartpageDurableRow, bool, bool, i64, String, usize)> = Vec::new();
     for (idx, row) in all_rows.drain(..).enumerate() {
-        let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || remote_epoch_by_id.contains_key(&row.session_id) || live_set.contains(&format!("remote-cc://{}", row.session_id)) || live_set.contains(&format!("remote-session://{}", row.session_id));
+        let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || live_set.contains(&row.session_id) || live_set.contains(&format!("remote-cc://{}", row.session_id)) || live_set.contains(&format!("remote-session://{}", row.session_id)) || live_set.contains(&format!("local://{}", row.session_id));
         let epoch_ms = remote_epoch_by_id.get(&row.session_id).map(|e| (*e as u128) * 1000).unwrap_or(row.modified_epoch_ms);
         let epoch = i64::try_from(epoch_ms / 1000).unwrap_or(0);
-        let in_scope = in_scope_checker(&row);
+        let in_scope = if scope_is_live_sessions {
+            is_live
+        } else if scope_machine.is_some() && scope_cwd.is_some() {
+            let scope_cwd_str = scope_cwd.as_deref().unwrap();
+            let scope_machine_str = scope_machine.as_deref().unwrap();
+            let row_cwd = row.cwd.trim();
+            let scope_cwd_trim = scope_cwd_str.trim();
+            let cwd_match = row_cwd == scope_cwd_trim || row_cwd.starts_with(&format!("{}/", scope_cwd_trim.trim_end_matches('/')));
+            let machine_match = if scope_machine_str == "__local__" {
+                !row.display_path.starts_with("remote-")
+            } else {
+                row.display_path.contains(scope_machine_str)
+            };
+            cwd_match && machine_match
+        } else if let Some(scope_cwd_str) = scope_cwd.as_deref() {
+            let row_cwd = row.cwd.trim();
+            let scope_cwd_trim = scope_cwd_str.trim();
+            row_cwd == scope_cwd_trim || row_cwd.starts_with(&format!("{}/", scope_cwd_trim.trim_end_matches('/')))
+        } else if let Some(scope_machine_str) = scope_machine.as_deref() {
+            if scope_machine_str == "__local__" {
+                !row.display_path.starts_with("remote-")
+            } else {
+                row.display_path.contains(scope_machine_str)
+            }
+        } else {
+            true
+        };
         // started_at for remote rows is available via remote map, but we use String::new for now (ordering tie-break)
         candidates.push((row, is_live, in_scope, epoch, String::new(), idx));
     }

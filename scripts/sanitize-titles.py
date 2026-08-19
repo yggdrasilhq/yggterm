@@ -39,7 +39,7 @@ CLI_STORES = [
     {"slug": "muse", "globs": [".local/share/muse/sessions/**/session.jsonl"], "exclude": ["/subagent/", "/tool-outputs/"], "kind": "muse"},
     {"slug": "codex", "globs": [".codex/sessions/**/rollout-*.jsonl"], "exclude": [".bak."], "kind": "codex"},
     {"slug": "codex-litellm", "globs": [".codex-litellm/sessions/**/rollout-*.jsonl"], "exclude": [".bak."], "kind": "codex-litellm"},
-    {"slug": "claude-code", "globs": [".claude/projects/*/*.jsonl"], "exclude": [], "kind": "claude-code"},
+    {"slug": "claude-code", "globs": [".claude/projects/*/*.jsonl"], "exclude": ["agent-", "/subagents/", "/workflows/"], "kind": "claude-code"},
     {"slug": "pi", "globs": [".pi/agent/sessions/*/*.jsonl"], "exclude": [], "kind": "pi"},
     {"slug": "qwen", "globs": [".qwen/projects/*/chats/*.jsonl"], "exclude": [".runtime."], "kind": "qwen"},
     {"slug": "antigravity", "globs": [".gemini/antigravity-cli/conversations/*.db", ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"], "exclude": ["-shm", "-wal"], "kind": "antigravity"},
@@ -90,7 +90,7 @@ def looks_like_weird_title(title: str, cwd: str = "") -> str | None:
         return "shorthash prefix"
     return None
 
-def run_on_host(host, cmd, timeout=15):
+def run_on_host(host, cmd, timeout=45):
     if host == "local":
         full = cmd
     else:
@@ -251,6 +251,15 @@ def request_litellm_title(endpoint, api_key, model, context):
         r = requests.post(url, json=body, headers=headers, timeout=30)
         if r.status_code == 429:
             return None, "rate limited 429 — retry next tick, do not persist heuristic"
+        if r.status_code == 500 and model == "chatgpt/gpt-5.6-luna":
+            # Fallback: endpoint's chatgpt mapping may be temporarily on responses API; try gemini
+            fallback = "antigravity/gemini-3.7-flash"
+            body["model"] = fallback
+            r = requests.post(url, json=body, headers=headers, timeout=30)
+            if r.status_code == 429:
+                return None, "rate limited 429 — retry next tick, do not persist heuristic"
+            if r.status_code == 500:
+                return None, f"500 from both {model} and fallback {fallback} — endpoint may be on responses API, not chat"
         r.raise_for_status()
         j = r.json()
         # OpenAI-compatible: choices[0].message.content

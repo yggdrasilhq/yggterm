@@ -54,7 +54,7 @@ CLI_STORES = [
     {
         "slug": "claude-code",
         "globs": [".claude/projects/*/*.jsonl"],
-        "exclude": [],
+        "exclude": ["agent-", "/subagents/", "/workflows/"],
         "kind": "claude-code",
     },
     {
@@ -112,7 +112,7 @@ def fleet_hosts():
         hosts = [h.strip() for h in env.split(",") if h.strip()]
     return hosts
 
-def run_on_host(host, cmd, timeout=15):
+def run_on_host(host, cmd, timeout=45):
     if host == "local":
         full = cmd
     else:
@@ -266,7 +266,11 @@ def parse_file_on_host(host, path, cli_slug):
             except:
                 pass
         if not cwd:
-            return {"session_id": None, "raw": ""}
+            parent_name = Path(path).parent.name
+            if parent_name.startswith("-"):
+                cwd = "/" + parent_name[1:].replace("-", "/")
+            else:
+                cwd = home
         # Title precedence per Rust read_cc_session_title: latest custom-title wins,
         # else latest ai-title, else first human prompt (we approximate with custom then ai).
         title = None

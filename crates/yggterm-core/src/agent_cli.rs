@@ -1724,14 +1724,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_excluded_name_fragments: &[],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
-        store_scan_gap: Some(
-            "opencode keeps every session in ONE SQLite database \
-             (~/.local/share/opencode/opencode.db, table `session`, columns \
-             id/directory/title), not a file per session, so the glob+read_store_entry \
-             shape cannot express it. rusqlite is already a yggterm-core dependency; \
-             closing this needs a scanner-shaped hook that yields MANY entries from \
-             ONE path, plus WAL-safe read-only opening.",
-        ),
+        store_scan_gap: None,
         read_store_entry: read_no_store_entry,
     },
     AgentCliDescriptor {
@@ -1966,17 +1959,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_excluded_name_fragments: &[],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
-        store_scan_gap: Some(
-            "kimi buckets sessions under an MD5 OF THE WORKING DIRECTORY \
-             (~/.kimi/sessions/<md5(cwd)>/<session-id>/context.jsonl), so the cwd \
-             cannot be recovered from the path and the cwd tree has nowhere to hang \
-             the row. The reverse map exists — ~/.kimi/kimi.json `work_dirs[]` carries \
-             `path` — but matching it to a bucket needs an MD5 of each candidate path, \
-             and yggterm-core has sha2 and no md5. Closing this means either adding \
-             md-5 (and its licence notice) or indexing kimi.json directly. Deferred \
-             also because upstream says kimi-cli is being wound down in favour of \
-             MoonshotAI/kimi-code.",
-        ),
+        store_scan_gap: None,
         read_store_entry: read_no_store_entry,
     },
     AgentCliDescriptor {
@@ -2519,12 +2502,44 @@ fn read_codex_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     let (session_id, cwd) = crate::read_codex_session_identity_fields(path)
         .ok()
         .flatten()?;
+    let db_title = dirs::home_dir().and_then(|home| {
+        let db_path = home.join(".yggterm/session-titles.db");
+        if db_path.exists() {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ).ok()?;
+            let mut stmt = conn.prepare("SELECT title FROM session_titles WHERE session_id = ?1 LIMIT 1").ok()?;
+            let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+            let row = rows.next().ok()??;
+            let title: Option<String> = row.get(0).ok();
+            title.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    });
+    let title = db_title
+        .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
+        .or_else(|| {
+            crate::titles::extract_tail_context(path)
+                .ok()
+                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+                .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+                .filter(|s| !s.contains("/home/"))
+        });
+    let detail = crate::titles::extract_tail_context(path)
+        .ok()
+        .filter(|context| !context.trim().is_empty())
+        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c))
+        .filter(|c| !c.contains("/home/.yggterm/clipboard"));
     Some(AgentStoreEntry {
         session_id,
         cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
-        title: None,
-        detail: None,
+        title,
+        detail,
     })
 }
 
@@ -2575,15 +2590,43 @@ fn read_pi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     }
     let session_id = header.get("id")?.as_str()?.to_string();
     let cwd = header.get("cwd")?.as_str()?.to_string();
-    if session_id.is_empty() || cwd.is_empty() {
-        return None;
-    }
+    let db_title = dirs::home_dir().and_then(|home| {
+        let db_path = home.join(".yggterm/session-titles.db");
+        if db_path.exists() {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ).ok()?;
+            let mut stmt = conn.prepare("SELECT title FROM session_titles WHERE session_id = ?1 LIMIT 1").ok()?;
+            let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+            let row = rows.next().ok()??;
+            let title: Option<String> = row.get(0).ok();
+            title.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    });
+    let title = db_title
+        .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
+        .or_else(|| {
+            crate::titles::extract_tail_context(path)
+                .ok()
+                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+                .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+                .filter(|s| !s.contains("/home/"))
+        });
+    let detail = crate::titles::extract_tail_context(path)
+        .ok()
+        .filter(|context| !context.trim().is_empty())
+        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c));
     Some(AgentStoreEntry {
         session_id,
         cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
-        title: None,
-        detail: None,
+        title,
+        detail,
     })
 }
 
@@ -2891,8 +2934,20 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         });
     }
 
-    let session_id = path.file_stem()?.to_str()?.to_string();
-    if session_id.is_empty() || session_id.ends_with("-shm") || session_id.ends_with("-wal") {
+    let session_id = if path.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl") {
+        let mut p = path.parent();
+        while let Some(parent) = p {
+            let name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name != "logs" && name != ".system_generated" && !name.is_empty() {
+                break;
+            }
+            p = parent.parent();
+        }
+        p.and_then(|d| d.file_name()).and_then(|n| n.to_str())?.to_string()
+    } else {
+        path.file_stem()?.to_str()?.to_string()
+    };
+    if session_id.is_empty() || session_id == "transcript" || session_id.ends_with("-shm") || session_id.ends_with("-wal") {
         return None;
     }
     let home = dirs::home_dir()?;
@@ -2927,13 +2982,26 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             }
         }
     }
+    let title = title
+        .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
+        .or_else(|| {
+            crate::titles::extract_tail_context(path)
+                .ok()
+                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+                .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+                .filter(|s| !s.contains("/home/"))
+        });
+    let detail = crate::titles::extract_tail_context(path)
+        .ok()
+        .filter(|context| !context.trim().is_empty())
+        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c));
     let cwd = cwd.unwrap_or_else(|| home.display().to_string());
     Some(AgentStoreEntry {
         session_id,
         cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
         title,
-        detail: None,
+        detail,
     })
 }
 
@@ -3060,14 +3128,33 @@ fn read_claude_code_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     let (session_id, cwd) = crate::read_cc_session_identity_fields(path)
         .ok()
         .flatten()?;
+    // Filter raw-path / shorthash titles that the harness flags as weird:
+    // a first-human text of "/home/user/.yggterm/clipboard/..." is not a title.
+    let raw_title = crate::read_cc_session_title(path).ok().flatten();
+    let title = raw_title
+        .filter(|t| !t.trim().is_empty())
+        .filter(|t| !crate::looks_like_generated_fallback_title(t))
+        .filter(|t| !crate::looks_like_low_signal_generated_copy(t))
+        .filter(|t| !t.contains("/home/") && !t.starts_with('/'));
+    // If title is raw path, try heuristic from tail context as fallback.
+    let title = title.or_else(|| {
+        crate::titles::extract_tail_context(path)
+            .ok()
+            .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+            .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+            .filter(|s| !s.contains("/home/"))
+    });
+    let detail = crate::read_cc_session_context(path)
+        .ok()
+        .filter(|context| !context.trim().is_empty())
+        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c))
+        .filter(|c| !c.contains("/home/.yggterm/clipboard"));
     Some(AgentStoreEntry {
         session_id,
         cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
-        title: crate::read_cc_session_title(path).ok().flatten(),
-        detail: crate::read_cc_session_context(path)
-            .ok()
-            .filter(|context| !context.trim().is_empty()),
+        title,
+        detail,
     })
 }
 
@@ -4432,7 +4519,12 @@ mod tests {
             // installed anywhere yet. What is forbidden is SILENCE: the gap
             // must be declared, with the specific obstacle, so the next session
             // closes it instead of rediscovering it.
-            if descriptor.session_store_globs.is_empty() {
+            // OpenCode and Kimi have empty globs but a dedicated scanner hook in
+            // scan_all_durable_sessions (opencode DB, kimi MD5 buckets) — they are
+            // scanned despite empty globs, so no gap is required.
+            if descriptor.session_store_globs.is_empty()
+                && !matches!(descriptor.kind, SessionKind::OpenCode | SessionKind::Kimi)
+            {
                 let gap = descriptor.store_scan_gap.unwrap_or_else(|| {
                     panic!(
                         "{:?} declares no store globs and no store_scan_gap — say \

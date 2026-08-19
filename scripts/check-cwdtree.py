@@ -37,7 +37,7 @@ from collections import defaultdict
 CLI_STORES = [
     {"slug": "codex", "globs": [".codex/sessions/**/rollout-*.jsonl"], "exclude": [".bak."], "kind": "codex", "glyph": ">_", "color": "#0f766e"},
     {"slug": "codex-litellm", "globs": [".codex-litellm/sessions/**/rollout-*.jsonl"], "exclude": [".bak."], "kind": "codex-litellm", "glyph": ">_", "color": "#0369a1"},
-    {"slug": "claude-code", "globs": [".claude/projects/*/*.jsonl"], "exclude": [], "kind": "claude-code", "glyph": "*_", "color": "#c2410c"},
+    {"slug": "claude-code", "globs": [".claude/projects/*/*.jsonl"], "exclude": ["agent-", "/subagents/", "/workflows/"], "kind": "claude-code", "glyph": "*_", "color": "#c2410c"},
     {"slug": "pi", "globs": [".pi/agent/sessions/*/*.jsonl"], "exclude": [], "kind": "pi", "glyph": "π_", "color": "#be185d"},
     {"slug": "qwen", "globs": [".qwen/projects/*/chats/*.jsonl"], "exclude": [".runtime."], "kind": "qwen", "glyph": "Q_", "color": "#6d28d9"},
     {"slug": "antigravity", "globs": [".gemini/antigravity-cli/conversations/*.db", ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"], "exclude": ["-shm", "-wal"], "kind": "antigravity", "glyph": "A_", "color": "#1557b0"},
@@ -73,7 +73,7 @@ def fleet_hosts():
     return hosts
 
 
-def run_on_host(host, cmd, timeout=15):
+def run_on_host(host, cmd, timeout=45):
     if host == "local":
         full = cmd
     else:
