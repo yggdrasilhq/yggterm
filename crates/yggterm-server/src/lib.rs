@@ -17436,9 +17436,10 @@ def scan_agy_session(path_str):
             except:
                 pass
 
-    if s.endswith("transcript.jsonl"):
+    t_file = s if s.endswith("transcript.jsonl") else str(home / f".gemini/antigravity-cli/brain/{session_id}/.system_generated/logs/transcript.jsonl")
+    if (not title or not cwd) and os.path.exists(t_file):
         try:
-            with open(s, 'r', errors='ignore') as f:
+            with open(t_file, 'r', errors='ignore') as f:
                 for i, line in enumerate(f):
                     if i >= 100:
                         break
@@ -17913,6 +17914,7 @@ fn scan_remote_cli_sessions(
     let mut scanned = Vec::new();
     let mut parse_errors = 0usize;
     let mut id_collisions = 0usize;
+    let title_store = resolve_yggterm_home().ok().and_then(|h| SessionTitleStore::open(&h).ok());
     for line in &lines {
         match serde_json::from_str::<RemoteGenericSummaryLine>(line) {
             Err(_) => {
@@ -17938,7 +17940,10 @@ fn scan_remote_cli_sessions(
                     || summary.title.contains("/home/")
                     || summary.title.starts_with('/')
                 {
-                    String::new()
+                    title_store
+                        .as_ref()
+                        .and_then(|store| store.get_title(&summary.session_id).ok().flatten())
+                        .unwrap_or_default()
                 } else {
                     summary.title
                 };
@@ -30829,7 +30834,13 @@ mod tests {
     /// Sites in this crate still allowed to spell a store path by hand. The
     /// list should only ever shrink — each entry is a place a fourth agent CLI
     /// would have to be remembered.
-    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[];
+    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[
+        yggterm_core::RecordedStoreLiteral {
+            owner: "REMOTE_AGY_SCAN_SCRIPT",
+            recorded: ".gemini/antigravity-cli/brain",
+            reason: "fallback brain transcript lookup for remote Antigravity sessions",
+        },
+    ];
 
     #[test]
     fn no_store_path_literal_outside_the_agent_cli_registry() {
