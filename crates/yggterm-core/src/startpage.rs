@@ -12,24 +12,14 @@ use std::path::{Path, PathBuf};
 use crate::agent_cli::{AGENT_CLIS, AgentStoreEntry};
 use crate::SessionKind;
 
-/// Whether a session file is noise (empty or no agent turn) and should be deleted on sight.
-/// Guard: files younger than 60s are kept to avoid deleting a CLI mid-write.
-/// Mirrors the spec heading 8 (2026-08-17) and is called from both startpage and cwd tree.
+/// Whether a session file is noise (empty or zero-prompt placeholder) and should be skipped during scan.
+/// Note: Startpage scanning is strictly READ-ONLY. Noise files are skipped in memory and NEVER deleted from disk.
 pub fn is_noise_session_file(path: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else { return false };
-    if meta.len() < 20 { return true }
+    if meta.len() == 0 { return true }
     let path_str = path.display().to_string();
-    // Muse: a session with no prompts is noise even if the bootstrap is >7k.
-    // Query session-index.db for prompt_count; a zero-prompt session that is
-    // older than the 60s guard is the exact "New session" placeholder the
-    // detector used to keep via the >5000 bypass.
+    // Muse: a session with no prompts is noise.
     if path_str.contains("muse/sessions") {
-        // Muse's JSONL is NOT codex-shaped, so the generic extract_tail_context
-        // below would misclassify every real Muse session as noise (empty context
-        // → large-file bypass removed). Decide SOLELY from the DB when the DB
-        // has an entry — that is the source `muse resume` lists from.
-        let mut muse_db_decided = false;
-        let mut muse_is_noise: bool = false;
         if let Some(home) = dirs::home_dir() {
             let db_path = home.join(".local/share/muse/session-index.db");
             if db_path.exists() {
@@ -45,7 +35,6 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
                         ) {
                             if let Ok(mut rows) = stmt.query(rusqlite::params![parent]) {
                                 if let Ok(Some(row)) = rows.next() {
-                                    muse_db_decided = true;
                                     let prompt_count: i64 = row.get(0).unwrap_or(1);
                                     let title: String = row.get(1).unwrap_or_default();
                                     let title_lower = title.trim().to_ascii_lowercase();
@@ -54,12 +43,7 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
                                             || title_lower.is_empty()
                                             || title_lower == "new muse code session")
                                     {
-                                        muse_is_noise = true;
-                                    } else if prompt_count <= 1 && title_lower.len() <= 8 {
-                                        let lower = title_lower.as_str();
-                                        if matches!(lower, "hi" | "hello" | "hey" | "/" | "/status" | "/help" | "/context" | "/clear" | "test") {
-                                            muse_is_noise = true;
-                                        }
+                                        return true;
                                     }
                                 }
                             }
@@ -68,75 +52,8 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
                 }
             }
         }
-        if muse_db_decided {
-            return muse_is_noise;
-        }
-        // No DB entry (old file or DB absent) — fall through to generic check.
-        // Do not early-return false on size alone; the generic tail will decide.
     }
-    // Antigravity: its JSONL is payload_type USER_INPUT or conversation_summaries.db,
-    // not Codex-shaped. Using the generic Codex tail would mark every real AGY
-    // session as noise. Prefer transcript presence when the DB is absent.
-    if path_str.contains("antigravity") || path_str.contains(".gemini") {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            // AGY transcript with a USER_INPUT and a non-whitespace prompt is not noise.
-            if content.contains("USER_INPUT") {
-                // Find a prompt line with substantive text (>10 chars after trimming tags)
-                for line in content.lines().take(32) {
-                    if line.contains("USER_INPUT") {
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                            if let Some(c) = value.get("content").and_then(|v| v.as_str()) {
-                                let prompt = if let Some(s) = c.find("<USER_REQUEST>") {
-                                    let after = &c[s + "<USER_REQUEST>".len()..];
-                                    after.split("</USER_REQUEST>").next().unwrap_or(after)
-                                } else {
-                                    c
-                                };
-                                if prompt.trim().len() >= 10 {
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                }
-                // Has USER_INPUT but no extractable prompt — still not noise (has turn)
-                return false;
-            }
-            if content.len() > 500 && content.contains("conversation_id") {
-                return false;
-            }
-        }
-        // For AGY .db files, stat-based size already handled; fall through to false
-        // only if file is truly empty. A .db with tables is not noise.
-        if path.extension().and_then(|e| e.to_str()) == Some("db") {
-            return false;
-        }
-    }
-    // Generic tail-context check: if we can extract substantive context (>=20 chars
-    // and not low-signal), this is not noise. Otherwise it is.
-    if let Ok(ctx) = crate::titles::extract_tail_context(path) {
-        let trimmed = ctx.trim();
-        if trimmed.len() >= 20 && !crate::looks_like_low_signal_generated_copy(trimmed) {
-            // Additionally, a context that is only a single "hi" or slash command
-            // is still noise — treat ultra-short prompt after stripping header.
-            let lower = trimmed.to_ascii_lowercase();
-            // If the only USER line is a single word hi/slash, the context will be just that.
-            if lower == "hi" || lower == "hello" || lower == "hey" || lower.starts_with("user: hi") || lower.contains("user: /status") {
-                return true;
-            }
-            return false;
-        }
-        // ctx exists but is empty/short/low-signal => noise candidate, continue to final verdict
-    } else if let Ok(content) = std::fs::read_to_string(path) {
-        // Fallback for unreadable tail: if file contains agent marker and is substantial, keep.
-        // But a small file (<500) with no substantive marker is noise.
-        if content.len() > 500 && content.to_lowercase().contains("agent") {
-            return false;
-        }
-    }
-    // No size-based keep-alive: a 7k muse bootstrap with 12 lines and no agent turn
-    // must be deleted. Large-file bypass was the bug.
-    true
+    false
 }
 
 /// One session as the startpage sees it — durable, from a store file.
@@ -166,24 +83,240 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
     let mut out = Vec::new();
     let mut seen_paths = HashSet::<PathBuf>::new();
     for descriptor in AGENT_CLIS {
+        if descriptor.kind == crate::SessionKind::OpenCode {
+            scan_opencode_sessions(home, &mut out);
+            continue;
+        }
+        if descriptor.kind == crate::SessionKind::Kimi {
+            scan_kimi_sessions(home, &mut out, &mut seen_paths);
+            continue;
+        }
         if descriptor.session_store_globs.is_empty() {
             continue;
         }
         for root in descriptor.store_roots_absolute(home) {
-            // `store_roots_absolute` returns the directory *above* the glob's
-            // literal prefix (e.g. `~/.codex`), but walk from the parent that
-            // actually exists — `collect` will filter by `store_path_is_session_file`.
+            // `store_roots_absolute` returns the directory above the glob's literal
+            // prefix (e.g. `~/.codex/sessions` for codex, `~/.local/share/muse/sessions`
+            // for Muse). Walk from that directory even when the glob contains `**`
+            // — the recursive walk plus `store_path_is_session_file` does the glob
+            // matching, so a shallow literal prefix would otherwise miss deep
+            // `YYYY/MM/DD/<uuid>/session.jsonl` layouts.
             let walk_root = root;
             if !walk_root.exists() {
                 continue;
             }
+            // Also walk the XDG fallback for Muse when `XDG_DATA_HOME` is set
+            // but the store still lives under `~/.local/share` — the descriptor's
+            // `store_home_env_override` is None for Muse, so we check both.
             walk_and_collect(descriptor, &walk_root, &mut out, &mut seen_paths);
+            // For Muse, also check the XDG_DATA_HOME location if it differs
+            if descriptor.kind == crate::SessionKind::Muse {
+                if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+                    let xdg_root = PathBuf::from(xdg).join("muse/sessions");
+                    if xdg_root != walk_root && xdg_root.exists() && !seen_paths.contains(&xdg_root) {
+                        walk_and_collect(descriptor, &xdg_root, &mut out, &mut seen_paths);
+                    }
+                }
+            }
         }
     }
     // Add Codex-family legacy roots that live under `~/.codex/sessions` with
     // date subdirectories — already covered by AGENT_CLIS walk, but keep as
     // fallback if walk missed due to permission.
     out
+}
+
+fn scan_opencode_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
+    let db_path = home.join(".local/share/opencode/opencode.db");
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, directory, title, time_updated, time_created FROM session",
+    ) else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let directory: String = row.get(1)?;
+        let title: String = row.get(2)?;
+        let time_updated: i64 = row.get(3)?;
+        let time_created: i64 = row.get(4)?;
+        Ok((id, directory, title, time_updated, time_created))
+    }) else {
+        return;
+    };
+    for row in rows.flatten() {
+        let (session_id, directory, raw_title, time_updated, time_created) = row;
+        if session_id.trim().is_empty() {
+            continue;
+        }
+        let cwd = if directory.trim().is_empty() {
+            home.display().to_string()
+        } else {
+            directory.clone()
+        };
+        // time_updated/created are seconds since epoch (INTEGER NOT NULL in schema)
+        let epoch_ms = if time_updated > 0 {
+            (time_updated as u128) * 1000
+        } else if time_created > 0 {
+            (time_created as u128) * 1000
+        } else {
+            0
+        };
+        let title = raw_title.trim();
+        let filtered_title = if title.is_empty()
+            || crate::looks_like_generated_fallback_title(title)
+            || crate::looks_like_low_signal_generated_copy(title)
+        {
+            None
+        } else {
+            Some(title.to_string())
+        };
+        let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::OpenCode);
+        let is_store_auth = descriptor.map(|d| d.title_is_store_authoritative()).unwrap_or(false);
+        let generated_title = if is_store_auth && filtered_title.is_some() {
+            None
+        } else {
+            StartpageDurableRow::load_generated_title(&session_id)
+        };
+        let filtered_gen = generated_title.clone().filter(|s| {
+            !crate::looks_like_generated_fallback_title(s)
+                && !crate::looks_like_low_signal_generated_copy(s)
+        });
+        let effective_title = if is_store_auth {
+            filtered_title.clone().or(filtered_gen.clone())
+        } else {
+            filtered_gen.clone().or(filtered_title.clone())
+        };
+        let display_path = descriptor
+            .and_then(|d| d.remote_row_scheme)
+            .map(|s| format!("{}{}", s, session_id))
+            .unwrap_or_else(|| db_path.display().to_string());
+        out.push(StartpageDurableRow {
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            title: filtered_title,
+            generated_title: filtered_gen,
+            effective_title,
+            detail: None,
+            kind: crate::SessionKind::OpenCode,
+            modified_epoch_ms: epoch_ms,
+            storage_path: db_path.display().to_string(),
+            display_path,
+        });
+    }
+}
+
+fn scan_kimi_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>, seen: &mut HashSet<PathBuf>) {
+    // Kimi buckets: ~/.kimi/sessions/<md5(cwd)>/<session-id>/context.jsonl
+    // Reverse map lives in ~/.kimi/kimi.json work_dirs[].path
+    let kimi_json_path = home.join(".kimi/kimi.json");
+    let sessions_root = home.join(".kimi/sessions");
+    if !sessions_root.exists() {
+        return;
+    }
+    // Build md5 -> cwd map from kimi.json
+    let mut md5_to_cwd: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(content) = std::fs::read_to_string(&kimi_json_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(work_dirs) = v.get("work_dirs").and_then(|w| w.as_array()) {
+                for wd in work_dirs {
+                    if let Some(p) = wd.get("path").and_then(|s| s.as_str()) {
+                        let md5_hex = format!("{:x}", md5::compute(p.as_bytes()));
+                        md5_to_cwd.insert(md5_hex, p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // Also walk all bucket dirs and fallback to unknown if not in map (handles md5 buckets not in work_dirs)
+    let Ok(buckets) = std::fs::read_dir(&sessions_root) else {
+        return;
+    };
+    for bucket_entry in buckets.flatten() {
+        let bucket_path = bucket_entry.path();
+        if !bucket_path.is_dir() {
+            continue;
+        }
+        let bucket_name = bucket_entry.file_name().to_string_lossy().to_string();
+        let cwd = md5_to_cwd.get(&bucket_name).cloned().unwrap_or_else(|| {
+            // Fallback: unknown cwd, use home; but still surface the session so divergence is visible
+            // rather than silently dropping it. The cwd tree will hang it at home.
+            home.display().to_string()
+        });
+        let Ok(sessions) = std::fs::read_dir(&bucket_path) else {
+            continue;
+        };
+        for sess_entry in sessions.flatten() {
+            let sess_path = sess_entry.path();
+            if !sess_path.is_dir() {
+                continue;
+            }
+            let session_id = sess_entry.file_name().to_string_lossy().to_string();
+            if session_id.trim().is_empty() {
+                continue;
+            }
+            let context_path = sess_path.join("context.jsonl");
+            if !context_path.exists() {
+                continue;
+            }
+            if !seen.insert(context_path.clone()) {
+                continue;
+            }
+            // Noise check: skip empty placeholder
+            if is_noise_session_file(&context_path) {
+                continue;
+            }
+            let modified_epoch_ms = std::fs::metadata(&context_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            // Title: kimi stores no title in context.jsonl system prompt; use generated or heuristic fallback
+            let generated = StartpageDurableRow::load_generated_title(&session_id);
+            let filtered_gen = generated.clone().filter(|s| {
+                !crate::looks_like_generated_fallback_title(s)
+                    && !crate::looks_like_low_signal_generated_copy(s)
+            });
+            // Heuristic from tail context if available
+            let heuristic = crate::titles::extract_tail_context(&context_path)
+                .ok()
+                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+                .filter(|s| {
+                    !crate::looks_like_generated_fallback_title(s)
+                        && !crate::looks_like_low_signal_generated_copy(s)
+                });
+            let effective_title = filtered_gen.clone().or(heuristic.clone());
+            let title = filtered_gen.clone();
+            let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::Kimi);
+            let display_path = descriptor
+                .and_then(|d| d.remote_row_scheme)
+                .map(|s| format!("{}{}", s, session_id))
+                .unwrap_or_else(|| context_path.display().to_string());
+            out.push(StartpageDurableRow {
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+                title,
+                generated_title: filtered_gen,
+                effective_title,
+                detail: None,
+                kind: crate::SessionKind::Kimi,
+                modified_epoch_ms,
+                storage_path: context_path.display().to_string(),
+                display_path,
+            });
+        }
+    }
 }
 
 fn walk_and_collect(
@@ -210,42 +343,7 @@ fn walk_and_collect(
             if !seen.insert(path.clone()) {
                 continue;
             }
-            // Noise deletion (heading 8) — mtime guard 60s, then DELETE file + title store entry.
             if is_noise_session_file(&path) {
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if let Ok(mtime) = meta.modified() {
-                        if let Ok(elapsed) = mtime.elapsed() {
-                            if elapsed.as_secs() < 60 {
-                                // Too young — keep for now, skip push but don't delete.
-                                continue;
-                            }
-                        }
-                    }
-                }
-                let _ = std::fs::remove_file(&path);
-                // Best-effort: remove any generated title for this id.
-                if let Some(entry) = (descriptor.read_store_entry)(&path) {
-                    if let Some(home) = dirs::home_dir() {
-                        if let Ok(store) = crate::SessionTitleStore::open(&home.join(".yggterm")) {
-                            let _ = store.delete_title(&entry.session_id);
-                        }
-                        if let Ok(store) = crate::SessionTitleStore::open(&home) {
-                            let _ = store.delete_title(&entry.session_id);
-                        }
-                    }
-                } else if let Some(home) = dirs::home_dir() {
-                    // Fallback: derive id from filename/parent for Muse etc.
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        if let Ok(store) = crate::SessionTitleStore::open(&home.join(".yggterm")) {
-                            let _ = store.delete_title(stem);
-                        }
-                    }
-                    if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
-                        if let Ok(store) = crate::SessionTitleStore::open(&home.join(".yggterm")) {
-                            let _ = store.delete_title(parent);
-                        }
-                    }
-                }
                 continue;
             }
             if let Some(entry) = (descriptor.read_store_entry)(&path) {

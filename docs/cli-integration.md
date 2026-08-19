@@ -137,9 +137,29 @@ The protocol system enforces uniform, structured compliance across all 10 regist
 * **Rule (2026-08-17):** yggterm must DELETE any CLI session file that is noise — no agent turn or empty session — as it is seen. A session is noise if `is_noise_session_file(path)` returns true: file < 20 bytes, or JSONL contains no `agent turn` / `role=assistant` record and `extract_tail_context` is < 20 chars after trimming. Guard: mtime < 60 s is kept to avoid deleting a session the CLI is still writing. On detection the verb deletes the file and removes any `session-titles.db` entry for that `session_id` so the next scan is clean. This applies to both startpage (`scan_all_durable_sessions` walk) and cwd tree (`build_local_cwd_tree`) and is verified by the oracles finding zero noise rows on a rescan.
 * **Implementation:** `crates/yggterm-core/src/startpage.rs::is_noise_session_file` and `crates/yggterm-core/src/lib.rs::build_local_cwd_tree` (inline walk) — both call `std::fs::remove_file` and `SessionTitleStore::delete`.
 
-### Issue Heading 9: Weird Title Filtering and On-Sight Repair
-* **Rule (2026-08-17):** Any title or detail that matches `looks_like_generated_fallback_title` or `looks_like_low_signal_generated_copy` — 8-hex shorthash (`a8f6dbd1`, `167d47bd`, `25663dc`), `Yggterm Shell/Codex`, `Remote <Kind> <hash>`, `local [ok] shell`, `Agent Handover Notes For` — is a spec violation and must be filtered on sight. `effective_title` / `detail` never surfaces such strings: `titles_effective_title` and `store_entry` helpers replace them with `heuristic_title_from_context(extract_tail_context(path))` when that heuristic exists and is not itself low-signal, otherwise `None`. The same filter guards `startpage.rs` row `title`/`detail` projection and `titles.rs` `sanitize` paths.
-* **Implementation:** `crates/yggterm-core/src/titles.rs::looks_like_generated_fallback_title`, `looks_like_low_signal_generated_copy`, `heuristic_title_from_context`, `extract_tail_context`; `crates/yggterm-core/src/agent_cli.rs::read_muse_store_entry` (and `read_codex`, `read_cc` equivalents already honour it); `crates/yggterm-core/src/startpage.rs::walk_and_collect` filtering.
+### Issue Heading 10: Per-CLI Rendering Quirks, Workarounds & Viewport Invariants
+* **Rule:** Each CLI has unique TUI rendering patterns and terminal control behaviors. Yggterm isolates these quirks inside `crates/yggterm-server/src/managed_cli/{cli}.rs` and xterm.js viewport integration, ensuring zero rendering artifacts across attach, switch, or resize.
+* **Claude Code (`claude-code`):**
+  - *Bottom Status Bar / Prompt Overwrite:* The Ink terminal engine uses CUF cursor-forward skipping for whitespace. When yggterm's frame-like write detector (`\x1b[?25l`) suppressed forced full refreshes, partial renders latched permanently. Fixed via refresh latching + 1500ms recovery ceiling.
+  - *Edge Asymmetry & Padding Overflow:* Claude Code expects full terminal column width. PTY column padding must be symmetrically aligned with xterm container boundaries.
+  - *Blank Middle on Switch:* Switching into an active Claude Code turn must re-anchor the absolute viewport coordinates (`CSI r;cH` / CUP replay) rather than waiting for subsequent differential tokens.
+* **Codex & Codex-LiteLLM (`codex`):**
+  - *Geometry Squish & Bottom Clipping:* Codex TUI requires matching PTY cols/rows. A mismatch causes status bar truncation; resolved by sending explicit SIGWINCH / nudge (`server terminal resize`) on client dimension changes.
+  - *Differential Space Artifacts:* Cells skipped by CUF retain previous background artifacts; mitigated by complete screen state replay on reveal transition.
+  - *Middle Buffer Desync:* Rapid switching between sessions repaints from daemon vt100 state snapshot.
+* **Muse (`muse`):**
+  - *Top Header & Bottom Indicators Tearing:* Custom prompt DB and yolo status indicators in Muse TUI tear during unattached mounts or viewport resizes. Restored via clean vt100 absolute redraw.
+  - *Blank Middle History on Resume:* Restoring conversational turns requires preserving scrollback buffer offsets during the re-attach handshake.
+  - *Title / Escape Leaks:* Raw ANSI sequences or shorthash strings in session headers are filtered at source.
+* **Antigravity (`antigravity`):**
+  - *Footer Shortcut Overflow:* The multi-line interactive shortcut footer (`["esc", "ctrl", "enter", "tab"]`) can overflow the bottom viewport row and push top conversation history out of view. Requires strict row clamping.
+  - *Live Streaming Token Flicker:* High-frequency delta emissions require batched render passes to prevent middle-screen flicker.
+* **Pi / Qwen / Grok-Build / OpenCode / Kimi:**
+  - *Multi-line Prompt Redraw & Non-Standard Width Wrapping:* TUI frames wrap improperly if client width is not immediately propagated to PTY. Managed CLI hooks enforce synchronized resize events.
+
+### Issue Heading 11: Built-in Interface LLM Title Rescue Contract
+* **Rule (2026-08-19):** When a session transcript exists but neither the CLI's native metadata nor regular expression heuristics can extract a high-signal title (e.g. transcript contains complex tool invocations without a plain prompt string), yggterm's core titling subsystem (`crates/yggterm-core/src/titles.rs`) automatically schedules an asynchronous title rescue request to the fleet's Interface LLM (`gpt-5.6-luna` / `gemini-3.7-flash` via LiteLLM) as a built-in measure of last resort.
+* **Persistence & Caching:** Rescued titles are cached in `~/.yggterm/session-titles.db` with source tag `litellm` and model metadata, preventing duplicate LLM queries.
 
 ## 3. Inventory — which spec/doc now lives where
 
@@ -147,5 +167,6 @@ The protocol system enforces uniform, structured compliance across all 10 regist
 * `spec-adding-an-agent-cli.md` — the **procedure** for a new CLI (10 recon questions, descriptor fields, rolling-upgrade hazard).
 * **This file** — the **BUGS & 9-CLI PROTOCOL** matrix (what is promised vs what is delivered for each of the 10 CLIs).
 * `pending-bugs.md:CLI` — pointer to this file (open) plus the `6.7` tmpfs/swap leak.
+
 
 

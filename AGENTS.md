@@ -1,472 +1,116 @@
 # AGENTS.md
 
-## Mission
+## Mission & Core Value Proposition
 
 Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first terminal workspace with a Dioxus desktop shell shaped like Zed, a daemon-owned PTY core, and an embedded xterm.js terminal surface.
 
 ### The product yggterm replaces
-
 The user's pre-yggterm workflow: VSCode terminal panes → tmux inside them (for persistence) → ssh to N different machines → `codex resume` / `claude -r` on each. When VSCode dies, manually reattach to tmux, re-find sessions, re-orient across machines. **yggterm exists to make this workflow disappear.**
 
-### Core value proposition (do not violate)
-
+### Core value proposition & handoff rule
 When the user clicks an agent session in the cwd tree, yggterm performs the equivalent of:
-
-```
+```bash
 ssh <machine> "cd <cwd> && codex resume <UUID>"      # or: claude -r <UUID>
 ```
+…and hands off the terminal. The user just types. **This handoff IS the product.**
+> **Wrapper-vs-manual parity rule:** If `app open <agent-session>` renders differently from `ssh -t <machine> codex resume <UUID>` typed into a clean shell, that is a yggterm bug, NOT a CLI bug. Diagnose in a clean shell first; fix yggterm's wrapper, PTY setup, or preservation path without adding CLI flags that change CLI behavior.
 
-…and hands off the terminal. The user just types. **This handoff IS the product.** Anything that breaks rendering parity between this handoff and the equivalent manual command typed into a shell is a regression of the core promise.
+### First-class vs second-class sessions
+- **First-class:** Codex, Claude Code, and all managed agent CLIs (per [[spec-cwd-tree-agent-cli-unified]]). The agent CLI persists via its JSONL; yggterm invokes `<cli> resume <UUID>`. Organized by `cwd` in the tree.
+- **Second-class:** Plain shell terminals (`Shell`, `SshShell`). Survive GUI death IFF marked keep-alive. Listed in `Live Sessions` on the sidebar rail; transient otherwise.
 
-### First-class vs second-class session kinds
-
-| Class | Kinds | Persistence | Tree placement |
-|---|---|---|---|
-| First-class | Codex, Claude Code, future agent CLIs (per [[spec-cwd-tree-agent-cli-unified]]) | The agent CLI itself persists via its JSONL. yggterm's job is to faithfully invoke `<cli> resume <UUID>` so the conversation continues. | Organized by cwd in the tree |
-| Second-class | Plain shell terminals (`Shell`, `SshShell`) | Survive GUI death IFF marked keep-alive. Otherwise die with the GUI. Persistence is provided by the yggterm-server (the tmux-like layer). | Listed in Live Sessions when keep-alive; transient otherwise |
-
-### What yggterm does NOT do (don't propose these)
-
-- **Does not parse codex/CC JSONL into the terminal viewport.** The terminal view delegates rendering to the CLI itself. Reading JSONL is the web view's job (separate surface, currently buggy, will improve).
-- **Does not reinvent the agent CLI's rendering.** Codex's TUI is codex's choice. CC's render is CC's choice.
-- **Does not add CLI flags beyond the minimum needed for handoff** (cwd, UUID, terminal-appearance env). If a fix adds a flag the manual case doesn't use, question it — the manual case PROVED the CLI works without it.
-
-### The wrapper-vs-manual parity rule
-
-> If `app open <agent-session>` renders differently from `ssh -t <machine> codex resume <UUID>` typed into a shell, that is a yggterm bug, NOT a CLI bug. The fix is in yggterm's wrapper / handoff / preservation path.
-
-Diagnose by running the manual command in a clean shell FIRST and comparing rows/cursor/scrollback. If manual works, the wrapper is at fault — don't add flags that change the CLI's behavior; instead find what the wrapper does differently in env, stty, PTY setup, ownership, or preservation.
-
-Full mission rationale: see `~/.claude/projects/-home-user-gh-yggterm/memory/project-purpose.md` (link `[[project-purpose]]`).
+### What yggterm does NOT do
+- Does not parse codex/CC JSONL into the terminal viewport (terminal view delegates rendering to the CLI itself; reading JSONL belongs to the web view).
+- Does not reinvent the agent CLI's rendering.
+- Does not add CLI flags beyond the minimum needed for handoff (`cwd`, UUID, terminal appearance).
 
 ## Local repository relationships
-
 - `../ghostty` contains legacy Ghostty integration code in Zig.
 - `../zed` is an optional visual/reference checkout for shell design study.
 - This repo (`yggterm`) is the integration layer and product surface.
-- ⛔ **`~/gh/paper` and `~/gh/cellulose` no longer exist** — both repos were
-  DELETED 2026-08-07 on the user's call (*"far far superceded in concept"*).
-  **Paper's role is retired**; ztlkasten took the brain-organization work.
-  **Cellulose's name is reserved** and it returns as a fresh repo later. Do not
-  recreate either from this file. When cellulose does return, its licence is
-  decided **before** the repo is made public, not after — see the maintainer's
-  private IP register for that gate. Cellulose as a *design target* is still
-  live throughout `docs/alt-keytips.md` and `docs/agent-control-plane.md`; that
-  is the concept, not a checkout.
+- ⛔ `~/gh/paper` and `~/gh/cellulose` no longer exist (deleted 2026-08-07). Cellulose returns later as a fresh repo under private IP gate; its design target is concept-only across `docs/alt-keytips.md`.
 
-## ⛔⛔ PRIVACY — this repo is PUBLIC, and the leak vector is not a secret
+## ⛔ Privacy — Public Repo Mandate
+**Run `scripts/check-privacy.sh` before every commit (enforced by `tests/privacy.rs`).**
+- **INVENT every example:** Sidebar titles, home paths, project names, portals, filenames (`"3. widgets: refactor"`, `/home/user/proj`, `example.test`).
+- **War-story comments cite SYMPTOMS, never cases:** "a batch fill of an async autocomplete drops the second value" — not live filing titles or personal entities.
+- **Never commit build artifacts:** No `.pyc`, `.db`, or binary cache leaks that embed absolute build paths.
 
-**Run `scripts/check-privacy.sh` before any commit that adds fixtures, docs or
-war-story comments.** It is enforced by `tests/privacy.rs`.
+## ⛔ Presentation Policy
+**Read `docs/presentation-policy.md` before touching display code.** Sanctioned per-platform defaults live in `crates/yggterm-core/src/presentation_policy.rs`.
+1. **Never set `PRESENTATION_VARS` on the user's running GUI:** Use `scripts/underglass-sandbox.sh` for testing.
+2. **Wayland runs Wayland-native:** Forcing X11 produces XWayland and invalidates compositor, input latency, and terminal measurements.
+3. **Xvfb lessons do not travel:** Headless sway / Xvfb are X11; do not copy `GDK_BACKEND=x11` to Wayland hosts.
+4. **Table is SSOT:** To change a default, update the table in `presentation_policy.rs` with measurements.
 
-On 2026-08-07 an audit found the maintainer's private working structure in this
-repo's tracked test fixtures: numbered sidebar row titles naming his real
-projects, personal home paths, and comments citing live legal filings by date.
-None of it was a credential, so no secret scanner would ever have caught it.
+## ⛔ Scratch Space — No `/tmp` Writes
+**`/tmp` is a `tmpfs` (RAM) on desktop hosts.** Bytes written there charge to RAM and swap.
+- **Agent scratch goes in `~/.yggterm/scratchpad/<whatever-you-like>`.** Disk-backed only. Not `/tmp`, not `/dev/shm`, not `$XDG_RUNTIME_DIR`.
+- Enforced by `scripts/ygg-scratch-guard.sh` and `scripts/ygg-resource-panic.sh`. Reap stale scratch; do not exhort.
 
-**The vector, stated so it cannot be misread: an agent writing a REAL example
-into a fixture because a real example was in front of it.** Every instance
-arrived that way.
+## Decentralized Host-Resident Daemon Architecture
 
-⇒ **INVENT every example.** A session title, a path, a project name, a portal, a
-filename — make one up (`"3. widgets: refactor"`, `/home/user/proj`,
-`example.test`). A test fixture is published source, and an invented example
-tests exactly as well.
-⇒ **A war-story comment cites the SYMPTOM, never the case.** "a batch fill of an
-async autocomplete drops the second value" — not which portal, which filing,
-which date.
-⇒ **Never commit build artifacts** (`__pycache__`, `*.pyc`, stray `*.db`): a
-`.pyc` embeds the absolute source path of the machine that built it, which is
-exactly how one leak survived a content rewrite.
+Yggterm is a terminal multiplexer that matches tmux's persistence while exceeding it in modern affordances.
 
-## ⛔ THE PRESENTATION POLICY — you may not flip these flags
+**Nomenclature:**
+- **yggterm** — the GUI desktop client.
+- **yggterm-headless** — the headless client/control interface for agents.
+- **yggterm server** — the host daemon that owns PTYs and keeps sessions alive.
 
-**Read `docs/presentation-policy.md` before touching anything that decides how
-this product draws.** The sanctioned per-platform defaults live in
-`crates/yggterm-core/src/presentation_policy.rs` and are the SSOT for display
-backend, GL, frame delivery and video decode.
+**The Model:**
+1. **Server runs on EVERY host:** Local machine AND each SSH host. The server owning a session's PTY runs on the machine where the session lives. Remote sessions are held alive by the remote host's yggterm server.
+2. **SSH is transport and auth:** Reaching a remote host's yggterm server over SSH is the sole authorization to attach its sessions.
+3. **Decentralized metadata:** Each host's `~/.yggterm` stores its own sessions, scrollback, and titles. The cwd tree is a union composed by querying each host's server.
+4. **Many clients, one server:** Multiple GUI or headless clients can attach live sessions concurrently.
+5. **No tmux dependency:** The host-resident yggterm server IS the multiplexer across GUI restarts and SSH drops.
 
-Four rules, all of them paid for in the user's time:
+**Tmux Parity & Exceed Gates:**
+- *Parity (Baseline):* Client-disconnect survival, multi-client reattach, synchronized window resize, and persistent terminal scrollback ring (10k+ rows).
+- *Exceed:* 24-bit xterm.js rendering, cross-machine unified session tree, cursor/scroll preservation across GUI restart, transcript stitching & generated titles, first-class observability, and unified multi-CLI cwd tree.
 
-1. **Never set a `PRESENTATION_VARS` variable against the user's running GUI.**
-   Not `GDK_BACKEND`, not `LIBGL_ALWAYS_SOFTWARE`, not
-   `WEBKIT_DISABLE_DMABUF_RENDERER`, not any of the rest. To test an arm, use
-   `scripts/underglass-sandbox.sh` or `scripts/web-tear-probe.sh`, which build a
-   throwaway GUI with its own env and its own daemon. **The user's GUI is not a
-   test rig.**
-2. **A Wayland session runs Wayland-native.** Forcing X11 gives XWayland and
-   silently changes compositing, input latency and the terminal renderer at
-   once. Every measurement taken afterwards describes a machine the user does
-   not run.
-3. **What you learned under Xvfb does not travel.** Headless sway and Xvfb ARE
-   X11, so `GDK_BACKEND=x11` is right *there* and wrong on the user's desktop.
-   This exact carry-over has cost hours more than once.
-4. **`/proc/<pid>/environ` cannot tell you what is in force** — these are
-   applied with `set_var` after exec. Read the
-   `gui/startup/linux_desktop_backend_policy` trace event instead.
+---
 
-If a default is wrong, **change the table and say why in the row**, with a
-measurement. Do not work around it with an env var, and do not "just try" one on
-the live host.
+## Multi-CLI Integration & Startpage / CwdTree Contract
 
-## ⛔⛔ SCRATCH SPACE — `/tmp` IS RAM ON THE DESKTOP HOST, SO NEVER WRITE THERE
+Per [[spec-cwd-tree-agent-cli-unified]] and `docs/cli-integration.md`:
+1. **SSOT Discovery (`scan_all_durable_sessions`):** Every agent CLI session flows through `yggterm_core::startpage::scan_all_durable_sessions(&Path)` over `AGENT_CLIS` descriptors in `agent_cli.rs`. Startpage and CwdTree in GUI (`shell/startpage.rs`) and CLI (`startpage_ls.rs`, `cwdtree_ls.rs`) consume identical core state; only the presentation porcelain differs.
+2. **Never Show Plain Shells (`[$ ]`) on Startpage or CwdTree:** Plain shells (`SessionKind::Shell`) belong strictly to `Live Sessions` on the sidebar rail (`presence: "live_rail"`). They must NEVER appear as Startpage cards or CwdTree folder sessions.
+3. **Recency Descending Sort:** All durable sessions across all CLIs sort by `modified_epoch_ms` descending (preventing 0-epoch fallback to alphabetical UUID).
+4. **Zero Shorthash / Corrupt Titles:** No session may surface an 8-hex shorthash (`a8f6dbd1`), raw path, or generic placeholder (`New session`, `Remote <kind> <hash>`). Titling authority rules in `titles.rs` and `managed_cli/{cli}.rs` are authoritative.
+5. **Built-in Interface LLM Title Rescue:** When stored transcripts have zero usable title or heuristic signal, yggterm core (`crates/yggterm-core/src/titles.rs`) automatically schedules background Interface LLM rescue (`gpt-5.6-luna` / `gemini-3.7-flash` via LiteLLM) as a built-in measure of last resort.
+6. **Managed CLI Modularization:** CLI-specific flags, launch/resume patterns, and environment quirks live in `crates/yggterm-server/src/managed_cli/{cli}.rs`.
+7. **Per-CLI Rendering Quirk Isolation:**
+   - *Claude Code:* Refresh latching + 1500ms recovery ceiling to prevent CUF whitespace skips from locking partial paints; symmetrical container padding; absolute viewport re-anchoring on switch.
+   - *Codex / Codex-LiteLLM:* SIGWINCH resize nudge to eliminate geometry squish; absolute screen state replay on reveal.
+   - *Muse:* Authoritative title extraction from `session-index.db`; scrollback offset preservation during re-attach.
+   - *Antigravity:* Row bounds clamping on interactive footer shortcuts (`esc/ctrl/enter/tab`) to prevent top prompt clipping; batched streaming token renders.
+   - *Pi / Qwen / Grok / OpenCode / Kimi:* Synchronized PTY resize propagation to prevent line-wrap distortions.
 
-**`/tmp` on the desktop host is a `tmpfs`.** It is memory wearing a filesystem's
-clothes: every byte written is charged to RAM, then to swap, and it is never
-reclaimed until something deletes it. Nothing warns you, `df` looks like a disk,
-and the cost lands on the owner as a slow machine.
+---
 
-⇒ **Agent scratch goes in `~/.yggterm/scratchpad/<whatever-you-like>`.** It is
-disk-backed. Not `/tmp`, not `/dev/shm`, not `$XDG_RUNTIME_DIR`. The same rule
-binds every tool this project drives: staged downloads, screenshots, probe
-output, A/B binaries, bundles.
+## Operating Directives & Engineering Contracts
 
-**What this rule is worth, measured on 2026-08-14** while the owner's 14 GB
-laptop sat at 11 GB of 15 GB swap and he reported it burning:
+- **Docs SSOT Audit:** `docs/architecture-audit-2026-05-16.md` is required reading before terminal, session, hot-update, theme, telemetry, app-control, or release-gate changes.
+- **⛔ SHIP IT (GUI Restart Policy):** Daemon owns the PTYs, sessions, and scrollback across GUI restart. Build it, install it, restart without asking, and report what was done — a GUI restart needs no permission.
+- **Source of Truth Rule:** Before fixing any regression, name the authoritative source of truth and the observers involved.
+- **Observer Rule:** Never promote an observer into product truth. App-control, telemetry, screenshots, and logs are witnesses, not drivers of state.
+- **No Symptom Patching:** Do not patch a symptom by adding a second source of truth (e.g. no shell text overlays, no prompt repair layers, no PTY-byte trimming).
+- **Spec Interpretation Rule:** Every spec MUST enumerate what it does NOT cover. Quote exact text, state the literal claim, and state adjacent claims not made.
+- **Session Display = Dual Presence:** Active sessions appear in BOTH "Live Sessions" and their cwd folder. Dedup is per-view, never cross-view.
+- **SessionKind Drives Display:** Icon, glyph, and color dispatch must consult `SessionKind`, never path-prefix heuristics. Local and remote session display paths share code.
+- **Panic Management & Incident Artifacts:** Treat `yggterm-headless server monitor` as the first-line diagnostic tool. Write incident artifacts to disk-backed scratch:
+  ```bash
+  mkdir -p ~/.tmp/yggterm && yggterm-headless server monitor --scenario panic-report --expect-path <session-path> --jsonl-out ~/.tmp/yggterm/yggterm-incident.jsonl
+  ```
+- **Stale Binary Prohibition:** Never execute archived GUI binaries or old `dist/` artifacts against live state. Prove versions from canonical metadata (`Cargo.toml`, git tag, `install-state.json`).
+- **Deterministic Diagnostics & Screenshots:** Use `.agents/skills/yggterm-diagnostics/SKILL.md`. For visual bugs, proof requires in-process faithful screenshots (`server app screenshot <out.png>`), not telemetry alone.
+- **Contract & Regression Tests:** Every fix must update the harness, smoke test, unit test, or CI gate to fail deterministically on the defect class before applying the runtime patch.
 
-| what was on the tmpfs | size |
-|---|---|
-| leaked CLI provisioner staging dirs (51, since 2026-08-02) | **2.85 GB** |
-| stale agent session scratch | **613 MB** |
-| abandoned deploy / A/B binaries | **452 MB** |
-| **total reclaimed, held open by nothing** | **~3.9 GB of RAM** |
+---
 
-⚠ **A disk-backed scratch is not a licence either.** Unbounded on disk is a
-slower leak, not a fixed one — which is why the roots carry budgets and are
-swept oldest-first.
+## Platform, Skills & Licensing
 
-**The tooling, and it is enforcement rather than advice:**
+- **libyggterm Surface Ownership:** yggterm provides the surface interface; embedded libyggterm apps (ychrome, ytop, Paper) own their content. Zero app-specific chrome belongs in `yggterm-shell`. Consult `.agents/skills/libyggterm-surfaces/SKILL.md`.
+- **Synchronize Skills:** When changing surface mechanisms, telemetry, or diagnostics, update the matching `.agents/skills/` file in the same commit.
+- **Licensing:** Code is licensed under `GPL-3.0-or-later` (see `LICENSE`); markdown docs under `CC BY-SA 4.0`. Copyright owner: Avikalpa Kundu.
 
-```sh
-scripts/ygg-scratch-guard.sh --host <h>            # report; non-zero if abusive
-scripts/ygg-scratch-guard.sh --host <h> --enforce  # reap to budget, incl. stale tmpfs scratch
-scripts/ygg-resource-panic.sh                      # memory/CPU/space thresholds, exit 1 on breach
-```
-
-⭐ **Reap, do not exhort.** An agent harness that picks its own `/tmp/<tool>-<uid>`
-session directory cannot be argued with, and asking people to be tidy has never
-bounded anything. The guard therefore sweeps what is stale rather than relying on
-whoever made it.
-
-## Engineering constraints
-
-- Primary implementation language: **Rust**.
-- Use the repository-pinned Rust `1.94.0` toolchain for the local desktop stack.
-- Ghostty interoperability may still require **Zig** for legacy bridge work, but it is not required for the default terminal path.
-- Prefer explicit modular boundaries:
-  - `core` (domain state and tree model)
-  - `ui` (rendering and interaction)
-  - `ghostty-bridge` (legacy FFI boundary)
-  - `platform` (OS-specific bindings)
-
-## Product direction
-
-- Dioxus desktop is the active application shell. Match the basic shape and chrome of Zed first, then replace editor-specific behaviors with terminal-specific ones.
-- The primary navigation model is a vertical sidebar of virtual folders and sessions, not a filesystem browser.
-- Tree nodes represent persisted metadata for sessions, generic terminals, papers, folders, separators, SSH targets, and other terminal workflows.
-- Example sidebar entries should feel like `remote/prod/codex-session-tui`, `machines/pi/ghostty-admin`, or other metadata-derived paths, not just on-disk folders.
-- Focusing a sidebar folder must open that folder's scoped Startpage and clear the active terminal host without closing live runtimes; expansion/collapse must use explicit disclosure controls or keyboard arrows.
-- Fast startup and interactive responsiveness.
-- Cross-platform support (Linux/macOS/Windows where feasible).
-- Keep terminal semantics owned by the Yggterm daemon plus xterm.js unless the Ghostty tradeoff is revisited explicitly.
-- Keep the minimal session promise front and center: a Yggterm session should feel like a durable, snappy automation of `ssh <machine>; cd <cwd>; codex resume <uuid>` or the equivalent shell task. Metadata, sidebar placement, hot update, screenshots, and observability support that terminal routine; they must not become alternate renderers, alternate input targets, or alternate sources of session truth.
-- For terminal rendering bugs, fix the daemon PTY/xterm.js path first. Do not hide prompt-background, cursor, resize redraw, animation, typed-echo, or scrollback defects behind shell-owned decorative layers just to satisfy screenshots. xterm.js-native renderer APIs such as decorations are part of the terminal surface; Yggterm-owned cursor/prompt/visibility aids must be explicit, narrow, observable, and secondary to PTY/xterm truth.
-- Keep terminal implementation notes and local xterm.js reproduction fixtures in `docs/xterm.md`; consult it before terminal rendering, resize, or PTY identity changes.
-- For SSH targets, prefer Yggterm-owned remote commands and metadata/clipboard flows over ad hoc shell-text or Python-side workarounds whenever the remote machine has a Yggterm binary available.
-- Remote SSH flows should version-check and, when needed, bootstrap a matching `yggterm` binary into `~/.yggterm/bin/yggterm` on the target machine before depending on remote Yggterm commands.
-- Yggterm should feel remote-first: multiple machines, SSH-heavy workflows, and restoring many live terminal contexts is a core use case.
-- Treat richer surfaces such as `paper`, `cellulose`, and Excalidraw integration as app-grade surfaces that can live in separate repos while still embedding into Yggterm.
-
-## Terminal multiplexer positioning (vs tmux / screen / abduco)
-
-Yggterm's daemon-owned PTY model IS a terminal multiplexer. Product positioning: **Yggterm must match tmux's baseline capabilities AND exceed them in modern affordances.** This is first-class customer value, not a nice-to-have. A user choosing yggterm should never have to fall back to tmux for "I need my history when I reconnect" or similar baseline expectations.
-
-### Decentralized host-resident daemon architecture (the core model — do not violate)
-
-This is the architecture that makes yggterm a real tmux replacement, and it is the lens for every persistence/remote decision.
-
-**Nomenclature (use these terms precisely):**
-- **yggterm** — the GUI client (the desktop app the user sees).
-- **yggterm-headless** — the headless *client*, made for agents (the app-control surface agents drive). It is a CLIENT, not the session-holder.
-- **yggterm server** — the daemon(s) that *hold* sessions alive (codex, Claude Code, plain shell, other TUIs). This is the tmux-equivalent. (The `yggterm-headless` binary can launch a server via `server daemon`, but the session-holding *role* is "yggterm server".)
-
-The model:
-- **The yggterm server (daemon) runs ON EVERY host** — the local machine AND each SSH host. The server that owns a session's PTY runs *on the machine where that session lives*, and holds it alive there, exactly as a tmux server would. A remote session is held alive by the remote host's yggterm server, not by anything on the GUI machine.
-- **SSH is the transport AND the auth layer.** A client reaches a remote host's yggterm server over SSH; having SSH access to the host *is* the authorization to see and attach its sessions. There is no separate yggterm auth.
-- **Metadata is decentralized — stored on each machine.** Each host's `~/.yggterm` holds its own sessions, retained scrollback, and session metadata. There is no central server; the cwd tree is a union the client composes by talking to each host's yggterm server.
-- **Many clients, one server.** Any client (GUI or headless) with SSH access to a host can attach the same live servers/sessions concurrently. Sessions are owned by the host's yggterm server, not by a client.
-- **Therefore tmux must NOT be a dependency.** The host-resident yggterm server IS the multiplexer that keeps shell terminals alive across client disconnect and SSH death — that is precisely tmux's job, done by yggterm with full xterm.js scrollback and yggterm's own UX. Any current use of tmux/screen to keep a shell alive (see `docs/terminal-backends.md`) is a **stopgap** for the remote-shell-PTY path not yet being fully wired through the host yggterm server, not a design choice. The target end state: shell terminals are owned by the host's yggterm server directly — no tmux process, no tmux status bar, no tmux-owned scrollback. The objection "the local server can't keep a remote shell alive across an SSH drop" is NOT a justification for tmux — it is the reason the server must run on the *remote* host.
-
-**Baseline parity (REQUIRED for credibility against tmux):**
-- Session survives client disconnect — GUI close/restart never kills a running session. ✓ shipped
-- Reattach from any client — any GUI sees the live daemon. ✓ shipped
-- Window/pane resize handshake — daemon reflows cell grid on client resize. ✓ shipped
-- **Real terminal history across restart** — daemon maintains a per-session headless VT parser with a scrollback ring (default 10k+ rows), so GUI restart restores full terminal history regardless of whether the inner app is a TUI (Codex, vim, htop) or plain shell. This matches tmux's `history-limit` semantics. ❌ NOT YET SHIPPED — currently the daemon retains only a small raw-byte ring (~146 KB) which collapses to ~one screen for TUI sessions. Implementing this is a parity gate, not an enhancement.
-- Per-session `history-limit` config — tunable scrollback retention exposed in settings.
-
-**Where yggterm must EXCEED tmux (these are why a customer picks yggterm):**
-- Native xterm.js render fidelity: 24-bit color, glyph anti-aliasing, hyperlinks, image protocols (Sixel, Kitty), web-grade font rendering. tmux is constrained to whatever terminal emulator the user happens to be in.
-- Cross-machine session graph: one GUI sees local + remote daemons as a unified session tree. tmux requires manual ssh nesting and per-machine state.
-- Cursor + scroll position preserved across GUI restart — not just history, also the user's reading position. ✓ shipped (commit 5a6e19f).
-- Agent-CLI awareness: Codex / Claude Code transcript stitching, generated summaries, session titles, kind-driven icons. tmux is application-agnostic by design and loses this.
-- First-class observability: app-control state, screenshots, probes for every visible region. tmux exposes only `capture-pane`.
-- Persistent session metadata: cwd, machine, working folder, agent kind, generated title — carried across restart and visible in the cwd tree. tmux drops this.
-- Unified cwd tree across agent CLIs ([[spec-cwd-tree-agent-cli-unified]]) — sessions from any CLI (Codex, Claude Code, future ones) live in one tree organized by cwd, with kind-driven icon/label/style. tmux has no concept of this.
-
-When choosing whether to ship a feature, ask: "does this advance baseline parity or the exceed-tmux line?" If neither, it's noise.
-
-## Design philosophy
-
-- `DESIGN.md` at the repository root is the source of truth for UI language, interaction taste, visual polish, naming, and reusable styling preferences. Consult it before making UI wording or styling changes.
-- When durable design preferences emerge during collaboration, update `DESIGN.md` instead of leaving them implicit in chat history.
-- Upstream-first integration: prefer proven layout patterns from `../zed` and a thin adapter boundary around terminal/runtime dependencies instead of reimplementing behavior blindly.
-- Minimize forks: keep Yggterm-specific code as adapter layers around upstream crates/APIs so upstream pulls stay low-friction.
-- Keep Yggterm-owned shell chrome and session UI in local crates so the desktop frontend stays maintainable and stays under the project's own licence.
-- Reuse upstream Zed layout ideas and `codex-session-tui` browser behavior, but do not couple the active shell to GPUI crates again unless that tradeoff is revisited explicitly.
-- Replace editor-centric open flows with terminal-centric behavior: selecting a tree node should open, restore, or focus Yggterm PTY sessions rather than text buffers.
-- The central viewport should host embedded xterm.js terminal views in place of file editors.
-- Keep the active desktop shell centered on real server-owned terminals rather than reviving temporary mock terminal bodies.
-- Treat `Session`, `Terminal`, `Paper`, `Folder`, and `Separator` as the active user-facing vocabulary unless explicitly revisited.
-- Session state is local-first under `~/.yggterm`, but the tree model is metadata-first rather than a direct filesystem mirror.
-- Use `~/gh/codex-session-tui` and, when helpful, the local `../zed` checkout as reference material when refining shell shape, chrome, and interaction patterns.
-- Use the running X11 session and screenshots of a live Zed window when validating visual changes to the scaffold.
-- Treat the yggterm daemon PTY API as the active terminal engine contract for the app.
-- Keep any Rust-to-Ghostty interop thin and explicit via `ghostty-bridge`, but do not route the default terminal path through it.
-- Rust is the primary language for product code.
-- Zig is required for Ghostty integration work; prefer stable Zig releases (including official stable tarballs) for reproducible builds.
-- Quality-of-life features such as full session restore, clipboard and screenshot paste into remote sessions, and durable session metadata are first-class product goals.
-
-## Agent workflow expectations
-
-### ⛔ SHIP IT — never park a built fix behind "this would restart your GUI"
-
-**Owner directive, 2026-08-08, verbatim:** *"Answer is almost always yes because of our
-daemon architecture I lose a max of ~10sec worst case. Always restart."*
-
-A GUI restart is **not** a destructive act here and must never be treated as one. The
-daemon is host-resident and owns the sessions: PTYs keep running, scrollback and cursor
-position survive, and the window comes back with the rows still there. **The whole cost is
-about ten seconds.** Asking him to authorise that trades ten seconds of his time for an
-indefinite wait, and it leaves a verified fix sitting in a binary nobody is running — which
-is strictly worse than the bug, because now the repo and the running system disagree.
-
-So: **build it, install it, restart it, and say what you did.** Do not end a turn with
-"needs a restart, your call".
-
-Three things this does NOT license, and they are the actual risks:
-- ⛔ It is not permission to install a **stale or unbuilt** artefact — the version rules
-  further down this section still bind, and `update restart` still refuses while an agent
-  web-surface lease is live (`server app state | jq .agent_leases`).
-- ⛔ It is not permission to restart to *test a guess*. Restart to ship something you have
-  already built and tested, not to see what happens.
-- ⛔ It does not extend to the **vault agent** or to anything holding an unlocked secret;
-  those have their own handover path (`ychrome-vault handover`), which keeps the session
-  unlocked instead of dropping it.
-
-⚠ Note the sibling trap: **`ychrome` has its own daemon.** Reinstalling the ychrome binary
-changes nothing until `ychrome daemon restart` runs — a browser window closed and reopened
-routes straight back into the OLD daemon. That cost an hour on 2026-08-07: a passkey fix was
-deployed, the owner reopened the window as asked, and it still ran the old code.
-
-- Treat this as an integration-heavy systems project.
-- When adding code, include clear ownership boundaries between Rust app logic, PTY runtime, and any optional Ghostty FFI.
-- Prefer incremental, testable changes.
-- `docs/architecture-audit-2026-05-16.md` is required reading before terminal,
-  session, hot-update, theme, telemetry, app-control, or release-gate changes.
-  Its authority table is the standing source-of-truth map.
-- Before fixing any regression, name the authoritative source of truth and the
-  observers involved. Daemon PTY/runtime truth, xterm render truth, session
-  identity, metadata, app-control, telemetry, screenshots, and smoke tests are
-  not interchangeable.
-- **Spec interpretation rule: every spec MUST enumerate what it does NOT cover.**
-  When you cite a spec to justify code, (1) quote the exact spec language,
-  (2) state the literal claim, (3) state at least one *adjacent* claim that
-  the spec does NOT make. A spec that reads "X stays in A and B. Also, C is
-  ordered by recency" is TWO separate claims (X∈{A,B}; C has a sort rule);
-  it is NOT "X stays in {A, B, C}". When in doubt, treat the spec as
-  *narrower* than your reading; expansions require user confirmation, not
-  agent inference. Memories that paraphrase a spec MUST link to the original
-  spec text (AGENTS.md or user message) and MUST include an "Out of scope"
-  section listing the related claims they deliberately do not make. Any code
-  comment of the form `// Per [[spec-X]]: do Y` must survive the test
-  "would the user agree Y is in [[spec-X]]'s scope, not Y-adjacent?"
-- Never promote an observer into product truth. App-control, telemetry,
-  screenshots, logs, generated summaries, and smoke results can prove or
-  disprove behavior, but they must not drive terminal rendering, input routing,
-  saved-session identity, daemon ownership, or theme state.
-- Do not patch a symptom by adding a second source of truth. Banned shortcuts
-  include shell-owned terminal text overlays, prompt/cursor repair layers,
-  PTY-byte coalescing or trimming, post-hoc transport cleanup as a normal path,
-  runtime-key identity substitution, alpha/blur/grain behavior in stable theme
-  code, and stale-daemon mutation outside the hot-update protocol.
-- **Session display = dual presence.** An active session appears in BOTH the
-  "Live Sessions" group AND its cwd folder group. "Single source of truth"
-  applies to the session OBJECT (one `ManagedSessionView` per logical session),
-  not to the display location. Never silently filter a live session out of
-  the cwd tree just because it also appears in Live Sessions; if you find
-  dedup code that does this, that is a SPEC VIOLATION. Acceptable dedup is
-  per-view (one row per logical session within the same tree), not cross-view.
-  **Out of scope: the start page.** The start page is a *launching pad* for
-  sessions to open/resume; live sessions are already running and are
-  accessible from the Live Sessions sidebar group — they are NOT a third
-  presence target. The `start_page_recent_rows` candidate loop must not push
-  `snapshot.live_sessions`. The `live_projection_paths` filter that strips
-  browser_row duplicates of live sessions from start page recents is the
-  correct behavior, not a bug. The start-page-ordered-by-recency rule is
-  about sort order on the durable recents list, NOT about content membership.
-- **SessionKind drives display, not path prefix.** Icon, glyph, label color,
-  button styling, and other display dispatch MUST consult `SessionKind`
-  (carried on `BrowserRow.session_kind` when the row was built from a
-  `ManagedSessionView`). Branches like `if path.starts_with("local://")
-  { "terminal" } else { "session" }` are SSOT violations — `local://` covers
-  both shells and Codex sessions, so the path alone cannot answer the
-  question. Path prefix is acceptable ONLY as a fallback for rows
-  synthesized from file paths where kind is genuinely unknown.
-- **Local and remote session display paths share code.** Do not introduce a
-  separate display path for local sessions vs remote sessions. Cosmetic
-  divergence (icon, label, button style) between a local Codex session and a
-  remote Codex session is itself a bug. When fixing session display, fix the
-  kind-driven code, not a locality-driven branch.
-- **Local cwd tree is agent-CLI-agnostic.** Per
-  [[spec-cwd-tree-agent-cli-unified]] every saved agent-CLI session
-  (Codex, Claude Code, future) flows through ONE pipeline:
-  `yggterm_core::scan_local_<cli>_sessions()` returns
-  `LocalAgentSessionSummary` records → `build_local_cwd_tree` groups them
-  by cwd → `SessionNode { session_kind, detail, ... }` → flattener carries
-  `session_kind` into `BrowserRow.session_kind`. NO post-hoc injection
-  passes. Adding a new agent CLI is ONE scanner + one call site in
-  `build_local_cwd_tree` + display-dispatch updates for the new
-  `SessionKind` variant — never a parallel `inject_<cli>_rows()` path.
-  The prior `inject_file_backed_cc_session_rows` bypassed expand/collapse
-  state, causing the orphaned-row bug reported 2026-05-26.
-- If code and docs disagree, stop and reconcile the interface doc before
-  implementing. The canonical docs are `docs/protocol.md` for runtime/hot-update
-  behavior, `docs/xterm.md` for terminal rendering and PTY bytes,
-  `docs/xterm-bugs.md` for the structured xterm.js bug registry (every
-  workaround site MUST have an `// XTERM-BUG: <id>` anchor and a matching
-  registry entry — see that file's template),
-  `docs/sessions.md` for saved-session identity and copy, `docs/theme.md` for
-  stable shell chrome, and `docs/telemetry.md` for observer-only telemetry.
-- For every reported regression, update the harness, smoke test, unit test, or CI gate to fail on the exact defect class before applying the runtime fix. Do not accept a fix based only on manual observation when a deterministic regression can be captured.
-- **Diagnose terminal/xterm symptoms with the diagnostic toolkit, not code-reading or user-eyeballing.** `.agents/skills/yggterm-diagnostics/SKILL.md` is the authoritative, ITERATIVELY-MAINTAINED index — when you add or change a diagnostic capability (a probe, a CLI verb, a harness, a post-process option), update that SKILL in the SAME commit. It covers: the deterministic harnesses (`mock-tui` — already codex-like, no need to clone codex — + `pipeline_integration.rs` for the daemon pipeline; `tools/xterm-harness/` for the exact vendored xterm.js client layer; extracted decision specs like `scroll_mode.rs` / `terminal_retained_replay_policy.rs`); the live probes (`server snapshot` → `active_session.terminal_lines` is the daemon vt100 screen + the `pty_cols/rows` squish gauge; `server app state`; `server app terminal probe-scroll` for the `viewport_force_log`; `server trace tail`); the RECOVERY verbs (`server app terminal reconcile` repaints client-from-daemon; `server terminal resize <key> --cols --rows [--nudge]` forces a SIGWINCH to a squished remote codex); and the IMAGE pipeline.
-- **For a VISUAL bug (squish, flicker, broken-bottom, blank), the proof is a FAITHFUL screenshot — never telemetry.** `server app screenshot <out.png>` composites the xterm canvas IN-PROCESS for a terminal view (`capture_backend=xterm_canvas_composite`, `capture_faithful=true`) — faithful on every platform, over SSH, unfocused (no Spectacle/focus dependency). It feeds the IMAGE POST-PROCESS PIPELINE (`--region terminal|full`, `--crop x,y,w,h`, `--scale N`) so you can crop+upscale the region of interest (a full 1920px frame reads illegibly small). `scp` it back and Read the PNG; cross-check `capture_faithful` (a `linux_webkit_snapshot` fallback is canvas-blind). The SKILL also documents which instruments LIE (stale `viewport_y` when backgrounded; public-vs-effective viewport; the Wayland focus trap; `server snapshot.terminal_lines` is logical/joined text, NOT the visual grid — use the screenshot for wrap-width/row-placement). Reach for the deterministic harness FIRST; confirm on the faithful screenshot + daemon ground truth, NOT on a telemetry field whose name you haven't verified.
-- For terminal resize regressions, the harness must assert a visible prompt-prefix pixel sample after settle on resize so partial redraw and prompt-clipping artifacts are caught even when x/y geometry metrics still pass.
-- Document integration assumptions in `README.md` or module-level docs.
-- Treat stale binary execution as destructive. Do not execute archived/versioned GUI binaries, old `dist/` artifacts, backup copies, or direct-install store entries just to inspect their version. In particular, never run globbed commands like `~/.local/share/yggterm/direct/versions/*/yggterm --version`; old GUI binaries may ignore CLI-only intent, launch against the live `~/.yggterm` state, and overwrite session metadata.
-- Prove versions from canonical metadata before installing, publishing, or replacing a running app: `Cargo.toml`/lockfile, changelog section, git commit/tag, release asset checksum, `install-state.json`, and the active launcher/headless path. If an executable must be probed, use the active launcher on 2.1.52+ or the exact active `yggterm-headless` sibling from `install-state.json`; otherwise isolate it with a temporary `HOME`/`YGGTERM_HOME` and no access to user state.
-- Never "fix" a release or runtime issue by installing, launching, or copying an older artifact unless the user explicitly requests rollback. If rollback is requested, snapshot user state first, state the exact target version/date, and keep the old artifact isolated from normal self-update paths.
-- Before touching a live install or remote GUI session, snapshot the relevant state files (`~/.yggterm/server-state*.json`, `session-titles.db`, `event-trace.jsonl`, install metadata) and confirm the currently running GUI/daemon executable paths. Treat mismatched GUI, daemon, launcher, and install-state versions as an incident until reconciled.
-- Treat `yggterm-headless server monitor` as the first-line panic-management tool for live terminal incidents. When a session is hung, missing after restore, slow to load, input-lagged, or visually blank on a live desktop host, run a read-only incident pass before changing code: `mkdir -p ~/.tmp/yggterm && yggterm-headless server monitor --scenario panic-report --expect-path <session-path> --jsonl-out ~/.tmp/yggterm/yggterm-incident.jsonl`, then `server-list`, `latency-check --all`, `wait-session`, or `hot-restart --all` as the evidence indicates.
-- For repeated or intermittent failures, monitor with `yggterm-headless server monitor --scenario panic-report --iterations <n> --interval-ms <ms> --jsonl-out ~/.tmp/yggterm/<name>.jsonl` so latency/session truth is captured independently of the GUI render loop.
-- Use `yggterm-headless server monitor` evidence to split incidents cleanly: daemon/version/reachability issues belong to server lifecycle and hot-restart paths; missing sessions belong to restore/session graph logic; slow status/snapshot belongs to daemon blocking work; healthy daemon state with bad pixels or input belongs to app-control screenshot/probe investigation.
-- For daemon-owned Codex live sessions, treat the Codex transcript JSONL discovered from the PTY process tree as the saved-session identity. A `codex-runtime://...` terminal key may be synthetic and must remain the terminal I/O key, but sidebar search, remote scans, resume deduplication, and user-facing saved-session identity should use the real Codex session id from the open transcript when available.
-- For KDE duplicate-icons, pinned launcher regressions, or update-handoff identity bugs, run `yggterm-headless server app desktop-identity` before changing code. The report should capture canonical desktop file fields, KDE pinned launchers, live client app ids, and the handoff environment flags.
-- Performance and UI snappiness are first-class requirements, not cleanup work.
-- For any non-trivial shell/runtime change, capture local performance telemetry under `~/.yggterm/perf-telemetry.jsonl`, inspect it, and plot it before closing the task.
-- Treat blocking startup work, render-path filesystem IO, synchronous IPC on the UI thread, and repeated full-tree rebuilds as bugs.
-- When a slowdown or UI hitch is reported, instrument first, optimize second, and leave the telemetry hooks in place for future regressions.
-- Treat `DESIGN.md` as reusable brand/design memory for this and future projects. Styling and naming rules should be captured there, not reinvented repeatedly.
-- The active shell is Dioxus-based. Keep steering it toward a polished Zed-shaped terminal workspace rather than rebuilding parallel frontend experiments.
-- Development and release workflow is server-first: builds happen in this server environment and release artifacts are pulled from `dist/` to a laptop for runtime testing.
-- The primary install channel is a direct GitHub-release installer with self-update on launch for direct installs; package-managed installs must stay notify-only.
-- Always produce checksums for release artifacts and keep packaging repeatable via project scripts.
-- Keep `debian/` metadata and packaging scripts current so each release can emit a usable `.deb` with accurate runtime dependencies.
-- For every release build, always generate the `.deb` package (and checksum) in `dist/` so laptop-side GUI/runtime testing can be done outside the SSH server environment.
-- For incremental development releases, always bump the patch version (e.g. `0.1.0` -> `0.1.1`) before packaging.
-- For GUI fixes, do not mark the issue as solved until it has been self-tested live on a different X11 display. Use `x11automation` when helpful for reliable interaction/click targeting. If only build/test validation was done, state that explicitly instead of claiming the GUI issue is fixed.
-- Treat a user's active work desktop as a real machine, not a disposable lab. Prefer rigorous local/debug-build proof in this server environment and isolated `YGGTERM_HOME`/second-display harnesses before driving a live user profile. When a live-desktop bug requires live proof, prefer Yggterm-owned app-control paths (`server app state`, `terminal send`, `probe-type --mode xterm`, `background`, `close`) over desktop-wide keyboard/pointer automation; KDE permission prompts or input leaking into other apps are automation failures to fix, not normal proof. Keep live runs short, target explicit PIDs, background or close automation-owned windows afterward, and remove temporary live sessions created by the test unless the user asks to keep them. For user-visible GUI/runtime regressions on a live desktop, do not hand control back until the target install has been updated, the relevant harness has been updated when needed to expose missing proof, and the harness proof has been run and recorded.
-- Treat the current `codex-litellm` upstream update banner as expected noise unless the user explicitly asks to update `~/gh/codex-litellm`. Do not chase that banner as a Yggterm regression or use it as failure evidence in latency, startup, or render investigations.
-- For terminal input/rendering regressions, the proof bar is stricter: run a second-X11 keyboard smoke against the real viewport, type `/status` plus `Enter`, capture screenshot + state, and do not mark the issue fixed unless the terminal stays interactive and readable afterward.
-- For `/status`-class terminal typing regressions, prefer the live keyboard smoke over synthetic core-trigger proof. The accepted bar is: the real viewport shows `/status` in the prompt area, the Codex status panel renders, the cursor remains visible at the next prompt, and the terminal stays interactive with no retry/disconnect toast.
-- For terminal UI/UX fixes, do not rely on state alone. On a second X11 display, require the matching trio: `server app state`, `server app screenshot`, and the relevant viewport probe (`probe-type`, `probe-scroll`, or `probe-select`). For light-theme readability/cursor bugs, reject the fix unless the screenshot itself shows readable text and a visible cursor, and the state/probe agree.
-- For terminal/UI visibility fixes, require a probe that matches the defect class before closing the issue. Examples: type/enter for overwrite bugs, scroll probes for viewport bugs, and selection/contrast probes for “text only visible when selected” regressions.
-- When touching terminal UX, resume behavior, or app-control truth, update and run the local checklist at `.todos/terminal-ux-smoketests.md` before handover. Keep the checklist untracked, but keep this reference in sync.
-- Screenshot review must be explicit, not impressionistic. When validating a GUI screenshot, classify each region separately: viewport content, floating toasts/overlays, title/session chip, sidebar affordances, and cursor/input position. Do not infer "no toast", "no arrows", or similar UI absence from memory, nearby state, or prior runs; confirm it from the exact image being discussed and cross-check with app-control state when possible.
-
-## Licensing
-
-- Repository license: GNU General Public License, version 3 or later
-  (`GPL-3.0-or-later`); see `LICENSE`. This changed on 2026-08-01 and the
-  *** to match, so there is no Apache-licensed lineage left
-  to inherit from — do not reintroduce that claim anywhere.
-- Markdown documentation license: CC BY-SA 4.0; see `LICENSE-CC-BY-SA-4.0`.
-- `LICENSE-APACHE` is retained only for third-party code under `vendor/` and
-  `third_party/`. It is not a grant over yggterm's own source.
-- Third-party obligations, including the bundled assets, are recorded in
-  `THIRD-PARTY-NOTICES.md`.
-- Copyright owner: Avikalpa Kundu.
-
-## README And Release Notes Contract
-
-- `README.md` should open with the direct-install one-liners and self-update behavior, then quickly explain the product shape: a remote-first, Zed-shaped terminal workspace.
-- Keep screenshots and examples focused on install, session restore, remote workflows, and daemon-owned PTY behavior rather than vague UI aspirations.
-- Changelog or release notes should explain install-path changes, runtime packaging, UI milestones, PTY/daemon behavior, and remote workflow gains that users will actually feel.
-- Release pages should reuse curated notes rather than autogenerated summaries.
-- Keep `README.md`, install scripts, `.deb` packaging, and release artifacts aligned.
-
-## Release Notes Automation
-
-- Keep the canonical changelog current with `## Unreleased` at the top while work is in flight.
-- When cutting a release, move the user-visible notes into an exact version section before or during the tag workstream.
-- Release automation should prefer the exact version section and fall back to `Unreleased` so curated notes still publish when the rename is late.
-- Release pages should use curated changelog text rather than autogenerated notes.
-
-## Campaigns And Work Branches (the experimental system is retired)
-
-- `main` contains release-ready work only. Stable end-user releases are cut from
-  `main`; feature-branch work must not land there until the feature is
-  intentionally promoted.
-- **Campaigns supersede experimental designs (2026-07-10).** New feature
-  direction starts as a campaign memory in the project memory store (like
-  `campaign-split-view-groups`, `campaign-alt-keytips-layer`,
-  `campaign-automations`), not a scope doc. `docs/experiments/` and
-  `docs/experimental-worktrees.md` are deleted; the pre-libyggterm scope docs
-  (paper/cellulose/excalidraw/openwebui/alpha-blur) are retrievable from git
-  history and the `archive/*` tags from the 2026-07-08 branch cleanup.
-  Paper/Cellulose are libyggterm apps now, not integration branches.
-- The only campaign still carrying a work branch is `experimental/automations`
-  (worktree `~/gh/yggterm--automations`; spec = `docs/automations.md` on the
-  branch; status in the `campaign-automations` memory). The branch keeps its
-  historical name. Rebase it onto `origin/main` after `git fetch origin
-  --prune`; do not merge `main` into it.
-- Any pre-promotion channel build must use a `yggterm-` prefixed binary and
-  package name (e.g. `yggterm-automations`), must not overwrite the stable
-  `yggterm` launcher, desktop identity, direct-install metadata, or update
-  channel, and should default to an isolated state home such as
-  `~/.yggterm-experimental/<channel>` unless explicitly testing a migration
-  against a snapshotted stable home. Channel CI may default to Linux x64 +
-  `.deb` + checksums; run the full cross-platform matrix when the branch
-  touches platform-specific shell, installer, compositor, or runtime behavior.
-- A work branch may carry branch-specific `AGENTS.md` changes, helper docs,
-  scripts, or operator notes. Treat those as branch-local by default; when
-  promoting or merging, explicitly decide which files drop, which stay
-  branch-only, and which reconcile into the stable docs on `main`.
-
-## Shared YggUI Platform Direction
-
-- **libyggterm surface ownership (do not violate):** yggterm provides the surface INTERFACE; a libyggterm app OWNS the surface content. yggterm must contain ZERO app-specific chrome — no app's sidebar body, icon, business logic, or crate. Apps (ychrome, ytop, yedit, Paper, Cellulose) contribute surfaces through the generic mechanism and keep their logic + state host-resident in their own repo. Before adding anything app-specific to `yggterm-shell`, read `.agents/skills/libyggterm-surfaces/SKILL.md`; if it belongs to an app, it goes in the app's repo, wired in via the contribution protocol.
-- **Keep the docs-skills current as we go (iterative):** the libyggterm-surfaces skill and the other `.agents/skills/` docs are living contracts. When you change or extend a surface mechanism (OSC 7717 verbs, sidebar contribution, chooser, viewport modes, the app-registry/menu, the ALT+/KeyTips layer) or the vault/agent design, update the relevant skill in the SAME change. A new libyggterm capability that ships without its skill update is not done. These docs exist so any agent — building a throwaway app or a heavyweight one — picks up the platform fast; stale docs defeat that.
-- Treat `yggterm` as the first proving ground for a reusable `yggui` platform covering app-control, observability, automation, proof bundles, and demo composition.
-- When a feature feels generic across future YggdrasilHQ desktop apps, prefer a structure that can later move into `yggui`, `yggui-platform`, `yggui-observe`, `yggui-automation`, or `yggui-demo` rather than hard-wiring it to `yggterm`.
-- Keep app-specific semantics in `yggterm`, but design schemas, manifests, trace formats, and macro concepts so future apps like `yggtopo` or `cellulose` can reuse them.
-- Prefer clean embedding boundaries so standalone repos like `paper` or `cellulose` remain independently valuable products rather than permanently trapped as private subfeatures.
-
-## Demo And Changelog Evidence
-
-- Significant user-visible work should be representable as a proof bundle: manifest, screenshots, optional recording, trace/state evidence, and a short narrative summary.
-- Use `docs/demos/` for the durable system design, `artifacts/demos/` for bundle layout, and `.agents/skills/` for operator workflow.
-- Prefer release notes that cite proof bundles and screenshots over vague summaries.
-- When adding new app-control or automation powers, update the demo/changelog docs and skill in the same change rather than letting the workflow drift out of sync.
-- When touching observability, app-control, proof capture, or terminal-resume verification, always update the relevant skill file in the same change so the debugging workflow stays current.
-- Terminal geometry classification in app-control is part of observability. If `active_terminal_surface.geometry_problem` changes semantics, update the relevant skill files in the same commit.
-- GUI singleton and focus behavior are part of observability too. If client-instance registration, app-control window metadata, or display/session matching changes, update the relevant skill files in the same commit.
-- Terminal text visibility and selection diagnostics are also part of observability. If `terminal_hosts[].low_contrast_span_*`, selection probes, or smoke coverage change, update the relevant skill files in the same commit.
-- Terminal input gating is part of observability too. If `terminal_hosts[].host_stdin_enabled` or the startup recovery input/focus contract changes, update the relevant skill files in the same commit.
-- Visual changelog assets should be deterministic, reusable, and cleanly composited, with restrained motion and annotation rather than flashy effects.
-- Once a UI/UX bug is fixed to the desired behavior, add or extend a concrete smoke test for it instead of relying on visual judgment alone. For terminal UI work, prefer app-control assertions against the mounted xterm row styles, theme state, input state, and screenshots on a second X11 display before calling it fixed.
-- Smoke tests should target the exact defect class that slipped. If the bug was a half-mounted terminal, invisible cursor, low-contrast rows, or broken overwrite path, add an assertion for that concrete failure mode instead of a generic “looks loaded” check.
-- For xterm embed fixes, the default regression bar is `scripts/smoke_xterm_embed_faults.py` plus a second-X11 screenshot. Do not call terminal display/input/cursor issues fixed unless that suite passes for the relevant session kind and the screenshot agrees.
-- For any user-visible UI behavior change, prefer the real probe/app-control path over ad hoc visual inspection. Add or extend a deterministic end-to-end smoke that matches the defect class, run it on a second X11 display, and only then call the behavior fixed.
-- For any reported regression, update the harness, tests, and CI first so the exact defect class fails deterministically before applying the product fix. Do not rely on a manual screenshot or state-only check when the missed behavior can be captured by app-control, a smoke probe, or a focused unit test.
-- Sidebar folder-focus regressions must be proved through app-control by selecting/opening a folder row, requiring `start_page_visible=true`, no active session path, no active terminal input target, and selected-row truth still pointing at the folder.
-- For retained terminal bugs, never assume `terminal_hosts[0]` is the active surface. Proof and smoke code must select the active host by active session path plus focus/activity, or use an explicit active-host field from app-control.

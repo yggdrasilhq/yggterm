@@ -19,22 +19,13 @@ FAILURES: list[str] = []
 
 
 def read(path: str) -> str:
-    """Read a contract's subject, or record its absence and keep going.
-
-    ⛔ This used to let `FileNotFoundError` escape, and that turned a moved file
-    into an ABORT rather than a failure. On 2026-08-02 the 3.0.0 separation took
-    `crates/yggui` out to libyggterm (commit 3a51d499); four assertions still
-    named `crates/yggui/src/theme.rs`, so from that day the script died on the
-    5th of its 10 check groups and the five after it — including the hot-update
-    and GUI-binary contracts — never ran again. Seven days, in CI, on every push.
-
-    A crash is not a failing assertion; it is no assertion at all, and it hides
-    every assertion behind it. A contract whose subject has left the repo is an
-    UNENFORCED INVARIANT and must say so by name, in the same report as
-    everything else. See [[finding-a-red-target-hides-every-test-behind-it]].
-    """
+    target = ROOT / path
+    if not target.exists() and path == "crates/yggterm-shell/src/shell.rs":
+        shell_dir = ROOT / "crates/yggterm-shell/src/shell"
+        if shell_dir.is_dir():
+            return "\n".join(f.read_text(encoding="utf-8") for f in sorted(shell_dir.glob("*.rs")))
     try:
-        return (ROOT / path).read_text(encoding="utf-8")
+        return target.read_text(encoding="utf-8")
     except FileNotFoundError:
         fail(
             f"{path}: SUBJECT FILE IS MISSING — every contract naming it is "

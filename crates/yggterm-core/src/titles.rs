@@ -2897,7 +2897,19 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "new terminal"
             | "new ychrome session"
     );
-    let yggterm_prefixed_title = lower.starts_with("yggterm ");
+    let yggterm_generic_placeholder = matches!(
+        lower.as_str(),
+        "yggterm"
+            | "yggterm shell"
+            | "yggterm codex"
+            | "yggterm codex litellm"
+            | "yggterm claude-code"
+            | "yggterm claude code"
+            | "yggterm muse"
+            | "yggterm antigravity"
+            | "yggterm session"
+            | "yggterm terminal"
+    );
     let new_muse_placeholder = lower.starts_with("new muse code session")
         || lower.starts_with("new antigravity session")
         || lower == "new session";
@@ -2908,7 +2920,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         || remote_codex_litellm_runtime_title
         || remote_claude_code_runtime_title
         || generic_runtime_title
-        || yggterm_prefixed_title
+        || yggterm_generic_placeholder
         || new_muse_placeholder
         || looks_like_low_signal_generated_title(compact)
 }
@@ -3069,6 +3081,29 @@ fn looks_like_shell_command_copy(text: &str) -> bool {
     let looks_like_command_line = |line: &str| {
         let trimmed = line.trim_start_matches("$ ").trim();
         if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let words = lower.split_whitespace().collect::<Vec<_>>();
+        let has_english_structure = words.iter().any(|w| {
+            matches!(
+                *w,
+                "and"
+                    | "for"
+                    | "with"
+                    | "the"
+                    | "setup"
+                    | "hardening"
+                    | "guide"
+                    | "docs"
+                    | "fix"
+                    | "feature"
+                    | "refactor"
+                    | "design"
+                    | "spec"
+            )
+        });
+        if has_english_structure && !line.starts_with("$ ") {
             return false;
         }
         shell_verbs.iter().any(|verb| trimmed.starts_with(verb))

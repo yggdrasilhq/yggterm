@@ -14,7 +14,7 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (sweep + upstream finally)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 ⚠ Our half is shipped; the upstream finally is patched on *** (2026-08-17) and in sweep as fallback.
 
@@ -132,15 +132,23 @@ changing today.
 **Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
 entry is void and only the unbounded-growth half stands.
 
-## ⛔⛔ [6.7] CLI INTEGRATION — 9-CLI INTEGRATION PROTOCOL & RESTORATION — SPEC IS `docs/cli-integration.md`
+## ⛔⛔ [6.7] CLI INTEGRATION — 10-CLI PROTOCOL, TITLES, & GROUPED RENDERING QUIRKS — SPEC IS `docs/cli-integration.md`
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-**One-line:** Unified store discovery, multi-root transcripts, titling authority, live remote birth scheme normalization, restart preservation, and traffic light phrases implemented across all 10 CLIs. Antigravity (`A_ #1557b0`) and Muse (`M_ #86198f`) sessions now populate CwdTree/Startpage and survive server restart without fallback to Codex. Dual Python oracles (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py`) exit 0.
+**One-line:** Unified store discovery, multi-root transcripts, titling authority, live remote birth scheme normalization, restart preservation, and traffic light phrases across 10 CLIs (`codex`, `claude-code`, `muse`, `antigravity`, `pi`, `qwen`, `opencode`, `kimi`, `grok-build`, `codex-litellm`).
 
-**Owner doc (merges `spec-cli-integration-verification.md` + `spec-adding-an-agent-cli.md`):** [`docs/cli-integration.md`](cli-integration.md) — 9-CLI integration protocol system (7 issue headings), full status matrix per CLI, dual-oracle verification results, and architecture invariants.
+**Active 6-Task Remediation Plan (Phase 1 Shipped):**
+1. **SSOT Startpage & CwdTree Unification (SHIPPED & VERIFIED):** Startpage and CwdTree in GUI vs CLI share the exact same underlying model (`yggterm_core::startpage::scan_all_durable_sessions`). Only the presentation layer differs.
+2. **Never Show Shell Sessions (`[$ ]`) (SHIPPED & VERIFIED):** Plain shell sessions are second-class and filtered from Startpage and durable CwdTree.
+3. **Aggregate Multi-CLI Sessions by Recency (SHIPPED & VERIFIED):** Aggregate all sessions across all 10 CLIs sorted strictly by `modified_epoch_ms` descending.
+4. **Elimination of Shorthashes & Corrupt Titles (SHIPPED & VERIFIED):** Plumbed SQLite and context heuristics; eliminated 8-hex shorthashes (`a8f6dbd1`) and low-signal placeholders.
+5. **Built-in Interface LLM Title Rescue (SHIPPED):** Background Interface LLM title rescue (`request_litellm_title` via LiteLLM) wired into `SessionTitleStore`.
+6. **Per-CLI Rendering Quirk Isolation (SHIPPED):** Modularized launch/resume in `crates/yggterm-server/src/managed_cli/` and fixed PTY narrow clamp helper `is_narrow_tui_session` in `terminal.rs`.
 
-**Falsifier:** `~/.local/bin/yggterm-headless server startpage ls --json`, `server titles ls --json`, and `server cwdtree ls --json` on `local`/`dev`/`***` match Python oracles with exit 0 (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py` all exit 0). Restored remote agent sessions preserve `LiveSsh` and their native `SessionKind` / launch subcommands.
+**Owner doc:** [`docs/cli-integration.md`](cli-integration.md) (11 issue headings, status matrix, dual-oracle verification).
+
+**Falsifier:** `yggterm-headless server startpage ls --json`, `server titles ls --json`, and `server cwdtree ls --json` on `local`/`dev`/`***` match Python oracles with exit 0 (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py` all exit 0). No shell sessions in startpage/cwdtree; no shorthashes; faithful screenshots show intact headers, bodies, and footers across all CLIs.
 
 ## ⛔⛔ [6.7] A RESTARTED GUI REPORTS `entered` / `bounded:true` WITHOUT ARMING ANYTHING — FIXED IN CODE, LIVE PROOF OWED
 
@@ -1696,7 +1704,7 @@ and if so this is a control-plane-wide clause and not a `rename` note.
 
 ## ⛔⛔⛔ [6.9→6.7] THE HANDLER SPAN MEASURES 9% OF THE HANDLER, IN THE WRONG UNIT
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (S6 live on *** 2026-08-17)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 ⛔ **THE SPEC BELOW IS BUILT — read "S6 — THE HANDLER NOW REPORTS CPU, END
 TO END, PER VERB" for what it measures and what it found.** S6's `client_handler_cost` is live: `ping 430µs`, `status 1.4ms` at 264 rows (vs 2.4ms wall), whole closure measured via `CLOCK_THREAD_CPUTIME_ID` at `spawn_unix_client_handler`. The ~94% kernel figure is RETRACTED: per-thread `utime`/`stime` floored to 10 ms independently.
