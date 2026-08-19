@@ -57,6 +57,24 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }
+        // Input latency — keystroke → PTY register → PTY render (flush out latency bugs).
+        for probe in [
+            "input/keystroke",
+            "input/pty",
+            "input/render",
+        ] {
+            p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
+        }
+        // Per-CLI wiring faults (Claude gold, Muse bad, agy + all others, codex hiccups) — same ytrace bus.
+        for probe in [
+            "cli/agy_title",
+            "cli/agy_resume",
+            "cli/codex_geometry",
+            "cli/codex_resume",
+            "cli/persisted_identity",
+        ] {
+            p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
+        }
         p
     })
 }
