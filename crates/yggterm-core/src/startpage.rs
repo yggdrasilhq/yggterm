@@ -385,7 +385,7 @@ fn scan_antigravity_sessions(
         } else if !raw_preview.trim().is_empty() {
             crate::agent_cli::clean_agy_prompt_first_line(&raw_preview)
         } else {
-            None
+            crate::read_antigravity_session_title(home, &session_id).ok().flatten()
         };
         let filtered_title = title_cand.filter(|t| {
             !crate::looks_like_generated_fallback_title(t)
@@ -395,7 +395,18 @@ fn scan_antigravity_sessions(
             !crate::looks_like_generated_fallback_title(s)
                 && !crate::looks_like_low_signal_generated_copy(s)
         });
-        let effective_title = filtered_title.clone().or(generated_title.clone());
+        let effective_title = filtered_title
+            .clone()
+            .or_else(|| generated_title.clone())
+            .or_else(|| {
+                crate::read_antigravity_session_title(home, &session_id)
+                    .ok()
+                    .flatten()
+                    .filter(|t| {
+                        !crate::looks_like_generated_fallback_title(t)
+                            && !crate::looks_like_low_signal_generated_copy(t)
+                    })
+            });
         let display_path = format!("agy-runtime://{session_id}");
         out.push(StartpageDurableRow {
             session_id: session_id.clone(),
@@ -535,7 +546,9 @@ impl StartpageDurableRow {
                 crate::titles::extract_tail_context(path).ok().and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx)).filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
             })
         } else {
-            filtered_generated.clone().or_else(|| filtered_raw.clone())
+            filtered_generated.clone().or_else(|| filtered_raw.clone()).or_else(|| {
+                crate::titles::extract_tail_context(path).ok().and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx)).filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+            })
         };
         let detail = entry.detail.filter(|d| !crate::looks_like_low_signal_generated_copy(d) && !crate::looks_like_generated_fallback_title(d));
         Self {
