@@ -1242,11 +1242,18 @@ mod tests {
         ));
         assert!(looks_like_generated_fallback_title("Yggterm Shell"));
         assert!(looks_like_generated_fallback_title("Yggterm Codex"));
-        assert!(looks_like_generated_fallback_title("Yggterm Codex LiteLLM"));
-        assert!(looks_like_generated_fallback_title(
-            "Fix But Only Typed First"
-        ));
+        assert!(looks_like_generated_fallback_title("User Home Codex"));
+        assert!(looks_like_generated_fallback_title("Operator Home Shell"));
+        assert!(looks_like_generated_fallback_title("Codex Session"));
+        assert!(looks_like_generated_fallback_title("Antigravity Session"));
+        assert!(looks_like_generated_fallback_title("Local Codex"));
+        assert!(looks_like_generated_fallback_title("Remote Muse a8f6dbd1"));
+        assert!(looks_like_generated_fallback_title("a8f6dbd1 - /home/user"));
+        assert!(looks_like_generated_fallback_title("/home/user/projects/sample"));
+        assert!(looks_like_generated_fallback_title("Fix But Only Typed First"));
         assert!(!looks_like_generated_fallback_title("Remove Them Entirely"));
+        assert!(!looks_like_generated_fallback_title("SSH setup and hardening for Termux tailnet"));
+        assert!(!looks_like_generated_fallback_title("Design session and build sweep system for yggterm"));
     }
 
     /// The judge answers "did a MACHINE invent this", and an agent-plane title
@@ -2853,25 +2860,84 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let prefixed_hash = (compact.len() == 7 || compact.len() == 8)
         && compact.starts_with('Q')
         && compact.chars().skip(1).all(|ch| ch.is_ascii_hexdigit());
+    let home_breed_placeholder = words.len() >= 2
+        && words.iter().any(|w| w.eq_ignore_ascii_case("home"))
+        && matches!(
+            words.last().copied().unwrap_or("").to_ascii_lowercase().as_str(),
+            "codex"
+                | "claude"
+                | "code"
+                | "muse"
+                | "antigravity"
+                | "pi"
+                | "qwen"
+                | "grok"
+                | "opencode"
+                | "kimi"
+                | "shell"
+                | "terminal"
+                | "session"
+        );
+    let breed_session_placeholder = words.len() >= 2
+        && words.last().is_some_and(|w| w.eq_ignore_ascii_case("session"))
+        && matches!(
+            words[..words.len() - 1].join(" ").to_ascii_lowercase().as_str(),
+            "codex"
+                | "codex litellm"
+                | "claude"
+                | "claude code"
+                | "claude-code"
+                | "muse"
+                | "muse code"
+                | "antigravity"
+                | "pi"
+                | "qwen"
+                | "qwen code"
+                | "grok"
+                | "grok build"
+                | "opencode"
+                | "kimi"
+                | "local"
+                | "ssh"
+                | "shell"
+                | "terminal"
+                | "new"
+        );
+    let local_or_new_placeholder = words.len() >= 2
+        && (words[0].eq_ignore_ascii_case("local") || words[0].eq_ignore_ascii_case("new"))
+        && matches!(
+            words[1..].join(" ").to_ascii_lowercase().as_str(),
+            "codex"
+                | "codex litellm"
+                | "claude"
+                | "claude code"
+                | "claude-code"
+                | "muse"
+                | "muse code"
+                | "antigravity"
+                | "pi"
+                | "qwen"
+                | "qwen code"
+                | "grok"
+                | "grok build"
+                | "opencode"
+                | "kimi"
+                | "shell"
+                | "terminal"
+                | "session"
+                | "ychrome"
+                | "ychrome session"
+        );
+    let remote_shorthash_title = words.len() >= 2
+        && words[0].eq_ignore_ascii_case("remote")
+        && (words.last().unwrap().len() == 7 || words.last().unwrap().len() == 8)
+        && words.last().unwrap().chars().all(|ch| ch.is_ascii_hexdigit());
+    let shorthash_with_tail = words.len() >= 2
+        && (words[0].len() == 7 || words[0].len() == 8)
+        && words[0].chars().all(|ch| ch.is_ascii_hexdigit())
+        && (words[1] == "-" || words[1] == "·" || words[1].starts_with('/'));
     let bare_hash = (compact.len() == 7 || compact.len() == 8)
         && compact.chars().all(|ch| ch.is_ascii_hexdigit());
-    let remote_codex_runtime_title = words.len() == 3
-        && words[0].eq_ignore_ascii_case("remote")
-        && words[1].eq_ignore_ascii_case("codex")
-        && (words[2].len() == 7 || words[2].len() == 8)
-        && words[2].chars().all(|ch| ch.is_ascii_hexdigit());
-    let remote_codex_litellm_runtime_title = words.len() == 4
-        && words[0].eq_ignore_ascii_case("remote")
-        && words[1].eq_ignore_ascii_case("codex")
-        && words[2].eq_ignore_ascii_case("litellm")
-        && (words[3].len() == 7 || words[3].len() == 8)
-        && words[3].chars().all(|ch| ch.is_ascii_hexdigit());
-    let remote_claude_code_runtime_title = words.len() == 4
-        && words[0].eq_ignore_ascii_case("remote")
-        && words[1].eq_ignore_ascii_case("claude")
-        && words[2].eq_ignore_ascii_case("code")
-        && (words[3].len() == 7 || words[3].len() == 8)
-        && words[3].chars().all(|ch| ch.is_ascii_hexdigit());
     let generic_runtime_title = matches!(
         lower.as_str(),
         "local shell"
@@ -2913,12 +2979,17 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let new_muse_placeholder = lower.starts_with("new muse code session")
         || lower.starts_with("new antigravity session")
         || lower == "new session";
+    let raw_path_title = compact.starts_with('/') || compact.contains("/home/") || compact.starts_with("c:\\");
+
     prefixed_session_uuid
         || prefixed_hash
         || bare_hash
-        || remote_codex_runtime_title
-        || remote_codex_litellm_runtime_title
-        || remote_claude_code_runtime_title
+        || remote_shorthash_title
+        || shorthash_with_tail
+        || raw_path_title
+        || home_breed_placeholder
+        || breed_session_placeholder
+        || local_or_new_placeholder
         || generic_runtime_title
         || yggterm_generic_placeholder
         || new_muse_placeholder
