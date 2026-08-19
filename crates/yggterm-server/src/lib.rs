@@ -28463,50 +28463,7 @@ fn build_session(
         blocks: transcript
             .as_ref()
             .map(|transcript| transcript.blocks.clone())
-            .filter(|blocks| !blocks.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    SessionPreviewBlock::message(
-                        "USER",
-                        started_at.clone(),
-                        PreviewTone::User,
-                        vec![
-                            if kind == SessionKind::Document {
-                                format!("Open document {title}.")
-                            } else {
-                                format!("Resume Codex session {session_id}.")
-                            },
-                            if kind == SessionKind::Document {
-                                "Documents live beside sessions in the same fast tree model.".to_string()
-                            } else {
-                                format!("Open the workspace rooted at {cwd}.")
-                            },
-                        ],
-                    ),
-                    SessionPreviewBlock::message(
-                        "ASSISTANT",
-                        "server:restore".to_string(),
-                        PreviewTone::Assistant,
-                        vec![
-                            if kind == SessionKind::Document {
-                                "Web View renders document content immediately from the local workspace store.".to_string()
-                            } else {
-                                "Web View reads stored transcript and metadata. Terminal mode owns live PTY interaction.".to_string()
-                            },
-                            if kind == SessionKind::Document {
-                                "Terminal mode is disabled for document nodes.".to_string()
-                            } else {
-                                format!("Stored session rooted at {cwd}; preview shows transcript when available.")
-                            },
-                            if kind == SessionKind::Document {
-                                format!("Document path: {path}")
-                            } else {
-                                "Use Terminal to resume this session; Web View stays readable without starting the PTY.".to_string()
-                            },
-                        ],
-                    ),
-                ]
-            }),
+            .unwrap_or_default(),
     };
 
     let mut metadata = vec![
@@ -42870,7 +42827,7 @@ terminal_window_id: None,
             .expect("inactive session");
         assert!(!inactive.stored_preview_hydrated);
         assert!(
-            inactive.preview.blocks[0].lines[0].contains("Resume Codex session inactive."),
+            inactive.preview.blocks.is_empty(),
             "{:?}",
             inactive.preview.blocks
         );

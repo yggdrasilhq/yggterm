@@ -1604,10 +1604,29 @@ pub fn read_agent_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessa
 /// "Resume Codex session <uuid>." placeholder, which is what the surface has
 /// been showing.
 pub fn read_agent_transcript_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
-    match transcript_reader_kind(path) {
-        TranscriptReaderKind::Codex => read_codex_transcript_entries(path),
-        TranscriptReaderKind::ClaudeCode => read_claude_code_transcript_entries(path),
+    let kind = transcript_reader_kind(path);
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read session transcript {}", path.display()))?;
+    let mut entries = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match kind {
+            TranscriptReaderKind::Codex => codex_entries_from_record(&value, &mut entries),
+            TranscriptReaderKind::ClaudeCode => {
+                claude_code_entries_from_record(&value, &mut entries)
+            }
+            TranscriptReaderKind::Antigravity => {
+                antigravity_entries_from_record(&value, &mut entries)
+            }
+            TranscriptReaderKind::GenericMessage => {
+                generic_message_entries_from_record(&value, &mut entries)
+            }
+        }
     }
+    Ok(entries)
 }
 
 /// A bounded read of a transcript's tail, and whether it left anything behind.
@@ -1686,6 +1705,12 @@ pub fn read_agent_transcript_entries_tail_limited(
                 TranscriptReaderKind::ClaudeCode => {
                     claude_code_entries_from_record(&value, &mut entries)
                 }
+                TranscriptReaderKind::Antigravity => {
+                    antigravity_entries_from_record(&value, &mut entries)
+                }
+                TranscriptReaderKind::GenericMessage => {
+                    generic_message_entries_from_record(&value, &mut entries)
+                }
             }
         }
         let exhausted_file = start == 0;
@@ -1711,6 +1736,214 @@ pub fn read_agent_transcript_entries_tail_limited(
     }
 }
 
+/// A Antigravity (Gemini CLI) record yields messages, reasoning thinking, and tool calls.
+fn antigravity_entries_from_record(value: &Value, out: &mut Vec<TranscriptEntry>) {
+    let timestamp = extract_timestamp_raw(value);
+    let typ = value.get("type").and_then(Value::as_str).unwrap_or("");
+    match typ {
+        "USER_INPUT" => {
+            if let Some(content) = value.get("content").and_then(Value::as_str) {
+                let mut text = content.trim();
+                if let Some(idx) = text.find("<USER_REQUEST>") {
+                    let after = &text[idx + "<USER_REQUEST>".len()..];
+                    text = after.split("</USER_REQUEST>").next().unwrap_or(after).trim();
+                }
+                let lines = normalize_preview_text(text);
+                if !lines.is_empty() {
+                    out.push(TranscriptEntry::message(
+                        TranscriptRole::User,
+                        lines,
+                        timestamp,
+                    ));
+                }
+            }
+        }
+        "PLANNER_RESPONSE" | "MODEL" => {
+            if let Some(thinking) = value.get("thinking").and_then(Value::as_str) {
+                let lines = normalize_preview_text(thinking);
+                if !lines.is_empty() {
+                    out.push(TranscriptEntry::reasoning(lines, timestamp.clone()));
+                }
+            }
+            if let Some(tool_calls) = value.get("tool_calls").and_then(Value::as_array) {
+                for (idx, call) in tool_calls.iter().enumerate() {
+                    let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let args = call.get("args");
+                    let headline = if let Some(args) = args {
+                        if let Some(cmd) = args.get("CommandLine").and_then(Value::as_str) {
+                            cmd.to_string()
+                        } else if let Some(path) = args
+                            .get("TargetFile")
+                            .or_else(|| args.get("AbsolutePath"))
+                            .and_then(Value::as_str)
+                        {
+                            path.to_string()
+                        } else if let Some(query) =
+                            args.get("query").or_else(|| args.get("Query")).and_then(Value::as_str)
+                        {
+                            query.to_string()
+                        } else {
+                            name.to_string()
+                        }
+                    } else {
+                        name.to_string()
+                    };
+                    let detail = if let Some(args) = args {
+                        serde_json::to_string_pretty(args)
+                            .map(|s| s.lines().map(String::from).collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    out.push(TranscriptEntry::tool_call(
+                        TranscriptToolCall {
+                            tool: name.to_string(),
+                            headline,
+                            detail,
+                            ..TranscriptToolCall::default()
+                        },
+                        timestamp.clone(),
+                        Some(format!("agy_call_{idx}")),
+                    ));
+                }
+            }
+            if let Some(content) = value.get("content").and_then(Value::as_str) {
+                let lines = normalize_preview_text(content);
+                if !lines.is_empty() {
+                    out.push(TranscriptEntry::message(
+                        TranscriptRole::Assistant,
+                        lines,
+                        timestamp,
+                    ));
+                }
+            }
+        }
+        "GENERIC" => {
+            if let Some(content) = value.get("content").and_then(Value::as_str) {
+                let lines = normalize_preview_text(content);
+                if !lines.is_empty() {
+                    if let Some(last) = out
+                        .last_mut()
+                        .filter(|e| e.kind == TranscriptEntryKind::ToolCall)
+                    {
+                        if let Some(tool) = &mut last.tool {
+                            tool.detail.extend(lines);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Generic turn-based reader for Muse, Pi, Qwen, Grok, OpenCode, Kimi.
+fn generic_message_entries_from_record(value: &Value, out: &mut Vec<TranscriptEntry>) {
+    let timestamp = extract_timestamp_raw(value);
+    let role = value
+        .get("role")
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let transcript_role = match role {
+        "user" | "human" | "USER_INPUT" => TranscriptRole::User,
+        "assistant" | "model" | "agent" => TranscriptRole::Assistant,
+        "system" => TranscriptRole::System,
+        _ => TranscriptRole::Assistant,
+    };
+
+    if let Some(thinking) = value
+        .get("thinking")
+        .or_else(|| value.get("thought"))
+        .and_then(Value::as_str)
+    {
+        let lines = normalize_preview_text(thinking);
+        if !lines.is_empty() {
+            out.push(TranscriptEntry::reasoning(lines, timestamp.clone()));
+        }
+    }
+
+    if let Some(tool_calls) = value
+        .get("tool_calls")
+        .or_else(|| value.get("tool_use"))
+        .and_then(Value::as_array)
+    {
+        for call in tool_calls {
+            let name = call
+                .get("name")
+                .or_else(|| call.get("tool"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let headline = call
+                .get("headline")
+                .or_else(|| call.get("input_summary"))
+                .and_then(Value::as_str)
+                .unwrap_or(name);
+            out.push(TranscriptEntry::tool_call(
+                TranscriptToolCall {
+                    tool: name.to_string(),
+                    headline: headline.to_string(),
+                    ..TranscriptToolCall::default()
+                },
+                timestamp.clone(),
+                call.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
+            ));
+        }
+    }
+
+    if let Some(content) = value.get("content").or_else(|| value.get("message")) {
+        if let Some(text) = content.as_str() {
+            let lines = normalize_preview_text(text);
+            if !lines.is_empty() {
+                out.push(TranscriptEntry::message(transcript_role, lines, timestamp));
+            }
+        } else if let Some(arr) = content.as_array() {
+            for block in arr {
+                if let Some(btype) = block.get("type").and_then(Value::as_str) {
+                    match btype {
+                        "text" => {
+                            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                let lines = normalize_preview_text(t);
+                                if !lines.is_empty() {
+                                    out.push(TranscriptEntry::message(
+                                        transcript_role,
+                                        lines,
+                                        timestamp.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                        "thinking" => {
+                            if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                                let lines = normalize_preview_text(t);
+                                if !lines.is_empty() {
+                                    out.push(TranscriptEntry::reasoning(lines, timestamp.clone()));
+                                }
+                            }
+                        }
+                        "tool_use" => {
+                            let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                            out.push(TranscriptEntry::tool_call(
+                                TranscriptToolCall {
+                                    tool: name.to_string(),
+                                    headline: name.to_string(),
+                                    ..TranscriptToolCall::default()
+                                },
+                                timestamp.clone(),
+                                block
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The HEAD of whichever agent CLI owns `path`, at most `max_messages` prose
 /// messages, stopping as soon as it has them.
 ///
@@ -1731,6 +1964,14 @@ pub fn read_agent_transcript_messages_limited(
                 (max_messages > 0).then_some(max_messages),
             )?,
         )),
+        TranscriptReaderKind::Antigravity | TranscriptReaderKind::GenericMessage => {
+            let entries = read_agent_transcript_entries(path)?;
+            let mut messages = transcript_messages_from_entries(&entries);
+            if max_messages > 0 && messages.len() > max_messages {
+                messages.truncate(max_messages);
+            }
+            Ok(messages)
+        }
     }
 }
 
@@ -1784,21 +2025,11 @@ pub fn read_agent_transcript_messages_tail_limited(
 enum TranscriptReaderKind {
     Codex,
     ClaudeCode,
+    Antigravity,
+    GenericMessage,
 }
 
 /// Which CLI's reader owns this file.
-///
-/// The agent-CLI registry answers first and is authoritative: it is the one
-/// place that knows where each CLI keeps its sessions.
-///
-/// A path the registry cannot name — a transcript copied out of its store, a
-/// fixture, a `local://<uuid>` row resolved by hand — is NOT guessed. Picking a
-/// reader by hope is the exact failure this lane exists to fix: the wrong reader
-/// returns `Ok(vec![])` and the caller cannot tell "empty session" from "wrong
-/// parser". So the file is SNIFFED, which answers a different question (what
-/// FORMAT is this?) from a different source (the bytes), and cannot silently
-/// disagree with the registry because it is only consulted when the registry
-/// declined.
 fn transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
     match crate::agent_cli_for_store_session_file(&path.display().to_string())
         .map(|descriptor| descriptor.kind)
@@ -1807,6 +2038,15 @@ fn transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
             return TranscriptReaderKind::Codex;
         }
         Some(crate::SessionKind::ClaudeCode) => return TranscriptReaderKind::ClaudeCode,
+        Some(crate::SessionKind::Antigravity) => return TranscriptReaderKind::Antigravity,
+        Some(
+            crate::SessionKind::Muse
+            | crate::SessionKind::Pi
+            | crate::SessionKind::QwenCode
+            | crate::SessionKind::GrokBuild
+            | crate::SessionKind::OpenCode
+            | crate::SessionKind::Kimi,
+        ) => return TranscriptReaderKind::GenericMessage,
         _ => {}
     }
     sniff_transcript_reader_kind(path)
@@ -1818,13 +2058,6 @@ fn transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
 const TRANSCRIPT_SNIFF_RECORD_BUDGET: usize = 24;
 
 /// The format of a transcript whose path the registry could not name.
-///
-/// Codex tags its records `session_meta` / `response_item` / `event_msg` /
-/// `compacted`; Claude Code tags them `user` / `assistant` and nests the turn
-/// under `message`. The two vocabularies do not overlap, so the first record
-/// that matches either decides. A file that matches NEITHER falls to Claude
-/// Code, which is the same answer as before this function existed — an honest
-/// default, not a claim.
 fn sniff_transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
     let Ok(file) = fs::File::open(path) else {
         return TranscriptReaderKind::ClaudeCode;
@@ -1834,6 +2067,9 @@ fn sniff_transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if value.get("step_index").is_some() || value.get("source").is_some() {
+            return TranscriptReaderKind::Antigravity;
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta" | "response_item" | "event_msg" | "compacted" | "turn_context") => {
                 return TranscriptReaderKind::Codex;
@@ -1841,7 +2077,13 @@ fn sniff_transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
             Some("user" | "assistant") if value.get("message").is_some() => {
                 return TranscriptReaderKind::ClaudeCode;
             }
+            Some("USER_INPUT" | "PLANNER_RESPONSE") => {
+                return TranscriptReaderKind::Antigravity;
+            }
             _ => {}
+        }
+        if value.get("role").is_some() {
+            return TranscriptReaderKind::GenericMessage;
         }
     }
     TranscriptReaderKind::ClaudeCode
