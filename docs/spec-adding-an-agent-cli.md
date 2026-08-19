@@ -207,13 +207,19 @@ re-running its install method, because it is the only thing that knows where its
 own payload lives. A descriptor that is both unfetchable and unupdatable fails
 the registry's own test.
 
-### Step 9 — prove it
+### Step 9 — title lifecycle (`New <CLI> Session` → generated title)
+
+Unlike `claude-code` (store holds `custom-title`/`ai-title`) and like `codex` (`Generated`), a CLI that writes **no** title (e.g. `muse`) must still show a two-phase lifecycle: new row → explicit `"New <CLI> Session"` (`set_session_title_explicit` at `terminal new` in `crates/yggterm-server/src/lib.rs:2501`), then after the first user prompt + assistant turn appears in its `store_globs` (for `muse`: `.local/share/muse/sessions/**/session.jsonl` + `session-index.db`), the daemon background title chore (same poll/throttle as `claude` — `LIVE_SUMMARY_REFRESH_HORIZON` 30 min, `crates/yggterm-server/src/daemon.rs:11682`) replaces it via `set_session_title_hint()` (passive, respects explicit) using `SessionTitleStore::heuristic_title_from_context()` / `request_litellm_title()`. The `looks_like_generated_fallback_title()` list (`crates/yggterm-core/src/titles.rs:2837`) must include the new CLI's daemon-derived placeholder (`"muse code stays attached daemon"` was missing for `muse`, so it persisted). Add `read_muse_session_title()` mirroring `read_cc_session_title()` and include it in `stored_missing`.
+
+### Step 10 — prove it
 
 The acceptance is `spec-agent-cli-harness.md` §6 A6: a session opened through
 yggterm must be indistinguishable (chrome aside) from
 `ssh -t <host> '<cli> resume <id>'` typed into a clean shell. Per
 `CLAUDE.md`, a UI change is not done until a live screenshot on the desktop host
 confirms it — code review and green tests are necessary and not sufficient.
+
+For `id_assigned_at_birth:false` CLIs (muse, claude-code), also prove **resume id**: `remote_runtime_agent_session_key("remote-<slug>://<host>/<row-id>")` and `persistent_agent_resume_command()` must return `<cli> resume <store-internal-id>` (read from the `session.jsonl` for that `cwd`), not the row UUID — otherwise `muse resume 134…` creates a brand new session (the `muse` kick-on-switch bug, `spec-adding-an-agent-cli.md` Muse exemplar).
 
 ---
 
