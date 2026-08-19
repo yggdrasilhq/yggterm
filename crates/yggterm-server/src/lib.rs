@@ -7073,6 +7073,16 @@ impl YggtermServer {
             self.active_session_path = Some(resolved_key);
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
+        } else if let Some((machine_key, session_id, _kind)) =
+            parse_remote_agent_session_path_with_kind(key)
+        {
+            let _ = self.open_remote_scanned_session_with_view(
+                machine_key,
+                session_id,
+                None,
+                None,
+                Some(WorkspaceViewMode::Terminal),
+            );
         }
     }
 
@@ -11653,6 +11663,29 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
         // rollout, and its store may be relocated by `CODEX_HOME`.
         SessionKind::Codex | SessionKind::CodexLiteLlm => {
             return remote_saved_codex_session_exists(session_id);
+        }
+        SessionKind::Antigravity => {
+            if let Some(home) = dirs::home_dir() {
+                let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+                if db_path.exists() {
+                    if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                        &db_path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    ) {
+                        if let Ok(mut stmt) = conn.prepare(
+                            "SELECT 1 FROM conversation_summaries WHERE conversation_id = ?1;",
+                        ) {
+                            if let Ok(exists) = stmt.exists(rusqlite::params![session_id]) {
+                                if exists {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -17312,9 +17345,22 @@ fn remote_muse_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-muse://{machine_key}/{session_id}")
 }
 
-const REMOTE_AGY_SCAN_SCRIPT: &str = r#"
+const REMOTE_AGY_SCAN_SCRIPT: &str = r##"
 import json, os, sys, sqlite3
 from pathlib import Path
+
+def clean_prompt_first_line(raw):
+    if not raw:
+        return ""
+    text = raw.strip()
+    if "<USER_REQUEST>" in text:
+        text = text.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
+    for l in text.splitlines():
+        l = l.strip()
+        if not l or l.startswith("```") or l.startswith("#") or l.startswith("<") or l.startswith("{{"):
+            continue
+        return l[:120]
+    return ""
 
 def scan_agy_session(path_str):
     p = Path(path_str)
@@ -17356,9 +17402,9 @@ def scan_agy_session(path_str):
             if row:
                 t, prev, uris, raw_mod = row
                 if t and t.strip():
-                    title = t.strip()[:120]
+                    title = clean_prompt_first_line(t)
                 elif prev and prev.strip():
-                    title = prev.strip()[:120]
+                    title = clean_prompt_first_line(prev)
                 if uris:
                     try:
                         u_list = json.loads(uris)
@@ -17385,27 +17431,33 @@ def scan_agy_session(path_str):
                             if hj.get("workspace"):
                                 cwd = hj.get("workspace").strip()
                             if not title and hj.get("display"):
-                                title = hj.get("display").strip()[:120]
+                                title = clean_prompt_first_line(hj.get("display"))
                             break
             except:
                 pass
 
-    if not cwd and s.endswith("transcript.jsonl"):
+    if s.endswith("transcript.jsonl"):
         try:
             with open(s, 'r', errors='ignore') as f:
                 for i, line in enumerate(f):
                     if i >= 100:
                         break
-                    if '[URI] -> [CorpusName]:' in line:
-                        for next_line in f:
-                            if ' -> ' in next_line:
-                                cand = next_line.split(' -> ')[0].strip()
-                                if cand:
-                                    cwd = cand
-                                    break
-                            break
-                        if cwd:
-                            break
+                    try:
+                        j = json.loads(line)
+                        if j.get("type") == "USER_INPUT":
+                            c = j.get("content", "")
+                            if not title:
+                                title = clean_prompt_first_line(c)
+                            if not cwd and "[URI] -> [CorpusName]:" in c:
+                                after = c.split("[URI] -> [CorpusName]:")[1]
+                                for l in after.splitlines():
+                                    if " -> " in l:
+                                        cand = l.split(" -> ")[0].strip()
+                                        if cand:
+                                            cwd = cand
+                                            break
+                    except:
+                        pass
         except:
             pass
 
@@ -17432,7 +17484,51 @@ for pattern in [a for a in sys.argv[1:] if a.strip()]:
         data=scan_agy_session(str(p))
         if data:
             print(json.dumps(data, ensure_ascii=False))
-"#;
+
+db_path = home / ".gemini/antigravity-cli/conversation_summaries.db"
+if db_path.exists():
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("SELECT conversation_id, title, preview, workspace_uris, last_modified_time FROM conversation_summaries WHERE killed=0")
+        for row in cur.fetchall():
+            session_id, t, prev, uris, raw_mod = row
+            if not session_id or session_id in seen:
+                continue
+            seen.add(session_id)
+            title = clean_prompt_first_line(t) if t else ""
+            if not title and prev:
+                title = clean_prompt_first_line(prev)
+            cwd = None
+            if uris:
+                try:
+                    u_list = json.loads(uris)
+                    for u in u_list:
+                        if isinstance(u, str):
+                            cand = u.replace("file://", "").rstrip("/")
+                            if cand:
+                                cwd = cand
+                                break
+                except:
+                    pass
+            mtime = 0
+            try:
+                mtime = int(os.path.getmtime(str(db_path)))
+            except:
+                pass
+            data = {
+                'session_id': session_id,
+                'cwd': cwd or str(home),
+                'title': title,
+                'context': '',
+                'mtime': mtime,
+                'path': f"remote-agy://{session_id}",
+            }
+            print(json.dumps(data, ensure_ascii=False))
+        conn.close()
+    except:
+        pass
+"##;
 
 pub(crate) fn remote_agy_scan_args() -> Vec<String> {
     yggterm_core::agent_cli_descriptor(yggterm_core::SessionKind::Antigravity)

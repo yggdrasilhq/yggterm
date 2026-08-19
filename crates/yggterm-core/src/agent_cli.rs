@@ -2747,7 +2747,7 @@ fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     })
 }
 
-fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
+pub fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
     let mut text = raw.trim();
     if let Some(idx) = text.find("<USER_REQUEST>") {
         let after = &text[idx + "<USER_REQUEST>".len()..];
@@ -2760,13 +2760,20 @@ fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
             || l.starts_with('#')
             || l.starts_with("<ADDITIONAL_METADATA>")
             || l.starts_with("<USER_SETTINGS_CHANGE>")
+            || l.starts_with("<CONTEXT_SUMMARY>")
+            || l.starts_with("<SYSTEM_MESSAGE>")
             || l.starts_with("{{ CHECKPOINT")
             || l.starts_with("<USER_REQUEST>")
         {
             continue;
         }
         if !crate::looks_like_generated_fallback_title(l) {
-            return Some(l.to_string());
+            let res = if l.len() > 120 {
+                l[..120].trim().to_string()
+            } else {
+                l.to_string()
+            };
+            return Some(res);
         }
     }
     None
