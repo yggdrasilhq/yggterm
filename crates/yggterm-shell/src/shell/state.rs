@@ -52090,6 +52090,18 @@ fn remote_scanned_session_label(
     if let Some(title) = best_effort_title_from_context(&session.recent_context) {
         return title;
     }
+    if let Ok(home) = resolve_yggterm_home() {
+        if let Ok(store) = yggterm_core::SessionTitleStore::open(&home) {
+            if let Ok(Some(saved_title)) = store.get_title(&session.session_id) {
+                if !saved_title.trim().is_empty()
+                    && !memoized_generated_fallback_title(&saved_title)
+                    && !memoized_low_signal_generated_copy(&saved_title)
+                {
+                    return saved_title;
+                }
+            }
+        }
+    }
     if let Some(short_id) = short_ids.get(&session.session_path) {
         let lower_title = title.to_ascii_lowercase();
         if short_id.len() > 8

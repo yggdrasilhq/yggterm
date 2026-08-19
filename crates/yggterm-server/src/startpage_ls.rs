@@ -461,12 +461,17 @@ fn build_remote_durable_rows(snapshot_json: &Option<serde_json::Value>) -> (Vec<
             };
             let kind = yggterm_core::agent_scheme::session_kind_for_path(&session_path).unwrap_or(yggterm_core::SessionKind::Codex);
             let display_path = if session_path.is_empty() { format!("remote-session://{}", session_id) } else { session_path.clone() };
-            let effective_title = title.clone();
+            let home_dir = dirs::home_dir().unwrap_or_default();
+            let generated_title = yggterm_core::SessionTitleStore::open(&home_dir.join(".yggterm")).ok()
+                .or_else(|| yggterm_core::SessionTitleStore::open(&home_dir).ok())
+                .and_then(|store| store.get_title(&session_id).ok().flatten())
+                .filter(|s| !yggterm_core::looks_like_generated_fallback_title(s) && !yggterm_core::looks_like_low_signal_generated_copy(s));
+            let effective_title = title.clone().or(generated_title.clone());
             rows.push(yggterm_core::startpage::StartpageDurableRow {
                 session_id: session_id.clone(),
                 cwd: if cwd.is_empty() { "/".to_string() } else { cwd },
                 title: title.clone(),
-                generated_title: None,
+                generated_title,
                 effective_title,
                 detail: None,
                 kind,
