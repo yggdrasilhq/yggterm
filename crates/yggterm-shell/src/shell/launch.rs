@@ -412,16 +412,24 @@ fn app() -> Element {
             } else {
                 0.0
             };
+            let app_render_payload = json!({
+                    "renders_in_window": count,
+                    "window_ms": window_ms,
+                    "renders_per_sec": (per_sec * 10.0).round() / 10.0,
+                });
             append_trace_event(
                 &trace_home,
                 "ui",
                 "perf",
                 "app_render_rate",
-                json!({
-                    "renders_in_window": count,
-                    "window_ms": window_ms,
-                    "renders_per_sec": (per_sec * 10.0).round() / 10.0,
-                }),
+                app_render_payload.clone(),
+            );
+            // Mirror to ytrace for Dash notebook `ytrace query --category ui --name app_render_rate`
+            yggterm_core::perf::ytrace_emit_event(
+                "ui",
+                "ui",
+                "app_render_rate",
+                app_render_payload,
             );
             // A sustained app() render rate this high is never output-driven
             // (steady agent streaming sits ~1/s, bursts ~16/s): it is the wake
@@ -429,12 +437,7 @@ fn app() -> Element {
             // the same fail-pattern channel the client anomalies use so
             // scripts/render_fail_patterns.py groups it with the rest.
             if window_ms > 0 && per_sec >= 20.0 {
-                append_trace_event(
-                    &trace_home,
-                    "ui",
-                    "render_fail_pattern",
-                    "detected",
-                    json!({
+                let storm_payload = json!({
                         "session_path": "",
                         "anomaly": {
                             "pattern": "app_render_storm",
@@ -442,7 +445,27 @@ fn app() -> Element {
                             "window_ms": window_ms,
                             "renders_per_sec": (per_sec * 10.0).round() / 10.0,
                         },
-                    }),
+                    });
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "render_fail_pattern",
+                    "detected",
+                    storm_payload.clone(),
+                );
+                // Mirror storm incident to ytrace — Dash Dash `render/storm` + incident channel
+                // so ytop Dash notebook can correlate fan/CPU with render rate without tailing trace.
+                yggterm_core::perf::ytrace_emit_event(
+                    "ui",
+                    "render",
+                    "storm",
+                    storm_payload.clone(),
+                );
+                yggterm_core::perf::ytrace_provider().incident(
+                    "ui",
+                    "render",
+                    "storm",
+                    storm_payload,
                 );
             }
             RENDER_COUNT.store(0, AtomicOrdering::Relaxed);

@@ -21,7 +21,7 @@ pub mod memory_profile;
 /// native CLI player, so two players can never drift into two chimes.
 pub mod notification_audio;
 pub mod startpage;
-mod perf;
+pub mod perf;
 // THE SANCTIONED PRESENTATION DEFAULTS, per platform — the one table that says
 // what this product runs as on each display stack, and the law that agents may
 // not flip those variables against the user's GUI. See

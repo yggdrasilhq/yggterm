@@ -10,8 +10,8 @@ use std::time::Instant;
 
 // ytrace provider — same probe names, same sampling, but file-first for Dash notebooks.
 // Top stays probe-free; Dash is exclusively ytrace (book pages). The wire is v:1.
-static YTRACE_PROVIDER: OnceLock<ytrace::Provider> = OnceLock::new();
-fn ytrace_provider() -> &'static ytrace::Provider {
+pub static YTRACE_PROVIDER: OnceLock<ytrace::Provider> = OnceLock::new();
+pub fn ytrace_provider() -> &'static ytrace::Provider {
     YTRACE_PROVIDER.get_or_init(|| {
         let p = ytrace::Provider::with_home(
             "yggterm",
@@ -31,8 +31,35 @@ fn ytrace_provider() -> &'static ytrace::Provider {
         }
         p.register("render/gui", ytrace::Clock::Cpu, ytrace::Sample::always());
         p.register("render/web_content", ytrace::Clock::Cpu, ytrace::Sample::always());
+        // Common-bug probes — always recorded so Dash notebooks see every occurrence.
+        // Render storm (launch.rs app_render_storm, 20/s sustained) and retained-rehydrate
+        // skips (viewport.rs — the session-only branch that starves keyboard+viewport).
+        // These are diagnostic events, not hot polled spans, so no sampling.
+        for probe in [
+            "render/storm",
+            "terminal_mount/retained_rehydrate_skipped_live_connected",
+            "terminal_mount/retained_rehydrate_skipped_pre_resize",
+            "terminal_mount/retained_rehydrate_skipped_inactive",
+            "terminal_mount/retained_rehydrate_begin",
+            "ui/render_fail_pattern",
+            "ui/app_render_rate",
+        ] {
+            p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
+        }
         p
     })
+}
+
+/// Mirror a yggterm trace event to ytrace so Dash notebooks can `ytrace query` it.
+/// `component` is the trace component (e.g. "ui"), `category`/`name` are the trace
+/// category/name. Wall clock, always sampled — callers decide whether to record.
+pub fn ytrace_emit_event(
+    component: &str,
+    category: &str,
+    name: &str,
+    payload: Value,
+) {
+    ytrace_provider().event(component, category, name, payload);
 }
 
 
