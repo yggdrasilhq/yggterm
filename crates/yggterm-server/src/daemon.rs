@@ -11926,10 +11926,71 @@ fn build_background_copy_updates(
             (title, summary)
         };
 
-        if title.is_some() || summary.is_some() {
+        // ytrace: every title-missing candidate is a resolve attempt — CLI store first,
+        // then interface LLM (heuristic fallback inside generate_*), then "untitled session".
+        // Emitted for Dash `title/resolve_attempt` and `title/untitled_session` timelines.
+        if title_missing {
+            let attempt_payload = serde_json::json!({
+                "session_path": candidate.session_path,
+                "session_id": candidate.session_id,
+                "candidate_title": candidate.title,
+                "stored_title": stored_title,
+                "generated_title": title.clone(),
+                "summary_missing": summary_missing,
+                "live_local_agent": candidate.live_local_agent,
+            });
+            yggterm_core::perf::ytrace_emit_event(
+                "daemon",
+                "title",
+                "resolve_attempt",
+                attempt_payload.clone(),
+            );
+            // If LLM/heuristic produced nothing and we are not rate-limited, the contract
+            // is "titles should never be a shorthash or generic" → "untitled session" with
+            // ytrace re-resolve (next tick will retry because "untitled session" is itself
+            // a fallback per titles.rs). Keep "New Muse Code Session" as placeholder
+            // until we have context — don't promote it to untitled before first prompt.
+            let is_new_placeholder_for_ytrace = candidate.title.trim().to_ascii_lowercase() == "new muse code session"
+                || candidate.title.trim().to_ascii_lowercase() == "new session";
+            if title.is_none() && !rate_limited_this_tick && !is_new_placeholder_for_ytrace {
+                let untitled_payload = serde_json::json!({
+                    "session_path": candidate.session_path,
+                    "session_id": candidate.session_id,
+                    "reason": "llm_and_heuristic_failed_or_no_context",
+                    "candidate_title": candidate.title,
+                });
+                yggterm_core::perf::ytrace_emit_event(
+                    "daemon",
+                    "title",
+                    "untitled_session",
+                    untitled_payload.clone(),
+                );
+                yggterm_core::perf::ytrace_provider().incident(
+                    "daemon",
+                    "title",
+                    "untitled_session",
+                    untitled_payload,
+                );
+            }
+        }
+
+        // If generation failed for a title-missing session and we are not rate-limited,
+        // surface "untitled session" explicitly so shorthash/generic is never shown.
+        // Keep "New Muse Code Session" as the pre-prompt placeholder — only promote
+        // to untitled after we had context to generate from but LLM/heuristic failed.
+        // The ytrace incident above ensures Dash can re-resolve it next tick.
+        let is_new_placeholder = candidate.title.trim().to_ascii_lowercase() == "new muse code session"
+            || candidate.title.trim().to_ascii_lowercase() == "new session";
+        let final_title = if title_missing && title.is_none() && !rate_limited_this_tick && !is_new_placeholder {
+            Some("untitled session".to_string())
+        } else {
+            title
+        };
+
+        if final_title.is_some() || summary.is_some() {
             updates.push(BackgroundCopyUpdate {
                 session_path: candidate.session_path,
-                title,
+                title: final_title,
                 summary,
             });
         }
