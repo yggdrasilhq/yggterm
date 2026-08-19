@@ -7425,6 +7425,18 @@ fn TerminalCanvas(
                             Ok(TerminalJsEvent::Input { data }) => {
                                 set_signal_if_changed(terminal_has_meaningful_output, true);
                                 set_signal_if_changed(terminal_prompt_only, false);
+                                // ytrace input latency: keystroke → PTY register → render
+                                yggterm_core::perf::ytrace_emit_event(
+                                    "shell",
+                                    "input",
+                                    "keystroke",
+                                    serde_json::json!({
+                                        "session_path": terminal_input_session_path.clone(),
+                                        "data_len": data.len(),
+                                        "is_remote": is_remote_resume_session,
+                                        "input_sample": data.chars().take(20).collect::<String>(),
+                                    }),
+                                );
                                 let post_attach_write_retry_limit = if is_remote_resume_session {
                                     2
                                 } else {
@@ -9832,6 +9844,19 @@ fn TerminalCanvas(
                                     // viewport. Forget the stale last-sent geometry and actively
                                     // re-send the live grid so the daemon resizes the fresh PTY to
                                     // match. See finding on the re-resume squish.
+                                    yggterm_core::perf::ytrace_emit_event(
+                                        "shell",
+                                        "cli",
+                                        "codex_geometry",
+                                        serde_json::json!({
+                                            "session_path": session_path.clone(),
+                                            "stale_cols": last_sent_terminal_resize_cols,
+                                            "stale_rows": last_sent_terminal_resize_rows,
+                                            "live_cols": current_terminal_cols,
+                                            "live_rows": current_terminal_rows,
+                                            "kind": "codex_squish_repair",
+                                        }),
+                                    );
                                     last_sent_terminal_resize_cols = 0;
                                     last_sent_terminal_resize_rows = 0;
                                     if terminal_geometry_is_usable(
@@ -10802,6 +10827,17 @@ fn TerminalCanvas(
                                                 current_millis(),
                                                 false,
                                             ) {
+                                                // ytrace input latency: PTY render (bytes about to be painted)
+                                                yggterm_core::perf::ytrace_emit_event(
+                                                    "shell",
+                                                    "input",
+                                                    "render",
+                                                    serde_json::json!({
+                                                        "session_path": session_path.clone(),
+                                                        "data_len": data.len(),
+                                                        "staged_len": data.len(),
+                                                    }),
+                                                );
                                                 record_terminal_forward_sample(
                                                     &trace_home,
                                                     write.len(),

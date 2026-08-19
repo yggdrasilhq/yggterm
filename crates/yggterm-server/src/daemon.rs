@@ -7159,6 +7159,17 @@ impl DaemonRuntime {
         runtime_key: &str,
         data: &str,
     ) -> Result<ServerResponse> {
+        // ytrace input latency: PTY register (daemon has the bytes, about to write to PTY)
+        yggterm_core::perf::ytrace_emit_event(
+            "daemon",
+            "input",
+            "pty",
+            serde_json::json!({
+                "session_path": path,
+                "runtime_key": runtime_key,
+                "data_len": data.len(),
+            }),
+        );
         match self.terminals.write(runtime_key, data) {
             Ok(()) => Ok(ServerResponse::Ack { message: None }),
             Err(error)
@@ -11410,10 +11421,41 @@ fn collect_live_antigravity_title_syncs(
             .ok()
             .flatten()
         else {
+            yggterm_core::perf::ytrace_emit_event(
+                "daemon",
+                "cli",
+                "agy_title",
+                serde_json::json!({
+                    "session_path": session.session_path,
+                    "reason": "no_title_in_store",
+                }),
+            );
             continue;
         };
         let title = title.trim().to_string();
+        if yggterm_core::looks_like_generated_fallback_title(&title) {
+            yggterm_core::perf::ytrace_emit_event(
+                "daemon",
+                "cli",
+                "agy_title",
+                serde_json::json!({
+                    "session_path": session.session_path,
+                    "title": title,
+                    "fallback": true,
+                }),
+            );
+        }
         if !title.is_empty() && title != session.title {
+            yggterm_core::perf::ytrace_emit_event(
+                "daemon",
+                "cli",
+                "agy_title",
+                serde_json::json!({
+                    "session_path": session.session_path,
+                    "title": title.clone(),
+                    "is_untitled": title.to_ascii_lowercase() == "untitled session",
+                }),
+            );
             append_trace_event(
                 &home,
                 "daemon",
