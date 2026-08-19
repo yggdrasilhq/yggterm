@@ -2955,6 +2955,8 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "local claude-code"
             | "local claude code"
             | "local shell stay alive daemon"
+            | "muse code stays attached daemon"
+            | "muse stays attached daemon"
             | "command bin bash"
             | "daemon pty request main viewport"
             | "new session"
@@ -2963,6 +2965,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "new ychrome"
             | "new terminal"
             | "new ychrome session"
+            | "untitled session"
     );
     let yggterm_generic_placeholder = matches!(
         lower.as_str(),

@@ -46,6 +46,17 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }
+        // Title lifecycle — never show shorthash/generic; wire FROM CLI store, then
+        // interface LLM, then "untitled session" with ytrace re-resolve.
+        for probe in [
+            "title/untitled_session",
+            "title/resolve_attempt",
+            "title/llm_rescue",
+            "title/cli_store_hit",
+            "title/generation",
+        ] {
+            p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
+        }
         p
     })
 }
