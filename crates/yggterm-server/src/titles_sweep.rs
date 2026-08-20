@@ -89,6 +89,14 @@ struct ResolvedRow {
     was: TitleState,
     title: Option<String>,
     source: &'static str,
+    /// How much transcript there was to name this session from.
+    ///
+    /// ⭐ Reported because the first full sweep answered a question nobody had
+    /// asked: 103 of 144 rows were named from 200 characters or less, median
+    /// FORTY-FOUR — one-line sessions whose best possible title says only "this
+    /// is a stub". That is a fact about the backlog, not about the titler, and
+    /// it belongs to whoever owns noise deletion.
+    context_chars: Option<usize>,
     error: Option<String>,
 }
 
@@ -181,9 +189,12 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
             // most of them cannot, because they are one-word sessions with no
             // content to name. So the plan is computed for real; only the
             // request is withheld.
-            let (source, error) = match plan_one(row) {
-                Ok(plan) => (plan.source(), None),
-                Err(error) => ("error", Some(format!("{error:#}"))),
+            let (source, plan_context_chars, error) = match plan_one(row) {
+                Ok(Plan::Generate { context, .. }) => {
+                    ("generated", Some(context.chars().count()), None)
+                }
+                Ok(plan) => (plan.source(), None, None),
+                Err(error) => ("error", None, Some(format!("{error:#}"))),
             };
             if source == "generated" {
                 attempted += 1;
@@ -194,13 +205,14 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
                 was,
                 title: None,
                 source,
+                context_chars: plan_context_chars,
                 error,
             });
             continue;
         }
         let outcome = resolve_one(store, &settings, row);
         match outcome {
-            Ok((title, source)) => {
+            Ok((title, source, context_chars)) => {
                 if source == "generated" {
                     attempted += 1;
                 }
@@ -210,6 +222,7 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
                     was,
                     title,
                     source,
+                    context_chars,
                     error: None,
                 })
             }
@@ -223,6 +236,7 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
                     was,
                     title: None,
                     source: "error",
+                    context_chars: None,
                     error: Some(rendered),
                 });
                 if endpoint_refusal {
@@ -323,12 +337,13 @@ fn resolve_one(
     store: &SessionStore,
     settings: &yggterm_core::AppSettings,
     row: &StartpageDurableRow,
-) -> Result<(Option<String>, &'static str)> {
+) -> Result<(Option<String>, &'static str, Option<usize>)> {
     match plan_one(row)? {
-        Plan::FromStore(title) => Ok((Some(title), "store")),
-        Plan::NoTranscript => Ok((None, "no-transcript")),
-        Plan::NoContext => Ok((None, "no-context")),
+        Plan::FromStore(title) => Ok((Some(title), "store", None)),
+        Plan::NoTranscript => Ok((None, "no-transcript", None)),
+        Plan::NoContext => Ok((None, "no-context", Some(0))),
         Plan::Generate { context, force } => {
+            let context_chars = context.chars().count();
             let title = store.generate_title_for_context(
                 settings,
                 &row.session_id,
@@ -336,7 +351,7 @@ fn resolve_one(
                 &context,
                 force,
             )?;
-            Ok((title, "generated"))
+            Ok((title, "generated", Some(context_chars)))
         }
     }
 }
@@ -403,6 +418,9 @@ fn prune_orphaned_copy(
 /// Copy younger than this is never pruned, however orphaned it looks.
 const PRUNE_MIN_AGE_DAYS: i64 = 7;
 
+/// Below this much transcript, a title can only say "this is a stub".
+const THIN_CONTEXT_CHARS: usize = 200;
+
 fn print_human(report: &SweepReport, bad_total: usize) {
     println!(
         "titles sweep — host {}  model {}{}",
@@ -443,6 +461,24 @@ fn print_human(report: &SweepReport, bad_total: usize) {
             (None, Some(error)) => println!("  ! {} {}", &row.session_id[..8.min(row.session_id.len())], error),
             (None, None) => println!("  · {} [{}] nothing to name it from", &row.session_id[..8.min(row.session_id.len())], row.source),
         }
+    }
+    let thin = report
+        .resolved
+        .iter()
+        .filter(|row| row.source == "generated")
+        .filter(|row| row.context_chars.is_some_and(|chars| chars < THIN_CONTEXT_CHARS))
+        .count();
+    if thin > 0 {
+        println!(
+            "{thin} of the {} generated came from under {THIN_CONTEXT_CHARS} characters of \
+             transcript — one-line sessions, whose best possible title says only that they are \
+             stubs. That is a deletion question, not a titling one.",
+            report
+                .resolved
+                .iter()
+                .filter(|row| row.source == "generated")
+                .count()
+        );
     }
     if !report.pruned.is_empty() {
         println!("pruned {} orphaned copy entries", report.pruned.len());
