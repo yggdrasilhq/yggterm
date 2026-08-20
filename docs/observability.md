@@ -106,8 +106,22 @@ are distinguished by the record's `layer` field, **not** by `component` — both
 | `xterm` | `xterm_screen/reset` | point | the canvas was wiped, with the reason |
 | `xterm` | `xterm_screen/{replay_reset,replay_reseed}` | point | the wipe-and-refill pair of a retained replay |
 | `xterm` | `xterm_attach/stream_sample` | point | the CONTROL structure of the bytes the canvas was handed, tagged `reseed` / `live_stream` / `restore`, with an SGR census |
-| `dioxus` | `dioxus_render/component_window` | window | per-component render cost: `renders`, `total_ms`, `max_ms`, `mean_ms`, hottest first |
+| `dioxus` | `dioxus_render/component_window` | window | per-component render cost (`renders`, `total_ms`, `max_ms`, `mean_ms`, hottest first) **and** the invalidation causes (`causes[]`, `root_renders`, `renders_unattributed`) |
 | `rust` | `trace_bridge/foreign_batch_faults` | point | what the boundary refused or repaired, and how far behind the emitter was running |
+
+⭐ **Reading `dioxus_render/component_window` — three numbers, in this order.**
+
+1. `root_renders` is the denominator. **A component whose `renders` equals it was memoized by
+   nothing** and re-rendered on every pass — that is "which component invalidates", answered
+   directly.
+2. `renders_unattributed` counts root renders with **no state write in front of them**: a forced
+   wake, or a second pass over one change. That is render amplification measured rather than
+   inferred, and it is the number a coalescing fix has to move.
+3. `causes[]` names who wrote the signal, ranked by **`renders_preceded`** — how many root renders
+   the site actually caused — not by `writes`. ⛔ The pair is the instrument and the totals alone
+   are a trap: ten writes before one render and one write before each of ten renders have the same
+   `writes` and opposite costs, so ranking by `writes` puts the harmless site above the expensive
+   one. A high-`writes`, low-`renders_preceded` site is chatty and cheap; the reverse is the storm.
 
 ⚠ **`full_canvas_frames` is the one to read first on a corruption report.** The reported symptom is
 a whole viewport of unreadable output, not a damaged line, so a session repainting everything it
