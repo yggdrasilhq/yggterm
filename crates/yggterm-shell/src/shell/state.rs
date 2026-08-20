@@ -16058,6 +16058,12 @@ struct ShellState {
     /// second in-memory copy of the values and an apply/cancel contract the
     /// owner never asked for.
     launch_flags_open: bool,
+    /// The CLI-installation modal, raised from Settings beside the launch-flags
+    /// one. Separate state from `launch_flags_open` because the two answer
+    /// different questions — which flags a CLI launches with, versus whether the
+    /// CLI is on this machine at all — and the owner asked for them as two
+    /// buttons so one can be opened without the other.
+    cli_install_open: bool,
     background_copy_scan_in_flight: bool,
     next_background_copy_scan_after_ms: u64,
     browser_tree_loading_in_flight: bool,
@@ -16840,6 +16846,7 @@ struct RenderSnapshot {
     theme_editor_draft: YgguiThemeSpec,
     theme_editor_selected_stop: Option<usize>,
     launch_flags_open: bool,
+    cli_install_open: bool,
     theme_accent: String,
     shell_tint: String,
     chrome_material_tint: String,
@@ -18432,6 +18439,7 @@ impl ShellState {
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
             launch_flags_open: false,
+            cli_install_open: false,
             background_copy_scan_in_flight: false,
             next_background_copy_scan_after_ms: 0,
             browser_tree_loading_in_flight: !browser_tree_loaded,
@@ -19438,6 +19446,7 @@ impl ShellState {
             theme_editor_draft: self.theme_editor_draft.clone(),
             theme_editor_selected_stop: self.theme_editor_selected_stop,
             launch_flags_open: self.launch_flags_open,
+            cli_install_open: self.cli_install_open,
             theme_accent: dominant_accent(&active_theme_spec, palette.accent),
             shell_tint: shell_tint(self.settings.theme, &active_theme_spec),
             chrome_material_tint: chrome_material_tint(self.settings.theme, &active_theme_spec),
@@ -20932,6 +20941,7 @@ impl ShellState {
             self.keymap_editor_open,
             self.theme_editor_open,
             self.launch_flags_open,
+            self.cli_install_open,
             self.pending_media_capture.is_some(),
             self.pending_fido2.is_some(),
             self.pending_delete.is_some(),
@@ -29946,6 +29956,54 @@ impl ShellState {
             return;
         }
         self.launch_flags_open = open;
+    }
+
+    fn set_cli_install_open(&mut self, open: bool) {
+        if self.cli_install_open == open {
+            return;
+        }
+        self.cli_install_open = open;
+    }
+
+    /// Record the licence acknowledgement behind the CLI-installation modal.
+    ///
+    /// ⛔ Stored as the wire word, never as a bool — `Declined` and `Undecided`
+    /// are different answers and the modal's offer keys off the difference.
+    fn set_agent_cli_install_consent(
+        &mut self,
+        consent: yggterm_core::cli_install::InstallConsent,
+    ) {
+        self.settings.agent_cli_install_consent = consent.as_wire().to_string();
+        self.persist_settings();
+    }
+
+    /// Install every agent CLI this machine is missing.
+    ///
+    /// ⛔ **Refuses unless consent has been granted**, and re-reads it here
+    /// rather than trusting the caller: this is the last point before a fetch,
+    /// and a button that can be reached by any other path must not be the only
+    /// thing standing between a user and someone else's install script.
+    ///
+    /// ⚠ **Scope is THIS machine, deliberately, and the modal says so.** The
+    /// fleet sweep that reaches remote hosts is the provisioner's own job
+    /// (`ManagedCliRefreshScope::Fleet`), and wiring the button to a sweep it
+    /// cannot report progress for would promise the user work they could not
+    /// watch. `Foreground` is the right mode: a human asked, by name, and is
+    /// waiting.
+    fn request_recommended_cli_installs(&mut self) {
+        let consent = yggterm_core::cli_install::InstallConsent::from_wire(
+            &self.settings.agent_cli_install_consent,
+        );
+        if !consent.may_fetch() {
+            return;
+        }
+        std::thread::spawn(|| {
+            if let Err(error) = yggterm_server::refresh_local_managed_cli_now(
+                yggterm_server::ManagedCliRefreshMode::Foreground,
+            ) {
+                tracing::warn!(?error, "cli-install: local managed-CLI refresh failed");
+            }
+        });
     }
 
     /// Store one CLI's launch flags, keyed by its descriptor slug.
@@ -42427,6 +42485,7 @@ fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
             ("Esc", "close"),
         ],
         TopModal::LaunchFlags => &[("Tab", "move"), ("Enter", "apply"), ("Esc", "close")],
+        TopModal::CliInstall => &[("Tab", "move"), ("Enter", "install"), ("Esc", "close")],
         TopModal::CopyEdit => &[
             ("Tab", "move"),
             ("Enter", "save"),
@@ -42479,6 +42538,12 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
         TopModal::LaunchFlags => {
             if dismiss {
                 state.with_mut_counted(|shell| shell.set_launch_flags_open(false));
+            }
+            true
+        }
+        TopModal::CliInstall => {
+            if dismiss {
+                state.with_mut_counted(|shell| shell.set_cli_install_open(false));
             }
             true
         }
@@ -44317,6 +44382,10 @@ enum TopModal {
     /// BY the user from a rail they are already in, so it outranks the dialogs a
     /// page can raise underneath it.
     LaunchFlags,
+    /// The CLI-installation modal, raised from Settings. It sits with the other
+    /// user-raised editors rather than with the page-raised dialogs, for the
+    /// same reason they do: the user opened it from a rail they were already in.
+    CliInstall,
     /// A page asking for the camera or the microphone. Above `Fido2` in the
     /// stack for the same reason `Fido2` is above `Delete`: it is raised by a
     /// PAGE, at a moment the user did not choose, and the keys must belong to
@@ -44381,9 +44450,10 @@ impl TopModal {
         match self {
             // Editing surfaces: fields to type in, chips to pick, a slider to
             // nudge. Landing on the control is the beginning of the work.
-            TopModal::ThemeEditor | TopModal::CopyEdit | TopModal::LaunchFlags => {
-                ModalKeyboardMode::Form
-            }
+            TopModal::ThemeEditor
+            | TopModal::CopyEdit
+            | TopModal::LaunchFlags
+            | TopModal::CliInstall => ModalKeyboardMode::Form,
             // Command surfaces: pick one of a few actions and be done.
             TopModal::KeymapEditor
             | TopModal::MediaCapture
@@ -44404,6 +44474,7 @@ impl TopModal {
             TopModal::KeymapEditor => "keymap-editor",
             TopModal::ThemeEditor => "theme-editor",
             TopModal::LaunchFlags => "launch-flags",
+            TopModal::CliInstall => "cli-install",
             TopModal::MediaCapture => "media-capture",
             TopModal::Fido2 => "fido2",
             TopModal::Delete => "delete",
@@ -44421,6 +44492,7 @@ impl TopModal {
             TopModal::KeymapEditor => "KeyTips",
             TopModal::ThemeEditor => "Theme",
             TopModal::LaunchFlags => "Launch Flags",
+            TopModal::CliInstall => "CLI Install",
             TopModal::MediaCapture => "Camera",
             TopModal::Fido2 => "Passkey",
             TopModal::Delete => "Confirm",
@@ -44455,6 +44527,7 @@ fn top_modal_of(
     keymap_editor: bool,
     theme_editor: bool,
     launch_flags: bool,
+    cli_install: bool,
     media_capture: bool,
     fido2: bool,
     delete: bool,
@@ -44473,6 +44546,9 @@ fn top_modal_of(
     }
     if launch_flags {
         return Some(TopModal::LaunchFlags);
+    }
+    if cli_install {
+        return Some(TopModal::CliInstall);
     }
     // A capture ask outranks a passkey ceremony: both are page-initiated, and
     // the one that hands over a microphone must be the one the keys reach.
@@ -44503,6 +44579,7 @@ fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
         snapshot.keymap_editor_open,
         snapshot.theme_editor_open,
         snapshot.launch_flags_open,
+        snapshot.cli_install_open,
         snapshot.pending_media_capture.is_some(),
         snapshot.pending_fido2.is_some(),
         snapshot.pending_delete.is_some(),
