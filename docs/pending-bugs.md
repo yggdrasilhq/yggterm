@@ -178,53 +178,40 @@ transport fault.
 comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
 `notebooks/06-ui-blocks.ipynb`.
 
-## ⛔⛔ [11.5] AN UNPARSEABLE `server-state.json` REFUSES TO START THE DAEMON, AND THE BACKUP THAT WOULD RECOVER IT IS NEVER READ
+## ⛔ [11.5] REGISTERING A REMOTE MACHINE HAS NO HEADLESS VERB — IT IS THE GUI'S CONNECT-SSH FLOW ONLY
 
 **Status:** OPEN
 
-*Found 2026-08-20 by breaking it on purpose in a sandbox, then reproducing it
-deliberately. Not a render defect — filed here because the user-visible symptom
-is a dead app with no diagnosis.*
+*Found 2026-08-20 while trying to soak the remote row path in a sandbox.*
 
-**The shape.** `load_persisted_state` (`daemon.rs`) propagates a parse failure
-with `?`, so ANY unparseable state document stops the daemon before it binds:
+**The gap.** `server app terminal new --machine-key <key>` answers
+`unknown remote machine key: <key>` on any daemon that has not been told about
+that machine, and there is no verb that tells it. Machines reach
+`server-state.json`'s `remote_machines` / `ssh_targets` through the GUI's
+Connect-SSH flow, so a headless daemon — which is what every sandbox, every
+soak harness and every CI arm runs — can never acquire one.
 
-```
-Error: parsing daemon state …/server-state.json
-Caused by: EOF while parsing a string at line 1 column 30      # truncated write
-Caused by: missing field `label` at line 1 column 39           # partial document
-```
+⇒ **The practical effect: the remote path cannot be exercised anywhere except a
+human's desktop.** A sandbox GUI starts on a fresh `HOME` with no machines, so
+every "soak the remote rows before deploying" plan stops at the first step. That
+is the plane most of the render, resume and identity faults live on.
 
-⛔ **THE DAEMON'S OWN ERROR IS EXCELLENT AND NOBODY EVER SEES IT.** It goes to the
-stderr of a spawned child. What the GUI reports is
-`local yggterm daemon did not become reachable`, and the trace shows only
-`spawned_daemon_exit code:1`. So the operator gets "the app is dead" with no
-cause, no file named, and no remedy — for a fault whose fix is deleting one file.
+⛔ **AND THE OBVIOUS WORKAROUND IS A TRAP THAT COST THIS SESSION A DAEMON.**
+Hand-seeding `server-state.json` with a machine entry looks like the way round it.
+A partial document — anything missing a required field, e.g. a machine entry
+without `label` — made the daemon refuse to start outright, with the GUI reporting
+only `local yggterm daemon did not become reachable`. (That refusal is now
+recoverable; the seeding gap is not.)
 
-⭐ **AND THE RECOVERY ALREADY EXISTS ON DISK, UNUSED.** Every persist copies the
-old document to **`server-state.previous.json`**, and the write path was
-deliberately improved so that backup holds the last *different* state rather than
-a copy of the current one (see `write_persisted_state_if_changed`). Nothing ever
-reads it. The daemon carries a good backup of the exact thing it is refusing to
-start without.
+**What would close it:** a verb that adds/removes an ssh target and a remote
+machine the same way the GUI does, writing through the same owner rather than a
+second encoding of the state file — the surface already exists on the GUI side,
+this is exposing it. `server connect --list` is the read half; there is no write
+half.
 
-**Why the realistic trigger is not operator error.** A truncated document is what
-a mid-write crash, a full disk or a power loss produces, and this file is 2.2 MB
-on the live host and rewritten whenever state changes. It holds the user's
-sessions, so the window is not small.
-
-⚠ **THIS IS A POLICY DECISION, NOT A ONE-LINE FIX, WHICH IS WHY IT IS FILED
-RATHER THAN PATCHED.** Falling back silently would start the daemon with an OLDER
-set of rows than the user last had, which is its own quiet data loss. The shape
-that seems right: fall back to `.previous.json`, keep the corrupt file aside
-rather than overwriting it, and make the substitution LOUD — a trace incident and
-a notification naming both files — so a recovered-but-stale row list can never be
-mistaken for the current one. Whoever takes it should settle that first.
-
-**Falsifier:** if the daemon already recovers from a truncated `server-state.json`
-on some path not found here, this entry is wrong. Reproduce with
-`printf '{"remote_machines":[{"machine_' > $YGGTERM_HOME/server-state.json` in a
-throwaway `YGGTERM_HOME` and start the daemon.
+**Falsifier:** if `server app` (or any headless verb) can already register a
+remote machine on a daemon that has never seen one, this entry is wrong — show
+the invocation.
 
 ## ⛔⛔⛔ [11.5→11.3] A SLOW REQUEST HOLDS THE DAEMON'S ONE RUNTIME LOCK, AND `TerminalRead` CAN PROXY TO ANOTHER DAEMON WHILE HOLDING IT
 
