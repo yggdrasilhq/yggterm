@@ -263,6 +263,13 @@ proxy never engages: reads serve locally, answer empty, and the client mounts wi
 screen — the colorless ghost, previously mis-filed as a pure render defect. The render half
 that remains: with an empty seed the client paints plain fallback content instead of failing
 loudly (a ghost LOOKS like a session; an empty view would at least say what is wrong).
+**MERGED SCOPE (2026-08-20 ~20:2x, on the trace lane's evidence):** this entry now OWNS the
+ghost-frame investigation that was filed under [11.5]. The reseed probe measured ALL NINE
+reseed batches at **29 chars, zero SGR** while the same window's live stream carried 148 SGR
+in 8570 chars — the bytes arrive as a near-empty non-screen, matching this entry's chars=0
+read. The render half was chasing a consequence: nothing downstream can paint colour it never
+received. The [11.5] residual that stays render-side: an empty/absent seed must REFUSE loudly
+instead of painting plain fallback that impersonates a session.
 **Fix direction:** the handover must carry the predecessor's preserved-owner map into the
 successor (transitively — generation N+2 must still reach N's PTYs), and a read that finds
 no runtime AND no owner for a key the row table lists must answer a typed refusal, never an
@@ -332,7 +339,11 @@ re-attach storms across sessions; multiple rows blocked). The input-dead half is
 the 3.1.10 GUI (read-error recovery keeps input alive on every session kind); the falsifier
 for the render half: capture the exact bytes the canvas receives during a forced re-attach —
 the xterm.js write-queue instrumentation being built by the trace-wiring lane is the decisive
-instrument.
+instrument. **RESOLVED INTO ONE INVESTIGATION:** the instrument landed and answered — the
+bytes arrive stripped AND near-empty (29 chars, sgr 0, nine of nine batches). Root ownership
+moved to "[11.0→6.1] AN ADOPTION CHAIN LOSES THE PRESERVED-OWNER TABLE" (the empty daemon
+read); what remains HERE is the render residual (refuse loudly on an empty seed) and the
+glyph-soup switches, which are not yet tied to the same root.
 
 **That instrument now exists, is armed by default, and here is how to read it.** On the trace
 plane: `layer:"xterm"`, probe `xterm_attach/stream_sample`, tagged `stage: "reseed"` vs
