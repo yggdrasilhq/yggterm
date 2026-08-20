@@ -9820,6 +9820,51 @@ fn TerminalCanvas(
                             "read_poll_apply",
                             &session_path,
                         );
+                        // ⛔⛔ THIS SESSION'S BYTES MAY NOT BE PAINTED ONTO ANOTHER
+                        // SESSION'S SURFACE. One terminal host is REUSED as the
+                        // user switches rows, and the "am I still mounted" check
+                        // sits at the TOP of the loop — so a read that resolves
+                        // after a switch used to run this whole branch and write
+                        // the OLD session's differentials into the NEWLY mounted
+                        // viewport, only noticing on the next trip round.
+                        //
+                        // That is the cross-session canvas bleed, reported with
+                        // frames 2026-08-20: a freshly created row (0 user, 0
+                        // assistant turns) rendering another row's live working
+                        // stream — spinner, diff and all — while its own metadata
+                        // rail correctly said it was empty. A full repaint inside
+                        // the CLI cleared it every time, which is the tell that
+                        // the daemon's screen was never wrong and only the client
+                        // grid was poisoned.
+                        //
+                        // The check is cheap (one read lock) and belongs HERE, at
+                        // the last instant before the bytes are used, because the
+                        // switch can land at any await in this branch. Locked by
+                        // `a_read_that_resolves_after_a_switch_is_not_painted`.
+                        {
+                            let still_mounted = {
+                                let shell = state.read();
+                                terminal_session_bridge_should_stay_mounted(
+                                    &shell,
+                                    &session_path,
+                                    &host_id,
+                                )
+                            };
+                            if !still_mounted {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "terminal_read_discarded_not_mounted",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                    }),
+                                );
+                                terminal_read_in_flight = false;
+                                continue;
+                            }
+                        }
                         // A superseded read (its successor was already re-issued
                         // after this one went overdue) is dropped whole: applying
                         // it would write the same chunks a second time. It also
