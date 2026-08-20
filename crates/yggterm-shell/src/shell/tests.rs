@@ -20969,6 +20969,43 @@ mod tests {
         .collect()
     }
 
+    /// ⛔⛔ AN ARRANGEMENT ENTRY WHOSE HEAD IS DEAD MAY NOT HIDE ITS MEMBERS.
+    ///
+    /// Row-set membership persists in settings while rows come and go, and
+    /// nothing prunes an entry whose head row closed (`retain_live` exists for
+    /// that and has no production caller). Caught live 2026-08-20: two remote
+    /// live sessions sat arranged under a head that no longer existed anywhere,
+    /// and the sidebar drew NEITHER — no rail row, no tree row, invisible to
+    /// `server app rows` and to both count verbs — while the start page, which
+    /// ignores the arrangement, kept counting them: header 785 against
+    /// durable_count 783, a standing two-row disagreement between surfaces that
+    /// share one universe by contract. The rail's outline walk skipped every
+    /// row with a stored parent, and only a drawn head can draw its members.
+    #[test]
+    fn a_live_row_arranged_under_a_dead_head_still_reaches_the_sidebar() {
+        let member_a = "remote-cc://buildbox/11111111-2222-4333-8444-eeeeeeeeee01";
+        let member_b = "remote-cc://buildbox/11111111-2222-4333-8444-eeeeeeeeee02";
+        let dead_head = "remote-cc://buildbox/11111111-2222-4333-8444-eeeeeeeeeeff";
+        let mut arrangement = yggterm_core::row_set_outline::RowArrangement::default();
+        arrangement.attach(dead_head, member_a, None).expect("attach a");
+        arrangement.attach(dead_head, member_b, None).expect("attach b");
+        let rows = live_rows_for_seats(
+            &[(member_a, ""), (member_b, "")],
+            &HashSet::new(),
+            &arrangement,
+        );
+        let drawn: Vec<&str> = rows.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(
+            drawn.contains(&member_a) && drawn.contains(&member_b),
+            "members of a dead head are rows, not casualties of it: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().map(|(_, depth)| *depth).max(),
+            Some(1),
+            "with no drawable head they sit at the rail's own level: {rows:?}"
+        );
+    }
+
     /// ⛔⛔ A PRESENTATION STATE MAY NOT REMOVE ROWS FROM A DATA VERB.
     ///
     /// Collapsing a row set hides its members — that is what collapsing means,
