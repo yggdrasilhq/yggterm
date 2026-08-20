@@ -16852,6 +16852,18 @@ struct RenderSnapshot {
     theme_editor_open: bool,
     theme_editor_draft: YgguiThemeSpec,
     theme_editor_selected_stop: Option<usize>,
+    /// Which gradient stop is being DRAGGED, mirrored onto the render snapshot
+    /// so the pad's handles can stop being hit-test targets for the duration.
+    ///
+    /// ⛔ WITHOUT THIS THE DRAG READS THE WRONG COORDINATE SPACE. The pad's
+    /// `onmousemove` takes `element_coordinates()`, which is `offsetX/offsetY`
+    /// — relative to the event's TARGET, not to the element the handler sits
+    /// on. A stop handle is 22px wide, so the moment the pointer crosses one the
+    /// offsets stop describing the 286px pad and start describing the handle:
+    /// measured mid-drag, one continuous gesture reported x = 60, 73, then -2,
+    /// 11 (over a handle), then 110, 123. The dragged stop teleports toward the
+    /// pad's origin every time the cursor touches another handle — or its own.
+    theme_editor_drag_stop: Option<usize>,
     launch_flags_open: bool,
     cli_install_open: bool,
     theme_accent: String,
@@ -19453,6 +19465,7 @@ impl ShellState {
             theme_editor_open: self.theme_editor_open,
             theme_editor_draft: self.theme_editor_draft.clone(),
             theme_editor_selected_stop: self.theme_editor_selected_stop,
+            theme_editor_drag_stop: self.theme_editor_drag_stop,
             launch_flags_open: self.launch_flags_open,
             cli_install_open: self.cli_install_open,
             theme_accent: dominant_accent(&active_theme_spec, palette.accent),
