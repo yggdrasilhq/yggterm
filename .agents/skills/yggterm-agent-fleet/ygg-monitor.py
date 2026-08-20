@@ -1170,7 +1170,23 @@ def report_escalation_gap(subs):
     now = time.time()
     parked = {s["uuid"][:8] for s in subs
               if s.get("parked") and (s.get("parked_until") or 0) > now}
-    gap = sorted(armed - watched)
+    # ⛔⛔ AND THE FORWARD CHECK HAD THE SAME BLIND SPOT THE REVERSE ONE WAS FIXED
+    #    FOR: it screened neither a park nor a RELEASE, so a row that stood itself
+    #    down deliberately was reported as "escalating into an empty room" — an
+    #    alarm whose only offered remedy is to re-subscribe it. `subscribe` then
+    #    REFUSES that exact repair, demanding `--rearm '<why>'`, so the two verbs
+    #    disagreed about the same row: one manufactured the work, the other
+    #    forbade it. Measured 2026-08-20 by seat 11.0, which was one flag away
+    #    from resurrecting FOUR rows holding a "phase 1 pre-reset clean hold".
+    #    ⇒ A release is a third answer, exactly as `released_rows()` says. The
+    #    listing must name it, not re-open it.
+    # ⚠ Unreadable is NOT empty, and the screen is the dangerous half: a damaged
+    #   ledger must not silently downgrade real gaps, so an unreadable ledger
+    #   reports the gap UNSCREENED and says the screen could not run.
+    rel = released_rows()
+    rel_short = {u[:8] for u in rel} if rel is not None else set()
+    gap = sorted(armed - watched - rel_short)
+    stood_down = sorted((armed - watched) & rel_short)
     if gap:
         log(f"⛔ {len(gap)} ROW(S) ARMED ON THE BOOTER BUT ESCALATING TO NOBODY — "
             f"a stall would ring into an empty room:")
@@ -1178,6 +1194,15 @@ def report_escalation_gap(subs):
             log(f"   {u}  ⇒ subscribe it with --escalate-to <its campaign's orchestrator>")
         log("   ⚠ cwd is a PRIOR, not the answer: a row can work in a checkout that has")
         log("     nothing to do with its subject. Confirm against its last prose turn.")
+        if rel is None:
+            log("   ⛔ the release ledger is UNREADABLE — this list is UNSCREENED and may")
+            log("     name rows that stood themselves down. Fix the ledger before acting.")
+    if stood_down:
+        log(f"({len(stood_down)} row(s) armed on the booter RELEASED their own supervision "
+            f"deliberately — not a gap, no action:)")
+        for u in stood_down:
+            why = next((v for k, v in (rel or {}).items() if k[:8] == u), "") or "(no reason recorded)"
+            log(f"   {u}  stood down: {why[:88]}")
     # ⛔⛔ A CROSSING THAT CHECKS ONE DIRECTION IS NOT A CROSSING. This reported
     # only `armed - watched` (on the booter, escalating to nobody) and was blind
     # to the reverse — subscribed here, unarmed there — while calling itself the
