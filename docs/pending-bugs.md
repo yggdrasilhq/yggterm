@@ -394,6 +394,13 @@ removing user activity would not remove most of these renders.
    insert sites, no reader beyond a debug `len`, grows per session forever), and
    `recent_ui_telemetry` — a telemetry dedup ledger — lives inside the render signal, same disease
    as the restore ledger was.
+5. ⚠ Filed from the laptop-GUI evidence (11.0, 2026-08-20 23:4x), root-caused, fix NOT taken at
+   midnight because it crosses a liveness contract: **`apply_sidebar_ping` stamps `now_ms` into
+   the reactive contribution on EVERY endpoint ping** (2.5s per app surface), so each ping is a
+   root render even when no stamp moved and no command arrived. The stamp cannot simply be
+   skipped — `sweep_stale_sidebar_contributions` reads it as the app's liveness, and a starved
+   stamp would reap live apps. The fix is moving ping-liveness to a non-reactive side table the
+   sweep also reads, in one change — see the 11.12 brief §2.
 
 **Falsifier:** under the same streaming-row load, renders track user-visible changes (order
 of 0.1/s), and the viewport repaints only for its own session's bytes. Read `Sidebar`'s

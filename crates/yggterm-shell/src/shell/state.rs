@@ -34663,6 +34663,16 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
         // stops tick N+1 re-asking a session tick N is still probing.
         let restore_attempts: Rc<RefCell<HashMap<String, AppSurfaceRestoreAttempt>>> =
             Rc::new(RefCell::new(HashMap::new()));
+        // The webview edit-plane fault watch. Both counters live in vendored
+        // dioxus-desktop, which has no trace plane of its own: an edit batch
+        // the webview never applied (`edit_faults` — the DOM has diverged for
+        // good) and a flush-gate timeout (`edit_flush_timeouts` — the whole
+        // VirtualDom sat frozen for the full gate window while the event loop
+        // looked healthy; 13 in one GUI's last 17 minutes, measured live
+        // 2026-08-20, and none of them left a queryable trace). This tick
+        // polls the deltas and files the incident the emitter cannot.
+        let mut last_webview_edit_faults = dioxus_desktop::edit_faults();
+        let mut last_webview_flush_timeouts = dioxus_desktop::edit_flush_timeouts();
         loop {
             sleep(Duration::from_millis(WORKING_FLAGS_POLL_INTERVAL_MS)).await;
             ping_tick = ping_tick.wrapping_add(1);
@@ -34706,6 +34716,46 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                 trace_home.clone(),
                 Rc::clone(&restore_attempts),
             ));
+            // Webview edit-plane fault deltas → the incident stream. Reads two
+            // atomics; writes nothing reactive.
+            {
+                let faults = dioxus_desktop::edit_faults();
+                let flush_timeouts = dioxus_desktop::edit_flush_timeouts();
+                if faults != last_webview_edit_faults
+                    || flush_timeouts != last_webview_flush_timeouts
+                {
+                    yggterm_core::perf::ytrace_provider().incident(
+                        "ui",
+                        "webview",
+                        "edit_stall",
+                        json!({
+                            "incident": true,
+                            "incident_id": "webview_edit_stall",
+                            "kind": "fault",
+                            "severity": "warn",
+                            "complaint_for": "llm",
+                            "diagnosis": format!(
+                                "webview edit plane stalled: {} new flush-gate timeout(s) \
+                                 (VirtualDom frozen ~2s each), {} new unapplied batch(es) \
+                                 (DOM divergence, restart-only)",
+                                flush_timeouts.saturating_sub(last_webview_flush_timeouts),
+                                faults.saturating_sub(last_webview_edit_faults),
+                            ),
+                            "observed": {
+                                "edit_faults_total": faults,
+                                "edit_faults_new": faults.saturating_sub(last_webview_edit_faults),
+                                "flush_timeouts_total": flush_timeouts,
+                                "flush_timeouts_new":
+                                    flush_timeouts.saturating_sub(last_webview_flush_timeouts),
+                            },
+                            "remedy": "an occluded window stops rAF acks; check compositor frame \
+                                       delivery and the webview process before blaming the vdom",
+                        }),
+                    );
+                    last_webview_edit_faults = faults;
+                    last_webview_flush_timeouts = flush_timeouts;
+                }
+            }
             // The handover suspension's fail-safe ceiling rides this tick too, and
             // for the same reason: it must expire on WALL CLOCK, not on the next
             // status poll. A daemon that dies mid-handover stops answering, and a
@@ -57276,6 +57326,7 @@ fn describe_app_state_snapshot(
         // listening, and those have opposite fixes. Only a GUI restart clears
         // it. Zero on every healthy instance, by construction.
         "webview_edit_faults": dioxus_desktop::edit_faults(),
+        "webview_edit_flush_timeouts": dioxus_desktop::edit_flush_timeouts(),
         "shell": {
             "sidebar_open": shell.sidebar_open,
             "sidebar_width": shell.sidebar_width,
