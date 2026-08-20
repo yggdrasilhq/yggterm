@@ -630,7 +630,10 @@ Every daemon on the fleet had been in a livelock for hours, and every part of it
     hot_update_handoff_prepared    36x   expected_build_id: null
     daemon_self_retire_handoff_ok  36x   "preserving 11 live terminal runtime(s)"
                                          outcome: "preserved_owner_handoff"
-    bind_lock_busy                116x
+    bind_lock_busy                 84x   (48 on the 3.1.5 socket, 36 on the 3.1.6 socket;
+                                          31 further hits were TEST sockets under /tmp and are
+                                          NOT evidence — counted in an earlier draft of this
+                                          entry as 116, corrected here)
     hot_restart_swap_queue_skipped 34x   "the replacement binary is not ahead of this daemon"
                                          current_version 3.1.6, target_version 3.1.6
 
@@ -660,10 +663,29 @@ GUI's small grey "newer build on disk", which reads as a note rather than an ala
 and dies, continuously, on every host including the laptop — worth weighing against the standing
 heat and responsiveness work.
 
-**Interim, used 2026-08-20:** bump the version. A genuinely-ahead target gives the successor a
-distinct socket name, the incumbent recognises it, and the designed preserving handover completes.
-That works and is the sanctioned path, but it means **every rebuild that does not bump is silently
-never adopted**, which is precisely the shape that made "verify against the LIVE pid" necessary.
+⭐⭐ **THE DOCUMENTED CURE EXISTED AND WAS INERT — THIS IS THE ACTUAL BUG.** The daemon-side
+`HotRestart` request carries a `force: bool` whose own doc says it exists so *"the daemon bypasses
+the same-version refusal check … used by dev/agent deploys where the build_id changed but the
+version_string didn't"*, and the headless verb `server update-daemons [--force]` documents the same
+promise one line above its own body. **Neither route reached it:**
+
+1. `update-daemons` skipped on `status.server_version == current_version` **before `force` was
+   consulted**, so a same-version rebuild answered `skipped_already_current` while echoing
+   `"forced": true` in the same JSON object.
+2. On the path that did send a request it called the five-argument `hot_restart` wrapper, which
+   hardcodes `force: false`.
+
+⇒ The one escape built for exactly this situation could not be invoked by the only verb that would
+ever pass it. **FIXED**: the skip is now `&& !force`, and the call carries `force` through.
+
+**What was done 2026-08-20 while the cure was still inert:** bumped 3.1.6 → 3.1.7. A
+genuinely-ahead target gives the successor a distinct socket name, the incumbent recognises it, and
+the designed preserving handover completes. **It worked — dev adopted at 14:56:59 owning all 11
+live runtimes, and the headless host at 14:57:14 owning 6, with no PTY lost and no session
+re-resumed.** ⚠ But a bump is not a fix: it means **every rebuild that does not bump is silently
+never adopted**, which is precisely the shape that made "verify against the LIVE pid" necessary,
+and it was demonstrated again within minutes — the next lane's build landed on disk at the same
+3.1.7 and the freshly-converged daemons could not take it.
 
 **Fix direction:** make supersession answerable at equal versions. The identity already exists —
 `current_local_build_id()` is passed to `hot_restart_detailed`, and the handoff record carries an
