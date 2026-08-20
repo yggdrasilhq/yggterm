@@ -102,6 +102,55 @@ pub fn package_temp_c() -> Option<f64> {
     hottest
 }
 
+/// Socket power in watts, and the fan reading if this machine has one.
+///
+/// ⛔ **Measured on the reference client, there is no fan tachometer.** The ACPI
+/// fan (`PNP0C0B`) exposes `fan1_input` and it is a stub pinned at 0; the two
+/// `type=Fan` thermal cooling devices are pinned at `cur_state=1` of `max_state=1`
+/// and never move. Both look like fan telemetry and neither carries any
+/// information, which is worse than having none — a series of zeroes graphs
+/// beautifully and means nothing.
+///
+/// What IS live on that hardware is **socket power** (`amdgpu power1_average`,
+/// the APU's package draw, covering CPU and GPU) alongside package temperature.
+/// Sustained power is what a laptop's fan curve actually responds to, so power
+/// plus temperature is the honest proxy — and it is reported as a proxy, never
+/// relabelled as a fan speed.
+pub fn power_and_fan() -> (Option<f64>, Option<u64>) {
+    let mut watts = None;
+    let mut rpm = None;
+    let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") else {
+        return (None, None);
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(name) = std::fs::read_to_string(dir.join("name")) else {
+            continue;
+        };
+        match name.trim() {
+            "amdgpu" | "intel-rapl" => {
+                if let Ok(text) = std::fs::read_to_string(dir.join("power1_average")) {
+                    if let Ok(micro) = text.trim().parse::<f64>() {
+                        watts = Some(micro / 1_000_000.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Ok(text) = std::fs::read_to_string(dir.join("fan1_input")) {
+            if let Ok(value) = text.trim().parse::<u64>() {
+                // A stub reports 0 forever. Absent beats a confident zero: the
+                // whole point of this field is to say whether the fan is on, and
+                // "0 rpm" from a device that cannot count is not that answer.
+                if value > 0 {
+                    rpm = Some(value);
+                }
+            }
+        }
+    }
+    (watts, rpm)
+}
+
 /// `(used_fraction, swap_used_gib)` from `/proc/meminfo`.
 pub fn memory_pressure() -> (Option<f64>, Option<f64>) {
     let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
@@ -268,6 +317,7 @@ impl HostPanicWatcher {
             return None;
         }
         let (mem_used_fraction, swap_used_gib) = memory_pressure();
+        let (socket_watts, fan_rpm) = power_and_fan();
         let mut sample = ytrace::diagnosis::HostPanicSample {
             host: self.host.clone(),
             package_temp_c: package_temp_c(),
@@ -309,6 +359,10 @@ impl HostPanicWatcher {
                 "incident_id": incident.id,
                 "severity": incident.severity.as_str(),
                 "diagnosis": incident.diagnosis,
+                // Proxies for "is the fan about to spin", carried alongside the
+                // verdict so a reader never has to go and re-sample the host.
+                "socket_watts": socket_watts,
+                "fan_rpm": fan_rpm,
             }),
         );
         Some(incident)
@@ -486,6 +540,20 @@ mod tests {
             "host_panic_ui_thrash", "host_panic_thermal",
         ] {
             assert_ne!(short_reason(id), "under load", "unmapped incident id: {id}");
+        }
+    }
+
+    #[test]
+    fn a_stub_fan_reads_as_absent_not_as_zero() {
+        // On hardware with no tachometer the ACPI fan reports 0 forever. A
+        // series of confident zeroes is worse than no series: it graphs
+        // beautifully and answers nothing.
+        let (watts, rpm) = power_and_fan();
+        if let Some(r) = rpm {
+            assert!(r > 0, "a zero rpm must never be reported as a reading");
+        }
+        if let Some(w) = watts {
+            assert!((0.0..=500.0).contains(&w), "implausible socket power: {w} W");
         }
     }
 

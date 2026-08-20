@@ -2136,6 +2136,49 @@ one known-bad daemon**, and a reason to drain it, not a property of chores.
 counts for a 40-minute request, so the long-window instrument has to come from
 outside the daemon, or that flag has to start working.
 
+## 7b. The fan contract, and what a client host can actually be asked
+
+**The contract, owner-set:** *a client host's fan must never spin because of
+yggterm sessions that are **offsite** — however many hundreds of them there are.*
+Sessions whose work runs on another machine may cost the client a socket, a
+screen delta and a repaint; they must not cost it sustained watts.
+
+**Onsite sessions are explicitly out of scope.** A process the user spawned on
+their own machine is entitled to burn it, and yggterm is not the thing that
+should be apologising for a local build. ⇒ The contract only ever grades
+**marginal** client cost per **offsite** session, and the notebook that checks it
+(`notebooks/05-fleet-heat.ipynb`) is built to that shape.
+
+### ⛔ There is no fan tachometer to grade against, measured not assumed
+
+On the reference client (a Lenovo ThinkBook, AMD Zen 4, `ideapad_laptop` rather
+than `thinkpad_acpi`) every candidate fan interface was enumerated and sampled:
+
+| candidate | reading | verdict |
+|---|---|---|
+| ACPI fan `PNP0C0B` → `hwmon/fan1_input` | `0`, on every sample | **stub** — the device exists, the counter does not |
+| `thermal/cooling_deviceN type=Fan` (two of them) | `cur_state=1` of `max_state=1`, never moves | **stub** — pinned, carries no information |
+| `ideapad_acpi/VPC2004:00/fan_mode` | a single small integer | a mode, not a speed |
+| `thinkpad_acpi` fan interface | module not present | not this hardware |
+| `nbfc-linux` | not installed | see below |
+
+⚠ **Two of those look exactly like fan telemetry and neither carries any.** A
+column of confident zeroes plots beautifully and answers nothing, which is worse
+than an empty column — this is the same failure as a temperature sensor that
+defaults to 0 when unreadable, and it is why both are reported as *absent*.
+
+**What is live on that hardware:** `amdgpu power1_average` — the APU's socket
+power, covering CPU and GPU — moved between 6 W and 17 W across a twenty-second
+idle sample while package temperature moved 49–61 °C. A laptop's fan curve
+responds to sustained socket power and package temperature, so **power plus
+temperature is the honest proxy for "is the fan about to spin"**, and it is
+recorded and graded as a proxy, never relabelled as a fan speed.
+
+Reaching a true RPM would mean reading the embedded controller directly
+(`nbfc-linux`), which needs root, a board-specific config, and a tool whose main
+purpose is to *take over* the fan curve. That is an owner decision and is filed
+in `docs/owner-attention.md`, not taken unilaterally.
+
 ## 8. What this file does NOT claim
 
 - **Nothing here measures the GUI.** The GUI runs on another host; the
