@@ -25439,7 +25439,7 @@ mod tests {
             storage_path: "/home/user/.codex/sessions/example.jsonl".to_string(),
         };
 
-        let label = remote_scanned_session_label(&session, &HashMap::new());
+        let label = remote_scanned_session_label_with_saved_title(&session, &HashMap::new(), None);
 
         assert_ne!(label, "Yggterm Codex");
         assert_ne!(label, "Codex Session");
@@ -25454,7 +25454,7 @@ mod tests {
             "USER: Fix the session close viewport fallback and sidebar title determinism."
                 .to_string();
 
-        let label = remote_scanned_session_label(&session, &HashMap::new());
+        let label = remote_scanned_session_label_with_saved_title(&session, &HashMap::new(), None);
 
         assert_ne!(label, "Codex Session");
         assert!(
@@ -25472,6 +25472,59 @@ mod tests {
     /// regression. An id no store can hold is what makes the fallback the only
     /// path left. Same root as the settings-store tests in `pending-bugs.md`:
     /// a test must not read the developer's `~/.yggterm`.
+    #[test]
+    /// ⛔ THE REASON THE LABEL TESTS BECAME HERMETIC. `remote_scanned_session_label`
+    /// used to open the live `~/.yggterm/session-titles.db` inline, so the three
+    /// tests around this one returned different answers on different fleet hosts
+    /// with identical code: a host whose real store happened to hold a row for a
+    /// fixture's session id got that title instead of the fallback, and the test
+    /// failed there and passed everywhere else. A test that consults the live
+    /// store measures the machine.
+    ///
+    /// The saved title is still honoured — it is now an ARGUMENT, so a test can
+    /// state it rather than inherit it.
+    #[test]
+    fn a_saved_title_is_honoured_but_is_an_argument_not_a_live_store_read() {
+        let session = RemoteScannedSession {
+            session_path: "remote-session://devhost/00000000-0000-4000-8000-0000000000d2"
+                .to_string(),
+            session_id: "00000000-0000-4000-8000-0000000000d2".to_string(),
+            cwd: "/home/user/gh/example".to_string(),
+            started_at: String::new(),
+            modified_epoch: 0,
+            event_count: 0,
+            user_message_count: 0,
+            assistant_message_count: 0,
+            title_hint: "Yggterm Codex".to_string(),
+            recent_context: String::new(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: false,
+            title_is_explicit: false,
+            storage_path: "/home/user/.codex/sessions/example.jsonl".to_string(),
+        };
+        let short_ids = HashMap::from([(session.session_path.clone(), "00000000".to_string())]);
+
+        // Same inputs, two store answers, two labels — and neither reads a file.
+        assert_eq!(
+            remote_scanned_session_label_with_saved_title(
+                &session,
+                &short_ids,
+                Some("Rename the billing importer")
+            ),
+            "Rename the billing importer",
+        );
+        assert_eq!(
+            remote_scanned_session_label_with_saved_title(&session, &short_ids, None),
+            "00000000",
+        );
+        // A stored generic title is not a title, so the fallback still wins.
+        assert_eq!(
+            remote_scanned_session_label_with_saved_title(&session, &short_ids, Some("   ")),
+            "00000000",
+        );
+    }
+
     #[test]
     fn remote_scanned_session_label_falls_back_to_short_id_not_generic_codex_session() {
         let session = RemoteScannedSession {
@@ -25494,7 +25547,8 @@ mod tests {
         };
         let short_ids = HashMap::from([(session.session_path.clone(), "00000000".to_string())]);
 
-        let label = remote_scanned_session_label(&session, &short_ids);
+        // ⛔ the pure form: the live title store must not decide a unit test
+        let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
 
         assert_eq!(label, "00000000");
         assert_ne!(label, "Codex Session");
@@ -46939,7 +46993,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let short_ids = HashMap::from([(session.session_path.clone(), "6d8cdd5".to_string())]);
 
-        let label = remote_scanned_session_label(&session, &short_ids);
+        // ⛔ the pure form: the live title store must not decide a unit test
+        let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
 
         assert_eq!(label, "Samplenotes Codex");
         assert!(!label.contains("6d8cdd5"));

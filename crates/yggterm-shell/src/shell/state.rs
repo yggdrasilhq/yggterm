@@ -52066,9 +52066,34 @@ fn push_remote_machine_rows(
         }
     }
 }
+/// The label for a scanned remote row.
+///
+/// ⛔ Thin wrapper ONLY: it reads the live `SessionTitleStore` and hands the
+/// answer to the pure function below. Everything that decides a label lives in
+/// [`remote_scanned_session_label_with_saved_title`], so a test can state the
+/// store's answer instead of inheriting whatever this developer's machine
+/// happens to hold.
+///
+/// It used to read the store inline, which made the label tests
+/// environment-dependent: identical code passed on one fleet host and failed on
+/// another purely because one `~/.yggterm/session-titles.db` had a row for the
+/// fixture's session id and the other did not. A test that consults the live
+/// store is not testing the code.
 fn remote_scanned_session_label(
     session: &RemoteScannedSession,
     short_ids: &HashMap<String, String>,
+) -> String {
+    let saved_title = resolve_yggterm_home()
+        .ok()
+        .and_then(|home| yggterm_core::SessionTitleStore::open(&home).ok())
+        .and_then(|store| store.get_title(&session.session_id).ok().flatten());
+    remote_scanned_session_label_with_saved_title(session, short_ids, saved_title.as_deref())
+}
+
+fn remote_scanned_session_label_with_saved_title(
+    session: &RemoteScannedSession,
+    short_ids: &HashMap<String, String>,
+    saved_title: Option<&str>,
 ) -> String {
     let title = session.title_hint.trim();
     if title.starts_with("Agent ") && title.contains(" unnamed ") {
@@ -52094,16 +52119,12 @@ fn remote_scanned_session_label(
     if let Some(title) = best_effort_title_from_context(&session.recent_context) {
         return title;
     }
-    if let Ok(home) = resolve_yggterm_home() {
-        if let Ok(store) = yggterm_core::SessionTitleStore::open(&home) {
-            if let Ok(Some(saved_title)) = store.get_title(&session.session_id) {
-                if !saved_title.trim().is_empty()
-                    && !memoized_generated_fallback_title(&saved_title)
-                    && !memoized_low_signal_generated_copy(&saved_title)
-                {
-                    return saved_title;
-                }
-            }
+    if let Some(saved_title) = saved_title {
+        if !saved_title.trim().is_empty()
+            && !memoized_generated_fallback_title(saved_title)
+            && !memoized_low_signal_generated_copy(saved_title)
+        {
+            return saved_title.to_string();
         }
     }
     if let Some(short_id) = short_ids.get(&session.session_path) {
