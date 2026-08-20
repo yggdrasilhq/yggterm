@@ -22,6 +22,7 @@ pub mod memory_profile;
 pub mod notification_audio;
 pub mod startpage;
 pub mod perf;
+pub mod ui_block;
 // THE SANCTIONED PRESENTATION DEFAULTS, per platform — the one table that says
 // what this product runs as on each display stack, and the law that agents may
 // not flip those variables against the user's GUI. See

@@ -130,6 +130,12 @@ pub fn ytrace_emit_event(
     name: &str,
     payload: Value,
 ) {
+    // Feed the UI-block watchdog's attribution hint. A block is only actionable
+    // if it can name what ran immediately before the gap, and the emit paths are
+    // the one place that sees every kind of work without instrumenting each
+    // handler separately. `note_activity` never blocks — on lock contention it
+    // skips, because a hint is worth having and never worth a lock on a hot path.
+    crate::ui_block::note_activity(&format!("{category}/{name}"));
     ytrace_provider().event(component, category, name, payload);
 }
 

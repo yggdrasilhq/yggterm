@@ -854,6 +854,31 @@ fn app() -> Element {
             let _ = document::eval(STATUS_DOT_BLINK_JS).await;
         });
     }
+    // UI-THREAD BLOCK WATCHDOG.
+    //
+    // The stamp runs on the Dioxus executor, i.e. the UI thread, on a TIMER —
+    // not on render. A render-driven heartbeat cannot work: the calm render
+    // rate is around one per second, so an idle app would look permanently
+    // blocked and a real block would be indistinguishable from quiet.
+    //
+    // The watcher is a plain OS thread started separately. That separation is
+    // the whole point: every existing instrument for a stalled GUI runs on the
+    // thread that stalls, which is why a freeze the user had to kill by hand
+    // produced zero incidents. Only something outside the UI thread can still
+    // speak while the UI thread cannot.
+    let ui_heartbeat_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    if !ui_heartbeat_started.swap(true, Ordering::SeqCst) {
+        yggterm_core::ui_block::spawn_watchdog(trace_home.clone());
+        spawn_forever(async move {
+            loop {
+                yggterm_core::ui_block::stamp();
+                sleep(Duration::from_millis(
+                    yggterm_core::ui_block::STAMP_INTERVAL_MS,
+                ))
+                .await;
+            }
+        });
+    }
     let keytip_alt_tap_loop_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     if !keytip_alt_tap_loop_started.swap(true, Ordering::SeqCst) {
         spawn_forever(async move {
