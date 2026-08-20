@@ -174,3 +174,166 @@ if (!window.__yggtermTrace) {
 }
 window.__yggtermTrace.registerSender(sendTerminalEvent);
 const ytrace = window.__yggtermTrace;
+
+
+// ── attach-stream capture ────────────────────────────────────────────────
+// The falsifier for the ghost-frame entry in docs/pending-bugs.md. That
+// symptom is the canvas painted COLOURLESS — every SGR colour flattened while
+// emoji keep theirs, which is what proves the ANSI attributes specifically were
+// lost rather than the content. The daemon serves a formatted screen, so the
+// flattening happens between that fetch and the canvas, and the open question
+// is binary:
+//
+//   (A) the bytes reaching the canvas carry no SGR colour  => the reseed strips
+//   (B) the bytes carry it and the canvas paints plain     => the attributes fail to apply
+//
+// ⛔⛔ AND THE OBVIOUS INSTRUMENT — A RING OF THE RAW BYTES — WOULD WRITE THE
+// USER'S TERMINAL CONTENT TO A DIAGNOSTIC FILE THAT AGENTS READ AND QUOTE.
+// The screen being captured is whatever they were working on: source, mail, a
+// secret echoed by a prompt, an OSC 52 clipboard payload. A capture that
+// answers a rendering question by recording the screen has traded a transient
+// exposure for a durable one.
+//
+// ⇒ The control plane is preserved byte-for-byte and the CONTENT is not
+// recorded at all. That is not a weaker instrument for this question: the
+// answer lives entirely in the escape sequences, so what survives redaction IS
+// the evidence, and a run of text becomes `·<length>·`. Two rules make it safe:
+//
+//   * CSI sequences (`ESC [ ... final`) are copied VERBATIM — their parameters
+//     are numeric, and they are exactly what the question is about.
+//   * OSC sequences (`ESC ] ... BEL/ST`) are reduced to their opcode and
+//     length. ⛔ Never verbatim: OSC carries window titles and, at OSC 52, the
+//     clipboard. That is the one escape family that IS content.
+const YGG_CAPTURE_SAMPLE_MAX_CHARS = 2048;
+const YGG_CAPTURE_BYTES_PER_ARM = 8192;
+const YGG_CAPTURE_ARMS_PER_HOST = 16;
+// SGR parameters that set a colour. 38/48 are the extended forms; the rest are
+// the 8/16-colour and bright ranges. 39/49 are the DEFAULT-colour resets and
+// count as colour-setting, because "something explicitly went back to default"
+// is a distinguishable and interesting answer to a flattening question.
+const yggSgrParamIsColour = (param) => {
+    const value = Number(param);
+    if (!Number.isFinite(value)) { return false; }
+    return (value >= 30 && value <= 49) || (value >= 90 && value <= 107);
+};
+// Redact a chunk, preserving its control structure. Returns the sample plus a
+// census, so a reader gets the answer without parsing the sample at all.
+const yggRedactPreservingControls = (data) => {
+    const text = String(data || '');
+    const ESC = '\x1b';
+    const BEL = '\x07';
+    let sample = '';
+    let plainRun = 0;
+    let sgrTotal = 0;
+    let sgrColour = 0;
+    let sgrReset = 0;
+    let oscCount = 0;
+    let truncated = false;
+    const flushPlain = () => {
+        if (plainRun > 0) {
+            sample += '·' + plainRun + '·';
+            plainRun = 0;
+        }
+    };
+    for (let i = 0; i < text.length; i++) {
+        if (sample.length >= YGG_CAPTURE_SAMPLE_MAX_CHARS) { truncated = true; break; }
+        const ch = text[i];
+        if (ch !== ESC) {
+            // Structural control characters are kept: they position the cursor
+            // and shape the screen, and none of them carry content.
+            if (ch === '\r' || ch === '\n' || ch === '\b' || ch === '\t' || ch === BEL) {
+                flushPlain();
+                sample += JSON.stringify(ch).slice(1, -1);
+            } else {
+                plainRun += 1;
+            }
+            continue;
+        }
+        flushPlain();
+        const next = text[i + 1];
+        if (next === '[') {
+            // CSI: parameters, then a final byte in @-~.
+            let end = i + 2;
+            while (end < text.length && !(text[end] >= '@' && text[end] <= '~')) { end++; }
+            const seq = text.slice(i, Math.min(end + 1, text.length));
+            if (seq[seq.length - 1] === 'm') {
+                sgrTotal += 1;
+                const params = seq.slice(2, -1).split(';');
+                if (params.some(yggSgrParamIsColour)) { sgrColour += 1; }
+                if (params.every((p) => p === '' || Number(p) === 0)) { sgrReset += 1; }
+            }
+            sample += '\\e' + seq.slice(1);
+            i = end;
+            continue;
+        }
+        if (next === ']') {
+            // OSC: opcode and LENGTH only. Never the payload.
+            let end = i + 2;
+            while (end < text.length && text[end] !== BEL
+                && !(text[end] === ESC && text[end + 1] === '\\')) { end++; }
+            const body = text.slice(i + 2, end);
+            const opcode = (body.split(';')[0] || '').slice(0, 8);
+            oscCount += 1;
+            sample += '\\e]' + opcode + ';<' + body.length + '>';
+            i = (text[end] === ESC) ? end + 1 : end;
+            continue;
+        }
+        // A two-character escape (RIS, index, charset select ...).
+        sample += '\\e' + (next === undefined ? '' : next);
+        i += 1;
+    }
+    flushPlain();
+    return {
+        sample,
+        chars: text.length,
+        truncated,
+        sgr_total: sgrTotal,
+        sgr_colour: sgrColour,
+        sgr_reset: sgrReset,
+        osc_count: oscCount,
+    };
+};
+if (window.__yggtermTrace && !window.__yggtermTrace.captureStream) {
+    const captures = {};
+    // Arm on the boundaries the symptom rides in on — a mount, a screen wipe, a
+    // replay. Bounded twice over (bytes per arm, arms per host) so a re-attach
+    // storm cannot turn the falsifier into the flood it was built to survive.
+    window.__yggtermTrace.armStreamCapture = (hostId, reason) => {
+        try {
+            const key = String(hostId || '');
+            let arm = captures[key];
+            if (!arm) {
+                arm = { arms: 0, budget: 0, reason: '' };
+                captures[key] = arm;
+            }
+            if (arm.arms >= YGG_CAPTURE_ARMS_PER_HOST) { return; }
+            arm.arms += 1;
+            arm.budget = YGG_CAPTURE_BYTES_PER_ARM;
+            arm.reason = String(reason || '');
+        } catch (_error) {}
+    };
+    // ⭐ `stage` is the point of the capture, not a label on it. The question is
+    // whether the RESEED writes different bytes from the live stream, so a
+    // sample that cannot say which one it came from answers nothing.
+    window.__yggtermTrace.captureStream = (hostId, stage, data) => {
+        try {
+            const arm = captures[String(hostId || '')];
+            if (!arm || arm.budget <= 0) { return; }
+            const text = String(data || '');
+            if (!text.length) { return; }
+            arm.budget -= text.length;
+            const census = yggRedactPreservingControls(text);
+            window.__yggtermTrace.emit({
+                category: "xterm_attach",
+                name: "stream_sample",
+                payload: Object.assign({
+                    host_id: String(hostId || ''),
+                    stage: String(stage || ''),
+                    arm_reason: arm.reason,
+                    arm_index: arm.arms,
+                }, census),
+            });
+        } catch (_error) {}
+    };
+    window.__yggtermTrace.redactPreservingControls = yggRedactPreservingControls;
+}

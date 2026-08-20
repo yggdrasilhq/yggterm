@@ -105,6 +105,7 @@ are distinguished by the record's `layer` field, **not** by `component` — both
 | `xterm` | `xterm_render/frame_gap` | point | a gap between painted frames past the stutter floor |
 | `xterm` | `xterm_screen/reset` | point | the canvas was wiped, with the reason |
 | `xterm` | `xterm_screen/{replay_reset,replay_reseed}` | point | the wipe-and-refill pair of a retained replay |
+| `xterm` | `xterm_attach/stream_sample` | point | the CONTROL structure of the bytes the canvas was handed, tagged `reseed` / `live_stream` / `restore`, with an SGR census |
 | `dioxus` | `dioxus_render/component_window` | window | per-component render cost: `renders`, `total_ms`, `max_ms`, `mean_ms`, hottest first |
 | `rust` | `trace_bridge/foreign_batch_faults` | point | what the boundary refused or repaired, and how far behind the emitter was running |
 
@@ -112,6 +113,14 @@ are distinguished by the record's `layer` field, **not** by `component` — both
 a whole viewport of unreadable output, not a damaged line, so a session repainting everything it
 owns over and over is the shape being looked for — and the old render counter, which counted frames
 without their row range, could not tell that apart from a healthy busy terminal.
+
+⭐ **`xterm_attach/stream_sample` carries a census, not a screen — read the census first.** Its
+`sgr_colour` count answers the ghost-frame question on its own: zero on a `reseed` sample means the
+colour was already gone before the canvas saw the bytes, non-zero means the bytes carried it and the
+fault is in applying the attributes. ⛔ The `sample` field is **redacted**: every run of printable
+text is replaced by its length, CSI sequences are verbatim, and an OSC is reduced to its opcode and
+length. Do not read it as a transcript — it is deliberately not one, and the reason is in
+`docs/spec-trace-plane-contract.md` §8.
 
 ⛔ **`xterm_screen/replay_reset` and `replay_reseed` are a PAIR, and the gap between them is the
 question.** Any record whose `seq` falls between the two wrote into a screen that was

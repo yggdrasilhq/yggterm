@@ -198,6 +198,20 @@ for the render half: capture the exact bytes the canvas receives during a forced
 the xterm.js write-queue instrumentation being built by the trace-wiring lane is the decisive
 instrument.
 
+**That instrument now exists, is armed by default, and here is how to read it.** On the trace
+plane: `layer:"xterm"`, probe `xterm_attach/stream_sample`, tagged `stage: "reseed"` vs
+`"live_stream"` vs `"restore"`. It arms on every screen wipe and every replay, and is bounded
+twice (bytes per arm, arms per host) so the re-attach storm this rides in on cannot turn the
+falsifier into a flood. ⭐ **`sgr_colour` on a `reseed` sample settles the binary question without
+reading anything else:** zero means the colour was already gone before the canvas saw the bytes
+(the reseed strips), non-zero means the bytes carried it and the fault is in applying the
+attributes. Cross-read `xterm_render/frame_window.full_canvas_frames` for repaint volume, and order
+the wipe/refill pair `xterm_screen/{replay_reset,replay_reseed}` on **`seq`, never `ts_ms`** — all
+three routinely share a millisecond, which is why the emitter numbers its own output. ⛔ The
+`sample` field is deliberately NOT a transcript: printable runs are replaced by their length and
+OSC payloads by an opcode and a size, because the screen being sampled is the user's actual work.
+Grammar and rules: `docs/spec-trace-plane-contract.md` §8; probe table: `docs/observability.md` §2.3.
+
 Owner evidence 2026-08-20 (two screenshots): (a) the viewport showing a
 ~30-minute-old frame of the selected session — old turns, stale spinner — while the session
 had long progressed, with the system itself aware (an "Open Session Before Redrawing …

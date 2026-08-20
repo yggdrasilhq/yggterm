@@ -355,6 +355,13 @@ fn terminal_eval_script_with_canvas_renderer(
         // turns that from a story into a total order a reader can check.
         const traceXtermScreenEvent = (name, detail) => {{
             closeXtermProbeWindows();
+            // A wipe is one of the two boundaries the ghost-frame symptom rides
+            // in on, so the stream capture arms HERE rather than on a timer —
+            // what matters is the bytes that refill the screen, and nothing
+            // else knows a refill is about to start.
+            if (window.__yggtermTrace && window.__yggtermTrace.armStreamCapture) {{
+                window.__yggtermTrace.armStreamCapture(hostId, String((detail && detail.reason) || name));
+            }}
             ytrace.emit({{
                 category: "xterm_screen",
                 name,
@@ -5686,6 +5693,9 @@ fn terminal_eval_script_with_canvas_renderer(
                         window.__yggtermArmOsc52Suppress(hostId, 400);
                         if (ws) {{ ws("\x1bc\x1b[H"); ws(restoredText); }}
                         else if (typeof term.write === "function") {{ term.write(`\x1bc\x1b[H${{restoredText}}`); }}
+                        if (window.__yggtermTrace && window.__yggtermTrace.captureStream) {{
+                            window.__yggtermTrace.captureStream(hostId, "restore", restoredText);
+                        }}
                         const tentry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
                             ? window.__yggtermXtermHosts[hostId] : null;
                         if (tentry) {{
@@ -10368,6 +10378,12 @@ fn terminal_eval_script_with_canvas_renderer(
                     syncWrite
                     && !syncWriteBypassFrameBudget
                     && renderPayloadLength < 2048;
+                // The last point at which the LIVE stream is still bytes. Both
+                // arms below hand it to the canvas, so this is the honest place
+                // to sample what the canvas was given.
+                if (window.__yggtermTrace && window.__yggtermTrace.captureStream) {{
+                    window.__yggtermTrace.captureStream(hostId, "live_stream", payload);
+                }}
                 if (preferSyncWrite) {{
                     syncWrite(payload);
                     finalizeWriteFlush(flushShouldFollow, false, paintRepairReason);
@@ -13027,6 +13043,10 @@ fn terminal_replay_retained_data_script_for_session(
                   replay_source: String(replaySource || ''),
                 }},
               }});
+              window.__yggtermTrace.armStreamCapture(
+                String(entry.hostId || ''),
+                'replay:' + String(replaySource || '')
+              );
             }}
             try {{
               if (typeof entry.term.reset === "function") {{
@@ -13051,6 +13071,15 @@ fn terminal_replay_retained_data_script_for_session(
               // during this replay parse (same skip as bridge write flushes).
               entry.writeBridgeInFlight = true;
               entry.lastWriteFlushStartedAtMs = Date.now();
+              // ⭐ THE HALF THE GHOST-FRAME ENTRY SUSPECTS. The daemon serves a
+              // formatted screen, so if these bytes carry no SGR colour the
+              // stripping happened before the canvas ever saw them; if they do
+              // carry it and the canvas still paints plain, the fault is in
+              // applying the attributes. Tagged `reseed` so the two answers
+              // cannot be confused with the live stream's.
+              if (window.__yggtermTrace && window.__yggtermTrace.captureStream) {{
+                window.__yggtermTrace.captureStream(String(entry.hostId || ''), "reseed", payload);
+              }}
               try {{
                 if (writeSync) {{
                   writeSync(replayResetPrefix);
@@ -13303,6 +13332,10 @@ fn terminal_replay_retained_data_script_for_session(
                   stage: "follow_retry",
                 }},
               }});
+              window.__yggtermTrace.armStreamCapture(
+                String(entry.hostId || ''),
+                'replay_follow_retry:' + String(replaySource || '')
+              );
             }}
             try {{
               if (typeof entry.term.reset === "function") {{
@@ -13330,6 +13363,9 @@ fn terminal_replay_retained_data_script_for_session(
               // during this replay parse (same skip as bridge write flushes).
               entry.writeBridgeInFlight = true;
               entry.lastWriteFlushStartedAtMs = Date.now();
+              if (window.__yggtermTrace && window.__yggtermTrace.captureStream) {{
+                window.__yggtermTrace.captureStream(String(entry.hostId || ''), "reseed", data);
+              }}
               try {{
                 if (writeSync) {{
                   writeSync(replayResetPrefix);
