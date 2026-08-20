@@ -15,6 +15,7 @@ It deliberately does **not** answer:
 | What should the `ytop` console look like? | `docs/spec-ytop-design.md` |
 | What is OPEN right now? | `docs/pending-bugs.md` |
 | Which instruments lie *in general*? | `docs/agent-field-guide.md` — the probe-specific ones are below |
+| What must a NON-Rust layer do to emit onto this plane? | `docs/spec-trace-plane-contract.md` |
 
 ---
 
@@ -87,6 +88,36 @@ fires depends on a code path being reached. Measured over a 36-minute live windo
 | `cli/*` | ✅ | **0** | no CLI-specific fault fired in the window |
 | `render/storm` | ✅ | **0** | no storm in the window |
 | `row_resource/*`, any incident | ✅ | **0** | **no incident has ever been recorded on either host** |
+
+### 2.3 The foreign layers — probes that are not emitted from Rust
+
+Two layers inside the webview emit onto the trace plane through the bridge in
+`docs/spec-trace-plane-contract.md` (which owns the grammar; this table owns what exists). They
+are distinguished by the record's `layer` field, **not** by `component` — both write
+`component: "ui"`, which is exactly why the extra tag had to exist.
+
+| `layer` | Probe | Kind | What it measures |
+|---|---|---|---|
+| `xterm` | `xterm_write/enqueue_window` | window | write-queue arrivals: `count`, `chars`, `max_depth`, `max_backlog_age_ms` |
+| `xterm` | `xterm_write/enqueue_backlog` | point | one arrival that crossed the depth or backlog-age floor — the outlier the window would otherwise average away |
+| `xterm` | `xterm_write/flush` | span (wall) | one bridge flush: latency, chars written, chars still pending, paint-repair reason |
+| `xterm` | `xterm_render/frame_window` | window | painted frames: `count`, `max_rows_painted`, `full_canvas_frames`, `max_gap_ms` |
+| `xterm` | `xterm_render/frame_gap` | point | a gap between painted frames past the stutter floor |
+| `xterm` | `xterm_screen/reset` | point | the canvas was wiped, with the reason |
+| `xterm` | `xterm_screen/{replay_reset,replay_reseed}` | point | the wipe-and-refill pair of a retained replay |
+| `dioxus` | `dioxus_render/component_window` | window | per-component render cost: `renders`, `total_ms`, `max_ms`, `mean_ms`, hottest first |
+| `rust` | `trace_bridge/foreign_batch_faults` | point | what the boundary refused or repaired, and how far behind the emitter was running |
+
+⚠ **`full_canvas_frames` is the one to read first on a corruption report.** The reported symptom is
+a whole viewport of unreadable output, not a damaged line, so a session repainting everything it
+owns over and over is the shape being looked for — and the old render counter, which counted frames
+without their row range, could not tell that apart from a healthy busy terminal.
+
+⛔ **`xterm_screen/replay_reset` and `replay_reseed` are a PAIR, and the gap between them is the
+question.** Any record whose `seq` falls between the two wrote into a screen that was
+mid-replacement; a `replay_reset` with no `replay_reseed` after it is a screen that was emptied and
+never refilled. Order these on `seq`, never on `ts_ms` — all three routinely share a millisecond,
+which is precisely why the emitter numbers its own output.
 
 The busiest observed probes in that window, which is what a notebook actually has to work with:
 
