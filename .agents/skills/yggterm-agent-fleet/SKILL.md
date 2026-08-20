@@ -1446,14 +1446,20 @@ handoff is a cycle, not an ending:
       "The successor inherits the model by relay" is BANNED as an explanation:
       there is no inheritance mechanism anywhere; what that phrase always
       described was the sticky default. Verify by transcript, every spawn.
-   4. ⛔ **The REMOTE lane currently drops `--model` end-to-end** (open queue
-      entry: "A REMOTE CC SPAWN'S --model NEVER REACHES THE PROCESS" — the
-      export composes without it; three layers mask it). Until that ships, the
-      canonical REMOTE recipe is: **spawn WITHOUT a prompt → verify model
-      (transcript/cmdline) → wrong ⇒ drive the in-session model command at
-      TURN ZERO (empty session, nothing to re-read; law 1's side effect
-      applies) → THEN deliver the brief via submit → verify by ACK token.**
-      Local spawns apply the flag correctly (proven live); still verify.
+   4. ⛔ **The REMOTE lane drops `--model` — ROOT-CAUSED AND FIXED IN CODE
+      2026-08-20, live from the next daemon version-bump deploy** (queue
+      entry: "A REMOTE CC SPAWN'S --model NEVER REACHES THE PROCESS"). The
+      create was never the fault: a LAUNCH-COMMAND REBUILD (TerminalRestart /
+      SyncTerminalIdentity) between the row's birth and its first spawn
+      recomposed the exports without the row's stored options — the remote
+      twin of the 2026-08-06 local-CC rebuild bug. Until a bumped daemon is
+      LIVE on the mediator, the canonical REMOTE recipe stays: **spawn
+      WITHOUT a prompt → verify model (transcript/cmdline) → wrong ⇒ drive
+      the in-session model command at TURN ZERO (empty session, nothing to
+      re-read; law 1's side effect applies) → THEN deliver the brief via
+      submit → verify by ACK token.** After the deploy, verify by transcript
+      once and retire this workaround. Local spawns apply the flag correctly
+      (proven live); still verify.
    5. ⭐ **Per-CLI register** (yggterm's `--model` maps to each CLI's native
       flag via the descriptor; native semantics measured where marked):
       | CLI | native flag | default lives in | flag sticks? | in-session cmd sticks? | decisive verification |
