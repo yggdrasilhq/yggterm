@@ -15647,14 +15647,6 @@ struct ShellState {
     /// OSC heartbeat cannot fix this on its own: it only reaches a session
     /// whose host is mounted, and a two-tier app like yedit declares exactly
     /// ONCE and exits, so there is no heartbeat to catch at all.
-    ///
-    /// This is the ledger that keeps the repair off the hot path: it holds the
-    /// runtime a session was last asked about, how many asks that runtime has
-    /// had, and when the last one went out, so
-    /// [`app_surface_restore_targets`] can space the next one out
-    /// ([`app_surface_restore_retry_ms`]) instead of either polling every tick
-    /// or giving up forever.
-    app_surface_restore_attempts: HashMap<String, AppSurfaceRestoreAttempt>,
     /// The schema currently rendered in `RightPanelMode::AppPane`, plus the
     /// pane it belongs to. Fetched from the app's control endpoint on open and
     /// replaced by whatever an action returns. `None` while a fetch is in
@@ -18250,7 +18242,6 @@ impl ShellState {
             web_surface_headless_wanted: HashMap::new(),
             web_surface_deliberate_close_ms: HashMap::new(),
             sidebar_contributions: HashMap::new(),
-            app_surface_restore_attempts: HashMap::new(),
             app_pane_schema: None,
             app_pane_values: HashMap::new(),
             right_panel_mode_before_app_pane: None,
@@ -24161,6 +24152,26 @@ impl ShellState {
     /// moving draft loses the keystrokes typed while the POST is in flight),
     /// and this exact draft has not already been synced.
     fn document_draft_sync_due(&mut self, session_path: &str) -> Option<String> {
+        let (pane_id, hash, dirty) = self.document_draft_sync_fingerprint(session_path)?;
+        let entry = self
+            .document_draft_sync
+            .entry(session_path.to_string())
+            .or_insert((0, 0));
+        let settled = entry.0 == hash;
+        entry.0 = hash;
+        if dirty && settled && entry.1 != hash {
+            entry.1 = hash;
+            Some(pane_id)
+        } else {
+            None
+        }
+    }
+    /// The `(pane_id, settle_hash, dirty)` fingerprint the debounced draft
+    /// sync keys on. ONE owner: both the deciding mutator
+    /// ([`Self::document_draft_sync_due`]) and its read-only twin
+    /// ([`Self::document_draft_sync_write_needed`]) hash through here, so the
+    /// two can never disagree about what a draft looks like.
+    fn document_draft_sync_fingerprint(&self, session_path: &str) -> Option<(String, u64, bool)> {
         let channel = self.document_pane_channel(session_path)?;
         let schema_state = channel.schema.as_ref()?;
         let pane_id = schema_state.pane_id.clone();
@@ -24191,18 +24202,47 @@ impl ShellState {
                 dirty = true;
             }
         }
-        let entry = self
-            .document_draft_sync
-            .entry(session_path.to_string())
-            .or_insert((0, 0));
-        let settled = entry.0 == hash;
-        entry.0 = hash;
-        if dirty && settled && entry.1 != hash {
-            entry.1 = hash;
-            Some(pane_id)
-        } else {
-            None
+        Some((pane_id, hash, dirty))
+    }
+    /// Read-only twin of [`Self::document_draft_sync_due`]: would the decider
+    /// mutate anything for this session right now? The poll tick asks this
+    /// under a plain read first, because the decider takes `&mut self` and so
+    /// had to run inside `with_mut` — which dirtied the whole `ShellState`
+    /// signal once per 2.5s tick on a fully idle app (measured as the single
+    /// hottest render cause in `dioxus_render/component_window`, 2026-08-20).
+    fn document_draft_sync_write_needed(&self, session_path: &str) -> bool {
+        let Some((_pane_id, hash, dirty)) = self.document_draft_sync_fingerprint(session_path)
+        else {
+            // No document pane, no schema: the decider bails before its
+            // `entry()` call and mutates nothing.
+            return false;
+        };
+        match self.document_draft_sync.get(session_path) {
+            // The decider would create the entry.
+            None => true,
+            // It would move the settle hash, or record a due sync.
+            Some((settle, synced)) => {
+                *settle != hash || (dirty && *settle == hash && *synced != hash)
+            }
         }
+    }
+    /// The sessions whose document editors can currently be typed in: the
+    /// active session plus the active split group's members.
+    fn co_visible_document_sessions(&self) -> Vec<String> {
+        let mut co_visible: Vec<String> = self
+            .server
+            .active_session_path()
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        if let Some(group) = self.active_split_group() {
+            for member in group.member_sessions() {
+                if !co_visible.iter().any(|path| path == member) {
+                    co_visible.push(member.to_string());
+                }
+            }
+        }
+        co_visible
     }
     fn document_pane_values_json(&self, session_path: &str) -> serde_json::Value {
         serde_json::Value::Object(
@@ -30322,6 +30362,14 @@ impl ShellState {
         self.notifications
             .retain(|notification| notification.job_key.as_deref() != Some(job_key));
     }
+    /// Read-only twin of [`Self::clear_job_notification`]: is there anything
+    /// to clear? Lets `safe_finish_job_notification` skip the signal write —
+    /// and therefore the root render — when the finish would be a no-op.
+    fn has_job_notification(&self, job_key: &str) -> bool {
+        self.notifications
+            .iter()
+            .any(|notification| notification.job_key.as_deref() == Some(job_key))
+    }
     fn clear_notifications(&mut self) {
         self.notifications.clear();
         self.persist_notifications(true);
@@ -31684,6 +31732,22 @@ fn safe_finish_job_notification(
     let job_key = job_key.into();
     let title = title.into();
     let message = message.into();
+    // A finish that emits nothing and has nothing to clear must not touch the
+    // signal. This helper runs from render bodies (`TerminalCanvas` calls it
+    // on ordinary passes to make sure a resume notice is gone), and the
+    // unconditional `with_mut` dirtied every subscriber even when the retain
+    // removed nothing — measured at 32 preceded renders in one 150s window
+    // (`dioxus_render/component_window`, 2026-08-20). On a read panic, fall
+    // through to the write: a wrongly-skipped clear is worse than a render.
+    if !emit_completion {
+        let has_job = safe_shell_read(state, "finish_job_notification_precheck", |shell| {
+            shell.has_job_notification(&job_key)
+        })
+        .unwrap_or(true);
+        if !has_job {
+            return;
+        }
+    }
     let job_key_for_write = job_key.clone();
     let title_for_write = title.clone();
     let message_for_write = message.clone();
@@ -34313,37 +34377,43 @@ impl ShellState {
             .collect()
     }
 
-    /// Record that a session was asked about, so it is not asked again until
-    /// its backoff window elapses or its runtime moves.
-    ///
-    /// A NEW runtime restarts the schedule rather than inheriting the previous
-    /// one's backoff: a handover that re-resumed the PTY is a fresh app that
-    /// deserves the fast asks, not the tail of a minute-long window the dead one
-    /// earned.
-    fn mark_app_surface_restore_attempted(
-        &mut self,
-        session_path: &str,
-        runtime_token: Option<String>,
-        now_ms: u64,
-    ) {
-        let entry = self
-            .app_surface_restore_attempts
-            .entry(session_path.to_string())
-            .or_insert_with(|| AppSurfaceRestoreAttempt {
-                runtime_token: runtime_token.clone(),
-                asks: 0,
-                last_at_ms: now_ms,
-            });
-        if entry.runtime_token != runtime_token {
-            *entry = AppSurfaceRestoreAttempt {
-                runtime_token,
-                asks: 0,
-                last_at_ms: now_ms,
-            };
-        }
-        entry.asks = entry.asks.saturating_add(1);
-        entry.last_at_ms = now_ms;
+}
+
+/// Record that a session was asked about, so it is not asked again until
+/// its backoff window elapses or its runtime moves.
+///
+/// A NEW runtime restarts the schedule rather than inheriting the previous
+/// one's backoff: a handover that re-resumed the PTY is a fresh app that
+/// deserves the fast asks, not the tail of a minute-long window the dead one
+/// earned.
+///
+/// The ledger lives with the poll loop, NOT in `ShellState`: no component
+/// renders it, and while it sat in the reactive signal every mark dirtied the
+/// whole shell — one full root render per tick, forever, on a host whose rows
+/// never declare (measured as a top cause in `dioxus_render/component_window`,
+/// 2026-08-20).
+fn mark_app_surface_restore_attempted(
+    attempts: &mut HashMap<String, AppSurfaceRestoreAttempt>,
+    session_path: &str,
+    runtime_token: Option<String>,
+    now_ms: u64,
+) {
+    let entry = attempts
+        .entry(session_path.to_string())
+        .or_insert_with(|| AppSurfaceRestoreAttempt {
+            runtime_token: runtime_token.clone(),
+            asks: 0,
+            last_at_ms: now_ms,
+        });
+    if entry.runtime_token != runtime_token {
+        *entry = AppSurfaceRestoreAttempt {
+            runtime_token,
+            asks: 0,
+            last_at_ms: now_ms,
+        };
     }
+    entry.asks = entry.asks.saturating_add(1);
+    entry.last_at_ms = now_ms;
 }
 
 /// Re-establish app surfaces this client never witnessed being declared.
@@ -34365,12 +34435,16 @@ impl ShellState {
 /// never opens a rail. It restores the session's surface STATE, which
 /// `document_surface_visible_for` and the web reconciler then render when the
 /// user visits that session.
-async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: std::path::PathBuf) {
+async fn restore_app_surfaces_tick(
+    state: Signal<ShellState>,
+    trace_home: std::path::PathBuf,
+    attempts: Rc<RefCell<HashMap<String, AppSurfaceRestoreAttempt>>>,
+) {
     let now_ms = current_millis() as u64;
     let targets = state.with(|shell| {
         app_surface_restore_targets(
             &shell.app_surface_restore_rows(),
-            &shell.app_surface_restore_attempts,
+            &attempts.borrow(),
             now_ms,
             APP_SURFACE_RESTORE_BUDGET_PER_TICK,
         )
@@ -34381,16 +34455,20 @@ async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: st
     // Mark BEFORE awaiting. A rebuild takes a daemon round trip plus an
     // endpoint probe, which is longer than the 2.5s tick — marking afterwards
     // would let the next tick pick the same session again and fire a second
-    // concurrent probe.
-    state.with_mut_counted(|shell| {
+    // concurrent probe. The ledger is loop-local (see
+    // [`mark_app_surface_restore_attempted`]): marking it must not re-render
+    // the app, so it never touches the `ShellState` signal.
+    {
+        let mut attempts = attempts.borrow_mut();
         for target in &targets {
-            shell.mark_app_surface_restore_attempted(
+            mark_app_surface_restore_attempted(
+                &mut attempts,
                 &target.session_path,
                 target.runtime_token.clone(),
                 now_ms,
             );
         }
-    });
+    }
     for target in targets {
         // The rail/document half. Endpoint-probed liveness lives inside it: a
         // declare whose control endpoint does not answer traces
@@ -34455,6 +34533,14 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
         // Cadence counter for the Phase 5 background ping sweep: the
         // active-visible contribution pings every tick, others every 4th.
         let mut ping_tick: u64 = 0;
+        // The surface-restore ask ledger. Owned HERE, not by `ShellState`:
+        // nothing renders it, and holding it in the reactive signal made every
+        // mark a full root render (see `mark_app_surface_restore_attempted`).
+        // Shared with each spawned tick because a tick's rebuilds can outlive
+        // the 2.5s interval; the mark-before-await inside the tick is what
+        // stops tick N+1 re-asking a session tick N is still probing.
+        let restore_attempts: Rc<RefCell<HashMap<String, AppSurfaceRestoreAttempt>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         loop {
             sleep(Duration::from_millis(WORKING_FLAGS_POLL_INTERVAL_MS)).await;
             ping_tick = ping_tick.wrapping_add(1);
@@ -34493,7 +34579,11 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             // no special case. Budgeted and one-shot per (session, runtime), so
             // on the overwhelming majority of ticks this decides "nothing" off
             // a read-only pass and spawns no task.
-            spawn(restore_app_surfaces_tick(state, trace_home.clone()));
+            spawn(restore_app_surfaces_tick(
+                state,
+                trace_home.clone(),
+                Rc::clone(&restore_attempts),
+            ));
             // The handover suspension's fail-safe ceiling rides this tick too, and
             // for the same reason: it must expire on WALL CLOCK, not on the next
             // status poll. A daemon that dies mid-handover stops answering, and a
@@ -34514,29 +34604,34 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             // sqlite row — the crash story — without waiting for a Save.
             // Co-visible sessions only (the ones whose editors can be typed
             // in): the active session and the active split group's members.
-            let draft_syncs = state.with_mut_counted(|shell| {
-                let mut co_visible: Vec<String> = shell
-                    .server
-                    .active_session_path()
-                    .map(str::to_string)
-                    .into_iter()
-                    .collect();
-                if let Some(group) = shell.active_split_group() {
-                    for member in group.member_sessions() {
-                        if !co_visible.iter().any(|path| path == member) {
-                            co_visible.push(member.to_string());
-                        }
-                    }
-                }
-                co_visible
-                    .into_iter()
-                    .filter_map(|session| {
-                        shell
-                            .document_draft_sync_due(&session)
-                            .map(|pane_id| (session, pane_id))
-                    })
-                    .collect::<Vec<_>>()
+            //
+            // Read-only precheck first (the working-flags idiom below): the
+            // decision fn is a mutator, so running it straight under
+            // `with_mut` dirtied the whole signal — one root render per 2.5s
+            // tick, forever, with no document pane open anywhere. The twin
+            // predicate answers "would the decider write?" off a plain read,
+            // and the mutating pass runs only when the answer is yes.
+            let draft_sync_write_needed = state.with(|shell| {
+                shell
+                    .co_visible_document_sessions()
+                    .iter()
+                    .any(|session| shell.document_draft_sync_write_needed(session))
             });
+            let draft_syncs = if draft_sync_write_needed {
+                state.with_mut_counted(|shell| {
+                    shell
+                        .co_visible_document_sessions()
+                        .into_iter()
+                        .filter_map(|session| {
+                            shell
+                                .document_draft_sync_due(&session)
+                                .map(|pane_id| (session, pane_id))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                Vec::new()
+            };
             for (session, pane_id) in draft_syncs {
                 spawn(document_pane_run_action(
                     state,
@@ -34852,6 +34947,16 @@ fn spawn_browser_tree_refresh(
     reason: &'static str,
     selected_hint: Option<String>,
 ) {
+    // Peek before mutating: the in-flight bail used to run inside `with_mut`,
+    // so a refresh suppressed for being already in flight still dirtied the
+    // whole signal and re-rendered the root. No await sits between this read
+    // and the write below, so the two cannot disagree.
+    let already_in_flight = state.with(|shell| {
+        shell.browser_tree_loading_in_flight || shell.browser_tree_refresh_in_flight
+    });
+    if already_in_flight {
+        return;
+    }
     let should_start = state.with_mut_counted(|shell| {
         if shell.browser_tree_loading_in_flight || shell.browser_tree_refresh_in_flight {
             return false;

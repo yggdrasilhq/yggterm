@@ -4133,6 +4133,53 @@ mod tests {
         );
     }
 
+    // The read-only twin must answer exactly "would the decider write?". A twin
+    // that under-reports starves the sync — drafts never reach the crash-safe
+    // store; one that over-reports reintroduces the once-per-tick root render
+    // it exists to end (the hottest cause in `dioxus_render/component_window`,
+    // 2026-08-20). So the twin is walked through the decider's whole
+    // lifecycle, agreeing at every step.
+    #[test]
+    fn the_draft_sync_write_probe_agrees_with_the_decider() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+
+        // No document pane at all — the overwhelmingly common tick. The
+        // decider bails before its `entry()` call; the twin must say "no
+        // write" or every terminal-only tick renders the root.
+        assert!(!shell.document_draft_sync_write_needed("local://a"));
+        assert_eq!(shell.document_draft_sync_due("local://a"), None);
+
+        // A pane with a dirty draft: the first tick creates the settle entry,
+        // so a write is needed even though nothing syncs yet.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", document_editor_schema("n1", ""));
+        shell.set_document_pane_value("local://a", "editor", "draft text".into());
+        assert!(shell.document_draft_sync_write_needed("local://a"));
+        assert_eq!(
+            shell.document_draft_sync_due("local://a"),
+            None,
+            "first tick records the hash"
+        );
+
+        // Second tick: settled + dirty + unsynced ⇒ due, and the twin agrees.
+        assert!(shell.document_draft_sync_write_needed("local://a"));
+        assert_eq!(
+            shell.document_draft_sync_due("local://a"),
+            Some("doc".to_string())
+        );
+
+        // Steady state: synced and untouched. The decider changes nothing and
+        // the twin must say so — this is the idle tick that used to render.
+        assert!(!shell.document_draft_sync_write_needed("local://a"));
+        assert_eq!(shell.document_draft_sync_due("local://a"), None);
+
+        // New keystrokes move the hash: the settle entry must be rewritten,
+        // and the twin re-arms.
+        shell.set_document_pane_value("local://a", "editor", "draft text more".into());
+        assert!(shell.document_draft_sync_write_needed("local://a"));
+    }
+
     // The document editor is an UNCONTROLLED textarea keyed by its value epoch:
     // a bumped epoch remounts the node and yanks focus + caret. A draft sync
     // POSTs the buffer for crash safety, the app echoes it back, and the user
@@ -4329,17 +4376,25 @@ mod tests {
     }
 
     /// [`restore_targets`] at a stated wall clock, for the backoff schedule.
+    /// A fresh (empty) ask ledger — the state a relaunched GUI starts in.
     fn restore_targets_at(
         shell: &ShellState,
         now_ms: u64,
         budget: usize,
     ) -> Vec<AppSurfaceRestoreTarget> {
-        app_surface_restore_targets(
-            &shell.app_surface_restore_rows(),
-            &shell.app_surface_restore_attempts,
-            now_ms,
-            budget,
-        )
+        restore_targets_with(shell, &HashMap::new(), now_ms, budget)
+    }
+
+    /// [`restore_targets_at`] against a stated ask ledger. The ledger lives
+    /// with the poll loop rather than in `ShellState` (a mark must not
+    /// re-render the app), so the schedule tests thread their own.
+    fn restore_targets_with(
+        shell: &ShellState,
+        attempts: &HashMap<String, AppSurfaceRestoreAttempt>,
+        now_ms: u64,
+        budget: usize,
+    ) -> Vec<AppSurfaceRestoreTarget> {
+        app_surface_restore_targets(&shell.app_surface_restore_rows(), attempts, now_ms, budget)
     }
 
     // The whole point of the feature: after a relaunch every live row is a
@@ -4470,13 +4525,14 @@ mod tests {
     #[test]
     fn a_session_is_asked_once_and_a_handover_re_arms_it() {
         let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let mut attempts = HashMap::new();
         let first = restore_targets(&shell, 8);
         assert_eq!(first.len(), 1, "the first tick asks");
         let token = first[0].runtime_token.clone();
         assert_eq!(token.as_deref(), Some("42"), "the PTY's pid IS the token");
-        shell.mark_app_surface_restore_attempted("local://alpha", token, 0);
+        mark_app_surface_restore_attempted(&mut attempts, "local://alpha", token, 0);
         assert!(
-            restore_targets(&shell, 8).is_empty(),
+            restore_targets_with(&shell, &attempts, 0, 8).is_empty(),
             "an answered session is not asked again on the next tick"
         );
 
@@ -4495,7 +4551,7 @@ mod tests {
             apps: Vec::new(),
         });
         assert_eq!(
-            restore_targets(&shell, 8)
+            restore_targets_with(&shell, &attempts, 0, 8)
                 .iter()
                 .map(|target| target.runtime_token.clone())
                 .collect::<Vec<_>>(),
@@ -4520,15 +4576,16 @@ mod tests {
     // a fresh shadow client on the same daemon answered `ready`.
     #[test]
     fn an_app_that_declares_after_the_first_ask_is_asked_again() {
-        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let mut attempts = HashMap::new();
         let token = restore_targets_at(&shell, 1_000, 8)[0].runtime_token.clone();
-        shell.mark_app_surface_restore_attempted("local://alpha", token, 1_000);
+        mark_app_surface_restore_attempted(&mut attempts, "local://alpha", token, 1_000);
         assert!(
-            restore_targets_at(&shell, 1_000 + 2_499, 8).is_empty(),
+            restore_targets_with(&shell, &attempts, 1_000 + 2_499, 8).is_empty(),
             "inside the window the session is not re-asked"
         );
         assert_eq!(
-            restore_targets_at(&shell, 1_000 + 2_500, 8)
+            restore_targets_with(&shell, &attempts, 1_000 + 2_500, 8)
                 .iter()
                 .map(|target| target.session_path.as_str())
                 .collect::<Vec<_>>(),
@@ -4547,18 +4604,24 @@ mod tests {
             vec![2_500, 5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000],
             "doubling from the tick interval, capped at a minute"
         );
-        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let mut attempts = HashMap::new();
         let token = restore_targets_at(&shell, 0, 8)[0].runtime_token.clone();
         for ask in 0..4 {
-            shell.mark_app_surface_restore_attempted("local://alpha", token.clone(), ask * 100);
+            mark_app_surface_restore_attempted(
+                &mut attempts,
+                "local://alpha",
+                token.clone(),
+                ask * 100,
+            );
         }
         // Four asks recorded ⇒ the next window is 20s from the last ask (300ms).
         assert!(
-            restore_targets_at(&shell, 300 + 19_999, 8).is_empty(),
+            restore_targets_with(&shell, &attempts, 300 + 19_999, 8).is_empty(),
             "the fourth window has not elapsed"
         );
         assert_eq!(
-            restore_targets_at(&shell, 300 + 20_000, 8).len(),
+            restore_targets_with(&shell, &attempts, 300 + 20_000, 8).len(),
             1,
             "…and it re-arms when it does"
         );
@@ -4569,17 +4632,23 @@ mod tests {
     // window the dead one earned.
     #[test]
     fn a_handover_restarts_the_backoff_schedule() {
-        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let mut attempts = HashMap::new();
         for ask in 0..6 {
-            shell.mark_app_surface_restore_attempted(
+            mark_app_surface_restore_attempted(
+                &mut attempts,
                 "local://alpha",
                 Some("42".to_string()),
                 ask * 10,
             );
         }
-        shell.mark_app_surface_restore_attempted("local://alpha", Some("4242".to_string()), 1_000);
+        mark_app_surface_restore_attempted(
+            &mut attempts,
+            "local://alpha",
+            Some("4242".to_string()),
+            1_000,
+        );
         assert_eq!(
-            shell.app_surface_restore_attempts["local://alpha"].asks, 1,
+            attempts["local://alpha"].asks, 1,
             "a new runtime starts the schedule over"
         );
     }
@@ -4638,6 +4707,21 @@ mod tests {
             body.contains("spawn(restore_app_surfaces_tick("),
             "the working-flags poll tick no longer spawns the surface restore, so \
              yedit/ychrome go back to coming up as bare terminals after a restart"
+        );
+        // The idle tick must not dirty the signal. Both standing tick chores
+        // route their writes behind read-only prechecks: the draft sync asks
+        // its twin predicate first, and the restore mark writes the loop-local
+        // ledger, never `ShellState`. Losing either re-arms the once-per-tick
+        // root render the blink-storm entry measured (2026-08-20).
+        assert!(
+            body.contains("document_draft_sync_write_needed"),
+            "the draft-sync decision no longer runs behind its read-only twin, so \
+             every 2.5s tick dirties the whole ShellState signal again"
+        );
+        assert!(
+            body.contains("let restore_attempts:"),
+            "the surface-restore ask ledger no longer lives with the poll loop — if \
+             it moved back into ShellState, every mark is a root render again"
         );
     }
 
@@ -46197,6 +46281,48 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(shell.server.active_session_path(), Some(stored_path));
         assert_eq!(shell.server.active_view_mode(), WorkspaceViewMode::Rendered);
         assert!(shell.snapshot().active_session.is_some());
+    }
+
+    #[test]
+    // `safe_finish_job_notification` runs from render bodies on every ordinary
+    // pass, so it peeks this twin before writing: a finish with nothing to
+    // clear and nothing to say must not dirty the signal (32 preceded renders
+    // in one 150s window before the guard, `dioxus_render/component_window`
+    // 2026-08-20). The twin must agree with what `clear_job_notification`
+    // would actually remove.
+    #[test]
+    fn a_finish_with_nothing_to_clear_is_detectable_before_the_write() {
+        let session_path = "/home/user/.codex/sessions/example.jsonl";
+        let notification_key = terminal_resume_notification_job_key(session_path);
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        assert!(
+            !shell.has_job_notification(&notification_key),
+            "no notification carries the key yet, so a finish would be a no-op"
+        );
+        shell.upsert_job_notification(
+            notification_key.clone(),
+            NotificationTone::Error,
+            "Remote Terminal Failed",
+            "The live terminal on localhost failed during restore",
+            None,
+            false,
+            None,
+        );
+        assert!(
+            shell.has_job_notification(&notification_key),
+            "the job notification exists: a finish now has something to clear"
+        );
+        shell.finish_job_notification(
+            &notification_key,
+            NotificationTone::Info,
+            "",
+            "",
+            false,
+        );
+        assert!(
+            !shell.has_job_notification(&notification_key),
+            "cleared — and the twin sees the same emptiness the retain left"
+        );
     }
 
     #[test]
