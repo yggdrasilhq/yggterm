@@ -13834,6 +13834,24 @@ fn refresh_restored_remote_runtime_codex_launch_command(
     key: &str,
     session: &mut ManagedSessionView,
 ) -> bool {
+    // ⛔ A REMOTE agent row is NOT a restored daemon runtime, and the
+    // eligibility sniff below cannot tell them apart on its own: a healthy
+    // remote row carries the same session-id metadata this function keys on,
+    // and a CLI whose start and resume flag COINCIDE (antigravity's
+    // `--conversation`) passes the already-resume check without the
+    // local-store existence lookup that happens to save remote Claude Code
+    // rows (their start spells `--session-id`, not `--resume`). Repairing a
+    // remote row rewrites its ssh launch into a LOCAL resume: the agent then
+    // runs on THIS host while the row keeps naming the remote one, the
+    // terminals map and the session view spell the runtime differently, the
+    // pid becomes unobservable, the launch phase sticks at RemoteBootstrap,
+    // and a session remove orphans the process (all five measured live,
+    // 2026-08-20). Remote rows have their own repair —
+    // `refresh_remote_codex_terminal_identity_launch_command` — so refuse
+    // them here, by scheme, before any metadata is consulted.
+    if session_path_is_remote_agent(key) || session_path_is_remote_agent(&session.session_path) {
+        return false;
+    }
     // EVERY agent CLI: restored daemon-runtime rows all repair their resume
     // launch the same way ([[spec-unify-local-remote]]).
     //
@@ -13989,6 +14007,92 @@ fn refresh_restored_remote_runtime_codex_launch_command(
     }
 
     changed
+}
+
+#[cfg(test)]
+mod restored_runtime_repair_tests {
+    use super::*;
+
+    fn agy_session(key_path: &str, launch_command: &str) -> ManagedSessionView {
+        ManagedSessionView {
+            id: "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011".to_string(),
+            session_path: key_path.to_string(),
+            title: "probe".to_string(),
+            kind: SessionKind::Antigravity,
+            host_label: "buildbox".to_string(),
+            source: SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::RemoteBootstrap,
+            remote_deploy_state: RemoteDeployState::Ready,
+            launch_command: launch_command.to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![],
+            preview: SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Antigravity Session",
+                value: "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            input_unanswered_ms: None,
+            agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        }
+    }
+
+    /// ⛔ THE MISFIRE THAT RAN A "REMOTE" AGENT LOCALLY. A remote agy row
+    /// carries the same session-id metadata the restored-runtime repair keys
+    /// on, and agy's start flag IS its resume flag (`--conversation`), so the
+    /// already-resume check passed and the repair rewrote the ssh launch into
+    /// a local resume — agy spawned on the mediator host, the terminals map
+    /// and the session view spelled the runtime differently, the pid read as
+    /// unobservable, and session remove orphaned the process. A remote agent
+    /// row must be refused by scheme before any metadata is consulted.
+    #[test]
+    fn a_remote_agent_row_is_never_repaired_into_a_local_runtime() {
+        let key = "remote-agy://buildbox/3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
+        let ssh_launch = "exec ssh -tt buildbox 'agy --conversation 3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011'";
+        let mut session = agy_session(key, ssh_launch);
+        let repaired = refresh_restored_remote_runtime_codex_launch_command(key, &mut session);
+        assert!(!repaired, "a remote row is not a restored daemon runtime");
+        assert_eq!(session.session_path, key, "the row keeps its remote path");
+        assert_eq!(session.launch_command, ssh_launch, "the ssh launch survives");
+        assert_eq!(session.source, SessionSource::LiveSsh);
+    }
+
+    /// The positive control: a genuinely runtime-keyed restored row — the one
+    /// this repair exists for — still repairs.
+    #[test]
+    fn a_runtime_keyed_restored_row_still_repairs() {
+        let key = "agy-runtime://3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
+        let mut session = agy_session(
+            key,
+            "agy --dangerously-skip-permissions --conversation 3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011",
+        );
+        session.source = SessionSource::LiveLocal;
+        let repaired = refresh_restored_remote_runtime_codex_launch_command(key, &mut session);
+        assert!(repaired, "the restored daemon-runtime case must keep working");
+        assert_eq!(session.session_path, key);
+        assert_eq!(session.source, SessionSource::LiveLocal);
+    }
 }
 
 fn remote_terminal_ssh_command(ssh_command: String) -> String {
