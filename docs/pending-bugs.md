@@ -26,9 +26,12 @@ a second live session, unrelated to the first, shows the same `0 user · 0 assis
 
 **Both encodings measure a WINDOW and name it a TOTAL:**
 
-* `state.rs:51852` — the LOCAL live path counts `session.preview.blocks` by tone. A preview is
-  an excerpt built for display, and for a terminal-view row it is routinely empty, so the count
-  is 0 whatever the conversation holds.
+* ✅ **The LOCAL live path is FIXED** (`state.rs`, 2026-08-20): it now reads
+  `count_agent_transcript_messages_cached` for the selected session, keyed on `(path, len,
+  mtime)` so a growing transcript re-counts instead of pinning its first answer. It used to
+  count `session.preview.blocks` by tone — an excerpt that is routinely empty for a
+  terminal-view row, hence `0` whatever the conversation held. The preview count survives only
+  as a fallback when there is no readable transcript.
 * `lib.rs:15174` — the REMOTE scan path counts
   `read_agent_transcript_messages_tail_limited(path, 12)`, so `user_message_count` can never
   exceed the last twelve messages no matter how long the session ran.
@@ -45,6 +48,10 @@ instrument has a ceiling. Same family as the store-column-called-title fault and
 alone is hundreds of files and gigabytes, and the tail window almost certainly exists because of
 that. But the rail describes ONE selected session, so the count is an on-demand read for that
 session, cached on `(path, len, mtime)` — not something every scan pays for every row.
+
+**What is left:** only the remote path. It is not a per-selection read — it runs for every
+session in a scan — so moving it needs the cost question answered first, which is why the tail
+window is there at all. The core primitive it needs already exists.
 
 **Falsifier:** for a live session, the rail's user/assistant counts equal a direct count over
 its transcript, **sampled at the same moment** (an instrument read taken at a different instant
