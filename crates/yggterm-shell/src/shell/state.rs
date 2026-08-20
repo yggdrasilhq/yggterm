@@ -16648,6 +16648,13 @@ struct RenderSnapshot {
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
     selected_row: Option<BrowserRow>,
+    /// The session whose transcript history is mid-expansion, if any — the
+    /// preview surface's busy indicator. Lives in the snapshot so
+    /// `MainSurface` reads it from its PROPS: its previous home was a direct
+    /// `state.read()` in the component body, which subscribed MainSurface to
+    /// the whole `ShellState` signal and re-rendered it on every write —
+    /// 330 of 330 root renders measured 2026-08-20.
+    preview_history_expanding: Option<String>,
     active_session: Option<ManagedSessionView>,
     /// The active session's kind, resolved from the sidebar row. Survives the
     /// window where `active_session` has not been populated yet — see
@@ -19214,6 +19221,7 @@ impl ShellState {
             rows,
             selected_path,
             selected_row,
+            preview_history_expanding: self.preview_history_expanding.clone(),
             active_session,
             // THE one accessor for "what identity is this surface", shared with
             // the classic strip badge, the dropdown's ✓ and the switch's no-op

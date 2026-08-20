@@ -84,8 +84,12 @@ fn MainSurface(
         .as_ref()
         .is_some_and(|(_, pin_key, _)| *preview_latest_pin_key.read() != *pin_key);
     // Named per session rather than a bare bool: two surfaces can be mounted
-    // and only the one that asked should read as busy.
-    let preview_history_expanding_path = state.read().preview_history_expanding.clone();
+    // and only the one that asked should read as busy. Read from the SNAPSHOT
+    // prop, never from `state` — a reactive read of the signal here subscribed
+    // MainSurface to the whole shell and re-rendered it on every write
+    // (330/330 measured 2026-08-20); through the props it re-renders exactly
+    // when the snapshot content changes.
+    let preview_history_expanding_path = snapshot.preview_history_expanding.clone();
     // The pad appears once the reader is far enough from the end to want it —
     // the transcript's answer to the same question the terminal asks in rows
     // against its prompt. No script needed.
@@ -130,7 +134,9 @@ fn MainSurface(
             return;
         }
         main_surface_trace_key.set(trace_key);
-        let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
+        // Peek: `bootstrap.settings_path` never changes after launch, and a
+        // reactive read here re-armed this effect on every ShellState write.
+        let trace_home = perf_home_dir(&state.peek().bootstrap.settings_path);
         append_trace_event(
             &trace_home,
             "ui",
@@ -3296,6 +3302,11 @@ fn TerminalCanvas(
     state: Signal<ShellState>,
     mount_epoch: u64,
 ) -> Element {
+    // The attribution span the storm work steered by covered only app /
+    // MainSurface / Sidebar — this component's renders were invisible to
+    // `dioxus_render/component_window`, which is exactly the blind spot an
+    // instrument must not have on the surface the user types into.
+    let _render_span = crate::render_attribution::ComponentRenderSpan::start("TerminalCanvas");
     let endpoint = BOOTSTRAP
         .get()
         .expect("shell bootstrap initialized")
