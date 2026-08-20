@@ -12,6 +12,52 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.0] A USAGE-LIMIT WAIT READS AS "IDLE" ON EVERY STATE SURFACE THE DAEMON OWNS
+
+**Status: OPEN — root-caused 2026-08-20 15:52, fix not yet implemented.** Owner-reported with a
+screenshot: a session row mid usage-limit wait (footer painting `Usage limit reached ·
+continuing shortly · esc to cancel`, auto-continue armed, spinner animating) while the Session
+Metadata panel reads `running · idle`. Reported as recurring across many rows recently — which
+matches plan-limit windows: every session that hits its limit sits in this state for minutes,
+and every one of them reads "idle".
+
+**Mechanism, from the code.** For agent rows the daemon computes `session.working` at snapshot
+time from the live screen: `overlay_terminal_runtime_snapshot_session` (daemon.rs:5179) calls
+`descriptor.screen_shows_working(screen)` (agent_cli.rs:1019), and the Claude Code descriptor's
+only working phrase is `esc to interrupt` (agent_cli.rs:1602-1618). A limit-wait screen says
+`esc to cancel`/`continuing shortly` — no phrase matches ⇒ `working: Some(false)` ⇒ "confirmed
+idle". Every consumer inherits the misread at once:
+
+- the Session Metadata `Status` field (`right_rail.rs:4393` — `Some(false)` ⇒ "idle");
+- the sidebar working dot (`sidebar.rs:973/985/1064` — no blink);
+- `server gate-screen`'s `screen_text_shows_agent_working` (core lib.rs:1450 — the union of the
+  same descriptors, same blind spot);
+- the working→done notification edge (a limit-hit fires a false "done").
+
+**The discriminator exists — in the wrong place.** The booter's classifier names `RATE_LIMITED`
+as a first-class state (ygg-booter.py, fleet-wide rate-limit hold) by grepping the same screen
+text in python. So "is this row limit-waiting" is answerable, but only by a sidecar re-deriving
+it; the daemon that owns the screen has a boolean with no third value. That is a second encoding
+of one concept, and the SSOT rule says the daemon should own it.
+
+**Verified live 2026-08-20 15:52:** on a genuinely-working row, gate verdict `working, idle 0s`
+and rows `busy:true, busy_reason:agent_working_daemon` — the surfaces are truthful outside the
+limit-wait state; the lie is state-specific, not general.
+
+**Fix direction:** the per-CLI descriptor grows limit-wait screen phrases (e.g. needle
+`usage limit reached`, also_any `continuing`/`esc to cancel`) feeding a THIRD state — extend
+`working: Option<bool>` semantics to an enum (Working / LimitWait / Idle / Unknown) on the
+snapshot, render it distinctly ("waiting on limit"), keep the done-notification suppressed
+during LimitWait, and let the booter consume the daemon's state instead of re-deriving its own.
+**Falsifier:** a row painted with the limit-wait footer must not read `idle` on the metadata
+panel, the dot, or `gate-screen`; a row at a genuine prompt still must.
+
+**Second, un-root-caused half:** the same screenshot shows a `Recovering Local Terminal —
+lost contact with its local helper` toast (viewport.rs) over a session that was rendering and
+updating normally. Not yet investigated; do not assume it shares this cause. The screenshot was
+taken minutes after a daemon generation handover on that host, so a handover-transient false
+recovery is the first hypothesis to falsify.
+
 ## ⛔⛔ [11.0] THE BOOTER'S SEND PLANE HAS THREE NON-CONVERGING LOOPS, AND TWO WATCHERS RAN AT ONCE
 
 **Status: OPEN.** Diagnosed 2026-08-20 15:10–15:40 from the boot log after the owner reported
