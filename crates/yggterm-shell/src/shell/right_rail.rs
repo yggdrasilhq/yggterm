@@ -252,10 +252,10 @@ fn web_chrome_input_style(foreground: &str, compact: bool, border: &str, flex: &
 // page without losing this one was to duplicate the tab first and step the copy.
 //
 // "Somewhere else" is NOT a new destination. `WebTabOrigin::Opener` already
-// means "below this tab, after the children it already has" — it is what the
-// row menu's "New tab below this one" uses and what a middle-clicked LINK uses —
+// means "above this tab, before the children it already has" — it is what the
+// row menu's "New tab above this one" uses and what a middle-clicked LINK uses —
 // so these route through that same owner. A second middle-click therefore
-// cascades after the first instead of shoving in between them.
+// cascades above the first instead of shoving in between them.
 
 /// Is this the middle button?
 ///
@@ -5633,7 +5633,7 @@ fn web_tab_count_phrase(count: usize, noun: &str) -> String {
 /// there were none at all. DESIGN.md ▸ Context menus asks for "modern Microsoft
 /// app menus", and those read create → act on this thing → arrange → destroy:
 ///
-///   create      New tab · New tab below this one · Reopen closed tabs
+///   create      New tab · New tab above this one · Reopen closed tabs
 ///   page        Reload · Copy URL · Duplicate tab · Split with active tab
 ///   arrange     Move to folder ▸
 ///   destroy     Close tab · Close N other tabs · Close N tabs below
@@ -5667,11 +5667,11 @@ fn web_tab_menu_items(
             items.push(
                 RowMenuItem::new("webtab-new", "New tab", 't').icon(ShellIcon::Plus),
             );
-            // Meaningful only because placement has an owner: "below this one"
+            // Meaningful only because placement has an owner: "above this one"
             // is a real destination now, and the tab it opens joins this tab's
-            // opener group so the next one cascades after it.
+            // opener group so the next one cascades above it.
             items.push(
-                RowMenuItem::new("webtab-new-below", "New tab below this one", 'b')
+                RowMenuItem::new("webtab-new-above", "New tab above this one", 'a')
                     .icon(ShellIcon::Plus),
             );
             let reopen = RowMenuItem::new(
@@ -5931,7 +5931,7 @@ fn web_tab_menu_page_turn(id: &str) -> Option<WebTabMenuPage> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebTabMenuAction {
     NewTab,
-    NewTabBelow(u64),
+    NewTabAbove(u64),
     ReopenClosedTabs,
     ReloadTab(u64),
     CopyTabUrl(u64),
@@ -5958,7 +5958,7 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
             let tab = *tab;
             match id {
                 "webtab-new" => Some(WebTabMenuAction::NewTab),
-                "webtab-new-below" => Some(WebTabMenuAction::NewTabBelow(tab)),
+                "webtab-new-above" => Some(WebTabMenuAction::NewTabAbove(tab)),
                 "webtab-reopen" => Some(WebTabMenuAction::ReopenClosedTabs),
                 "webtab-reload" => Some(WebTabMenuAction::ReloadTab(tab)),
                 "webtab-copy-url" => Some(WebTabMenuAction::CopyTabUrl(tab)),
@@ -6020,7 +6020,7 @@ fn web_tab_menu_close_plan(tabs: &[WebTabScopeRow], action: &WebTabMenuAction) -
         // them, and a close plan is the one place that could quietly turn
         // "delete the organization" into "delete the content".
         WebTabMenuAction::NewTab
-        | WebTabMenuAction::NewTabBelow(_)
+        | WebTabMenuAction::NewTabAbove(_)
         | WebTabMenuAction::ReopenClosedTabs
         | WebTabMenuAction::ReloadTab(_)
         | WebTabMenuAction::CopyTabUrl(_)
@@ -6965,8 +6965,8 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
             open_web_surface_tab(state, &session_path, WebTabOpenRequest::blank());
             return;
         }
-        WebTabMenuAction::NewTabBelow(tab_id) => {
-            open_web_surface_tab(state, &session_path, WebTabOpenRequest::blank_below(*tab_id));
+        WebTabMenuAction::NewTabAbove(tab_id) => {
+            open_web_surface_tab(state, &session_path, WebTabOpenRequest::blank_above(*tab_id));
             return;
         }
         WebTabMenuAction::ReopenClosedTabs => {

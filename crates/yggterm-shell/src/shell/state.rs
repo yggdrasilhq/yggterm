@@ -2053,17 +2053,27 @@ impl WebSurfaceTab {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebTabOrigin {
     /// Nothing opened it: the rail header's "+", the classic strip's "+", an
-    /// agent's `open_tab` command. It joins the end of the list, which is where
-    /// a browser has always put a tab nobody asked to sit anywhere.
-    Append,
-    /// Born filed, with no opener: a folder row's "+". It joins the end of THAT
+    /// agent's `open_tab` command. It joins the TOP of the list, directly under
+    /// the app tab.
+    ///
+    /// ⚠ **This is the browser's direction, and it is deliberately the OPPOSITE
+    /// of a live session's.** A terminal row list grows downward because it is a
+    /// log — the thing you started last is the thing you scroll to. A tab list
+    /// is a working set, and the tab you just opened is the one you are about to
+    /// use, so it belongs where the eye already is. Owner requirement: *new tabs
+    /// open from the top*. Do not "unify" the two directions; see
+    /// [`web_tab_placement`].
+    Top,
+    /// Born filed, with no opener: a folder row's "+". It joins the TOP of THAT
     /// FOLDER's run, so it appears under the header that minted it rather than
-    /// at the bottom of the window.
+    /// at the far end of the window.
     Folder(String),
-    /// A TAB opened it: the row menu's "New tab below this one", a middle- or
+    /// A TAB opened it: the row menu's "New tab above this one", a middle- or
     /// ctrl-clicked link, a duplicate, a `window.open` / `target="_blank"`.
-    /// It lands immediately below its opener and CASCADES after the children
-    /// that opener already has — Chrome's and Firefox's opener-group model.
+    /// It lands immediately ABOVE its opener and CASCADES above the children
+    /// that opener already has, so the newest child of a page is always the
+    /// topmost row of that page's group — the mirror of Chrome's opener-group
+    /// model, flipped for the same reason [`WebTabOrigin::Top`] is.
     Opener(u64),
     /// Back where it was: the "Reopen closed tab" verb. The index is the one the
     /// CLOSE recorded, clamped on the way in — the list has moved on since, and
@@ -2109,10 +2119,10 @@ struct WebTabOpenRequest {
 }
 
 impl WebTabOpenRequest {
-    /// A header "+": a blank tab at the end, typing-ready.
+    /// A header "+": a blank tab at the TOP, typing-ready.
     fn blank() -> Self {
         Self {
-            origin: WebTabOrigin::Append,
+            origin: WebTabOrigin::Top,
             destination: WebTabDestination::Blank,
             foreground: true,
         }
@@ -2125,9 +2135,9 @@ impl WebTabOpenRequest {
             foreground: true,
         }
     }
-    /// The row menu's "New tab below this one": a blank tab in the clicked
+    /// The row menu's "New tab above this one": a blank tab in the clicked
     /// tab's group, typing-ready.
-    fn blank_below(opener: u64) -> Self {
+    fn blank_above(opener: u64) -> Self {
         Self {
             origin: WebTabOrigin::Opener(opener),
             destination: WebTabDestination::Blank,
@@ -2144,18 +2154,18 @@ impl WebTabOpenRequest {
             foreground: !background,
         }
     }
-    /// A duplicate: the same page, below the original, and the user goes with
-    /// it — which is what "duplicate" means to someone who wants two of
-    /// something to compare.
+    /// A duplicate: the same page, directly above the original, and the user
+    /// goes with it — which is what "duplicate" means to someone who wants two
+    /// of something to compare.
     fn duplicate_of(source: u64) -> Self {
         Self::opened_by(source, false)
     }
     /// An agent's `open_tab` command. No opener — the command names a session,
-    /// not a page — so it appends, and it carries a URL, so it never steals the
-    /// keyboard even when it raises.
+    /// not a page — so it takes the top, and it carries a URL, so it never
+    /// steals the keyboard even when it raises.
     fn command(raise: bool) -> Self {
         Self {
-            origin: WebTabOrigin::Append,
+            origin: WebTabOrigin::Top,
             destination: WebTabDestination::Bound,
             foreground: raise,
         }
@@ -2233,55 +2243,80 @@ fn web_tab_descends_from(rows: &[WebTabPlacementRow], index: usize, ancestor: u6
 /// THE single owner of "where does a new tab go".
 ///
 /// Pure, total, and a function of the rows alone — never of timing, of which
-/// call site asked, or of how many webviews happen to exist. The three rules:
+/// call site asked, or of how many webviews happen to exist.
 ///
-/// - `Append` joins the end.
-/// - `Folder` joins the end of that folder's run, so a folder's "+" fills the
+/// ⭐ **EVERY BRANCH GROWS UPWARD.** Owner requirement: *new tabs open from the
+/// top*. A tab list is a working set rather than a log, so the row you just
+/// minted is the row you are about to use, and it belongs where the eye already
+/// is instead of below whatever has accumulated. The three rules:
+///
+/// - `Top` joins the top, directly under the app tab.
+/// - `Folder` joins the top of that folder's run, so a folder's "+" fills the
 ///   folder instead of the window.
-/// - `Opener` lands immediately below its opener, AFTER the descendants that
-///   opener already has. That last clause is the cascade: the second link
-///   opened from a page goes after the first, not between the page and it.
+/// - `Opener` lands immediately ABOVE its opener, BEFORE the descendants that
+///   opener already has. That last clause is the cascade, mirrored: the second
+///   link opened from a page goes above the first, so the newest child of a page
+///   is always the topmost row of that page's group.
+///
+/// ⚠ **The inversion against a live session's row order is DELIBERATE** — a
+/// yggterm Live session appends BELOW its spawnee, a browser tab opens ABOVE it.
+/// Two different objects with two different reading directions; do not unify
+/// them.
 ///
 /// The app tab is `tabs[0]` and stays there — no branch can return 0, because
-/// `Append`/`Folder` return a length (≥ 1, the app tab is always present) and
-/// `Opener` returns at least `at + 1`.
+/// every branch is clamped to at least 1 and the upward `Opener` walk stops at
+/// the app tab, which descends from nothing.
 fn web_tab_placement(rows: &[WebTabPlacementRow], origin: &WebTabOrigin) -> WebTabPlacement {
+    // The topmost slot a new tab may take. `tabs[0]` is the app's, and every
+    // close verb in the product is written on that premise — but a surface can
+    // legitimately be empty for the instant before the app tab arrives, so this
+    // is a clamp against the row count rather than a bare `1`.
+    let top = rows.len().min(1);
     match origin {
-        WebTabOrigin::Append => WebTabPlacement {
-            index: rows.len(),
+        WebTabOrigin::Top => WebTabPlacement {
+            index: top,
             folder: None,
             opener: None,
         },
         WebTabOrigin::Folder(folder_id) => WebTabPlacement {
             index: rows
                 .iter()
-                .rposition(|row| row.folder.as_deref() == Some(folder_id.as_str()))
-                .map(|last| last + 1)
-                .unwrap_or(rows.len()),
+                .position(|row| row.folder.as_deref() == Some(folder_id.as_str()))
+                .map(|first| first.max(top))
+                .unwrap_or(top),
             folder: Some(folder_id.clone()),
             opener: None,
         },
         WebTabOrigin::Restore { index, folder } => WebTabPlacement {
             // Never onto the app tab's slot, never past the end.
-            index: (*index).clamp(1, rows.len()),
+            index: (*index).clamp(top, rows.len()),
             folder: folder.clone(),
             opener: None,
         },
         WebTabOrigin::Opener(opener) => {
             let Some(at) = rows.iter().position(|row| row.id == *opener) else {
                 // The opener went away between the gesture and the mint. There
-                // is nothing to sit below, so this is an ordinary append — and
+                // is nothing to sit above, so this is an ordinary top open — and
                 // it carries NO opener id, because a dangling one would quietly
-                // turn every later open in this group into an append too.
+                // turn every later open in this group into a plain one too.
                 return WebTabPlacement {
-                    index: rows.len(),
+                    index: top,
                     folder: None,
                     opener: None,
                 };
             };
-            let mut index = at + 1;
-            while index < rows.len() && web_tab_descends_from(rows, index, *opener) {
-                index += 1;
+            // Walk UP through the descendants this opener already has, so the
+            // new child lands above all of them rather than between the opener
+            // and its first child.
+            //
+            // ⛔ `max(top)` is load-bearing: the APP TAB can open a tab too (a
+            // link in the app's own page), and it sits at index 0 with nothing
+            // above it. Without the clamp, its children would be minted onto
+            // `tabs[0]` — the one slot every close verb in the product assumes
+            // is the app's.
+            let mut index = at.max(top);
+            while index > top && web_tab_descends_from(rows, index - 1, *opener) {
+                index -= 1;
             }
             WebTabPlacement {
                 index,
@@ -23858,7 +23893,7 @@ impl ShellState {
             // clipboard owner. Same reason the split and the duplicate live
             // there.
             WebTabMenuAction::NewTab
-            | WebTabMenuAction::NewTabBelow(_)
+            | WebTabMenuAction::NewTabAbove(_)
             | WebTabMenuAction::ReopenClosedTabs
             | WebTabMenuAction::CopyTabUrl(_) => return false,
             WebTabMenuAction::DuplicateTab(tab_id) => {
