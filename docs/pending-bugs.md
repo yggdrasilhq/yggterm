@@ -218,6 +218,59 @@ transport fault.
 comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
 `notebooks/06-ui-blocks.ipynb`.
 
+## ⛔⛔⛔ [11.5] THE INPUT CHAIN PROVES DELIVERY TO THE PTY, NEVER CONSUMPTION BY THE PROGRAM — AND THAT IS THE GAP "I CANNOT TYPE" FALLS THROUGH
+
+**Status:** OPEN
+
+*Found 2026-08-20 while trying, and failing, to explain a reported total input
+lockout from telemetry.*
+
+**The report:** on the GUI host the owner could not type to any session at all,
+and could not report it from that machine because of the state the GUI was in.
+
+⛔ **THE TELEMETRY FLATLY CONTRADICTS IT, AND THE TELEMETRY IS THE THING THAT IS
+WRONG.** Across the exact window his evidence came from, the input chain recorded
+**486 `input/keystroke` events and 488 `input/pty` events** — a ~1:1 delivery
+ratio, indistinguishable from a healthy machine. `input/keystroke` is emitted from
+exactly one place (the xterm JS input event), so those are REAL human keystrokes,
+not agent writes, which take a different path and emit no keystroke event.
+
+⇒ **The chain stops at the PTY write.** `keystroke → pty → render` answers *were
+the bytes delivered to the pseudo-terminal*. It has no leg for *did the program on
+the other side read them*. A CLI that has stopped reading its PTY produces exactly
+this signature: keystroke ✓, pty ✓, and nothing whatsoever happens on screen.
+**From the user: "I cannot type." From every probe we have: "input is fine."**
+
+⭐ **THE PASSIVE SIGNATURE ALREADY EXISTS AND IS FILED IN THE WRONG PLACE.**
+`input_unanswered_ms` (a large value beside a small output-idle) is the deaf-row
+tell — see the `[6.7]` deaf-row entry — but it is exposed only on the
+`HotRestartBlocker`, i.e. on the DEPLOY GATE. Anyone investigating a freeze looks
+at `input/*`, where it does not appear. Two correct instruments, and the one that
+would have answered is not on the path anybody walks to ask the question.
+
+**What would close it:** give the input chain a fourth leg — consumption, not just
+delivery — sourced from the `input_unanswered_ms` the daemon already computes, so
+that `ytrace --category input` can show a row taking bytes and never reading them.
+Until then a freeze investigation cannot distinguish "delivered and consumed" from
+"delivered and ignored", which are the two cases that matter.
+
+⛔⛔ **AND THE OBVIOUS PROBE IS DESTRUCTIVE — DO NOT REACH FOR IT.** `input-check`
+answers this question by **writing a marker into the row**, i.e. by typing into a
+session a human may be using. That is the documented "our own probe typing over
+him" incident. The passive read (`server gate-screen`, read-only, never written to
+the trace) is the only safe door while a human is at the machine.
+
+⚠ **NOT EXPLAINED, AND NOT CLAIMED:** the loop-starvation fix shipped the same day
+removes a stall proportional to daemon read time; on that host `terminal_read`
+slow-waits sat at p50 109 ms with 2 of 60 above 9 s, which yields sub-second
+hiccups, not a lockout. The GUI/daemon version mismatch does not explain it either
+— delivery was ~1:1 straight through that window. **The cause of the reported
+lockout is still unidentified**, and no fix should be credited with curing it.
+
+**Falsifier:** if a future lockout shows `input/keystroke` present and
+`input/pty` absent, the chain did catch it and this framing is wrong. The
+prediction here is the opposite: both present, and the row still dead.
+
 ## ⛔ [11.5] REGISTERING A REMOTE MACHINE HAS NO HEADLESS VERB — IT IS THE GUI'S CONNECT-SSH FLOW ONLY
 
 **Status:** OPEN
