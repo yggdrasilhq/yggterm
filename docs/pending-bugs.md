@@ -420,7 +420,10 @@ removing user activity would not remove most of these renders.
    field arriving via props) plus six inline handler props (hoisted like Sidebar's). Locked by
    `the_main_surface_neither_subscribes_nor_takes_inline_handlers`. `TerminalCanvas` also gained
    the `ComponentRenderSpan` it never had — its renders were invisible to `component_window`.
-   Live separation proof owed from the post-roll window.
+   **Live-proven post-roll (2026-08-21 00:2x, both GUI hosts): MainSurface 52/287 root renders
+   on the GUI host and 90/366 on the laptop (was 330/330); `ui/block` incidents 0 in both
+   windows — the laptop had ~1/min on 3.1.14 an hour earlier. TerminalCanvas reports for the
+   first time (922 renders/11.4 min on its own subscriptions — the next granularity floor).
 3. **The next layer stood exposed once the chores fell:** the remote-preview retry loop
    (`kick_active_remote_preview_sync` entered `with_mut` before its own bails, ~17 no-op
    renders/min) — now behind a shared read-only twin. And `app_control`'s defer-background-refresh
