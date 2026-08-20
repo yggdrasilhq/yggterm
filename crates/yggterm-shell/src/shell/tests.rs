@@ -49941,16 +49941,34 @@ Shared connection to 192.0.2.14 closed.\r\n";
     #[test]
     fn terminal_host_health_sidebar_samples_skip_hot_tui_frames() {
         // Far past the throttle interval so only sample_changed/frame_like_hot gate.
+        // Background session (not active-visible), sidebar open — the write path.
         let now = SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS * 10;
         assert!(terminal_host_health_should_update_sidebar_sample(
-            true, false, now, 0
+            true, false, now, 0, false, true
         ));
         assert!(!terminal_host_health_should_update_sidebar_sample(
-            true, true, now, 0
+            true, true, now, 0, false, true
         ));
         assert!(!terminal_host_health_should_update_sidebar_sample(
-            false, false, now, 0
+            false, false, now, 0, false, true
         ));
+    }
+
+    // The two dossier skips (2026-08-21): the ACTIVE-VISIBLE session's live
+    // canvas already shows this content — its preview line earns no root
+    // render; and a hidden sidebar renders no preview at all. This gate was
+    // the #1 render cause on both 3.1.14 and 3.1.15 before these cuts.
+    #[test]
+    fn terminal_host_health_sidebar_samples_skip_invisible_previews() {
+        let now = SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS * 10;
+        assert!(
+            !terminal_host_health_should_update_sidebar_sample(true, false, now, 0, true, true),
+            "the active-visible session's canvas shows the content live"
+        );
+        assert!(
+            !terminal_host_health_should_update_sidebar_sample(true, false, now, 0, false, false),
+            "a hidden sidebar renders no preview line"
+        );
     }
 
     #[test]
@@ -49962,15 +49980,128 @@ Shared connection to 192.0.2.14 closed.\r\n";
             true,
             false,
             last + SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS - 1,
-            last
+            last,
+            false,
+            true
         ));
         // Once the interval elapses, the write is allowed again.
         assert!(terminal_host_health_should_update_sidebar_sample(
             true,
             false,
             last + SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS,
-            last
+            last,
+            false,
+            true
         ));
+    }
+
+    // The ping precheck's whole contract in one walk: a changed-nothing reply
+    // must NOT take the reactive write (it was one root render per 2.5s ping),
+    // and every reply that changes anything — a moved stamp, a command batch,
+    // a due refetch, the stale overlay to clear — MUST. An under-reporting
+    // twin starves refetch retries; an over-reporting one reinstates the
+    // render-per-ping.
+    #[test]
+    fn a_changed_nothing_ping_is_detectable_before_the_write() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://a"));
+        let empty_reply = serde_json::json!({});
+        let now = 10_000_u64;
+        // No contribution at all: the apply pass would bail — no write owed.
+        assert!(!shell.sidebar_ping_would_change_reactive_state(
+            "local://a", None, None, None, None, None, &empty_reply, now
+        ));
+        shell.upsert_sidebar_contribution(
+            "local://a",
+            Vec::new(),
+            Some(String::new()),
+            Some("app".to_string()),
+            Some(String::new()),
+            Some(String::new()),
+            Some(String::new()),
+            None,
+            None,
+            now,
+            Some(("http://x".to_string(), "http://x".to_string(), None)),
+        );
+        // The steady state: same stamps (reply omitted them), same name, no
+        // commands, nothing to refetch (all stamps empty ⇒ no budgets armed).
+        assert!(
+            !shell.sidebar_ping_would_change_reactive_state(
+                "local://a", None, None, None, None, None, &empty_reply, now
+            ),
+            "a changed-nothing ping must not cost a root render"
+        );
+        // A moved stamp.
+        assert!(shell.sidebar_ping_would_change_reactive_state(
+            "local://a",
+            None,
+            Some("v2"),
+            None,
+            None,
+            None,
+            &empty_reply,
+            now
+        ));
+        // A command batch.
+        let with_commands =
+            serde_json::json!({"commands": {"batch_id": "b1", "entries": []}});
+        assert!(shell.sidebar_ping_would_change_reactive_state(
+            "local://a", None, None, None, None, None, &with_commands, now
+        ));
+        // A due refetch with UNCHANGED stamps: give the contribution a policy
+        // stamp whose fetch has not landed — the retry must still dispatch.
+        shell.upsert_sidebar_contribution(
+            "local://a",
+            Vec::new(),
+            Some("pv1".to_string()),
+            Some("app".to_string()),
+            Some(String::new()),
+            Some(String::new()),
+            Some(String::new()),
+            None,
+            None,
+            now,
+            None,
+        );
+        assert!(
+            shell.sidebar_ping_would_change_reactive_state(
+                "local://a", None, None, None, None, None, &empty_reply, now
+            ),
+            "an unfetched policy's retry budget must still take the write path"
+        );
+    }
+
+    // The liveness the skipped write records must feed the sweep: a
+    // contribution whose reactive stamp has aged past expiry but whose side
+    // table says a ping just landed is ALIVE — reaping it would tear down a
+    // healthy app's rail and control forward.
+    #[test]
+    fn side_table_ping_liveness_keeps_the_sweep_honest() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://a"));
+        let born = 1_000_u64;
+        shell.upsert_sidebar_contribution(
+            "local://a",
+            Vec::new(),
+            Some(String::new()),
+            Some("app".to_string()),
+            Some(String::new()),
+            Some(String::new()),
+            Some(String::new()),
+            None,
+            None,
+            born,
+            Some(("http://x".to_string(), "http://x".to_string(), None)),
+        );
+        let late = born + SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS * 3;
+        // Anchor the reads-live clock well before `late`, or the post-switch
+        // grace alone would keep the contribution alive and prove nothing.
+        shell.sweep_stale_sidebar_contributions(born + 1);
+        note_sidebar_ping_liveness("local://a", late);
+        shell.sweep_stale_sidebar_contributions(late);
+        assert!(
+            shell.sidebar_contributions.contains_key("local://a"),
+            "a side-table-fresh contribution must survive the sweep"
+        );
     }
 
     #[test]

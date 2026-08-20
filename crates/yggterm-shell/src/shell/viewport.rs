@@ -6279,11 +6279,12 @@ fn TerminalCanvas(
                 // time; `continue`/`break` paths measure their partial time
                 // via Drop.
                 let pre_select_guard = TerminalLoopBranchGuard::new("pre_select", &session_path);
-                let (window_focused_for_read, active_visible_terminal_for_read) =
+                let (window_focused_for_read, active_visible_terminal_for_read, sidebar_open_for_read) =
                     state.with(|shell| {
                         (
                             shell.effective_window_focused(),
                             terminal_active_visible_for_session(shell, &session_path),
+                            shell.sidebar_open,
                         )
                     });
                 if window_focused_for_read != last_window_focused_for_read {
@@ -7719,6 +7720,8 @@ fn TerminalCanvas(
                                     frame_like_hot,
                                     current_millis(),
                                     last_sidebar_sample_write_ms,
+                                    active_visible_terminal_for_read,
+                                    sidebar_open_for_read,
                                 ) {
                                     last_sidebar_sample_write_ms = current_millis();
                                     let _ = safe_shell_mut(
@@ -14248,9 +14251,20 @@ fn terminal_host_health_should_update_sidebar_sample(
     frame_like_hot: bool,
     now_ms: u64,
     last_write_ms: u64,
+    is_active_visible: bool,
+    sidebar_open: bool,
 ) -> bool {
+    // The sample is the sidebar/start-page PREVIEW LINE, and its write is a
+    // root render (the #1 render cause on both 3.1.14 and 3.1.15, measured
+    // 2026-08-21: 8-9 preceded renders/min per streaming session). Two skips,
+    // both from the confirmed-roots dossier: the ACTIVE-VISIBLE session's live
+    // canvas already shows this content, so its preview line earns no render;
+    // and a hidden sidebar renders no preview at all — the next sample after
+    // re-open (≤ one throttle window) refreshes it.
     sample_changed
         && !frame_like_hot
+        && !is_active_visible
+        && sidebar_open
         && now_ms.saturating_sub(last_write_ms) >= SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS
 }
 fn terminal_host_health_should_mark_sidebar_busy(
