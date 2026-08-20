@@ -12,55 +12,6 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔⛔ [11.1] THE START PAGE HEADER, THE SIDEBAR AND THE `ls` VERBS COUNT DIFFERENT UNIVERSES
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*Reported 2026-08-20 with a frame: the start page header read four fewer than both `ls` verbs
-on the same host. Root-caused the same day with a SIMULTANEOUS sample — GUI (shadow render)
-789, both verbs 793, in one 7.5 s window — so the gap is systematic, not timing.*
-
-**The one owner of "how many durable sessions are there":** the deduplicated union of
-`scan_all_durable_sessions(<agent store home>)` + every machine scan + live agent rows, keyed
-by session id. Both `server startpage ls` and `server cwdtree ls` already compute exactly this
-(they agree with each other and with their own row payloads). The GUI did not, in two ways:
-
-1. **−5: the GUI's local tree scanned the WRONG HOME and found nothing.** The 2026-08-17 scan
-   unification passed the yggterm home (`~/.yggterm`) into `scan_all_durable_sessions`, whose
-   descriptor roots join onto it — so the GUI walked `~/.yggterm/.codex/…`, a tree where no CLI
-   store exists, and returned zero local durable rows. Every local durable session WITHOUT a
-   live row vanished from the sidebar tree and the start page (the ones with live rows were
-   masked by their live row, which is why the hole read as "a few rows off" instead of "the
-   local store is gone"). The verbs had hit this identical trap earlier and each grew a private
-   resolution; the GUI never did. The resolution now has ONE owner —
-   `yggterm_core::startpage::agent_store_home` — read by the tree builder and all four verb
-   sites, locked by `the_local_tree_scan_walks_the_agent_store_home_not_the_yggterm_home`.
-2. **+1: the header counted a workspace document.** A terminal-recipe document passed
-   `is_start_page_candidate`, so the page held (and counted) one card that is not a durable
-   session and that no verb counts. RECENT WORK's universe is now durable agent sessions only
-   (`a_workspace_document_is_not_a_start_page_candidate`); recipes stay reachable from the
-   sidebar tree. *Reversible call, taken in relay mode: restoring the old behaviour is one
-   predicate arm in `BrowserRow::is_start_page_candidate` — but then the header and the verbs
-   must be taught to disagree by design, which is the state this entry exists to end.*
-
-**CLOSED AS BY-DESIGN — the sidebar machine-node counts.** The per-machine numbers (which sum
-to roughly double the fleet-unique count) are per-scan-scope INSTANCE counts: each machine node
-counts the sessions reachable under that machine's own store scan, and one session reachable
-under two machine keys legitimately counts in both (two of the fleet's machine keys name one
-physical host, so their stores overlap almost entirely). Per the dual-presence law, dedup is
-per-view: the fleet-unique number answers "how many sessions exist", a machine node answers
-"how many are reachable HERE", and the two must not be reconciled by deduplicating the tree.
-
-**The Live Sessions rail count is a THIRD defect and already has an owner entry.** Sampled in
-one window: daemon `live_sessions` 50, verb `live_count` 50, GUI live-rail rows **52** — same
-path SET, two rows rendered twice at two depths. That is the already-open *ONE SESSION, TWO
-ROWS, SAME VIEW* entry below, now with live evidence recorded there.
-
-**Falsifier for the fix:** a shadow-rendered start page's `dom.start_page_recent_count`, `server
-startpage ls --json --limit 100000` `durable_count`, and `server cwdtree ls --json --limit
-100000` `durable_count` — all three sampled in ONE window — are equal, and the sidebar's local
-subtree shows the local store's cwd folders again.
-
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
 **Status:** OPEN
