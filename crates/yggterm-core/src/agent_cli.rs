@@ -775,6 +775,26 @@ pub struct AgentCliDescriptor {
     /// authoritatively", and only a CLI that answers yes may have a resume
     /// re-routed on its say-so.
     pub store_membership_index: Option<fn(&Path, &str) -> Option<bool>>,
+    /// The file a RUNNING session of this CLI keeps open inside its OWN session
+    /// directory, when that directory's name is the session id.
+    ///
+    /// This is what lets a live row be bound to the id the CLI actually minted,
+    /// for a CLI that mints its own (`id_assigned_at_birth:false`). Codex's
+    /// equivalent is its open rollout file, but codex writes its id INSIDE the
+    /// file, so it reads identity rather than naming it — hence a separate hook
+    /// rather than a shared one.
+    ///
+    /// ⚠ MEASURED, not guessed. Muse's live process holds `cron.db` open for
+    /// SEVERAL session directories at once (2026-08-20) — including ones it is
+    /// merely carrying forward — and only `.session.lock` for the session it is
+    /// actually running. Picking the wrong open file here is precisely the
+    /// mis-attribution that repointed a live Claude Code row at a foreign
+    /// transcript, so the marker has to be the one file that means "this is MY
+    /// session", not merely "I have this file open".
+    ///
+    /// `None` ⇒ this CLI is not identified this way, and the fd route is not
+    /// attempted for it.
+    pub live_session_dir_marker: Option<&'static str>,
 }
 
 /// The longest a store title may be before it stops being a title and starts
@@ -1397,6 +1417,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: Some(crate::ENV_YGGTERM_CODEX_HOME),
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
@@ -1502,6 +1523,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::ClaudeCode,
@@ -1632,6 +1654,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         read_store_entry: read_claude_code_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
     // ── The 2026-08-08 intake. Every field below was read off the CLI's own
     // source or its installed binary on this date, never from memory; the
@@ -1749,6 +1772,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_pi_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::OpenCode,
@@ -1837,6 +1861,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::QwenCode,
@@ -1956,6 +1981,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_qwen_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
@@ -2074,6 +2100,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -2208,6 +2235,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_muse_store_entry,
         store_membership_index: Some(muse_store_index_holds_session),
+        live_session_dir_marker: Some(".session.lock"),
     },
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
@@ -2374,6 +2402,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_antigravity_store_entry,
         store_membership_index: Some(antigravity_store_index_holds_session),
+        // Antigravity keeps no per-conversation file open: its live process holds
+        // only the shared `conversation_summaries.db` (measured 2026-08-20), so
+        // there is nothing under a session directory to recognise.
+        live_session_dir_marker: None,
     },
     // ── The 2026-08-13 intake. Every field below was read off the installed
     // binary (`@xai-official/grok` 1.0.3 `1a29d5bc12`, provisioned into the
@@ -2568,6 +2600,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_grok_build_store_entry,
         store_membership_index: None,
+        live_session_dir_marker: None,
     },
 ];
 

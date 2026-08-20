@@ -12,7 +12,8 @@ use crate::{
     SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
     active_client_instance_records, active_client_instance_records_for_endpoint_scope,
     claude_code_runtime_process_identity_from_root_pid,
-    codex_runtime_process_identity_from_root_pid, current_millis, fetch_remote_generation_context,
+    agent_runtime_session_id_from_root_pid, codex_runtime_process_identity_from_root_pid,
+    current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, overlay_codex_runtime_snapshot_identity,
     persist_remote_generated_copy, poll_remote_local_codex_identities,
     remote_resume_runtime_output_requires_restart, request_remote_agent_session_shutdown,
@@ -5337,6 +5338,57 @@ impl DaemonRuntime {
         Some(resolution.identity)
     }
 
+    /// Bind live rows of the self-minting CLIs to the session id their CLI
+    /// actually created.
+    ///
+    /// ⭐ This is the half that makes the handoff work rather than merely fail
+    /// safely. Without it a muse or agy row keeps the yggterm row uuid forever —
+    /// an id its CLI has never heard of — so every resume is a miss and the
+    /// user's conversation is unreachable after a restart.
+    ///
+    /// ⚖ Cheap by construction, which matters because this runs inside the
+    /// global runtime lock: the candidate list holds only rows whose store
+    /// positively DENIES their current id, and a row leaves it for good the
+    /// moment it is bound. The resolution itself is a `/proc/<pid>/fd` readdir,
+    /// not a transcript parse — the cost that had to be engineered out of the
+    /// Claude Code refresh does not exist on this path.
+    fn refresh_live_agent_runtime_session_ids_for_persistence(&mut self) -> usize {
+        let targets = self.server.live_agent_session_keys_needing_runtime_identity();
+        if targets.is_empty() {
+            return 0;
+        }
+        let mut bound = 0usize;
+        for (key, kind) in targets {
+            let runtime_path = self.terminal_runtime_key_for_path(&key);
+            let Some(pid) = self.terminals.session_process_id(&runtime_path) else {
+                continue;
+            };
+            let Some(session_id) = agent_runtime_session_id_from_root_pid(kind, pid) else {
+                continue;
+            };
+            if self
+                .server
+                .apply_agent_runtime_session_id_to_live_session(&key, &session_id)
+            {
+                bound += 1;
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "persistence",
+                    "agent_runtime_session_id_bound",
+                    serde_json::json!({
+                        "session_path": key,
+                        "runtime_path": runtime_path,
+                        "pid": pid,
+                        "kind": format!("{kind:?}"),
+                        "session_id": session_id,
+                    }),
+                );
+            }
+        }
+        bound
+    }
+
     /// Mirrors `refresh_live_codex_runtime_identities_for_persistence` for
     /// Claude Code. Walks each live ClaudeCode session's PTY process tree
     /// to find the open `~/.claude/projects/.../<session-id>.jsonl` and
@@ -8043,6 +8095,7 @@ impl DaemonRuntime {
         let _perf = yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "persist");
         self.refresh_live_codex_runtime_identities_for_persistence();
         self.refresh_live_claude_code_runtime_identities_for_persistence();
+        self.refresh_live_agent_runtime_session_ids_for_persistence();
         // Ledger chokepoint: every lifecycle event that can change the live
         // order flows through here, so the shared-scope ledger observes the
         // order exactly once per mutation, with no per-handler bookkeeping.
@@ -8452,6 +8505,7 @@ impl DaemonRuntime {
     fn persisted_state_for_update_restart(&mut self) -> PersistedDaemonState {
         self.refresh_live_codex_runtime_identities_for_persistence();
         self.refresh_live_claude_code_runtime_identities_for_persistence();
+        self.refresh_live_agent_runtime_session_ids_for_persistence();
         self.server.persisted_state_for_update_restart()
     }
 
