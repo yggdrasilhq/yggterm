@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use yggterm_core::ForeignTraceRecord;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -163,6 +164,23 @@ pub(crate) enum TerminalJsEvent {
     Perf {
         name: String,
         payload: Value,
+    },
+    /// A drained batch of foreign trace records from a layer inside the
+    /// webview — see `docs/spec-trace-plane-contract.md`.
+    ///
+    /// ⛔ **This is a separate channel from `Debug` and `Perf` on purpose, and
+    /// the reason is the batch, not the schema.** `Debug` carries a bare
+    /// string, so joining the trace plane through it would mean parsing a
+    /// grammar out of prose — a second encoding of the record, which is the one
+    /// thing the project's single-source-of-truth rule forbids outright.
+    /// `Perf` is already structured, but it is one event per IPC hop and one
+    /// synchronous append per event on the UI thread, which is exactly the cost
+    /// that froze the app under a reveal burst and forced the throttle that
+    /// sheds the events an investigator most wants. A batch pays that cost once
+    /// per drain instead of once per probe, which is what makes the channel
+    /// cheap enough not to need a lossy throttle in front of it.
+    Trace {
+        records: Vec<ForeignTraceRecord>,
     },
     /// libyggterm web-surface control emitted by a program in the PTY as
     /// OSC 7717 (ychrome pilot). Travels the existing byte relay (remote
@@ -417,6 +435,10 @@ enum TerminalJsEventWire {
         name: String,
         payload: Value,
     },
+    Trace {
+        #[serde(default)]
+        records: Vec<ForeignTraceRecord>,
+    },
     WebSurface {
         action: String,
         session: String,
@@ -608,6 +630,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 body,
             },
             TerminalJsEventWire::Perf { name, payload } => TerminalJsEvent::Perf { name, payload },
+            TerminalJsEventWire::Trace { records } => TerminalJsEvent::Trace { records },
             TerminalJsEventWire::WebSurface {
                 action,
                 session,

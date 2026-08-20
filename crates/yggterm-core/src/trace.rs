@@ -8,6 +8,10 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::trace_contract::{
+    ForeignRecordFault, ForeignTraceRecord, MAX_FOREIGN_BATCH_RECORDS, validate_foreign_record,
+};
+
 use crate::retention::{
     DIAGNOSTIC_RETENTION_MAX_AGE_MS, JsonlRetention, now_epoch_ms, prune_jsonl_generations,
     rotate_jsonl_with_retention,
@@ -45,6 +49,16 @@ const EVENT_TRACE_RETENTION: JsonlRetention = JsonlRetention {
     max_age_ms: DIAGNOSTIC_RETENTION_MAX_AGE_MS,
 };
 
+/// One line of the trace plane.
+///
+/// ⭐ **Every field added after `payload` is additive and skipped when absent**,
+/// which is what lets a record written before the language-agnostic contract
+/// existed still parse under it, and lets `ytop` read a stream containing both.
+/// A native record therefore looks byte-for-byte as it always did; only records
+/// that genuinely carry the new information pay for the fields.
+///
+/// The grammar these fields belong to lives in
+/// [`crate::trace_contract`] and `docs/spec-trace-plane-contract.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventTraceRecord {
     pub ts_ms: u128,
@@ -54,6 +68,51 @@ pub struct EventTraceRecord {
     pub name: String,
     #[serde(default)]
     pub payload: Value,
+    /// Which runtime produced this. Absent means `rust` — see
+    /// [`crate::trace_contract::TraceLayer`] for why the implicit default is
+    /// the correct reading of every byte already on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// `point` / `span` / `window`. Absent means `point`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Which clock `duration_ms` is on. ⛔ A `duration_ms` without this is not
+    /// a slightly worse number, it is an uninterpretable one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<f64>,
+    /// The emitting layer's own monotonic counter, for ordering records that
+    /// share a millisecond.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+impl EventTraceRecord {
+    /// The layer a reader should attribute this record to. Absent is `rust`,
+    /// stated once here so no consumer has to remember it.
+    pub fn layer_or_default(&self) -> &str {
+        self.layer.as_deref().unwrap_or("rust")
+    }
+
+    /// The kind a reader should attribute this record to. Absent is `point`
+    /// unless the record carries a duration, in which case it is a span — the
+    /// same inference the foreign validator makes, so both sides of the bridge
+    /// answer this question identically.
+    pub fn kind_or_default(&self) -> &str {
+        match self.kind.as_deref() {
+            Some(kind) => kind,
+            None if self.duration_ms.is_some() => "span",
+            None => "point",
+        }
+    }
+
+    /// Whether `ts_ms` may be used for temporal correlation. False for a
+    /// windowed aggregate, whose timestamp is bookkeeping — see
+    /// `docs/observability.md` §4.3c for the analysis this prevents.
+    pub fn timestamp_is_correlatable(&self) -> bool {
+        self.kind_or_default() != "window"
+    }
 }
 
 pub fn event_trace_path(home: &Path) -> PathBuf {
@@ -132,6 +191,15 @@ pub fn append_trace_event(
         category: category_s.clone(),
         name: name_s.clone(),
         payload: payload.clone(),
+        // The native path leaves every contract field absent on purpose. It is
+        // the implicit `rust`/`point` case, and writing the defaults out would
+        // add bytes to the highest-volume writer on the plane to say what the
+        // reader already assumes.
+        layer: None,
+        kind: None,
+        clock: None,
+        duration_ms: None,
+        seq: None,
     };
     let Ok(mut line) = serde_json::to_vec(&record) else {
         return;
@@ -192,6 +260,171 @@ fn write_trace_line(home: &Path, line: &[u8]) {
             writers.remove(&path);
         }
     }
+}
+
+/// What one foreign batch did, so the bridge can account for it in a single
+/// record instead of one per outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForeignBatchOutcome {
+    pub accepted: usize,
+    /// Records refused at the boundary, keyed by fault. ⛔ A refusal must never
+    /// be silent: a foreign layer that has started emitting garbage and a
+    /// foreign layer that has gone quiet look identical from the reader's side,
+    /// and only one of them is a bug in the emitter.
+    pub rejected: Vec<(&'static str, usize)>,
+    /// Records that landed but were altered on the way in.
+    pub repaired: usize,
+    /// Records the emitter itself dropped before the batch was sent, summed
+    /// across the batch. This is the emitter's own back-pressure being honest
+    /// about itself.
+    pub emitter_dropped: u64,
+    /// Records discarded because the batch exceeded
+    /// [`MAX_FOREIGN_BATCH_RECORDS`].
+    pub over_batch_cap: usize,
+}
+
+impl ForeignBatchOutcome {
+    fn count_rejection(&mut self, fault: &ForeignRecordFault) {
+        let key = fault.as_str();
+        if let Some(entry) = self.rejected.iter_mut().find(|(name, _)| *name == key) {
+            entry.1 += 1;
+        } else {
+            self.rejected.push((key, 1));
+        }
+    }
+
+    pub fn rejected_total(&self) -> usize {
+        self.rejected.iter().map(|(_, count)| *count).sum()
+    }
+}
+
+/// Append a batch of foreign (non-Rust) trace records in one pass.
+///
+/// ⛔⛔ **THE BATCH IS THE POINT, AND IT IS NOT AN OPTIMISATION.** The single
+/// -record path does a lock acquire, a rotation check and a `write_all` per
+/// call, on whichever thread called it. For the native crates that thread is
+/// usually a worker; for a record arriving from the webview it is the **UI
+/// event thread** — the exact thread whose stalls the foreign layers were
+/// instrumented to explain. Hundreds of those back-to-back is not a
+/// hypothetical: it is `finding-ui-freeze-js-debug-trace-flood`, where a reveal
+/// burst turned the diagnostic channel into a seconds-long freeze, and the
+/// standing mitigation is a throttle that sheds the events you most wanted.
+///
+/// ⇒ An instrument that perturbs the thing it measures does not produce a noisy
+/// reading; it produces a reading **of itself**. One lock, one write, N lines
+/// is what makes the channel affordable enough not to need the throttle that
+/// was hiding the evidence.
+pub fn append_foreign_trace_batch(
+    home: &Path,
+    records: Vec<ForeignTraceRecord>,
+) -> ForeignBatchOutcome {
+    let mut outcome = ForeignBatchOutcome::default();
+    if records.is_empty() {
+        return outcome;
+    }
+
+    let mut records = records;
+    if records.len() > MAX_FOREIGN_BATCH_RECORDS {
+        // Keep the OLDEST, because the batch is ordered and the tail of an
+        // oversized batch is the part a following batch will carry anyway,
+        // whereas the head is the only copy of the earliest evidence.
+        outcome.over_batch_cap = records.len() - MAX_FOREIGN_BATCH_RECORDS;
+        records.truncate(MAX_FOREIGN_BATCH_RECORDS);
+    }
+
+    // Attribution hint for the UI-block watchdog, once for the batch rather
+    // than once per record: the watchdog wants to know what ran before a stall,
+    // and N identical notes for one drain is noise, not attribution.
+    crate::ui_block::note_activity("trace/foreign_batch");
+
+    let mut buffer: Vec<u8> = Vec::with_capacity(records.len() * 256);
+    let mut mirrored: Vec<(String, String, String, Value)> = Vec::with_capacity(records.len());
+
+    for raw in records {
+        let emitter_dropped = raw.dropped.unwrap_or(0);
+        let validated = match validate_foreign_record(raw) {
+            Ok(validated) => validated,
+            Err(fault) => {
+                outcome.count_rejection(&fault);
+                // A refused record still contributes its drop count: the
+                // emitter really did drop those, and refusing the carrier is
+                // no reason to also lose the number it was carrying.
+                outcome.emitter_dropped = outcome.emitter_dropped.saturating_add(emitter_dropped);
+                continue;
+            }
+        };
+        outcome.emitter_dropped = outcome
+            .emitter_dropped
+            .saturating_add(validated.dropped.unwrap_or(0));
+        if !validated.repairs.is_empty() {
+            outcome.repaired += 1;
+        }
+
+        let mut payload = validated.payload.clone();
+        // Fold the emitter's own drop count into the payload so it survives
+        // even for a reader who never looks at the batch accounting record.
+        if let Some(dropped) = validated.dropped.filter(|dropped| *dropped > 0)
+            && let Some(map) = payload.as_object_mut()
+        {
+            map.insert("ygg_emitter_dropped".into(), json!(dropped));
+        }
+        if !validated.repairs.is_empty()
+            && let Some(map) = payload.as_object_mut()
+        {
+            map.insert(
+                "ygg_repairs".into(),
+                json!(
+                    validated
+                        .repairs
+                        .iter()
+                        .map(|fault| fault.as_str())
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+
+        let record = EventTraceRecord {
+            ts_ms: validated.ts_ms,
+            // ⛔ Stamped by the RECEIVER, never carried on the wire: a
+            // sandboxed emitter has no truthful access to a pid, and one that
+            // could set its own could set another process's.
+            pid: std::process::id(),
+            component: validated.component.clone(),
+            category: validated.category.clone(),
+            name: validated.name.clone(),
+            payload: payload.clone(),
+            layer: Some(validated.layer.as_str().to_string()),
+            kind: Some(validated.kind.as_str().to_string()),
+            clock: validated.clock.map(|clock| clock.as_str().to_string()),
+            duration_ms: validated.duration_ms,
+            seq: validated.seq,
+        };
+        let Ok(mut line) = serde_json::to_vec(&record) else {
+            continue;
+        };
+        line.push(b'\n');
+        buffer.extend_from_slice(&line);
+        outcome.accepted += 1;
+        mirrored.push((
+            validated.component,
+            validated.category,
+            validated.name,
+            payload,
+        ));
+    }
+
+    if !buffer.is_empty() {
+        // ⭐ ONE call, so ONE lock acquisition and ONE `write_all` for the whole
+        // drain. Rotation is still checked, once, against the accumulated
+        // counter — the same rule the single-record path uses.
+        write_trace_line(home, &buffer);
+    }
+
+    for (component, category, name, payload) in mirrored {
+        ytrace_trace_provider().event(component, category, name, payload);
+    }
+
+    outcome
 }
 
 pub struct EventTraceSpan {
@@ -333,6 +566,164 @@ mod tests {
             counted, on_disk,
             "in-memory byte counter must track the real file size"
         );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    fn foreign(category: &str, name: &str) -> crate::trace_contract::ForeignTraceRecord {
+        crate::trace_contract::ForeignTraceRecord {
+            ts_ms: 1_723_900_000_123,
+            layer: "xterm".into(),
+            component: "ui".into(),
+            category: category.into(),
+            name: name.into(),
+            kind: None,
+            clock: None,
+            duration_ms: None,
+            seq: None,
+            dropped: None,
+            payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn a_record_written_before_the_contract_still_parses_under_it() {
+        // ⛔ The regression this guards is invisible: adding required fields to
+        // the record would make every byte written before this commit fail to
+        // deserialize, and the failure mode is a reader reporting an ABSENCE
+        // over a window where the events plainly happened. Absence is the one
+        // answer a diagnostic must never give wrongly.
+        let legacy = r#"{"ts_ms":1,"pid":2,"component":"ui","category":"c","name":"n","payload":{}}"#;
+        let record: EventTraceRecord = serde_json::from_str(legacy).expect("legacy line parses");
+        assert_eq!(record.layer, None);
+        assert_eq!(record.layer_or_default(), "rust");
+        assert_eq!(record.kind_or_default(), "point");
+        assert!(record.timestamp_is_correlatable());
+    }
+
+    #[test]
+    fn a_native_record_gains_no_bytes_from_the_contract_fields() {
+        // The native path is the highest-volume writer on the plane, and the
+        // retention window is set by the BYTE budget. Serializing five absent
+        // fields onto every line would shorten the diagnostic window for
+        // nothing — the reader already assumes exactly these defaults.
+        let record = EventTraceRecord {
+            ts_ms: 1,
+            pid: 2,
+            component: "ui".into(),
+            category: "c".into(),
+            name: "n".into(),
+            payload: json!({}),
+            layer: None,
+            kind: None,
+            clock: None,
+            duration_ms: None,
+            seq: None,
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        for absent in ["layer", "kind", "clock", "duration_ms", "seq"] {
+            assert!(!line.contains(absent), "{absent} must not be serialized: {line}");
+        }
+    }
+
+    #[test]
+    fn a_foreign_batch_lands_every_record_and_tags_the_layer() {
+        let home = unique_home("foreign-batch");
+        let mut records = Vec::new();
+        for i in 0..4u64 {
+            let mut record = foreign("xterm_write", "flush");
+            record.seq = Some(i);
+            record.clock = Some("wall".into());
+            record.duration_ms = Some(1.5 + i as f64);
+            records.push(record);
+        }
+        let outcome = append_foreign_trace_batch(&home, records);
+        assert_eq!(outcome.accepted, 4);
+        assert_eq!(outcome.rejected_total(), 0);
+
+        let lines = read_trace_tail(&event_trace_path(&home), 100);
+        assert_eq!(lines.len(), 4, "one line per record: {lines:?}");
+        for (i, line) in lines.iter().enumerate() {
+            let record: EventTraceRecord = serde_json::from_str(line).expect("valid jsonl");
+            assert_eq!(record.layer_or_default(), "xterm");
+            assert_eq!(record.kind_or_default(), "span");
+            assert_eq!(record.clock.as_deref(), Some("wall"));
+            assert_eq!(record.seq, Some(i as u64));
+            // ⛔ Stamped by the receiver: a sandboxed emitter has no truthful
+            // pid, so the wire never carries one.
+            assert_eq!(record.pid, std::process::id());
+        }
+        trace_writers().lock().unwrap().remove(&event_trace_path(&home));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_refused_record_is_counted_and_never_silently_swallowed() {
+        // A foreign layer emitting garbage and a foreign layer that has gone
+        // quiet look identical from the reader's side. Only one is a bug in
+        // the emitter, so the refusal has to be a number someone can read.
+        let home = unique_home("foreign-refuse");
+        let mut bad_clock = foreign("xterm_write", "flush");
+        bad_clock.clock = Some("cpu".into());
+        bad_clock.duration_ms = Some(2.0);
+        let mut bad_layer = foreign("xterm_write", "flush");
+        bad_layer.layer = "rust".into();
+        let good = foreign("xterm_write", "enqueue");
+
+        let outcome = append_foreign_trace_batch(&home, vec![bad_clock, bad_layer, good]);
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.rejected_total(), 2);
+        assert!(outcome.rejected.contains(&("cpu_clock_from_sandbox", 1)));
+        assert!(outcome.rejected.contains(&("layer_not_foreign", 1)));
+
+        trace_writers().lock().unwrap().remove(&event_trace_path(&home));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_emitters_own_drop_count_survives_the_record_that_carried_it_being_refused() {
+        // The drop count rides on records precisely so a drop cannot be the
+        // thing that gets dropped. Refusing the carrier for an unrelated fault
+        // must not also lose the number it was carrying.
+        let home = unique_home("foreign-dropcount");
+        let mut refused = foreign("xterm_write", "flush");
+        refused.dropped = Some(17);
+        refused.clock = Some("cpu".into());
+        refused.duration_ms = Some(2.0);
+        let outcome = append_foreign_trace_batch(&home, vec![refused]);
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.emitter_dropped, 17);
+
+        trace_writers().lock().unwrap().remove(&event_trace_path(&home));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_oversized_batch_keeps_the_oldest_records_and_reports_the_rest() {
+        // The tail of an oversized batch is what a following flush would carry
+        // anyway; the head is the only copy of the earliest evidence.
+        let home = unique_home("foreign-cap");
+        let over = crate::trace_contract::MAX_FOREIGN_BATCH_RECORDS + 5;
+        let records = (0..over as u64)
+            .map(|i| {
+                let mut record = foreign("xterm_write", "enqueue");
+                record.seq = Some(i);
+                record
+            })
+            .collect::<Vec<_>>();
+        let outcome = append_foreign_trace_batch(&home, records);
+        assert_eq!(outcome.over_batch_cap, 5);
+        assert_eq!(
+            outcome.accepted,
+            crate::trace_contract::MAX_FOREIGN_BATCH_RECORDS
+        );
+        let lines = read_trace_tail(&event_trace_path(&home), 4);
+        let first: EventTraceRecord = serde_json::from_str(&lines[0]).unwrap();
+        assert!(
+            first.seq.unwrap() < over as u64 - 5,
+            "the retained window must start at the head, not the tail"
+        );
+
+        trace_writers().lock().unwrap().remove(&event_trace_path(&home));
         let _ = fs::remove_dir_all(&home);
     }
 

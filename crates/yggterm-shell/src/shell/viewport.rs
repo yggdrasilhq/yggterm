@@ -9660,6 +9660,69 @@ fn TerminalCanvas(
                                     }),
                                 );
                             }
+                            Ok(TerminalJsEvent::Trace { records }) => {
+                                // The foreign layers' door onto the trace
+                                // plane. Everything expensive about a trace
+                                // write happens ONCE here for the whole drain,
+                                // which is what lets the emitter stay
+                                // unthrottled — see `append_foreign_trace_batch`
+                                // for why a per-record path could not.
+                                if !records.is_empty() {
+                                    // How far behind the emitter is running,
+                                    // measured before the write so the write's
+                                    // own cost is not folded into it. ⭐ This is
+                                    // not bookkeeping: the emitter flushes off
+                                    // the hot path, so a lag that grows IS the
+                                    // UI thread failing to reach idle, which is
+                                    // the stall these probes exist to explain.
+                                    // A blocked emitter would otherwise report
+                                    // its own silence as "nothing happened".
+                                    let newest_ts_ms = records
+                                        .iter()
+                                        .map(|record| record.ts_ms)
+                                        .max()
+                                        .unwrap_or_default();
+                                    let flush_lag_ms = u128::from(current_millis())
+                                        .saturating_sub(newest_ts_ms);
+                                    let submitted = records.len();
+                                    let outcome =
+                                        append_foreign_trace_batch(&trace_home, records);
+                                    // ONE accounting record per drain, and only
+                                    // when there is something to account for. A
+                                    // refusal or a drop that is never counted
+                                    // makes a broken emitter indistinguishable
+                                    // from a quiet one.
+                                    if outcome.rejected_total() > 0
+                                        || outcome.emitter_dropped > 0
+                                        || outcome.over_batch_cap > 0
+                                        || outcome.repaired > 0
+                                    {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "trace_bridge",
+                                            "foreign_batch_faults",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "host_id": host_id.clone(),
+                                                "submitted": submitted,
+                                                "accepted": outcome.accepted,
+                                                "repaired": outcome.repaired,
+                                                "over_batch_cap": outcome.over_batch_cap,
+                                                "emitter_dropped": outcome.emitter_dropped,
+                                                "rejected": outcome
+                                                    .rejected
+                                                    .iter()
+                                                    .map(|(fault, count)| {
+                                                        json!({ "fault": fault, "count": count })
+                                                    })
+                                                    .collect::<Vec<_>>(),
+                                                "flush_lag_ms": flush_lag_ms,
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
                             Ok(TerminalJsEvent::Ignored { reason, value }) => {
                                 append_trace_event(
                                     &trace_home,

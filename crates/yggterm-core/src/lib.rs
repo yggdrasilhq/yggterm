@@ -68,6 +68,7 @@ mod telemetry;
 pub mod terminal_input;
 mod titles;
 mod trace;
+pub mod trace_contract;
 mod transcript;
 pub mod web_profile;
 mod workspace;
@@ -152,8 +153,12 @@ pub use titles::{
     session_title_store_open_count,
 };
 pub use trace::{
-    EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,
-    follow_trace_lines, read_trace_tail,
+    EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_foreign_trace_batch,
+    append_trace_event, event_trace_path, follow_trace_lines, read_trace_tail,
+};
+pub use trace_contract::{
+    ForeignRecordFault, ForeignTraceRecord, MAX_FOREIGN_BATCH_RECORDS, MAX_FOREIGN_PAYLOAD_BYTES,
+    TraceClock, TraceKind, TraceLayer, ValidatedForeignRecord, validate_foreign_record,
 };
 pub use transcript::{
     TranscriptEntry, TranscriptEntryKind, TranscriptMessage, TranscriptRole, TranscriptTail,
