@@ -7247,8 +7247,65 @@ impl DaemonRuntime {
             {
                 self.recover_terminal_write_lost_runtime(path, runtime_key, data, error)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                // ⚖ The HUSK: this runtime exists but its process is gone — a
+                // launch that spawned a PTY, printed an error frame and died
+                // before its CLI could take input. The row kept
+                // `launch_phase: Running` over a corpse, so it read as IDLE, and
+                // the caller got a bare write error with nothing to act on.
+                //
+                // ⛔ Only `Some(true)` acts. `session_has_exited` answers `None`
+                // when the probe itself failed, and treating that as an exit
+                // would mark a healthy row dead on a transient `waitpid` error.
+                //
+                // This is the one place the check is FREE of false positives:
+                // it runs only because a write already failed, so no idle,
+                // healthy row is ever inspected — let alone relabelled.
+                if self.terminals.session_has_exited(runtime_key) == Some(true) {
+                    let screen = self.dead_runtime_screen_tail(runtime_key);
+                    let moved = self.server.record_launch_death_for_path(path, &screen);
+                    if moved && let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_write",
+                            "launch_process_exited",
+                            serde_json::json!({
+                                "path": path,
+                                "runtime_key": runtime_key,
+                                "detail": screen,
+                            }),
+                        );
+                    }
+                    // Say what happened INSTEAD of the generic write failure.
+                    // The caller's whole problem was that the error named the
+                    // symptom (a write did not land) and never the cause.
+                    return Err(anyhow::anyhow!(
+                        "this row's launch process has exited, so there is nothing to type into{}",
+                        if screen.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — last screen: {screen}")
+                        }
+                    ));
+                }
+                Err(error)
+            }
         }
+    }
+
+    /// The last visible line the dead runtime left on screen — the frozen error
+    /// frame, which for a failed launch wrapper IS the diagnosis and is about to
+    /// become the only surviving copy of it.
+    fn dead_runtime_screen_tail(&self, runtime_key: &str) -> String {
+        self.terminals
+            .session_screen_snapshot(runtime_key)
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .map(|line| line.trim().to_string())
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
     }
 
     /// Recovery order: (1) ADOPT — another reachable daemon actually OWNS
