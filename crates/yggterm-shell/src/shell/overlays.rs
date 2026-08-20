@@ -1608,11 +1608,25 @@ fn ThemeEditorOverlay(
                                 }
                             }
                         }
+                        // ⭐ THE RECOLOUR TOOLS APPEAR WITH SOMETHING TO RECOLOUR.
+                        // Both controls below drive `update_selected_theme_color`,
+                        // which RETURNS EARLY when no stop is selected — so with an
+                        // empty selection the library and the colour well were not
+                        // merely redundant, they were INERT: a swatch you can click
+                        // that silently does nothing, which is worse than a control
+                        // that is not there. Disclosing them on the selection makes
+                        // the modal say what it can do, and DESIGN.md ▸ Theming asks
+                        // for a "lightweight color library" rather than a permanent
+                        // panel of dials.
+                        if let Some(selected_index) = snapshot.theme_editor_selected_stop {
                         div {
                             style: "display:flex; flex-direction:column; gap:8px;",
                             div {
                                 style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
-                                "Color Library"
+                                // Named for its TARGET. A library headed only
+                                // "Color Library" leaves the user to infer which of
+                                // several dots a swatch is about to repaint.
+                                "Color {selected_index + 1}"
                             }
                             div {
                                 // §12.4 clause 3 — the library is one group; no
@@ -1633,17 +1647,16 @@ fn ThemeEditorOverlay(
                                 }
                             }
                         }
-                        div {
-                            style: "display:flex; flex-direction:column; gap:8px;",
+                        input {
+                            r#type: "color",
+                            value: selected_stop.as_ref().map(|stop| stop.color.clone()).unwrap_or_else(|| accent.clone()),
+                            style: "width:100%; height:42px; border:none; border-radius:12px; background:transparent;",
+                            oninput: move |evt| on_update_stop_color.call(evt.value()),
+                        }
+                        } else if preview_has_stops {
                             div {
-                                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
-                                "Selected Color"
-                            }
-                            input {
-                                r#type: "color",
-                                value: selected_stop.as_ref().map(|stop| stop.color.clone()).unwrap_or_else(|| accent.clone()),
-                                style: "width:100%; height:42px; border:none; border-radius:12px; background:transparent;",
-                                oninput: move |evt| on_update_stop_color.call(evt.value()),
+                                style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
+                                "Pick a dot on the pad to recolour it."
                             }
                         }
                         div {
