@@ -59740,6 +59740,55 @@ mod terminal_loop_input_starvation_locks {
         assert!(!terminal_read_may_start(true, 5_000, 1_000));
     }
 
+    /// A read that resolves after the user has switched rows must not be painted.
+    ///
+    /// ⛔⛔ **ONE TERMINAL HOST IS REUSED ACROSS SESSIONS**, and the loop's "am I
+    /// still mounted" check sits at the TOP of the iteration — so a daemon read
+    /// that resolved after a switch ran its whole apply branch and wrote the OLD
+    /// session's differentials into the NEWLY mounted viewport, noticing only on
+    /// the next trip round.
+    ///
+    /// That is the cross-session canvas bleed reported with frames on 2026-08-20:
+    /// a freshly created row showing 0 user and 0 assistant turns in its metadata
+    /// rail while its viewport rendered another row's live working stream. A
+    /// repaint inside the CLI cleared it every time — the tell that the daemon's
+    /// screen was never wrong and only the client grid was poisoned. Plain
+    /// terminal CC never shows it, so by the wrapper-vs-manual parity rule it is
+    /// ours.
+    ///
+    /// The gate must sit at the LAST instant before the bytes are used, not at
+    /// the top of the loop, because the switch can land at any await in between.
+    #[test]
+    fn a_read_that_resolves_after_a_switch_is_not_painted() {
+        let source = include_str!("viewport.rs");
+        let apply_at = source
+            .find("terminal_read_rx.recv()")
+            .expect("a branch must receive the read result off the channel");
+        let apply_branch = &source[apply_at..];
+
+        let gate_at = apply_branch
+            .find("terminal_session_bridge_should_stay_mounted(")
+            .expect(
+                "the read-apply branch must re-check that this session is still the \
+                 mounted one before using the bytes — one host is reused across rows",
+            );
+        // It has to come before the chunks are handed to the write bridge, or the
+        // check is decoration and the bleed still happens.
+        if let Some(write_at) = apply_branch.find("terminal_write_bridge.stage_or_immediate(") {
+            assert!(
+                gate_at < write_at,
+                "the mounted-session gate must precede the write, or the old \
+                 session's bytes reach the new session's canvas anyway"
+            );
+        }
+        assert!(
+            apply_branch.contains("terminal_read_discarded_not_mounted"),
+            "a discard on this path must be traced — it is otherwise invisible, \
+             and this is the class where the client grid lies while every daemon \
+             instrument reads correct"
+        );
+    }
+
     /// The keystroke branch must not be starved by the daemon read.
     ///
     /// ⛔ **`tokio::select!` IS A SERIALIZER, AND THAT IS THE WHOLE DEFECT.**
