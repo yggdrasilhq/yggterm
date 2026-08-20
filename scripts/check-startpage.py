@@ -92,7 +92,7 @@ CLI_STORES = [
 # stay per-script on purpose: the oracle must not import the Rust descriptors).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ygg_scan_truth import (  # noqa: E402
-    agy_durable_rows, muse_noise_ids, locally_backed_ids,
+    agy_durable_rows, muse_noise_ids, locally_backed_ids, condense_store_title,
 )
 
 
@@ -453,9 +453,19 @@ def compare(host, verb_data, manual_sessions, verbose=False):
         sid=row.get("session_id")
         if sid in manual_by_id:
             verb_title=(row.get("title") or "").strip()
-            manual_title=(manual_by_id[sid].get("parsed", {}).get("title") or "").strip()
+            # Compare against the CONDENSED store title — the row label the verb
+            # ships — not the raw store text it keeps as `detail`.
+            manual_title=(condense_store_title(manual_by_id[sid].get("parsed", {}).get("title")) or "").strip()
             if verb_title and manual_title and verb_title != manual_title:
-                issues.append(f"title mismatch {sid[:8]}: verb {verb_title[:40]!r} vs manual {manual_title[:40]!r}")
+                cut = next(
+                    (i for i, (a, b) in enumerate(zip(verb_title, manual_title)) if a != b),
+                    min(len(verb_title), len(manual_title)),
+                )
+                issues.append(
+                    f"title mismatch {sid[:8]} at char {cut}: "
+                    f"verb ...{verb_title[cut:cut + 40]!r} vs manual ...{manual_title[cut:cut + 40]!r} "
+                    f"(len {len(verb_title)} vs {len(manual_title)})"
+                )
     # Count check. ⛔ EXACT, and on the LOCAL half only. This used to allow a
     # ±10 slack, which is a checker that cannot see up to ten missing sessions —
     # the absence a count is least able to notice is the one it is asked to find.
