@@ -2136,6 +2136,35 @@ one known-bad daemon**, and a reason to drain it, not a property of chores.
 counts for a 40-minute request, so the long-window instrument has to come from
 outside the daemon, or that flag has to start working.
 
+## 7a. The offsite channel: what actually reaches the client, and what it costs
+
+**The question:** work runs on a compute host, so why does the client machine get hot? Measured on
+the client over one hour with the fleet busy:
+
+| what crosses or runs | rate | cost on the client |
+|---|---:|---:|
+| `request/begin` (daemon requests) | 243 /min | — |
+| `terminal_io/dispatch` (bytes to the GUI) | 117 /min | — |
+| `daemon_request/terminal_app_declares` | 115 /min, p50 0.21 ms | **1.7 s of CPU per hour** |
+| `sidebar/merge_rows` | 44 /min, p50 7.8 ms | **31.6 s of wall per hour** (~0.9% of a core) |
+| `copy_generation/title` | ~1 /min, p50 8.7 s | wall, not CPU — LLM-bound |
+| **render tree** (`gui` + `web_content`) | continuous | **~0.31 cores, continuously** |
+
+⇒ **The wire is not the mechanism.** Everything the compute host sends the client — every request,
+every declare, every dispatched byte — costs the client under **two seconds of CPU per hour**. The
+render tree costs **0.31 cores continuously**, two orders of magnitude more, and in a sample taken
+while the machine was hot it accounted for **94% of all busy CPU on the box**.
+
+⚠ **That share is not stable and must be re-measured, never quoted from here.** Two samples eight
+minutes apart gave **12%** and **94%**, because an unrelated package install was running during the
+first. The attribution question has a different answer minute to minute, which is exactly why it
+needs an instrument rather than a belief — `notebooks/05-fleet-heat.ipynb` answers it on demand.
+
+⭐ **A corollary worth stating, because it inverts an inherited claim.** "The host is at 90 °C with
+14 of 16 cores idle, so the heat is not ours" does not follow. A two-core load at boost clocks
+reaches the thermal ceiling on a laptop; idle-core *count* says nothing about who is generating
+heat. Attribute by **share of busy CPU**, which is what the notebook grades.
+
 ## 7b. The fan contract, and what a client host can actually be asked
 
 **The contract, owner-set:** *a client host's fan must never spin because of
