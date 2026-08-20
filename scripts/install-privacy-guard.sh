@@ -64,6 +64,16 @@ set -uo pipefail
 # from. ⇒ A leak gate's source is itself private data, and publishing it here
 # would leak exactly what it exists to protect. It stays outside; this installer
 # is the tracked half.
+# ⛔ THE GUARD'S PATH SCAN IS `--diff-filter=AR`, AND THAT IS NOT AN OPTIMISATION.
+# Patched 2026-08-20. It used to list every path a commit TOUCHED, which made a
+# DELETION indistinguishable from an addition — so removing a privately-named
+# file refused the push that removed it. A leak gate that blocks the removal of a
+# leak fails in the worst possible direction, and it does so while its output
+# looks perfectly correct. Only an added or renamed-to path can introduce a name;
+# a modified path already existed and was already public.
+# ⚠ If a future edit widens that filter, the three-commit fixture is the proof:
+# add a privately-named path (must refuse), delete it (must pass), add a
+# privately-named line (must refuse). The middle case is the one that regresses.
 SELF="${YGG_PRIVACY_GUARD:-$HOME/.local/bin/ygg-privacy-guard}"
 [ -x "$SELF" ] || { echo "no guard at $SELF — set YGG_PRIVACY_GUARD" >&2; exit 1; }
 
