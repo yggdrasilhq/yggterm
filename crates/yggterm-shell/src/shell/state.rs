@@ -24894,20 +24894,80 @@ impl ShellState {
         // [[finding-a-constant-anomaly-is-a-measurement-bug]] — a flag that is
         // true on 106/106 samples is a broken measurement, not a finding.
         const SLOW_REVEAL_NOTIFY_MS: u64 = 6_000;
+        // Swap residency of this process plus its direct children (the WebKit
+        // web process holds the terminal canvas), in MB. 0 on any read failure
+        // and on non-Linux — the caller treats 0 as "nothing measured", never
+        // as proof of absence. Runs only on the rare ≥6 s reveal.
+        fn own_process_tree_swap_mb() -> u64 {
+            fn vm_swap_kb(status_path: &std::path::Path) -> u64 {
+                std::fs::read_to_string(status_path)
+                    .ok()
+                    .and_then(|s| {
+                        s.lines().find(|l| l.starts_with("VmSwap:")).and_then(|l| {
+                            l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                        })
+                    })
+                    .unwrap_or(0)
+            }
+            let self_pid = std::process::id();
+            let mut total_kb = vm_swap_kb(std::path::Path::new("/proc/self/status"));
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                        continue;
+                    };
+                    if pid == self_pid {
+                        continue;
+                    }
+                    let stat_path = entry.path().join("stat");
+                    let Ok(stat) = std::fs::read_to_string(&stat_path) else {
+                        continue;
+                    };
+                    // ppid is field 4, after the parenthesised comm (which may
+                    // itself contain spaces — split after the LAST ')').
+                    let ppid = stat
+                        .rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                        .and_then(|v| v.parse::<u32>().ok());
+                    if ppid == Some(self_pid) {
+                        total_kb += vm_swap_kb(&entry.path().join("status"));
+                    }
+                }
+            }
+            total_kb / 1024
+        }
         if outcome == "ready" && notify_total_ms >= SLOW_REVEAL_NOTIFY_MS {
             let seconds = notify_total_ms as f64 / 1000.0;
+            // ⛔ THE 2026-08-10 INVERSION HAD A BLIND SPOT, measured 2026-08-20:
+            // PSI `full` is machine-wide (every non-idle task stalled at once),
+            // so it reads ~0 while the ONE process the user is watching pays
+            // seconds of swap-in for its own paged-out memory. A machine that
+            // was under pressure earlier leaves GiBs of swap RESIDUE; free RAM
+            // is plentiful, reclaim is quiet, and the first reveal that touches
+            // cold pages still crawls. On the live host: 5.7 GiB residue,
+            // "Memory is not the cause: 9022 MB available" on an 81.8 s reveal.
+            // The discriminator that sees it is the app's OWN swap residency,
+            // read at notify time (self + direct children — the web process
+            // holds the canvas).
+            let notify_own_swap_mb = own_process_tree_swap_mb();
             let detail = if notify_reclaim_pressured {
                 // The honest predicate agrees: memory really is the problem.
                 format!(
                     "The machine is short of memory ({} MB of {} MB available), so freeing RAM should help.",
                     notify_mem_available_mb, notify_mem_total_mb,
                 )
+            } else if notify_own_swap_mb >= 64 {
+                format!(
+                    "Free RAM is plentiful ({} MB of {} MB available) but this app holds {} MB in swap — residue from an earlier memory crunch. Pages come back lazily, and a reveal that touches them pays the swap-in once.",
+                    notify_mem_available_mb, notify_mem_total_mb, notify_own_swap_mb,
+                )
             } else {
                 // Say what was ruled out, so the next person does not re-chase it.
                 match notify_psi_full_pct {
                     Some(psi) => format!(
-                        "Memory is not the cause: {} MB of {} MB available and the kernel stalled on reclaim {:.2}% of the time.",
-                        notify_mem_available_mb, notify_mem_total_mb, psi,
+                        "Memory is not the cause: {} MB of {} MB available, {} MB of this app in swap, and the kernel stalled on reclaim {:.2}% of the time.",
+                        notify_mem_available_mb, notify_mem_total_mb, notify_own_swap_mb, psi,
                     ),
                     None => format!(
                         "Memory does not look like the cause: {} MB of {} MB available.",
