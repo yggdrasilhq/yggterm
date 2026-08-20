@@ -12,6 +12,52 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.2] `terminal new --model` IS ACCEPTED AND SILENTLY DROPPED FROM THE LAUNCH COMMAND
+
+**Status:** OPEN — measured 2026-08-20, reproduced on 8 of 8 spawns in one batch
+
+`server app terminal new --kind claude-code --model <id> …` answers success and creates the row,
+but the spawned process command line is `claude --dangerously-skip-permissions --session-id <id>`
+— no model flag at all. The row silently launches on the CLI's saved default model. Reproduced on
+every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
+
+- **Consequence:** an orchestrator directed to spawn delegates on a specific model cannot; every
+  delegate lands on whatever default the CLI last saved. Nothing downstream flags the substitution
+  (same shape as the fleet skill's "silently mangled id yields a working row on the wrong model").
+- **Workaround (proven):** drive `/model <id>` into the row after it reaches its composer.
+- **Locality:** launch-command construction for agent kinds — the same
+  `persistent_agent_resume_command` / managed_cli family lane 11.2 is auditing for resume-id
+  mapping. Check whether `--permission-mode` and other per-launch options survive, too: the
+  spawned cmdline shows `--dangerously-skip-permissions` did, so the drop is selective.
+- **Falsifier:** spawn with `--model <x>`; `/proc/<pid>/cmdline` (or the CLI's own session state)
+  carries x, and the row header shows x.
+
+## ⛔⛔ [11.6] THE CLI PROVISIONER'S npm AUTO-UPDATE RACES ITSELF ACROSS CONCURRENT LAUNCHES
+
+**Status:** OPEN — evidence captured 2026-08-20 (log paths below)
+
+Six agent rows spawned in one batch on one host. Each launch ran the provisioner's npm update into
+the shared prefix `~/.yggterm/npm`. Two launches died mid-update and their rows dropped to a bare
+shell with the agent never started:
+
+- `MODULE_NOT_FOUND` requiring `…/@anthropic-ai/claude-code/install.cjs` (a half-reified tree),
+- `postinstall Failed to place binary: ENOENT … link` (a sibling unlinked what this run was
+  linking).
+
+Four npm runs within 11 s in `~/.yggterm/npm-cache/_logs/2026-08-20T05_18_*.log`. There is no
+lock around the prefix and reify is not atomic, so concurrent updates corrupt each other. This is
+the same failure class reported for grok-build provisioning ("npm breaking every time").
+
+- **Second defect in the same incident:** a row whose launch dies this way is a husk born broken —
+  its PTY write path answers `remote terminal write failed`, the frozen npm error frame renders as
+  the screen, and nothing marks the row as failed. A launch that never reached its CLI must surface
+  an error state on the row, not a corpse that looks idle.
+- **Owner lane:** 11.6 (`docs/cli-integration.md`). Fix class: single-flight lock per prefix +
+  install-to-temp-then-rename on disk (never tmpfs) + skip-if-fresh TTL so N concurrent launches
+  cause at most one update.
+- **Falsifier:** spawn 6 rows concurrently twice; zero npm failures, zero husk rows, and at most
+  one update run per prefix per TTL window.
+
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
