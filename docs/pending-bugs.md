@@ -573,12 +573,31 @@ So it exercises scroll-region handling, cursor save/restore, and bottom-row repa
 exact trio that the wrapper-vs-manual parity rule cares about, and the trio a plain `ls` or a
 scrolling build log never touches.
 
-**First diagnostic, and it is cheap:** run the same `apt update` in a bare terminal emulator on the
-same host and compare. Per the parity rule in CLAUDE.md, if it renders correctly outside and breaks
-inside, the defect is ours and it is in the emulator/compositing path, not in apt.
+**A DETERMINISTIC PROBE NOW EXISTS — USE IT INSTEAD OF apt.** `scripts/decstbm-probe.sh`
+reserves the last row with `DECSTBM`, scrolls ordinary output above it, and repaints that row out
+of band through `DECSC`/`DECRC` — the same trio, with no root, no network and no package state, so
+it is repeatable on any host and cannot be blamed on a mirror.
+
+**NARROWED 2026-08-20 (11.0): THE DAEMON'S PARSE IS NOT THE FAULT — DO NOT RE-DERIVE THIS.**
+The probe was run in a plain-shell row on the GUI host and the in-daemon screen read back through
+`server gate-screen` (the read door; `input-check` writes a marker and must not be used while the
+owner is at the machine). The scrolled region and the anchored bottom row both came back intact and
+coherent. The same probe under an independent emulator on the same host, at 80x24, produced the
+same structure: output scrolling above, the bar held at the bottom, nothing broken up.
+
+⇒ Two implementations agree, so `DECSTBM` + cursor save/restore are handled correctly on the
+**parse** side. The daemon parses with the `vt100` crate; the client paints with xterm.js from raw
+PTY chunks, and those are different parsers. **The remaining suspects are the client paint and the
+frame delivery into it — not the scroll-region semantics.**
+
+⚠ **What is still owed, and why it was not taken here:** the client half needs a FAITHFUL
+screenshot, and a faithful capture needs the row visible. The owner's view was live on another row
+throughout, and his viewport is not ours to move. This is render-lane work.
 
 **Falsifier:** a bottom-anchored `DECSTBM` redraw in a PLAIN SHELL row paints identically to the
-same command in a bare terminal emulator, across a window resize and a scrollback scroll.
+same probe in a bare terminal emulator, across a window resize and a scrollback scroll — compared
+on a faithful capture (`capture_faithful: true`), never on the daemon's screen, which is already
+known to be correct and therefore cannot see this fault at all.
 
 ## ⛔⛔ [leak] REAL SPEECH AND A THIRD HOST NAME SIT IN THE TITLE HEURISTICS' OWN FIXTURES
 
