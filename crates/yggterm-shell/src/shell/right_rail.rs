@@ -1373,6 +1373,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     let tab_id = *tab_id;
                     let tab = tabs.get(&tab_id).cloned();
                     let loading = tab.as_ref().is_some_and(|tab| tab.loading);
+                    // BACKGROUND-only, and the view already resolved that — see
+                    // `WebSurfaceOverlayTabView::media_playing`. The rail asks
+                    // no question about it here, so the rail and the classic
+                    // strip cannot answer it differently.
+                    let media_playing = tab.as_ref().is_some_and(|tab| tab.media_playing);
                     let (select_path, close_path) = (session_path.clone(), session_path.clone());
                     // The app tab's ✕ is shown only while it holds a saved page;
                     // when closable it despawns like any tab (user request: first
@@ -1385,13 +1390,19 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         tab.as_ref().is_some_and(|tab| tab.active),
                         None,
                         None,
-                        // A tab's ONE leading mark is its loading dot; it rides
-                        // the mark column the folder's glyph sits in, so both
-                        // row kinds start their titles at one x on ONE column.
+                        // A tab's ONE leading mark is its activity dot; it
+                        // rides the mark column the folder's glyph sits in, so
+                        // both row kinds start their titles at one x on ONE
+                        // column. Two causes light it — the page is loading, or
+                        // the engine says this background tab is playing media —
+                        // and each gets its own attribute so a probe (and the
+                        // falsifier screenshot's companion read) can tell which.
                         Some(rsx! {
                             span {
                                 "data-web-tab-loading": if loading { "true" } else { "false" },
-                                style: web_tab_loading_dot_style(loading),
+                                "data-web-tab-media": if media_playing { "true" } else { "false" },
+                                title: web_tab_activity_dot_title(loading, media_playing).unwrap_or_default(),
+                                style: web_tab_activity_dot_style(loading, media_playing),
                             }
                         }),
                         // No glyph, no chevron — and `None`, not `rsx!{}`. An

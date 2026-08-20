@@ -1412,6 +1412,8 @@ mod tests {
             session_path.to_string(),
             WebSurfaceUiState {
                 tabs: vec![WebSurfaceTab {
+                    media_playing: false,
+                    media_seen_ms: 0,
                     id: 0,
                     url: "https://app".to_string(),
                     effective_url: "https://app".to_string(),
@@ -20618,7 +20620,7 @@ mod tests {
         let dot_styles = [
             live_session_status_dot_style(dark, true, true),
             live_session_status_dot_style(dark, false, true),
-            web_tab_loading_dot_style(true),
+            web_tab_activity_dot_style(true, false),
             status_dot_blink_opacity_css(true),
         ];
         for style in &dot_styles {
@@ -20653,11 +20655,165 @@ mod tests {
             keys(&live_session_status_dot_style(dark, true, false))
         );
         assert_eq!(
-            keys(&web_tab_loading_dot_style(true)),
-            keys(&web_tab_loading_dot_style(false))
+            keys(&web_tab_activity_dot_style(true, false)),
+            keys(&web_tab_activity_dot_style(false, false))
         );
         assert!(status_dot_blink_opacity_css(false).contains("opacity: 1;"));
         assert!(!status_dot_blink_opacity_css(false).contains("var("));
+    }
+
+    // ========================================================================
+    // A BACKGROUND TAB PLAYING MEDIA — the blinking indicator (owner mandate,
+    // 2026-08-20). The falsifier is a live screenshot and no unit test can
+    // stand in for it; what these lock is everything that would make the
+    // screenshot lie.
+    // ========================================================================
+
+    /// ⛔ THE ONE RULE: the dot marks a BACKGROUND tab whose media claim is
+    /// FRESH. Both halves have their own failure and each one is silent.
+    #[test]
+    fn only_a_background_tab_with_a_fresh_engine_answer_earns_the_media_dot() {
+        let now = 1_000_000_u64;
+        // The case the mandate exists for.
+        assert!(web_tab_earns_media_dot(false, true, now, now));
+        // FOREGROUND: the user is already looking at it.
+        assert!(!web_tab_earns_media_dot(true, true, now, now));
+        // Silent: the whole point. An indicator that blinks on a quiet row is
+        // worse than none, because the user stops believing the ones that mean it.
+        assert!(!web_tab_earns_media_dot(false, false, now, now));
+        // A claim still inside the freshness window is still believed — this is
+        // what lets an hour-long album keep its dot between heartbeats.
+        assert!(web_tab_earns_media_dot(
+            false,
+            true,
+            now - (WEB_SURFACE_MEDIA_MAX_MS - 1),
+            now,
+        ));
+        // ...and one nobody has renewed has lapsed. The surface may have been
+        // destroyed by a session close or replaced by a reload; from here those
+        // are indistinguishable from real playback, which is why the window and
+        // not a guess is the answer.
+        assert!(!web_tab_earns_media_dot(
+            false,
+            true,
+            now - (WEB_SURFACE_MEDIA_MAX_MS + 1),
+            now,
+        ));
+        // A stamp from the future (clock step) must not read as ancient.
+        assert!(web_tab_earns_media_dot(false, true, now + 5_000, now));
+    }
+
+    /// The heartbeat has to be comfortably inside the window it renews, or a
+    /// genuinely playing tab flickers off between beats — the exact false
+    /// negative that teaches the user to ignore the dot.
+    #[test]
+    fn the_media_heartbeat_renews_well_inside_the_window_it_renews() {
+        assert!(
+            WEB_SURFACE_MEDIA_HEARTBEAT_MS * 2 <= WEB_SURFACE_MEDIA_MAX_MS,
+            "a renewal every {WEB_SURFACE_MEDIA_HEARTBEAT_MS}ms cannot keep a \
+             {WEB_SURFACE_MEDIA_MAX_MS}ms claim alive across a slow tick",
+        );
+        // ...and far above the reconcile beat, or a playing tab writes shell
+        // state sixty times a second and repaints the rail with it.
+        assert!(WEB_SURFACE_MEDIA_HEARTBEAT_MS > WEB_SURFACE_RECONCILE_BEAT_MS * 10);
+    }
+
+    /// The media dot is the SAME dot, so it must obey the same two laws the
+    /// loading light does: join the one blink clock, and declare the same style
+    /// keys lit and unlit (Dioxus never clears a key a later render drops, so an
+    /// arm that omitted one would leave a finished tab blinking forever).
+    #[test]
+    fn the_media_dot_joins_the_one_clock_and_keeps_the_key_set_fixed() {
+        let keys = |style: &str| {
+            let mut keys: Vec<String> = style
+                .split(';')
+                .filter_map(|decl| decl.split(':').next())
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+                .collect();
+            keys.sort();
+            keys
+        };
+        let media = web_tab_activity_dot_style(false, true);
+        assert!(
+            media.contains("var(--yggterm-status-dot-blink, 1)"),
+            "the media dot must read the shared phase, never its own: {media}"
+        );
+        assert!(
+            !media.contains("animation:"),
+            "a dot must never own an animation: {media}"
+        );
+        assert!(media.contains("#22c55e"), "a lit dot is the vocabulary's green");
+        assert_eq!(keys(&media), keys(&web_tab_activity_dot_style(false, false)));
+        // Either cause lights it, and a tab that is both loading AND playing is
+        // lit once, not twice.
+        assert_eq!(web_tab_activity_dot_style(true, false), media);
+        assert_eq!(web_tab_activity_dot_style(true, true), media);
+        assert!(web_tab_activity_dot_style(false, false).contains("transparent"));
+    }
+
+    /// A lit dot says WHY when hovered; an unlit one says nothing at all, so the
+    /// rail is not full of rows announcing that they are idle.
+    #[test]
+    fn only_a_lit_activity_dot_carries_a_tooltip() {
+        assert_eq!(web_tab_activity_dot_title(false, false), None);
+        assert_eq!(web_tab_activity_dot_title(true, false), Some("Loading"));
+        assert_eq!(
+            web_tab_activity_dot_title(false, true),
+            Some("Playing media in the background"),
+        );
+        // Loading is the transient of the two, so it is what a row that is both
+        // reports while it lasts.
+        assert_eq!(web_tab_activity_dot_title(true, true), Some("Loading"));
+    }
+
+    /// ⛔⛔ THE DEFECT THAT WOULD BLIND THE WHOLE FEATURE, AND IT FAILS SILENTLY.
+    ///
+    /// The reconciler's page-state poll sits behind `if entry.stashed_at_ms
+    /// .is_none()`, because a stashed surface's URL and title cannot change while
+    /// nothing drives it. Media is the opposite case: a soft-stashed surface IS a
+    /// background tab, which is the only thing this signal was ever asked for.
+    /// Tucked under that guard — the natural place for a new engine poll, right
+    /// beside the three that are already there — the probe would read silence
+    /// from every tab it was built to find, and would do it in the reassuring
+    /// direction: no dot anywhere, nothing visibly broken, a feature that simply
+    /// never fires.
+    ///
+    /// ⚠ Locked on the SOURCE because there is nothing else to lock it on: the
+    /// bug is a line's POSITION, and a probe in the wrong place computes a
+    /// perfectly correct answer to a question about the wrong surface.
+    #[test]
+    fn the_media_probe_runs_outside_the_not_stashed_guard() {
+        let source = SHELL_SOURCE;
+        let product: Vec<&str> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("fn the_media_probe_runs_outside_the_not_stashed_guard")),
+            "the scan is reading this test, so its own needle would satisfy it",
+        );
+        let probe = product
+            .iter()
+            .position(|line| {
+                line.contains("let media_playing = desktop.web_surface_is_playing_audio(")
+            })
+            .expect(
+                "the reconciler no longer probes the engine for media — the tab dot \
+                 is now driven by something that is not the engine's own answer",
+            );
+        let guard = product
+            .iter()
+            .position(|line| line.trim() == "if entry.stashed_at_ms.is_none()")
+            .expect("the not-stashed guard moved; re-read this test before editing it");
+        assert!(
+            probe < guard,
+            "the media probe (line {probe} of the product scan) sits INSIDE the \
+             not-stashed guard (line {guard}) — it will read silent on every \
+             backgrounded tab, which is every tab this indicator exists for",
+        );
     }
     #[test]
     fn codex_completion_notification_only_fires_after_busy_session_becomes_idle() {
@@ -52096,6 +52252,10 @@ mod webtabs_menu_switcher_locks {
 
     fn tab(id: u64, label: &str, folder: Option<&str>, active: bool) -> WebSurfaceOverlayTabView {
         WebSurfaceOverlayTabView {
+            // The rail fixture builds SILENT tabs; the media cases say so
+            // explicitly, so a row that blinks in a layout assertion is a bug
+            // and never a fixture default.
+            media_playing: false,
             id,
             // A user tab always holds a saved page; the app-tab cases that care
             // build the view themselves and say so.

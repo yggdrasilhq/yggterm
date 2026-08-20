@@ -13259,7 +13259,13 @@ fn TerminalCanvas(
                                 let is_app_tab = tab.is_app_tab;
                                 let holds_saved_page = tab.holds_saved_page;
                                 let tab_loading = tab.loading;
-                                let tab_loading_dot = web_tab_loading_dot_style(tab_loading);
+                                // Resolved by the view, not here — the strip and
+                                // the rail must never disagree about which tab
+                                // counts as background.
+                                let tab_media = tab.media_playing;
+                                let tab_activity_dot = web_tab_activity_dot_style(tab_loading, tab_media);
+                                let tab_activity_title =
+                                    web_tab_activity_dot_title(tab_loading, tab_media).unwrap_or_default();
                                 let select_path = web_surface_session_path.clone();
                                 let close_tab_path = web_surface_session_path.clone();
                                 let menu_path = web_surface_session_path.clone();
@@ -13297,7 +13303,9 @@ fn TerminalCanvas(
                                         },
                                         span {
                                             "data-web-tab-loading": if tab_loading { "true" } else { "false" },
-                                            style: "{tab_loading_dot}",
+                                            "data-web-tab-media": if tab_media { "true" } else { "false" },
+                                            title: "{tab_activity_title}",
+                                            style: "{tab_activity_dot}",
                                         }
                                         span {
                                             style: "flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
