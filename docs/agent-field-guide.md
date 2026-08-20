@@ -613,6 +613,32 @@ independently and identically that day; one version stripped tests and comments
 and one did not. Both were green. Only the decoy separated the fix from the
 placebo.
 
+### ⛔⛔ A CHECKER THAT DIES WHEN IT PASSES — the success path is the least-exercised one
+
+**The tell:** a status hook that has run for weeks suddenly ends in a shell error
+instead of a verdict, and the fleet looks broken at exactly the moment it became
+healthy.
+
+The fleet daemon audit crashed with `SPLIT: unbound variable` **the first time
+every host agreed**. Cause: `${#ARRAY[@]}` on a *declared but never assigned*
+associative array is an unbound variable under `set -u`. A host had been split
+on every previous run, so the array was always populated and the clean branch had
+never executed. ⇒ **The path that reports "all good" is the path least likely to
+have been run**, and its failure is the one most likely to be misread as a real
+problem with the thing being checked.
+
+⚠ **And the obvious hardening is wrong, which is the second half of the lesson.**
+`${!ARRAY[*]-}` looks like "keys, with a safe default". It is not: combining `!`
+with a default operator turns *key* expansion into *indirect* expansion, so bash
+takes the array's VALUES as a variable name and dies with
+`1 1: invalid variable name` — on precisely the populated case the branch exists
+to handle. The first fix therefore moved the crash from the empty case to the
+real case, and passed a test that only exercised the empty one.
+
+⭐ **`${!ARRAY[@]}` (keys) is safe on the same empty array where `${#ARRAY[@]}`
+(count) is not.** Measured, not assumed — and the way to know is to test BOTH
+branches, including the one you did not change.
+
 ## 2. Profiling recipes that work
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
