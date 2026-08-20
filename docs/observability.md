@@ -188,6 +188,20 @@ of CPU to answer with about five rows.
 resource priority is memory first. The trace streams are bounded; the discovery index that exists to
 *find* them is not.
 
+### 4.4 `ytrace tail --since` is silently capped by a `--lines` default you did not set
+
+`ytrace tail` computes its limit as `lines.unwrap_or(20)` **before** applying the
+`--since` window, so `ytrace tail --since 1h` returns the **last twenty records**, not an hour of
+them. Nothing warns. The result is well-formed, correctly ordered, correctly filtered by category —
+and describes the last few seconds while claiming to describe an hour.
+
+⚠ This is the worst shape an instrument can take: the flag you set is overridden by a default you
+did not, and the output looks exactly like a correct answer. Every rate, timeline and percentile
+built on it is wrong in the same invisible way, and nothing downstream can detect it.
+
+⇒ **Always pass an explicit `--lines` large enough to cover the window.** `notebooks/` sets
+`TAIL_LINES_DEFAULT = 100_000` for this reason and never calls `tail` without it.
+
 ### 4.4 A probe that is registered but never emitted looks identical to one that is healthy
 
 There is no "declared but silent" report. §2.2 exists because the only way to notice was to diff the

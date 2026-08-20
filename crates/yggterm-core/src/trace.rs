@@ -118,6 +118,10 @@ pub fn append_trace_event(
     let component_s = component.into();
     let category_s = category.into();
     let name_s = name.into();
+    // Attribution hint for the UI-block watchdog — see `ui_block::note_activity`.
+    // The trace path sees far more of the GUI's work than the ytrace path does,
+    // so it is the better witness to what ran just before a stall.
+    crate::ui_block::note_activity(&format!("{category_s}/{name_s}"));
     let record = EventTraceRecord {
         ts_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
