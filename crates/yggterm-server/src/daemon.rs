@@ -19965,6 +19965,105 @@ fn daemon_wpe_agent_control(action: &str) -> ServerResponse {
     }
 }
 
+/// ⛔⛔ A REMOTE START MUST NOT SSH UNDER THE RUNTIME LOCK — the TerminalRead
+/// hoist's law, second instance. Every remote START used to resolve its cwd by
+/// shelling out to the target host from INSIDE the locked handler
+/// (`normalize_remote_attach_cwd`, ssh ConnectTimeout=5), so a burst of remote
+/// creates deafened this daemon for seconds per create and every other
+/// client's reads queued behind it — observed as read-timeout recovery
+/// episodes on the GUI while a batch of rows was being spawned. Resolve here,
+/// BEFORE any lock, and hand the handler an already-resolved cwd (the
+/// in-method resolution is a pass-through now; the remote wrapper's own
+/// walk-up covers any path that arrives unresolved).
+fn hoist_remote_start_cwd(request: ServerRequest) -> ServerRequest {
+    fn resolve(target: &str, prefix: Option<&str>, cwd: Option<String>) -> Option<String> {
+        let ssh_target = crate::canonicalize_ssh_target_alias(target);
+        if ssh_target.is_empty() {
+            return cwd;
+        }
+        let requested = cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        match crate::normalize_remote_attach_cwd(&ssh_target, prefix, requested.as_deref()) {
+            Some(resolved) => Some(resolved),
+            // Resolution failed (unreachable host, empty request): pass the
+            // request through unchanged — the wrapper walks up at attach time.
+            None => cwd,
+        }
+    }
+    match request {
+        ServerRequest::StartRemoteCodexSession {
+            target,
+            prefix,
+            cwd,
+            title_hint,
+            terminal_appearance,
+            insert_after,
+            outline_prefix,
+        } => {
+            let cwd = resolve(&target, prefix.as_deref(), cwd);
+            ServerRequest::StartRemoteCodexSession {
+                target,
+                prefix,
+                cwd,
+                title_hint,
+                terminal_appearance,
+                insert_after,
+                outline_prefix,
+            }
+        }
+        ServerRequest::StartRemoteClaudeSession {
+            target,
+            prefix,
+            cwd,
+            title_hint,
+            terminal_appearance,
+            insert_after,
+            outline_prefix,
+            launch_options,
+        } => {
+            let cwd = resolve(&target, prefix.as_deref(), cwd);
+            ServerRequest::StartRemoteClaudeSession {
+                target,
+                prefix,
+                cwd,
+                title_hint,
+                terminal_appearance,
+                insert_after,
+                outline_prefix,
+                launch_options,
+            }
+        }
+        ServerRequest::StartRemoteAgentSession {
+            session_kind,
+            target,
+            prefix,
+            cwd,
+            title_hint,
+            terminal_appearance,
+            insert_after,
+            outline_prefix,
+            launch_options,
+        } => {
+            let cwd = resolve(&target, prefix.as_deref(), cwd);
+            ServerRequest::StartRemoteAgentSession {
+                session_kind,
+                target,
+                prefix,
+                cwd,
+                title_hint,
+                terminal_appearance,
+                insert_after,
+                outline_prefix,
+                launch_options,
+            }
+        }
+        other => other,
+    }
+}
+
 fn daemon_request_response(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     request: ServerRequest,
@@ -19996,6 +20095,8 @@ fn daemon_request_response(
     if let ServerRequest::RefreshRemoteMachine { machine_key } = request {
         return daemon_queue_remote_machine_refresh(runtime, machine_key, request_name);
     }
+    // Remote-start cwd resolution happens HERE, lock-free — see the fn's doc.
+    let request = hoist_remote_start_cwd(request);
     // ⛔⛔ A PROXIED READ MUST NOT HOLD THE RUNTIME LOCK ACROSS ITS ROUND TRIP.
     //
     // Every request is served under ONE runtime lock, so a handler that performs
