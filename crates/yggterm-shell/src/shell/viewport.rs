@@ -10929,6 +10929,36 @@ fn TerminalCanvas(
                                                 } else {
                                                     data.clone()
                                                 };
+                                                // ytrace input latency, RENDER leg — the third
+                                                // leg of keystroke -> pty -> render.
+                                                //
+                                                // The only other emission of this probe sits inside
+                                                // the remote-resume branch, behind
+                                                // `!terminal_overlay_dismissed()`. That branch is
+                                                // taken for a moment during attach and never again,
+                                                // so in steady state the leg was permanently silent
+                                                // and the echo tail could not be measured at all —
+                                                // the chain wired for exactly that symptom recorded
+                                                // two legs out of three.
+                                                //
+                                                // Gated on input-hot rather than emitted on every
+                                                // write, for two reasons: this is the *input* render
+                                                // leg, so output the user did not cause is not part
+                                                // of the measurement; and the general write path is
+                                                // hot enough that an always-on probe here would
+                                                // dominate the stream it is meant to be read from.
+                                                if terminal_input_hot_until_ms() > current_millis() {
+                                                    yggterm_core::perf::ytrace_emit_event(
+                                                        "shell",
+                                                        "input",
+                                                        "render",
+                                                        json!({
+                                                            "session_path": session_path.clone(),
+                                                            "data_len": data.len(),
+                                                            "is_remote": is_remote_resume_session,
+                                                        }),
+                                                    );
+                                                }
                                                 for write in
                                                     terminal_write_bridge.stage_or_immediate(
                                                         data_to_write,
