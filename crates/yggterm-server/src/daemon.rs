@@ -18611,6 +18611,20 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         home_dir.clone(),
         runtime.clone(),
     );
+    // Host panic heartbeat — the whole-machine verdict the row governor cannot
+    // give, because it watches rows and this question is about the machine they
+    // sit on. Detect and notify only; actuation is an owner decision and is
+    // filed in docs/owner-attention.md. YGGTERM_HOST_PANIC=0 disables.
+    {
+        let panic_home = home_dir.clone();
+        crate::host_panic::spawn_host_panic_watcher(
+            home_dir.clone(),
+            crate::host_panic::local_host_label(),
+            std::sync::Arc::new(move |incident: &ytrace::diagnosis::Incident| {
+                crate::host_panic::notify_owner(&panic_home, incident);
+            }),
+        );
+    }
     match RemoteRuntimeRegistry::open(&home_dir) {
         Ok(registry) => append_trace_event(
             &home_dir,

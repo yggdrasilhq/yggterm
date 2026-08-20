@@ -30,6 +30,18 @@ copies.
 
 ## Decisions only he makes
 
+- **Should the panic heartbeat ACTUATE, or only report?** The detector is live and files a durable
+  `heartbeat/panic` incident plus one addressed notification when the client host crosses the
+  memory/CPU/thermal thresholds, in that priority order. What it deliberately does **not** do is act
+  — throttle the scan cadence, pace the title chore, or park a hot row — because each of those
+  changes behaviour the campaign depends on, and a detector that quietly starts steering is far
+  harder to trust than one that only ever reports. **Recommendation: allow actuation for the scan
+  cadence only**, as a bounded slowdown that reverts on its own when the condition clears, and leave
+  row parking manual. **Done meanwhile:** detection, incident and notification are shipped and
+  running; nothing is throttled. **To reverse:** `YGGTERM_HOST_PANIC=0` disables the whole watcher.
+  Detail: `docs/observability.md` §7.
+  *Meanwhile:* nothing waits on this; the relay reads the incidents in the fleet-heat notebook.
+
 - **Where should the leak gate's own source live?** It is currently tracked in **no repository at
   all** — a loose file in `~/.local/bin`, replicated newest-wins across three hosts, unversioned and
   unreviewed, while being the thing that stops private data reaching public GitHub. A weakening edit
