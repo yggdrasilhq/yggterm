@@ -751,6 +751,12 @@ pub fn run_server_startpage_ls_cli(store: &SessionStore, args: &[String]) -> any
 /// Same durable scan, title-ranked (effective_title presence + recency).
 /// See `docs/spec-cli-integration-verification.md` §3.2.
 pub fn run_server_titles_ls_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    // `ls` REPORTS which titles are bad; `sweep` ACTS on the same answer. They
+    // share a dispatcher because they must share a recognizer — a verb that
+    // reported one set and fixed another would be worse than either alone.
+    if args.get(2).is_some_and(|arg| arg == "sweep") {
+        return crate::titles_sweep::run_server_titles_sweep(store, args);
+    }
     crate::titles_ls::run_server_titles_ls(store, args)
 }
 

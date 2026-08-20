@@ -94,6 +94,7 @@ mod remote_cli;
 mod remote_runtime;
 pub mod startpage_ls;
 pub mod titles_ls;
+pub mod titles_sweep;
 pub mod resume_ls;
 pub mod cwdtree_ls;
 pub mod row_sanity;

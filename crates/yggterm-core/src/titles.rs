@@ -521,6 +521,49 @@ impl SessionTitleStore {
         Ok(())
     }
 
+    /// Every session this store holds generated copy for, with how old that
+    /// copy is in days.
+    ///
+    /// For a PRUNE, and the age is the load-bearing half: a row's copy can be
+    /// written before the CLI's own store file exists (a live row is keyed by
+    /// its runtime uuid until the CLI writes its first transcript), so "no file
+    /// answers to this id" is true of a brand-new session as well as a deleted
+    /// one. Age is what tells those apart.
+    pub fn generated_copy_ages_in_days(&self) -> Result<Vec<(String, i64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, MAX(updated_at) FROM (
+                 SELECT session_id, updated_at FROM session_titles
+                 UNION ALL
+                 SELECT session_id, updated_at FROM session_summaries
+             ) GROUP BY session_id",
+        )?;
+        let now = OffsetDateTime::now_utc();
+        let rows = statement.query_map([], |row| {
+            let session_id: String = row.get(0)?;
+            let updated_at: String = row.get(1)?;
+            Ok((session_id, updated_at))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (session_id, updated_at) = row?;
+            // An unparseable timestamp reads as brand new, never as ancient:
+            // the direction of the guess decides whether a bug DELETES data.
+            let age_days = parse_copy_timestamp(&updated_at)
+                .map(|stamp| (now - stamp).whole_days())
+                .unwrap_or(0);
+            out.push((session_id, age_days));
+        }
+        Ok(out)
+    }
+
+    /// Forget everything this store holds about one session.
+    pub fn delete_generated_copy(&self, session_id: &str) -> Result<()> {
+        self.delete_title(session_id)?;
+        self.delete_summary(session_id)?;
+        self.reset_summary_timeline(session_id)?;
+        Ok(())
+    }
+
     pub fn delete_title(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM session_titles WHERE session_id = ?1",
