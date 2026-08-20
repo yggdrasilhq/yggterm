@@ -173,6 +173,54 @@ transport fault.
 comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
 `notebooks/06-ui-blocks.ipynb`.
 
+## ⛔⛔ [11.5] AN UNPARSEABLE `server-state.json` REFUSES TO START THE DAEMON, AND THE BACKUP THAT WOULD RECOVER IT IS NEVER READ
+
+**Status:** OPEN
+
+*Found 2026-08-20 by breaking it on purpose in a sandbox, then reproducing it
+deliberately. Not a render defect — filed here because the user-visible symptom
+is a dead app with no diagnosis.*
+
+**The shape.** `load_persisted_state` (`daemon.rs`) propagates a parse failure
+with `?`, so ANY unparseable state document stops the daemon before it binds:
+
+```
+Error: parsing daemon state …/server-state.json
+Caused by: EOF while parsing a string at line 1 column 30      # truncated write
+Caused by: missing field `label` at line 1 column 39           # partial document
+```
+
+⛔ **THE DAEMON'S OWN ERROR IS EXCELLENT AND NOBODY EVER SEES IT.** It goes to the
+stderr of a spawned child. What the GUI reports is
+`local yggterm daemon did not become reachable`, and the trace shows only
+`spawned_daemon_exit code:1`. So the operator gets "the app is dead" with no
+cause, no file named, and no remedy — for a fault whose fix is deleting one file.
+
+⭐ **AND THE RECOVERY ALREADY EXISTS ON DISK, UNUSED.** Every persist copies the
+old document to **`server-state.previous.json`**, and the write path was
+deliberately improved so that backup holds the last *different* state rather than
+a copy of the current one (see `write_persisted_state_if_changed`). Nothing ever
+reads it. The daemon carries a good backup of the exact thing it is refusing to
+start without.
+
+**Why the realistic trigger is not operator error.** A truncated document is what
+a mid-write crash, a full disk or a power loss produces, and this file is 2.2 MB
+on the live host and rewritten whenever state changes. It holds the user's
+sessions, so the window is not small.
+
+⚠ **THIS IS A POLICY DECISION, NOT A ONE-LINE FIX, WHICH IS WHY IT IS FILED
+RATHER THAN PATCHED.** Falling back silently would start the daemon with an OLDER
+set of rows than the user last had, which is its own quiet data loss. The shape
+that seems right: fall back to `.previous.json`, keep the corrupt file aside
+rather than overwriting it, and make the substitution LOUD — a trace incident and
+a notification naming both files — so a recovered-but-stale row list can never be
+mistaken for the current one. Whoever takes it should settle that first.
+
+**Falsifier:** if the daemon already recovers from a truncated `server-state.json`
+on some path not found here, this entry is wrong. Reproduce with
+`printf '{"remote_machines":[{"machine_' > $YGGTERM_HOME/server-state.json` in a
+throwaway `YGGTERM_HOME` and start the daemon.
+
 ## ⛔⛔⛔ [11.5→11.3] A SLOW REQUEST HOLDS THE DAEMON'S ONE RUNTIME LOCK, AND `TerminalRead` CAN PROXY TO ANOTHER DAEMON WHILE HOLDING IT
 
 **Status:** OPEN
