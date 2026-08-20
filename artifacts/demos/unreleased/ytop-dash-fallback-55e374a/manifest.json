@@ -1,29 +1,30 @@
 {
   "bundle": "ytop-dash-fallback-55e374a",
   "claim": "Dash fallback to yggterm live_sessions + Last 60s sparkline; Top daemon-cost + ZFS IOSTAT live; viewport heartbeat open-only",
-  "commits": ["55e374a", "017ef16", "f2857e8b"],
+  "commits": [
+    "55e374a",
+    "017ef16",
+    "f2857e8b"
+  ],
   "ygtterm_version": "3.1.0",
   "ytop_version": "55e374a",
-  "host": "***",
+  "host": "the GUI host",
   "gui_pid": 3101138,
   "daemon_pid": 3102070,
   "ytop_pid": 3291587,
   "ytop_control": "http://127.0.0.1:40617",
-  "captures": [
-    "captures/01-ytop-top-manin.png",
-    "captures/02-ytop-dash-54live.png",
-    "captures/03-deeptest-top.png"
-  ],
+  "captures": [],
   "traces": [
     "trace/app-state-yggterm.json",
-    "trace/ytop-pane-topo-***.json",
-    "trace/ytop-pane-rail-***.json",
+    "trace/ytop-pane-topo-gui-host.json",
+    "trace/ytop-pane-rail-gui-host.json",
     "trace/perf-summary.json"
   ],
   "deeptest": {
     "preconditions": "version 3.1.0 parity, single daemon, violations []",
-    "A_session_sweep": "live_sessions 54, app rows 380, opened ytop-verify + 13596c88 + oc/019da16a, all view Terminal violations []",
+    "A_session_sweep": "live_sessions 54, app rows 380, opened ytop-verify + two remote rows, all view Terminal violations []",
     "B_live_mode_cycle": "limit 3 --all-live timeout 20 exit 0 (no output file, script silent) — full --all-live (54) timed out, expected",
     "H_resource": "perf-summary 57 categories, gui p50 41s, ytop durable spark 2 samples"
-  }
+  },
+  "captures_withheld": "Three faithful 1920x1200 grabs were taken and are NOT published: each one photographs a live private desktop (sidebar row titles, cwd tree, home paths, machine inventory). See ../README.md."
 }

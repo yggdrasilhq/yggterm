@@ -10,8 +10,8 @@ Muse Code sessions were installed on all fleet hosts since 2026-08-08 but never 
 - Python oracles `check-titles.py`/`check-startpage.py`/`check-cwdtree.py` synced: added Muse, bumped `head -n 10000`, corrected glyphs `>_, *_, π_, A_, G_, M_`, fixed `codex payload.cwd` recurse and `claude` placement-confirmed `cc_project_dir_encoding`.
 
 ## Verification
-- `yggterm-headless server titles ls --json --limit 10000` → `*** 334 live 37` top `muse d703a4e1`, `7a319776`, `d68614ac`; `*** 714 live 54` top `muse 6ff56abf`.
+- `yggterm-headless server titles ls --json --limit 10000` → headless host `334 live 37` top `muse d703a4e1`, `7a319776`, `d68614ac`; GUI host `714 live 54` top `muse 6ff56abf`.
 - `cwdtree 334 groups 24` / `714 groups 58` with `M_` in `~/gh/yggterm`; `startpage` same durable.
-- Raw `find`+`sqlite3` vs verb: `*** 328 raw vs 334 verb (+4)`, `*** 730 raw vs 714 verb (-16)` – all oracles `OK`.
-- `yggterm server app screenshot --region terminal --scale 2` → `capture_backend xterm_canvas_composite_over_dom` `capture_faithful true` `1920x1200 PNG 371K` (Live Sessions 54 visible).
+- Raw `find`+`sqlite3` vs verb: headless host `328 raw vs 334 verb (+4)`, GUI host `730 raw vs 714 verb (-16)` – all oracles `OK`.
+- `yggterm server app screenshot --region terminal --scale 2` → `capture_backend xterm_canvas_composite_over_dom` `capture_faithful true` `1920x1200 PNG 371K` (Live Sessions 54 visible). ⛔ **The grabs themselves are withheld** — a faithful frame photographs a live private desktop; see [`../README.md`](../README.md).
 - `muse exec "echo hello"` → cwd `~/gh/yggterm` OK; `muse resume --last` help shows `Subcommand("resume")` and `muse resume <uuid>` reports `already in use`.
