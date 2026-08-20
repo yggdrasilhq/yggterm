@@ -17,6 +17,7 @@ fn RightRail(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_open_launch_flags: EventHandler<MouseEvent>,
+    on_open_cli_install: EventHandler<MouseEvent>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -141,6 +142,7 @@ fn RightRail(
                     on_api_key_change,
                     on_model_change,
                     on_open_launch_flags,
+                    on_open_cli_install,
                     on_focus_input,
                     on_blur_input,
                     on_set_ui_theme,
@@ -4512,6 +4514,7 @@ fn SettingsRailBody(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_open_launch_flags: EventHandler<MouseEvent>,
+    on_open_cli_install: EventHandler<MouseEvent>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -4640,6 +4643,11 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 summary: launch_flags_rail_summary(&snapshot.settings.agent_cli_extra_args),
                 on_open: on_open_launch_flags,
+            }
+            CliInstallSettingsSection {
+                palette: snapshot.palette,
+                summary: cli_install_rail_summary(&snapshot.settings.agent_cli_install_consent),
+                on_open: on_open_cli_install,
             }
             ThemeSettingsSection {
                 palette: snapshot.palette,

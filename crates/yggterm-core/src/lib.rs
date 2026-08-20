@@ -10,6 +10,7 @@ mod browser;
 // error. See ychrome/docs/collections.md §Import.
 pub mod browser_import;
 pub mod cli_args;
+pub mod cli_install;
 pub mod click_grid;
 pub mod gl_probe;
 mod icon;
@@ -522,6 +523,18 @@ pub struct AppSettings {
     /// draft doing it.
     #[serde(default)]
     pub agent_cli_extra_args: BTreeMap<String, String>,
+    /// Whether the user has agreed that yggterm may FETCH third-party agent
+    /// CLIs on their behalf — the licence acknowledgement behind the
+    /// CLI-installation modal.
+    ///
+    /// ⛔ Stored as the wire word of [`cli_install::InstallConsent`], and read
+    /// back ONLY through `InstallConsent::from_wire`, which degrades anything it
+    /// does not recognise to `Undecided`. A bare `bool` was rejected here
+    /// because it cannot tell "declined" from "never asked": the first must stop
+    /// the offer re-appearing, the second must show it, and collapsing them
+    /// either nags a user who said no or installs for one who was never asked.
+    #[serde(default)]
+    pub agent_cli_install_consent: String,
     pub default_agent_profile: AgentSessionProfile,
     pub in_app_notifications: bool,
     pub system_notifications: bool,
@@ -592,6 +605,7 @@ impl Default for AppSettings {
             litellm_api_key: String::new(),
             interface_llm_model: String::new(),
             agent_cli_extra_args: default_agent_cli_extra_args(),
+            agent_cli_install_consent: String::new(),
             default_agent_profile: AgentSessionProfile::Codex,
             in_app_notifications: true,
             system_notifications: false,
@@ -1217,6 +1231,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.prefer_ghostty_backend = serde_json::from_value(value.clone())
             .context("failed to parse prefer_ghostty_backend")?;
     }
+    if let Some(value) = object.get("agent_cli_install_consent") {
+        settings.agent_cli_install_consent = serde_json::from_value(value.clone())
+            .context("failed to parse agent_cli_install_consent")?;
+    }
     if let Some(value) = object.get("litellm_endpoint") {
         settings.litellm_endpoint =
             serde_json::from_value(value.clone()).context("failed to parse litellm_endpoint")?;
@@ -1393,6 +1411,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "terminal_dark_theme_name": settings.terminal_dark_theme_name,
         "ui_font_size": settings.ui_font_size,
         "prefer_ghostty_backend": settings.prefer_ghostty_backend,
+        "agent_cli_install_consent": settings.agent_cli_install_consent,
         "litellm_endpoint": settings.litellm_endpoint,
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,

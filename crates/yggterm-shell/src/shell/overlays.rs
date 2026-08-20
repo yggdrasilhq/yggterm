@@ -1863,6 +1863,24 @@ fn launch_flags_rail_summary(stored: &std::collections::BTreeMap<String, String>
     format!("{total} CLIs · {customised} customised")
 }
 
+/// The one-line summary the settings rail shows beside the CLI-install button.
+///
+/// It reports THIS machine only, and says so, because that is the only host the
+/// GUI can probe without reaching over ssh — and a summary that silently
+/// averaged several machines would hide the exact fault this surface exists to
+/// show, where one host carries every CLI and the host beside it carries none.
+fn cli_install_rail_summary(stored_consent: &str) -> String {
+    use yggterm_core::cli_install::{local_machine_status, InstallConsent};
+    let status = local_machine_status("this machine");
+    let total = status.rows.len();
+    let present = status.present_count();
+    match InstallConsent::from_wire(stored_consent) {
+        InstallConsent::Undecided if present < total => format!("{present}/{total} here · not asked"),
+        InstallConsent::Declined => format!("{present}/{total} here · declined"),
+        _ => format!("{present}/{total} on this machine"),
+    }
+}
+
 /// The CLIs that get a ROW in the launch-flags modal, in registry order.
 ///
 /// ⛔ Derived, never hand-listed: `docs/spec-agent-cli-extra-args-modal.md` §1
@@ -1941,6 +1959,329 @@ fn LaunchFlagsSettingsSection(
             div {
                 style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
                 "Flags appended to every new and resumed session of that CLI. Each CLI spells its permission checks differently."
+            }
+        }
+    }
+}
+
+/// The machine list the CLI-installation modal draws, local first.
+///
+/// ⛔ **Only the local machine is PROBED.** The GUI can read its own `PATH`;
+/// every other machine is reachable only over ssh, which is the provisioner's
+/// path and not the renderer's. Remote hosts are therefore reported as
+/// `Unknown`, which the modal renders as "not probed" — an honest blank rather
+/// than an `Absent` that would make the primary button offer installs it cannot
+/// perform against hosts it has not contacted.
+fn cli_install_machines(
+    snapshot: &SharedSnapshot,
+) -> Vec<yggterm_core::cli_install::MachineCliStatus> {
+    use yggterm_core::cli_install::{local_machine_status, CliPresence, MachineCliStatus};
+    let mut machines = vec![local_machine_status("This machine")];
+    machines.extend(snapshot.remote_machines.iter().map(|machine| {
+        MachineCliStatus::build(
+            machine.machine_key.clone(),
+            machine.label.clone(),
+            |_| CliPresence::Unknown,
+        )
+    }));
+    machines
+}
+
+/// The CLI-installation modal: which agent CLIs are on which machine, what is
+/// missing, and the licence acknowledgement that lets yggterm fetch them.
+///
+/// ⚖ **Why the consent banner is part of THIS surface and not a settings
+/// toggle.** yggterm installs other people's programs — some by package
+/// manager, one by piping a vendor's install script. The acknowledgement has to
+/// sit where the user can see WHAT would be installed and WHERE, or it is
+/// consent to an abstraction. Everything below the banner is that "what and
+/// where", which is why the banner cannot be lifted out into a checkbox.
+#[component]
+fn CliInstallOverlay(
+    palette: Palette,
+    theme: UiTheme,
+    machines: Vec<yggterm_core::cli_install::MachineCliStatus>,
+    consent: yggterm_core::cli_install::InstallConsent,
+    pending: bool,
+    on_grant: EventHandler<MouseEvent>,
+    on_decline: EventHandler<MouseEvent>,
+    on_install_all: EventHandler<MouseEvent>,
+    on_close: EventHandler<MouseEvent>,
+) -> Element {
+    use yggterm_core::cli_install::{plan_install_count, recommended_plans, ArrivalPlan, CliPresence};
+
+    let overlay_wash = match theme {
+        UiTheme::ZedLight => "rgba(228,237,245,0.03)",
+        UiTheme::ZedDark => "rgba(10,14,18,0.05)",
+    };
+    let editor_surface = match theme {
+        UiTheme::ZedLight => "rgb(248,252,255)",
+        UiTheme::ZedDark => "rgb(28,34,41)",
+    };
+    let editor_shadow = match theme {
+        UiTheme::ZedLight => {
+            "0 0 0 1px rgba(215,229,243,0.96), 0 0 0 10px rgba(129,188,255,0.18), 0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92)"
+        }
+        UiTheme::ZedDark => {
+            "0 0 0 1px rgba(59,87,112,0.90), 0 0 0 10px rgba(124,200,255,0.16), 0 26px 60px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(68,84,99,0.94)"
+        }
+    };
+    let plans = recommended_plans(&machines, consent);
+    let pending_count = plan_install_count(&plans);
+    // Counted independently of consent: the user must be able to SEE how much
+    // work there is before deciding whether to authorise it. Gating this number
+    // on consent would show "0 missing" to exactly the person being asked.
+    let actionable_total: usize = machines
+        .iter()
+        .map(|machine| machine.installable().count())
+        .sum();
+
+    rsx! {
+        div {
+            "data-cli-install-overlay": "1",
+            "data-yggterm-modal-root": "cli-install",
+            style: format!(
+                "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:{};",
+                overlay_wash
+            ),
+            onmousedown: move |evt| on_close.call(evt),
+            onclick: move |evt| on_close.call(evt),
+            div {
+                "data-cli-install-shell": "1",
+                style: format!(
+                    "width:min(720px, calc(100vw - 44px)); max-height:calc(100vh - 56px); overflow:auto; \
+                     display:flex; flex-direction:column; gap:12px; padding:16px; \
+                     border-radius:22px; background:{}; color:{}; box-shadow:{}; font-family:{};",
+                    editor_surface,
+                    palette.text,
+                    editor_shadow,
+                    interface_font_family()
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
+                    div {
+                        style: "display:flex; flex-direction:column; gap:3px;",
+                        div {
+                            style: format!("font-size:15px; font-weight:800; letter-spacing:-0.01em; color:{};", palette.text),
+                            "Agent CLI installation"
+                        }
+                        div {
+                            style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                            "Every machine yggterm can reach should carry every agent CLI, so a session opens wherever you click. Pick what you want where."
+                        }
+                    }
+                    button {
+                        "data-cli-install-close": "1",
+                        style: format!(
+                            "border:none; background:transparent; color:{}; font-size:16px; font-weight:700; cursor:pointer;",
+                            palette.muted
+                        ),
+                        onclick: move |evt| on_close.call(evt),
+                        "✕"
+                    }
+                }
+
+                if consent.should_offer() {
+                    div {
+                        "data-cli-install-consent": "1",
+                        style: format!(
+                            "display:flex; flex-direction:column; gap:8px; padding:12px; border-radius:14px; \
+                             background:{}; box-shadow: inset 0 0 0 1px {};",
+                            if palette_is_dark(palette) { "rgba(28,36,45,0.86)" } else { "rgba(248,250,252,0.94)" },
+                            if palette_is_dark(palette) { "rgba(120,146,168,0.42)" } else { "rgba(206,217,228,0.9)" }
+                        ),
+                        div {
+                            style: format!("font-size:12px; font-weight:800; color:{};", palette.text),
+                            "These are third-party programs"
+                        }
+                        div {
+                            style: format!("font-size:11px; line-height:1.5; color:{};", palette.muted),
+                            "Each agent CLI is published by its own vendor under its own licence and terms, separate from yggterm. \
+                             Installing one here fetches it from that vendor — by package manager, or by running the vendor's own \
+                             install script — into your user account on the machine you choose. yggterm does not redistribute them \
+                             and grants you no rights to them. Nothing is fetched until you agree."
+                        }
+                        div {
+                            style: "display:flex; gap:8px; align-items:center;",
+                            button {
+                                "data-cli-install-grant": "1",
+                                style: format!(
+                                    "border:none; border-radius:10px; height:30px; padding:0 14px; font-size:12px; \
+                                     font-weight:800; cursor:pointer; background:{}; color:#fff;",
+                                    palette.accent
+                                ),
+                                onclick: move |evt| on_grant.call(evt),
+                                "I agree — yggterm may install them"
+                            }
+                            button {
+                                "data-cli-install-decline": "1",
+                                style: format!(
+                                    "border:none; border-radius:10px; height:30px; padding:0 14px; font-size:12px; \
+                                     font-weight:700; cursor:pointer; background:transparent; color:{}; \
+                                     box-shadow: inset 0 0 0 1px {};",
+                                    palette.muted,
+                                    if palette_is_dark(palette) { "rgba(120,146,168,0.42)" } else { "rgba(206,217,228,0.9)" }
+                                ),
+                                onclick: move |evt| on_decline.call(evt),
+                                "Not now"
+                            }
+                        }
+                    }
+                }
+
+                if consent == yggterm_core::cli_install::InstallConsent::Declined {
+                    div {
+                        "data-cli-install-declined": "1",
+                        style: format!("font-size:11px; line-height:1.5; color:{};", palette.muted),
+                        "You chose not to let yggterm install these. The diagnosis below still works — install anything you want by hand, or change your mind with the button at the bottom."
+                    }
+                }
+
+                for machine in machines.iter() {
+                    div {
+                        key: "{machine.machine_key}",
+                        "data-cli-install-machine": "{machine.machine_key}",
+                        style: format!(
+                            "display:flex; flex-direction:column; gap:6px; padding:10px 12px; border-radius:14px; \
+                             box-shadow: inset 0 0 0 1px {};",
+                            if palette_is_dark(palette) { "rgba(93,116,134,0.4)" } else { "rgba(214,224,234,0.9)" }
+                        ),
+                        div {
+                            style: "display:flex; align-items:baseline; justify-content:space-between; gap:8px;",
+                            div {
+                                style: format!("font-size:12px; font-weight:800; color:{};", palette.text),
+                                "{machine.display_label}"
+                            }
+                            div {
+                                style: format!("font-size:10px; font-weight:700; color:{};", palette.muted),
+                                "{machine.summary()}"
+                            }
+                        }
+                        div {
+                            style: "display:flex; flex-wrap:wrap; gap:6px;",
+                            for row in machine.rows.iter() {
+                                div {
+                                    key: "{row.slug}",
+                                    "data-cli-install-row": "{row.slug}",
+                                    "data-cli-install-presence": match &row.presence {
+                                        CliPresence::Present { .. } => "present",
+                                        CliPresence::Absent => "absent",
+                                        CliPresence::UnsupportedHere => "unsupported",
+                                        CliPresence::Unknown => "unknown",
+                                    },
+                                    style: format!(
+                                        "display:flex; align-items:center; gap:6px; padding:4px 9px; border-radius:9px; \
+                                         font-size:11px; font-weight:700; background:{}; color:{};",
+                                        if row.presence.is_present() {
+                                            if palette_is_dark(palette) { "rgba(16,72,52,0.55)" } else { "rgba(222,246,235,0.95)" }
+                                        } else if palette_is_dark(palette) {
+                                            "rgba(38,30,20,0.62)"
+                                        } else {
+                                            "rgba(253,243,224,0.95)"
+                                        },
+                                        palette.text
+                                    ),
+                                    span { "{row.display_name}" }
+                                    span {
+                                        style: format!("font-size:10px; font-weight:700; color:{};", palette.muted),
+                                        match (&row.presence, row.arrival) {
+                                            (CliPresence::Present { version: Some(v) }, _) => v.clone(),
+                                            (CliPresence::Present { version: None }, _) => "installed".to_string(),
+                                            (CliPresence::UnsupportedHere, _) => "not on this platform".to_string(),
+                                            (CliPresence::Unknown, _) => "not probed".to_string(),
+                                            (CliPresence::Absent, ArrivalPlan::Unattended) => "missing".to_string(),
+                                            (CliPresence::Absent, ArrivalPlan::NeedsHuman) => "install by hand".to_string(),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div {
+                    style: "display:flex; align-items:center; justify-content:space-between; gap:10px; padding-top:2px;",
+                    div {
+                        style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                        if actionable_total == 0 {
+                            "Nothing to install on the machines yggterm has probed."
+                        } else {
+                            "Recommended: install every CLI on every machine, so a session opens wherever you click."
+                        }
+                    }
+                    button {
+                        "data-cli-install-run": "1",
+                        disabled: pending || pending_count == 0,
+                        style: format!(
+                            "border:none; border-radius:10px; height:32px; padding:0 14px; font-size:12px; font-weight:800; \
+                             cursor:{}; background:{}; color:#fff; opacity:{};",
+                            if pending || pending_count == 0 { "default" } else { "pointer" },
+                            palette.accent,
+                            if pending || pending_count == 0 { "0.5" } else { "1" }
+                        ),
+                        onclick: move |evt| on_install_all.call(evt),
+                        if pending {
+                            "Installing…"
+                        } else if pending_count == 0 {
+                            "Install all recommended"
+                        } else {
+                            "Install all recommended ({pending_count})"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CliInstallSettingsSection(
+    palette: Palette,
+    summary: String,
+    on_open: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px;",
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                    "Agent CLI installation"
+                }
+                span {
+                    style: format!("font-size:10px; font-weight:700; color:{};", palette.muted),
+                    "{summary}"
+                }
+            }
+            button {
+                "data-cli-install-open-button": "1",
+                style: format!(
+                    "display:flex; align-items:center; justify-content:space-between; height:34px; padding:0 12px; \
+                     border:none; border-radius:11px; background:{}; color:{}; \
+                     box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700;",
+                    if palette_is_dark(palette) {
+                        "rgba(21,28,35,0.94)"
+                    } else {
+                        "rgba(255,255,255,0.86)"
+                    },
+                    palette.text,
+                    if palette_is_dark(palette) {
+                        "rgba(93,116,134,0.56)"
+                    } else {
+                        "rgba(208,219,229,0.85)"
+                    }
+                ),
+                onclick: move |evt| on_open.call(evt),
+                span { "Diagnose" }
+                span { style: format!("color:{};", palette.muted), "↗" }
+            }
+            div {
+                style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                "Which agent CLIs are on which machine, and what is missing. These are third-party programs under their own licences — yggterm fetches them only after you say so."
             }
         }
     }

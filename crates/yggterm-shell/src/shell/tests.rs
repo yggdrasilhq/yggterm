@@ -10023,50 +10023,100 @@ mod tests {
         );
     }
 
+    /// The CLI-installation modal is a first-class member of the precedence
+    /// list, not a special case bolted beside it.
+    #[test]
+    fn the_cli_install_modal_owns_the_keys_when_it_is_the_only_one_up() {
+        assert_eq!(
+            top_modal_of(false, false, false, true, false, false, false, false, false, false),
+            Some(TopModal::CliInstall)
+        );
+        assert_eq!(TopModal::CliInstall.kind(), "cli-install");
+        assert_eq!(TopModal::CliInstall.scope_label(), "CLI Install");
+    }
+
+    /// Two Settings-raised modals can be flagged at once (the rail can open
+    /// either). The order must be DECIDED rather than incidental, or Enter lands
+    /// in whichever one the struct happened to list first.
+    #[test]
+    fn launch_flags_outranks_cli_install_when_both_are_flagged() {
+        assert_eq!(
+            top_modal_of(false, false, true, true, false, false, false, false, false, false),
+            Some(TopModal::LaunchFlags),
+            "the deeper modal keeps the keys until it is dismissed"
+        );
+    }
+
+    /// The owner asked for the install button to sit AFTER the launch-flags
+    /// button in the settings rail. Locked against the source because the two
+    /// are adjacent siblings in one `rsx!` block: a later edit that inserts a
+    /// section between them, or reorders them, changes the thing that was asked
+    /// for while every behavioural test still passes.
+    #[test]
+    fn the_cli_install_button_follows_the_launch_flags_button_in_the_settings_rail() {
+        let source = include_str!("right_rail.rs");
+        let flags = source
+            .find("LaunchFlagsSettingsSection {")
+            .expect("the launch-flags section is mounted in the rail");
+        let install = source
+            .find("CliInstallSettingsSection {")
+            .expect("the CLI-install section is mounted in the rail");
+        assert!(
+            flags < install,
+            "the install button must follow the flags button, as asked"
+        );
+        let between = &source[flags..install];
+        assert_eq!(
+            between.matches("SettingsSection {").count(),
+            1,
+            "nothing may be inserted between the two buttons: {between}"
+        );
+    }
+
     // ONE precedence list decides both "is a modal up" and "who gets the Enter".
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false),
+            top_modal_of(false, false, false, false, false, false, false, false, false, false),
             None
         );
         // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false, false, false, false, false),
+            top_modal_of(true, false, false, false, false, false, false, false, false, false),
             Some(TopModal::KeymapEditor)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false, false, false, false, false),
+            top_modal_of(false, true, false, false, false, false, false, false, false, false),
             Some(TopModal::ThemeEditor)
         );
         assert_eq!(
-            top_modal_of(false, false, false, true, false, false, false, false, false),
+            top_modal_of(false, false, false, false, true, false, false, false, false, false),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, false, false, false),
+            top_modal_of(false, false, false, false, false, true, false, false, false, false),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, false, false, false),
+            top_modal_of(false, false, false, false, false, false, true, false, false, false),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, false, false),
+            top_modal_of(false, false, false, false, false, false, false, true, false, false),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true, false),
+            top_modal_of(false, false, false, false, false, false, false, false, true, false),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true),
+            top_modal_of(false, false, false, false, false, false, false, false, false, true),
             Some(TopModal::StripDropdown)
         );
         // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
         // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, true, true, true, true, true, true),
+            top_modal_of(true, true, true, false, true, true, true, true, true, true),
             Some(TopModal::KeymapEditor)
         );
         // ⛔ A capture prompt outranks every dialog below the two editors. Both
@@ -10075,21 +10125,21 @@ mod tests {
         // keyboard reaches, or Escape would dismiss the wrong dialog and leave
         // the engine blocked on this one.
         assert_eq!(
-            top_modal_of(false, false, false, true, true, true, true, true, true),
+            top_modal_of(false, false, false, false, true, true, true, true, true, true),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, true, true, true, true),
+            top_modal_of(false, false, false, false, false, true, true, true, true, true),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, true, true, true),
+            top_modal_of(false, false, false, false, false, false, true, true, true, true),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true, true),
+            top_modal_of(false, false, false, false, false, false, false, false, true, true),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -41712,6 +41762,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -42637,6 +42688,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -42839,6 +42891,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -43041,6 +43094,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -43246,6 +43300,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -43455,6 +43510,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -43656,6 +43712,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -43857,6 +43914,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -44098,6 +44156,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -44302,6 +44361,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -44544,6 +44604,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -45065,6 +45126,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_value: String::new(),
             theme_editor_open: false,
             launch_flags_open: false,
+            cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
