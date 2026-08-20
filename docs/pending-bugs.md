@@ -103,6 +103,33 @@ gate-screen working/idle heuristics) must learn the agents-hint signature (dim c
 `← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
 typed-residue detector must require the footer's absence before claiming residue.
 
+## ⛔⛔ [11.0] A REMOTE CC SPAWN'S --model NEVER REACHES THE PROCESS — AND THREE LAYERS HIDE IT
+
+**Status:** OPEN
+
+Measured end-to-end 2026-08-20 with every component on the same current build (client, GUI-host
+daemon, and target-host daemon all 3.1.9): `server app terminal new --kind claude-code
+--machine-key <target> --model <id>` starts the remote row with `YGGTERM_CC_EXTRA_ARGS`
+carrying only the configured args — the requested model is absent from the export, the wrapper
+command, and the process cmdline (verified in the claude process's /proc environ). A direct
+daemon-socket request with `launch_options` set reproduces it with the GUI fully bypassed, and
+a unit round-trip of those exact bytes through `ClientRequestEnvelope` deserializes the model
+intact — so the drop is at runtime between the daemon's `StartRemoteClaudeSession` handler and
+`remote_agent_start_exports`, in code whose source reads correct. Not yet pinned; next
+instrument is a trace event inside `claude_extra_args_remote_exports_with_launch` logging the
+launch it actually received.
+
+**Three layers hide it:** (1) the snapshot post-processor re-derives remote rows'
+`launch_command` from configured args alone, so the stored command cannot be told from the
+composed one; (2) `launch.applied` is computed against that re-derived command, so it reports
+`false` truthfully but for an unverifiable reason; (3) on fleets whose configured default IS
+the requested model, the row lands on the right tier anyway and the drop is invisible — which
+is exactly this fleet today, and why it survives. It bites whenever requested ≠ default (the
+dossier campaign's spawner has carried a `/model`-at-turn-zero workaround for precisely this).
+**Falsifier for the fix:** the claude process env on the target host carries the requested
+model in `YGGTERM_CC_EXTRA_ARGS`, and `launch.applied` is computed against the command the
+create composed, not a re-derivation.
+
 ## ⛔⛔ [11.5] SESSION SWITCHES PAINT GHOST FRAMES AND FULL-CANVAS GLYPH SOUP — EVIDENCE FILED, MECHANISM UNPROVEN
 
 **Status:** OPEN
