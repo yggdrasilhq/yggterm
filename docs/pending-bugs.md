@@ -369,6 +369,42 @@ empty screen. **Falsifier:** run two same-day adoptions, then read every listed 
 screen through the newest daemon — every answer is either content or a named refusal;
 no `chars=0` on a streaming row; no colorless mount.
 
+**ROOT CAUSES MEASURED 2026-08-20 ~23:0x (the blockade dissected live).** The "map loss"
+decomposed into four distinct defects, each proven from the trace or `/proc`:
+
+1. **FIXED IN CODE (3.1.14, deploy pending) — a lock-race loser unlinked the winner's
+   handoff listener.** The pty-handoff listener bound (unconditionally unlinking the
+   socket path) BEFORE the server-socket lock was checked; a starter that lost the lock
+   exited leaving the path pointing at its own dead socket. Trace fingerprint, four
+   instances ~15 s apart: `pty_handoff_listener_bound` then `bind_lock_busy` 1 ms later.
+   The retiring predecessor (21 preserved PTYs — the four lanes AND the owner's seats)
+   then dialed the corpse every 60 s for an hour: `superseded_self_retire_sweep →
+   NoneMoved: Connection refused (before the commit point — the fd stayed)`. The commit
+   point held: nothing was lost, only unreachable.
+2. **OPEN — the retire swap lane latches shut and discovery goes blind, so a predecessor
+   in this state NEVER converges without outside help.** `HOT_RESTART_SWAP_LANE_SETTLED`
+   is a process-local one-way latch: once the swap lane converged once, every later
+   `hot_restart_swap_step` returns `Lingering` forever. Beside it, the same process's
+   `live_newer_daemon_version` answered `null` while a fresh process running the same
+   probe against the same socket succeeded — the retiring daemon could not see the live
+   successor it needed. The superseded sweep (its designed second chance, deliberately
+   un-`break`-able) is gated on that same blind discovery, so both exits were closed at
+   once. Suspect: process-held state keyed by the successor socket path (the corpse it
+   kept failing against); unproven. A VERSION BUMP routes around it — a new version means
+   a fresh socket path with no poisoned state — which is why the 3.1.14 roll converges
+   what the 3.1.13 restart could not.
+3. **OPEN — a live daemon's server socket FILE was unlinked while it served.** 3.1.12's
+   daemon still answers on its bound inode (status replies visible in its trace) but
+   `~/.yggterm/server-3-1-12.sock` is gone from disk, so no new client can ever reach it,
+   and `--endpoint` fails with "no socket at path". Suspect the same loser-start storm or
+   the stale-socket sweep misclassifying a busy daemon; unattributed. A daemon that can
+   serve but cannot be dialed is invisible to every instrument except `/proc` and `ss`.
+4. **OPEN — `scripts/deploy-dev.sh` restarts daemons with a verb that does not exist.**
+   Its convergence step runs `server stack restart --force`; the 3.1.13 binary answers
+   `unsupported server command: stack`, and the script swallows it with `|| warn`. Every
+   deploy that relied on it left daemons unconverged — plausibly the parent of today's
+   generation pile-up.
+
 ## ⛔⛔ [11.0] A REMOTE CC SPAWN'S --model NEVER REACHES THE PROCESS — AND THREE LAYERS HIDE IT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
