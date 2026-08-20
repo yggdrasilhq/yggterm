@@ -318,6 +318,17 @@ removing user activity would not remove most of these renders.
 of 0.1/s), and the viewport repaints only for its own session's bytes. Read `Sidebar`'s
 `renders` against `root_renders` in `component_window` — with the hoist live they must separate.
 
+**FIRST POST-FIX WINDOW, 2026-08-20 ~21:33–22:05 (commit `2d834fd6`):** root renders
+**0.35/s** (from 1.57/s), **Sidebar 39 of 330** root renders (from 232 of 234 — the hoist
+delivers), remaining causes are real content work (`background_copy_scan_*`,
+`summary_generation_start`, live-session snapshots). NOT met yet: the target is ~0.1/s, and
+**55% of root renders are now unattributed forced wakes** (~12/min, absolute rate unchanged
+from before the fixes) — with the write-driven renders gone, the amplification IS the
+majority and is the next slice: coalesce the signal-less wakes (eval resolutions, future
+completions) instead of rendering per wake. `MainSurface` still renders on every root pass
+(direct `state` subscription), though its own body is cheap (~0.4 ms mean); the `app` root
+pass carries the cost (~26 ms mean).
+
 ## ⛔⛔⛔ [11.0→6.1] AN ADOPTION CHAIN LOSES THE PRESERVED-OWNER TABLE, AND EVERY OLD-GENERATION ROW MOUNTS AS A GHOST
 
 **Status:** OPEN
@@ -840,6 +851,14 @@ transport fault.
 **Falsifier:** with the named work moved off the UI thread, a 30-minute window on the GUI host under
 comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
 `notebooks/06-ui-blocks.ipynb`.
+
+**FIRST FALSIFIER WINDOW, 2026-08-20 ~21:33–22:05, GUI commit `2d834fd6` (all five 11.12
+slices): ZERO `ui/block` incidents in 32.2 minutes**, zero `input/loop_block` over the 120 ms
+floor, under live fleet streaming (copy scans, summary generation, session snapshots all
+running). Same-day baselines on older builds: 53 blocks/h at cruise, 4–6/min at saturation.
+⚠ Not signed off: the window held **no human keystrokes** (the echo-chain tail needs his next
+natural typing session — do not manufacture samples) and evening load; the entry closes on a
+clean TYPED window under comparable daytime load.
 
 ## ⛔⛔⛔ [11.5] THE INPUT CHAIN PROVES DELIVERY TO THE PTY, NEVER CONSUMPTION BY THE PROGRAM — AND THAT IS THE GAP "I CANNOT TYPE" FALLS THROUGH
 
