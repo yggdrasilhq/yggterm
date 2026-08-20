@@ -450,6 +450,12 @@ in 8570 chars — the bytes arrive as a near-empty non-screen, matching this ent
 read. The render half was chasing a consequence: nothing downstream can paint colour it never
 received. The [11.5] residual that stays render-side: an empty/absent seed must REFUSE loudly
 instead of painting plain fallback that impersonates a session.
+**INSTANCE 2026-08-21 ~00:0x, owner-reported:** during the 3.1.15 fleet adoption on the GUI
+host, the owner's WATCHED row (the 11.0 orchestrator, process alive and untouched through
+the swap) rendered a fully BLANK viewport for minutes — metadata read running/idle, client
+and daemon both already 3.1.15, daemon uptime 47 s in his screenshot — and only a manual GUI
+restart recovered the paint. Third forced GUI restart of the night; the adoption path still
+mounts a client on an empty seed instead of re-requesting or refusing loudly.
 **Fix direction:** the handover must carry the predecessor's preserved-owner map into the
 successor (transitively — generation N+2 must still reach N's PTYs), and a read that finds
 no runtime AND no owner for a key the row table lists must answer a typed refusal, never an
