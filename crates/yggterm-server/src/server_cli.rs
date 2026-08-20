@@ -462,8 +462,23 @@ fn print_wpe_failure(verb: &str, outcome: &crate::wpe_agent::WpeOutcome) -> anyh
 /// The trailing session identifier of a session path (`.../<uuid>` → `<uuid>`),
 /// used to match a requested path against the daemon's canonical key regardless
 /// of scheme/prefix normalization.
-fn connect_path_session_uuid(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// The session id a connect path names.
+///
+/// ⛔ The last path SEGMENT is the fallback, not the answer. For a CLI STORE
+/// path it is the FILENAME, and Muse names every session file `session.jsonl`
+/// (`sessions/YYYY/MM/DD/<session-id>/session.jsonl`) — so every Muse session
+/// answered the same string, and rows opened from the store collapsed onto one
+/// identity. Claude Code hid it because its filename really is its id.
+///
+/// The owning CLI's own reader knows where its identity lives; ask it first.
+fn connect_path_session_uuid(path: &str) -> String {
+    if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_for_store_session_file(path)
+        && let Some(entry) = (descriptor.read_store_entry)(std::path::Path::new(path))
+        && !entry.session_id.trim().is_empty()
+    {
+        return entry.session_id.trim().to_string();
+    }
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// Parse a remote-SCANNED Codex path (`remote-session://<machine>/<uuid>`) into
@@ -645,7 +660,7 @@ fn run_server_connect_apply(
                     endpoint,
                     connect_session_kind_for_path(path),
                     path,
-                    Some(connect_path_session_uuid(path)),
+                    Some(connect_path_session_uuid(path).as_str()),
                     cwd.as_deref(),
                     title.as_deref(),
                     Some(view),
@@ -699,7 +714,7 @@ fn run_server_connect_apply(
 /// but are NOT currently in the live set — the connectable "void", newest first.
 fn run_server_connect_list_apply(endpoint: &crate::ServerEndpoint) -> anyhow::Result<()> {
     let (snapshot, _) = crate::snapshot(endpoint)?;
-    let live_uuids: Vec<&str> = snapshot
+    let live_uuids: Vec<String> = snapshot
         .live_sessions
         .iter()
         .map(|session| connect_path_session_uuid(&session.session_path))
