@@ -775,26 +775,72 @@ pub struct AgentCliDescriptor {
     /// authoritatively", and only a CLI that answers yes may have a resume
     /// re-routed on its say-so.
     pub store_membership_index: Option<fn(&Path, &str) -> Option<bool>>,
-    /// The file a RUNNING session of this CLI keeps open inside its OWN session
-    /// directory, when that directory's name is the session id.
+    /// How a RUNNING session of this CLI can be recognised from the files its
+    /// process holds open — the route that binds a live row to the id the CLI
+    /// actually minted, for a CLI that mints its own
+    /// (`id_assigned_at_birth:false`).
     ///
-    /// This is what lets a live row be bound to the id the CLI actually minted,
-    /// for a CLI that mints its own (`id_assigned_at_birth:false`). Codex's
-    /// equivalent is its open rollout file, but codex writes its id INSIDE the
-    /// file, so it reads identity rather than naming it — hence a separate hook
-    /// rather than a shared one.
+    /// ⚠ MEASURED per CLI, never guessed, because the obvious file is the wrong
+    /// one in both observed cases (2026-08-20):
+    /// * a live Muse process holds `cron.db` open for SEVERAL session
+    ///   directories at once and `.session.lock` only for the one it is running;
+    /// * a live Antigravity process holds the SHARED conversation index open
+    ///   from launch, and names its own conversation only once a turn has
+    ///   happened, through `presence/<id>.lock`.
+    /// Picking "some open file under the store" would be a coin flip in the
+    /// first case and useless in the second.
     ///
-    /// ⚠ MEASURED, not guessed. Muse's live process holds `cron.db` open for
-    /// SEVERAL session directories at once (2026-08-20) — including ones it is
-    /// merely carrying forward — and only `.session.lock` for the session it is
-    /// actually running. Picking the wrong open file here is precisely the
-    /// mis-attribution that repointed a live Claude Code row at a foreign
-    /// transcript, so the marker has to be the one file that means "this is MY
-    /// session", not merely "I have this file open".
-    ///
-    /// `None` ⇒ this CLI is not identified this way, and the fd route is not
-    /// attempted for it.
-    pub live_session_dir_marker: Option<&'static str>,
+    /// `None` ⇒ this CLI is not identified this way and the route is not tried.
+    pub live_session_marker: Option<LiveSessionMarker>,
+}
+
+/// How a live session of a CLI is recognised from a path its process holds open.
+///
+/// Two shapes, because the two CLIs that need this spell identity differently:
+/// one names the session's DIRECTORY, the other names the FILE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSessionMarker {
+    /// `<home>/<root>/…/<session-id>/<file_name>` — the id names the directory
+    /// the marker sits in (Muse).
+    EnclosingDirectory {
+        root: &'static str,
+        file_name: &'static str,
+    },
+    /// `<home>/<root>/<session-id>.<extension>` — the id is the marker's own
+    /// file stem (Antigravity).
+    FileStem {
+        root: &'static str,
+        extension: &'static str,
+    },
+}
+
+impl LiveSessionMarker {
+    /// The directory, under `home`, that a marker of this shape must live below.
+    /// Declared rather than derived from the store globs: Antigravity's presence
+    /// locks sit beside its store, not inside it.
+    pub fn root_absolute(&self, home: &Path) -> PathBuf {
+        match self {
+            Self::EnclosingDirectory { root, .. } | Self::FileStem { root, .. } => home.join(root),
+        }
+    }
+
+    /// The session id `path` names, if it is a marker of this shape.
+    pub fn session_id_of(&self, path: &Path) -> Option<String> {
+        match self {
+            Self::EnclosingDirectory { file_name, .. } => {
+                if path.file_name()? != *file_name {
+                    return None;
+                }
+                Some(path.parent()?.file_name()?.to_str()?.to_string())
+            }
+            Self::FileStem { extension, .. } => {
+                if path.extension()? != *extension {
+                    return None;
+                }
+                Some(path.file_stem()?.to_str()?.to_string())
+            }
+        }
+    }
 }
 
 /// The longest a store title may be before it stops being a title and starts
@@ -1417,7 +1463,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: Some(crate::ENV_YGGTERM_CODEX_HOME),
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
@@ -1523,7 +1569,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::ClaudeCode,
@@ -1654,7 +1700,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         read_store_entry: read_claude_code_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
     // ── The 2026-08-08 intake. Every field below was read off the CLI's own
     // source or its installed binary on this date, never from memory; the
@@ -1772,7 +1818,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_pi_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::OpenCode,
@@ -1861,7 +1907,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::QwenCode,
@@ -1981,7 +2027,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_qwen_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
@@ -2100,7 +2146,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -2235,7 +2281,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_muse_store_entry,
         store_membership_index: Some(muse_store_index_holds_session),
-        live_session_dir_marker: Some(".session.lock"),
+        live_session_marker: Some(LiveSessionMarker::EnclosingDirectory {
+            root: ".local/share/muse/sessions",
+            file_name: ".session.lock",
+        }),
     },
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
@@ -2402,10 +2451,15 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_antigravity_store_entry,
         store_membership_index: Some(antigravity_store_index_holds_session),
-        // Antigravity keeps no per-conversation file open: its live process holds
-        // only the shared `conversation_summaries.db` (measured 2026-08-20), so
-        // there is nothing under a session directory to recognise.
-        live_session_dir_marker: None,
+        // Measured 2026-08-20: at LAUNCH an agy process holds only the shared
+        // index, so a fresh row has nothing to bind to — its conversation does
+        // not exist yet. Once a turn has happened it holds
+        // `presence/<conversation-id>.lock`, and the id is the file's own stem
+        // rather than a directory name.
+        live_session_marker: Some(LiveSessionMarker::FileStem {
+            root: ".gemini/antigravity-cli/presence",
+            extension: "lock",
+        }),
     },
     // ── The 2026-08-13 intake. Every field below was read off the installed
     // binary (`@xai-official/grok` 1.0.3 `1a29d5bc12`, provisioned into the
@@ -2600,7 +2654,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_grok_build_store_entry,
         store_membership_index: None,
-        live_session_dir_marker: None,
+        live_session_marker: None,
     },
 ];
 
@@ -3243,18 +3297,49 @@ fn muse_store_index_holds_session(home: &Path, session_id: &str) -> Option<bool>
     stmt.exists(rusqlite::params![session_id]).ok()
 }
 
-/// Does Antigravity's conversation index hold `session_id`?
+/// Does Antigravity hold `session_id`?
 ///
-/// Antigravity's store IS this database — a conversation has no file of its own
-/// until it has been written to — so this is the only question that can be
-/// asked about a fresh id.
+/// ⛔ NOT via `conversation_summaries.db`, which is the obvious answer and the
+/// WRONG one. Measured 2026-08-20: a conversation created by the CLI gets a
+/// `brain/<id>/` directory and a `conversations/<id>.db` immediately, and is
+/// STILL ABSENT from `conversation_summaries.db` afterwards — yet
+/// `agy --conversation <id>` resumes it without complaint. Asking the summaries
+/// table would therefore report a live, resumable conversation as missing, and a
+/// caller acting on that would re-birth over it.
+///
+/// The per-conversation artefacts are the authority, and they are a path check
+/// rather than a query: the file NAME is the id, exactly as Claude Code's is.
+/// The summaries table is kept only as an additional yes, never as a no.
 fn antigravity_store_index_holds_session(home: &Path, session_id: &str) -> Option<bool> {
-    let conn =
-        open_cli_index_readonly(&home.join(".gemini/antigravity-cli/conversation_summaries.db"))?;
-    let mut stmt = conn
-        .prepare("SELECT 1 FROM conversation_summaries WHERE conversation_id = ?1;")
-        .ok()?;
-    stmt.exists(rusqlite::params![session_id]).ok()
+    // A session id is used to build a path here, so anything that could escape
+    // the directory is refused rather than sanitized.
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+    {
+        return None;
+    }
+    let root = home.join(".gemini/antigravity-cli");
+    if !root.exists() {
+        // Antigravity has never run here, so this host cannot testify at all.
+        return None;
+    }
+    if root.join("conversations").join(format!("{session_id}.db")).exists()
+        || root.join("brain").join(session_id).exists()
+    {
+        return Some(true);
+    }
+    if let Some(conn) = open_cli_index_readonly(&root.join("conversation_summaries.db")) {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT 1 FROM conversation_summaries WHERE conversation_id = ?1;")
+        {
+            if stmt.exists(rusqlite::params![session_id]) == Ok(true) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
 fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
