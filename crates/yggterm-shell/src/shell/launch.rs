@@ -2689,6 +2689,74 @@ fn app() -> Element {
         state.with_mut_counted(|shell| shell.cancel_tree_rename());
         sync_active_terminal_input_policy(state);
     });
+    // ── MainSurface handlers, hoisted for the same reason as the Sidebar's
+    // above: an inline closure prop is a fresh box per render and its ptr_eq
+    // compare can never pass, so MainSurface's props never memoized.
+    let main_on_expand_preview = use_callback(move |_: ()| {
+        spawn_surface_snapshot_action(
+            state,
+            "expanding preview".to_string(),
+            YggRequestMeta::interactive(
+                format!("preview-expand-{}", current_millis()),
+                "expand_preview",
+                YggSurface::Preview,
+                YggTarget::ActiveSession,
+            ),
+            false,
+            |endpoint| set_all_preview_blocks_folded(&endpoint, false),
+        )
+    });
+    let main_on_collapse_preview = use_callback(move |_: ()| {
+        spawn_surface_snapshot_action(
+            state,
+            "collapsing preview".to_string(),
+            YggRequestMeta::interactive(
+                format!("preview-collapse-{}", current_millis()),
+                "collapse_preview",
+                YggSurface::Preview,
+                YggTarget::ActiveSession,
+            ),
+            false,
+            |endpoint| set_all_preview_blocks_folded(&endpoint, true),
+        )
+    });
+    let main_on_toggle_preview_block = use_callback(move |ix: usize| {
+        state.with_mut_counted(|shell| {
+            shell.server.toggle_preview_block(ix);
+        });
+        spawn_surface_snapshot_action(
+            state,
+            format!("toggling preview block {}", ix + 1),
+            YggRequestMeta::interactive(
+                format!("preview-toggle-{}-{}", ix, current_millis()),
+                "toggle_preview_block",
+                YggSurface::Preview,
+                YggTarget::ActiveSession,
+            ),
+            false,
+            move |endpoint| daemon_toggle_preview_block(&endpoint, ix),
+        )
+    });
+    let main_on_set_preview_layout = use_callback(move |mode: PreviewLayoutMode| {
+        state.with_mut_counted(|shell| shell.set_preview_layout(mode))
+    });
+    let main_on_save_document = use_callback(move |(path, input): (String, WorkspaceDocumentInput)| {
+        queue_document_save(state, path, input, AfterSaveAction::SaveOnly)
+    });
+    let main_on_run_recipe_document = use_callback(
+        move |(path, input, run_new_session): (String, WorkspaceDocumentInput, bool)| {
+            queue_document_save(
+                state,
+                path,
+                input,
+                if run_new_session {
+                    AfterSaveAction::RunNewSession
+                } else {
+                    AfterSaveAction::RunHere
+                },
+            )
+        },
+    );
     // A native child webview paints above ALL DOM. An auto-hidden titlebar is
     // `position:absolute` OVER the content — and a web surface would swallow
     // that whole: the titlebar (app menu, the ychrome/incognito identity, the
@@ -4037,63 +4105,12 @@ fn app() -> Element {
                         MainSurface {
                             state,
                             snapshot: main_snapshot,
-                            on_expand_preview: move || spawn_surface_snapshot_action(
-                            state,
-                            "expanding preview".to_string(),
-                            YggRequestMeta::interactive(
-                                format!("preview-expand-{}", current_millis()),
-                                "expand_preview",
-                                YggSurface::Preview,
-                                YggTarget::ActiveSession,
-                            ),
-                            false,
-                            |endpoint| set_all_preview_blocks_folded(&endpoint, false),
-                        ),
-                        on_collapse_preview: move || spawn_surface_snapshot_action(
-                            state,
-                            "collapsing preview".to_string(),
-                            YggRequestMeta::interactive(
-                                format!("preview-collapse-{}", current_millis()),
-                                "collapse_preview",
-                                YggSurface::Preview,
-                                YggTarget::ActiveSession,
-                            ),
-                            false,
-                            |endpoint| set_all_preview_blocks_folded(&endpoint, true),
-                        ),
-                        on_toggle_preview_block: move |ix: usize| {
-                            state.with_mut_counted(|shell| {
-                                shell.server.toggle_preview_block(ix);
-                            });
-                            spawn_surface_snapshot_action(
-                                state,
-                                format!("toggling preview block {}", ix + 1),
-                                YggRequestMeta::interactive(
-                                    format!("preview-toggle-{}-{}", ix, current_millis()),
-                                    "toggle_preview_block",
-                                    YggSurface::Preview,
-                                    YggTarget::ActiveSession,
-                                ),
-                                false,
-                                move |endpoint| daemon_toggle_preview_block(&endpoint, ix),
-                            )
-                        },
-                        on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut_counted(|shell| shell.set_preview_layout(mode)),
-                        on_save_document: move |(path, input): (String, WorkspaceDocumentInput)| {
-                            queue_document_save(state, path, input, AfterSaveAction::SaveOnly)
-                        },
-                            on_run_recipe_document: move |(path, input, run_new_session): (String, WorkspaceDocumentInput, bool)| {
-                            queue_document_save(
-                                state,
-                                path,
-                                input,
-                                if run_new_session {
-                                    AfterSaveAction::RunNewSession
-                                } else {
-                                    AfterSaveAction::RunHere
-                                },
-                            )
-                            },
+                            on_expand_preview: main_on_expand_preview,
+                            on_collapse_preview: main_on_collapse_preview,
+                            on_toggle_preview_block: main_on_toggle_preview_block,
+                            on_set_preview_layout: main_on_set_preview_layout,
+                            on_save_document: main_on_save_document,
+                            on_run_recipe_document: main_on_run_recipe_document,
                         }
                     }
                     if !chrome_hidden {

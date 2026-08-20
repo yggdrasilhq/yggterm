@@ -4171,6 +4171,48 @@ mod tests {
         );
     }
 
+    // MainSurface's twin: its 330-of-330 root renders had TWO causes, and both
+    // must stay dead. (1) a `state.read()` in the render body subscribed it to
+    // the whole ShellState signal — the busy indicator now rides the snapshot
+    // prop instead; (2) six inline handler props defeated its memoization the
+    // same way Sidebar's did.
+    #[test]
+    fn the_main_surface_neither_subscribes_nor_takes_inline_handlers() {
+        let viewport = include_str!("viewport.rs");
+        let body_start = viewport
+            .find("fn MainSurface(")
+            .expect("MainSurface must exist");
+        let body_end = viewport[body_start..]
+            .find("fn SessionHeaderCopy(")
+            .expect("the component after MainSurface moved — re-anchor this scan");
+        let body = &viewport[body_start..body_start + body_end];
+        assert!(
+            !body.contains("state.read()"),
+            "a reactive state read is back in MainSurface's body — one line is \
+             enough to subscribe it to every ShellState write again. Read from \
+             the snapshot prop, or peek."
+        );
+
+        let source = SHELL_SOURCE;
+        let call_at = source
+            .find("MainSurface {\n                            state,")
+            .expect("the MainSurface call site moved — re-anchor this scan");
+        let call_end = source[call_at..]
+            .find("on_run_recipe_document:")
+            .expect("MainSurface's last handler prop is gone");
+        let call = &source[call_at..call_at + call_end];
+        assert!(
+            !call.contains("move |") && !call.contains("move ||"),
+            "an inline closure is back in the MainSurface call site — its props \
+             can never compare equal again. Hoist it into a use_callback beside \
+             main_on_expand_preview."
+        );
+        assert!(
+            source.contains("let main_on_expand_preview = use_callback("),
+            "the hoisted MainSurface callbacks are gone from app()"
+        );
+    }
+
     // The epoch cache's two obligations, and the property that makes it sound.
     // `snapshot_shared` may serve a cached merge ONLY while nothing wrote to
     // `ShellState`; its key is `SHELLSTATE_MUT_TOTAL`, which every write path
@@ -41618,6 +41660,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -42544,6 +42587,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -42747,6 +42791,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -42950,6 +42995,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -43156,6 +43202,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -43366,6 +43413,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -43568,6 +43616,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -43770,6 +43819,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -44012,6 +44062,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -44217,6 +44268,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -44460,6 +44512,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
@@ -44982,6 +45035,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
         let session_path = "local://test";
         let snapshot = RenderSnapshot {
+            preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
