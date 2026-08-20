@@ -69,10 +69,17 @@ impl BrowserRow {
             || self.full_path.starts_with("ssh://")
     }
 
-    /// Whether this row is a resumable startpage candidate (first-class agent or terminal recipe).
+    /// Whether this row is a resumable startpage candidate — a first-class
+    /// agent session, the same universe `server startpage ls` counts.
     pub fn is_start_page_candidate(&self) -> bool {
+        // A workspace document — a terminal recipe included — is not RECENT
+        // WORK. Recipes stay reachable from the sidebar tree; counting one on
+        // the start page made the page header disagree with `server startpage
+        // ls`'s `durable_count` by exactly the number of recipes, forever, and
+        // the page's universe must be the same one the verbs count: durable
+        // agent sessions.
         if self.kind == BrowserRowKind::Document {
-            return self.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe);
+            return false;
         }
         self.is_agent_session()
     }
@@ -849,6 +856,50 @@ mod tests {
         // A real directory still expands — the exclusion is stores, not
         // dotfiles.
         assert!(selected_path_should_expand_ancestors("/home/user/gh/yggterm"));
+    }
+
+    /// The start page's RECENT WORK universe is durable agent sessions — the
+    /// same universe `server startpage ls` reports as `durable_count`. A
+    /// workspace document (terminal recipe included) rendering and counting on
+    /// that list put the page header one ahead of the verb per recipe, which
+    /// is a permanent, unexplainable disagreement between two surfaces that
+    /// claim one source of truth. Recipes remain reachable in the sidebar tree.
+    #[test]
+    fn a_workspace_document_is_not_a_start_page_candidate() {
+        let recipe = super::BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "/home/user/recipes/build-shell".to_string(),
+            label: "build shell recipe".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(crate::WorkspaceDocumentKind::TerminalRecipe),
+            group_kind: None,
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
+        };
+        assert!(!recipe.is_start_page_candidate());
+        let agent = super::BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "remote-cc://buildbox/cafef00d-beef-4ace-8bad-c0ffeecafe01".to_string(),
+            label: "fix login race".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 2,
+            host_label: "buildbox".to_string(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("cafef00d-beef-4ace-8bad-c0ffeecafe01".to_string()),
+            session_cwd: Some("/home/user/proj".to_string()),
+            session_kind: Some(SessionKind::ClaudeCode),
+        };
+        assert!(agent.is_start_page_candidate());
     }
 
     #[test]

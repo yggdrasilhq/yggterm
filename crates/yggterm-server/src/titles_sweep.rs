@@ -145,7 +145,7 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
 
     let started_at = Instant::now();
     let home = store.home_dir().to_path_buf();
-    let system_home = dirs::home_dir().unwrap_or_else(|| home.clone());
+    let system_home = yggterm_core::startpage::agent_store_home(&home);
     let mut settings = store.load_settings().unwrap_or_default();
     if let Some(model) = model_override {
         settings.interface_llm_model = model;

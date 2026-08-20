@@ -1830,7 +1830,16 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     // Previously this was a hand-rolled per-CLI fan-out that drifted from startpage's walk;
     // now both surfaces call scan_all_durable_sessions so a CLI added to AGENT_CLIS automatically
     // appears in the cwd tree without a second encoding.
-    let durable = crate::startpage::scan_all_durable_sessions(home);
+    //
+    // ⛔ The scan walks the AGENT STORE home (`~/.codex`, `~/.claude`, …), which
+    // `home` here is not — `home` is the yggterm home, where PerfGuard and the
+    // workspace store live. The 2026-08-17 unification passed `home` straight
+    // through, so the tree scanned `~/.yggterm/.codex/...`, found nothing, and
+    // every local durable session without a live row silently left the sidebar
+    // and the start page. `agent_store_home` is the one resolver of that
+    // distinction; the `ls` verbs read the same one.
+    let durable =
+        crate::startpage::scan_all_durable_sessions(&crate::startpage::agent_store_home(home));
     let sessions: Vec<LocalAgentSessionSummary> = durable
         .into_iter()
         .map(|row| LocalAgentSessionSummary {
@@ -4237,6 +4246,38 @@ mod tests {
         assert!(
             body.contains("perf.annotate("),
             "the guard still has to carry the scan counts"
+        );
+    }
+
+    /// The `home` this builder receives is the YGGTERM home (`~/.yggterm`) —
+    /// where PerfGuard and the workspace store live — while the durable scan
+    /// walks the AGENT STORE home (`~/.codex`, `~/.claude`, …). Passing `home`
+    /// straight to the scan (2026-08-17 → 2026-08-20) walked a tree where no
+    /// CLI store exists, so the scan returned zero rows and every local
+    /// durable session without a live row vanished from the sidebar and the
+    /// start page — while `server startpage ls`, resolving the store home
+    /// correctly, still counted them. A four-row gap between the GUI header
+    /// and the verb was the visible symptom.
+    ///
+    /// Source-level, like the perf lock above and for the same reason: a
+    /// behavioural test cannot drive this builder hermetically because the
+    /// store home resolves through the process-global `dirs::home_dir()`.
+    #[test]
+    fn the_local_tree_scan_walks_the_agent_store_home_not_the_yggterm_home() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("fn build_local_cwd_tree(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("build_local_cwd_tree should be present");
+        assert!(
+            body.contains("scan_all_durable_sessions(&crate::startpage::agent_store_home(home))"),
+            "the durable scan must be given the agent-store home via the ONE resolver; \
+             passing the yggterm home scans ~/.yggterm/.codex/... and finds nothing"
+        );
+        assert!(
+            !body.contains("scan_all_durable_sessions(home)"),
+            "the yggterm home must never reach the durable scan directly"
         );
     }
 }
