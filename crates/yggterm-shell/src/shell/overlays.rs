@@ -1279,6 +1279,15 @@ fn ThemeEditorOverlay(
     let brightness_percent = (snapshot.theme_editor_draft.brightness * 100.0).round() as i32;
     let accent = snapshot.theme_accent.clone();
     let preview_has_stops = !snapshot.theme_editor_draft.colors.is_empty();
+    // The stop positions the pad hit-tests a press against. Snapshotted here
+    // rather than read from the DOM, so the grab and the paint are answering
+    // from the same values in the same render.
+    let pad_stop_positions: Vec<(f32, f32)> = snapshot
+        .theme_editor_draft
+        .colors
+        .iter()
+        .map(|stop| (stop.x, stop.y))
+        .collect();
     let overlay_wash = match snapshot.settings.theme {
         UiTheme::ZedLight => "rgba(228,237,245,0.03)",
         UiTheme::ZedDark => "rgba(10,14,18,0.05)",
@@ -1401,6 +1410,22 @@ fn ThemeEditorOverlay(
                             // and a stop could only ever be eyeballed onto it.
                             // Holding Alt suspends the magnetism for the placement
                             // that genuinely wants to sit between two lines.
+                            onmousedown: move |evt| {
+                                // The handles are inert, so the grab is resolved HERE, in the pad's
+                                // own coordinates — the space every other pointer handler on this
+                                // element already speaks. A press within a handle's radius grabs
+                                // that stop; anywhere else is a press on bare pad and starts
+                                // nothing, exactly as before.
+                                let point = evt.element_coordinates();
+                                if let Some(index) = theme_editor_stop_at(
+                                    &pad_stop_positions,
+                                    point.x,
+                                    point.y,
+                                ) {
+                                    on_pick_stop.call(index);
+                                    on_begin_drag_stop.call(index);
+                                }
+                            },
                             onmousemove: move |evt| {
                                 let point = evt.element_coordinates();
                                 let snapping = !evt.modifiers().contains(Modifiers::ALT);
@@ -1456,7 +1481,7 @@ fn ThemeEditorOverlay(
                                     // as on one just dragged.
                                     style: format!(
                                         "position:absolute; left:calc({:.2}% - 11px); top:calc({:.2}% - 11px); width:22px; height:22px; \
-                                         border-radius:999px; border:{}; background:{}; box-shadow:{};",
+                                         border-radius:999px; border:{}; background:{}; box-shadow:{}; pointer-events:{};",
                                         stop.x * 100.0,
                                         stop.y * 100.0,
                                         if snapshot.theme_editor_selected_stop == Some(index) {
@@ -1474,13 +1499,28 @@ fn ThemeEditorOverlay(
                                             )
                                         } else {
                                             "0 10px 22px rgba(42,67,88,0.16)".to_string()
-                                        }
+                                        },
+                                        // ⛔⛔ A HANDLE IS NEVER A HIT-TEST TARGET. THE PAD OWNS THE
+                                        // POINTER, AND IT IS THE ONLY THING THAT MAY.
+                                        // The pad's pointer handlers read `element_coordinates()` =
+                                        // `offsetX/offsetY`, which is relative to the event's TARGET
+                                        // rather than to the element the handler is attached to. Let a
+                                        // 22px handle be a target and the coordinate space silently
+                                        // changes meaning whenever the cursor is over one: measured
+                                        // mid-drag, a single continuous gesture reported x = 60, 73,
+                                        // then -2, 11 (over a handle), then 110, 123 — so the stop
+                                        // being dragged teleports toward the pad's origin and back.
+                                        //
+                                        // Gating this on "a drag is in flight" fixes all of it except
+                                        // the FIRST frame, because the mousedown that begins the drag
+                                        // lands on the handle and the gate cannot apply until the next
+                                        // render — leaving a one-frame teleport at the start of every
+                                        // drag, which is the same bug at 16ms. So the handles are
+                                        // inert ALWAYS and the pad begins the drag itself, by
+                                        // hit-testing its own coordinates. One owner for "where is the
+                                        // pointer on the pad", and no event that could disagree.
+                                        "none"
                                     ),
-                                    onmousedown: move |evt| {
-                                        evt.stop_propagation();
-                                        on_begin_drag_stop.call(index);
-                                    },
-                                    onclick: move |_| on_pick_stop.call(index),
                                 }
                             }
                         }
@@ -1761,6 +1801,28 @@ fn snap_theme_editor_axis_px(value: f64, snapping: bool) -> f64 {
         }
     }
     best
+}
+/// The radius, in pad pixels, within which a press grabs a stop. It is the
+/// handle's own half-width, so the target the pointer can hit is exactly the
+/// circle the eye sees — no invisible margin, and no dead ring inside the dot.
+const THEME_EDITOR_HANDLE_GRAB_PX: f64 = 11.0;
+/// Which stop a press at these PAD coordinates grabs, if any.
+///
+/// Topmost wins, matching what the eye expects of overlapping dots: the handles
+/// paint in index order, so the LAST one drawn is the one on top, and it is the
+/// one a press must take. Iterating forwards would hand the press to whichever
+/// stop happens to be underneath.
+fn theme_editor_stop_at(positions: &[(f32, f32)], x: f64, y: f64) -> Option<usize> {
+    positions
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (sx, sy))| {
+            let dx = f64::from(*sx) * THEME_EDITOR_PAD_SIZE - x;
+            let dy = f64::from(*sy) * THEME_EDITOR_PAD_SIZE - y;
+            dx * dx + dy * dy <= THEME_EDITOR_HANDLE_GRAB_PX * THEME_EDITOR_HANDLE_GRAB_PX
+        })
+        .map(|(index, _)| index)
 }
 /// The snap halo's colour: the theme accent at low alpha.
 ///
