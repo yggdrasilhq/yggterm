@@ -2290,44 +2290,107 @@ def _pty_type_and_enter(host, row):
         log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — could not read its screen, "
             f"so it cannot be ruled out that a prompt is waiting. Blind is not clear.")
         return "refused-screen-unreadable"
+    # ⭐ RESIDUE SELF-HEAL, BEFORE ANY WRITE — measured 2026-08-20 12:12–12:23:
+    # an abort leaves the typed boot text unsent, the next tick typed a SECOND
+    # copy, and the copy's own prefix then read as "a foreign draft". The
+    # machinery was compounding its own residue on a row the owner was viewing.
+    # ⇒ If the composer ALREADY shows the boot head: never type again. Complete
+    # with a lone Enter when the residue is the boot text alone; otherwise
+    # capture whatever else is there to the durable draft store and refuse.
+    head = BOOT_TEXT[:27]                       # "continue, the booter booted"
+    pre = _plain_screen(_screen_text(host, row) or "")
+    pidx = pre.rfind(head)
+    if pidx >= 0:
+        pprefix = pre[max(0, pidx - 60):pidx].rstrip()
+        if pprefix.endswith(("❯", ">")):
+            log(f"⭐ RESIDUE SELF-HEAL {row.rsplit('/', 1)[-1][:8]} — an earlier "
+                f"abort left the boot text typed and unsent; completing it with "
+                f"a lone Enter instead of typing a second copy.")
+            enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
+            return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
+        _capture_draft(row, pre, head)
+        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — composer holds boot-text "
+            f"residue PLUS other content; captured to the draft store, typing nothing.")
+        return "refused-draft-race"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
                         "--refuse-if-draft"], BOOT_TEXT)
     if _field(typed.stdout or "", "refused_for_draft") is True:
+        _capture_draft(row, pre, head)
         return "refused-draft"
     if _field(typed.stdout or "", "accepted") is not True:
         return ""
-    time.sleep(0.08)
     # ⛔⛔ VERIFY BEFORE ENTER — the Enter used to be UNGUARDED, and the owner
     # paid for it 2026-08-20: his half-typed sentence raced into the gap
-    # between the two writes (the daemon's draft flag had nothing to see at
-    # text-write time because his keystrokes were still in flight through a
-    # lagging input pipeline), and the lone `\r` submitted HIS SENTENCE with
+    # between the two writes, and the lone `\r` submitted HIS SENTENCE with
     # the boot text spliced into the middle. `--refuse-if-draft` cannot guard
-    # the Enter — by now the boot text itself IS the draft. So read the screen
-    # back and press Enter ONLY if the composer holds the boot text alone:
-    # the prompt marker, and nothing foreign, must be what precedes it.
-    # ⚠ The residual window is one write round-trip. The atomic form of this
+    # the Enter — by now the boot text itself IS the draft. Press Enter ONLY
+    # if the composer holds the boot text alone.
+    # ⭐ WITH PATIENCE: three of four live aborts were "not visible on screen"
+    # — the verify read racing a LAGGING ECHO (the ui/block disease itself), on
+    # a screen that would have shown the text a second later. Poll up to ~6 s
+    # before concluding; only a FOREIGN PREFIX aborts immediately.
+    # ⚠ The residual race window is one write round-trip. The atomic form
     # ("submit iff the input line equals X") needs a daemon-side verb —
     # requested via pending-bugs; this check is the best a caller can do.
-    plain = _plain_screen(_screen_text(host, row) or "")
-    head = BOOT_TEXT[:27]                       # "continue, the booter booted"
-    idx = plain.rfind(head)
-    prefix = plain[max(0, idx - 60):idx].rstrip() if idx >= 0 else ""
-    if idx < 0 or not prefix.endswith(("❯", ">")):
+    verdict = None                              # "clean" | "foreign" | None=not seen
+    for attempt in range(4):
+        time.sleep(0.4 if attempt == 0 else 1.8)
+        plain = _plain_screen(_screen_text(host, row) or "")
+        idx = plain.rfind(head)
+        if idx >= 0:
+            prefix = plain[max(0, idx - 60):idx].rstrip()
+            verdict = "clean" if prefix.endswith(("❯", ">")) else "foreign"
+            if verdict == "foreign":
+                break
+            # clean on a late read is trustworthy; no need to re-poll
+            break
+    if verdict != "clean":
+        why = ("a foreign draft precedes it" if verdict == "foreign"
+               else "boot text never appeared on screen after 6 s")
+        if verdict == "foreign":
+            _capture_draft(row, plain, head)
         log(f"⛔ ABORTING BOOT of {row.rsplit('/', 1)[-1][:8]} between write and "
-            f"Enter — the composer does not hold the boot text alone "
-            f"({'boot text not visible on screen' if idx < 0 else 'a foreign draft precedes it'}). "
-            f"Enter NOT sent; boot-text residue is left in the composer.")
+            f"Enter — {why}. Enter NOT sent; residue self-heals next tick.")
         target = resolve(host, row)
         nargs = ["server", "app", "notify", "booter: aborted mid-boot",
-                 "a draft raced the booter; the composer holds boot-text residue "
-                 "to clean up — nothing was submitted", "--tone", "warning"]
+                 "a draft raced the booter; your typed text is captured in "
+                 "~/.yggterm/relay/drafts/ and nothing was submitted", "--tone", "warning"]
         if target:
             nargs += ["--session", target]
         ygg(host, *nargs)
         return "refused-draft-race"
     enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
     return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
+
+
+def _capture_draft(row, plain_screen, boot_head):
+    """Owner design 2026-08-20: a draft the booter meets is NEVER lost — store it
+    durably so the boot (or a handover) can re-deliver it. 'If I type something
+    the booter should store it … and in a handover my prompt must be handed to
+    the next spawnee too. So there is no data loss.'
+
+    Best-effort extraction: the text after the LAST prompt marker, minus any
+    boot-text copies. Empty extractions are not written. The consumer is the
+    relay protocol (fleet SKILL §8): a successor's spawner checks
+    ~/.yggterm/relay/drafts/<uuid>.txt and re-types it into the fresh composer."""
+    try:
+        uuid = row.rsplit("/", 1)[-1]
+        seg = plain_screen
+        m = max(seg.rfind("❯"), seg.rfind("> "))
+        if m >= 0:
+            seg = seg[m + 1:]
+        for chunk in (BOOT_TEXT, boot_head):
+            seg = seg.replace(_plain_screen(chunk), " ").replace(chunk, " ")
+        seg = re.sub(r"\s+", " ", seg).strip()
+        if not seg:
+            return
+        d = os.path.join(STATE, "drafts")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{uuid}.txt"), "a") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} captured by the booter\n{seg}\n")
+        log(f"  ⭐ draft captured for {uuid[:8]} → relay/drafts/{uuid}.txt ({len(seg)} chars)")
+    except Exception as e:
+        log(f"  ⚠ draft capture failed for {row}: {e} — refusing the boot is unchanged")
 
 
 def escalate(host, row, why):

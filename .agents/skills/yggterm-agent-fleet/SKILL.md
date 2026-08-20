@@ -1339,7 +1339,20 @@ handoff is a cycle, not an ending:
    later.
 5. **Spawn the successor, then die.** Hand it (a) your row path to kill, (b) the
    subset you finished, (c) the next load-bearing subset, (d) anything parked
-   for the human. Then it kills you.
+   for the human, (e) ⛔ **YOUR OWN MODEL — a successor runs the SAME model as
+   its predecessor** (owner directive 2026-08-20: *"when you spawn a new version
+   of yourself you should use the same model"*; most fleet sessions are Opus,
+   but some seats are deliberately Fable and a relay must not silently demote or
+   promote one). ⚠ `terminal new --model` is silently DROPPED from the launch
+   (pending-bugs [11.2], measured 8/8) — verify the model on the successor's
+   PROCESS/header and repair with `/model <id>` before delivering the brief.
+   And (f) ⛔ **ANY UNSENT OWNER DRAFT — a handover must lose no typed text**
+   (owner design 2026-08-20: *"my prompt must be handed over to the next
+   spawnee too, so there is no data loss"*). Check `~/.yggterm/relay/drafts/
+   <your-uuid>.txt` (the booter's capture store) AND your own composer; hand
+   the text to the spawnee by re-typing it into the fresh composer (text only,
+   NO Enter) or inlining it in the brief marked OWNER-DRAFT-PRESERVED.
+   Then it kills you.
 6. **Repeat until the campaign is finished.**
 
 ### ⛔⛔ IN RELAY MODE, STOPPING IS A SIN — DECIDE, RECORD, CONTINUE (recorded 2026-08-10)
