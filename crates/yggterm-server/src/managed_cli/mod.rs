@@ -3623,7 +3623,18 @@ fn install_one_npm_cli(
         fs::create_dir_all(&staged)
             .with_context(|| format!("creating staged prefix {}", staged.display()))?;
 
-        run_npm_install(paths, npm, &staged, package, background)?;
+        // ⛔ REAP THE HALF-WRITTEN GENERATION ON FAILURE TOO, not only when the
+        //    install "succeeded" without producing a binary. `?` here would
+        //    return leaving the partial tree on disk; the next pass reaps it
+        //    (it recomputes the SAME generation number, because nothing was
+        //    published), so this is tidiness rather than correctness — but the
+        //    size of what is left is set by WHERE the install died, and a
+        //    network drop mid-download leaves far more than the 1 MB a registry
+        //    resolution error does.
+        if let Err(error) = run_npm_install(paths, npm, &staged, package, background) {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(error);
+        }
 
         // ⛔ VERIFY BEFORE PUBLISHING. npm exits 0 having installed a package
         //    whose `bin` never materialised — a broken CLI that reports success
