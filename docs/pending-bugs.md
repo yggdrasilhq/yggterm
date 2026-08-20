@@ -199,6 +199,26 @@ the supervisor to respawn on clean child exit), honouring the active-viewport co
 until the viewer is idle, bounded). **Falsifier:** swap the binary, run the verb, and the new
 pid runs the new image with the supervisor alive and every row intact.
 
+## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
+
+**Status:** OPEN (owner-reported live 2026-08-21 ~00:1x as "INPUT BLOCK ON 13.0")
+
+A seat raised an interactive question picker (the standing owner-question shape) and sat on
+it 27 minutes. Every surface misdescribed the state: `gate-screen` answered
+`screen_text_shows_agent_working: true` (busy dot, "working" — on a row doing nothing but
+waiting for its owner), and the picker consumes only navigation keys, so the owner's typed
+sentences produced nothing visible — experienced as total input block on exactly the row
+that was asking for him. The write transport was healthy; the block was interactional.
+
+**Wanted:** (1) a third classifier state `awaiting_user_choice` beside working/idle/
+limit_wait, on the dot, Status, and gate-screen; (2) the GUI names the mode when a picker is
+up ("this session is asking a question — arrows/Enter to answer, Esc to cancel") instead of
+accepting text into a void; (3) a seat raising an owner question notifies like a done-edge,
+not sits silent under a busy dot.
+
+**Falsifier:** raise a picker — the dot and Status read neither working nor idle, typed
+text is refused with the mode named, and a notification fires.
+
 ## ⚠ [11.0] A WEBVIEW THAT STOPS ACKING EDIT BATCHES IS DEAD INPUT WEARING A LIVE WINDOW
 
 **Status:** OPEN (incident evidence; owner-reported as "input blocked — trauma")
