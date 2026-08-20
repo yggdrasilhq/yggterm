@@ -1062,6 +1062,15 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         // sessions (the "blinking long after done" bug). The optimistic input
         // hint above stays: it is direct user intent, capped at
         // TERMINAL_BUSY_HINT_MS.
+        // ⛔ BEFORE the working arm, not after: a row holding an owner question
+        // is mid-turn, so `working` is TRUE and the dot would report ordinary
+        // work on a session that is stopped and waiting for the human. The dot
+        // stays lit — something IS pending — but with its own reason, so every
+        // reader of this state can tell "the machine is busy" from "the machine
+        // is waiting on you and eating what you type".
+        if session.awaiting_user_choice {
+            return SidebarBusyState::busy("awaiting_user_choice");
+        }
         if session.working == Some(true) {
             return SidebarBusyState::busy("agent_working_daemon");
         }

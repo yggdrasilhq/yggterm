@@ -840,6 +840,23 @@ impl WebviewInstance {
 
             // If we're waiting for a render, wait for it to finish before we continue
             let edits_flushed_poll = self.edits.wry_queue.poll_edits_flushed(&mut cx);
+            // ⛔ THE LAST RUNG OF THE EDIT-PLANE RECOVERY LADDER, and the only
+            // one this module can act on: the queue can see that the webview
+            // has acknowledged nothing at all for the whole streak, but it does
+            // not hold the handle to the surface that has stopped listening.
+            //
+            // A reload is a full remount — `handle_initialize_msg` rebuilds the
+            // VirtualDom against the fresh page — so it is expensive and it is
+            // NOT reached by a merely slow webview: a single acknowledgement,
+            // however late, resets the streak (see `edit_flush_recovery`). By
+            // the time this fires the page has been rendering into a void for
+            // at least `EDIT_ACK_DEAD_MS`, so there is nothing left to protect.
+            if self.edits.wry_queue.take_resync_request() {
+                tracing::error!("reloading the webview: its edit acknowledgement plane is dead");
+                if let Err(err) = self.desktop_context.webview.reload() {
+                    tracing::error!(?err, "webview reload failed");
+                }
+            }
             if edits_flushed_poll.is_pending() {
                 return;
             }

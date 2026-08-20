@@ -41,6 +41,15 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
             "terminal_mount/retained_rehydrate_skipped_pre_resize",
             "terminal_mount/retained_rehydrate_skipped_inactive",
             "terminal_mount/retained_rehydrate_begin",
+            // The seed's give-up family. An empty answer was previously visible
+            // only in the file trace, which is how a 13-minute black canvas was
+            // witnessed by exactly one event nobody could query; the retry and
+            // the refusal are the other two states that family can end in.
+            // Rare by construction (one per failed seed), so `always` costs the
+            // retention budget almost nothing.
+            "terminal_mount/retained_rehydrate_empty",
+            "terminal_mount/retained_rehydrate_retry_scheduled",
+            "terminal_mount/retained_rehydrate_refused",
             "ui/render_fail_pattern",
             "ui/app_render_rate",
         ] {

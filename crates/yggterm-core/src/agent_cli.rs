@@ -640,6 +640,20 @@ pub struct AgentCliDescriptor {
     /// state then folds into idle for that CLI because nothing was observed,
     /// and the gap belongs here where the next session can see it.
     pub limit_wait_screen_phrases: &'static [ScreenWorkingPhrase],
+    /// Whole-SCREEN phrases meaning the CLI has an OWNER-FACING QUESTION PICKER
+    /// up — a fourth state that is neither working nor idle nor limit-waiting.
+    ///
+    /// ⛔ THIS ONE EATS TYPED INPUT, which is what makes it different from the
+    /// others. A picker consumes navigation keys only, so a sentence typed at
+    /// it produces nothing visible anywhere: the owner experiences total input
+    /// block on precisely the row that is asking for him, while the write
+    /// transport is perfectly healthy. Worse, the CLI is mid-turn while it
+    /// asks, so `working` reads TRUE and every surface says the row is busy
+    /// working — a 27-minute wait was misdescribed that way (queue entry: an
+    /// owner-facing question picker reads as "working" and eats typed input).
+    ///
+    /// ⛔ EMPTY means UNMEASURED, the same law as `working_screen_phrases`.
+    pub question_picker_screen_phrases: &'static [ScreenWorkingPhrase],
     /// How an existing session id is named on resume.
     pub resume_selector: ResumeSelector,
     /// Whether resuming into a known cwd passes it explicitly.
@@ -1068,6 +1082,27 @@ impl AgentCliDescriptor {
         })
     }
 
+    /// Whether this CLI's SCREEN is holding an OWNER-FACING QUESTION PICKER —
+    /// the state in which typed text goes nowhere because the CLI is reading
+    /// navigation keys. Same window and folding as
+    /// [`Self::screen_shows_working`], and deliberately NOT subject to the
+    /// working negations: those describe lines that fake a WORK signal, and
+    /// this is not a work signal at all.
+    pub fn screen_shows_question_picker(&self, sample: &str) -> bool {
+        sample.lines().rev().take(10).any(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            self.question_picker_screen_phrases.iter().any(|phrase| {
+                lower.contains(phrase.needle)
+                    && (phrase.also_any.is_empty()
+                        || phrase.also_any.iter().any(|also| lower.contains(also)))
+            })
+        })
+    }
+
     /// Tokens for the CLI's own resume PICKER (no session id).
     pub fn resume_picker_tokens(&self) -> Vec<String> {
         match self.resume_selector {
@@ -1384,6 +1419,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `Worked for 12s` is codex's COMPLETION summary, not active work.
         working_screen_negations: &["worked for "],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // `codex resume <id>` reopens the session's ORIGINAL cwd unless
         // re-rooted; the cwd tree's whole promise is that a row opens where the
@@ -1536,6 +1572,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         working_screen_negations: &["worked for "],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // ⚠ Deliberately FALSE, preserving shipped behavior exactly: the
         // pre-descriptor builder gated `-C "$PWD"` on `SessionKind::Codex`
@@ -1648,6 +1685,33 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             needle: "usage limit reached",
             also_any: &["continuing", "esc to cancel"],
         }],
+        // ⭐ MEASURED 2026-08-21 by driving a real `claude` in a pty until it
+        // raised a one-question picker, and by reading the shipped binary's own
+        // literals. The picker's footer renders as
+        // `Enter to select · ↑/↓ to navigate · Esc to cancel` for a single
+        // question and swaps the middle chord for the literal
+        // `Tab/Arrow keys to navigate` when there is more than one — so the
+        // needle is the half both spellings share, guarded by the neighbours on
+        // the SAME line so a sentence that merely says "navigate" cannot arm it.
+        // The review step of a multi-question picker paints no navigate footer
+        // at all, hence the second phrase; the third is the CLI's generic
+        // select-list helper (`(Use arrow keys)` / `(Use arrow keys to reveal
+        // more choices)`), which every menu and permission prompt renders — and
+        // all of those eat typed text exactly the same way.
+        question_picker_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "to navigate",
+                also_any: &["to select", "to cancel"],
+            },
+            ScreenWorkingPhrase {
+                needle: "ready to submit your answers",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "(use arrow keys",
+                also_any: &[],
+            },
+        ],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -1787,6 +1851,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         // `pi` takes `process.cwd()`; there is no `--cwd`, and `--session-dir`
         // relocates STORAGE, not the working directory.
@@ -1897,6 +1962,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         }],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -1986,6 +2052,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         }],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -2121,6 +2188,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // silently swallow it.
         working_screen_negations: &["thought for "],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         // ⭐ CONFIRMED 2026-08-08 against a real `kimi --help` on guihost (yggterm
         // provisioned it via uv the same day): `--session,--resume  -S,-r`. The
         // value was read from source at intake and is now MEASURED — recorded
@@ -2239,6 +2307,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         // ⭐ MEASURED 2026-08-08 on guihost, from `muse resume --help` on a real
         // install: `muse resume` / `muse resume --last` / `muse resume
         // <session-uuid>`. ⛔ The placeholder here said `Flag("--resume")`,
@@ -2382,6 +2451,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
         resume_selector: ResumeSelector::Flag("--conversation"),
@@ -2592,6 +2662,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
         resume_selector: ResumeSelector::Flag("--resume"),
         // grok takes the process cwd (`--cwd <CWD>` exists but the launch
@@ -5109,5 +5180,73 @@ mod tests {
                 .resume_picker_tokens(),
             vec!["--resume"]
         );
+    }
+
+    // ⭐ THE SCREEN THIS ASSERTS IS MEASURED, not imagined: a real `claude` was
+    // driven in a pty until it raised a one-question picker, and these are the
+    // lines it painted. The footer is the discriminator — the options above it
+    // are ordinary numbered text that any conversation could contain.
+    #[test]
+    fn a_claude_code_question_picker_is_recognised_from_its_footer() {
+        let descriptor = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
+        let single_question = "\
+ ☐ Next step  How would you like to proceed?\n\
+ ❯ 1. Continue   Proceed with the current approach.\n\
+   2. Stop here  Halt and wait for further instructions.\n\
+   3. Type something.\n\
+   4. Chat about this\n\
+ Enter to select · ↑/↓ to navigate · Esc to cancel\n";
+        assert!(descriptor.screen_shows_question_picker(single_question));
+
+        // The multi-question spelling swaps the middle chord for a literal.
+        let many_questions = " Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n";
+        assert!(descriptor.screen_shows_question_picker(many_questions));
+
+        // The review step paints no navigate footer at all.
+        assert!(descriptor.screen_shows_question_picker("  Ready to submit your answers?\n"));
+
+        // The CLI's generic select list — menus and permission prompts — eats
+        // typed text exactly the same way, so it is the same state.
+        assert!(descriptor.screen_shows_question_picker("   (Use arrow keys)\n"));
+        assert!(descriptor
+            .screen_shows_question_picker("   (Use arrow keys to reveal more choices)\n"));
+    }
+
+    // The guard that keeps prose out: the needle alone is common English, so
+    // the neighbours must be on the SAME line before the state arms.
+    #[test]
+    fn prose_that_merely_mentions_navigating_does_not_arm_the_picker() {
+        let descriptor = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
+        assert!(!descriptor.screen_shows_question_picker(
+            "  I will use the arrow keys to navigate the file tree next.\n"
+        ));
+        assert!(!descriptor.screen_shows_question_picker(
+            "  esc to interrupt · 12s · 340 tokens\n"
+        ));
+        assert!(!descriptor.screen_shows_question_picker(""));
+    }
+
+    // ⛔ EMPTY MEANS UNMEASURED and must stay visibly empty: a CLI whose picker
+    // nobody has looked at folds into the old two-state reading rather than
+    // guessing, and the gap is where the next session can see it.
+    #[test]
+    fn an_unmeasured_cli_has_no_picker_phrases_and_never_arms() {
+        let codex = agent_cli_descriptor(SessionKind::Codex).unwrap();
+        assert!(codex.question_picker_screen_phrases.is_empty());
+        assert!(!codex.screen_shows_question_picker(
+            " Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        ));
+    }
+
+    // The union is what callers with no kind in hand read, and it must agree
+    // with the per-kind answer for the kind that HAS been measured.
+    #[test]
+    fn the_kind_agnostic_union_sees_the_measured_picker() {
+        assert!(crate::screen_text_shows_agent_question_picker(
+            " Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        ));
+        assert!(!crate::screen_text_shows_agent_question_picker(
+            " nothing here is a picker\n"
+        ));
     }
 }

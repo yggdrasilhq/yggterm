@@ -1488,6 +1488,18 @@ pub fn screen_text_shows_agent_limit_wait(sample: &str) -> bool {
         .any(|descriptor| descriptor.screen_shows_limit_wait(sample))
 }
 
+/// Kind-agnostic union of every CLI's OWNER-QUESTION-PICKER phrases — same
+/// shape as [`screen_text_shows_agent_working`], for callers with no kind in
+/// hand. A row holding a picker reads `working: true` (the CLI is mid-turn
+/// while it asks), so a gate reader with only that field calls it "busy
+/// working" and moves on — while every sentence the owner types at it is
+/// swallowed by a widget reading arrow keys.
+pub fn screen_text_shows_agent_question_picker(sample: &str) -> bool {
+    agent_cli::AGENT_CLIS
+        .iter()
+        .any(|descriptor| descriptor.screen_shows_question_picker(sample))
+}
+
 /// How long input may go unanswered before a row is worth pointing
 /// `terminal input-check` at.
 ///

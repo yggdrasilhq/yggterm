@@ -23388,6 +23388,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -23461,6 +23462,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -23664,6 +23666,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -23774,6 +23777,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -23862,6 +23866,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -23990,6 +23995,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -24081,6 +24087,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -24192,6 +24199,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -24696,6 +24704,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -24794,6 +24803,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25199,6 +25209,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25251,6 +25262,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25295,6 +25307,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25345,6 +25358,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25393,6 +25407,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25481,6 +25496,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25560,6 +25576,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25645,6 +25662,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25723,6 +25741,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -25773,6 +25792,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -26140,6 +26160,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -26211,6 +26232,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -26286,6 +26308,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -26358,6 +26381,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -26435,6 +26459,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -26516,6 +26541,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -26582,6 +26608,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
@@ -29132,6 +29159,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29176,6 +29204,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29267,6 +29296,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29340,6 +29370,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29395,6 +29426,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29752,6 +29784,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29808,6 +29841,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29875,6 +29909,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -29945,6 +29980,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -30013,6 +30049,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -30075,6 +30112,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -30131,6 +30169,7 @@ mod tests {
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -38386,6 +38425,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -38429,6 +38469,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -39295,6 +39336,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -39436,6 +39478,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             pty_rows: None,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -39685,6 +39728,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -40638,6 +40682,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -40709,6 +40754,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -40761,6 +40807,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -40936,6 +40983,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -41569,6 +41617,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -41653,6 +41702,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -42503,6 +42553,120 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             busy.reason
         );
     }
+    // ⛔ THE PRECEDENCE IS THE WHOLE FIX. A row holding an owner question is
+    // MID-TURN, so the daemon answers `working: Some(true)` truthfully — and a
+    // dot that reads only `working` therefore reports ordinary busy work on a
+    // session that has stopped, is waiting for its human, and is swallowing
+    // every sentence he types at it. That is how a 27-minute wait went
+    // unnoticed, so the picker arm must sit ABOVE the working arm.
+    #[test]
+    fn a_row_asking_its_owner_a_question_never_reads_as_ordinary_working() {
+        let asking_path = "remote-session://example-host/asking";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(asking_path));
+        let mut asking = test_live_shell_session(asking_path);
+        asking.id = "asking".to_string();
+        asking.kind = SessionKind::ClaudeCode;
+        asking.source = SessionSource::LiveSsh;
+        asking.working = Some(true);
+        asking.awaiting_user_choice = true;
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(asking_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(asking.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(asking)],
+            apps: Vec::new(),
+        });
+        shell.needs_initial_server_sync = false;
+        shell.browser.select_path(asking_path.to_string());
+
+        let snapshot = shell.snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| {
+                normalize_live_session_path(&row.full_path)
+                    == normalize_live_session_path(asking_path)
+            })
+            .expect("asking live session row");
+        let busy = sidebar_row_busy_state(&snapshot, row);
+        assert!(busy.visible, "a row waiting on its owner is not idle");
+        assert_eq!(
+            busy.reason, "awaiting_user_choice",
+            "the dot must name the question, not call it ordinary work"
+        );
+    }
+
+    // The card is the surface that tells the owner what to DO. Without it the
+    // only feedback for typing at a picker is nothing at all, which reads as a
+    // dead row rather than as a question.
+    #[test]
+    fn a_raised_owner_question_raises_a_card_and_clears_it_when_answered() {
+        let watched_path = "remote-session://example-host/watched";
+        let asking_path = "remote-session://example-host/background-asking";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(watched_path));
+        shell.settings.in_app_notifications = true;
+        shell.needs_initial_server_sync = false;
+        let watched = test_live_shell_session(watched_path);
+        let mut asking = test_live_shell_session(asking_path);
+        asking.id = "background-asking".to_string();
+        asking.title = "Fixture Row".to_string();
+        asking.kind = SessionKind::ClaudeCode;
+        asking.source = SessionSource::LiveSsh;
+        asking.working = Some(true);
+        asking.awaiting_user_choice = true;
+
+        let job_key = session_question_notification_job_key(asking_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(watched_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(watched.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(watched.clone()),
+                snapshot_session_view_for_ui(asking.clone()),
+            ],
+            apps: Vec::new(),
+        });
+        shell.notify_sessions_awaiting_user_choice("test");
+        let card = shell
+            .notifications
+            .iter()
+            .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
+            .expect("the question card is raised");
+        assert!(
+            card.message.contains("Enter to select"),
+            "the card must name the keys that answer it, got {:?}",
+            card.message
+        );
+
+        // Answered: the flag falls and the card must go with it, or the row
+        // keeps advertising a question that is no longer being asked.
+        asking.awaiting_user_choice = false;
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(watched_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(watched.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(watched),
+                snapshot_session_view_for_ui(asking),
+            ],
+            apps: Vec::new(),
+        });
+        shell.notify_sessions_awaiting_user_choice("test");
+        assert!(
+            !shell
+                .notifications
+                .iter()
+                .any(|notification| notification.job_key.as_deref() == Some(job_key.as_str())),
+            "the card must clear on the falling edge"
+        );
+    }
+
     #[test]
     fn sidebar_busy_icon_ignores_stale_inactive_live_sample_without_foreground_activity() {
         let stale_session = ManagedSessionView {
@@ -42540,6 +42704,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -42580,6 +42745,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -42784,6 +42950,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -42988,6 +43155,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -43195,6 +43363,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -43406,6 +43575,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -43609,6 +43779,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -43812,6 +43983,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -44015,6 +44187,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -44055,6 +44228,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -44261,6 +44435,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -44465,6 +44640,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -44505,6 +44681,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -45236,6 +45413,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -47314,6 +47492,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -47541,6 +47720,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -48275,6 +48455,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -48318,6 +48499,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -48528,6 +48710,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -48592,6 +48775,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -48724,6 +48908,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -48821,6 +49006,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -48878,6 +49064,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -50329,6 +50516,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -50385,6 +50573,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -50435,6 +50624,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -50488,6 +50678,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -50555,6 +50746,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -50632,6 +50824,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -50694,6 +50887,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -51053,6 +51247,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
@@ -51145,6 +51340,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,

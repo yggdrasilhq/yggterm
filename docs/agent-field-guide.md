@@ -763,6 +763,30 @@ timestamp against `date` before trusting the window**. (Separately: `--since`
 without an explicit `--lines` silently caps at 20 records — the opposite failure,
 same consequence.)
 
+### ⛔⛔ A WEBVIEW FLUSH-GATE TIMEOUT IS NOT EVIDENCE THE UI IS STALE
+
+`webview_edit_flush_timeouts` counts times the VirtualDom was frozen waiting for
+the webview to acknowledge an edit batch, and the log line it used to leave said
+"the UI may be one frame stale". **That reads as DOM divergence and it usually
+is not.** The batch is delivered over the websocket; the interpreter applies it
+*before* acknowledging; and the acknowledgement has its own 1 s `setTimeout`
+backstop on the JS side for exactly the occluded-window case the gate's comment
+blames. So the common shape is a webview that was SLOW — the edits landed, the
+ack was late, nothing is stale.
+
+**The discriminator is `webview_edit_acks_late`, and you must read it first.** A
+timeout followed by a late ack means the surface is alive and behind; a streak of
+timeouts with NO late ack means the acknowledgement plane is dead, which is a
+different fault with a different remedy (the ladder reloads the page, which is a
+full remount). ⚠ `webview_edit_faults` is the one that really does mean
+divergence — the webview reporting it could not apply a batch — and it is
+restart-only. Three counters, three meanings; the middle one is the one that
+looks like the worst and usually is not.
+
+⇒ Read all four together in `DescribeState`
+(`webview_edit_{faults,flush_timeouts,acks_late,gate_bypasses,resync_requests}`)
+or in the `webview_edit_stall` incident payload, never the timeout alone.
+
 ### ⛔ A HAND-ROLLED vt100 SCORES A PAINTED BANNER AS BLANK, AND INVENTS A CUT-OFF TOP
 
 **The instrument:** any quick parser written to answer "how much of the grid did

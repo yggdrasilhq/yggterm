@@ -60,11 +60,13 @@ use crate::terminal_protocol::{
     Fido2Account, PanePlacement, SidebarPaneDeclaration, TerminalJsCommand, TerminalJsEvent,
 };
 use crate::terminal_retained_replay_policy::{
-    RetainedRehydrateMode, blank_host_snapshot_replay_from_read_should_start,
+    RETAINED_EMPTY_XTERM_SURFACE_PROBLEM, RetainedRehydrateMode,
+    blank_host_snapshot_replay_from_read_should_start,
     blank_host_snapshot_replay_should_start, daemon_retained_snapshot_replay_identity_key,
     daemon_retained_snapshot_replay_should_start, retained_ready_remote_host_rehydrate_mode,
     retained_ever_ready_host_should_pin_bootstrap_epoch, retained_rehydrate_allow_screen_fallback,
-    retained_rehydrate_identity_key, retained_remote_host_should_rehydrate,
+    retained_rehydrate_identity_key, retained_rehydrate_seed_retry_delay_ms,
+    retained_remote_host_should_rehydrate,
 };
 use crate::terminal_themes::{
     default_terminal_theme_name, terminal_theme_by_name, terminal_theme_names_for_mode,
@@ -15611,6 +15613,9 @@ struct ShellState {
     // [[finding-stuck-working-dot-noop-signature]] and the daemon-authoritative
     // working state on ManagedSessionView.
     session_working_prev: HashMap<String, bool>,
+    /// Last seen `awaiting_user_choice` per session — the edge source for the
+    /// question card. Same shape and lifetime rules as `session_working_prev`.
+    session_awaiting_choice_prev: HashMap<String, bool>,
     // Notification debounce (NOT the dot): consecutive `working=true` polls seen
     // for a session. A session must be CONFIRMED working (streak >=
     // `WORKING_NOTIFY_CONFIRM_POLLS`) before a later idle can fire a "finished"
@@ -17335,6 +17340,7 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
         limit_wait: session.limit_wait,
+        awaiting_user_choice: session.awaiting_user_choice,
         // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
         // reads, so dropping the field here would leave the daemon knowing a row
         // had gone deaf and the human still unable to see it — the exact gap
@@ -17397,6 +17403,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
         limit_wait: session.limit_wait,
+        awaiting_user_choice: session.awaiting_user_choice,
         // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
         // reads, so dropping the field here would leave the daemon knowing a row
         // had gone deaf and the human still unable to see it — the exact gap
@@ -18268,6 +18275,7 @@ impl ShellState {
             notifications_persisted_at_ms: 0,
             notifications_persist_pending: false,
             session_working_prev: HashMap::new(),
+            session_awaiting_choice_prev: HashMap::new(),
             session_working_confirm_streak: HashMap::new(),
             web_surfaces: HashMap::new(),
             web_profiles_root: web_surface_profiles_root(),
@@ -24712,6 +24720,33 @@ impl ShellState {
         let attempt_id = self.terminal_open_attempt_by_session.get(session_path)?;
         self.terminal_open_attempts.get(attempt_id)
     }
+    /// Record a surface problem learned by a path that is NOT the JS observer.
+    ///
+    /// The seed task finds out "the daemon calls this row live and answers a
+    /// blank screen for it" long before any observation reaches
+    /// `record_terminal_surface_observation` — and that fact is exactly what
+    /// arms the existing recovery lane (the problem string flips the rehydrate
+    /// mode, which changes the identity key, which re-arms the seed with a
+    /// different read verb). Returns whether it was NEWLY recorded, so a caller
+    /// refusing the same thing twice does not re-report it as fresh news, and
+    /// so the second refusal cannot re-arm a lane that is already armed.
+    fn note_terminal_surface_problem(&mut self, session_path: &str, problem: &str) -> bool {
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
+            return false;
+        };
+        if attempt.last_surface_problem.as_deref() == Some(problem) {
+            return false;
+        }
+        attempt.last_surface_problem = Some(problem.to_string());
+        true
+    }
     fn latest_terminal_open_attempt_snapshot_for_path(&self, session_path: &str) -> Option<Value> {
         self.latest_terminal_open_attempt_for_path(session_path)
             .map(describe_terminal_open_attempt)
@@ -25336,9 +25371,9 @@ impl ShellState {
             attempt.surface_mounted_at_ms = Some(now_ms);
         }
         let empty_surface_problem = attempt.last_surface_problem.as_deref()
-            == Some("active terminal host exists but xterm surface is empty")
+            == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
             || attempt.last_observed_reason.as_deref()
-                == Some("active terminal host exists but xterm surface is empty");
+                == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM);
         attempt.last_observed_reason = Some(reason.to_string());
         attempt.last_surface_problem = None;
         if empty_surface_problem {
@@ -25871,7 +25906,93 @@ impl ShellState {
     /// the session must read `working=true` for `WORKING_NOTIFY_CONFIRM_POLLS`
     /// consecutive polls before a later idle can notify, so a single-poll false
     /// `working` blip on an idle re-attached session cannot spam a "finished" ping.
+    /// Raise (and clear) the card that NAMES the mode when a session is holding
+    /// an owner-facing question picker.
+    ///
+    /// ⛔ WHY A CARD AND NOT JUST A DOT. The picker consumes navigation keys and
+    /// nothing else, so a sentence typed at it produces nothing visible
+    /// anywhere — no echo, no error, no refusal. The owner experiences that as
+    /// the row having gone deaf, and every surface agreed with him: the CLI is
+    /// mid-turn while it asks, so `working` reads true and the row looked busy.
+    /// A row that has STOPPED to ask its owner something must say so in words,
+    /// on the surface he is already looking at.
+    ///
+    /// The rising edge also notifies like a done-edge, and for the same reason:
+    /// a question raised in a background row is a thing that has finished
+    /// happening and now needs him. ⛔ Background only, per the settled call
+    /// that the session you are actively watching never pings you — the card
+    /// itself is raised for every row, active or not, because naming the mode
+    /// is the point.
+    fn notify_sessions_awaiting_user_choice(&mut self, source: &str) {
+        let active_path = self.server.active_session().map(|s| s.session_path.clone());
+        let mut live_paths: HashSet<String> = HashSet::new();
+        let mut raised: Vec<(String, String, SessionKind, bool)> = Vec::new();
+        let mut cleared: Vec<String> = Vec::new();
+        for session in self.server.live_sessions() {
+            live_paths.insert(session.session_path.clone());
+            let asking = session.awaiting_user_choice;
+            let previous = self
+                .session_awaiting_choice_prev
+                .insert(session.session_path.clone(), asking);
+            if previous == Some(asking) {
+                continue;
+            }
+            if asking {
+                let is_background = active_path.as_deref() != Some(session.session_path.as_str());
+                raised.push((
+                    session.session_path.clone(),
+                    session.title.clone(),
+                    session.kind,
+                    is_background,
+                ));
+            } else if previous == Some(true) {
+                cleared.push(session.session_path.clone());
+            }
+        }
+        // Sessions that went away take their card with them, and their memory:
+        // otherwise a row that returns still holding a picker never re-fires.
+        self.session_awaiting_choice_prev
+            .retain(|path, _| live_paths.contains(path));
+        for session_path in cleared {
+            self.clear_job_notification(&session_question_notification_job_key(&session_path));
+        }
+        for (session_path, title, kind, is_background) in raised {
+            let cli = match yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+                Some(descriptor) => descriptor.display_name,
+                None => "The agent",
+            };
+            let label = title.trim();
+            let where_it_is = if label.is_empty() {
+                String::new()
+            } else {
+                format!(" in \u{201c}{label}\u{201d}")
+            };
+            let message = format!(
+                "{cli}{where_it_is} has stopped and is asking you to choose.                  Answer it on the row: arrow keys to move, Enter to select, Esc to cancel.                  \u{26d4} Typed text is ignored while a picker is up."
+            );
+            append_ui_telemetry_event(
+                "session_awaiting_user_choice_raised",
+                json!({
+                    "session_path": &session_path,
+                    "source": source,
+                    "background": is_background,
+                }),
+            );
+            self.upsert_job_notification(
+                session_question_notification_job_key(&session_path),
+                NotificationTone::Info,
+                "Waiting On Your Answer",
+                message,
+                None,
+                // The chime/system ping is the done-edge half, and it is
+                // background-only. The card is raised either way.
+                is_background,
+                Some(session_path.clone()),
+            );
+        }
+    }
     fn notify_finished_working_sessions(&mut self, source: &str) {
+        self.notify_sessions_awaiting_user_choice(source);
         if !self.settings.in_app_notifications
             && !self.settings.system_notifications
             && !self.settings.notification_sound
@@ -27968,7 +28089,7 @@ impl ShellState {
         // identity mismatch, etc.) are unaffected — only the empty-surface reason
         // is graced. See [[followups-switch-hotness-update-friction]].
         let benign_reveal_empty_fault = fault_reason
-            == Some("active terminal host exists but xterm surface is empty")
+            == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
             && self.terminal_session_in_reveal_grace(session_path)
             && self.terminal_session_was_ever_ready(session_path)
             && self.daemon_owns_session_runtime(session_path);
@@ -28365,9 +28486,9 @@ impl ShellState {
         self.latest_terminal_open_attempt_for_path(active_session_path)
             .is_some_and(|attempt| {
                 attempt.last_surface_problem.as_deref()
-                    == Some("active terminal host exists but xterm surface is empty")
+                    == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
                     || attempt.last_observed_reason.as_deref()
-                        == Some("active terminal host exists but xterm surface is empty")
+                        == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
             })
     }
     fn startup_terminal_restore_should_recover(
@@ -28407,9 +28528,9 @@ impl ShellState {
                 ) && now_ms.saturating_sub(attempt.started_at_ms)
                     >= STARTUP_TERMINAL_RESTORE_RECOVERY_MS;
                 let empty_surface = attempt.last_surface_problem.as_deref()
-                    == Some("active terminal host exists but xterm surface is empty")
+                    == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
                     || attempt.last_observed_reason.as_deref()
-                        == Some("active terminal host exists but xterm surface is empty");
+                        == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM);
                 let stale =
                     stale_open_attempt && (attempt.source == "startup_restore" || empty_surface);
                 if stale && empty_surface {
@@ -31905,7 +32026,13 @@ fn surface_problem_is_codex_session_gone(surface_problem: Option<&str>) -> bool 
 /// recovery deciders (`startup_terminal_restore_should_recover`,
 /// `latest_terminal_open_attempt_has_empty_surface`) read it back.
 fn surface_problem_is_empty_xterm(problem: &str) -> bool {
-    problem == "active terminal host exists but xterm surface is empty"
+    problem == RETAINED_EMPTY_XTERM_SURFACE_PROBLEM
+}
+/// The job key for the "this row is asking you something" card. One key per
+/// session, so the rising edge upserts and the falling edge clears exactly the
+/// card it raised.
+fn session_question_notification_job_key(session_path: &str) -> String {
+    format!("session-question:{session_path}")
 }
 fn terminal_resume_notification_session_path(job_key: &str) -> Option<&str> {
     job_key.strip_prefix("terminal-resume:")
@@ -32397,7 +32524,7 @@ fn remote_retained_surface_fault_should_invalidate(reason: Option<&str>) -> bool
             | Some("active remote Codex prompt surface has stale scrollback but no current prompt")
             | Some("active remote Codex prompt surface has no current input row")
             | Some("active remote Codex runtime has exited and is showing a resume instruction",)
-            | Some("active terminal host exists but xterm surface is empty")
+            | Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
             | Some("active terminal host is still showing generic Codex idle chrome")
             | Some("active remote terminal lost expected scrollback after retained replay")
             | Some("active remote terminal received scroll input but has no xterm scrollback")
@@ -32406,7 +32533,7 @@ fn remote_retained_surface_fault_should_invalidate(reason: Option<&str>) -> bool
 fn retained_fault_reason_can_wait_for_ready_settle(reason: Option<&str>) -> bool {
     matches!(
         reason,
-        Some("active terminal host exists but xterm surface is empty")
+        Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
             | Some("active remote terminal is input-enabled on retained history replay")
             | Some("active remote terminal is input-enabled without a prompt-ready surface")
             | Some(
@@ -32420,9 +32547,9 @@ fn retained_fault_reason_can_wait_for_ready_settle(reason: Option<&str>) -> bool
 }
 fn retained_fault_recovery_rearm_after_ms(attempt: &TerminalOpenAttempt) -> u64 {
     let empty_surface = attempt.last_surface_problem.as_deref()
-        == Some("active terminal host exists but xterm surface is empty")
+        == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
         || attempt.last_observed_reason.as_deref()
-            == Some("active terminal host exists but xterm surface is empty");
+            == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM);
     if empty_surface && attempt.observations > 0 && attempt.surface_mounted_at_ms.is_some() {
         RETAINED_EMPTY_SURFACE_RECOVERY_REARM_MS
     } else {
@@ -34673,6 +34800,15 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
         // polls the deltas and files the incident the emitter cannot.
         let mut last_webview_edit_faults = dioxus_desktop::edit_faults();
         let mut last_webview_flush_timeouts = dioxus_desktop::edit_flush_timeouts();
+        // The recovery half of the same plane: acknowledgements that arrived
+        // LATE (proof the webview was slow, not dead, and the DOM caught up),
+        // batches that skipped the gate on purpose, and reloads the ladder
+        // asked for. Without the late-ack count every timeout reads equally
+        // fatal, which is how "the UI may be one frame stale" got said about a
+        // webview that was one second behind.
+        let mut last_webview_acks_late = dioxus_desktop::edit_acks_late();
+        let mut last_webview_gate_bypasses = dioxus_desktop::edit_flush_gate_bypasses();
+        let mut last_webview_resync_requests = dioxus_desktop::edit_webview_resync_requests();
         loop {
             sleep(Duration::from_millis(WORKING_FLAGS_POLL_INTERVAL_MS)).await;
             ping_tick = ping_tick.wrapping_add(1);
@@ -34721,9 +34857,19 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             {
                 let faults = dioxus_desktop::edit_faults();
                 let flush_timeouts = dioxus_desktop::edit_flush_timeouts();
+                let acks_late = dioxus_desktop::edit_acks_late();
+                let gate_bypasses = dioxus_desktop::edit_flush_gate_bypasses();
+                let resync_requests = dioxus_desktop::edit_webview_resync_requests();
                 if faults != last_webview_edit_faults
                     || flush_timeouts != last_webview_flush_timeouts
+                    || acks_late != last_webview_acks_late
+                    || gate_bypasses != last_webview_gate_bypasses
+                    || resync_requests != last_webview_resync_requests
                 {
+                    let new_acks_late = acks_late.saturating_sub(last_webview_acks_late);
+                    let new_bypasses = gate_bypasses.saturating_sub(last_webview_gate_bypasses);
+                    let new_resyncs =
+                        resync_requests.saturating_sub(last_webview_resync_requests);
                     yggterm_core::perf::ytrace_provider().incident(
                         "ui",
                         "webview",
@@ -34737,9 +34883,17 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                             "diagnosis": format!(
                                 "webview edit plane stalled: {} new flush-gate timeout(s) \
                                  (VirtualDom frozen ~2s each), {} new unapplied batch(es) \
-                                 (DOM divergence, restart-only)",
+                                 (DOM divergence, restart-only), {} late ack(s) \
+                                 (the webview answered after the gate gave up — it was \
+                                 SLOW, and the DOM caught up), {} gate bypass(es) \
+                                 (the gate stopped freezing a webview already several \
+                                 acks behind), {} webview reload(s) requested \
+                                 (the ack plane answered nothing at all)",
                                 flush_timeouts.saturating_sub(last_webview_flush_timeouts),
                                 faults.saturating_sub(last_webview_edit_faults),
+                                new_acks_late,
+                                new_bypasses,
+                                new_resyncs,
                             ),
                             "observed": {
                                 "edit_faults_total": faults,
@@ -34747,13 +34901,24 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                                 "flush_timeouts_total": flush_timeouts,
                                 "flush_timeouts_new":
                                     flush_timeouts.saturating_sub(last_webview_flush_timeouts),
+                                "acks_late_total": acks_late,
+                                "acks_late_new": new_acks_late,
+                                "gate_bypasses_total": gate_bypasses,
+                                "gate_bypasses_new": new_bypasses,
+                                "resync_requests_total": resync_requests,
+                                "resync_requests_new": new_resyncs,
                             },
-                            "remedy": "an occluded window stops rAF acks; check compositor frame \
-                                       delivery and the webview process before blaming the vdom",
+                            "remedy": "read acks_late FIRST: non-zero means the webview answered \
+                                       late and the DOM is NOT stale (it was slow — look at what \
+                                       is saturating the web process), zero across a streak means \
+                                       the ack plane is dead and the ladder will reload the page",
                         }),
                     );
                     last_webview_edit_faults = faults;
                     last_webview_flush_timeouts = flush_timeouts;
+                    last_webview_acks_late = acks_late;
+                    last_webview_gate_bypasses = gate_bypasses;
+                    last_webview_resync_requests = resync_requests;
                 }
             }
             // The handover suspension's fail-safe ceiling rides this tick too, and
@@ -57327,6 +57492,12 @@ fn describe_app_state_snapshot(
         // it. Zero on every healthy instance, by construction.
         "webview_edit_faults": dioxus_desktop::edit_faults(),
         "webview_edit_flush_timeouts": dioxus_desktop::edit_flush_timeouts(),
+        // ⭐ Read this beside the timeouts, never without them: a timeout that
+        // was later acknowledged means the webview was SLOW and the DOM caught
+        // up, which is a different fault from one that was never answered.
+        "webview_edit_acks_late": dioxus_desktop::edit_acks_late(),
+        "webview_edit_gate_bypasses": dioxus_desktop::edit_flush_gate_bypasses(),
+        "webview_edit_resync_requests": dioxus_desktop::edit_webview_resync_requests(),
         "shell": {
             "sidebar_open": shell.sidebar_open,
             "sidebar_width": shell.sidebar_width,

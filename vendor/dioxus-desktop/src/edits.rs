@@ -64,6 +64,90 @@ pub fn edit_flush_timeouts() -> u64 {
     EDIT_FLUSH_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Acknowledgements that arrived AFTER the flush gate had given up on them.
+///
+/// ⭐ THIS IS THE FIELD THAT SAYS WHETHER THE UI IS ACTUALLY STALE. A gate
+/// timeout on its own does not: the batch is delivered over the websocket and
+/// the interpreter applies it before acking, and the acknowledgement itself has
+/// a `setTimeout` backstop on the JS side for exactly the occluded-window case.
+/// So a timeout followed by a late ack means the webview was merely SLOW — the
+/// DOM caught up and nothing is stale. A streak of timeouts with no late ack
+/// means the ack plane is dead, which is a different fault with a different
+/// remedy. Counting them apart is what stops "the UI may be one frame stale"
+/// from being said about a webview that was one second behind.
+static EDIT_ACKS_LATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Acknowledgements that arrived after the gate gave up. See [`EDIT_ACKS_LATE`].
+pub fn edit_acks_late() -> u64 {
+    EDIT_ACKS_LATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Batches sent while the flush gate was BYPASSED — i.e. the VirtualDom was
+/// deliberately not frozen, because the webview already owes us
+/// [`EDIT_FLUSH_GATE_BYPASS_AFTER`] acknowledgements and freezing it for every
+/// further batch is the input-death the owner feels, not a fix for it.
+static EDIT_GATE_BYPASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Batches that skipped the flush gate. See [`EDIT_GATE_BYPASSES`].
+pub fn edit_flush_gate_bypasses() -> u64 {
+    EDIT_GATE_BYPASSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Times the ack plane was judged DEAD and a webview resync was asked for.
+static EDIT_RESYNC_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Webview resyncs requested by the recovery ladder. See [`EDIT_RESYNC_REQUESTS`].
+pub fn edit_webview_resync_requests() -> u64 {
+    EDIT_RESYNC_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Unacknowledged batches after which the gate stops freezing the VirtualDom.
+///
+/// Two is a slow frame; three in a row is a webview that is not keeping its end
+/// of the bargain, and the gate is only an ORDERING nicety — worth a wait, never
+/// worth a third consecutive freeze.
+pub const EDIT_FLUSH_GATE_BYPASS_AFTER: u32 = 3;
+
+/// Unacknowledged batches after which the ack plane is judged dead.
+pub const EDIT_ACK_DEAD_BATCHES: u32 = 12;
+
+/// How long the streak must ALSO have lasted before the ack plane is judged
+/// dead. ⛔ The batch count alone is not enough: once the gate is bypassed the
+/// VirtualDom runs freely and can produce a dozen batches in a second, so a
+/// count-only rule would call a webview dead a second after it went quiet.
+pub const EDIT_ACK_DEAD_MS: u64 = 20_000;
+
+/// What to do about a batch the webview has not acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditFlushRecovery {
+    /// Wait for the acknowledgement, as designed.
+    Gate,
+    /// Stop waiting. The webview owes us acks; freezing the whole VirtualDom
+    /// for each further batch turns one slow webview into a dead application.
+    BypassGate,
+    /// The ack plane has not answered at all for long enough that the page is
+    /// no longer a live surface. Reload it.
+    ReloadWebview,
+}
+
+/// The recovery ladder, kept pure so it can be tested without a webview.
+///
+/// `unacked_batches` counts batches sent since the last acknowledgement OF ANY
+/// KIND — timely or late. A single late ack resets it, which is the whole
+/// point: a webview that answers, however slowly, is never reloaded.
+pub(crate) fn edit_flush_recovery(
+    unacked_batches: u32,
+    ms_since_last_ack: u64,
+) -> EditFlushRecovery {
+    if unacked_batches >= EDIT_ACK_DEAD_BATCHES && ms_since_last_ack >= EDIT_ACK_DEAD_MS {
+        return EditFlushRecovery::ReloadWebview;
+    }
+    if unacked_batches >= EDIT_FLUSH_GATE_BYPASS_AFTER {
+        return EditFlushRecovery::BypassGate;
+    }
+    EditFlushRecovery::Gate
+}
+
 /// This handles communication between the requests that the webview makes and the interpreter.
 #[derive(Clone)]
 pub(crate) struct WryQueue {
@@ -87,6 +171,16 @@ impl WryQueue {
         let receiver = myself.websocket.send_edits(webview_id, serialized_edits);
         myself.edits_in_progress = Some(receiver);
         myself.edits_deadline = Some(Box::pin(tokio::time::sleep(EDITS_FLUSH_TIMEOUT)));
+        myself.unacked_batches = myself.unacked_batches.saturating_add(1);
+    }
+
+    /// Whether the recovery ladder has asked for a webview reload, clearing the
+    /// request. Called by the poll loop, which is the only place holding the
+    /// webview handle — this module can diagnose the dead ack plane but cannot
+    /// reach the thing that fixes it.
+    pub(crate) fn take_resync_request(&self) -> bool {
+        let mut self_mut = self.inner.borrow_mut();
+        std::mem::take(&mut self_mut.resync_requested)
     }
 
     /// Wait until all pending edits have been rendered in the webview
@@ -95,6 +189,22 @@ impl WryQueue {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let mut self_mut = self.inner.borrow_mut();
+        // Late acknowledgements first, and unconditionally — a batch the gate
+        // gave up on can still be answered, and that answer is the evidence
+        // that the DOM caught up and the webview is alive. Polling here also
+        // registers our waker with those receivers.
+        loop {
+            let Some(front) = self_mut.abandoned_edits.front_mut() else {
+                break;
+            };
+            if front.poll_unpin(cx).is_ready() {
+                self_mut.abandoned_edits.pop_front();
+                EDIT_ACKS_LATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self_mut.note_edits_acknowledged();
+            } else {
+                break;
+            }
+        }
         if self_mut.edits_in_progress.is_none() {
             return std::task::Poll::Ready(());
         }
@@ -108,6 +218,7 @@ impl WryQueue {
         if flushed {
             self_mut.edits_in_progress = None;
             self_mut.edits_deadline = None;
+            self_mut.note_edits_acknowledged();
             return std::task::Poll::Ready(());
         }
 
@@ -129,6 +240,48 @@ impl WryQueue {
         // So: wait, but not forever. Polling the deadline here also registers
         // our waker with the timer, which is what guarantees we are polled again
         // to observe the timeout at all.
+        //
+        // ⭐ AND WAIT LESS EACH TIME IT HAPPENS. Waiting the full window for
+        // every batch of a webview that is already several acknowledgements
+        // behind multiplies one slow surface into a dead application: 13 gate
+        // timeouts in one GUI's last 17 minutes is 26 seconds during which
+        // renders, effects and spawned futures were all stopped, and the owner
+        // fought "input blocked" for that whole stretch. So the ladder below
+        // gates, then stops gating, then — only if nothing is ever
+        // acknowledged, late or otherwise — declares the page dead.
+        let ms_since_last_ack = self_mut.last_ack_at.elapsed().as_millis() as u64;
+        let unacked = self_mut.unacked_batches;
+        match edit_flush_recovery(unacked, ms_since_last_ack) {
+            EditFlushRecovery::Gate => {}
+            EditFlushRecovery::BypassGate => {
+                EDIT_GATE_BYPASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self_mut.abandon_pending_edits();
+                return std::task::Poll::Ready(());
+            }
+            EditFlushRecovery::ReloadWebview => {
+                let webview_id = self_mut.location.webview_id;
+                EDIT_RESYNC_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self_mut.resync_requested = true;
+                tracing::error!(
+                    webview_id,
+                    unacked_batches = unacked,
+                    ms_since_last_ack,
+                    "webview has not acknowledged ANY edit batch for the whole streak; \
+                     asking for a reload rather than rendering into a surface that is \
+                     no longer listening"
+                );
+                self_mut.abandon_pending_edits();
+                // ⛔ AND START THE MEASUREMENT AGAIN, or the very next batch
+                // sees the same spent streak and asks for another reload —
+                // a reload loop, which is strictly worse than the fault it
+                // is recovering from. The reload gets one full streak to
+                // prove it worked before the ladder may fire again.
+                self_mut.abandoned_edits.clear();
+                self_mut.note_edits_acknowledged();
+                return std::task::Poll::Ready(());
+            }
+        }
+
         let timed_out = match self_mut.edits_deadline.as_mut() {
             Some(deadline) => deadline.as_mut().poll(cx).is_ready(),
             None => false,
@@ -139,11 +292,12 @@ impl WryQueue {
             tracing::error!(
                 webview_id,
                 timeout_ms = EDITS_FLUSH_TIMEOUT.as_millis() as u64,
+                unacked_batches = self_mut.unacked_batches,
                 "webview never acknowledged an edit batch; releasing the flush gate \
-                 so the VirtualDom keeps running (the UI may be one frame stale)"
+                 so the VirtualDom keeps running (the UI may be one frame stale \
+                 until the acknowledgement arrives late)"
             );
-            self_mut.edits_in_progress = None;
-            self_mut.edits_deadline = None;
+            self_mut.abandon_pending_edits();
             return std::task::Poll::Ready(());
         }
 
@@ -202,11 +356,55 @@ pub(crate) struct WryQueueInner {
     // Deadline for the above. See `poll_edits_flushed` for why a missing
     // acknowledgement must not be able to wedge the VirtualDom forever.
     edits_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    // Receivers for batches the gate gave up on, oldest first. ⛔ NOT dropped:
+    // the websocket thread serialises one batch at a time and answers them in
+    // order, so the front of this queue is the next acknowledgement the webview
+    // will produce — and observing it is the only way to tell a SLOW webview
+    // (late acks arriving, DOM fine) from a DEAD one (nothing, ever). Dropping
+    // the receiver instead, which is what the code did before, threw away that
+    // distinction and left every timeout looking equally fatal.
+    abandoned_edits: VecDeque<oneshot::Receiver<()>>,
+    // Batches sent since the last acknowledgement of any kind.
+    unacked_batches: u32,
+    // When the webview last acknowledged anything. Starts at construction so a
+    // webview that never acks at all still ages into the dead verdict.
+    last_ack_at: std::time::Instant,
+    // Set when the ladder asks for a reload; taken by the poll loop, which is
+    // the only place that holds the webview handle.
+    resync_requested: bool,
     // The socket may be killed by the OS while running. If it does, this channel will receive the new server location
     server_location_changed: Arc<Notify>,
     server_location_changed_future: Pin<Box<dyn Future<Output = ()>>>,
     mutation_state: MutationState,
 }
+
+impl WryQueueInner {
+    /// The webview answered. Everything the ladder measures is measured from
+    /// here — a single acknowledgement, however late, means the surface is
+    /// alive and the streak starts again from nothing.
+    fn note_edits_acknowledged(&mut self) {
+        self.unacked_batches = 0;
+        self.last_ack_at = std::time::Instant::now();
+    }
+
+    /// Release the gate on the in-flight batch while KEEPING its receiver, so a
+    /// late acknowledgement is still observed rather than thrown away.
+    fn abandon_pending_edits(&mut self) {
+        if let Some(receiver) = self.edits_in_progress.take() {
+            // Bounded: the websocket answers in order, so anything older than
+            // the last few is of no diagnostic value, and an unbounded queue on
+            // a webview that never answers is a leak.
+            if self.abandoned_edits.len() >= ABANDONED_EDIT_ACK_WATCH {
+                self.abandoned_edits.pop_front();
+            }
+            self.abandoned_edits.push_back(receiver);
+        }
+        self.edits_deadline = None;
+    }
+}
+
+/// How many un-acknowledged batches to keep watching for a late answer.
+const ABANDONED_EDIT_ACK_WATCH: usize = 8;
 
 /// The location of a webview websocket connection. This is used to identify the webview and the port it is connected to.
 #[derive(Clone)]
@@ -515,6 +713,10 @@ impl EditWebsocket {
                 websocket: self.clone(),
                 edits_in_progress: None,
                 edits_deadline: None,
+                abandoned_edits: VecDeque::new(),
+                unacked_batches: 0,
+                last_ack_at: std::time::Instant::now(),
+                resync_requested: false,
                 mutation_state: MutationState::default(),
             })),
         }
@@ -625,4 +827,56 @@ fn owned_notify_future(notify: Arc<Notify>) -> Pin<Box<dyn Future<Output = ()>>>
     // Start tracking notify before the output future is polled
     _ = (&mut notify_owned).now_or_never();
     notify_owned
+}
+
+#[cfg(test)]
+mod edit_flush_recovery_tests {
+    use super::*;
+
+    // The ordinary case: one slow frame is waited for, as designed.
+    #[test]
+    fn a_single_unanswered_batch_still_gates() {
+        assert_eq!(edit_flush_recovery(0, 0), EditFlushRecovery::Gate);
+        assert_eq!(edit_flush_recovery(1, 1_500), EditFlushRecovery::Gate);
+        assert_eq!(
+            edit_flush_recovery(EDIT_FLUSH_GATE_BYPASS_AFTER - 1, 5_000),
+            EditFlushRecovery::Gate
+        );
+    }
+
+    // The freeze the owner feels is the REPEAT, not the first wait.
+    #[test]
+    fn a_webview_several_acks_behind_stops_freezing_the_vdom() {
+        assert_eq!(
+            edit_flush_recovery(EDIT_FLUSH_GATE_BYPASS_AFTER, 6_000),
+            EditFlushRecovery::BypassGate
+        );
+        assert_eq!(edit_flush_recovery(11, 19_000), EditFlushRecovery::BypassGate);
+    }
+
+    // ⛔ THE ONE THAT MATTERS: a reload is a full remount, so a webview that is
+    // merely SLOW must never reach it. Both conditions are required, and the
+    // time floor is what stops a freely-running VirtualDom from producing a
+    // dozen batches in a second and calling the page dead.
+    #[test]
+    fn only_a_silent_ack_plane_earns_a_reload() {
+        assert_eq!(
+            edit_flush_recovery(EDIT_ACK_DEAD_BATCHES, EDIT_ACK_DEAD_MS),
+            EditFlushRecovery::ReloadWebview
+        );
+        assert_eq!(
+            edit_flush_recovery(EDIT_ACK_DEAD_BATCHES, EDIT_ACK_DEAD_MS - 1),
+            EditFlushRecovery::BypassGate,
+            "a burst of batches inside the window is not a dead webview"
+        );
+        assert_eq!(
+            edit_flush_recovery(EDIT_ACK_DEAD_BATCHES - 1, 10 * EDIT_ACK_DEAD_MS),
+            EditFlushRecovery::BypassGate,
+            "a long quiet stretch with few batches is not a dead webview either"
+        );
+        // And the reset that makes a late ack decisive: the caller zeroes both
+        // inputs on any acknowledgement, so the ladder drops straight back to
+        // the bottom rung.
+        assert_eq!(edit_flush_recovery(0, 0), EditFlushRecovery::Gate);
+    }
 }

@@ -2582,6 +2582,14 @@ pub struct HotRestartGateScreen {
     /// window opens. serde(default) keeps older daemons' answers readable.
     #[serde(default)]
     pub shows_limit_wait: bool,
+    /// Whether any registered CLI's OWNER-QUESTION-PICKER phrases are on the
+    /// WHOLE screen. ⛔ Read this BEFORE `shows_agent_working`: a row holding a
+    /// picker is mid-turn, so it answers `working: true` and reads as ordinary
+    /// busy work — while every keystroke sent to it is swallowed by a widget
+    /// that only accepts arrow keys. serde(default) keeps older daemons'
+    /// answers readable.
+    #[serde(default)]
+    pub shows_question_picker: bool,
 }
 
 /// How much of the screen a gate-screen reading returns when the caller does not
@@ -5193,6 +5201,16 @@ impl DaemonRuntime {
                 session.limit_wait = screen_text
                     .as_deref()
                     .is_some_and(|screen| descriptor.screen_shows_limit_wait(screen));
+                // The fourth state, and the only one that EATS INPUT: an
+                // owner-facing question picker. `working` stays honest and
+                // reads true (the CLI really is mid-turn while it asks), which
+                // is exactly why this needs its own field — every surface that
+                // renders `working` alone called the row "busy working" while
+                // the owner's typed sentences went into a widget reading arrow
+                // keys.
+                session.awaiting_user_choice = screen_text
+                    .as_deref()
+                    .is_some_and(|screen| descriptor.screen_shows_question_picker(screen));
             } else if session.kind == SessionKind::Shell
                 && crate::launch_command_is_local_app_verb(&session.launch_command)
             {
@@ -7077,6 +7095,9 @@ impl DaemonRuntime {
                     shows_limit_wait: screen
                         .as_deref()
                         .is_some_and(yggterm_core::screen_text_shows_agent_limit_wait),
+                    shows_question_picker: screen
+                        .as_deref()
+                        .is_some_and(yggterm_core::screen_text_shows_agent_question_picker),
                     screen_tail: screen.map(|screen| gate_screen_tail(&screen, tail_lines)),
                 }
             })
@@ -25779,8 +25800,16 @@ mod tests {
     #[test]
     fn unix_daemon_accept_loop_dispatches_clients_off_accept_thread() {
         let source = include_str!("daemon.rs");
+        // ⛔ THE MARKER MUST BE THE STATEMENT, NOT THE EXPRESSION. This split
+        // used to be on the bare `if let ServerEndpoint::UnixSocket(path) =
+        // endpoint {`, which the socket-lock work then matched FIRST as
+        // `let daemon_socket_lock = if let ServerEndpoint::UnixSocket(...)` —
+        // so `nth(1)` began reading a 17 KB binding instead of the 288 KB accept
+        // loop, and both of these tests reported the accept loop had lost
+        // properties it still has. A source-text test whose anchor can be
+        // matched by a second construct fails LOUDLY about the wrong thing.
         let unix_loop = source
-            .split("if let ServerEndpoint::UnixSocket(path) = endpoint {")
+            .split("\n    if let ServerEndpoint::UnixSocket(path) = endpoint {")
             .nth(1)
             .and_then(|suffix| suffix.split("if let ServerEndpoint::Tcp").next())
             .expect("unix daemon accept loop should be present");
@@ -25983,8 +26012,16 @@ mod tests {
     #[test]
     fn unix_hot_restart_releases_bind_lock_before_spawning_replacement() {
         let source = include_str!("daemon.rs");
+        // ⛔ THE MARKER MUST BE THE STATEMENT, NOT THE EXPRESSION. This split
+        // used to be on the bare `if let ServerEndpoint::UnixSocket(path) =
+        // endpoint {`, which the socket-lock work then matched FIRST as
+        // `let daemon_socket_lock = if let ServerEndpoint::UnixSocket(...)` —
+        // so `nth(1)` began reading a 17 KB binding instead of the 288 KB accept
+        // loop, and both of these tests reported the accept loop had lost
+        // properties it still has. A source-text test whose anchor can be
+        // matched by a second construct fails LOUDLY about the wrong thing.
         let unix_loop = source
-            .split("if let ServerEndpoint::UnixSocket(path) = endpoint {")
+            .split("\n    if let ServerEndpoint::UnixSocket(path) = endpoint {")
             .nth(1)
             .and_then(|suffix| suffix.split("if let ServerEndpoint::Tcp").next())
             .expect("unix daemon accept loop should be present");
@@ -26818,6 +26855,7 @@ mod tests {
             pty_rows: None,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
