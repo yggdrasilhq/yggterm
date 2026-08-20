@@ -64,6 +64,25 @@ established; n=2 is a lead, not a verdict.
 took **25.7 s** against a 76 ms median. Neither lined up with a block in this sample, but the sample
 is 8 blocks — absence here is not exoneration.
 
+### The echo tail, now that all three legs emit
+
+With `input/render` fixed the chain measures end to end. One hour on the GUI host, **4,105
+keystrokes**, all `remote-cc`:
+
+| leg | n | p50 | p95 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| keystroke → pty | 4101 | **1 ms** | 205 ms | 632 ms | **4345 ms** |
+| pty → render | 695 | 95 ms | 150 ms | 384 ms | 763 ms |
+| keystroke → render | 695 | 97 ms | 158 ms | 399 ms | 763 ms |
+
+⭐ **The owner's reported stall is in the tail.** A median of 1 ms with a maximum of 4.3 s is not a
+slow path with noise — it is a fast path that occasionally stops, and the stop is the only part
+anyone experiences. Grading the median would have called this healthy.
+
+Only **4 of 4,105** keystrokes lost their pty leg, so the bytes are not being dropped; they are
+being delayed. That points at the same UI-thread blocking as the entry above rather than at a
+transport fault.
+
 **Falsifier:** with the named work moved off the UI thread, a 30-minute window on the GUI host under
 comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
 `notebooks/06-ui-blocks.ipynb`.
