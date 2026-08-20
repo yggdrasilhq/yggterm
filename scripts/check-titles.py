@@ -32,6 +32,7 @@ import json
 import os
 import shlex
 import subprocess
+import tempfile
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -131,11 +132,29 @@ def fleet_hosts():
         hosts = [h.strip() for h in env.split(",") if h.strip()]
     return hosts
 
+def _ssh_control_path(host):
+    """Per-host multiplexing socket, in the user's runtime dir when there is one."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in host)
+    return os.path.join(base, f"ygg-check-{safe}.sock")
+
+
 def run_on_host(host, cmd, timeout=45):
     if host == "local":
         full = cmd
     else:
-        full = f"ssh -o ConnectTimeout=5 -o BatchMode=yes {shlex.quote(host)} {shlex.quote(cmd)}"
+        # ⛔ ControlMaster is load-bearing, not tuning. This walk makes one ssh
+        # call PER FILE (stat, then parse), so on a host with ~700 store files a
+        # fresh TCP+auth handshake each time put a remote run past ten minutes —
+        # and a falsifier nobody can afford to run is not a falsifier. One
+        # multiplexed connection turns each call into a channel on a socket that
+        # is already open.
+        full = (
+            "ssh -o ConnectTimeout=5 -o BatchMode=yes "
+            "-o ControlMaster=auto -o ControlPersist=120 "
+            f"-o ControlPath={shlex.quote(_ssh_control_path(host))} "
+            f"{shlex.quote(host)} {shlex.quote(cmd)}"
+        )
     try:
         out = subprocess.check_output(full, shell=True, text=True, timeout=timeout, stderr=subprocess.STDOUT)
         return out, None
