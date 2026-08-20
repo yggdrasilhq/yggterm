@@ -225,7 +225,7 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
                 // A REJECTED title spent a request too — counting only the
                 // successes would let a host that can produce nothing usable
                 // spend an unbounded number of them.
-                if source == "generated" || source == "rejected" {
+                if matches!(source, "generated" | "rejected" | "no-title") {
                     attempted += 1;
                 }
                 resolved.push(ResolvedRow {
@@ -386,7 +386,12 @@ fn resolve_one(
                     return Ok((None, "rejected", Some(context_chars)));
                 }
             }
-            Ok((title, "generated", Some(context_chars)))
+            // ⛔ "generated" must mean a title CAME BACK. Labelling the call
+            // rather than its result had a host reporting 37 generations while
+            // its own after-scan said nothing changed — all 37 returned
+            // nothing, and the report could not say so.
+            let source = if title.is_some() { "generated" } else { "no-title" };
+            Ok((title, source, Some(context_chars)))
         }
     }
 }
@@ -513,7 +518,7 @@ fn print_human(report: &SweepReport, bad_total: usize) {
     let thin = report
         .resolved
         .iter()
-        .filter(|row| row.source == "generated")
+        .filter(|row| matches!(row.source, "generated" | "no-title" | "rejected"))
         .filter(|row| row.context_chars.is_some_and(|chars| chars < THIN_CONTEXT_CHARS))
         .count();
     if thin > 0 {
@@ -524,7 +529,7 @@ fn print_human(report: &SweepReport, bad_total: usize) {
             report
                 .resolved
                 .iter()
-                .filter(|row| row.source == "generated")
+                .filter(|row| matches!(row.source, "generated" | "no-title" | "rejected"))
                 .count()
         );
     }
