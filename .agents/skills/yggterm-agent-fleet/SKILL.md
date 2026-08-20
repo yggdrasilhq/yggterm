@@ -2587,6 +2587,42 @@ launch — do not route around it.
 
 ---
 
+### Viewport coverage — how much of the grid Grok Build, OpenCode, Pi and Qwen actually paint
+
+*A cross-CLI measurement, deliberately one table rather than four entries: its
+whole value is the COMPARISON, and the register's per-CLI rule exists so a
+session driving X reads only X's list — here the other three ARE the control.*
+
+*Measured 2026-08-20 with `scripts/cli-viewport-probe` (a real PTY fed to the same
+`vt100` crate the daemon parses with). Recorded because the LAST session to ask
+this question guessed, and the guess became a 120x40 PTY clamp that produced the
+fault it was meant to fix.*
+
+| CLI | given a 173x63 PTY, paints to column | reads as |
+|---|---|---|
+| `grok` | 171 | fills whatever grid it is handed |
+| `opencode` | 172 | fills whatever grid it is handed |
+| `pi` | 173 | fills whatever grid it is handed |
+| `qwen` | 102 | genuinely narrow — **and paints the same 102 at a 120-col PTY**, so shrinking the terminal does not make it fill anything |
+
+- ⛔ **THE TELL, AND IT IS THE WHOLE ENTRY: a TUI painting ~120 columns inside a
+  wider viewport is a STALE PTY GRID, not a narrow CLI.** The two look identical
+  on screen. Read `PTY size` in the session metadata pane (or `server snapshot`)
+  and compare it against the client grid *before* concluding anything about the
+  program. If they disagree, the bug is the geometry, not the CLI.
+- ⚠ **`qwen` renders a 3-row header, not the 6-row banner its ASCII art suggests**,
+  at every grid size from 100x30 to 173x200, in a bare PTY with no yggterm
+  involved. If you are chasing "qwen's motd is cut off at the top", reproduce it
+  in a plain shell first — by the wrapper-vs-manual parity rule that makes it
+  qwen's own rendering and not ours.
+- ⚠ **A hand-rolled vt100 will lie to you here, and it lied first.** Gradient
+  banners and block art are routinely drawn as SPACES carrying a background
+  colour; a probe that asks "is the text blank" scores a fully-painted header as
+  empty and invents a cut-off top. Use the probe (it reports `bg_only_cells` so
+  the failure mode is visible) or the daemon's own screen, never a quick parser.
+
+---
+
 ### Grok Build (grok)
 
 **The tell:** `grok --version` works, the npm package installed fine, and yet
@@ -2647,6 +2683,26 @@ cluster of failure timestamps reads as concurrency. Check the INTERVAL between
 them before concluding anything: ~3.5 s apart is a lock working, not a race.
 
 ### Any CLI — quirks that are about the ROW, not the program
+
+**0. ⛔⛔ A MULTI-SECOND "the row will not take my typing" IS NOT ALWAYS THE ROW —
+until 2026-08-20 the GUI's own event loop stopped reading input while it waited
+on the daemon.** `tokio::select!` runs the chosen branch to completion before
+polling any branch again, and the terminal loop awaited the daemon read inline.
+While that read was out, the branch handling KEYSTROKES was not polled at all.
+
+- **Tell:** typing lands seconds later, all at once; and the `input/keystroke`
+  probe shows **nothing at all** for the stall, because it is emitted from inside
+  the branch that was blocked. **A zero reading from that probe during a reported
+  freeze is not evidence the user did not type.**
+- **Measured:** with the daemon deliberately stopped for 6 s, the old build
+  recorded `input/loop_block branch=read_poll held_ms=5964`; the fixed build
+  recorded nothing across the identical stall.
+- **Fix (shipped):** the read runs on its own task; `input/loop_block` is emitted
+  by whichever branch held the loop, so a stall now names its cause.
+- ⚠ **What it does NOT fix:** the daemon serves every request under ONE runtime
+  lock, so a handler doing slow IO still deafens it to all clients. That half is
+  its own queue entry — do not read a quiet loop as a quiet daemon.
+
 
 These bite regardless of which agent CLI is inside the row, and they have each
 cost a live session:

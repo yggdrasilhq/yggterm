@@ -269,6 +269,65 @@ visible rather than silent.
 
 *Probes wired.* `crates/yggterm-core/src/perf.rs: input/keystroke|pty|render` registered `always`; `crates/yggterm-shell/src/shell/viewport.rs:Ok(TerminalJsEvent::Input)` emits `input/keystroke`, `crates/yggterm-server/src/daemon.rs:write_local_terminal_with_lost_runtime_recovery` emits `input/pty`, `crates/yggterm-shell/src/shell/viewport.rs:terminal_write_bridge.stage_or_immediate` emits `input/render`. Use `ytrace tail --category input --since 5m --json | jq 'group_by(.name)'` to flush out bugs where `keystroke` count ≫ `pty` or `render` lags >50 ms.
 
+#### ⛔ THE GUI EVENT LOOP STOPPED READING INPUT WHILE IT WAITED ON THE DAEMON (fixed 2026-08-20)
+
+*The fault it produced: "many CLI sessions have a sudden input freeze".*
+
+`tokio::select!` runs the chosen branch's body to completion before polling any
+branch again. The terminal event loop in `yggterm-shell/src/shell/viewport.rs`
+has three branches — the JS bridge result, **the JS events (keystrokes)**, and
+**the read poll** — and the read poll awaited `terminal_read_async` inline.
+While that await was outstanding the keystroke branch was not polled at all, so
+the user's typing sat in the JS event channel until the daemon answered.
+`TerminalRead` carries the 10 s default client IO timeout, so one slow read could
+hold input for up to ten seconds. **Echo was waiting on the read poll, not on its
+own PTY write** — and so were resize, clipboard, focus, bell and close.
+
+⛔ **AND THE PROBE FOR THIS SYMPTOM COULD NOT SEE IT.** `input/keystroke` (Issue
+13) is emitted at the top of the keystroke handler, i.e. **downstream of the
+block**. A real multi-second stall therefore records nothing at all. ⇒ **A zero
+reading from `input/*` during a reported freeze is not evidence that the user did
+not type**; it is consistent with the loop never having been polled. This is a
+blind instrument by construction, not by misconfiguration — the deployed GUI does
+carry the probe strings.
+
+**The fix.** The read runs on its own task and its result arrives on a channel,
+so typing is serviced while the daemon answers. One read stays outstanding at a
+time (depth-1 channel plus an in-flight latch), so cursor advance stays
+sequential. The hoist admits an interleaving that could not happen before — six
+paths in the JS-event branch reset `cursor` to 0 to force a re-attach, and
+applying a stale read's `next_cursor` afterwards would skip past everything the
+re-attach meant to replay — so a read issued at a different cursor than the
+current one is discarded and re-read (`terminal_read_discarded_stale_cursor`).
+
+**New instrument: `input/loop_block`.** Emitted by whichever branch held the loop
+past ~120 ms, with the branch name and the hold, so a stall names its cause
+instead of vanishing. Drop-based, because the branch bodies exit from many
+places and the unusual slow path is exactly the one an explicit timing call at
+the bottom would miss.
+
+**A/B, measured in the under-glass sandbox** — same daemon build, same 6 s
+`SIGSTOP` of the daemon, only the GUI differs:
+
+| GUI arm | `input/loop_block` during the stall |
+|---|---|
+| read awaited inline (before) | **1 event — `branch:read_poll, held_ms:5964`** |
+| read dispatched off-loop (after) | **0 events** |
+
+The fixed session came back healthy across the stall (live prompt, intact bottom,
+grid unchanged) and recorded zero stale-cursor discards.
+
+⚠ **WHAT THIS DOES NOT FIX, AND DO NOT READ A QUIET LOOP AS A QUIET DAEMON.** The
+daemon serves every request under ONE runtime lock, and `TerminalRead` can proxy
+synchronously to a preserved-owner daemon while holding it. That is the amplifier
+underneath, it is a separate OPEN queue entry, and it is what decides how long the
+round trip itself takes once the loop is free.
+
+**Locked by:** `the_daemon_read_is_dispatched_off_the_select_loop` — a
+source-level check, because a behavioural test cannot reach this loop and a
+re-inlined `.await` would pass every functional assertion while quietly restoring
+the stall.
+
 ### Issue Heading 14: Agy exemplar — Antigravity faults vs Claude gold (like Muse)
 
 *Why agy.* `antigravity` (`agy` binary, `remote-agy://` / `agy-runtime://`, `agy --conversation <id>`) stores in SQLite `~/.gemini/antigravity-cli/conversations/*.db` + `brain/*/.system_generated/logs/transcript.jsonl` + `history.jsonl`, `TitleAuthority::Store` (`conversation_summaries.title` > `preview`). Like `muse`, it writes no title for empty sessions — fresh rows landed `A_ #1557b0` shorthash or generic `antigravity` until the `Muse` fix. Unlike `claude`, its store is a DB, not one file per session, so `read_antigravity_session_title()` must open the DB (not a JSONL tail) and `id` is `conversation_id` (not filename). Faults: (1) shorthash/generic not filtered → now via `titles.rs` bare_hash + `generic_runtime_title` (same `Muse` fix, `ytrace title/*`), (2) `agy` title pickup in `daemon.rs:collect_live_antigravity_title_syncs` now emits `cli/agy_title` `ytrace` for `no_title_in_store`, `fallback:true`, and `is_untitled` (so Dash can see `agy` untitled re-resolve like `muse`), (3) resume uses `agy-runtime://` + `agy --conversation` (like `muse` `resume` subcommand, not flag) — verify `remote_runtime_agent_session_key("remote-agy://…")` returns `agy-runtime://<internal-id>` from DB, not row UUID, otherwise switch orphans PTY (same `muse` kick), **(4) `server connect` wiring — `remote-agy://oc/<id>` opened as Codex (`yggterm: saved Codex session <id> is no longer available` measured 2026-08-19 `oc → gh/yggterm` `2cc9f225…` via `server connect remote-agy://oc/…` and cwdtree click): `crates/yggterm-server/src/server_cli.rs:488 connect_session_kind_for_path()` hand-list missed `remote-agy://` in the live `4083ede2` daemon, falling through to `Codex` default, and `crates/yggterm-server/src/lib.rs:11658 remote_saved_agent_session_exists()` checked **local** `~/.gemini/...` (`dirs::home_dir()` on `dev`) for a `remote-agy://oc/<id>` instead of `ssh oc` remote DB — so a DB-only `conversation_id` (`2cc9f225…` no file, only `conversation_summaries.db` row) was seen as missing. Fix: `server_cli.rs:475 parse_remote_scanned_connect_path()` only matched `remote-session://` (Codex) by design, but `server_cli.rs:488` now registry-derived via `yggterm_core::agent_scheme::remote_agent_row_schemes()` (so every `remote-<slug>://` maps to its `SessionKind`), and `lib.rs:11658` dispatches `remote-agy://<machine>/<id>` to `ssh <machine> "sqlite3 -readonly ~/.gemini/antigravity-cli/conversation_summaries.db 'select 1 where conversation_id=? and killed=0'"` (same pattern as `remote_saved_codex_session_exists`), with `open_stored_session` then launching `agy --conversation <id>` via `managed_cli` `agy-runtime://`. Verified via `server snapshot` `remote_machines[oc].scanned_sessions` `remote-agy://oc/… cwd ~/gh/yggterm` under `oc/__remote_folder__/gh/yggterm` as `A_ #1557b0` and `server connect remote-agy://oc/2cc9f225…` → live `agy-runtime://` + `pty`**. `claude` gold remains the reference: one file per session, flag `--resume`, filename IS id.
