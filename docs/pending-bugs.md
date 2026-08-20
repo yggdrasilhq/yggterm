@@ -365,6 +365,31 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 **Falsifier (11.4's half):** with the watchdog live, an induced 500 ms main-thread block raises
 `ui/block` with attribution within one tick, and the keystroke echo tail lands on the GUI host.
 
+## ⛔⛔ [11.2→6.1] A DEPLOY THAT CHANGES THE GUI IMAGE LEAVES THE GUI RUNNING THE OLD ONE, QUEUING A SWAP THAT CAN NEVER CONVERGE
+
+**Status:** OPEN — measured live 2026-08-20 13:0x on the desktop host, mid-wave
+
+After the 3.1.6 deploy (12:56): daemon adopted 3.1.6 ✅; the GUI process (started 11:57:50) kept
+running the REPLACED image — `readlink /proc/<pid>/exe` ends "(deleted)", the deploy's markers
+count 0 in `/proc/<pid>/exe` while counting 1 on disk. Every ~70 s since, a futile loop: old GUI
+emits `startup_hot_swap_declined_swap_queued`, daemon answers
+`hot_restart_swap_queue_skipped {"reason":"the replacement binary is not ahead of this daemon"}`.
+Both are individually correct; nothing converges, because **what needs replacing is the GUI
+PROCESS and the swap machinery only reasons about daemons.** A GUI cannot hot-swap itself in
+place. (Checked against the catastrophic-mismatch spin: 780 events/min vs that failure's 2,500/min,
+GUI otherwise working — a stuck transitional state, not the emergency class.)
+
+Consequences measured: three GUI-side fixes were dead on disk while "marker-verified" read green
+(the verification rule was disk-strings; corrected wave-wide 13:20 — verify against the LIVE pid's
+`/proc/<pid>/exe`, its readlink, and start-time-vs-deploy-time).
+
+**Fix direction:** the deploy (or the daemon answering the queued swap) must detect
+`gui_image_changed && gui_process_predates_deploy` and either restart the GUI (clean env per
+presentation policy) or raise a LOUD stale-GUI alarm — silent futile queuing is the defect.
+
+**Falsifier:** deploy a GUI-image change; within one swap-queue cycle the GUI either runs the new
+image (fresh pid, markers present in /proc/<pid>/exe) or a visible alarm names the staleness.
+
 ## ⛔⛔ [leak] A FLEET HOST NAME SITS IN 33 TRACKED LINES, AND THE GUARD NEVER KNEW IT WAS A TERM
 
 **Status:** OPEN
