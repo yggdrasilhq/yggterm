@@ -199,6 +199,21 @@ the supervisor to respawn on clean child exit), honouring the active-viewport co
 until the viewer is idle, bounded). **Falsifier:** swap the binary, run the verb, and the new
 pid runs the new image with the supervisor alive and every row intact.
 
+## ⛔⛔ [11.9] THE HOT-RESTART GATE COMPARES VERSION STRINGS, SO A SAME-VERSION REBUILD NEVER ROLLS
+
+**Status:** OPEN (measured 2026-08-21 ~00:15 by the cli-practice lane)
+
+A rebuilt binary installed at the SAME version answers `already_ready:true` from the deploy
+gate while `/proc/<daemon>/exe` md5 differs from disk — the daemon keeps running the old
+code and every instrument agrees the deploy landed. Any lane that ships a fix without
+bumping the version is then live-testing code that is not running, with green instruments.
+This composes with the known "deploy race has no instrument" trap into a closed loop: the
+same-version path both skips the roll AND hides that it skipped. **Fix direction:** the
+gate must compare BUILD IDENTITY (build id / exe hash), not the version string; a
+same-version different-build install is a roll, and `already_ready` must name the build id
+it verified. **Falsifier:** rebuild at an unchanged version with a one-line observable
+change, install, and the gate must roll the daemon and the change must be observable live.
+
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
 **Status:** OPEN (owner-reported live 2026-08-21 ~00:1x as "INPUT BLOCK ON 13.0")
