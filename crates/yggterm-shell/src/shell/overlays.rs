@@ -1395,19 +1395,35 @@ fn ThemeEditorOverlay(
                                 THEME_EDITOR_PAD_SIZE as i32,
                                 preview_surface
                             ),
+                            // ⭐ THE GRID IS MAGNETIC, AND ALT LETS GO OF IT.
+                            // The pad has always PAINTED a grid; until now it did
+                            // not act on one, so every line on it was decoration
+                            // and a stop could only ever be eyeballed onto it.
+                            // Holding Alt suspends the magnetism for the placement
+                            // that genuinely wants to sit between two lines.
                             onmousemove: move |evt| {
                                 let point = evt.element_coordinates();
+                                let snapping = !evt.modifiers().contains(Modifiers::ALT);
                                 on_drag_stop.call((
-                                    normalize_theme_editor_axis(point.x),
-                                    normalize_theme_editor_axis(point.y),
+                                    normalize_theme_editor_axis(snap_theme_editor_axis_px(
+                                        point.x, snapping,
+                                    )),
+                                    normalize_theme_editor_axis(snap_theme_editor_axis_px(
+                                        point.y, snapping,
+                                    )),
                                 ));
                             },
                             onmouseup: move |evt| on_end_drag_stop.call(evt),
                             ondoubleclick: move |evt| {
                                 let point = evt.element_coordinates();
+                                let snapping = !evt.modifiers().contains(Modifiers::ALT);
                                 on_double_click_pad.call((
-                                    normalize_theme_editor_axis(point.x),
-                                    normalize_theme_editor_axis(point.y),
+                                    normalize_theme_editor_axis(snap_theme_editor_axis_px(
+                                        point.x, snapping,
+                                    )),
+                                    normalize_theme_editor_axis(snap_theme_editor_axis_px(
+                                        point.y, snapping,
+                                    )),
                                 ));
                             },
                             div {
@@ -1429,9 +1445,18 @@ fn ThemeEditorOverlay(
                             for (index, stop) in snapshot.theme_editor_draft.colors.iter().enumerate() {
                                 button {
                                     key: "theme-stop-{index}",
+                                    // ⭐ THE HANDLE SAYS WHEN THE GRID HAS HOLD OF IT.
+                                    // A magnetic grid the eye cannot read is worse
+                                    // than none: the point moves by an amount the
+                                    // hand did not ask for and nothing explains why.
+                                    // A stop resting on the grid wears a thin accent
+                                    // halo; one placed freely does not. Derived from
+                                    // the stop's coordinates (DESIGN.md ▸ Gradient pad),
+                                    // so it reads the same on a theme loaded from disk
+                                    // as on one just dragged.
                                     style: format!(
                                         "position:absolute; left:calc({:.2}% - 11px); top:calc({:.2}% - 11px); width:22px; height:22px; \
-                                         border-radius:999px; border:{}; background:{}; box-shadow:0 10px 22px rgba(42,67,88,0.16);",
+                                         border-radius:999px; border:{}; background:{}; box-shadow:{};",
                                         stop.x * 100.0,
                                         stop.y * 100.0,
                                         if snapshot.theme_editor_selected_stop == Some(index) {
@@ -1439,7 +1464,17 @@ fn ThemeEditorOverlay(
                                         } else {
                                             "2px solid rgba(255,255,255,0.86)".to_string()
                                         },
-                                        stop.color
+                                        stop.color,
+                                        if theme_editor_axis_is_on_grid(stop.x)
+                                            && theme_editor_axis_is_on_grid(stop.y)
+                                        {
+                                            format!(
+                                                "0 0 0 4px {}, 0 10px 22px rgba(42,67,88,0.16)",
+                                                theme_editor_snap_halo(&accent)
+                                            )
+                                        } else {
+                                            "0 10px 22px rgba(42,67,88,0.16)".to_string()
+                                        }
                                     ),
                                     onmousedown: move |evt| {
                                         evt.stop_propagation();
@@ -1688,6 +1723,79 @@ fn ThemeDialogButton(
 }
 fn normalize_theme_editor_axis(value: f64) -> f32 {
     ((value / THEME_EDITOR_PAD_SIZE).clamp(0.0, 1.0)) as f32
+}
+/// The gradient pad's minor gridline pitch, in pad pixels. It is the SAME number
+/// the pad paints its 24px grid with — one owner, so a point can never snap to a
+/// line the eye cannot see. (The 96px major grid is a visual accent over these,
+/// not a second set of targets.)
+const THEME_EDITOR_GRID_PX: f64 = 24.0;
+/// How close a point must come before the grid takes it. Arc's pad is MAGNETIC,
+/// not quantised: a quantised pad cannot express a stop at 37% and so takes the
+/// pen out of the designer's hand, while a magnetic one snaps the placements that
+/// wanted to be exact and leaves the rest alone. 7px on a 24px pitch means the
+/// outer ~70% of every cell is still free travel.
+const THEME_EDITOR_SNAP_RADIUS_PX: f64 = 7.0;
+/// Pull one axis of a gradient stop onto the visible grid, in PAD PIXELS.
+///
+/// Snap targets are the minor gridlines AND both pad edges. The edges must be
+/// named explicitly: the pad is 286px and the pitch is 24px, so the far edge is
+/// not a multiple of the pitch and the nearest-line arithmetic alone can never
+/// land on it — a stop dragged into the far corner would come to rest a few
+/// pixels short of it, which is precisely the placement a designer most wants
+/// to be exact.
+fn snap_theme_editor_axis_px(value: f64, snapping: bool) -> f64 {
+    if !snapping {
+        return value;
+    }
+    let mut best = value;
+    let mut best_distance = THEME_EDITOR_SNAP_RADIUS_PX;
+    let last_line = (THEME_EDITOR_PAD_SIZE / THEME_EDITOR_GRID_PX).floor() as i32;
+    let candidates = (0..=last_line)
+        .map(|line| f64::from(line) * THEME_EDITOR_GRID_PX)
+        .chain([0.0, THEME_EDITOR_PAD_SIZE]);
+    for candidate in candidates {
+        let distance = (value - candidate).abs();
+        if distance <= best_distance {
+            best_distance = distance;
+            best = candidate;
+        }
+    }
+    best
+}
+/// The snap halo's colour: the theme accent at low alpha.
+///
+/// ⛔ AN ALPHA SUFFIX IS NOT UNIVERSALLY APPENDABLE. `#rrggbb` takes a two-digit
+/// alpha and becomes `#rrggbbaa`, but the accent is a theme-supplied string and a
+/// theme may hand over `rgb(…)`, `oklch(…)` or a named colour — appending to any
+/// of those yields a colour the engine silently drops, taking the whole
+/// `box-shadow` declaration with it and leaving the snap state invisible with
+/// nothing in the log. Only the shape that can carry alpha gets it; anything else
+/// falls back to a neutral halo that always renders.
+fn theme_editor_snap_halo(accent: &str) -> String {
+    let hex = accent.trim();
+    if hex.len() == 7
+        && hex.starts_with('#')
+        && hex[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return format!("{hex}2e");
+    }
+    "rgba(120,142,166,0.30)".to_string()
+}
+/// True when a stop already sits on the grid, so the handle can SAY it is
+/// snapped. Derived from the stop's own coordinates rather than remembered from
+/// the drag that placed it — a remembered flag is a second encoding of the same
+/// fact and drifts the moment a theme is loaded from disk rather than dragged.
+fn theme_editor_axis_is_on_grid(normalized: f32) -> bool {
+    // ⛔ NOT `snap(px) == px`. The snapper RETURNS ITS INPUT UNCHANGED when the
+    // point is out of magnet range, so comparing against it reports every
+    // free-standing point as on-grid — the answer is "true" for the mid-cell
+    // placement this is meant to distinguish. Ask the gridlines directly.
+    let px = f64::from(normalized) * THEME_EDITOR_PAD_SIZE;
+    let last_line = (THEME_EDITOR_PAD_SIZE / THEME_EDITOR_GRID_PX).floor() as i32;
+    (0..=last_line)
+        .map(|line| f64::from(line) * THEME_EDITOR_GRID_PX)
+        .chain([0.0, THEME_EDITOR_PAD_SIZE])
+        .any(|candidate| (px - candidate).abs() < 0.5)
 }
 #[component]
 fn SettingsField(
