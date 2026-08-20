@@ -70,6 +70,13 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
             // is emitted from the branch that DID run, so the stall is attributed
             // to whoever caused it instead of vanishing.
             "input/loop_block",
+            // ⛔ THE FOURTH LEG: CONSUMPTION, not delivery. `keystroke → pty →
+            // render` proves the bytes reached the pseudo-terminal and says
+            // nothing about whether the program behind it READ them. A CLI that
+            // has stopped reading its PTY scores a perfect run on the other three
+            // and leaves the user unable to type. This probe is the difference,
+            // and it is a SUSPICION rather than a verdict — see the emitter.
+            "input/unconsumed",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }

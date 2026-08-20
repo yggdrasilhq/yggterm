@@ -255,11 +255,27 @@ tell — see the `[6.7]` deaf-row entry — but it is exposed only on the
 at `input/*`, where it does not appear. Two correct instruments, and the one that
 would have answered is not on the path anybody walks to ask the question.
 
-**What would close it:** give the input chain a fourth leg — consumption, not just
-delivery — sourced from the `input_unanswered_ms` the daemon already computes, so
-that `ytrace --category input` can show a row taking bytes and never reading them.
-Until then a freeze investigation cannot distinguish "delivered and consumed" from
-"delivered and ignored", which are the two cases that matter.
+✅ **THE FOURTH LEG IS BUILT: `input/unconsumed`.** The daemon's chore tick now
+reports any row whose input has gone unanswered past a threshold, with
+`unanswered_ms`, `output_idle_ms` and `verdict: "suspected"`. Live-proven: a row
+put into `stty raw -echo` and then left unreading was named with
+`unanswered_ms: 4008` beside a climbing output-idle — the deaf-row signature, on
+the input category where a freeze investigation actually looks.
+
+⛔ **AND THE ONE THING TO KNOW ABOUT IT: IT CANNOT FIRE WHILE THE TTY ECHOES.**
+`input_unanswered_ms` means "input newer than output", and on a cooked-mode tty
+the KERNEL echoes every byte written — which counts as output. A plain shell at
+its prompt therefore never becomes a suspect. Measured while building it: writing
+into a row running `exec sleep 300` echoed and stayed `None` indefinitely; the
+same write after `stty raw -echo` produced the signature immediately.
+⇒ **This points the probe exactly where it is needed rather than limiting it.**
+Every agent CLI runs its tty raw with echo off — that is what a TUI is — so the
+rows that can wedge invisibly are precisely the rows it can see, and a cooked
+shell cannot go silently deaf because the kernel answers for it.
+
+⚠ Still a SUSPICION and named as one in the payload. The definitive check writes a
+marker into the row, which is destructive on a session a human is using; this
+exists so nobody needs to reach for that to find the candidate.
 
 ⛔⛔ **AND THE OBVIOUS PROBE IS DESTRUCTIVE — DO NOT REACH FOR IT.** `input-check`
 answers this question by **writing a marker into the row**, i.e. by typing into a
