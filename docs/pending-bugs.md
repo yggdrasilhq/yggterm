@@ -64,11 +64,36 @@ policy, now fixed client-side: it disabled the composer on every retry and never
 on exhaust, so each episode cost ~a minute of dead input and an exhausted loop left the
 composer dead until a fresh switch won — the owner's "unusable input lag, 3-5 switches".
 Fixed: local sessions keep input enabled through read recovery (the daemon owns the PTY; a
-keystroke is its own request), and read-exhaust re-enables the composer. Remote resume and the
-write-error twin keep their stricter gates. **Still OPEN under this heading: the daemon-side
-root** — `terminal_read` must never out-wait the client IO timeout (serve reads from a
-snapshot without the write lock); until then the toast keeps firing, merely without taking
-input hostage.
+keystroke is its own request), and read-exhaust re-enables the composer. The write-error twin
+keeps its stricter gate. **Second round, same day:** with the local fix live, a remote-row
+episode froze typing again during a burst of remote session creates — the REMOTE read-recovery
+branch had kept its input-disable, and the burst itself was the cause: every remote START
+resolved its cwd by shelling out over ssh (ConnectTimeout=5) INSIDE the locked request
+handler, deafening the GUI-host daemon per create while every other client's reads queued
+behind it (the target host's daemon showed zero slow lock waits — the stall was entirely
+mediator-side). Both fixed in code (remote read recovery keeps input alive + the resolution
+moved to the dispatch's pre-lock stage, the TerminalRead hoist's law applied a second time) —
+**LIVE PROOF OWED after the next daemon adoption**: a burst of remote creates must produce no
+read-timeout recovery episode on a focused row, and any episode that does occur must leave
+typing alive. **Still OPEN under this heading: the structural half** — `terminal_read` can
+out-wait the client IO timeout whenever the lock holder is slow for any other reason; serving
+reads from a snapshot without the write lock closes the class, not just the instances.
+
+## ⚠ [11.0] THE GUI HAS NO "RESTART ONTO THE CURRENT DISK IMAGE" VERB, AND THE RAW KILL COSTS THE SUPERVISOR
+
+**Status:** OPEN
+
+Two measured facts from one deploy day: (1) killing the GUI child takes the supervisor down
+with it — the supervised pair exits together, so an agent-driven binary swap turns into a full
+outage until an explicit relaunch (~40 s observed); (2) `server app update restart` restarts
+only within its OWN staged-update flow (`restart_pending_update`) — pointed at a
+freshly-written disk binary outside that flow it accepts the request and changes nothing.
+Result: there is no clean agent path from "new GUI binary on disk" to "running GUI on that
+binary" while sessions keep their daemon-owned PTYs. **Fix direction:** a first-class
+`server app restart` that execs the current disk image under the same supervisor (or teaches
+the supervisor to respawn on clean child exit), honouring the active-viewport courtesy (defer
+until the viewer is idle, bounded). **Falsifier:** swap the binary, run the verb, and the new
+pid runs the new image with the supervisor alive and every row intact.
 
 ## ⚠ [11.0] SWAP RESIDUE MAKES EVERY FIRST TOUCH CRAWL, AND TWO INSTRUMENTS CALLED IT HEALTHY
 
