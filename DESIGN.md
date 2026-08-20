@@ -1725,3 +1725,74 @@ It should be able to grow toward richer canvas modes such as:
 - spreadsheet-like surfaces
 
 If a paper surface gains structured tools, prefer a ribbon-like strip beneath the titlebar over scattered floating controls.
+
+### Window corners
+
+The app draws its own chrome, so its window corners are its own problem. They
+are part of the product's shape, not a platform default it inherits.
+
+- **Unmaximized windows are rounded at 10px** (`UNMAXIMIZED_SHELL_RADIUS_PX`) on
+  every platform that can express it.
+- **Maximized windows square off.** A maximized window is edge-to-edge with the
+  screen; a rounded corner there reveals nothing behind it and reads as damage,
+  not as shape. This is the contract, not a regression.
+- **The radius is applied in the page, not on the frame.** The shell root carries
+  both `border-radius` and `clip-path: inset(0 round Npx)`. The clip-path is the
+  load-bearing half: GTK's own `border-radius` rounds a widget's background and
+  does **not** clip a child WebView, so without the clip the web content paints
+  square straight over a rounded frame.
+
+**Per-platform, how the corner is actually cut:**
+
+| Platform | Mechanism | State |
+|---|---|---|
+| Linux / Wayland | Transparent (RGBA) surface + the page's `clip-path`. There is no Shape extension, so this is the only path. | Works on every compositor. |
+| Linux / X11 | `shape_combine_region` on the GDK window (the Shape extension), opaque surface. KDE/X11 takes the transparent path instead, for its compositor's blur. | Works. |
+| Windows | Transparent surface + the page's `clip-path`, same as Wayland. | Rounds. See the note below. |
+| macOS | Native window rounding — the window is `decorated` with a hidden title and a full-size content view, so AppKit cuts the corner itself. | Free. |
+
+⛔ **Never gate the corner on which desktop the session claims to be.** Alpha
+compositing is core to Wayland — it is not an extension a compositor may decline
+— so there is nothing to detect. Gating on desktop identity is what made this
+setting cycle fixed→broken for years: every desktop not named in the list shipped
+square corners, and the one that *was* named was recognised from scraped
+environment that a daemon-launched GUI does not have, so the same machine
+rendered both ways on different launches. Key on the capability.
+
+⚠ **Windows 11 has a native corner preference** (`DwmSetWindowAttribute` with
+`DWMWA_WINDOW_CORNER_PREFERENCE`) that yggterm does **not** currently set. The
+CSD path above already rounds the window, so this is a polish gap rather than a
+break: the native attribute would additionally hand the corner to DWM for the
+system shadow and the snap-layout affordance, and Windows 10 has no equivalent
+and must stay on the CSD path regardless.
+
+**The corner is a tested contract, and it must stay one.** `scripts/corner-contract.sh`
+asserts it in pixels against a headless Wayland-native compositor. Do not
+"verify" a corner change from `dom.shell_root_border_radius` or from
+`server app screenshot`: the first reports the CSS that was *asked for* and reads
+`10px` on a window whose corners are square, and the second returns RGB, so the
+snapshot flattens the very alpha that distinguishes a rounded corner from a
+square one. Only a compositor grab can tell them apart.
+
+### Gradient pad (theme editor)
+
+The pad is the theme engine's direct-manipulation surface: gradient stops are
+dragged on a square canvas, and it takes its cues from Arc's gradient editor.
+
+- **The grid is magnetic, not quantised.** A stop within 7px of the visible 24px
+  gridline is pulled onto it; further away it moves freely. A pad that rounds
+  *every* point to the grid cannot express a stop at 37% and has taken the pen
+  out of the designer's hand — the magnet snaps the placements that wanted to be
+  exact and leaves the rest alone.
+- **Both pad edges are snap targets.** The pad is not a whole number of cells, so
+  the nearest-gridline arithmetic can never land on the far edge — and the corner
+  is exactly the placement that most wants to be exact.
+- **Alt suspends the magnetism** for the placement that genuinely belongs between
+  two lines.
+- **A snapped stop says so**, with a thin accent halo. A magnet the eye cannot
+  read is worse than none: the point moves by an amount the hand did not ask for
+  and nothing explains why. The halo is derived from the stop's coordinates, not
+  remembered from the drag that placed it, so a theme loaded from disk reads the
+  same as one just dragged.
+- **The grid the magnet uses and the grid the pad paints are the same number.** A
+  stop must never snap to a line the eye cannot see.

@@ -12,6 +12,37 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## [11.11] A COMPOSITOR-DRIVEN FULLSCREEN KEEPS ITS ROUNDED CORNERS, SO THEY COMPOSITE ONTO BLACK
+
+**Status:** OPEN
+
+Found 2026-08-20 while building the corner-pixel contract; it is a separate defect
+from the Wayland corner gating fixed in the same lane, and narrower.
+
+**Symptom.** A window the COMPOSITOR puts fullscreen (a tiling WM, or an F11-style
+fullscreen that does not also set the maximized state) goes on drawing its 10px
+radius. Nothing sits behind a fullscreen surface, so the rounded corners composite
+onto black and the window gains four dark notches. Reproduced in the sandbox with
+`swaymsg fullscreen enable`: the corner arc is intact and reads `(0,0,0)`.
+
+**Mechanism.** `shell_effective_radius` squares the window off on `maximized` only
+(`crates/yggterm-shell/src/shell/launch.rs`, the `shell_radius` binding), and
+`maximized` comes from `desktop.is_maximized()` — the xdg-shell MAXIMIZED state.
+A compositor fullscreen sets the FULLSCREEN state instead, which that flag never
+sees. The shell's own `fullscreen` field cannot be folded in as the fix: it is the
+user's sticky distraction-free mode, not a window state, and squaring off on it
+would square a normal floating window whenever distraction-free is on. The window's
+real fullscreen state is not currently plumbed into the snapshot.
+
+**Why it survived.** The same gap made the corner contract's maximized arm pass for
+the wrong reason: a rounded corner over black is "not the compositor background",
+which is what the weak form of that assertion tested. The assertion now compares
+against the window's own paint, and the arm is skipped-and-named on a rack that
+will not set the maximized state.
+
+**Falsifies the fix:** put the window fullscreen through the compositor and grab the
+frame — all four corners must be the window's own paint, not black.
+
 ## ⛔⛔ [11.0] A USAGE-LIMIT WAIT READS AS "IDLE" ON EVERY STATE SURFACE THE DAEMON OWNS
 
 **Status:** OPEN
