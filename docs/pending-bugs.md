@@ -167,6 +167,14 @@ reason if it does not.
 
 **Status:** OPEN
 
+**ESCALATED same evening: at saturation this storm BLOCKS INPUT — the owner was frozen out
+twice while typing one message, with zero recovery-path disable events in the trace.** The
+dying GUI's last 35 minutes held 800 UI-thread block events, including a saturated minute of
+back-to-back 420-2101 ms stalls that exactly matched the felt freeze; the trigger window
+matched a fleet daemon adoption (re-attach churn across ~50 rows). So the storm has two
+presentations: blinks at cruise, input freezes at saturation — same mechanism, and adoption
+storms are its worst driver.
+
 Owner-reported as rapid viewport blinks, "a storm processed semi-gracefully"; measured live
 on the GUI while ~8 remote agent rows streamed: **898 `render` events in 8 minutes (~1.9/s;
 the app's own `app_render_rate` window agrees at 1.1/s)** against a same-day quiet baseline
