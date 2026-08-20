@@ -254,6 +254,38 @@ claim about a live machine. The live `ytrace.jsonl` was current **to the second*
 The instrument was reading elsewhere, and the size of the request is what sent it
 there.
 
+### 4.4c ⛔ A STARTUP EVENT IS EMITTED BY EVERY SHORT-LIVED CLI PROCESS, NOT ONLY BY THE APP
+
+`gui/startup/*` — `main_enter`, `linux_desktop_backend_policy`,
+`linux_memory_scope` — is emitted by **any** invocation of the binary, and the
+same binary serves the CLI. On a host where agents drive app-control, that is
+**207 distinct pids emitting `main_enter` in a five-minute window**. Every one of
+them also publishes a desktop-backend policy decision, and a CLI invocation over
+ssh has no desktop: `wayland_display_present: False`, `display_present: False`.
+
+⇒ **`tail | grep <name> | tail -1` therefore answers about a random CLI process,
+not about the app.** Read after relaunching a GUI, it says the GUI came up blind.
+
+**The near-miss (2026-08-20).** A GUI was relaunched and its arming checked this
+way. The last `linux_desktop_backend_policy` record showed no display at all —
+which, if reported, would have been a false alarm that the user's desktop had been
+replaced by a headless window. Filtered to the launched pid, the same stream said
+`policy: kde_wayland_native_default`, `gdk_backend: wayland`,
+`wayland_display_present: True`. Both records were true; only one was about the
+GUI.
+
+⇒ **Filter every startup event by the pid you are asking about**, and prefer the
+one you launched:
+
+```bash
+# the pid `server app launch` returned — not "the most recent record"
+… | python3 -c '…; [print(d) for d in recs if d["pid"] == LAUNCHED_PID]'
+```
+
+⚠ Same family as §4.4/§4.4b: the record is well-formed and true, and the question
+you asked is not the question it answers. Here the discriminator is **whose pid**,
+not which window.
+
 ### 4.3c The probe NAME does not tell you the record KIND, and a temporal test needs a point event
 
 `request/lock_wait_slow` and `request/lock_wait_window` read as two views of one thing. They are not:
