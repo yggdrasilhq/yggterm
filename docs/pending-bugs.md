@@ -523,6 +523,35 @@ presentation policy) or raise a LOUD stale-GUI alarm — silent futile queuing i
 **Falsifier:** deploy a GUI-image change; within one swap-queue cycle the GUI either runs the new
 image (fresh pid, markers present in /proc/<pid>/exe) or a visible alarm names the staleness.
 
+## ⛔⛔ [11.0] A DEPLOY LEAVES NO PROVENANCE, SO "WHICH BUILD IS THIS" IS ANSWERED BY GUESSWORK
+
+**Status:** OPEN
+
+*Designed by the observability lane 2026-08-20; still unbuilt. The need is measured, repeatedly.*
+
+Every deploy-verification law this campaign has written exists because the running
+system cannot say where its own image came from. The rules are all workarounds:
+verify against the LIVE pid rather than the binary on disk, because a deploy writes a
+file that nothing adopted; `grep -c <marker> /proc/<pid>/exe` and a `readlink` for
+`(deleted)`, because a version string cannot distinguish two builds of one version;
+`strings -a | grep -c` for a marker chosen per-fix, because there is no general answer.
+
+⚠ **Each workaround is sound and none of them compose.** A marker proves one fix is
+present; it cannot say which commit, which host built it, when, or whether the copy
+serving this host is the one that was verified. So a lane proves its own change landed
+and still cannot answer "is this daemon current", which is the question every other
+lane asks about it. Measured cost this wave: one half-applied deploy where the daemon
+took the new image and the GUI did not, with a swap loop that never converged and no
+instrument that could name the split.
+
+**The stamp:** the build records commit, build host, build time and a content hash into
+the binary; a verb reads it back out of a RUNNING process, not a file. `strings` on the
+live image stays the fallback for a binary that predates the stamp.
+
+**Falsifier:** on any host, a single verb names the running daemon's commit and build
+time; two daemons of the same version built from different commits are distinguishable
+by it; and it reads from `/proc/<pid>` so a replaced-on-disk binary cannot forge it.
+
 ## ⛔⛔⛔ [11.0] A PLAIN SHELL BREAKS apt's BOTTOM-ANCHORED PROGRESS BAR — SO THE RENDER FAULT IS **NOT** SESSION-ONLY
 
 **Status:** OPEN
@@ -592,44 +621,6 @@ rewrite.
 title-heuristic fixture and phrase table reads as invented; `cargo test -p yggterm-core --lib
 titles` and `-p yggterm-server --lib` pass on the invented corpus; `scripts/check-privacy.sh` stays
 green with the term added to the shared key.
-
-## ⛔ [11.0] SEAT DERIVATION CROSSES CAMPAIGN ERAS AND SEATS ORCHESTRATORS BARE — TWO MIS-SEATS IN ONE SPAWN BATCH
-
-**Status:** OPEN
-
-Measured 2026-08-20 on a sibling campaign's spawn batch; owner-reported both faces.
-
-Two faces of the claim/seat derivation (`ygg-claim.sh` and callers that inherit its rules):
-
-1. **Token-sibling inference crossed eras.** An orchestrator seated at `12` spawned a delegate it
-   intended as `12.2`. The derivation matched campaign siblings by TOKEN, found rows from the same
-   campaign's OLD numbering era (`2.1`, `2.3` — months old, same token), and seated the new row at
-   **`2.2`** — a live, working delegate its own spawner could not find, reported as "it thinks it
-   spawned 12.2; there is no 12.2 row". The delegate was fine; the seat lied about its lineage.
-   ⇒ Derivation must prefer the SPAWNER'S OWN SEAT PREFIX (a row seated `12` spawns under `12.x`,
-   full stop) and use token-sibling inference only when the spawner has no seat.
-2. **A derived top-level seat is bare `N`, and the owner ruled it should be `N.0`.** The same
-   orchestrator self-claimed and landed at `12`, not `12.0` (owner: *"It spawned a row called 12.
-   instead of 12.0. So clearly some instructions need work in our row mechanism."*). The fleet's
-   own convention is `N.0` for an orchestrator seat with delegates at `N.1+` — the tool should
-   derive it that way when `--campaign` is given.
-
-**Mechanism sharpened by the victim's own timeline (2026-08-20):** the spawner's wrapper had a
-GENUINE sidebar read-back of seat `12.2` at 12:34:21 — the mis-seat happened AFTERWARDS, when the
-delegate ran `ygg-claim` minutes into its first turn (the global standing order tells every session
-to claim unasked) and the derivation token-matched the retired-era rows, **RENUMBERING an
-already-seated row**. That breaks the tool's own documented contract ("a row that already has a
-number KEEPS it; re-running the claim is a no-op") — either the derivation ignores an existing
-`outline_prefix` when the campaign token matches siblings, or the known seat-durability evaporation
-struck between verify and claim and the re-derivation then crossed eras. Fix must make an existing
-`outline_prefix` ABSOLUTE (claim = no-op), and token inference must exclude rows outside the
-spawner's own seat prefix. Victim's interim mitigation: briefs now say "you are already claimed and
-seated — skip ygg-claim".
-
-**Falsifier:** with old-era `2.x` rows present and an orchestrator seated `12.0`, a campaign-token
-spawn lands at `12.1` (never `2.x`), a fresh campaign claim with no explicit number lands at the
-next free `N.0`, and re-running `ygg-claim` on an already-seated row changes NOTHING even when the
-token matches foreign-era siblings.
 
 ## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
 
