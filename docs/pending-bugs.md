@@ -302,6 +302,53 @@ what happens after a boot decision.
 silence; a live stalled row is booted with exactly one typed copy and one Enter; `ps` shows
 exactly one watcher after two racing starts.
 
+## ⛔⛔ [11.10] A ROW-SET ENTRY WHOSE HEAD IS DEAD HIDES ITS MEMBERS FROM THE SIDEBAR — AND THE START PAGE, WHICH IGNORES ARRANGEMENT, KEPT COUNTING THEM
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Caught 2026-08-20 ~19:4x re-running the closed count-universe falsifier under practice
+traffic: shadow-rendered start page header **785**, both `startpage ls` and `cwdtree ls`
+`durable_count` **783**, bracketed and re-rendered fresh — a standing, not a timing, gap.*
+
+The two extras are two remote live sessions stuck in `RemoteBootstrap` (a relay wake spawned
+them; the [11.6] husk class), but the husk-ness is NOT why they hid. Their paths sit in
+`settings.row_arrangement` as MEMBERS of a row set whose head row no longer exists anywhere —
+no live session, no row, no transcript. The chain:
+
+1. **`RowArrangement::retain_live` — written precisely so "a departed head DISSOLVES … a
+   closed session never takes its members off the screen with it" — has NO production call
+   site.** Only its own unit tests call it. The cure existed and was inert (second instance
+   of that shape this week). The dead-head entry therefore persists in settings forever.
+2. **`RowSets::visible_rows` skipped every row with a stored parent**, and a member is only
+   drawn through its head — so a head absent from the drawn rows made its members VANISH:
+   no rail row, no tree row, invisible to `server app rows` and to both count verbs (whose
+   live-session injection iterates sidebar rows). Two LIVE sessions, hidden by layout state.
+3. **The start page builds its universe with `RowArrangement::default()`** — it ignores the
+   user's arrangement — so it kept showing them. Three surfaces, two answers, one universe
+   by contract.
+
+**Fixed in code (render side, non-destructive):** `visible_rows` now draws a member with no
+DRAWN ancestor at top level — arrangement may nest and order, it may not make a row
+disappear. With membership-neutral visibility the page's default-arrangement build and the
+sidebar's user-arrangement build count the same set again. Tests:
+`row_set::a_member_of_an_absent_head_draws_at_top_level_not_nowhere`,
+`…reaches_the_surface_through_an_absent_intermediate_head`, and shell
+`a_live_row_arranged_under_a_dead_head_still_reaches_the_sidebar`.
+
+**Open halves:** (a) the stored dead entry is now harmless but still garbage — `retain_live`
+still wants a production call site at a NON-TRANSIENT departure point (the GUI close/remove
+paths already call `dissolve`/`detach`; the gap is heads that die daemon-side or remotely,
+and a naive per-frame prune against a flickering universe would DESTROY user arrangement
+during a daemon restart, which is presumably why it was never wired); (b) the two live husk
+specimens on the GUI host (spawned by a campaign's parked-row wake relay, seated under a
+head that has since died) are evidence for the [11.6] husk entry and for the wake plane
+that spawned them — do not silently reap them.
+
+**Falsifier (re-arms the count-universe closure):** on the live GUI, with the dead-head
+arrangement entry still in settings, one simultaneous window must answer: shadow start page
+header == `startpage ls durable_count` == `cwdtree ls durable_count`, AND the two husk
+sessions each have a visible sidebar row (`server app rows` carries their paths).
+
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
 **Status:** OPEN

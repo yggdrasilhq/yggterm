@@ -387,20 +387,54 @@ impl RowSets {
     /// The caller supplies the top-level order because this module does not own
     /// it: Live Sessions order is durable user layout with its own owner, and a
     /// row set rearranges nothing about it.
+    ///
+    /// ⛔ A member whose head is NOT among the drawn rows is drawn at top
+    /// level, never dropped. Membership is stored durably while rows come and
+    /// go, so a stored parent can name a row this surface does not have — a
+    /// closed head, a session another surface owns. Skipping every row with a
+    /// parent made two live sessions invisible on the sidebar (and in every
+    /// verb that reads it) while a dead head sat in the arrangement; the start
+    /// page, which ignores the arrangement, kept showing them, and the two
+    /// surfaces disagreed by exactly that count. Arrangement may nest and
+    /// order; it may not make a row disappear.
     pub fn visible_rows<'a>(
         &'a self,
         top_level: impl IntoIterator<Item = &'a str>,
     ) -> Vec<(String, usize)> {
+        let order: Vec<&'a str> = top_level.into_iter().collect();
+        let present: HashSet<&str> = order.iter().copied().collect();
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        for path in top_level {
-            if self.parent_of(path).is_some() {
+        for path in order {
+            if self.drawn_ancestor_exists(path, &present) {
                 // Drawn under its head, not at the top level.
                 continue;
             }
             self.push_visible(path, 0, &mut out, &mut seen);
         }
         out
+    }
+
+    /// Does any ancestor of `path` exist among the rows being drawn? Only such
+    /// an ancestor can actually draw `path` beneath it — a stored parent that
+    /// is not on this surface cannot, so its members must fall back to the top
+    /// level rather than vanish.
+    fn drawn_ancestor_exists(&self, path: &str, present: &HashSet<&str>) -> bool {
+        let mut current = self.parent_of(path);
+        let mut guard = 0usize;
+        while let Some(head) = current {
+            if present.contains(head) {
+                return true;
+            }
+            guard += 1;
+            if guard > self.parent.len() {
+                // Unreachable while `insert_member` refuses cycles; a
+                // hand-edited persisted file still may not hang the render.
+                return false;
+            }
+            current = self.parent_of(head);
+        }
+        false
     }
 
     fn push_visible(
@@ -509,6 +543,39 @@ mod tests {
                 ("e".into(), 2)
             ],
             "re-expanding restores the inner sets, it does not flatten them open"
+        );
+    }
+
+    /// ⛔ THE ONE THAT HID TWO LIVE SESSIONS. Membership is stored durably
+    /// while rows come and go, so a stored parent can name a row the surface
+    /// being drawn does not have — a closed head whose entry nothing pruned.
+    /// Its members must fall back to the top level, never vanish: the sidebar
+    /// dropped them while the start page (which ignores arrangement) kept
+    /// counting them, and the two surfaces disagreed by exactly that count.
+    #[test]
+    fn a_member_of_an_absent_head_draws_at_top_level_not_nowhere() {
+        let sets = arrange(&[("gone", "b"), ("gone", "c")]);
+        // "gone" is not among the drawn rows.
+        let order = ["b", "c", "z"];
+        assert_eq!(
+            sets.visible_rows(order),
+            vec![("b".into(), 0), ("c".into(), 0), ("z".into(), 0)],
+            "orphaned members are rows, not casualties of their head"
+        );
+    }
+
+    /// A member whose head is absent but whose GRANDHEAD is drawn is still
+    /// reached through the chain — nested, not dropped and not doubled.
+    #[test]
+    fn a_member_reaches_the_surface_through_an_absent_intermediate_head() {
+        let sets = arrange(&[("g", "gone"), ("gone", "x")]);
+        let order = ["g", "x"];
+        let drawn = sets.visible_rows(order);
+        let x_entries: Vec<_> = drawn.iter().filter(|(path, _)| path == "x").collect();
+        assert_eq!(
+            x_entries.len(),
+            1,
+            "x is drawn exactly once, through g's chain: {drawn:?}"
         );
     }
 
