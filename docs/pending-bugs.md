@@ -105,7 +105,7 @@ closed by deriving the mapping from `remote_agent_row_schemes()`. Check whether
 `live_session_kind` needs the same treatment.
 
 
-## ⛔ [11.2] `terminal new --model` IS ACCEPTED AND SILENTLY DROPPED FROM THE LAUNCH COMMAND
+## ⛔⛔ [11.2] `terminal new --model` IS ACCEPTED AND SILENTLY DROPPED — AND IT IS NOW THE ONLY SANCTIONED WAY TO SET A MODEL
 
 **Status:** OPEN
 
@@ -119,7 +119,22 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 - **Consequence:** an orchestrator directed to spawn delegates on a specific model cannot; every
   delegate lands on whatever default the CLI last saved. Nothing downstream flags the substitution
   (same shape as the fleet skill's "silently mangled id yields a working row on the wrong model").
-- **Workaround (proven):** drive `/model <id>` into the row after it reaches its composer.
+- ⛔⛔ **THE OLD WORKAROUND IS WITHDRAWN BY OWNER RULING, 2026-08-20.** It read *"drive `/model
+  <id>` into the row after it reaches its composer"*. Do not do this to a session that has done
+  any work: a conversation is prompt-cached AGAINST ONE MODEL, so an in-session switch re-reads
+  the ENTIRE accumulated history on the next message. The CLI's own confirmation dialog is what
+  caught it (*"This conversation is cached for the current model. Switching … means the full
+  history gets re-read on your next message."*). Owner: *"Never attempt to switch like this,
+  because it will burn tokens … model switching should be done in always new spawning with the
+  --model flag. All CLIs have some equivalent."*
+- ⇒ **THIS RAISES THE ENTRY FROM NUISANCE TO BLOCKER.** With the switch forbidden on a warm
+  session, `--model` at spawn is the ONLY sanctioned mechanism for aiming a seat at a model — and
+  it does not work. A seat ordered onto a specific model therefore cannot be delivered at all
+  today; it runs its whole life on the CLI's saved default. **A session already on the wrong
+  model finishes its work there and hands over** — the correction rides the next spawn.
+- ⚠ **Turn zero is the one safe moment** (an empty session has no history to re-read), so a
+  switch immediately after a spawn repairs a launch that has just failed. That is a repair, not
+  a way to re-aim a session that has run.
 - **Narrowed 2026-08-20 (sibling campaign, 2/2 spawns):** `--permission-mode bypass` from the SAME
   call IS honoured (`--dangerously-skip-permissions` present on the process) — the drop is specific
   to the model flag's plumbing, not general option loss. And the decisive VERIFICATION instrument

@@ -1350,12 +1350,33 @@ handoff is a cycle, not an ending:
    its predecessor** (owner directive 2026-08-20: *"when you spawn a new version
    of yourself you should use the same model"*; most fleet sessions are Opus,
    but some seats are deliberately Fable and a relay must not silently demote or
-   promote one). ⚠ `terminal new --model` is silently DROPPED from the launch
-   (pending-bugs [11.2]; `--permission-mode` from the same call survives, so it
-   is that flag's plumbing) — repair with `/model <id>` before the brief.
+   promote one).
+   ⛔⛔ **THE MODEL IS SET AT SPAWN, WITH THE CLI'S `--model` FLAG — NEVER BY AN
+   IN-SESSION SWITCH.** Owner-directed 2026-08-20, after the CLI's own
+   confirmation dialog stopped a switch mid-flight: *"Never attempt to switch
+   like this, because it will burn tokens … model switching should be done in
+   always new spawning with the --model flag. All CLIs have some equivalent."*
+   **Why it is expensive and not merely untidy:** a conversation is prompt-cached
+   AGAINST ONE MODEL. Switching re-reads the ENTIRE accumulated history on the
+   next message, so the cost scales with everything the session has already
+   done — precisely the cold re-read the fleet pays a keepalive to avoid. The
+   dialog states it: *"This conversation is cached for the current model.
+   Switching … means the full history gets re-read on your next message."*
+   ⇒ **A seat that must run a particular model is SPAWNED on it.** A running
+   session on the wrong model FINISHES ITS WORK on the wrong model and hands
+   over; the correction rides the next spawn, where it costs nothing.
+   ⚠ The one safe moment is TURN ZERO — an empty session has no history to
+   re-read — so a switch there repairs a spawn that has just failed. It is
+   never a way to re-aim a session that has already done work.
+   ⛔⛔ **AND THE FLAG IS CURRENTLY BROKEN, WHICH MAKES THIS A BLOCKER RATHER
+   THAN A PREFERENCE:** `terminal new --model` is silently DROPPED from the
+   launch (pending-bugs [11.2]; `--permission-mode` from the same call
+   survives, so it is that flag's plumbing). Until it is repaired the only
+   sanctioned way to set a seat's model does not work — so the drop is not a
+   nuisance, it is the thing standing between the fleet and the law above.
    ⭐ THE DECISIVE VERIFICATION is the transcript's assistant-record `model`
    field after the first turn: the screen banner false-negatives once it
-   scrolls, and the process cmdline is blind after a `/model` repair.
+   scrolls, and the process cmdline is blind about the model either way.
    And (f) ⛔ **ANY UNSENT OWNER DRAFT — a handover must lose no typed text**
    (owner design 2026-08-20: *"my prompt must be handed over to the next
    spawnee too, so there is no data loss"*). Check `~/.yggterm/relay/drafts/
