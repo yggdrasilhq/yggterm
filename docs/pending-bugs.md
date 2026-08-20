@@ -407,7 +407,9 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 
 ## ⛔⛔ [11.2→6.1] A DEPLOY THAT CHANGES THE GUI IMAGE LEAVES THE GUI RUNNING THE OLD ONE, QUEUING A SWAP THAT CAN NEVER CONVERGE
 
-**Status:** OPEN — measured live 2026-08-20 13:0x on the desktop host, mid-wave
+**Status:** OPEN
+
+*Measured live 2026-08-20 13:0x on the desktop host, mid-wave.*
 
 After the 3.1.6 deploy (12:56): daemon adopted 3.1.6 ✅; the GUI process (started 11:57:50) kept
 running the REPLACED image — `readlink /proc/<pid>/exe` ends "(deleted)", the deploy's markers
