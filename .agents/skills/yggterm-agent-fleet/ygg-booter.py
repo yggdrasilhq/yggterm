@@ -95,6 +95,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ygg_host import resolve_gui_host  # noqa: E402
+from ygg_rowarg import bare_uuid, resolve_row  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 STATE = Path.home() / ".yggterm" / "relay"
@@ -1699,6 +1700,29 @@ def cmd_retire(args):
     return 0
 
 
+def _row_is_live(row):
+    """Is this row entry a LIVE session, as opposed to a durable on-disk one?
+
+    The one owner of that question for this tool. `presence` is the field the
+    GUI added so a consumer could tell dual presence from duplication:
+    `live_rail` (the Live Sessions rail) and `cwd_tree` (the same live session
+    in its cwd folder) are live; `row` is a durable session listed because its
+    transcript is on disk and can be resumed.
+
+    ⛔ Unknown/absent presence falls back to `live_member` and then to TRUE.
+    A row we cannot classify must be treated as live: the cost of a false
+    "live" is one harmless removal attempt, and the cost of a false "durable"
+    is a genuine husk left in the sidebar reported as clean.
+    """
+    presence = row.get("presence")
+    if presence in ("live_rail", "cwd_tree"):
+        return True
+    if presence == "row":
+        return False
+    live_member = row.get("live_member")
+    return True if live_member is None else bool(live_member)
+
+
 def _drop_row(uuid):
     """Remove a decided-dead row from the sidebar, on the host that renders it.
 
@@ -1724,12 +1748,42 @@ def _drop_row(uuid):
         return
 
     def row_paths():
+        """The LIVE rows this uuid renders as — the only ones retirement removes.
+
+        ⛔⛔ **A DURABLE ON-DISK SESSION IS NOT A ROW THAT SURVIVED ITS OWN
+        RETIREMENT.** This asked only "does any listed row carry this session
+        id", and `server app rows` answers with the whole tree: 66 live rows
+        beside 448 durable listings on one measured host. A durable listing is
+        the session's transcript being resumable in its cwd folder — the
+        product's core value proposition, not a husk. `session remove` does not
+        take it away, so the re-read found it again and the verb reported
+        `⛔ ROW SURVIVED REMOVAL` on a reap that was clean, naming the one plane
+        the owner actually looks at and telling the caller not to trust it.
+
+        ⚠ **The alarm could never be cleared, and its only implied remedy —
+        remove it by hand — was itself wrong**, because removing that entry
+        deletes a resumable session from the tree. Same shape as the monitor's
+        stand-down defect fixed in 5dcefb17: *a warning whose remedy another
+        verb forbids is a defect in the warning.*
+
+        ⚠ **And it was non-deterministic**: whether the durable listing had been
+        rescanned into the tree yet decided whether the same clean reap printed
+        "already gone" or the alarm. Two identical retirements, two verdicts,
+        minutes apart (measured 2026-08-20).
+
+        `presence` exists precisely so a consumer need not infer this — it is
+        `live_rail`/`cwd_tree` for a live session and `row` for a durable one,
+        and it agreed with `live_member` on every one of 514 measured rows. Both
+        are read, and a row counts as live if EITHER says so: a missing field
+        must not silently demote a live row to "nothing to remove here".
+        """
         # A uuid is not an address: `session remove` takes the row's PATH.
         data = ygg(host, "server", "app", "rows") or {}
         rows = (data.get("data") or data).get("rows") or []
         return [r.get("full_path") or r.get("path") for r in rows
                 if str(r.get("session_id") or "") == uuid
-                and (r.get("full_path") or r.get("path"))]
+                and (r.get("full_path") or r.get("path"))
+                and _row_is_live(r)]
 
     paths = row_paths()
     if not paths:
@@ -3118,7 +3172,16 @@ def main():
                          "With no --until, `hold` reports the current hold")
     ap.add_argument("--reason", default="",
                     help="hold: why the fleet is being held (recorded and logged)")
-    ap.add_argument("--row", default="")
+    # ⛔ THE ROW ARGUMENT, IN EVERY SPELLING. `--row` here versus a bare
+    #    positional on the monitor meant naming one row took a different
+    #    incantation per tool, and each refusal reads like "not subscribed".
+    #    ygg_rowarg owns the vocabulary now; both watchdogs accept both.
+    ap.add_argument("row", nargs="?", default="",
+                    help="the row: a bare uuid, or an addressable "
+                         "`scheme://host/<uuid>` path")
+    ap.add_argument("--row", "--uuid", dest="_row_flag", default="", metavar="ROW",
+                    help="the same row, named by flag instead of position — "
+                         "both spellings work on every verb and on both watchdogs")
     ap.add_argument("--campaign", default="")
     ap.add_argument("--note", default="")
     ap.add_argument("--evidence", default="",
@@ -3163,6 +3226,18 @@ def main():
                          "WHEN it is next at risk of a boot. Costs a row-list call "
                          "and a transcript read per subscriber, so it is opt-in")
     args = ap.parse_args()
+    # ⭐ One row name, whichever way the caller spelled it. ⛔ `arm` validates
+    #    args.row as a full addressable path, so the RAW value is restored
+    #    after resolution and only the disagreement check is applied here —
+    #    folding a path down to a bare uuid would break that refusal.
+    args._row_dest = "row"
+    raw_row = args.row or args._row_flag
+    try:
+        resolve_row(args)
+    except ValueError as exc:
+        log(f"⛔ {exc}")
+        return 64
+    args.row = raw_row.strip().rstrip("/") if raw_row else ""
     # ⛔ Never carry a placeholder host into a boot decision.
     # ⭐ But a LEDGER WRITE IS NOT A BOOT DECISION, and making it wait on the GUI
     #    host is how recording a decision fails on a host that cannot reach the
