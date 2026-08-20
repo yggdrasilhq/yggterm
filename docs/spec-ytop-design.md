@@ -17,21 +17,21 @@ It provides a unified, real-time control plane across two fundamental operationa
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Y T O P   ·   [ ⚡ TOP ]   [ 📊 DASH ]                             [ 🔍 Filter ] [ 🔄 2s ] │
 ├──────────────────────────┬──────────────────────────────────────────────────────────────────┤
-│ MACHINES & FLEET         │  ⚡ TOP VIEW: openclaw (Local Host)                              │
+│ MACHINES & FLEET         │  ⚡ TOP VIEW: alpha (Local Host)                              │
 │                          │                                                                  │
-│ ● openclaw (local)       │  ┌─ SYSTEM METRICS ────────────────────────────────────────────┐ │
+│ ● alpha (local)       │  ┌─ SYSTEM METRICS ────────────────────────────────────────────┐ │
 │   37% CPU · 24.1/62.7 GB │  │ CPU: [████████████░░░░░░░░░░░░] 37.2% · 32 Cores · Load 9.78 │ │
 │                          │  │ RAM: [████████████████░░░░░░░░] 320.9 / 503.6 GB (63.7%)    │ │
-│ ● dev (ssh dev)          │  │ SWP: [░░░░░░░░░░░░░░░░░░░░░░░░] 0.0 MB / 0.0 MB              │ │
+│ ● beta (ssh beta)          │  │ SWP: [░░░░░░░░░░░░░░░░░░░░░░░░] 0.0 MB / 0.0 MB              │ │
 │   12% CPU · 8.4/32.0 GB  │  └─────────────────────────────────────────────────────────────┘ │
 │                          │                                                                  │
-│ ● jojo (ssh jojo)        │  ┌─ ZFS STORAGE & IOSTAT (Main Storage Pool) ──────────────────┐ │
+│ ● delta (ssh delta)        │  ┌─ ZFS STORAGE & IOSTAT (Main Storage Pool) ──────────────────┐ │
 │   5% CPU · 4.2/16.0 GB   │  │ zpool: rpool [ONLINE] · 1.8 TB / 3.6 TB Allocated (50%)     │ │
 │                          │  │ Read:  1.2 MB/s (142 IOPS)  ·  Write: 8.4 MB/s (820 IOPS)   │ │
-│ ● main (ssh main)        │  └─────────────────────────────────────────────────────────────┘ │
+│ ● gamma (ssh gamma)        │  └─────────────────────────────────────────────────────────────┘ │
 │   45% CPU · 94.2/128 GB  │                                                                  │
 │                          │  ┌─ LXC CONTAINERS (with expandable process consumption) ──────┐ │
-│ [ + Add SSH Machine ]    │  │ ▼ 📦 ct-openclaw [RUNNING]  ·  24.5% CPU  ·  1.8 GB RAM     │ │
+│ [ + Add SSH Machine ]    │  │ ▼ 📦 ct-alpha [RUNNING]  ·  24.5% CPU  ·  1.8 GB RAM     │ │
 │                          │  │   ├─ PID 1235385  agy            24.7% CPU   336 MB RSS     │ │
 │                          │  │   ├─ PID 1109226  claude          2.5% CPU   612 MB RSS     │ │
 │                          │  │   └─ PID 3970214  claude          2.5% CPU   564 MB RSS     │ │
@@ -71,7 +71,7 @@ The application titlebar / header hosts the primary mode toggle:
 
 ### 4.1. Connected Machines Sidebar & Persistent Machine Registry
 - **Sources of Machines**:
-  1. Local machine (`local` / `openclaw`).
+  1. Local machine (`local` / `alpha`).
   2. Auto-discovered remote SSH sessions from live Yggterm daemon snapshots (`server daemons`).
   3. Stored user configurations from `~/.yggterm/config/machines.json`.
 - **`[ + Add SSH Machine ]` Action**:
@@ -176,13 +176,13 @@ Dedicated diagnostic engine to explain and eliminate host lag:
   {
     "machines": [
       {
-        "alias": "dev",
-        "label": "dev (Backend Compute)",
+        "alias": "beta",
+        "label": "beta (Backend Compute)",
         "is_yggdrasil": true
       },
       {
-        "alias": "main",
-        "label": "main (Server & Storage)",
+        "alias": "gamma",
+        "label": "gamma (Server & Storage)",
         "is_yggdrasil": true
       }
     ]
