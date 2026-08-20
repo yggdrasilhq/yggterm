@@ -127,6 +127,62 @@ transport fault.
 comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
 `notebooks/06-ui-blocks.ipynb`.
 
+## ⛔⛔⛔ [11.5→11.3] A SLOW REQUEST HOLDS THE DAEMON'S ONE RUNTIME LOCK, AND `TerminalRead` CAN PROXY TO ANOTHER DAEMON WHILE HOLDING IT
+
+**Status:** OPEN
+
+*Found 2026-08-20 while root-causing the input freeze from the GUI side. The GUI
+half is fixed (the read no longer starves the keystroke branch); this is the
+amplifier underneath it, and it is not the GUI's to fix.*
+
+**The shape.** Every client request is handled under ONE global lock:
+`spawn_unix_client_handler` gives each connection its own thread, but
+`daemon.rs` takes `lock_daemon_runtime_for_request(...)` before
+`runtime.handle_request(...)`. So any request that performs slow I/O *inside*
+the handler deafens the daemon to every other client for its whole duration.
+**The code already names an instance**, in a comment explaining why the WPE
+plane was routed around it: *one `terminal_ensure` held this loop 30.7 s on
+2026-06-11 and the user watched a shadow the whole time.*
+
+⛔ **AND `TerminalRead` IS ONE OF THOSE REQUESTS.** Its handler
+(`ServerRequest::TerminalRead`) resolves a preserved-owner endpoint and, when the
+row is owned by a DIFFERENT daemon, calls `terminal_read(&owner_endpoint, …)`
+synchronously — a second daemon round trip, carrying the 10 s default client IO
+timeout, **taken while this daemon's runtime lock is held**. Every other request
+on this daemon parks behind it.
+
+⚠ **THE TRIGGER IS THE CONSTITUTION'S OWN MECHANISM, WHICH IS WHY IT IS NOT
+RARE.** Version-coexisting daemons are how a restart avoids evicting live work,
+so after every hot-update the current daemon holds rows whose owner is the
+predecessor — and those rows are exactly the ones whose reads proxy. The
+condition is created by the thing we deliberately do, on a schedule set by how
+often we deploy.
+
+**Why it reads as a GUI freeze.** The GUI's terminal loop polls
+`TerminalRead` continuously per visible session. A daemon that has gone quiet
+under the lock stalls that read, and until 2026-08-20 the GUI's `tokio::select!`
+awaited it inline — so no JS event of any kind was serviced while it was out.
+That half is fixed; a lock-blocked daemon now delays the round trip rather than
+the whole surface.
+
+**What to measure before changing anything.** The daemon already traces requests
+parked on the runtime lock (`a_request_parked_on_the_runtime_lock_is_visible_in_the_trace`).
+Read hold-time by `request_name` over an hour containing a reported stall; the
+question is not whether the lock is contended but **which handler holds it
+longest**, and whether the proxied `TerminalRead` is in that set on a host with
+preserved-owner rows.
+
+**Candidate directions, not yet chosen.** Resolve the proxy target and release
+the lock before the second round trip (the shape `build_background_copy_updates`
+already uses: read what you need under the lock, do the slow thing outside it);
+or give the proxied read a much shorter timeout than the direct one, since a
+preserved owner that has not answered in ~1 s is a different problem from a busy
+one.
+
+**Falsifier:** with hold-time by request name in hand, if no handler holds the
+runtime lock longer than ~100 ms during a reported stall, this framing is wrong
+and the stall is elsewhere.
+
 ## ⛔⛔⛔ [11.4→11.3] THE GUI FREEZES WITH ZERO INCIDENTS RECORDED — OWNER KILLED IT; INPUT PROBES WERE BLIND AND THE TITLE CHORE OWNED THE HOUR
 
 **Status:** OPEN
