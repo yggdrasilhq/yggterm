@@ -19303,3 +19303,17 @@ failure. The verb losing its reply is the defect.
 
 **Falsifier:** a create whose row lands never answers empty — the reply carries the session_path,
 or a distinguishable transport error, under the same ssh conditions (repeat under load).
+
+## ygg-monitor calls a row on another host DEAD — the probe is single-host (2026-08-20)
+
+**Seen:** `ygg-monitor.py list` prints `⇒ DEAD — no agent process on dev holds it.
+unsubscribe it.` for a subscription whose row is alive on a DIFFERENT host (a `local://` row
+on the GUI host). The liveness probe enumerates processes on the host it runs on and nowhere
+else, so any cross-host subscription reads as a corpse, and the advice attached ("unsubscribe
+it") would tear down supervision of a living orchestrator.
+
+**Want:** either probe the row's own host (the row path names it) before printing DEAD, or
+downgrade the verdict to `UNPROVEN (row lives on <host>; probe ran on <this host>)` so the
+reader knows the instrument's reach ended before the answer did.
+
+---
