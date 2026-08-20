@@ -1093,6 +1093,28 @@ fn restored_local_runtime_id(
     if kind == SessionKind::Codex && has_storage && !id.trim().is_empty() {
         return Some(id.to_string());
     }
+    // ⚖ A CLI that MINTS ITS OWN id has no reason for the row key to outrank
+    // the id the row is carrying. The key holds the uuid yggterm invented at
+    // birth; a persisted id that DIFFERS from it can only have got there because
+    // a runtime-identity rebind found the real one, and taking the key's answer
+    // here silently un-binds the row on every restart — so the session would be
+    // reachable right up until the restart that is the entire point of
+    // persisting it.
+    //
+    // ⛔ Scoped to `id_assigned_at_birth:false` on purpose, and the inverse
+    // case is why: for a CLI BORN with the row uuid (Claude Code), the key IS
+    // authoritative, and preferring a stored id there would re-open the
+    // identity poisoning that once repointed a live row at a foreign transcript
+    // and made every relaunch collide with "session id already in use".
+    //
+    // No IO: "was this row rebound" is answered by the row disagreeing with its
+    // own key, not by asking a store — which also keeps restore off the disk.
+    if !id.trim().is_empty()
+        && agent_cli_descriptor(kind).is_some_and(|descriptor| !descriptor.id_assigned_at_birth)
+        && local_runtime_id_from_key(key).is_some_and(|from_key| from_key != id)
+    {
+        return Some(id.to_string());
+    }
     local_runtime_id_from_key(key)
         .map(ToOwned::to_owned)
         .filter(|value| !value.trim().is_empty())
@@ -43263,6 +43285,93 @@ terminal_window_id: None,
         assert!(!server.sessions.contains_key(&phantom_path));
         assert_ne!(server.active_session_path(), Some(phantom_path.as_str()));
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+    }
+
+    #[test]
+    fn a_rebound_muse_row_resumes_the_real_session_across_a_restart() {
+        // The falsifier, end to end at the state layer: a row born with the
+        // yggterm uuid must, once bound to the id its CLI actually minted,
+        // still carry that id after a restart AND resume it rather than the
+        // phantom. Binding without re-pointing the stored command would look
+        // fixed here and still resume the phantom on the next cold attach.
+        let runtime_key = "local://00000000-0000-4000-8000-00000000r0w1";
+        let row_uuid = "00000000-0000-4000-8000-00000000r0w1";
+        let minted = "00000000-0000-4000-8000-00000000m1nt";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.to_string(),
+            id: row_uuid.to_string(),
+            title: "New Muse Code Session".to_string(),
+            kind: SessionKind::Muse,
+            keep_alive: false,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/tmp/workspace".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        server.request_terminal_launch_for_path(runtime_key);
+
+        assert!(
+            server.apply_agent_runtime_session_id_to_live_session(runtime_key, minted),
+            "a row carrying the phantom must move when its CLI's id is found"
+        );
+        // Idempotent: binding the same id twice is not a change, so the trace
+        // records genuine rebinds rather than one line per persist per row.
+        assert!(!server.apply_agent_runtime_session_id_to_live_session(runtime_key, minted));
+
+        let persisted = server.persisted_state_for_update_restart();
+        let live = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == runtime_key)
+            .expect("persisted local live session");
+        assert_eq!(live.id, minted, "the row must persist the minted id");
+
+        let mut restored = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        restored.restore_persisted_state_with_launch_policy(persisted, None, false);
+        let after = restored
+            .persisted_state_for_update_restart()
+            .live_sessions
+            .iter()
+            .find(|live| live.key == runtime_key)
+            .expect("session survives the restart")
+            .clone();
+        assert_eq!(after.id, minted, "the binding must survive a restart");
+
+        // And the resume the row would run names the minted session, not the
+        // uuid muse has never heard of. Asked on the REMOTE arm, which by
+        // contract never consults this machine's store — so the assertion is
+        // about the builder rather than about whatever muse sessions happen to
+        // exist on the machine running the test. The local arm's extra step
+        // (refusing to resume an id the store denies) is covered separately by
+        // `a_phantom_id_is_re_birthed_rather_than_resumed_into_a_new_session`.
+        let resume = stored_session_launch_command_for_locality(
+            SessionKind::Muse,
+            "/tmp/workspace",
+            minted,
+            false,
+        );
+        assert!(resume.contains(minted), "{resume}");
+        assert!(
+            !resume.contains(row_uuid),
+            "the phantom must not survive anywhere in the resume: {resume}"
+        );
     }
 
     #[test]
