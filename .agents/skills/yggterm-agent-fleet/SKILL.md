@@ -1421,6 +1421,54 @@ handoff is a cycle, not an ending:
    4. Wrong model discovered after work has begun ⇒ say so plainly, FINISH the
       unit on the wrong model, and hand over — the correction rides the next
       spawn, where it is free. Never switch in-session (the law above).
+
+   ### ⛔⛔ THE MODEL EQUATION — a "default model" is MUTABLE STATE, and it lies to agents
+   Measured 2026-08-20 across the fleet's CLIs, after four seats landed on the
+   right model for the WRONG reason. The laws, in force for every spawn and
+   every relay:
+   1. ⛔ **A CLI's default model is a FILE another session can rewrite, not a
+      constant.** Claude Code: the in-session `/model` command WRITES
+      `~/.claude/settings.json` `model` — proven by timestamp correlation
+      (four queued `/model` submits; the file's mtime is the minute they
+      applied). Convenient for a human choosing interactively; for agents it
+      means **any session's model repair silently re-aims every later spawn on
+      that host that omits the flag.** After an intentional `/model` repair,
+      the host default HAS CHANGED — either intend that or restore the setting
+      explicitly and verify (⚠ a settings file is the app's OUTPUT: a running
+      CLI can write it back from memory).
+   2. ✅ **The spawn FLAG does not stick.** `claude --model <id> -p 'hi'` with a
+      non-default id answered on that id and left the settings default
+      untouched (measured). ⇒ the flag is the ONLY side-effect-free way to aim
+      a session.
+   3. ⛔ **"Right model without a working flag" is a MASK, not a success.** When
+      the flag is dropped (see 4) the session lands on the sticky default,
+      which can coincide with what you wanted — four seats did exactly this.
+      "The successor inherits the model by relay" is BANNED as an explanation:
+      there is no inheritance mechanism anywhere; what that phrase always
+      described was the sticky default. Verify by transcript, every spawn.
+   4. ⛔ **The REMOTE lane currently drops `--model` end-to-end** (open queue
+      entry: "A REMOTE CC SPAWN'S --model NEVER REACHES THE PROCESS" — the
+      export composes without it; three layers mask it). Until that ships, the
+      canonical REMOTE recipe is: **spawn WITHOUT a prompt → verify model
+      (transcript/cmdline) → wrong ⇒ drive the in-session model command at
+      TURN ZERO (empty session, nothing to re-read; law 1's side effect
+      applies) → THEN deliver the brief via submit → verify by ACK token.**
+      Local spawns apply the flag correctly (proven live); still verify.
+   5. ⭐ **Per-CLI register** (yggterm's `--model` maps to each CLI's native
+      flag via the descriptor; native semantics measured where marked):
+      | CLI | native flag | default lives in | flag sticks? | in-session cmd sticks? | decisive verification |
+      |---|---|---|---|---|---|
+      | claude-code | `--model` | `~/.claude/settings.json` `model` | NO (measured) | YES — `/model` writes it (measured) | transcript `"model"` per assistant record |
+      | codex | `-m/--model` | `~/.codex/config.toml` top-level `model` | unchanged across two refused runs (weak; UNMEASURED positive) | UNMEASURED | TUI banner + config; transcript field UNMEASURED |
+      | muse | `--model` | `~/.config/muse/settings.json` `model` | UNMEASURED | UNMEASURED | UNMEASURED |
+      | antigravity | `--model` ("for the current CLI session"; `models` lists) | session-scoped per its own help | implied NO | n/a | UNMEASURED |
+      | grok-build | `-m/--model` | config dir | UNMEASURED | UNMEASURED | UNMEASURED |
+      | kimi | `-m/--model` | `~/.kimi-code/config.toml` (login-managed) | UNMEASURED | UNMEASURED | UNMEASURED |
+      ⚠ Auth can constrain the id space (codex under a ChatGPT account refuses
+      non-account models by NAME — the refusal is loud, read it). ⚠ UNMEASURED
+      cells are invitations, not blanks to assume across: measure with a
+      cheap non-interactive run and write the answer back here (§11's
+      written-to-GROW rule).
    And (f) ⛔ **ANY UNSENT OWNER DRAFT — a handover must lose no typed text**
    (owner design 2026-08-20: *"my prompt must be handed over to the next
    spawnee too, so there is no data loss"*). Check `~/.yggterm/relay/drafts/
