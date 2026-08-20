@@ -15859,7 +15859,7 @@ mod tests {
                 && source.contains("const TERMINAL_IDLE_READ_BACKOFF_STEP_MS: u64 = 500;")
                 && source.contains("let mut input_echo_read_burst_remaining = 0_u8;")
                 && source.contains(
-                    "input_echo_read_burst_remaining =\n                                        TERMINAL_INPUT_ECHO_READ_BURST_READS;"
+                    "input_echo_read_burst_remaining =\n                                    TERMINAL_INPUT_ECHO_READ_BURST_READS;"
                 )
                 && source.contains("terminal_read_nudge_burst_reads(&reason,")
                 && source.contains(
@@ -60447,6 +60447,64 @@ mod terminal_loop_input_starvation_locks {
         assert!(
             source.contains("struct TerminalLoopBranchGuard"),
             "the loop must report when one branch holds it long enough to be felt"
+        );
+    }
+
+    // The write-side twin of the lock above. The Input arm used to await the
+    // keystroke's own daemon write inline (10s io timeout; runtime-lock waits
+    // measured at 41.6s/68.8s), so one slow write held every later keystroke —
+    // the measured keystroke→pty tail of p50 1 ms / max 4,345 ms. The writes
+    // now flow through an ordered channel to a dedicated task, and only
+    // FAILURES return to the loop, on their own select branch.
+    #[test]
+    fn the_keystroke_write_is_dispatched_off_the_select_loop() {
+        let source = include_str!("viewport.rs");
+
+        let input_marker = "Ok(TerminalJsEvent::Input { data }) =>";
+        let input_at = source
+            .find(input_marker)
+            .expect("the terminal loop must still have an Input arm");
+        // The arm ends where the next arm begins.
+        let arm_end = source[input_at..]
+            .find("Ok(TerminalJsEvent::ReadNudge")
+            .expect("the ReadNudge arm must follow the Input arm");
+        let input_arm = &source[input_at..input_at + arm_end];
+        assert!(
+            !input_arm.contains("terminal_write_async("),
+            "the Input arm performs the daemon write inline again — one slow \
+             write once more holds every later keystroke for up to the write \
+             timeout. Enqueue on terminal_write_tx instead."
+        );
+        assert!(
+            !input_arm.contains(".await"),
+            "the Input arm awaits something — the keystroke path must complete \
+             without waiting on any round trip"
+        );
+        assert!(
+            input_arm.contains("terminal_write_tx.send("),
+            "the Input arm no longer enqueues onto the ordered writer channel"
+        );
+
+        // The writer task: ordered, off the loop, and it still performs the
+        // real write.
+        let writer_at = source
+            .find("terminal_write_queue_rx.recv()")
+            .expect("the ordered writer task must drain the write queue");
+        let writer_scope = &source[writer_at.saturating_sub(600)..writer_at + 900];
+        assert!(
+            writer_scope.contains("terminal_write_async("),
+            "the writer task no longer performs the daemon write"
+        );
+
+        // The failure path survives, on its own branch, with the same
+        // recovery gate the inline path had.
+        let failure_at = source
+            .find("terminal_write_failure_rx.recv()")
+            .expect("write failures must come back to the loop on their own branch");
+        let failure_branch = &source[failure_at..failure_at + 4_000];
+        assert!(
+            failure_branch.contains("should_retry_terminal_write_error_after_attach("),
+            "the write-failure branch lost the attach-retry recovery gate"
         );
     }
 }

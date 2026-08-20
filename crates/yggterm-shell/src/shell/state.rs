@@ -77023,11 +77023,21 @@ async fn process_pending_app_control_requests(
         );
     };
     if app_control_command_defers_background_refresh(&command) {
-        let _ = safe_shell_mut(state, "app_control_defer_background_refresh", |shell| {
-            shell.background_refresh_after_ms = shell
-                .background_refresh_after_ms
-                .max(current_millis() + BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS);
-        });
+        // Hysteresis before the write: `current_millis()` moves every call, so
+        // the max() above advanced — and dirtied the whole ShellState signal —
+        // once per agent probe, which on a fleet host is a render per probe.
+        // The deadline's job is coarse ("hold refreshes while interaction is
+        // live"); sub-second precision buys nothing, so only write when the
+        // stored deadline is more than a second behind the new one.
+        let target_ms = current_millis() + BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS;
+        let needs_advance = state
+            .with(|shell| shell.background_refresh_after_ms + 1_000 < target_ms);
+        if needs_advance {
+            let _ = safe_shell_mut(state, "app_control_defer_background_refresh", |shell| {
+                shell.background_refresh_after_ms =
+                    shell.background_refresh_after_ms.max(target_ms);
+            });
+        }
     }
     let active_session_path = state
         .read()

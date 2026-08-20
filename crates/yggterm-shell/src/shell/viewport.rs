@@ -6066,6 +6066,42 @@ fn TerminalCanvas(
             // newest read is applied, every earlier one is dropped.
             let mut terminal_read_started_at_ms = 0_u64;
             let mut terminal_read_generation = 0_u64;
+            // KEYSTROKES MUST NOT WAIT ON THEIR OWN ROUND TRIP. The Input arm
+            // used to await the daemon write inline, so while one write sat on
+            // the daemon's runtime lock (10 s io timeout; waits measured at
+            // 41.6 s and 68.8 s) the branch that receives the NEXT keystroke
+            // was not polled — the write leg of the measured keystroke→pty
+            // tail (p50 1 ms, max 4,345 ms; docs/pending-bugs.md, the
+            // app-control/terminal_mount entry). Writes now go through this
+            // ordered channel to a dedicated task: the arm enqueues and moves
+            // on in microseconds, the task performs the writes STRICTLY in
+            // order off the select loop, and only FAILURES come back — on
+            // `terminal_write_failure_rx`, whose select branch runs the same
+            // recovery the inline path ran. Success needs no message: the
+            // echo read burst is armed at enqueue and the daemon's own
+            // `input/pty` probe still stamps the delivery.
+            let (terminal_write_tx, mut terminal_write_queue_rx) =
+                tokio::sync::mpsc::unbounded_channel::<String>();
+            let (terminal_write_failure_tx, mut terminal_write_failure_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(serde_json::Value, anyhow::Error)>();
+            {
+                let endpoint = endpoint.clone();
+                let write_path = terminal_input_session_path.clone();
+                tokio::spawn(async move {
+                    while let Some(data) = terminal_write_queue_rx.recv().await {
+                        let shape = yggterm_core::perf::input_shape(&data);
+                        if let Err(error) =
+                            terminal_write_async(endpoint.clone(), write_path.clone(), data).await
+                        {
+                            // The loop dropping its failure receiver means the
+                            // session unmounted: nothing left to recover.
+                            if terminal_write_failure_tx.send((shape, error)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
             let mut startup_resize_repair_scheduled = false;
             // RE-RESUME / REFLOW-BG FIX: when the COLUMN count changes, xterm.js
             // reflows and drops the background attribute of existing cells; a
@@ -6222,6 +6258,16 @@ fn TerminalCanvas(
             let mut unfocused_tui_drop_active = false;
             let mut eval_result = Box::pin(eval.clone().join::<Value>());
             loop {
+                // The PRE-SELECT body (focus bookkeeping, bridge flush, screen
+                // reconcile — including a daemon snapshot round trip when a
+                // reconcile is due) runs before any branch can be polled, so a
+                // stall here delays keystrokes exactly like a slow branch —
+                // and until this guard existed it was the one section
+                // `input/loop_block` could never name. Dropped explicitly
+                // before the select so the idle await is not measured as held
+                // time; `continue`/`break` paths measure their partial time
+                // via Drop.
+                let pre_select_guard = TerminalLoopBranchGuard::new("pre_select", &session_path);
                 let (window_focused_for_read, active_visible_terminal_for_read) =
                     state.with(|shell| {
                         (
@@ -6603,6 +6649,7 @@ fn TerminalCanvas(
                         next_read_deadline = trickle_deadline;
                     }
                 }
+                drop(pre_select_guard);
                 tokio::select! {
                     result = &mut eval_result => {
                         let _ = safe_shell_mut(state, "terminal_attach_bridge_result", |shell| {
@@ -7476,155 +7523,50 @@ fn TerminalCanvas(
                                         "shape": yggterm_core::perf::input_shape(&data),
                                     }),
                                 );
-                                let post_attach_write_retry_limit = if is_remote_resume_session {
-                                    2
-                                } else {
-                                    4
-                                };
-                                if let Err(write_error) = terminal_write_async(
-                                    endpoint.clone(),
-                                    terminal_input_session_path.clone(),
-                                    data.clone(),
-                                )
-                                .await
-                                {
-                                    append_trace_event(
-                                        &trace_home,
-                                        "ui",
-                                        "terminal_mount",
-                                        "terminal_write_error",
-                                        json!({
-                                            "session_path": session_path.clone(),
-                                            "error": write_error.to_string(),
-                                            "shape": yggterm_core::perf::input_shape(&data),
-                                        }),
-                                    );
-                                    if should_retry_terminal_write_error_after_attach(
-                                        is_remote_resume_session,
-                                        &write_error,
-                                    ) && post_attach_read_recovery_attempts < post_attach_write_retry_limit {
-                                        let _ = safe_shell_mut(
-                                            state,
-                                            "terminal_attach_retry_after_write_error",
-                                            |shell| {
-                                                shell.retain_terminal_session_path(&session_path);
-                                                shell.terminal_attach_in_flight
-                                                    .insert(session_path.clone());
-                                                shell.terminal_resume_ready_paths
-                                                    .remove(&session_path);
-                                            },
-                                        );
-                                        set_signal_if_changed(
-                                            terminal_overlay_dismissed,
-                                            false,
-                                        );
-                                        set_signal_if_changed(
-                                            terminal_live_host_connected,
-                                            false,
-                                        );
-                                        set_signal_if_changed(resume_overlay_failed, false);
-                                        set_signal_if_changed(resume_overlay_timed_out, false);
-                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
-                                            enabled: false,
-                                            focus: false,
-                                        });
-                                        let (notification_title, notification_message) =
-                                            if is_remote_resume_session {
-                                                (
-                                                    "Retrying Remote Terminal",
-                                                    format!(
-                                                        "Yggterm hit a live terminal write error on {} and is retrying the restore.",
-                                                        session_host_label
-                                                    ),
-                                                )
-                                            } else {
-                                                (
-                                                    "Recovering Local Terminal",
-                                                    format!(
-                                                        "Yggterm lost its local terminal runtime on {} and is retrying the restore.",
-                                                        session_host_label
-                                                    ),
-                                                )
-                                            };
-                                        upsert_terminal_resume_notification(
-                                            state,
-                                            &session_path,
-                                            NotificationTone::Warning,
-                                            notification_title,
-                                            notification_message,
-                                        );
-                                        post_attach_read_recovery_attempts += 1;
-                                        deferred_resume_output.clear();
-                                        visual_reveal_output_sample.clear();
-                                        first_resume_connected_output_ms = None;
-                                        if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
-                                            endpoint.clone(),
-                                            runtime_session_path.clone(),
-                                            &trace_home,
-                                            "terminal_write_error",
-                                            post_attach_read_recovery_attempts,
-                                        )
-                                        .await
-                                        {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "terminal_write_recovery_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "error": recovery_error.to_string(),
-                                                    "attempt": post_attach_read_recovery_attempts,
-                                                }),
-                                            );
-                                        }
-                                        cursor = 0;
-                                        read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
-                                    } else {
-                                        safe_push_notification(
-                                            state,
-                                            NotificationTone::Error,
-                                            "Terminal Input Failed",
-                                            write_error.to_string(),
-                                        );
-                                    }
-                                } else {
-                                    if is_remote_resume_session {
-                                        set_signal_if_changed(terminal_resume_surface_staged, true);
-                                        set_signal_if_changed(terminal_live_host_connected, true);
-                                        set_signal_if_changed(terminal_overlay_dismissed, true);
-                                        set_signal_if_changed(resume_overlay_failed, false);
-                                        set_signal_if_changed(resume_overlay_timed_out, false);
-                                        clear_terminal_resume_notification(state, &session_path);
-                                    }
-                                    read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
-                                    input_echo_read_burst_remaining =
-                                        TERMINAL_INPUT_ECHO_READ_BURST_READS;
-                                    next_read_deadline = tokio::time::Instant::now()
-                                        + Duration::from_millis(TERMINAL_INPUT_ECHO_READ_DELAY_MS);
-                                    let (show_busy_hint, next_pending_input_has_text) =
-                                        terminal_input_busy_hint_decision(
-                                            &data,
-                                            pending_terminal_input_has_text,
-                                        );
-                                    pending_terminal_input_has_text = next_pending_input_has_text;
-                                    if codex_completion_notifications_enabled && show_busy_hint {
-                                        codex_busy_since_input = true;
-                                        codex_busy_started_at_ms.get_or_insert_with(current_millis);
-                                        codex_completion_notified = false;
-                                    }
-                                    // Mark input hot + arm the post-input snapshot WITHOUT a
-                                    // per-keystroke whole-shell re-render. The optimistic busy
-                                    // hint still shows on submit (it changes reactive state, so
-                                    // it takes the re-render path inside the helper).
-                                    let optimistic_busy_hint = show_busy_hint
-                                        && terminal_input_uses_optimistic_busy_hint(&session_path);
-                                    mark_terminal_input_hot_and_schedule_snapshot(
-                                        state,
-                                        &session_path,
-                                        optimistic_busy_hint,
-                                    );
+                                // ENQUEUE, never await: the dedicated writer task
+                                // performs the daemon write in order, and a failure
+                                // comes back on the `write_failure` select branch
+                                // below. The echo-anticipation state (read burst,
+                                // busy hint, input-hot mark) arms optimistically at
+                                // enqueue — if the write later fails, the recovery
+                                // branch resets the cadence exactly as the inline
+                                // error path did.
+                                let _ = terminal_write_tx.send(data.clone());
+                                if is_remote_resume_session {
+                                    set_signal_if_changed(terminal_resume_surface_staged, true);
+                                    set_signal_if_changed(terminal_live_host_connected, true);
+                                    set_signal_if_changed(terminal_overlay_dismissed, true);
+                                    set_signal_if_changed(resume_overlay_failed, false);
+                                    set_signal_if_changed(resume_overlay_timed_out, false);
+                                    clear_terminal_resume_notification(state, &session_path);
                                 }
+                                read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
+                                input_echo_read_burst_remaining =
+                                    TERMINAL_INPUT_ECHO_READ_BURST_READS;
+                                next_read_deadline = tokio::time::Instant::now()
+                                    + Duration::from_millis(TERMINAL_INPUT_ECHO_READ_DELAY_MS);
+                                let (show_busy_hint, next_pending_input_has_text) =
+                                    terminal_input_busy_hint_decision(
+                                        &data,
+                                        pending_terminal_input_has_text,
+                                    );
+                                pending_terminal_input_has_text = next_pending_input_has_text;
+                                if codex_completion_notifications_enabled && show_busy_hint {
+                                    codex_busy_since_input = true;
+                                    codex_busy_started_at_ms.get_or_insert_with(current_millis);
+                                    codex_completion_notified = false;
+                                }
+                                // Mark input hot + arm the post-input snapshot WITHOUT a
+                                // per-keystroke whole-shell re-render. The optimistic busy
+                                // hint still shows on submit (it changes reactive state, so
+                                // it takes the re-render path inside the helper).
+                                let optimistic_busy_hint = show_busy_hint
+                                    && terminal_input_uses_optimistic_busy_hint(&session_path);
+                                mark_terminal_input_hot_and_schedule_snapshot(
+                                    state,
+                                    &session_path,
+                                    optimistic_busy_hint,
+                                );
                             }
                             Ok(TerminalJsEvent::ReadNudge { reason }) => {
                                 read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
@@ -9686,42 +9628,60 @@ fn TerminalCanvas(
                                     let flush_lag_ms =
                                         current_millis().saturating_sub(newest_ts_ms);
                                     let submitted = records.len();
-                                    let outcome =
-                                        append_foreign_trace_batch(&trace_home, records);
-                                    // ONE accounting record per drain, and only
-                                    // when there is something to account for. A
-                                    // refusal or a drop that is never counted
-                                    // makes a broken emitter indistinguishable
-                                    // from a quiet one.
-                                    if outcome.rejected_total() > 0
-                                        || outcome.emitter_dropped > 0
-                                        || outcome.over_batch_cap > 0
-                                        || outcome.repaired > 0
-                                    {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "trace_bridge",
-                                            "foreign_batch_faults",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "host_id": host_id.clone(),
-                                                "submitted": submitted,
-                                                "accepted": outcome.accepted,
-                                                "repaired": outcome.repaired,
-                                                "over_batch_cap": outcome.over_batch_cap,
-                                                "emitter_dropped": outcome.emitter_dropped,
-                                                "rejected": outcome
-                                                    .rejected
-                                                    .iter()
-                                                    .map(|(fault, count)| {
-                                                        json!({ "fault": fault, "count": count })
-                                                    })
-                                                    .collect::<Vec<_>>(),
-                                                "flush_lag_ms": flush_lag_ms,
-                                            }),
+                                    // Validate + serialize + write OFF the loop:
+                                    // the batch is owned data and touches no UI
+                                    // state, yet doing it inline held the one
+                                    // thread every keystroke crosses — the
+                                    // watchdog attributed live blocks to
+                                    // `trace/foreign_batch` (2026-08-20).
+                                    // A batch stays contiguous under the writer
+                                    // lock inside `append_foreign_trace_batch`;
+                                    // cross-batch order rests on the records'
+                                    // own ts/seq stamps, which every reader
+                                    // sorts by anyway.
+                                    let batch_trace_home = trace_home.clone();
+                                    let batch_session_path = session_path.clone();
+                                    let batch_host_id = host_id.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let outcome = append_foreign_trace_batch(
+                                            &batch_trace_home,
+                                            records,
                                         );
-                                    }
+                                        // ONE accounting record per drain, and only
+                                        // when there is something to account for. A
+                                        // refusal or a drop that is never counted
+                                        // makes a broken emitter indistinguishable
+                                        // from a quiet one.
+                                        if outcome.rejected_total() > 0
+                                            || outcome.emitter_dropped > 0
+                                            || outcome.over_batch_cap > 0
+                                            || outcome.repaired > 0
+                                        {
+                                            append_trace_event(
+                                                &batch_trace_home,
+                                                "ui",
+                                                "trace_bridge",
+                                                "foreign_batch_faults",
+                                                json!({
+                                                    "session_path": batch_session_path,
+                                                    "host_id": batch_host_id,
+                                                    "submitted": submitted,
+                                                    "accepted": outcome.accepted,
+                                                    "repaired": outcome.repaired,
+                                                    "over_batch_cap": outcome.over_batch_cap,
+                                                    "emitter_dropped": outcome.emitter_dropped,
+                                                    "rejected": outcome
+                                                        .rejected
+                                                        .iter()
+                                                        .map(|(fault, count)| {
+                                                            json!({ "fault": fault, "count": count })
+                                                        })
+                                                        .collect::<Vec<_>>(),
+                                                    "flush_lag_ms": flush_lag_ms,
+                                                }),
+                                            );
+                                        }
+                                    });
                                 }
                             }
                             Ok(TerminalJsEvent::Ignored { reason, value }) => {
@@ -9767,6 +9727,110 @@ fn TerminalCanvas(
                                 warn!(session=%session_path, error=%error, "terminal eval bridge closed");
                                 break;
                             }
+                        }
+                    }
+                    Some((write_shape, write_error)) = terminal_write_failure_rx.recv() => {
+                        // A keystroke's daemon write failed on the writer task.
+                        // This branch is the inline error path of the old Input
+                        // arm, verbatim — it merely runs when the failure
+                        // ARRIVES instead of holding every later keystroke
+                        // hostage while the failing write timed out.
+                        let _branch_guard =
+                            TerminalLoopBranchGuard::new("write_failure", &session_path);
+                        let post_attach_write_retry_limit =
+                            if is_remote_resume_session { 2 } else { 4 };
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "terminal_write_error",
+                            json!({
+                                "session_path": session_path.clone(),
+                                "error": write_error.to_string(),
+                                "shape": write_shape,
+                            }),
+                        );
+                        if should_retry_terminal_write_error_after_attach(
+                            is_remote_resume_session,
+                            &write_error,
+                        ) && post_attach_read_recovery_attempts < post_attach_write_retry_limit
+                        {
+                            let _ = safe_shell_mut(
+                                state,
+                                "terminal_attach_retry_after_write_error",
+                                |shell| {
+                                    shell.retain_terminal_session_path(&session_path);
+                                    shell.terminal_attach_in_flight.insert(session_path.clone());
+                                    shell.terminal_resume_ready_paths.remove(&session_path);
+                                },
+                            );
+                            set_signal_if_changed(terminal_overlay_dismissed, false);
+                            set_signal_if_changed(terminal_live_host_connected, false);
+                            set_signal_if_changed(resume_overlay_failed, false);
+                            set_signal_if_changed(resume_overlay_timed_out, false);
+                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                enabled: false,
+                                focus: false,
+                            });
+                            let (notification_title, notification_message) =
+                                if is_remote_resume_session {
+                                    (
+                                        "Retrying Remote Terminal",
+                                        format!(
+                                            "Yggterm hit a live terminal write error on {} and is retrying the restore.",
+                                            session_host_label
+                                        ),
+                                    )
+                                } else {
+                                    (
+                                        "Recovering Local Terminal",
+                                        format!(
+                                            "Yggterm lost its local terminal runtime on {} and is retrying the restore.",
+                                            session_host_label
+                                        ),
+                                    )
+                                };
+                            upsert_terminal_resume_notification(
+                                state,
+                                &session_path,
+                                NotificationTone::Warning,
+                                notification_title,
+                                notification_message,
+                            );
+                            post_attach_read_recovery_attempts += 1;
+                            deferred_resume_output.clear();
+                            visual_reveal_output_sample.clear();
+                            first_resume_connected_output_ms = None;
+                            if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
+                                endpoint.clone(),
+                                runtime_session_path.clone(),
+                                &trace_home,
+                                "terminal_write_error",
+                                post_attach_read_recovery_attempts,
+                            )
+                            .await
+                            {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "terminal_write_recovery_error",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "error": recovery_error.to_string(),
+                                        "attempt": post_attach_read_recovery_attempts,
+                                    }),
+                                );
+                            }
+                            cursor = 0;
+                            read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                        } else {
+                            safe_push_notification(
+                                state,
+                                NotificationTone::Error,
+                                "Terminal Input Failed",
+                                write_error.to_string(),
+                            );
                         }
                     }
                     _ = tokio::time::sleep_until(next_read_deadline),
@@ -15673,18 +15737,27 @@ const TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS: u64 = 120;
 /// loop, and reports it when that becomes user-visible.
 ///
 /// ⛔ **THE LOOP IS A SERIALIZER, AND THAT IS THE POINT OF THIS PROBE.**
-/// `tokio::select!` runs the chosen branch's body to completion before any other
-/// branch is polled again. The terminal loop has three branches, and one of them
-/// — the read poll — performs a daemon round trip with no timeout, followed by
-/// replay and reconcile work. While that body is awaiting, the branch that
-/// handles KEYSTROKES is not polled at all: the user's typing sits in the JS
-/// event channel until the read returns. Echo therefore waits on the read poll,
-/// not only on its own PTY write.
+/// `tokio::select!` runs the chosen branch's body to completion before any
+/// other branch is polled again. The loop has five branches — bridge close
+/// (`eval_result`), JS events (`js_event`, all 22 event kinds including
+/// keystrokes), keystroke-write failures (`write_failure`), read start
+/// (`read_poll_start`) and read apply (`read_poll_apply`) — and any slow body
+/// holds every other one. The two round trips that once ran inline are hoisted
+/// onto their own tasks (the daemon read since the keystroke-starvation fix,
+/// the keystroke's PTY write since the ordered-writer fix), but the loop still
+/// runs real synchronous work per branch: `read_poll_apply` alone is ~2900
+/// lines, and `js_event`'s non-Input arms (HostHealth in particular) still
+/// hold inline daemon awaits. While one of those runs, the user's typing sits
+/// in the JS event channel.
 ///
 /// ⚠ **AND THAT IS WHY `input/keystroke` COULD READ ZERO THROUGH A REAL STALL.**
 /// It is emitted at the top of the keystroke handler, which is downstream of the
 /// block — a blind instrument by construction, not by misconfiguration. This
 /// guard is emitted from the branch that WAS running, so a stall names its cause.
+///
+/// ⚠ The pre-select loop body (screen reconcile, ahead of the `select!`) is
+/// NOT covered by any guard — a stall there is invisible to `input/loop_block`
+/// and shows up only as watchdog `ui/block` time.
 ///
 /// Drop-based on purpose: the branch bodies `continue` and `return` from many
 /// places, and an explicit timing call at the bottom would miss exactly the
