@@ -19695,3 +19695,33 @@ conflicts. A stash it opens and does not close is a trap it leaves for a differe
 ⇒ **Until that exists, the standing rule for any lane on a shared checkout:** before
 concluding work is missing, run `git stash list` and `git reflog`. A tree that looks
 innocent has still been edited by someone.
+
+## ygg-claim: a fresh top-level claim can derive a PID-shaped seat number
+
+**Status:** OPEN. Hit 2026-08-21 claiming a fresh orchestrator row.
+
+A fresh session (no existing `outline_prefix`, predecessor already retired) ran the claim
+script and was seated as **`6914974.0`** — a number that looks like a process id, not a seat.
+The claim read-back reported it as verified, so nothing failed loudly; the garbage number
+would have sat in the sidebar as the row's family for the rest of the campaign.
+
+Expected: a top-level claim derives the next small family number against existing rows
+(the fixed derivation of 2026-08-20 evening), and something sanity-checks the magnitude —
+a seat family in the millions is never right and should refuse or warn rather than verify.
+
+Repair that worked: `server app session outline <row> <seat>` + read-back, per the standing
+corollary that a wrong seat is repaired with the outline verb, never a re-claim.
+
+## server app session outline: calling it without a seat CLEARS the prefix — a read that writes
+
+**Status:** OPEN. Hit 2026-08-21, immediately after the repair above.
+
+`server app session outline <row> 12.0` applies the seat. The natural way to READ it back is
+to call the same verb without the seat argument — and that call **applies the empty string**:
+`daemon_message: outline "" on <row>`, `outline_prefix: null`, `applied: true`. The read-shaped
+form is a destructive write, and it reports success.
+
+⇒ The one verb is both the setter and the eraser, selected by argument arity, with no
+confirmation on the erasing form. Wanted: the no-argument form should RETURN the current
+value (or refuse), and clearing should be an explicit flag (`--clear`). Until then the only
+safe read-back is a listing instrument, not the verb itself.
