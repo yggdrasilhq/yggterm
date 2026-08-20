@@ -14,7 +14,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔ [11.0] A USAGE-LIMIT WAIT READS AS "IDLE" ON EVERY STATE SURFACE THE DAEMON OWNS
 
-**Status: OPEN — root-caused 2026-08-20 15:52, fix not yet implemented.** Owner-reported with a
+**Status:** OPEN
+
+*Root-caused 2026-08-20 15:52; fix not yet implemented.* Owner-reported with a
 screenshot: a session row mid usage-limit wait (footer painting `Usage limit reached ·
 continuing shortly · esc to cancel`, auto-continue armed, spinner animating) while the Session
 Metadata panel reads `running · idle`. Reported as recurring across many rows recently — which
@@ -52,15 +54,82 @@ during LimitWait, and let the booter consume the daemon's state instead of re-de
 **Falsifier:** a row painted with the limit-wait footer must not read `idle` on the metadata
 panel, the dot, or `gate-screen`; a row at a genuine prompt still must.
 
-**Second, un-root-caused half:** the same screenshot shows a `Recovering Local Terminal —
-lost contact with its local helper` toast (viewport.rs) over a session that was rendering and
-updating normally. Not yet investigated; do not assume it shares this cause. The screenshot was
-taken minutes after a daemon generation handover on that host, so a handover-transient false
-recovery is the first hypothesis to falsify.
+**Second half ROOT-CAUSED 2026-08-20 ~17:00 (was: the un-investigated toast):** the
+`Recovering Local Terminal` toast is the read-error recovery loop reporting honestly — the
+client's IPC read of a daemon response fails ("reading daemon response", 8 episodes/90 min on
+a freshly-restarted GUI, all on the post-attach read path) because the daemon's
+`terminal_read` can wait on the runtime lock past the client's 10 s IO timeout (the lock waits
+measured at up to 84.7 s by the observability lane). What was WRONG was the loop's input
+policy, now fixed client-side: it disabled the composer on every retry and never re-enabled it
+on exhaust, so each episode cost ~a minute of dead input and an exhausted loop left the
+composer dead until a fresh switch won — the owner's "unusable input lag, 3-5 switches".
+Fixed: local sessions keep input enabled through read recovery (the daemon owns the PTY; a
+keystroke is its own request), and read-exhaust re-enables the composer. Remote resume and the
+write-error twin keep their stricter gates. **Still OPEN under this heading: the daemon-side
+root** — `terminal_read` must never out-wait the client IO timeout (serve reads from a
+snapshot without the write lock); until then the toast keeps firing, merely without taking
+input hostage.
+
+## ⚠ [11.0] SWAP RESIDUE MAKES EVERY FIRST TOUCH CRAWL, AND TWO INSTRUMENTS CALLED IT HEALTHY
+
+**Status:** OPEN
+
+*Mitigated by hand once; the diagnostic half is fixed in code, live proof owed.* After a memory crunch, GiBs stay swapped while free RAM recovers (measured: 5.7 GiB
+residue with 8.6 GiB free). Every first touch of a paged-out session — a switch, a reveal, a
+daemon round trip — pays multi-second swap-in, which is the substrate under the input-lag
+episodes and the 80 s reveals. Two instruments denied it: the slow-reveal notification read
+PSI `full` (machine-wide thrash, ~0 while ONE process pays swap-in) and said "Memory is not
+the cause: 9022 MB available"; the health heartbeat separately raised `host_panic_memory`
+incidents about the same state. The reveal verdict now reads the app's own VmSwap (self +
+direct children) and names residue when it is the likely bill — live proof owed on the next
+natural slow reveal. **Open half:** nothing reclaims residue; a one-time swap flush when free
+RAM comfortably exceeds swap-used (observed to end the stall class immediately) wants an owner
+ruling on where it belongs (manual verb vs. automatic after pressure clears).
+
+## ⚠ [11.0] A DIM AGENTS-HINT LINE READS AS TYPED-BUT-UNSENT INPUT, AND THREE PARTIES MISREAD IT
+
+**Status:** OPEN
+
+An idle Claude Code row running a background agent renders a dim line in the
+empty composer describing the task, plus a `← 1 agent` footer. On the row/screen plane this is
+indistinguishable from a typed-but-unsubmitted draft: the owner read it as "the booter typed a
+message without sending it", and two live probes (lone `\r` submits — correctly no-ops on an
+empty buffer) sustained the misread until a visible-character probe showed the composer was
+empty (typed `x` REPLACED the line instead of appending) and a transcript grep showed the text
+nowhere (0 hits). Consequences: the booter's residue detection and Enter guard cannot tell
+this hint from their own typed copy; gate-screen readers diagnose stuck input on healthy rows;
+humans lose time. **Fix direction:** the screen classifiers (booter `_screen_text` arms,
+gate-screen working/idle heuristics) must learn the agents-hint signature (dim composer line +
+`← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
+typed-residue detector must require the footer's absence before claiming residue.
+
+## ⛔⛔ [11.5] SESSION SWITCHES PAINT GHOST FRAMES AND FULL-CANVAS GLYPH SOUP — EVIDENCE FILED, MECHANISM UNPROVEN
+
+**Status:** OPEN
+
+Owner evidence 2026-08-20 (two screenshots): (a) the viewport showing a
+~30-minute-old frame of the selected session — old turns, stale spinner — while the session
+had long progressed, with the system itself aware (an "Open Session Before Redrawing …
+right-click → Redraw Terminal" notification asks the HUMAN to repair the stale viewport by
+hand); (b) a switch painting the entire canvas as unreadable glyph soup. Same-day trace
+context on the freshly-restarted GUI, for whoever takes this:
+47 `screen_reconcile_forced_deadline` events/20 min (the 12 s deadline forces the destructive
+reset+reseed replay over sessions that never go quiet — defer chains of depth 4+ on
+actively-streaming rows), 8 read-error recovery loops/90 min clearing
+`deferred_resume_output` mid-restore, and (now excluded as substrate after the flush) GiBs of
+swap residue. ⛔ No mechanism is proven: the reconcile loop's single-task structure orders
+bridge flushes around the replay, so naive interleaving does NOT explain the soup — do not
+"fix" the deadline without reproducing the corruption under instrumentation first (the
+deadline is itself the broken-bottom fix and tearing it out regresses that). **Fix directions
+worth testing:** automate the redraw the notification prescribes (the manual remedy proves a
+full replay heals it); reproduce the soup with the xterm.js write queue instrumented to see
+what actually interleaves.
 
 ## ⛔⛔ [11.0] THE BOOTER'S SEND PLANE HAS THREE NON-CONVERGING LOOPS, AND TWO WATCHERS RAN AT ONCE
 
-**Status: OPEN.** Diagnosed 2026-08-20 15:10–15:40 from the boot log after the owner reported
+**Status:** OPEN
+
+Diagnosed 2026-08-20 15:10–15:40 from the boot log after the owner reported
 "the booter is patched today and I think it is not sending properly to ANY session." The
 classification plane (WORKING / RATE_LIMITED / NO_TRANSCRIPT) is healthy; every defect is in
 what happens after a boot decision.
