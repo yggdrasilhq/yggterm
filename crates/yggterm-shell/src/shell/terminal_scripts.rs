@@ -299,19 +299,55 @@ fn terminal_eval_script_with_canvas_renderer(
                 }});
             }}
         }};
+        // ⛔⛔ EVERY FLUSH AS A SPAN WAS MEASURED AND IT WAS TOO MUCH. The first
+        // cut emitted one span per flush, reasoning that the write-frame budget
+        // bounds the rate so it could not flood. On the live host that came to
+        // **6500 spans in 42 minutes — 63% of all foreign records, and the
+        // foreign records were 48.7% of the trace plane's BYTES.** The plane's
+        // retention is a byte budget, so nearly doubling the write rate HALVES
+        // the diagnostic window — for every reader, including the very
+        // investigations these probes were added to serve.
+        //
+        // ⇒ The rule this file already applies to enqueue, applied here too:
+        // an always-on aggregate keeps the RATE honest, and point resolution is
+        // spent only where the question lives. What makes it safe is that the
+        // expensive question — what interleaves across a corrupted switch — is
+        // asked at BOUNDARIES, and a boundary arms full resolution for a while
+        // (see `armXtermFlushDetail`). So the steady state is summarised and the
+        // switch is recorded flush by flush.
+        const YGG_XTERM_FLUSH_FLOOR_MS = 8;
+        const YGG_XTERM_FLUSH_DETAIL_MS = 4000;
+        let xtermFlushDetailUntilMs = 0;
+        const armXtermFlushDetail = () => {{
+            xtermFlushDetailUntilMs = Date.now() + YGG_XTERM_FLUSH_DETAIL_MS;
+        }};
         const traceXtermFlush = (elapsedMs, detail) => {{
-            // Every flush, as a span. Unlike the enqueue probe this one is rate
-            // -bounded by the write-frame budget rather than by how fast the PTY
-            // talks, so it cannot flood the ring — and a flush is the unit the
-            // interleave question is actually asked in.
-            ytrace.emit({{
-                category: "xterm_write",
-                name: "flush",
-                kind: "span",
-                clock: "wall",
-                duration_ms: Math.max(0, Number(elapsedMs) || 0),
-                payload: Object.assign({{ host_id: hostId }}, detail || {{}}),
+            const duration = Math.max(0, Number(elapsedMs) || 0);
+            const now = Date.now();
+            const repaired = Boolean(detail && detail.paint_repair_reason);
+            // Keep every slow flush, every repaired flush, and everything inside
+            // a boundary window. Those are the three shapes a reader ever asks
+            // a single flush about.
+            if (now < xtermFlushDetailUntilMs || duration >= YGG_XTERM_FLUSH_FLOOR_MS || repaired) {{
+                ytrace.emit({{
+                    category: "xterm_write",
+                    name: "flush",
+                    kind: "span",
+                    clock: "wall",
+                    duration_ms: duration,
+                    payload: Object.assign({{ host_id: hostId }}, detail || {{}}),
+                }});
+                return;
+            }}
+            const bucket = xtermProbeWindow("xterm_write/flush_window", {{
+                total_ms: 0,
+                max_ms: 0,
+                chars: 0,
             }});
+            bucket.count += 1;
+            bucket.total_ms += duration;
+            bucket.max_ms = Math.max(bucket.max_ms, duration);
+            bucket.chars += Number((detail && detail.raw_payload_length) || 0);
         }};
         const traceXtermRender = (rowStart, rowEnd, rows) => {{
             const now = Date.now();
@@ -362,6 +398,7 @@ fn terminal_eval_script_with_canvas_renderer(
             if (window.__yggtermTrace && window.__yggtermTrace.armStreamCapture) {{
                 window.__yggtermTrace.armStreamCapture(hostId, String((detail && detail.reason) || name));
             }}
+            armXtermFlushDetail();
             ytrace.emit({{
                 category: "xterm_screen",
                 name,

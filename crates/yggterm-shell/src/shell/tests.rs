@@ -8926,6 +8926,15 @@ mod tests {
             "traceXtermRender(",
             "traceXtermScreenEvent(",
             "captureStream(hostId, \"live_stream\"",
+            // ⛔ The flush probe must stay RATIONED. Emitting one span per flush
+            // was measured at 63% of all foreign records and pushed the foreign
+            // share of the trace plane's BYTES to 48.7% — and since retention
+            // here is a byte budget, that halves the diagnostic window for
+            // every reader. If this marker ever disappears, the instrument has
+            // gone back to eating the evidence it exists to preserve.
+            "YGG_XTERM_FLUSH_FLOOR_MS",
+            "xterm_write/flush_window",
+            "armXtermFlushDetail()",
         ] {
             assert!(
                 script.contains(marker),
