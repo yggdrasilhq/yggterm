@@ -2060,6 +2060,38 @@ mod tests {
         assert_eq!(provision_step_for(codex, false), Some(ProvisionStep::Npm));
     }
 
+    /// ⛔ A SELF-UPDATER THAT IS npm IN DISGUISE MUST NOT BE PREFERRED.
+    ///
+    /// grok ships `grok update`, and the general rule prefers a CLI's own
+    /// updater over re-running the install method. Measured 2026-08-20, its own
+    /// `update --check --json` reports `"installer":"npm"` — the updater
+    /// delegates back to npm for an npm-provisioned copy. Preferring it would
+    /// move the npm call inside a process where the staged prefix, the binary
+    /// verification and the atomic publish do not apply, and where an inherited
+    /// `npm_config_prefix` would write the SHARED prefix and overwrite the
+    /// published per-CLI symlink.
+    ///
+    /// ⚠ Locks the DECISION, not the mechanism: Antigravity must keep its
+    /// self-updater, because for an unfetchable CLI it is the only step there is.
+    #[test]
+    fn a_self_updater_that_delegates_to_npm_is_not_preferred_over_our_own() {
+        let grok = ManagedCliTool::GrokBuild.descriptor();
+        assert_eq!(
+            provision_step_for(grok, true),
+            Some(ProvisionStep::Npm),
+            "grok's updater re-enters npm, so yggterm runs npm itself and keeps \
+             the generation, verification and atomic-publish guarantees"
+        );
+        // The rule it declines is still the rule for a CLI that really does
+        // update itself.
+        let agy = ManagedCliTool::Antigravity.descriptor();
+        assert_eq!(
+            provision_step_for(agy, true),
+            Some(ProvisionStep::SelfUpdate(&["update"])),
+            "an unfetchable CLI's own updater is the only step there is"
+        );
+    }
+
     /// The non-npm methods are RUN, not recorded.
     ///
     /// ⛔ Guards the exact regression the ruling reversed: `npm_package()`

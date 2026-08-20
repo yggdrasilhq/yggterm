@@ -2277,10 +2277,32 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // optionalDependencies (linux/darwin/win32 × x64/arm64) — so one npm
         // name provisions correctly on every host the fleet has.
         install: CliInstall::Npm("@xai-official/grok"),
-        // MEASURED: `grok update  Check for updates or install a specific
-        // version`. A CLI that ships its own updater has it PREFERRED over
-        // re-running the install method.
-        update: CliUpdate::SelfCommand(&["update"]),
+        // ⛔⛔ IT SHIPS AN UPDATER AND THAT UPDATER IS npm IN DISGUISE, SO IT IS
+        // NOT PREFERRED HERE. `grok update` exists and the general rule would
+        // pick it over re-running the install method — but MEASURED 2026-08-20,
+        // `grok update --check --json` answers, of itself:
+        //
+        //     {"currentVersion":"1.0.5","latestVersion":"1.0.5",
+        //      "updateAvailable":false,"installer":"npm", ...}
+        //
+        // `"installer":"npm"` is the CLI reporting that its own updater
+        // DELEGATES BACK TO npm for an npm-provisioned copy. So preferring it
+        // does not escape npm at all; it moves the npm invocation inside a
+        // process where yggterm's prefix, staging directory, verification and
+        // atomic publish do not apply. Worse, a session inherits
+        // `npm_config_prefix` from the managed shell exports, so that inner
+        // install would write the SHARED prefix and overwrite the published
+        // per-CLI symlink with a plain npm bin link.
+        //
+        // ⇒ Reinstall through the provisioner's own npm path, which stages into
+        // a fresh generation, proves the binary, and publishes atomically. The
+        // vendor's real payload mechanism is unaffected: its postinstall still
+        // installs `~/.grok/bin/grok-<version>` and swaps its own symlink.
+        //
+        // ⚠ This is NOT a reversal of the self-updater rule — that rule stands
+        // and Antigravity still depends on it. It is the rule declining a
+        // wrapper that would give up guarantees for nothing.
+        update: CliUpdate::Reinstall,
         icon_glyph: "G_",
         // xAI's black. 21:1 against white text — the highest contrast in the
         // table, and the brand's actual colour rather than a nearest match.
