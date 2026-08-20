@@ -79,6 +79,48 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
     })
 }
 
+/// Describe a terminal input burst WITHOUT recording what was typed.
+///
+/// The input-latency chain (`input/keystroke` -> `input/pty` -> `input/render`)
+/// needs to know that input HAPPENED, how big it was, and whether it ended a
+/// line. It must never carry the text itself: this stream is durable, is
+/// rotated into generations, and is read back by agents and notebooks. A
+/// password, an API key and an ordinary command are the same bytes to the code
+/// that writes the probe, so the only safe rule is that content never enters
+/// the stream at all.
+///
+/// The returned shape is deliberately sufficient for every diagnosis the chain
+/// supports: a paste is a large `chars`, an arrow key is `control` with
+/// `has_escape`, a submit is `has_enter`, and a stuck surface is a keystroke
+/// with no matching `input/pty`.
+pub fn input_shape(data: &str) -> Value {
+    let mut printable = 0usize;
+    let mut control = 0usize;
+    let mut has_enter = false;
+    let mut has_escape = false;
+    for ch in data.chars() {
+        if ch == '\r' || ch == '\n' {
+            has_enter = true;
+        }
+        if ch == '\u{1b}' {
+            has_escape = true;
+        }
+        if ch.is_control() {
+            control += 1;
+        } else {
+            printable += 1;
+        }
+    }
+    json!({
+        "chars": data.chars().count(),
+        "bytes": data.len(),
+        "printable": printable,
+        "control": control,
+        "has_enter": has_enter,
+        "has_escape": has_escape,
+    })
+}
+
 /// Mirror a yggterm trace event to ytrace so Dash notebooks can `ytrace query` it.
 /// `component` is the trace component (e.g. "ui"), `category`/`name` are the trace
 /// category/name. Wall clock, always sampled — callers decide whether to record.
@@ -253,8 +295,22 @@ pub fn append_perf_event(home: &Path, category: &str, name: &str, payload: Value
         ytrace::Clock::Wall
     };
     if let Some(dur) = payload.get("duration_ms").and_then(|v| v.as_f64()) {
-        let meta = payload.get("meta").cloned().unwrap_or(serde_json::Value::Null);
-        ytrace_provider().emit_span("perf", category.to_string(), name.to_string(), clock, dur, meta);
+        // The WHOLE payload crosses, not `payload["meta"]`. Only one writer in
+        // the tree nests its context under `meta`; every other one is flat, so
+        // extracting that key sent `null` and the span arrived on the bus as a
+        // bare number. For `render/*` that discarded `interval_ms`, which is the
+        // DENOMINATOR: `duration_ms` there is CPU-ms consumed during an interval,
+        // so without it a reader cannot turn 18,300 into a core fraction and the
+        // one question the render probe exists to answer is unanswerable from
+        // ytrace. A span's context is not optional metadata; it is the units.
+        ytrace_provider().emit_span(
+            "perf",
+            category.to_string(),
+            name.to_string(),
+            clock,
+            dur,
+            payload.clone(),
+        );
     } else {
         ytrace_provider().event("perf", category.to_string(), name.to_string(), payload);
     }
@@ -1193,5 +1249,57 @@ mod tests {
             "the row must name every process that contributed to it, ascending"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn input_shape_never_carries_the_typed_text() {
+        let secret = "hunter2 correct horse\r";
+        let shape = input_shape(secret);
+        let rendered = serde_json::to_string(&shape).expect("serialisable");
+        for word in ["hunter", "correct", "horse"] {
+            assert!(
+                !rendered.contains(word),
+                "input shape leaked the typed text: {rendered}"
+            );
+        }
+        assert_eq!(shape["chars"], 22);
+        assert_eq!(shape["has_enter"], true);
+    }
+
+    #[test]
+    fn input_shape_separates_printable_from_control() {
+        let shape = input_shape("ab\u{1b}[A");
+        assert_eq!(shape["printable"], 4, "esc is the only control char here");
+        assert_eq!(shape["control"], 1);
+        assert_eq!(shape["has_escape"], true);
+        assert_eq!(shape["has_enter"], false);
+    }
+
+    #[test]
+    fn input_shape_counts_bytes_and_chars_separately_for_multibyte() {
+        let shape = input_shape("\u{e9}\u{e9}");
+        assert_eq!(shape["chars"], 2, "two characters");
+        assert_eq!(shape["bytes"], 4, "four bytes — a paste sized in bytes is not sized in chars");
+    }
+
+    #[test]
+    fn perf_span_payload_crosses_to_ytrace_whole_not_just_meta() {
+        // The render probe writes a FLAT payload whose `interval_ms` is the
+        // denominator for its cpu-ms `duration_ms`. Reading `payload["meta"]`
+        // dropped it. Guard the shape the mirror depends on.
+        let payload = json!({
+            "duration_ms": 18_530.0,
+            "interval_ms": 60_000.0,
+            "core_fraction": 0.308,
+            "role": "gui",
+        });
+        assert!(
+            payload.get("meta").is_none(),
+            "the render payload is flat — a mirror that reads `meta` sends null"
+        );
+        assert!(
+            payload.get("interval_ms").is_some(),
+            "cpu-ms without its interval cannot become a core fraction"
+        );
     }
 }

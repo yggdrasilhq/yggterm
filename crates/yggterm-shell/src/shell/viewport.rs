@@ -7434,7 +7434,9 @@ fn TerminalCanvas(
                                         "session_path": terminal_input_session_path.clone(),
                                         "data_len": data.len(),
                                         "is_remote": is_remote_resume_session,
-                                        "input_sample": data.chars().take(20).collect::<String>(),
+                                        // Shape, never content — this is the human's own
+                                        // typing and the stream it lands in is durable.
+                                        "shape": yggterm_core::perf::input_shape(&data),
                                     }),
                                 );
                                 let post_attach_write_retry_limit = if is_remote_resume_session {
@@ -7457,7 +7459,7 @@ fn TerminalCanvas(
                                         json!({
                                             "session_path": session_path.clone(),
                                             "error": write_error.to_string(),
-                                            "input_sample": data.chars().take(80).collect::<String>(),
+                                            "shape": yggterm_core::perf::input_shape(&data),
                                         }),
                                     );
                                     if should_retry_terminal_write_error_after_attach(
