@@ -19936,6 +19936,59 @@ mod tests {
         assert_eq!(style.shell_radius, "0px");
         assert_eq!(style.host_radius, "0px");
     }
+    /// The pad has painted a 24px grid since it was built. Until the snap
+    /// landed, that grid was DECORATION — a stop could only be eyeballed onto a
+    /// line it was drawn beside. These assertions are what make it real.
+    #[test]
+    fn theme_editor_grid_pulls_a_near_point_onto_the_line() {
+        // 2px from the 48px line: inside the magnet, so it is taken.
+        assert_eq!(snap_theme_editor_axis_px(50.0, true), 48.0);
+        assert_eq!(snap_theme_editor_axis_px(46.0, true), 48.0);
+    }
+
+    /// ⛔ MAGNETIC, NOT QUANTISED. A pad that rounds EVERY point to the grid
+    /// cannot express a stop at 37% and has taken the pen out of the designer's
+    /// hand; the mid-cell placement must survive untouched.
+    #[test]
+    fn theme_editor_grid_leaves_a_mid_cell_point_alone() {
+        // 36px is 12px from both 24 and 48 — outside the 7px magnet either way.
+        assert_eq!(snap_theme_editor_axis_px(36.0, false), 36.0);
+        assert_eq!(snap_theme_editor_axis_px(36.0, true), 36.0);
+    }
+
+    /// Alt suspends the magnetism outright, for the placement that genuinely
+    /// belongs between two lines.
+    #[test]
+    fn theme_editor_grid_disengages_when_asked() {
+        assert_eq!(snap_theme_editor_axis_px(50.0, false), 50.0);
+    }
+
+    /// ⛔ THE FAR EDGE IS A SNAP TARGET AND THE ARITHMETIC ALONE NEVER REACHES IT.
+    /// The pad is 286px on a 24px pitch, so the last gridline is 264 and the edge
+    /// is 22px past it — outside the magnet. Without naming the edges explicitly,
+    /// a stop dragged into the far corner comes to rest short of it, which is
+    /// exactly the placement a designer most wants to be exact.
+    #[test]
+    fn theme_editor_grid_snaps_to_both_pad_edges() {
+        assert_eq!(snap_theme_editor_axis_px(3.0, true), 0.0);
+        assert_eq!(
+            snap_theme_editor_axis_px(THEME_EDITOR_PAD_SIZE - 3.0, true),
+            THEME_EDITOR_PAD_SIZE
+        );
+    }
+
+    /// The handle reports snapped-ness from the stop's OWN coordinates, so a
+    /// theme loaded from disk shows the same truth as one just dragged.
+    #[test]
+    fn theme_editor_on_grid_is_derived_not_remembered() {
+        let on_line = (48.0 / THEME_EDITOR_PAD_SIZE) as f32;
+        let mid_cell = (36.0 / THEME_EDITOR_PAD_SIZE) as f32;
+        assert!(theme_editor_axis_is_on_grid(on_line));
+        assert!(!theme_editor_axis_is_on_grid(mid_cell));
+        assert!(theme_editor_axis_is_on_grid(0.0));
+        assert!(theme_editor_axis_is_on_grid(1.0));
+    }
+
     #[test]
     fn opaque_linux_shell_drops_radius_when_native_shape_is_unavailable() {
         assert_eq!(

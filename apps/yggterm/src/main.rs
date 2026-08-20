@@ -2274,13 +2274,6 @@ fn linux_window_profile_from_input(input: LinuxWindowProfileInput) -> LinuxWindo
             reason: "kde_x11_transparent_profile",
         };
     }
-    if input.kde_session && input.wayland_display_present {
-        return LinuxWindowProfile {
-            transparent: true,
-            xrpd_session: false,
-            reason: "kde_wayland_transparent_profile",
-        };
-    }
     if input.gdk_backend_x11 || (input.display_present && !input.wayland_display_present) {
         return LinuxWindowProfile {
             transparent: false,
@@ -2288,14 +2281,44 @@ fn linux_window_profile_from_input(input: LinuxWindowProfileInput) -> LinuxWindo
             reason: "x11_native_shape_profile",
         };
     }
+    // ⛔ A WAYLAND CORNER IS A CAPABILITY, NOT A DESKTOP'S FEATURE.
+    // Wayland has no Shape extension, so `shape_combine_region` — the whole X11
+    // rounding path — is a no-op here. The ONLY way a corner rounds on Wayland
+    // is an alpha surface the compositor composites, and EVERY Wayland
+    // compositor composites alpha: it is wl_surface core, not an extension a
+    // desktop may decline. So there is nothing to detect and no allow-list to
+    // maintain.
+    //
+    // This branch used to read `kde_session && wayland_display_present`, which
+    // made the corner a property of WHO the desktop claimed to be. That is why
+    // the rounding kept cycling fixed→broken for the product's life:
+    //   · every desktop not named here (GNOME, sway, Hyprland, wlroots, and
+    //     yggterm's OWN shadow clients and sandboxes) shipped square corners —
+    //     not because it could not round, but because it was not on the list;
+    //   · KDE itself is recognised only by scraped environment
+    //     (XDG_CURRENT_DESKTOP / KDE_FULL_SESSION), which a GUI launched before
+    //     its desktop env is hydrated does not have — so the SAME machine
+    //     rendered rounded or square depending on how that launch went, which
+    //     is exactly the non-determinism the engineering contract forbids.
+    // Keying on the capability removes both failures at once, and there is no
+    // third desktop to add later.
+    if input.wayland_display_present {
+        return LinuxWindowProfile {
+            transparent: true,
+            xrpd_session: false,
+            // KDE keeps its own reason string so existing traces stay
+            // comparable across the change; the behaviour is now identical.
+            reason: if input.kde_session {
+                "kde_wayland_transparent_profile"
+            } else {
+                "wayland_transparent_profile"
+            },
+        };
+    }
     LinuxWindowProfile {
         transparent: false,
         xrpd_session: false,
-        reason: if input.wayland_display_present {
-            "wayland_opaque_default"
-        } else {
-            "linux_opaque_default"
-        },
+        reason: "linux_opaque_default",
     }
 }
 
@@ -2310,8 +2333,19 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
                     "1" | "true" | "yes" | "on"
                 )
             });
-        let wayland_display_present = std::env::var_os("WAYLAND_DISPLAY").is_some();
         let display_present = std::env::var_os("DISPLAY").is_some();
+        // ⛔ ENV ALONE ANSWERS THIS TOO EARLY. A GUI started by the daemon
+        // (`server app launch`) runs before its display env is hydrated from the
+        // desktop scope, so an env-only read saw NEITHER display and fell to the
+        // opaque default — squaring the corners of a window whose compositor was
+        // right there. The renderer policy already learned this and consults the
+        // compositor SOCKET (`linux_wayland_session_available`); the window
+        // profile never did, so the two disagreed about the same session.
+        // The socket only RESCUES the no-display-env case: a genuine X11 session
+        // has DISPLAY set, so a nested compositor's stray socket cannot capture
+        // it away from the X11 arm above.
+        let wayland_display_present = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || (!display_present && linux_wayland_session_available());
         let gdk_backend_x11 = std::env::var("GDK_BACKEND")
             .ok()
             .is_some_and(|value| value.split(',').any(|part| part.trim() == "x11"));
@@ -5934,9 +5968,46 @@ mod tests {
         assert_eq!(profile.reason, "xrdp_opaque_profile");
     }
 
+    /// ⭐ THE CORNER CONTRACT, WAYLAND HALF. This test replaces
+    /// `linux_wayland_window_profile_stays_opaque_by_default`, which asserted
+    /// the opposite and so froze the defect in place: a non-KDE Wayland session
+    /// was handed an opaque window, and an opaque window on Wayland can never
+    /// round — there is no Shape extension to fall back to. Every Wayland
+    /// compositor composites alpha, so the transparent profile is owed to all of
+    /// them, not to an enumerated few.
     #[test]
-    fn linux_wayland_window_profile_stays_opaque_by_default() {
-        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+    fn linux_wayland_window_profile_is_transparent_on_every_compositor() {
+        for kde_session in [false, true] {
+            let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+                transparent_opt_in: false,
+                wayland_display_present: true,
+                display_present: true,
+                gdk_backend_x11: false,
+                kde_session,
+                xrpd_session: false,
+            });
+            assert!(
+                profile.transparent,
+                "wayland must round its corners regardless of desktop identity (kde={kde_session})"
+            );
+        }
+    }
+
+    /// The desktop's NAME may not change the outcome — only its reason string.
+    /// This is the regression guard for the non-determinism itself: the same
+    /// session, launched once with its desktop env hydrated and once without,
+    /// must produce the same window.
+    #[test]
+    fn linux_wayland_window_profile_does_not_depend_on_desktop_identity() {
+        let with_identity = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: true,
+            display_present: true,
+            gdk_backend_x11: false,
+            kde_session: true,
+            xrpd_session: false,
+        });
+        let without_identity = linux_window_profile_from_input(LinuxWindowProfileInput {
             transparent_opt_in: false,
             wayland_display_present: true,
             display_present: true,
@@ -5944,8 +6015,27 @@ mod tests {
             kde_session: false,
             xrpd_session: false,
         });
+        assert_eq!(with_identity.transparent, without_identity.transparent);
+        assert_eq!(with_identity.reason, "kde_wayland_transparent_profile");
+        assert_eq!(without_identity.reason, "wayland_transparent_profile");
+    }
+
+    /// A session with no display environment at all is NOT a Wayland session as
+    /// far as this pure function is concerned — the socket probe that rescues
+    /// that case lives in `detect_linux_window_profile`, and feeds its answer in
+    /// through `wayland_display_present`.
+    #[test]
+    fn linux_headless_window_profile_stays_opaque() {
+        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: false,
+            display_present: false,
+            gdk_backend_x11: false,
+            kde_session: false,
+            xrpd_session: false,
+        });
         assert!(!profile.transparent);
-        assert_eq!(profile.reason, "wayland_opaque_default");
+        assert_eq!(profile.reason, "linux_opaque_default");
     }
 
     #[test]
