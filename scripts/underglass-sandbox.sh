@@ -36,6 +36,22 @@
 #                       sandbox that silently lands on XWayland answers a
 #                       different question — see `backend`)
 #
+# ⛔ WHICH BINARY IT ACTUALLY RUNS — set YGGTERM_GUI_BIN, every time.
+#   The resolver tries the INSTALLED build first and your repo build second, so a
+#   sandbox started to prove a change you have not installed comes up green,
+#   behaves perfectly, and proves nothing. It fails in the reassuring direction:
+#   there is no error, only a GUI that does not have your code in it.
+#     YGGTERM_GUI_BIN=<repo>/target/release/yggterm scripts/underglass-sandbox.sh start
+#   Then confirm, rather than assume — `strings -a <bin> | grep -F '<a string
+#   only your build has>'`. ⚠ MTIME CANNOT ANSWER THIS: an installed binary
+#   stamped minutes AFTER a commit has been observed not to contain it.
+#
+# ⛔ SETTINGS ARE READ AT START. Anything you want the GUI to come up with —
+#   vertical tabs is the one that keeps catching people, because without it you
+#   silently get the horizontal strip and go looking for a rail that was never on
+#   screen — must be written into <sandbox home>/.yggterm/settings.json BEFORE
+#   `start`. Written afterwards it is not re-read.
+#
 # Requires: sway, grim (same as shadow-client.sh).
 
 set -euo pipefail
