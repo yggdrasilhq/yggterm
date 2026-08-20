@@ -12,6 +12,83 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.2] `terminal new --model` IS ACCEPTED AND SILENTLY DROPPED FROM THE LAUNCH COMMAND
+
+**Status:** OPEN — measured 2026-08-20, reproduced on 8 of 8 spawns in one batch
+
+`server app terminal new --kind claude-code --model <id> …` answers success and creates the row,
+but the spawned process command line is `claude --dangerously-skip-permissions --session-id <id>`
+— no model flag at all. The row silently launches on the CLI's saved default model. Reproduced on
+every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
+
+- **Consequence:** an orchestrator directed to spawn delegates on a specific model cannot; every
+  delegate lands on whatever default the CLI last saved. Nothing downstream flags the substitution
+  (same shape as the fleet skill's "silently mangled id yields a working row on the wrong model").
+- **Workaround (proven):** drive `/model <id>` into the row after it reaches its composer.
+- **Locality:** launch-command construction for agent kinds — the same
+  `persistent_agent_resume_command` / managed_cli family lane 11.2 is auditing for resume-id
+  mapping. Check whether `--permission-mode` and other per-launch options survive, too: the
+  spawned cmdline shows `--dangerously-skip-permissions` did, so the drop is selective.
+- **Falsifier:** spawn with `--model <x>`; `/proc/<pid>/cmdline` (or the CLI's own session state)
+  carries x, and the row header shows x.
+
+## ⛔⛔⛔ [11.4→11.3] THE GUI FREEZES WITH ZERO INCIDENTS RECORDED — OWNER KILLED IT; INPUT PROBES WERE BLIND AND THE TITLE CHORE OWNED THE HOUR
+
+**Status:** OPEN — instance 2026-08-20 ~11:06 IST (GUI killed and relaunched by the owner)
+
+**Owner report:** the GUI froze hard enough to need a manual kill; separately, typed prompt
+characters echoed only after ~3 s of stuckness. No coredump for today (the GL SIGSEGV entries are
+from earlier days) — the process was alive and blocked, i.e. a UI-thread stall, not a crash.
+
+**What the instruments said about the freeze hour (GUI host, `ytrace --since 60m`):**
+
+| instrument | reading | verdict |
+|---|---|---|
+| `ytrace incidents` | **0** | a freeze the owner had to kill produced no incident — the UI-block class is invisible to every probe we have |
+| `ytrace tail --category input` | **0 events** | the keystroke→pty→render chain (wired for exactly this symptom) recorded NOTHING on the GUI host during an hour containing a real 3 s input stall — blind instrument, cause unknown (wrong host? wrong build path? category name?) |
+| `copy_generation title` | **132 calls, p50 8.7 s, p95 10.4 s, max 20.8 s — ~19 min of wall in one hour** | the title/LLM re-resolve loop dominated the hour; if any call holds a lock the render/input path needs, 3 s echo stalls follow |
+| `render gui cpu` + `render web_content cpu` | ~1238 s + ~1390 s CPU over the hour | ~70% of a core at "rest", consistent with the standing burning-core entries |
+| `sidebar merge_rows` | 2247 calls/hour | steady background jank source |
+
+**Two workstreams, one owner each:**
+- **11.4 (instrument):** a UI-thread block watchdog — a main-loop heartbeat probe that emits a
+  durable `ui/block` incident for any gap > ~200 ms with attribution (what ran last), so the next
+  freeze names itself; plus root-cause why `input/*` recorded zero on the GUI host and make the
+  echo-latency tail land there. The freeze class must never again be zero-incident.
+- **11.3 (suspect):** the title chore's 8.7–20.8 s calls must be strictly async off any lock or
+  thread the UI/snapshot path touches, and paced; likely amplified by the agy fake-recency flood
+  (~1000 rows perpetually "fresh" and eligible for re-title — 11.1's fix shrinks the queue).
+
+**Falsifier:** with the watchdog live, an induced 500 ms main-thread block raises `ui/block` with
+attribution within one tick; after the chore fix, a full title-chore tick under LLM latency ≥ 10 s
+shows keystroke echo p95 < 100 ms in the input chain on the GUI host.
+
+## ⛔⛔ [11.6] THE CLI PROVISIONER'S npm AUTO-UPDATE RACES ITSELF ACROSS CONCURRENT LAUNCHES
+
+**Status:** OPEN — evidence captured 2026-08-20 (log paths below)
+
+Six agent rows spawned in one batch on one host. Each launch ran the provisioner's npm update into
+the shared prefix `~/.yggterm/npm`. Two launches died mid-update and their rows dropped to a bare
+shell with the agent never started:
+
+- `MODULE_NOT_FOUND` requiring `…/@anthropic-ai/claude-code/install.cjs` (a half-reified tree),
+- `postinstall Failed to place binary: ENOENT … link` (a sibling unlinked what this run was
+  linking).
+
+Four npm runs within 11 s in `~/.yggterm/npm-cache/_logs/2026-08-20T05_18_*.log`. There is no
+lock around the prefix and reify is not atomic, so concurrent updates corrupt each other. This is
+the same failure class reported for grok-build provisioning ("npm breaking every time").
+
+- **Second defect in the same incident:** a row whose launch dies this way is a husk born broken —
+  its PTY write path answers `remote terminal write failed`, the frozen npm error frame renders as
+  the screen, and nothing marks the row as failed. A launch that never reached its CLI must surface
+  an error state on the row, not a corpse that looks idle.
+- **Owner lane:** 11.6 (`docs/cli-integration.md`). Fix class: single-flight lock per prefix +
+  install-to-temp-then-rename on disk (never tmpfs) + skip-if-fresh TTL so N concurrent launches
+  cause at most one update.
+- **Falsifier:** spawn 6 rows concurrently twice; zero npm failures, zero husk rows, and at most
+  one update run per prefix per TTL window.
+
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
