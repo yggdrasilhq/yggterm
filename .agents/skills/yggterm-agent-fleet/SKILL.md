@@ -1475,11 +1475,61 @@ handoff is a cycle, not an ending:
       | CLI | native flag | default lives in | flag sticks? | in-session cmd sticks? | decisive verification |
       |---|---|---|---|---|---|
       | claude-code | `--model` | `~/.claude/settings.json` `model` | NO (measured) | YES — `/model` writes it (measured) | transcript `"model"` per assistant record |
-      | codex | `-m/--model` | `~/.codex/config.toml` top-level `model` | unchanged across two refused runs (weak; UNMEASURED positive) | UNMEASURED | TUI banner + config; transcript field UNMEASURED |
-      | muse | `--model` | `~/.config/muse/settings.json` `model` | UNMEASURED | UNMEASURED | UNMEASURED |
-      | antigravity | `--model` ("for the current CLI session"; `models` lists) | session-scoped per its own help | implied NO | n/a | UNMEASURED |
-      | grok-build | `-m/--model` | config dir | UNMEASURED | UNMEASURED | UNMEASURED |
-      | kimi | `-m/--model` | `~/.kimi-code/config.toml` (login-managed) | UNMEASURED | UNMEASURED | UNMEASURED |
+      | codex | `-m/--model` | `~/.codex/config.toml` top-level `model` | unchanged across two refused runs (weak; UNMEASURED positive) | UNMEASURED | **footer `<model> <effort> · <cwd>` (measured)**; transcript field UNMEASURED |
+      | muse | `--model` | `~/.config/muse/settings.json` `model` | **NO (measured)** | UNMEASURED | **footer `<model> · <effort> · <cwd> · YOLO` (measured)**; a bad id is refused BY NAME by the provider |
+      | antigravity | `--model` ("for the current CLI session"; `models` lists) | `~/.gemini/antigravity-cli/settings.json` `model` — ⚠ **stores the DISPLAY NAME ("Gemini 3.x Flash (High)"), not the id the flag takes** (measured) | **NO (measured — config mtime unchanged across a flagged run)** | n/a | `-p … --output-format json` returns `{conversation_id, usage{…}}`; `models` lists the ids |
+      | grok-build | `-m/--model` | `~/.grok/` | UNMEASURED | UNMEASURED | **footer `<model> (<effort>) · <approval-mode>` (measured)** |
+      | kimi | `-m/--model` | `~/.kimi-code/config.toml` (login-managed) ⚠ its own `--help` names `~/.kimi/config.toml`; **the directory on disk is `.kimi-code`** | UNMEASURED | UNMEASURED | **footer `context: N%` (measured)** |
+      | qwen-code | `-m/--model` | `~/.qwen/settings.json` | UNMEASURED | UNMEASURED | UNMEASURED — first run holds on a consent MENU (§11) |
+      | pi | `--model` (`provider/id`) | `~/.pi/agent/settings.json`; custom providers in `~/.pi/agent/models.json` | UNMEASURED | UNMEASURED | **footer `<used>/<window> (auto)` + the model id (measured)** |
+      | opencode | `-m/--model` (`provider/model`) | `~/.config/opencode/opencode.jsonc` | UNMEASURED | UNMEASURED | **footer `<agent> · <model>` and `<used> (<pct>)` (measured)** |
+
+      ⛔⛔ **AND THE LAW THAT OUTRANKS THE WHOLE TABLE: ON A REMOTE SPAWN THERE IS
+      CURRENTLY NO WAY TO PIN A MODEL FOR ANY CLI.** Measured 2026-08-20 across
+      all ten kinds, and it splits two ways — neither of which gives you a
+      pinned model:
+      - **Nine kinds REFUSE the flag BY NAME.** `terminal new --kind <any but
+        claude-code> --machine-key <host> --model <id>` answers, before creating
+        anything: *"a REMOTE <kind> session cannot carry --model /
+        --permission-mode yet: that lane has no extra-args forwarding to the
+        remote host (claude-code does, via an env var). Launch it locally on
+        that machine, or use --kind claude-code."* ⭐ **This refusal is the
+        HONEST outcome and costs nothing** — no row is created, so there is
+        nothing to reap.
+      - **claude-code, the ONE kind that accepts it, silently loses it.** The
+        create succeeds, `launch.model` echoes your id back, and
+        **`launch.applied` reads `false`** — `--model` appears nowhere in the
+        resulting launch command and the row lands on the host's sticky
+        settings default (its banner will name that default, not your id).
+      ⇒ **Read `launch.applied` on EVERY create.** It is the field that tells
+      the two apart, and it was correct both times. ⚠ Do not "route around" the
+      nine refusals by switching a lane to `--kind claude-code` — that silently
+      changes which CLI runs the work.
+      ⚠ **"Launch it locally on that machine" is not available on a fleet whose
+      GUI host does not carry the CLIs.** Check before planning around it: on
+      the host measured, the GUI host had NONE of the eight non-Claude CLIs
+      installed, so every one of them can only be spawned remotely — i.e. only
+      on its unpinnable lane.
+
+      ⭐⭐ **THE CONTEXT EQUATION IS THE PTY FOOTER, AND READING IT TYPES
+      NOTHING.** Every one of these TUIs paints its model, and often its context
+      usage, into the last two rendered lines. `server snapshot` →
+      `live_sessions[].terminal_lines` returns them, so a single read answers
+      "what model is this row on" and "how full is it" for ANY CLI, with no
+      slash command, no keystroke, and no risk of typing into a live prompt.
+      **It is the safest cross-CLI instrument there is** — prefer it to every
+      per-CLI `/context` equivalent. Exact spellings measured 2026-08-20:
+      | CLI | footer carries | context %? |
+      |---|---|---|
+      | codex | `<model> <effort> · <cwd>` | no |
+      | muse | `<model> · <effort> · <cwd> · YOLO` | no |
+      | grok-build | `<model> (<effort>) · <approval-mode>` | no |
+      | kimi | `yolo  agent  <cwd>` then `context: <pct>%` | **yes** |
+      | pi | `<cwd>` then `<used>/<window> (auto)` + model id | **yes, with the window** |
+      | opencode | `<cwd>` then `<used> (<pct>)`; model on the `<agent> · <model>` line | **yes** |
+      | claude-code | banner names model + effort + account | no (banner scrolls away) |
+      ⚠ Strip the ANSI/CSI noise before matching — these footers are drawn with
+      colour and cursor-positioning escapes, and a naive substring test misses.
       ⚠ Auth can constrain the id space (codex under a ChatGPT account refuses
       non-account models by NAME — the refusal is loud, read it). ⚠ UNMEASURED
       cells are invitations, not blanks to assume across: measure with a
@@ -2866,6 +2916,225 @@ per-platform payload package anywhere you would expect it.
 - **Versioned + symlinked, deliberately.** `~/.grok/bin/grok-<version>` with a
   `grok` symlink swapped onto it, because replacing a binary a running process
   has mmap'd is fatal on macOS. Worth copying rather than working around.
+
+### ⛔⛔ EVERY CLI BELOW — `terminal submit` CANNOT SEE THEIR COMPOSER. USE `send`.
+
+**Read this before the per-CLI entries; it applies to all of them and it is the single
+thing most likely to cost you an hour.** Measured 2026-08-20 on six freshly-spawned rows
+(muse · grok-build · codex · kimi · pi · opencode), each `launch_phase: Running`, each
+with its composer visibly painted:
+
+- **Tell:** `terminal submit` answers, after ~30 s, `submitted:false` with
+  *"no agent composer row appeared within the timeout — the row is mid-output, in a
+  menu, or is not an agent CLI, so input readiness is unanswerable rather than false"* —
+  **while `server snapshot` → `terminal_lines` shows the composer drawn and idle.**
+- ⛔ **Do not believe the reason string.** It blames the ROW (mid-output, in a menu) for
+  what is a DETECTOR gap, and it will send you hunting a wedge that does not exist. The
+  detector recognises a Claude-Code/Codex-shaped composer; these TUIs each draw a
+  different prompt glyph, so readiness is genuinely unanswerable *to it* — the wording is
+  honest about its own limits and misleading about the row.
+- ✅ **What works:** `terminal send` — the raw PTY write — as **two separate writes**:
+  the text, a short pause, then a **lone `\r`**. Verified by the CLIs answering in-frame.
+  (This is the same two-write law as the Enter key everywhere else in this file.)
+- ⚠ **`send` is UNGATED.** `submit` existed to refuse a busy row; `send` will type over
+  one. Read the frame first and never point it at a row a human is using.
+
+---
+
+### The context + model equation for ALL of these CLIs: READ THE FOOTER
+
+⭐⭐ **Every one of these TUIs paints its model — and usually its context usage — into
+the last rendered lines, so `server snapshot` → `live_sessions[].terminal_lines` answers
+"what model is this on" and "how full is it" for ANY CLI without typing a single byte.**
+Prefer it to every per-CLI `/context` equivalent: it is one read, it is identical across
+CLIs, and it cannot type into a live prompt. Exact spellings are in §8.5(e)'s footer
+table. ⚠ Strip ANSI/CSI escapes before matching — these footers are drawn with colour and
+cursor-positioning codes and a naive substring test misses them.
+
+---
+
+### Muse — additions
+
+**Spawn:** clean. Reaches `Running` with a full PTY inside ~100 s; composer is `⟩`.
+**Footer:** `<model> · <effort> · <cwd> · YOLO`.
+**Model:** `--model` reaches the provider and **does not stick** (measured: config mtime
+identical across a flagged run). ⭐ **A bad id is refused BY NAME by the provider** —
+`agent loop failed: model failed: model '<id>' does not exist or you lack access
+[request_id=…]`. Treat that as the flag WORKING, not as a launch failure.
+⚠ It emits a startup warning when a rules file exceeds its context budget and
+**truncates it for that session** — worth reading, because a truncated rules file is a
+silent behaviour change, not an error.
+
+---
+
+### Kimi
+
+**The tell of a login-less kimi: it looks HEALTHY.** The row reaches `Running`, paints a
+full TUI with a working composer, and accepts input. Only when you submit does it answer
+`LLM not set, send "/login" to login` — inline, as if it were a reply.
+
+- ⛔ **It is NOT a wedge and not a spawn failure.** Every launch signal is green; the
+  refusal arrives at turn time, in the transcript position where an answer would go.
+- ⭐ **A login-less run STILL MINTS A SESSION ID** (non-interactively it prints
+  `To resume this session: kimi -r <uuid>` and exits 1). So a store scan finds kimi
+  sessions that never did anything — a stack of them is the fingerprint of repeated
+  login-less launches, not of work.
+- **Footer:** `yolo  agent  <cwd>` and, on its own line, **`context: <pct>%`** — one of
+  the two CLIs that states context as a bare percentage.
+- ⚠ **Its `--help` names `~/.kimi/config.toml` as the config default; the directory that
+  actually exists on disk is `~/.kimi-code/`.** Do not go looking for the former.
+- Startup may paint an **update notice**, not a login gate — do not read the notice as
+  the auth problem.
+
+---
+
+### Qwen Code
+
+**The tell: the row is `Running`, the CLI is painted, and NOTHING you send lands —
+because it is sitting on a first-run consent MENU.** The frame shows a numbered list:
+
+    › 1. Yes
+      2. No (esc)
+      3. No, don't ask again
+
+- ⛔ **This is a menu, so the composer verbs cannot work** — same class as Claude Code's
+  workspace-trust gate (§11.1). Drive it with `terminal send` and a lone `\r` after
+  confirming from the frame which line the `›` sits on. **Never arrow blind through a
+  menu that sets a persistent preference** — option 3 is "don't ask again".
+- **Login:** non-interactively it exits 1 with *"No auth type is selected. Please
+  configure an auth type (e.g. via settings or `--auth-type`) before running in
+  non-interactive mode."* — a different and much clearer shape than kimi's, and it comes
+  BEFORE any session work.
+- ⚠ Its narrow painting is genuine, not a stale PTY grid — see the viewport table above
+  before chasing it.
+
+---
+
+### Pi
+
+**Spawn:** clean; reaches `Running` promptly.
+**Footer — the richest of any CLI here:** the cwd on one line, then
+**`<used>/<window> (auto)`** together with the model id. It is the only one that states
+the context WINDOW alongside the usage, so a percentage can be checked rather than
+trusted.
+
+- ⭐ **Custom / gateway providers go in `~/.pi/agent/models.json`** — a `providers` map
+  with `baseUrl`, `api: "openai-completions"`, `apiKey` and a `models` list. `apiKey`
+  supports `$ENV_VAR` interpolation and `!shell-command` resolution, so a key need never
+  be written literally. `pi --list-models` then shows the provider and is the cheap
+  read-back that the file parsed.
+- ⛔⛔ **A generation swap can delete the tree a RUNNING row is executing from.** Observed
+  live: a row launched from a `pi.genN` prefix failed mid-turn with a Node
+  module-resolution error naming a path inside that prefix — which had been removed while
+  the row ran, the CLI having been re-provisioned to `genN+1`. **Tell:** a running agent
+  row that suddenly cannot resolve its own bundled modules, with a generation number in
+  the path that no longer exists on disk. It is not a config error and re-reading the
+  config will not show it.
+- ⚠ A malformed skill/extension file surfaces as a YAML parse error painted into the
+  session — noisy but not fatal; it does not stop the row.
+
+---
+
+### OpenCode
+
+**Footer:** `<agent> · <model>` on one line, `<cwd>` and **`<used> (<pct>)`** on the last.
+
+- ⭐ **Custom / gateway providers go in `~/.config/opencode/opencode.jsonc`** under
+  `provider.<id>` with `npm: "@ai-sdk/openai-compatible"`, `options.baseURL`,
+  `options.apiKey`, and a `models` map. ⭐ **Key the models map by a SHORT ALIAS and put
+  the real upstream id in the entry's `id` field** — the CLI addresses models as
+  `provider/model`, so an upstream id that itself contains slashes makes the address
+  ambiguous. `opencode models | grep <provider>` is the read-back.
+- ⛔⛔ **It sends `reasoning_effort` and `verbosity` on EVERY request, and setting
+  `reasoning: false` on the model does NOT stop it.** Against a gateway that rejects
+  unknown params this fails the whole turn. **Tell, and it is a nasty one: the first
+  symptom is a SILENT TIMEOUT, not an error** — the CLI retries on an escalating ladder
+  for well over a minute before printing anything, so a 120 s timeout returns with no
+  output at all and reads as a hang. ⇒ **Run it once with `--print-logs` before
+  concluding anything**; the per-attempt `stream error` lines name the real cause
+  immediately.
+  ✅ **Fix that worked:** put the gateway's own suggested escape in the model's `options`
+  — `{"allowed_openai_params": ["reasoning_effort", "verbosity"]}` — which tells the
+  gateway to pass them through instead of rejecting the request.
+- ⚠ **The TUI's default model is NOT the one `run -m` uses.** A freshly spawned row
+  showed the vendor's own default in its footer while `opencode run -m <provider>/<alias>`
+  answered on the configured gateway. Pin the model on the row, or read the footer.
+
+---
+
+### Grok Build — additions
+
+**Footer:** `<model> (<effort>) · <approval-mode>`, drawn INTO the bottom border of its
+composer box — so a line-oriented match for the model must include border characters.
+**Spawn:** clean, reaches `Running`. Composer is `❯` inside a box.
+⚠ Of the CLIs driven by raw `send`, this was the one where a text-then-`\r` pair did NOT
+land on the first attempt while the same pattern worked elsewhere. Read the frame back
+after sending rather than assuming; give it a longer pause between the two writes.
+
+---
+
+### Antigravity — additions
+
+**⛔⛔ ON A REMOTE LANE IT NEVER ATTACHES, AND EVERY SUCCESS SIGNAL SAYS OTHERWISE.**
+Measured twice, independently, 2026-08-20: `terminal new --kind antigravity
+--machine-key <host>` answers `launch.applied: true` and creates a row — which then sits
+in **`launch_phase: RemoteBootstrap` indefinitely** (still there after ~10 minutes) with
+`pty_cols`/`pty_rows` both **`null`**, painting only yggterm's own launcher preamble.
+Every other kind reached `Running` with a real PTY inside ~100 s.
+
+- **Tell:** `launch_phase` never leaves `RemoteBootstrap` and the PTY dimensions are
+  null. `input-check` times out with "no agent composer row appeared", which reads like
+  a slow CLI rather than a lane that never opened.
+- ⚠ **Its session path has no host segment** — `agy-runtime://<uuid>` where every other
+  remote kind produces `remote-<cli>://<host>/<uuid>`. A reap of that row answered
+  `verified:false` with no reason and no surviving pids, while every `remote-*://` reap
+  in the same batch answered `verified:true`. Treat the scheme asymmetry as the likely
+  cause and verify the process by hand.
+- ⭐ **Its config stores the model's DISPLAY NAME, not the id.** `settings.json` holds
+  something like `"Gemini 3.x Flash (High)"` while `--model` and `agy models` speak ids
+  like `gemini-3.x-flash-high`. Comparing the two directly will always look like a
+  mismatch. The flag does **not** write the config (measured: mtime unchanged).
+- ⭐ **Cheapest model/context read of any CLI here:** `agy -p "<prompt>" --output-format
+  json` returns `{"conversation_id": …, "usage": {"input_tokens", "output_tokens",
+  "total_tokens", "cache_read_tokens"}}` — a real token accounting without a TUI.
+
+---
+
+### Codex — additions
+
+**Footer:** `<model> <effort> · <cwd>`.
+⚠ **Its durable store entry can carry the YGGTERM ROW TITLE rather than a CLI-generated
+one** — a row spawned with `--title 'probe: …'` showed up in the store scan under exactly
+that string, where the other CLIs showed either a generated title or a placeholder.
+⛔ **A reap can delist the row and leave the codex processes running** (measured: sidebar
+clean, two live codex processes still holding the row's cwd). Identity-check by cmdline
+after every reap — the sidebar will not tell you.
+
+---
+
+### Durable rows: what a despawn actually leaves behind (measured across all eight)
+
+⭐ **The good news, and it was worth proving: a despawned agent-CLI session DOES survive
+into the durable plane for every CLI that took a turn.** After reaping eight probe rows,
+the store scanner reported durable rows for muse, grok-build, kimi, qwen-code, pi,
+opencode and codex, each carrying the right cwd. The cwd tree and start page are fed from
+that scan, so these CLIs are findable again after their live row is gone.
+
+Three defects ride along, and all three are recognition problems rather than data loss:
+- **One spawn can produce SEVERAL durable rows** (four of the CLIs contributed two or
+  more for a single session), so one session can look like three.
+- **Placeholder titles** — `Grok Shell`, `Kimi Shell`, `Pi Shell`, `Qwen Shell`,
+  `Opencode Shell` — which read as stray plain shells rather than as agent sessions.
+- **Some rows carry no title at all** (`None`), leaving them effectively unlabelled in
+  the one surface whose job is recognition.
+
+⚠ **And the measurement trap that nearly produced a false finding here:** the sidebar
+row list emits children only for EXPANDED groups. Counting per-CLI rows in it and finding
+none is NOT evidence the durable plane lacks them — the sample was 206 of 373 rows hidden
+by collapsed sets. **Ask the scanner directly** (`server startpage ls --json`), which
+reports what the stores actually hold, and ask it **on the host where the CLIs run** —
+running it against the GUI host's home answers a different question and quietly returns
+that host's much smaller set.
 
 ### npm-provisioned CLIs as a CLASS — the one that cost the most
 
