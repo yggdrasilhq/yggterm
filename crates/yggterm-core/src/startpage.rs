@@ -464,6 +464,14 @@ fn scan_antigravity_sessions(
         if let Some(ids) = durable_ids.as_ref() {
             walked.retain(|row| ids.contains(&row.session_id));
         }
+        // ⛔ One conversation can have MORE THAN ONE file — a brain transcript and
+        // a legacy `.antigravitycli/<id>.json` both resolve to the same
+        // conversation id. `walk_and_collect` dedups by PATH, which cannot see
+        // that, so such a session was emitted twice and appeared twice inside a
+        // single cwd-tree group (measured: 4 sessions on one host). A session is
+        // identified by its id, not by the file it happens to be stored in.
+        let mut walked_ids = HashSet::new();
+        walked.retain(|row| walked_ids.insert(row.session_id.clone()));
         out.append(&mut walked);
     }
 
@@ -860,6 +868,34 @@ mod scan_truth_tests {
         let ids: Vec<&str> = out.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(ids, ["keep-me"], "only the real session survives, got {ids:?}");
         assert_eq!(out[0].modified_epoch_ms, 1786524062868, "row recency, not DB file mtime");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // One conversation, more than one file on disk — the shape that put the same
+    // session in one cwd-tree group twice.
+    #[test]
+    fn a_conversation_stored_in_two_files_is_still_one_session() {
+        let tmp = std::env::temp_dir().join(format!("ygg_scan_dup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let id = "3f2a71c4-9b0e-4d6a-8c15-a7e30bd94f62";
+        summaries_db(&tmp, &[(id, r#"["file:///home/user/proj/sample"]"#, 9)]);
+        // A brain transcript AND a legacy json, both naming the same conversation.
+        let brain = tmp
+            .join(".gemini/antigravity-cli/brain")
+            .join(id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&brain).unwrap();
+        std::fs::write(brain.join("transcript_full.jsonl"), b"{\"type\":\"USER_INPUT\"}\n").unwrap();
+        let legacy = tmp.join(".antigravitycli");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(format!("{id}.json")), b"{}").unwrap();
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        scan_antigravity_sessions(&tmp, &mut out, &mut seen);
+        let hits = out.iter().filter(|r| r.session_id == id).count();
+        assert_eq!(hits, 1, "one conversation is one row, got {hits}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
