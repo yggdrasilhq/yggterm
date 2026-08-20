@@ -12,6 +12,46 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.1] THE METADATA RAIL'S "CONVERSATION N user · M assistant" COUNTS A PREVIEW, NOT A CONVERSATION
+
+**Status:** OPEN
+
+*Measured 2026-08-20 on two live sessions, and the two code paths disagree with the transcript
+in two DIFFERENT ways.*
+
+A live session whose transcript holds **774 records — 138 user / 271 assistant**, active over
+1h43m, is described by the rail as `Conversation 0 user · 0 assistant`. A faithful screenshot of
+a second live session, unrelated to the first, shows the same `0 user · 0 assistant` beside a
+7 MB transcript. The number is not slightly wrong; it is answering a different question.
+
+**Both encodings measure a WINDOW and name it a TOTAL:**
+
+* `state.rs:51852` — the LOCAL live path counts `session.preview.blocks` by tone. A preview is
+  an excerpt built for display, and for a terminal-view row it is routinely empty, so the count
+  is 0 whatever the conversation holds.
+* `lib.rs:15174` — the REMOTE scan path counts
+  `read_agent_transcript_messages_tail_limited(path, 12)`, so `user_message_count` can never
+  exceed the last twelve messages no matter how long the session ran.
+
+Neither reads the conversation. The transcript is the only thing that knows, and it is not
+consulted by either.
+
+⚠ **Why it survived:** every value it produces is plausible. `0` reads as "new session" and a
+single-digit count reads as "short session", so nothing about the output announces that the
+instrument has a ceiling. Same family as the store-column-called-title fault and the
+`durable_count` computed before a dedup: the name promises a total, the code delivers a window.
+
+**Design constraint that must not be lost.** A full count per scan is not free — the codex store
+alone is hundreds of files and gigabytes, and the tail window almost certainly exists because of
+that. But the rail describes ONE selected session, so the count is an on-demand read for that
+session, cached on `(path, len, mtime)` — not something every scan pays for every row.
+
+**Falsifier:** for a live session, the rail's user/assistant counts equal a direct count over
+its transcript, **sampled at the same moment** (an instrument read taken at a different instant
+from the screen is not a verification of the screen), and the counts keep rising past 12 as the
+session runs.
+
+
 ## ⛔⛔ [11.1] AN UNRESOLVABLE ROW KIND IS A **PERMANENT, DEADLINE-EXEMPT** HOT-RESTART BLOCKER, SO ONE agy ROW PINS A DAEMON FOREVER
 
 **Status:** OPEN
