@@ -235,6 +235,31 @@ transcript that fails to read causes that round to trash nothing.
 then a second TTL before the bytes are actually released. A **hold** is
 `zfs hold`: a held session is C4 and no class may take it.
 
+**9.2a Noise sessions: QUARANTINE FIRST, and the destination is named.**
+*Owner ruling relayed through the wave orchestrator, 2026-08-20 — recorded here
+because this file owns the mechanism; the ruling itself is in
+[`settled-calls.md`](settled-calls.md).* It sharpens the trash hop of 9.2 for the
+noise class specifically:
+
+- the quarantined file is renamed into a **`.noise/` sidecar directory beside its
+  own store**, not merely suffixed in place;
+- ⛔ **never into a temp directory.** On at least one fleet host `/tmp` is a
+  **tmpfs** — moving a transcript there is not quarantine, it is deletion with an
+  extra step, and it also spends RAM to do it;
+- the sidecar is swept after **7 days**;
+- **every action emits a ytrace incident carrying the path and the reason**, so
+  the trail outlives the process that made the decision;
+- a direct `rm` returns only once quarantine has earned trust.
+
+⚠ **Why this is worth the sidecar rather than a suffix.** The classifier can be
+wrong about a file that is not empty: a muse session with `prompt_count = 0`
+carries real lifecycle records, and an agy conversation looks like a session in
+every field that is not `workspace_uris`/`step_count`. A wrong call must cost a
+`mv` back, not a restore from backup. ⛔ And the scan itself still deletes
+NOTHING — `is_noise_session_file` classifies, both its callers `continue`, and
+`scanning_never_removes_a_session_file` pins that. Quarantine is what a future
+sweep does, not something scanning acquired.
+
 **9.3 ⛔ Never delete a binary that something is running, and never break the
 constitution's rollback set.** `CLAUDE.md`'s constitution requires
 **version-coexisting daemons**: an older daemon stays alive owning sessions that
