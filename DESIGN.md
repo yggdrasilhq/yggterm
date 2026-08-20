@@ -115,6 +115,16 @@ Yggdrasil shells should support a reusable visual theme editor.
 - Reset should always return to the project’s base shell theme, not an empty placeholder state.
 - The active portable theme should be stored in `~/.yggterm/settings.json` under the `theme` object.
 - If no custom colors exist, the shell should fall back to the system gradient cleanly.
+- **A recolour tool appears when there is something to recolour.** The colour
+  library and the colour well both drive the selected stop, and their handler
+  returns early when nothing is selected — so on an empty selection they were not
+  merely redundant, they were inert: swatches that can be clicked and do nothing,
+  which is worse than controls that are not there. They are disclosed on the
+  selection, and the library is headed with the stop it will repaint ("Color 2")
+  rather than an anonymous "Color Library", so it is never ambiguous which of
+  several dots a swatch is about to change. Every route into having a stop —
+  starter, double-click, clicking a dot — selects it, so the tools are never
+  withheld from someone who has something to edit.
 - Stable Yggterm exposes brightness only as a scalar control. Alpha,
   translucency, grain, and blur controls are experimental and must not affect
   stable shell rendering.
