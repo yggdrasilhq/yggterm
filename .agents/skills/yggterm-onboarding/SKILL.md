@@ -81,7 +81,7 @@ wrong models are common and the interview is what catches them.
 never been offered the choice.**
 
 A **fleet** is just yggterm running on more than one machine that trust each other
-(`jojo`, `dev`, `oc` in this fleet — aliases over `ssh` to real hosts). Every row
+(say `laptop`, `builder`, `gpu` — ssh aliases, one per machine). Every row
 knows which machine its terminal lives on, and clicking a row does the `ssh` + `cd`
 + `resume` for you. From your chair there is one sidebar; behind it are several
 computers acting as one.
@@ -90,7 +90,8 @@ computers acting as one.
 
 - **Cool laptop, hot work elsewhere.** The GUI lives on the laptop you touch;
   the heavy agents run on the server that has the cores, the RAM, the GPUs, the
-  repo checkouts. Jojo stays cool and quiet even with six agents grinding on dev/oc,
+  repo checkouts. The laptop stays cool and quiet even with six agents grinding on the
+  headless hosts,
   because the timers are `Nice=10` + `IOSchedulingClass=idle` and coalesced by the
   kernel — they wake, do 200ms, and exit. No resident Python loop burning your fan.
 - **Right tool on the right host.** A browser-automation agent that needs the screen
@@ -98,7 +99,7 @@ computers acting as one.
   runs where the GPU is. Yggterm files that "which host" per-row, so you never re-type
   `ssh dev cd ~/gh/foo` again.
 - **Memory that follows you.** With fleet memory (`~/.yggterm/memory` + `ygg-memory`),
-  a finding Claude proves on jojo is visible to Muse on oc ten minutes later, via
+  a finding Claude proves on one host is visible to Muse on another ten minutes later, via
   a background `sync-fleet` mesh over ssh. No hand-copying, no stale host re-breaking
   what another fixed. Deletes propagate via tombstones, not resurrection.
 - **One machine is a complete yggterm.** You do not *need* a fleet to get value.
@@ -273,18 +274,18 @@ rather than rot:**
 
 **The problem it solves:** when you run Claude Code on Monday, Muse on Tuesday, and
 Gemini/Codex on Wednesday on the same project — possibly from different machines
-(jojo/dev/oc) — each harness and each host starts isolated. Critical bug findings,
+— each harness and each host starts isolated. Critical bug findings,
 campaign handover ledgers, and rules learned by one agent are invisible to the next.
 
 `~/.yggterm/memory` is the host-resident **unified fleet memory**: one SSOT that every
-harness on every host converges through. It is why a Muse session on `oc` sees what
-Claude learned on `jojo` yesterday, without anyone hand-copying files.
+harness on every host converges through. It is why a Muse session on the builder sees
+what Claude learned on the laptop yesterday, without anyone hand-copying files.
 
 **Why this saves them real time and money:**
 
 - **No re-derivation tax.** A finding proven once (`finding-*.md` with a code citation)
   is read in 20 tokens via `ygg-memory diff` instead of re-debugged for 15k tokens.
-- **No fleet drift.** Without it, `~/.claude/projects/<ns>/memory` on jojo and dev
+- **No fleet drift.** Without it, `~/.claude/projects/<ns>/memory` on two hosts
   diverge silently — the same bug gets fixed twice, then re-broken by a stale host.
 - **No resident watcher cost.** Sync is not a forever Python loop; it is
   kernel-coalesced timers (`systemd --user` on Linux, `launchd` on macOS, Task Scheduler
@@ -307,7 +308,9 @@ Claude learned on `jojo` yesterday, without anyone hand-copying files.
    # Fast path: current project + yggterm at session start (blocking <500ms)
    ~/.local/bin/ygg-memory-sync claude        # hook does this; also: muse/gemini/codex/grok
    # Slow path: full fleet mesh in background (systemd-run, 2s delay, coalesced)
-   #   ygg-memory sync-harness --all + ygg-memory sync-fleet --mesh "jojo dev oc"
+   #   ygg-memory sync-harness --all + ygg-memory sync-fleet
+   #   (sync-fleet reads the peer roster from ~/.config/ygg-fleet/mesh — one ssh alias
+   #    per line, outside every checkout, so no repo ever names their machines)
 
    # Persistent timers (installed by onboarding, kernel-optimized):
    systemctl --user enable --now ygg-memory-fleet.timer     # 10m, RandomizedDelaySec=45
@@ -319,7 +322,7 @@ Claude learned on `jojo` yesterday, without anyone hand-copying files.
    catch-up after sleep instead of N; `Nice=10 IOSchedulingClass=idle` keeps it off
    their hot path. On macOS show the `launchd` plist equivalent; on Windows the
    Task Scheduler repetition. **The timers replace resident `watch` loops** — that is
-   why jojo stops running hot when work is on dev/oc.
+   why the laptop stops running hot when the work is on the headless hosts.
 
 3. **Teach the turn-one retrieval ritual (<40 tokens, but now mostly automatic)**:
    Auto-sync already pulled `yggterm` + cwd. Teach the manual fallback for cross-project recall:

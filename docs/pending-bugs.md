@@ -536,39 +536,85 @@ inside, the defect is ours and it is in the emulator/compositing path, not in ap
 **Falsifier:** a bottom-anchored `DECSTBM` redraw in a PLAIN SHELL row paints identically to the
 same command in a bare terminal emulator, across a window resize and a scrollback scroll.
 
-## ⛔⛔ [leak] A FLEET HOST NAME SITS IN 33 TRACKED LINES, AND THE GUARD NEVER KNEW IT WAS A TERM
+## ⛔⛔ [leak] REAL SPEECH AND A THIRD HOST NAME SIT IN THE TITLE HEURISTICS' OWN FIXTURES
 
 **Status:** OPEN
 
-Found 2026-08-20 by lane 11.5 (surfaced as a context line in their own diff; their additions were
-clean), routed to the leak plane by 11.0. The desktop host's name appears in **33 lines across 14
-tracked files** on main — CHANGELOG, five docs, three briefs, an onboarding skill, two demo
-artifact bundles, **shipped source** (`crates/yggterm-shell/src/shell/viewport.rs` — measurement
-provenance comments), and **three scripts where it is a FUNCTIONAL host roster**
-(`ygg-memory.py`, `ygg-memory-sync`, `scripts/sanitize-titles.py`).
+Found 2026-08-20 while sweeping a *different* private host name out of the tree — the sweep's own
+`git grep` turned this up, which is the transferable half: **one private term in an answer key
+finds one term.** The guard names what it was told to name, so a sibling of the same shape, added
+to the tree by the same habit on the same day, is invisible to it. Audit by CLASS (every fleet host
+name, every operator prompt, every prompt-shaped fixture), not by the term you were handed.
 
-⛔ **Why every push was green:** the pre-push guard's `MESH` tuple is a fleet-SYNC roster (which
-hosts to reconcile), not a scan list — the guard had no concept of fleet host names as private
-terms at all. **The writer is FIXED first, 2026-08-20 13:0x:** the name is now in the private-terms
-answer key on all three hosts (32 terms, fingerprint `bd535410`), so any push ADDING a line with it
-refuses. Existing lines bite only when edited — expect guard refusals on these files and REWRITE,
-never override.
+**What is in the tree, 18 lines across four files, all of it SHIPPED SOURCE:**
 
-**The sweep (this entry's work), in three grades:**
-1. Prose mentions (docs, briefs, CHANGELOG, source comments): rewrite to role names — "the GUI
-   host" / "the desktop host". Mechanical, but do it file-aware, not by blind sed.
-2. ⛔ FUNCTIONAL rosters in the three scripts: the name is load-bearing there. Externalize to
-   config outside the repo (the answer-key pattern; `scripts/ygg-live-host.sh` is the existing
-   owner of "which host is live"), never just rename.
-3. Demo artifact bundles: regenerate or scrub; a bundle is generated output and may simply be
-   rebuilt.
+1. ⛔ **Verbatim operator turns, used as title-generation fixtures**
+   (`crates/yggterm-core/src/titles.rs`, `crates/yggterm-shell/src/terminal_observe.rs`). Real
+   sentences typed by a real person, kept because a real example was in front of whoever wrote the
+   test — the exact failure the privacy checker's own header warns about. They read as what they
+   are: a person's phrasing, spelling slips included, about their own machines.
+2. ⛔ **A third fleet host name** appears inside those fixtures and in
+   `crates/yggterm-server/src/lib.rs`, including a shell prompt of the form `<user>@<host>`.
+3. ⚠ **The name is LOAD-BEARING in one place** — a heuristic phrase table maps those literal
+   sentences to a fixed title string, and a test asserts the mapping. Renaming the fixtures without
+   renaming the table breaks the test; renaming both is correct but must be done as one edit. A
+   second list in `lib.rs` enumerates host-ish names for a classifier and is the same shape.
 
-**History:** the name is throughout git history. Do NOT run a lone rewrite for it — batch it into
-the standing `[6.4]` history-rewrite entry (three identifiers already pending there), with the
-documented `filter-repo` signature and reflog traps. Tree sweep and writer fix do not wait on it.
+⇒ **Fix direction:** invent the whole fixture corpus. The heuristic proves *"a phrase table maps a
+recognisable ask to a stable title"*, and an invented ask proves that exactly as well — the method
+survives, the identity does not. Rename the table's phrases and the fixtures in the same commit,
+and keep the asserted title derived from the invented phrase.
 
-**Falsifier:** `git grep` for the term on main returns zero prose/source hits and the three scripts
-read their roster from outside the tree; a push adding the term to any public repo refuses.
+⛔ **Do NOT add these terms to the shared answer key until the tree is clean.** Keying a term that
+still has occurrences on `main` reddens `scripts/check-privacy.sh` and `tests/privacy.rs` for
+**every lane at once** — that is what happened on 2026-08-20 and it is why this lane existed.
+Writer-fix and tree-sweep are one operation, in that order, close together.
+
+**History:** these are throughout git history; batch into the `[6.4]` history entry, never a lone
+rewrite.
+
+**Falsifier:** `git grep` for the third host name over the tree returns zero hits; every
+title-heuristic fixture and phrase table reads as invented; `cargo test -p yggterm-core --lib
+titles` and `-p yggterm-server --lib` pass on the invented corpus; `scripts/check-privacy.sh` stays
+green with the term added to the shared key.
+
+## ⛔ [11.0] SEAT DERIVATION CROSSES CAMPAIGN ERAS AND SEATS ORCHESTRATORS BARE — TWO MIS-SEATS IN ONE SPAWN BATCH
+
+**Status:** OPEN
+
+Measured 2026-08-20 on a sibling campaign's spawn batch; owner-reported both faces.
+
+Two faces of the claim/seat derivation (`ygg-claim.sh` and callers that inherit its rules):
+
+1. **Token-sibling inference crossed eras.** An orchestrator seated at `12` spawned a delegate it
+   intended as `12.2`. The derivation matched campaign siblings by TOKEN, found rows from the same
+   campaign's OLD numbering era (`2.1`, `2.3` — months old, same token), and seated the new row at
+   **`2.2`** — a live, working delegate its own spawner could not find, reported as "it thinks it
+   spawned 12.2; there is no 12.2 row". The delegate was fine; the seat lied about its lineage.
+   ⇒ Derivation must prefer the SPAWNER'S OWN SEAT PREFIX (a row seated `12` spawns under `12.x`,
+   full stop) and use token-sibling inference only when the spawner has no seat.
+2. **A derived top-level seat is bare `N`, and the owner ruled it should be `N.0`.** The same
+   orchestrator self-claimed and landed at `12`, not `12.0` (owner: *"It spawned a row called 12.
+   instead of 12.0. So clearly some instructions need work in our row mechanism."*). The fleet's
+   own convention is `N.0` for an orchestrator seat with delegates at `N.1+` — the tool should
+   derive it that way when `--campaign` is given.
+
+**Mechanism sharpened by the victim's own timeline (2026-08-20):** the spawner's wrapper had a
+GENUINE sidebar read-back of seat `12.2` at 12:34:21 — the mis-seat happened AFTERWARDS, when the
+delegate ran `ygg-claim` minutes into its first turn (the global standing order tells every session
+to claim unasked) and the derivation token-matched the retired-era rows, **RENUMBERING an
+already-seated row**. That breaks the tool's own documented contract ("a row that already has a
+number KEEPS it; re-running the claim is a no-op") — either the derivation ignores an existing
+`outline_prefix` when the campaign token matches siblings, or the known seat-durability evaporation
+struck between verify and claim and the re-derivation then crossed eras. Fix must make an existing
+`outline_prefix` ABSOLUTE (claim = no-op), and token inference must exclude rows outside the
+spawner's own seat prefix. Victim's interim mitigation: briefs now say "you are already claimed and
+seated — skip ygg-claim".
+
+**Falsifier:** with old-era `2.x` rows present and an orchestrator seated `12.0`, a campaign-token
+spawn lands at `12.1` (never `2.x`), a fresh campaign claim with no explicit number lands at the
+next free `N.0`, and re-running `ygg-claim` on an already-seated row changes NOTHING even when the
+token matches foreign-era siblings.
 
 ## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
 
@@ -735,7 +781,7 @@ than an idle-looking frozen frame, and that a submit to it answers with the erro
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-⚠ Our half is shipped; the upstream finally is patched on jojo (2026-08-17) and in sweep as fallback.
+⚠ Our half is shipped; the upstream finally is patched on the GUI host (2026-08-17) and in sweep as fallback.
 
 *Owner-reported 2026-08-14 as memory pressure; measured on the desktop host*
 
@@ -891,7 +937,7 @@ entry is void and only the unbounded-growth half stands.
 
 **Owner doc:** [`docs/cli-integration.md`](cli-integration.md) (11 issue headings, status matrix, dual-oracle verification).
 
-**Falsifier:** `yggterm-headless server startpage ls --json`, `server titles ls --json`, and `server cwdtree ls --json` on `local`/`dev`/`jojo` match Python oracles with exit 0 (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py` all exit 0). No shell sessions in startpage/cwdtree; no shorthashes; faithful screenshots show intact headers, bodies, and footers across all CLIs.
+**Falsifier:** `yggterm-headless server startpage ls --json`, `server titles ls --json`, and `server cwdtree ls --json` on every fleet host match Python oracles with exit 0 (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py` all exit 0). No shell sessions in startpage/cwdtree; no shorthashes; faithful screenshots show intact headers, bodies, and footers across all CLIs.
 
 ## ⛔⛔ [6.7] A RESTARTED GUI REPORTS `entered` / `bounded:true` WITHOUT ARMING ANYTHING — FIXED IN CODE, LIVE PROOF OWED
 
@@ -2609,7 +2655,7 @@ here.
 **Falsifier:** create a local agent session with `--cwd` naming a path that does
 not exist, and read the row back.
 
-## ⛔⛔ [6.4] THREE PRIVATE IDENTIFIERS REACHED origin/main AND ARE STILL IN HISTORY
+## ⛔⛔ [6.4] PRIVATE MATERIAL REACHED origin/main AND IS STILL IN HISTORY
 
 **Status:** OPEN
 
@@ -2619,6 +2665,31 @@ Three private identifiers sat in this file on `origin/main` and were removed fro
 HEAD 2026-08-14 (`c6720880`, reachable from `main` via `6e2d9c81`). Removal from
 HEAD shrinks the surface and **revokes nothing**: the blobs remain fetchable at
 their pre-removal commits.
+
+**Two more classes joined this entry on 2026-08-20, from the tree sweep:**
+
+4. **Two fleet host names**, swept out of 18 tracked files (prose, briefs, an
+   onboarding skill, shipped source comments, two demo bundles, and the
+   `sync-fleet` roster). A third is still in the tree — see the `[leak]` entry —
+   and joins this list when it is swept.
+5. ⛔⛔ **Six faithful 1920×1200 GUI screenshots**, committed as proof-bundle
+   captures and removed from HEAD 2026-08-20. **These are the worst blobs in this
+   entry and they are the least like the others**: a text term is a word, a
+   faithful frame is a photograph of a whole private desktop. Each carried the
+   operator's home path, machine aliases, the cwd tree including private
+   data-store directories, and the sidebar's campaign row titles — which name
+   projects, people and subject matter unrelated to a terminal emulator. One
+   frame additionally rendered a session's working directory, its transcript path
+   and its resume command in the metadata panel.
+
+   ⭐ **How six of them shipped without one objection:** a screenshot leaks by
+   *background*, not by subject. The reviewer looks at the pane being proven and
+   ships everything around it, and no checker can contradict them —
+   `scripts/check-privacy.sh` reads text and cannot open a PNG. That is a
+   permanent blind spot, not a gap to close, so the countermeasure is a rule
+   rather than a check: `artifacts/demos/unreleased/README.md` now forbids
+   publishing a faithful frame at all, and bundles record what the frame showed
+   instead of showing it.
 
 ### ⛔ Why a rewrite alone does not close this
 
@@ -13253,7 +13324,7 @@ SSOT the intake built.
 ✅ The help half is fixed: both usage blocks said `--kind <shell|codex|claude-code>`
 while the parser accepted nine, and they now say `<shell|<agent-cli>>` and point
 at the refusal string, which is generated from the registry and has always been
-correct. **Verified live 2026-08-18 on jojo (build 1787043819, GUI pid 1040230):**
+correct. **Verified live 2026-08-18 on the GUI host (build 1787043819, GUI pid 1040230):**
 `server app --help` now shows `shell|codex|codex-litellm|claude-code|pi|opencode|qwen-code|kimi|muse|antigravity|grok-build` on both `terminal new` lines and `automation create`, dynamically generated from `AGENT_CLIS` so future CLIs appear without a help edit. Daemon still on old build 1787035942 (hot-restart pending) — help is served by the GUI/headless CLI, not the daemon, so it is live.
 
 ## TESTS ARE FLAKY UNDER PARALLEL EXECUTION — they pass alone and fail in the suite

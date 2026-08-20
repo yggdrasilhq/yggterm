@@ -2272,7 +2272,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         content_rederives_on_resume: true,
         // Muse stores sessions as `~/.local/share/muse/sessions/YYYY/MM/DD/<uuid>/session.jsonl`
         // (XDG_DATA_HOME) plus a SQLite index `~/.local/share/muse/session-index.db`.
-        // Verified 2026-08-16 on openclaw: `session-index.db.sessions(workspace_root→cwd, title,
+        // Verified 2026-08-16 on a headless host: `session-index.db.sessions(workspace_root→cwd, title,
         // updated_at_us)` carries the cwd/title the cwd tree and startpage need, and
         // `route_facts.cwd` in the JSONL is the fallback when the DB is absent.
         session_store_globs: &[".local/share/muse/sessions/**/session.jsonl"],

@@ -54,8 +54,8 @@ These four divergences produced the reported “I see 52 in Live Sessions but no
 
 *Human:* `app screenshot` with `capture_backend xterm_canvas_composite` but screenshot was gated on `active_terminal_surface.problem` (suppressed fresh-shell).  
 *Agent:* `app state active_terminal_hosts[].dom_paint_hit_test_problem` raw stays `xterm row sample is not topmost` for a single-line `pi@host` prompt at `y=40` — `elementsFromPoint` returns `xterm-screen` (ancestor) not the span, so `top_within_rows false`.  
-*Raw `terminal_observe.rs`* had `visible_text.len<40 && contains pi@openclaw` but `visible_text` is `"\n"`-joined dedup via raw equality (`pi@openclaw` vs `pi@openclaw ` distinct → 45 chars), so the exemption never fired.  
-*Fix retained in 3.1.3:* also check `buffer_text_sample|cursor_line_text|text_tail` and any `pi@openclaw` line `<50` chars; `app state surface.problem` is now `null` while raw host field still shows the probe. **Read `active_terminal_surface.problem`, not the raw host field.**
+*Raw `terminal_observe.rs`* had `visible_text.len<40 && contains <user>@<host>` (the bare shell prompt) but `visible_text` is `"\n"`-joined dedup via raw equality (the prompt with and without a trailing space are distinct → 45 chars), so the exemption never fired.  
+*Fix retained in 3.1.3:* also check `buffer_text_sample|cursor_line_text|text_tail` and any bare-prompt line `<50` chars; `app state surface.problem` is now `null` while raw host field still shows the probe. **Read `active_terminal_surface.problem`, not the raw host field.**
 
 ### Divergence B — stale viewport & Wayland focus lie
 
@@ -67,7 +67,7 @@ These four divergences produced the reported “I see 52 in Live Sessions but no
 
 ### Divergence D — remote/host filtering
 
-A daemon screen is host-resident (`~/.yggterm/sessions` per host, `remote_machines []` here, `jojo` has no yggterm binary → no remote probe). `snapshot` on `openclaw` shows only its 41 sessions; a session on another host never appears in this host’s GUI until that host runs a yggterm daemon and the row is `remote-cc://host/uuid`. `SSH localhost` shells (`sshd-session` parent, no `YGGTERM_SESSION_ID`) were never yggterm rows and never in Live Sessions — they are the “ether”. Attach them by `yggterm server app terminal new --cwd …` daemon-owned replacements (e.g. `local://a1b2…`).
+A daemon screen is host-resident (`~/.yggterm/sessions` per host, `remote_machines []` here, and a host with no yggterm binary gets no remote probe). `snapshot` on a headless host shows only its 41 sessions; a session on another host never appears in this host’s GUI until that host runs a yggterm daemon and the row is `remote-cc://host/uuid`. `SSH localhost` shells (`sshd-session` parent, no `YGGTERM_SESSION_ID`) were never yggterm rows and never in Live Sessions — they are the “ether”. Attach them by `yggterm server app terminal new --cwd …` daemon-owned replacements (e.g. `local://a1b2…`).
 
 ---
 

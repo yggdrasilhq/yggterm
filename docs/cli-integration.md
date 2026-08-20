@@ -11,7 +11,7 @@ truthful and which is a second encoding waiting to drift. The harness that prove
 CLI is `spec-adding-an-agent-cli.md`. This file is the **BUGS & PROTOCOL** specification.
 
 A fix is not done when the code lands. It is done when `scripts/check-<area>.py --host <host>`
-exits `0` on `openclaw`/`oc`/`dev`/`jojo` **and** a 1920×1200 `os`/`xterm` faithful screenshot
+exits `0` on every fleet host **and** a 1920×1200 `os`/`xterm` faithful screenshot
 shows the corrected row with the right glyph/colour/title. Until then the row is an
 unverified claim. See `spec-cli-integration-verification.md:5`.
 
@@ -63,7 +63,7 @@ Multiple agent sessions repeatedly struggled or reported misleading success on m
 ## 1. The matrix — what the user is promised vs what the code delivers
 
 "Works" means **verified** by `server <area> ls --json` + `scripts/check-<area>.py` `0` on
-`openclaw`/`dev`/`jojo` **and** a faithful screenshot with the right glyph/colour/title.
+every fleet host **and** a faithful screenshot with the right glyph/colour/title.
 "Shipped" means code landed but the verb/oracle still reports a lie. "Gap" means the descriptor
 declares `store_scan_gap` (honest `unknown`, not `false`). ⚠ Empty `session_store_globs`
 does NOT mean gapped — see §Scanned, not gapped.
@@ -372,7 +372,7 @@ the stall.
 
 *Why codex.* `codex` (`codex` binary, `remote-session://` historical `remote-codex://` + `codex-runtime://`, `codex resume <id>`) and `codex-litellm` (`codex-litellm` binary, local-only `codex-litellm://`, `id_assigned_at_birth` same) are *workable* per matrix (`TitleAuthority::Generated` via `SessionTitleStore` heuristic/litellm, store `~/.codex/sessions/**/rollout-*.jsonl` id inside file, `re_roots_with_cwd:true` for `codex`, `false` for `litellm`). Their faults are viewport, not title/resume: (1) **Geometry squish** — daemon re-creates PTY at default `120×36` after hot-update re-resume, `last_sent_terminal_resize_*` is stale-equal to live grid, so no `Resize` fires and `codex` renders squished; fix is `viewport.rs:9837` re-resume squish repair (`last_sent_* = 0` + `spawn_terminal_startup_resize_repair`) now emits `ytrace cli/codex_geometry` (`stale_cols/rows`, `live_cols/rows`, `kind: codex_squish_repair`) for Dash. (2) **Differential CUF spaces** — `CUF` cursor-forward skips leave stale `bg` artifacts; mitigated by full screen replay on reveal (same `muse`/`codex` path, `ytrace` `terminal_mount` already). (3) **Middle desync on rapid switch** — `codex` status bar truncation if `SIGWINCH` not nudged; `terminal_write_should_frame_budget` / `terminal_write_bridge` already gates, now `ytrace` `cli/codex_geometry` covers it. `claude` gold has no squish because its Ink engine re-anchors absolute `CUP` on switch; `codex` needs the explicit resize repair — that is the hiccup to copy for any TUI that expects full width.
 
-**Checklist for any new CLI (add to `spec-adding-an-agent-cli.md` steps 1–9):** 1) `SessionKind` variant, 2) `AGENT_CLIS` descriptor (+ `TitleAuthority`, `store_globs`, `id_assigned_at_birth`, `resume_selector_token`, `re_roots_with_cwd`), 3) `SESSION_PATH_SCHEMES` (`remote-<slug>://` + `<slug>-runtime://`), 4) `cargo check` exhaustive matches, 5) catch-alls `rg SessionKind::(Codex|ClaudeCode)`, 6) `agent_arm_matrix` two arms (Local `local://` + Remote `remote-<slug>://`), 7) surfaces (icon/menu/KeyTips free), 8) provisioning `install`/`update`, 9) **title lifecycle** (`New <CLI> Session` → after first prompt `heuristic`/`litellm` via `SessionTitleStore`) + fallback list, 10) **resume id** (if `id_assigned_at_birth:false`, implement store→row mapping), 11) `spec-cli-integration-verification.md` oracles (`check-startpage.py`/`check-titles.py`/`check-cwdtree.py` must `0` on `dev`/`jojo`/`oc`/`openclaw` + faithful 1920×1200 screenshot).
+**Checklist for any new CLI (add to `spec-adding-an-agent-cli.md` steps 1–9):** 1) `SessionKind` variant, 2) `AGENT_CLIS` descriptor (+ `TitleAuthority`, `store_globs`, `id_assigned_at_birth`, `resume_selector_token`, `re_roots_with_cwd`), 3) `SESSION_PATH_SCHEMES` (`remote-<slug>://` + `<slug>-runtime://`), 4) `cargo check` exhaustive matches, 5) catch-alls `rg SessionKind::(Codex|ClaudeCode)`, 6) `agent_arm_matrix` two arms (Local `local://` + Remote `remote-<slug>://`), 7) surfaces (icon/menu/KeyTips free), 8) provisioning `install`/`update`, 9) **title lifecycle** (`New <CLI> Session` → after first prompt `heuristic`/`litellm` via `SessionTitleStore`) + fallback list, 10) **resume id** (if `id_assigned_at_birth:false`, implement store→row mapping), 11) `spec-cli-integration-verification.md` oracles (`check-startpage.py`/`check-titles.py`/`check-cwdtree.py` must `0` on every fleet host + faithful 1920×1200 screenshot).
 
 ## 3. Inventory — which spec/doc now lives where
 

@@ -37001,7 +37001,7 @@ mod tests {
 
     #[test]
     fn remote_snapshot_shell_prompt_is_not_treated_as_codex() {
-        let shell = b"pi@openclaw:~$\n\npi@openclaw:~$\n";
+        let shell = b"user@examplehost:~$\n\nuser@examplehost:~$\n";
         assert!(remote_snapshot_looks_like_shell_prompt(shell));
         assert!(!remote_snapshot_looks_like_codex(shell));
     }
@@ -37021,7 +37021,7 @@ mod tests {
 
     #[test]
     fn remote_snapshot_prompt_tailed_scrollback_is_not_treated_as_codex() {
-        let shell = b"earlier output line\nanother transcript line\npi@openclaw:~$\n";
+        let shell = b"earlier output line\nanother transcript line\nuser@examplehost:~$\n";
         assert!(!remote_snapshot_looks_like_codex(shell));
     }
 
@@ -37078,7 +37078,7 @@ mod tests {
 
     #[test]
     fn remote_resume_runtime_output_requires_restart_for_shell_prompt() {
-        let prompt = b"pi@openclaw:~$\n";
+        let prompt = b"user@examplehost:~$\n";
         assert!(remote_resume_runtime_output_requires_restart(prompt));
     }
 
