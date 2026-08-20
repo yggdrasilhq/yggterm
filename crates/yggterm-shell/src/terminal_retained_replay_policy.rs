@@ -239,11 +239,54 @@ pub(crate) fn retained_rehydrate_identity_key(
     )
 }
 
+/// The one spelling of "the daemon says this session is live, and its screen is
+/// blank anyway".
+///
+/// ⛔ SSOT: this string is a KEY, not prose. Four gates in `state.rs` and the
+/// retry-reason list below all match on it verbatim; when it lived as four
+/// string literals a reworded copy would have silently unarmed the recovery
+/// lane with every oracle still agreeing.
+pub(crate) const RETAINED_EMPTY_XTERM_SURFACE_PROBLEM: &str =
+    "active terminal host exists but xterm surface is empty";
+
+/// Base delay before re-asking the daemon for a terminal seed.
+pub(crate) const RETAINED_REHYDRATE_SEED_RETRY_BASE_MS: u64 = 2_500;
+/// Ceiling the seed re-ask backoff doubles up to.
+pub(crate) const RETAINED_REHYDRATE_SEED_RETRY_CEILING_MS: u64 = 60_000;
+/// How many times the seed re-asks before it refuses loudly.
+pub(crate) const RETAINED_REHYDRATE_SEED_MAX_RETRIES: u32 = 6;
+
+/// How long to wait before re-asking for a seed the daemon could not answer.
+///
+/// ⛔ THE LAW THIS ENCODES, borrowed verbatim from the app-declare plane: **an
+/// EMPTY answer is not a durable answer.** The seed was a one-shot task whose
+/// dedup key is consumed at SPAWN time, so an empty screen taken inside a
+/// daemon adoption window left the canvas black with no path back — measured
+/// once at 13+ minutes, while sibling rows pulled full screens through the same
+/// daemon ten seconds later. The declare plane already re-asks on a doubling
+/// backoff and converges; the screen seed did not, and that asymmetry was the
+/// whole bug.
+///
+/// `retries_done` is how many re-asks have already been made (0 for the first).
+/// `None` means the budget is spent and the caller must paint a NAMED failure —
+/// never another silent return.
+pub(crate) fn retained_rehydrate_seed_retry_delay_ms(retries_done: u32) -> Option<u64> {
+    if retries_done >= RETAINED_REHYDRATE_SEED_MAX_RETRIES {
+        return None;
+    }
+    let delay = RETAINED_REHYDRATE_SEED_RETRY_BASE_MS
+        .saturating_mul(1u64 << retries_done.min(16))
+        .min(RETAINED_REHYDRATE_SEED_RETRY_CEILING_MS);
+    Some(delay)
+}
+
 pub(crate) fn retained_rehydrate_ready_history_retry_reason(reason: Option<&str>) -> bool {
+    if reason == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM) {
+        return true;
+    }
     matches!(
         reason,
         Some("active terminal host is only showing a plain shell prompt")
-            | Some("active terminal host exists but xterm surface is empty")
             | Some("active terminal host is still showing generic Codex idle chrome")
             | Some("active remote terminal lost expected scrollback after retained replay")
             | Some("active remote terminal received scroll input but has no xterm scrollback")
@@ -812,5 +855,71 @@ mod tests {
         assert!(!blank_host_snapshot_replay_from_read_should_start(
             true, true, true, true, true, true, true, false, 0, 2,
         ));
+    }
+
+    // An empty answer is not a durable answer: the seed re-asks on a doubling
+    // backoff instead of returning silently into a black canvas.
+    #[test]
+    fn seed_retry_backoff_doubles_to_a_ceiling_then_refuses() {
+        assert_eq!(retained_rehydrate_seed_retry_delay_ms(0), Some(2_500));
+        assert_eq!(retained_rehydrate_seed_retry_delay_ms(1), Some(5_000));
+        assert_eq!(retained_rehydrate_seed_retry_delay_ms(2), Some(10_000));
+        assert_eq!(retained_rehydrate_seed_retry_delay_ms(3), Some(20_000));
+        assert_eq!(retained_rehydrate_seed_retry_delay_ms(4), Some(40_000));
+        assert_eq!(
+            retained_rehydrate_seed_retry_delay_ms(5),
+            Some(RETAINED_REHYDRATE_SEED_RETRY_CEILING_MS),
+            "the fifth re-ask is capped, not 80s"
+        );
+        assert_eq!(
+            retained_rehydrate_seed_retry_delay_ms(RETAINED_REHYDRATE_SEED_MAX_RETRIES),
+            None,
+            "budget spent -> the caller must paint a named failure"
+        );
+        assert_eq!(retained_rehydrate_seed_retry_delay_ms(u32::MAX), None);
+    }
+
+    // The refusal writes this exact problem string so the EXISTING recovery lane
+    // engages as a second net (mode flips to CollapsedScrollbackRecovery, which
+    // changes the identity key). If the two ever disagree the net silently
+    // unarms, so the coupling is asserted rather than commented.
+    #[test]
+    fn the_empty_surface_problem_string_arms_the_recovery_lane() {
+        assert!(retained_rehydrate_ready_history_retry_reason(Some(
+            RETAINED_EMPTY_XTERM_SURFACE_PROBLEM
+        )));
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(
+                true,
+                true,
+                false,
+                true,
+                false,
+                Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM),
+                false,
+            ),
+            Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
+        );
+    }
+
+    // A refusal must change the identity key, or the second net re-computes the
+    // same key and skips forever — the shape of the original bug.
+    #[test]
+    fn the_recovery_mode_flip_changes_the_identity_key() {
+        let initial = retained_rehydrate_identity_key(
+            "remote-cc://box/abc",
+            "mount-3",
+            true,
+            true,
+            Some(RetainedRehydrateMode::InitialRead),
+        );
+        let recovery = retained_rehydrate_identity_key(
+            "remote-cc://box/abc",
+            "mount-3",
+            true,
+            true,
+            Some(RetainedRehydrateMode::CollapsedScrollbackRecovery),
+        );
+        assert_ne!(initial, recovery);
     }
 }

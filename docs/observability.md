@@ -58,7 +58,7 @@ gets a confident answer about yesterday. **Never hand-resolve this path.** Ask t
 
 ### 2.1 Declared
 
-`perf::ytrace_provider()` (`crates/yggterm-core/src/perf.rs:14`) pre-registers 26 probes so that
+`perf::ytrace_provider()` (`crates/yggterm-core/src/perf.rs:14`) pre-registers 33 probes so that
 sampling policy and clock are attached before the first emission:
 
 | Group | Probes | Clock | Sampling |
@@ -66,9 +66,9 @@ sampling policy and clock are attached before the first emission:
 | daemon hot paths | `daemon_request/{status,ping,terminal_read,terminal_write,terminal_snapshot,working_flags}` | wall | `floor 8 ms` + `1:50` |
 | render cost | `render/{gui,web_content}` | **cpu** | always |
 | render faults | `render/storm`, `ui/{render_fail_pattern,app_render_rate}` | wall | always |
-| attach faults | `terminal_mount/retained_rehydrate_{skipped_live_connected,skipped_pre_resize,skipped_inactive,begin}` | wall | always |
+| attach faults | `terminal_mount/retained_rehydrate_{skipped_live_connected,skipped_pre_resize,skipped_inactive,begin,empty,retry_scheduled,refused}` | wall | always |
 | title lifecycle | `title/{untitled_session,resolve_attempt,llm_rescue,cli_store_hit,generation}` | wall | always |
-| input latency | `input/{keystroke,pty,render}` | wall | always |
+| input latency | `input/{keystroke,pty,render,loop_block,unconsumed}` | wall | always |
 | per-CLI wiring | `cli/{agy_title,agy_resume,codex_geometry,codex_resume,persisted_identity}` | wall | always |
 
 `resource_governor.rs:59` registers three more from the daemon: `row_resource/{hot,oom}` (cpu) and

@@ -201,8 +201,9 @@ pid runs the new image with the supervisor alive and every row intact.
 
 ## ⛔⛔ [11.9] THE HOT-RESTART GATE COMPARES VERSION STRINGS, SO A SAME-VERSION REBUILD NEVER ROLLS
 
-**Status:** OPEN (measured 2026-08-21 ~00:15 by the cli-practice lane)
+**Status:** OPEN
 
+Measured 2026-08-21 ~00:15 by the cli-practice lane.
 A rebuilt binary installed at the SAME version answers `already_ready:true` from the deploy
 gate while `/proc/<daemon>/exe` md5 differs from disk — the daemon keeps running the old
 code and every instrument agrees the deploy landed. Any lane that ships a fix without
@@ -216,7 +217,7 @@ change, install, and the gate must roll the daemon and the change must be observ
 
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
-**Status:** OPEN (owner-reported live 2026-08-21 ~00:1x as "INPUT BLOCK ON 13.0")
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 A seat raised an interactive question picker (the standing owner-question shape) and sat on
 it 27 minutes. Every surface misdescribed the state: `gate-screen` answered
@@ -234,9 +235,45 @@ not sits silent under a busy dot.
 **Falsifier:** raise a picker — the dot and Status read neither working nor idle, typed
 text is refused with the mode named, and a notification fires.
 
+**LANDED 2026-08-21 (11.14), live proof owed on the 3.1.16 roll.** `awaiting_user_choice`
+is a fourth classifier state beside working/idle/limit_wait, built on the limit-wait
+precedent: per-CLI descriptor phrases (`question_picker_screen_phrases`), a kind-agnostic
+union for callers with no kind in hand, and an additive `serde(default)` bool on the
+snapshot SSOT so older daemons read `false`. ⭐ **The claude-code phrases are MEASURED, not
+guessed** — a real `claude` was driven in a pty until it raised a one-question picker, and
+it painted `Enter to select · ↑/↓ to navigate · Esc to cancel`; the multi-question spelling
+swaps the middle chord for the literal `Tab/Arrow keys to navigate`, its review step paints
+`Ready to submit your answers?`, and the CLI's generic select list (menus, permission
+prompts — all of which eat typed text identically) paints `(Use arrow keys)`. Every other
+CLI's set is empty and means UNMEASURED, per the descriptor's own law. ⛔ **The precedence
+is the fix, not the flag:** a row holding a picker is MID-TURN, so `working` reads
+`Some(true)` honestly, and the picker arm therefore sits ABOVE the working arm on the dot,
+on the metadata Status ("asking you a question") and in `gate-screen`, which now prints an
+explicit STOPPED line because here `working: true` is the misread. The rising edge raises a
+card naming the keys that answer it, and for a BACKGROUND row (per the settled call that the
+session you are watching never pings you) that card also fires the OS notification; the
+falling edge clears the card. ⚠ **No chime, deliberately:** the done-edge's chime goes
+through `push_notification_with`, which the code states is the ONE enforcement point for the
+sound setting, and job cards do not pass through it. Adding a direct `emit_notification_chime`
+call here would be exactly the second delivery path that comment forbids, so the silence is
+ended with a card and an OS notification instead. If the chime turns out to be the half that
+matters, it belongs in the job-card path for every card, not in this one caller. **What live proof still owes:** raise a
+picker on the live host after the roll and read the dot, the Status, `gate-screen` and the
+card — and confirm the card's wording survives a row whose title is empty.
+
+⛔ **ONE HALF OF THE WANTED LIST WAS DELIBERATELY NOT BUILT, AND THE REASON IS THE
+MEASUREMENT.** "Typed text is refused" would break the thing it means to protect: the
+picker's options are NUMBERED, so a digit selects one, and one of the standing options is
+"Type something", which then takes free text. A GUI that swallowed keystrokes while a
+picker was up would turn a row the owner could answer into one he could not. The picker
+does not ignore typing — it ignores SENTENCES, because it is reading single keys. So the
+fix is to NAME the mode and the keys, which the card does, and to leave the input path
+alone. If a refusal is still wanted, it can only be a refusal of a multi-character line
+plus Enter, never of keystrokes.
+
 ## ⚠ [11.0] A WEBVIEW THAT STOPS ACKING EDIT BATCHES IS DEAD INPUT WEARING A LIVE WINDOW
 
-**Status:** OPEN (incident evidence; owner-reported as "input blocked — trauma")
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 2026-08-20 ~23:2x-23:37: the GUI instance launched at 23:20 (via app-control, unsupervised
 after the raw-kill-loses-the-supervisor gap below) logged **13 ×** `webview never
@@ -260,6 +297,41 @@ expedited to the lane driving it with this evidence. **Wanted:**
 the ACK-failure count surfaced as a ytrace incident (`webview_edit_faults` exists — wire it
 to ui/block so a sick webview is VISIBLE from outside), and a threshold at which the GUI
 self-restarts its webview instead of limping one frame stale.
+
+**THE OBSERVABILITY HALF LANDED FIRST (11.12, commit 77622ecf): the gate bumps
+`edit_flush_timeouts` and the working-flags tick files a `webview_edit_stall` incident.
+THE RECOVERY HALF LANDED 2026-08-21 (11.14), live proof owed.** A three-rung ladder in the
+vendored flush gate, keyed on batches unacknowledged since the last ack OF ANY KIND: wait
+as designed for the first two; from the third, STOP FREEZING THE VIRTUALDOM (the repeat is
+the input-death — 13 timeouts in one GUI's last 17 minutes is 26 s during which renders,
+effects and spawned futures were all stopped); and only if nothing is acknowledged at all
+for twelve batches AND twenty seconds, reload the page.
+
+⭐ **THE CORRECTION THAT SHAPED IT, and it changes what the existing incident MEANS.** A
+flush-gate timeout is not evidence that the UI is stale. The batch is delivered over the
+websocket and the interpreter applies it *before* acking, and the ack has its own 1 s
+`setTimeout` backstop on the JS side for exactly the occluded-window case the gate's comment
+blames. So a timeout followed by a late ack means the webview was merely SLOW and the DOM
+caught up. The gate used to DROP the receiver on timeout, which threw that distinction away
+and made every timeout look equally fatal. It now keeps the receiver, counts `acks_late`,
+and a single late ack resets the streak — so a slow webview can never be reloaded, which
+matters because a reload is a full remount (`handle_initialize_msg` rebuilds the VirtualDom
+against the fresh page, wiping every component's state and re-seeding every terminal).
+`webview_edit_acks_late` / `_gate_bypasses` / `_resync_requests` are in DescribeState and in
+the incident payload; ⛔ **read `acks_late` FIRST or the numbers mislead in the old
+direction.** The reload rung also resets the streak, because a ladder that keeps seeing the
+spent streak asks for another reload on the very next batch — a reload loop is strictly
+worse than the fault it recovers from.
+
+**What live proof still owes.** The ladder has unit tests but has never been seen to fire.
+Two live questions, both on the reload rung: (a) the page's init script re-sends the
+`initialize` IPC on any load, so `handle_initialize_msg` should rebuild the VirtualDom
+against the fresh page — but `rebuild` is documented as wiping all component state and has
+never been run against an already-built dom here; (b) batches queued behind the dead ack
+sit in the websocket's own send queue and would reach the fresh interpreter as mutations
+naming nodes that no longer exist — the JS applies batches inside a try/catch and the
+rebuild that follows re-creates the tree, so it should be self-correcting, but "should" is
+the word doing the work.
 
 ## ⚠ [11.0] SWAP RESIDUE MAKES EVERY FIRST TOUCH CRAWL, AND TWO INSTRUMENTS CALLED IT HEALTHY
 
@@ -494,6 +566,23 @@ the swap) rendered a fully BLANK viewport for minutes — metadata read running/
 and daemon both already 3.1.15, daemon uptime 47 s in his screenshot — and only a manual GUI
 restart recovered the paint. Third forced GUI restart of the night; the adoption path still
 mounts a client on an empty seed instead of re-requesting or refusing loudly.
+**THE CLIENT-SIDE RESIDUAL LANDED 2026-08-21 (11.14), live proof owed; the daemon-side
+halves below stay OPEN.** The seed no longer accepts an empty answer as a durable one. Its
+dedup key was consumed at SPAWN time, not at success, and nothing in that key changes when
+the daemon becomes readable — so one empty answer inside an adoption window burned the arm
+for the life of the mount (measured: 13+ minutes of black while sibling rows pulled full
+screens through the same daemon ten seconds later, against a control case where a second
+seed eight seconds later converged). The task now carries the arm, re-asks on the
+app-declare plane's proven backoff (2.5 s doubling to a 60 s ceiling, six re-asks), hands
+the arm back if the row leaves the screen, and on exhaustion REFUSES LOUDLY: a named card,
+`retained_rehydrate_refused` on the trace and ytrace planes, and the empty-surface problem
+string recorded on the open attempt — which flips the rehydrate mode, changes the identity
+key, and engages the existing recovery lane as a second net exactly once. `retained_rehydrate_empty`
+now mirrors to ytrace too; it was the only witness to the 13-minute blank and was reachable
+only by reading the file trace by hand. ⚠ **This converges the owner's symptom without
+touching either daemon-side root** — the re-requested seed succeeds seconds later, as the
+control case did — so the four defects below are unchanged and still own the blockade.
+
 **Fix direction:** the handover must carry the predecessor's preserved-owner map into the
 successor (transitively — generation N+2 must still reach N's PTYs), and a read that finds
 no runtime AND no owner for a key the row table lists must answer a typed refusal, never an

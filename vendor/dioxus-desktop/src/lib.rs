@@ -69,7 +69,11 @@ pub mod trayicon;
 // Public exports
 pub use assets::AssetRequest;
 pub use config::{Config, WindowCloseBehaviour};
-pub use edits::{edit_faults, edit_flush_timeouts};
+pub use edits::{
+    EDIT_ACK_DEAD_BATCHES, EDIT_ACK_DEAD_MS, EDIT_FLUSH_GATE_BYPASS_AFTER, EditFlushRecovery,
+    edit_acks_late, edit_faults, edit_flush_gate_bypasses, edit_flush_timeouts,
+    edit_webview_resync_requests,
+};
 pub use webview::allow_webview_navigation_prefix;
 pub use webview::set_webview_http_navigation_open;
 pub use default_icon::{default_icon, icon_from_memory, icon_from_path};

@@ -4397,7 +4397,13 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
     // rendering that as "idle" was the owner-reported lie (the row's own
     // footer said "Usage limit reached · continuing shortly" while this field
     // said idle).
-    let working = if session.limit_wait {
+    // ⛔ The picker check comes before BOTH: a row holding an owner question is
+    // mid-turn, so `working` reads `Some(true)` and this field said "working"
+    // on a session that had been stopped for 27 minutes waiting for its owner
+    // — while eating every sentence typed at it.
+    let working = if session.awaiting_user_choice {
+        "asking you a question"
+    } else if session.limit_wait {
         "waiting on limit"
     } else {
         match session.working {

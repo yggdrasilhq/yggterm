@@ -3295,6 +3295,177 @@ fn TerminalScrollController(session_path: String, host_id: String, palette: Pale
         }
     }
 }
+/// The terminal seed's give-up path: re-ask on a bounded backoff, then REFUSE
+/// LOUDLY when the budget is spent.
+///
+/// ⛔ WHY THIS EXISTS. The retained-rehydrate seed is deduplicated by an identity
+/// key that is consumed at SPAWN time, not at success — and nothing in that key
+/// changes when the daemon becomes readable. So a single empty answer taken
+/// inside a daemon adoption window burned the arm for the life of the mount:
+/// measured once at 13+ minutes of black canvas while sibling rows pulled full
+/// screens through the same daemon ten seconds later, and a control case where a
+/// second seed eight seconds after the empty one converged. The app-declare
+/// plane already knows the law — *the daemon holds no answer for this session is
+/// not a durable answer* — and re-asks on a doubling backoff. The screen seed
+/// did not, and that asymmetry was the whole bug.
+///
+/// ⭐ THE RE-ASK GOES THROUGH THE RENDER PATH, NOT THROUGH A REPLAYED CLOSURE.
+/// It sleeps first (the consumed arm is what holds the backoff — hand it back
+/// early and the very next render re-asks immediately), then hands the arm back
+/// and dirties the shell signal so a render is guaranteed rather than hoped for.
+/// The next render recomputes mode, endpoint and key from CURRENT state, which
+/// is the difference between re-asking the question and repeating it.
+#[allow(clippy::too_many_arguments)]
+async fn retained_rehydrate_seed_retry_or_refuse(
+    state: Signal<ShellState>,
+    trace_home: std::path::PathBuf,
+    session_path: String,
+    session_host_label: String,
+    endpoint_label: String,
+    mode_key: &'static str,
+    reason: &'static str,
+    detail: String,
+    identity_key: String,
+    identity: std::rc::Rc<std::cell::RefCell<String>>,
+    retry_budget: std::rc::Rc<std::cell::RefCell<(String, u32)>>,
+) {
+    let retries_done = {
+        let budget = retry_budget.borrow();
+        if budget.0 == identity_key { budget.1 } else { 0 }
+    };
+    let Some(delay_ms) = retained_rehydrate_seed_retry_delay_ms(retries_done) else {
+        // ⛔ NEVER A SILENT BLACK CANVAS. The budget is spent, so say so where
+        // the owner and the instruments can both see it, and hand the row to the
+        // EXISTING recovery lane: the empty-surface problem string flips the
+        // rehydrate mode, which changes the identity key, which re-arms the seed
+        // with a different read verb. One flip, not a loop — the second refusal
+        // records the same problem, `note_terminal_surface_problem` answers
+        // false, and the key stops moving.
+        let mut recovery_lane_armed = false;
+        let _ = safe_shell_mut(state, "retained_rehydrate_refused", |shell| {
+            if reason == "empty" {
+                recovery_lane_armed = shell.note_terminal_surface_problem(
+                    &session_path,
+                    RETAINED_EMPTY_XTERM_SURFACE_PROBLEM,
+                );
+            }
+            shell.record_terminal_io_telemetry(
+                "retained_rehydrate_refused",
+                "error",
+                &session_path,
+                "the daemon never answered a paintable screen for a live session",
+                json!({
+                    "session_path": &session_path,
+                    "mode": mode_key,
+                    "reason": reason,
+                    "detail": &detail,
+                    "endpoint": &endpoint_label,
+                    "attempts": retries_done + 1,
+                    "recovery_lane_armed": recovery_lane_armed,
+                }),
+            );
+        });
+        let refused_payload = json!({
+            "session_path": &session_path,
+            "mode": mode_key,
+            "reason": reason,
+            "detail": &detail,
+            "endpoint": &endpoint_label,
+            "attempts": retries_done + 1,
+            "recovery_lane_armed": recovery_lane_armed,
+        });
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "retained_rehydrate_refused",
+            refused_payload.clone(),
+        );
+        yggterm_core::perf::ytrace_emit_event(
+            "ui",
+            "terminal_mount",
+            "retained_rehydrate_refused",
+            refused_payload,
+        );
+        upsert_terminal_resume_notification(
+            state,
+            &session_path,
+            NotificationTone::Warning,
+            "Terminal Screen Unavailable",
+            format!(
+                "Yggterm asked {} for this session's screen {} times and got nothing paintable back ({}). The session itself is untouched; a recovery read is armed.",
+                session_host_label,
+                retries_done + 1,
+                detail
+            ),
+        );
+        return;
+    };
+    let retry_payload = json!({
+        "session_path": &session_path,
+        "mode": mode_key,
+        "reason": reason,
+        "detail": &detail,
+        "endpoint": &endpoint_label,
+        "retries_done": retries_done,
+        "delay_ms": delay_ms,
+    });
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "terminal_mount",
+        "retained_rehydrate_retry_scheduled",
+        retry_payload.clone(),
+    );
+    yggterm_core::perf::ytrace_emit_event(
+        "ui",
+        "terminal_mount",
+        "retained_rehydrate_retry_scheduled",
+        retry_payload,
+    );
+    sleep(Duration::from_millis(delay_ms)).await;
+    // ⛔ THE ARM MAY HAVE MOVED WHILE WE SLEPT. A remount changes the key and
+    // re-arms the seed on its own; clearing the arm then would hand a SECOND
+    // task the same work. Only the holder of this key may release it.
+    if *identity.borrow() != identity_key {
+        return;
+    }
+    let still_active = state.with(|shell| {
+        shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && shell.server.active_session_path() == Some(session_path.as_str())
+    });
+    if !still_active {
+        // Hand the arm back WITHOUT spending the budget: the row not being on
+        // screen is no evidence about whether the daemon can answer.
+        identity.borrow_mut().clear();
+        return;
+    }
+    {
+        let mut budget = retry_budget.borrow_mut();
+        if budget.0 != identity_key {
+            *budget = (identity_key.clone(), 0);
+        }
+        budget.1 = budget.1.saturating_add(1);
+    }
+    identity.borrow_mut().clear();
+    let _ = safe_shell_mut(state, "retained_rehydrate_retry_rearm", |shell| {
+        shell.record_terminal_io_telemetry(
+            "retained_rehydrate_retry",
+            "warn",
+            &session_path,
+            "re-asking the daemon for a terminal seed it could not answer",
+            json!({
+                "session_path": &session_path,
+                "mode": mode_key,
+                "reason": reason,
+                "detail": &detail,
+                "endpoint": &endpoint_label,
+                "attempt": retries_done + 1,
+                "waited_ms": delay_ms,
+            }),
+        );
+    });
+}
 #[component]
 fn TerminalCanvas(
     session: ManagedSessionView,
@@ -3429,8 +3600,18 @@ fn TerminalCanvas(
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let retained_rehydrate_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    // (identity_key, re-asks already spent) — the seed's retry budget. It lives
+    // BESIDE the arm rather than inside the task so the budget survives the
+    // re-arm the retry rides in on; a counter inside the task would reset to
+    // zero every time and re-ask forever.
+    let retained_rehydrate_retry_budget =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new((String::new(), 0u32)))).clone();
     let daemon_retained_replay_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    // The twin seed's retry budget — same shape, separate arm. See the note on
+    // `retained_rehydrate_retry_budget`.
+    let daemon_retained_replay_retry_budget =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new((String::new(), 0u32)))).clone();
     let server_snapshot_replay_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let recovery_snapshot_probe_identity =
@@ -4575,7 +4756,19 @@ fn TerminalCanvas(
     if let Some(retained_rehydrate_mode) = retained_rehydrate_mode
         && *retained_rehydrate_identity.borrow() != retained_rehydrate_key
     {
+        // A key we have never armed starts a fresh retry budget; a key we are
+        // RE-arming (the backoff handed the arm back) keeps the one it spent.
+        if retained_rehydrate_retry_budget.borrow().0 != retained_rehydrate_key {
+            *retained_rehydrate_retry_budget.borrow_mut() = (retained_rehydrate_key.clone(), 0);
+        }
+        let retained_rehydrate_key_for_task = retained_rehydrate_key.clone();
         *retained_rehydrate_identity.borrow_mut() = retained_rehydrate_key;
+        // ⛔ THE ARM IS CONSUMED AT SPAWN, NOT AT SUCCESS. The task carries it so
+        // a give-up can hand it back instead of stranding the row on a black
+        // canvas until the next remount.
+        let retained_rehydrate_identity_for_task = retained_rehydrate_identity.clone();
+        let retained_rehydrate_retry_budget_for_task = retained_rehydrate_retry_budget.clone();
+        let session_host_label_for_task = session_host_label.clone();
         let endpoint = endpoint.clone();
         let runtime_session_path =
             state.with(|shell| terminal_runtime_session_path(&shell, &session_path));
@@ -4689,11 +4882,25 @@ fn TerminalCanvas(
                         "terminal_mount",
                         "retained_rehydrate_error",
                         json!({
-                            "session_path": session_path_for_task,
+                            "session_path": &session_path_for_task,
                             "mode": retained_rehydrate_mode.as_key(),
-                            "error": error_text,
+                            "error": &error_text,
                         }),
                     );
+                    retained_rehydrate_seed_retry_or_refuse(
+                        state,
+                        trace_home.clone(),
+                        session_path_for_task.clone(),
+                        session_host_label_for_task.clone(),
+                        endpoint_label.clone(),
+                        retained_rehydrate_mode.as_key(),
+                        "daemon_ready_error",
+                        error_text,
+                        retained_rehydrate_key_for_task.clone(),
+                        retained_rehydrate_identity_for_task.clone(),
+                        retained_rehydrate_retry_budget_for_task.clone(),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -4936,18 +5143,42 @@ fn TerminalCanvas(
                         }
                     }
                     if data.trim().is_empty() {
+                        let _empty_payload = json!({
+                            "session_path": &session_path_for_task,
+                            "mode": retained_rehydrate_mode.as_key(),
+                            "attach_ready_marker": saw_attach_ready_marker,
+                        });
                         append_trace_event(
                             &trace_home,
                             "ui",
                             "terminal_mount",
                             "retained_rehydrate_empty",
-                            json!({
-                                "session_path": session_path_for_task,
-                                "mode": retained_rehydrate_mode.as_key(),
-                                "attach_ready_marker": saw_attach_ready_marker,
-                            }),
+                            _empty_payload.clone(),
                         );
-                        return;
+                        // Mirror to ytrace: this event was the ONLY witness to a
+                        // 13-minute black canvas and it was reachable only by
+                        // reading the file trace by hand.
+                        yggterm_core::perf::ytrace_emit_event(
+                            "ui",
+                            "terminal_mount",
+                            "retained_rehydrate_empty",
+                            _empty_payload,
+                        );
+                    retained_rehydrate_seed_retry_or_refuse(
+                        state,
+                        trace_home.clone(),
+                        session_path_for_task.clone(),
+                        session_host_label_for_task.clone(),
+                        endpoint_label.clone(),
+                        retained_rehydrate_mode.as_key(),
+                        "empty",
+                        "the daemon answered an empty screen".to_string(),
+                        retained_rehydrate_key_for_task.clone(),
+                        retained_rehydrate_identity_for_task.clone(),
+                        retained_rehydrate_retry_budget_for_task.clone(),
+                    )
+                    .await;
+                    return;
                     }
                     if retained_rehydrate_should_discard_after_read(
                         retained_rehydrate_mode,
@@ -5020,17 +5251,33 @@ fn TerminalCanvas(
                     );
                 }
                 Err(error) => {
+                    let error_text = error.to_string();
                     append_trace_event(
                         &trace_home,
                         "ui",
                         "terminal_mount",
                         "retained_rehydrate_error",
                         json!({
-                            "session_path": session_path_for_task,
+                            "session_path": &session_path_for_task,
                             "mode": retained_rehydrate_mode.as_key(),
-                            "error": error.to_string(),
+                            "error": &error_text,
                         }),
                     );
+                    retained_rehydrate_seed_retry_or_refuse(
+                        state,
+                        trace_home.clone(),
+                        session_path_for_task.clone(),
+                        session_host_label_for_task.clone(),
+                        endpoint_label.clone(),
+                        retained_rehydrate_mode.as_key(),
+                        "read_error",
+                        error_text,
+                        retained_rehydrate_key_for_task.clone(),
+                        retained_rehydrate_identity_for_task.clone(),
+                        retained_rehydrate_retry_budget_for_task.clone(),
+                    )
+                    .await;
+                    return;
                 }
             }
         });
@@ -5055,7 +5302,17 @@ fn TerminalCanvas(
         terminal_retained_snapshot_staged(),
     ) && *daemon_retained_replay_identity.borrow() != daemon_retained_replay_key
     {
+        if daemon_retained_replay_retry_budget.borrow().0 != daemon_retained_replay_key {
+            *daemon_retained_replay_retry_budget.borrow_mut() =
+                (daemon_retained_replay_key.clone(), 0);
+        }
+        let daemon_retained_replay_key_for_task = daemon_retained_replay_key.clone();
         *daemon_retained_replay_identity.borrow_mut() = daemon_retained_replay_key;
+        // Same one-shot-arm trap as the seed above, same cure.
+        let daemon_retained_replay_identity_for_task = daemon_retained_replay_identity.clone();
+        let daemon_retained_replay_retry_budget_for_task =
+            daemon_retained_replay_retry_budget.clone();
+        let session_host_label_for_replay_task = session_host_label.clone();
         let endpoint = endpoint.clone();
         let runtime_session_path =
             state.with(|shell| terminal_runtime_session_path(&shell, &session_path));
@@ -5246,6 +5503,30 @@ fn TerminalCanvas(
                                 "attach_ready_marker": saw_attach_ready_marker,
                             }),
                         );
+                        // ⛔ ONLY THE EMPTY ANSWER RE-ASKS, NOT THE LOW-SIGNAL ONE.
+                        // The `line_count <= 4` arm is a QUALITY gate, not a
+                        // failure: a session whose screen really is four lines
+                        // long is fine, and re-asking six times and then telling
+                        // its owner the screen is unavailable would be a lie
+                        // about a healthy row. An EMPTY answer is the daemon
+                        // saying nothing at all, which is the one-shot-arm trap
+                        // the seed above documents.
+                        if replay_text.trim().is_empty() {
+                            retained_rehydrate_seed_retry_or_refuse(
+                                state,
+                                trace_home.clone(),
+                                session_path_for_task.clone(),
+                                session_host_label_for_replay_task.clone(),
+                                server_endpoint_label(&endpoint),
+                                "daemon-retained-replay",
+                                "empty",
+                                "the daemon answered an empty retained replay".to_string(),
+                                daemon_retained_replay_key_for_task.clone(),
+                                daemon_retained_replay_identity_for_task.clone(),
+                                daemon_retained_replay_retry_budget_for_task.clone(),
+                            )
+                            .await;
+                        }
                         return;
                     }
                     let bytes = replay_text.len();

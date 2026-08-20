@@ -3490,6 +3490,19 @@ pub struct SnapshotSessionView {
     /// older snapshots read `false` and nothing breaks across versions.
     #[serde(default)]
     pub limit_wait: bool,
+    /// The session is holding an OWNER-FACING QUESTION PICKER — a fourth state
+    /// beside working/idle/limit_wait, detected from the CLI's own picker
+    /// footer (per-CLI descriptor phrases).
+    ///
+    /// ⛔ UNLIKE THE OTHER THREE, THIS STATE EATS TYPED INPUT. The picker reads
+    /// navigation keys and nothing else, so a typed sentence produces nothing
+    /// visible and is experienced as total input block — on precisely the row
+    /// that is asking for the owner. And because the CLI is mid-turn while it
+    /// asks, `working` reads `true` and every surface that renders only
+    /// `working` says "busy working", which is how a 27-minute wait went
+    /// unnoticed. Additive + serde(default), so older snapshots read `false`.
+    #[serde(default)]
+    pub awaiting_user_choice: bool,
     /// How long this session has been WRITTEN TO without answering, when that is
     /// outstanding at all — the gap between the last byte written toward the
     /// child and the last byte it produced. `None` = the child has answered at
@@ -3905,6 +3918,10 @@ pub struct ManagedSessionView {
     pub working: Option<bool>,
     /// Waiting out a usage limit — see [`SnapshotSessionView::limit_wait`].
     pub limit_wait: bool,
+    /// Holding an owner-facing question picker — see
+    /// [`SnapshotSessionView::awaiting_user_choice`]. ⚠ Typed text goes nowhere
+    /// while this is true.
+    pub awaiting_user_choice: bool,
     /// Input written with nothing said back — see
     /// [`SnapshotSessionView::input_unanswered_ms`]. `None` = answering, or not
     /// reported. ⚠ A trigger, never a verdict.
@@ -14096,6 +14113,7 @@ mod restored_runtime_repair_tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -28710,6 +28728,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         pty_rows: None,
         working: session.working,
         limit_wait: session.limit_wait,
+        awaiting_user_choice: session.awaiting_user_choice,
         input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options,
         title_is_explicit: session.title_is_explicit,
@@ -28827,6 +28846,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         pty_rows: None,
         working: session.working,
         limit_wait: session.limit_wait,
+        awaiting_user_choice: session.awaiting_user_choice,
         input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options.clone(),
         title_is_explicit: session.title_is_explicit,
@@ -29026,6 +29046,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         stored_preview_hydrated: true,
         working: session.working,
         limit_wait: session.limit_wait,
+        awaiting_user_choice: session.awaiting_user_choice,
         input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options,
     }
@@ -29398,6 +29419,7 @@ terminal_window_id: None,
         stored_preview_hydrated: should_hydrate_stored_preview,
         working: None,
         limit_wait: false,
+        awaiting_user_choice: false,
         // A row being built has no runtime yet; the daemon's snapshot overlay is
         // the only thing that can answer this, and it does so every snapshot.
         input_unanswered_ms: None,
@@ -29763,6 +29785,7 @@ fn build_live_session_with_launch_options(
         stored_preview_hydrated: true,
         working: None,
         limit_wait: false,
+        awaiting_user_choice: false,
         // A row being built has no runtime yet; the daemon's snapshot overlay is
         // the only thing that can answer this, and it does so every snapshot.
         input_unanswered_ms: None,
@@ -31140,6 +31163,7 @@ mod recipe_tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -33379,6 +33403,7 @@ mod tests {
             pty_rows: None,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -36988,6 +37013,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
@@ -37084,6 +37110,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -37141,6 +37168,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -37933,6 +37961,7 @@ terminal_window_id: None,
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -40894,6 +40923,7 @@ terminal_window_id: None,
             pty_rows: None,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -43964,6 +43994,7 @@ terminal_window_id: None,
                 stored_preview_hydrated: false,
                 working: None,
                 limit_wait: false,
+                awaiting_user_choice: false,
                 input_unanswered_ms: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
@@ -44055,6 +44086,7 @@ terminal_window_id: None,
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -44176,6 +44208,7 @@ terminal_window_id: None,
             stored_preview_hydrated: false,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,

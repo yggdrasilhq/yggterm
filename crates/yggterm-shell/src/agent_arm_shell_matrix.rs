@@ -536,6 +536,7 @@ impl ShellArm {
             stored_preview_hydrated: true,
             working: None,
             limit_wait: false,
+            awaiting_user_choice: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,

@@ -290,9 +290,19 @@ pub fn run_server_gate_screen_cli(store: &SessionStore, args: &[String]) -> anyh
             None => "not blocking".to_string(),
         };
         println!(
-            "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}{limit_wait}\n   screen: {screen}",
+            "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}{limit_wait}{question_picker}\n   screen: {screen}",
             key = session.session_key,
             working = session.shows_agent_working,
+            // Printed only when armed, and loudly, for the opposite reason to
+            // the limit-wait line above: a row holding a picker reads
+            // `working: true`, so "true means it is busy working, leave it
+            // alone" is the misread — when in fact it is stopped, waiting for
+            // its owner, and swallowing everything typed at it.
+            question_picker = if session.shows_question_picker {
+                "\n   screen_shows_question_picker: true — STOPPED, asking its owner a question; typed text is eaten, answer with arrows/Enter"
+            } else {
+                ""
+            },
             // Printed only when armed, and loudly: a limit-waiting row reads
             // `working: false` above, and "false means idle, safe to move on"
             // is exactly the misread this third state exists to prevent.
