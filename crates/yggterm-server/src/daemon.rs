@@ -4870,9 +4870,28 @@ impl DaemonRuntime {
             if !self
                 .server
                 .live_session_kind(key)
+                // ⛔ A key with NO LIVE ROW is not the same as a row whose kind is
+                // unreadable, and folding them together pinned a daemon FOREVER.
+                // Measured 2026-08-20 on the GUI host: three `remote-agy://`
+                // runtimes were owned but absent from `live_sessions` — live
+                // `agy --conversation` processes whose rows had been lost — so
+                // `live_session_kind` answered `None`, the fail-closed bias made
+                // each a `not_restorable` blocker with `permanent: true`, and
+                // because permanent blockers are deadline-exempt the forced swap
+                // could never fire. The daemon stayed pinned on its build with
+                // the whole fleet deployed around it.
+                //
+                // ⭐ The key ITSELF names the CLI: `remote-agy://` is a
+                // registered scheme, so the registry can answer what the missing
+                // row cannot. This only lets the predicate DECIDE where it
+                // previously could not — a scheme the registry does not know
+                // still falls through to the conservative refusal below, which is
+                // the case that bias was actually written for.
+                .or_else(|| yggterm_core::agent_scheme::session_kind_for_path(key))
                 .map(session_kind_state_survives_pty_loss)
-                // A key whose kind we cannot read is not provably restorable, and
-                // the safety bias on a PTY-destroying decision is to refuse.
+                // A key whose kind we cannot read AT ALL is not provably
+                // restorable, and the safety bias on a PTY-destroying decision is
+                // to refuse.
                 .unwrap_or(false)
             {
                 blockers.push(HotRestartBlocker {
@@ -21869,6 +21888,41 @@ mod tests {
     /// refused and exited 1; the requester then waited out 10.2 s + 15.4 s of
     /// deadlines before falling back to the preserve path. A pre-flight that
     /// cannot see this case is decoration.
+    #[test]
+    fn a_runtime_whose_row_is_gone_is_named_by_its_key_not_left_unreadable() {
+        use super::session_kind_state_survives_pty_loss;
+        use yggterm_core::SessionKind;
+        // ⛔ The pin: three owned `remote-agy://` runtimes with NO live row made
+        // `live_session_kind` answer None, the fail-closed bias marked each
+        // `not_restorable` with `permanent: true`, and permanent blockers are
+        // deadline-exempt — so the forced swap could never fire and the daemon
+        // stayed on its build with the fleet deployed around it.
+        //
+        // The key itself names the CLI, so the registry answers what the missing
+        // row cannot, and an agent's state survives PTY loss (its store does).
+        for key in [
+            "remote-agy://host/00000000-0000-4000-8000-00000000a6y1",
+            "remote-muse://host/00000000-0000-4000-8000-0000000mu5e",
+            "remote-cc://host/00000000-0000-4000-8000-000000000cc1",
+        ] {
+            let kind = yggterm_core::agent_scheme::session_kind_for_path(key)
+                .unwrap_or_else(|| panic!("{key} must be named by the registry"));
+            assert!(
+                session_kind_state_survives_pty_loss(kind),
+                "{key} is an agent row: its state is its store, not its PTY"
+            );
+        }
+        // ⛔ And the case the conservative bias was actually written for still
+        // refuses: a scheme nothing recognises stays unreadable.
+        assert!(
+            yggterm_core::agent_scheme::session_kind_for_path("wat://host/whatever").is_none(),
+            "an unknown scheme must stay unreadable rather than be guessed"
+        );
+        // A shell is preservable via fd handoff; a document is not an agent.
+        assert!(session_kind_state_survives_pty_loss(SessionKind::Shell));
+        assert!(!session_kind_state_survives_pty_loss(SessionKind::Document));
+    }
+
     #[test]
     fn a_handoff_promising_a_newer_version_than_the_binary_is_predicted_refused() {
         assert!(
