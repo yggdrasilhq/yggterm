@@ -336,6 +336,29 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 **Falsifier (11.4's half):** with the watchdog live, an induced 500 ms main-thread block raises
 `ui/block` with attribution within one tick, and the keystroke echo tail lands on the GUI host.
 
+## ⛔ [11.0] SEAT DERIVATION CROSSES CAMPAIGN ERAS AND SEATS ORCHESTRATORS BARE — TWO MIS-SEATS IN ONE SPAWN BATCH
+
+**Status:** OPEN — measured 2026-08-20 on a sibling campaign's spawn batch; owner-reported both
+
+Two faces of the claim/seat derivation (`ygg-claim.sh` and callers that inherit its rules):
+
+1. **Token-sibling inference crossed eras.** An orchestrator seated at `12` spawned a delegate it
+   intended as `12.2`. The derivation matched campaign siblings by TOKEN, found rows from the same
+   campaign's OLD numbering era (`2.1`, `2.3` — months old, same token), and seated the new row at
+   **`2.2`** — a live, working delegate its own spawner could not find, reported as "it thinks it
+   spawned 12.2; there is no 12.2 row". The delegate was fine; the seat lied about its lineage.
+   ⇒ Derivation must prefer the SPAWNER'S OWN SEAT PREFIX (a row seated `12` spawns under `12.x`,
+   full stop) and use token-sibling inference only when the spawner has no seat.
+2. **A derived top-level seat is bare `N`, and the owner ruled it should be `N.0`.** The same
+   orchestrator self-claimed and landed at `12`, not `12.0` (owner: *"It spawned a row called 12.
+   instead of 12.0. So clearly some instructions need work in our row mechanism."*). The fleet's
+   own convention is `N.0` for an orchestrator seat with delegates at `N.1+` — the tool should
+   derive it that way when `--campaign` is given.
+
+**Falsifier:** with old-era `2.x` rows present and an orchestrator seated `12.0`, a campaign-token
+spawn lands at `12.1` (never `2.x`), and a fresh campaign claim with no explicit number lands at
+the next free `N.0`.
+
 ## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
 
 **Status:** OPEN
