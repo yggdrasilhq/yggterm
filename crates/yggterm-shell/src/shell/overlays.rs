@@ -5013,6 +5013,58 @@ fn apply_linux_window_shape_reapply_sequence(
     _maximized: bool,
 ) {
 }
+/// Hand the window's corner to DWM on Windows 11.
+///
+/// The page's `clip-path` already rounds this window on every platform, so this
+/// is not what makes the corner appear — it is what makes the corner REAL to the
+/// system. An attribute DWM knows about gets the matching drop shadow and the
+/// snap-layout affordance on the maximize button; a corner the compositor does
+/// not know about is a shape drawn inside a square window, and the shadow stays
+/// square around it.
+///
+/// ⚠ WINDOWS 10 HAS NO SUCH ATTRIBUTE and the call fails there. That is the
+/// designed outcome, not a gap to guard with a version probe: the CSD path is
+/// what rounds the window on 10, it is already in force, and a probe would only
+/// buy us the privilege of skipping a call whose failure costs nothing. The
+/// result is discarded deliberately.
+#[cfg(target_os = "windows")]
+fn apply_windows_window_corner_preference(
+    desktop: &dioxus::desktop::DesktopContext,
+    radius: u8,
+    maximized: bool,
+) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+        DWMWCP_ROUND, DwmSetWindowAttribute,
+    };
+
+    // A maximized window squares off — the same contract the shell radius keeps,
+    // stated once more here because DWM is a second painter and would otherwise
+    // round a corner the page has already squared.
+    let preference: DWM_WINDOW_CORNER_PREFERENCE = if maximized || radius == 0 {
+        DWMWCP_DONOTROUND
+    } else {
+        DWMWCP_ROUND
+    };
+    let hwnd = HWND(desktop.window.hwnd() as _);
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            std::ptr::from_ref(&preference).cast(),
+            u32::try_from(std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>()).unwrap_or(4),
+        );
+    }
+}
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_window_corner_preference(
+    _desktop: &dioxus::desktop::DesktopContext,
+    _radius: u8,
+    _maximized: bool,
+) {
+}
 #[cfg(target_os = "linux")]
 fn apply_linux_always_on_top_state(desktop: &dioxus::desktop::DesktopContext, always_on_top: bool) {
     use gtk::prelude::*;
