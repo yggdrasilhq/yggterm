@@ -1832,3 +1832,13 @@ which takes the store's answer as an ARGUMENT. The wrapper does the file read an
 nothing else. **A test that consults a live store measures the machine** — and
 this is the recurring shape here, not a one-off; see
 `[[finding-a-unit-test-that-reads-the-users-settings-store]]`.
+
+## Corner instruments are blind to the pixel (measured 2026-08-20)
+
+- `dom.shell_root_border_radius` reports the CSS the page ASKED for, not the pixel drawn: it
+  read 10px on a window whose corners rendered square. Never cite it as proof of rounding.
+- `server app screenshot` returns RGB — the WebKit snapshot flattens the alpha channel that
+  distinguishes a rounded corner from a square one. Only a compositor grab can tell them
+  apart; `scripts/corner-contract.sh` is the instrument that answers in pixels.
+- Sampling a compositor grab at (0,0) reads the compositor's own titlebar and reports square
+  on a perfectly rounded window — sample inside the window's own geometry.

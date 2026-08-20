@@ -528,10 +528,13 @@ matches() {
   [ "$got_num" = "$NUM" ] && [ "$got_title" = "$FINAL_TITLE" ]
 }
 GOT=""
-for attempt in 1 2 3; do
+# 5×4s, not 3×3s: a rename's propagation has been measured to outlast 9s on a
+# loaded host, and the old window failed a claim that was one read away from
+# passing (2026-08-20, a lane's row left unsubscribed over it).
+for attempt in 1 2 3 4 5; do
   GOT="$(assert_state)"
   matches "$GOT" && break
-  sleep 3
+  sleep 4
 done
 matches "$GOT" || {
   # ⛔ NAME WHICH FAILURE THIS IS. A caller that cannot tell "the claim did not take"
@@ -546,7 +549,18 @@ matches "$GOT" || {
       echo "ygg-claim:     yggterm server app rows | grep ${MINE##*/}" >&2 ;;
     *) echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|' | tr -d '\000'))" >&2 ;;
   esac
-  echo "ygg-claim: ⛔ the booter arm and the --replace reap below did NOT run" >&2; exit 3; }
+  # ⛔ An unverified RENAME is cosmetic; an UNSUPERVISED row is a safety gap.
+  # The row exists regardless of what the read-back saw, so arm the booter
+  # before exiting — a claim that failed verification must never also strand
+  # its row outside the watch plane (2026-08-20: exactly that happened, and
+  # the lane armed itself by hand).
+  if [ "${BOOTER:-0}" = 1 ] && [ -x "$(dirname "$0")/ygg-booter.py" ]; then
+    "$(dirname "$0")/ygg-booter.py" subscribe --row "$SESSION" \
+      ${CAMPAIGN:+--campaign "$CAMPAIGN"} >/dev/null 2>&1 \
+      && echo "ygg-claim: ⭐ booter armed despite the failed verification" >&2 \
+      || echo "ygg-claim: ⚠ booter arm ALSO failed — arm it by hand" >&2
+  fi
+  echo "ygg-claim: ⛔ the --replace reap below did NOT run" >&2; exit 3; }
 case "$GOT" in *$'\x00'HIDDEN*)
   log "⚠ seated correctly, but the row is HIDDEN BY A COLLAPSED SET — it will not be on screen" ;;
 esac
