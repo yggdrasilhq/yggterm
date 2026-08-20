@@ -435,7 +435,7 @@ pub fn append_foreign_trace_batch(
         }
 
         let record = EventTraceRecord {
-            ts_ms: validated.ts_ms,
+            ts_ms: u128::from(validated.ts_ms),
             // ⛔ Stamped by the RECEIVER, never carried on the wire: a
             // sandboxed emitter has no truthful access to a pid, and one that
             // could set its own could set another process's.

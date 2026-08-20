@@ -8851,6 +8851,46 @@ mod tests {
     }
 
     #[test]
+    fn the_replay_script_marks_its_wipe_and_refill_and_captures_the_reseed() {
+        // ⚠ THE ONE PATH THE SANDBOX COULD NOT TRIGGER. A retained replay needs
+        // a re-attach with daemon-held history, which a freshly started sandbox
+        // never produces — so live proof of this arm is owed, and until it
+        // arrives the wiring is guarded here rather than assumed.
+        //
+        // What it guards is the reseed half of the ghost-frame falsifier: the
+        // wipe and the refill must both be marked (so a `replay_reset` with no
+        // `replay_reseed` after it is visibly a screen emptied and never
+        // refilled), and the bytes handed to the canvas must be sampled with
+        // `stage: "reseed"` so they cannot be confused with the live stream's.
+        let script = terminal_replay_retained_data_script_for_session(
+            "local://replay-test",
+            "seeded output",
+            "daemon_retained_history",
+            7,
+        );
+        for marker in [
+            "\"replay_reset\"",
+            "\"replay_reseed\"",
+            "armStreamCapture(",
+            "captureStream(String(entry.hostId || ''), \"reseed\"",
+        ] {
+            assert!(
+                script.contains(marker),
+                "the replay script must carry `{marker}`"
+            );
+        }
+        // ⛔ And it must reach the emitter DEFENSIVELY: this script is generated
+        // by a different function from the terminal bootstrap and can run before
+        // it, so an unguarded call would throw into the replay path — turning a
+        // diagnostic into a session that never repaints.
+        assert!(
+            script.contains("if (window.__yggtermTrace)")
+                || script.contains("window.__yggtermTrace &&"),
+            "every emitter call in the replay script must be guarded"
+        );
+    }
+
+    #[test]
     fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
