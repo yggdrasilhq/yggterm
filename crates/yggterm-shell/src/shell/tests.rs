@@ -59696,6 +59696,50 @@ mod resume_gate_wiring_locks {
 /// only, with a self-check that the scan is not reading this module.
 #[cfg(test)]
 mod terminal_loop_input_starvation_locks {
+    /// The in-flight latch must not be able to stick.
+    ///
+    /// ⛔ **A STUCK LATCH IS WORSE THAN THE STALL THIS HOIST REMOVES.** The latch
+    /// is the only thing that re-enables the read branch, so a completion that is
+    /// never delivered would stop the session reading FOREVER — a terminal that
+    /// goes silently dead, with no error anywhere, which is precisely the failure
+    /// class this repo keeps paying for. Nothing is known to lose a completion
+    /// (`run_dedicated_terminal_io` turns a panic in the blocking read into an
+    /// `Err` that is sent normally); this locks the belt for the paths that are
+    /// not known.
+    #[test]
+    fn an_outstanding_read_that_never_answers_does_not_disable_reading_forever() {
+        // Every shell/*.rs is `include!`d into one flat `shell` module, so these
+        // are siblings rather than a `viewport::` path.
+        use super::{TERMINAL_READ_OVERDUE_MS, terminal_read_may_start};
+
+        // Nothing outstanding: always free to start.
+        assert!(terminal_read_may_start(false, 0, 1_000));
+        assert!(terminal_read_may_start(false, 900, 1_000));
+
+        // Outstanding and answering normally — the client's own IO timeout for
+        // TerminalRead is 10s, so a live read resolves well inside the window and
+        // must NOT be raced by a second one.
+        assert!(!terminal_read_may_start(true, 1_000, 1_000));
+        assert!(!terminal_read_may_start(true, 1_000, 1_000 + 10_000));
+        assert!(!terminal_read_may_start(
+            true,
+            1_000,
+            1_000 + TERMINAL_READ_OVERDUE_MS - 1
+        ));
+
+        // Past the backstop, reading resumes rather than staying dead.
+        assert!(terminal_read_may_start(
+            true,
+            1_000,
+            1_000 + TERMINAL_READ_OVERDUE_MS
+        ));
+        assert!(terminal_read_may_start(true, 1_000, 1_000 + 600_000));
+
+        // A clock that goes backwards must not be read as "overdue by a huge
+        // amount" and start racing reads — saturating_sub, not wrapping.
+        assert!(!terminal_read_may_start(true, 5_000, 1_000));
+    }
+
     /// The keystroke branch must not be starved by the daemon read.
     ///
     /// ⛔ **`tokio::select!` IS A SERIALIZER, AND THAT IS THE WHOLE DEFECT.**
@@ -59722,11 +59766,11 @@ mod terminal_loop_input_starvation_locks {
     fn the_daemon_read_is_dispatched_off_the_select_loop() {
         let source = include_str!("viewport.rs");
 
-        let start_marker = "if !terminal_read_in_flight =>";
+        let start_marker = "if terminal_read_may_start(";
         let apply_marker = "terminal_read_rx.recv()";
         let start_at = source
             .find(start_marker)
-            .expect("the read-poll branch must be gated on an in-flight latch");
+            .expect("the read-poll branch must be gated on the in-flight predicate");
         let apply_at = source
             .find(apply_marker)
             .expect("a branch must receive the read result off the channel");
@@ -59756,6 +59800,11 @@ mod terminal_loop_input_starvation_locks {
         // applying the stale read's `next_cursor` afterwards would skip past
         // everything the re-attach meant to replay.
         let apply_branch = &source[apply_at..];
+        assert!(
+            apply_branch.contains("read_generation != terminal_read_generation"),
+            "a superseded read must be dropped WHOLE — applying it after its \
+             successor was re-issued writes the same chunks a second time"
+        );
         assert!(
             apply_branch.contains("read_issued_at_cursor != cursor"),
             "a read issued before the cursor moved must be discarded, or a \
