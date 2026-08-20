@@ -159,6 +159,21 @@ create composed, not a re-derivation.
 
 **Status:** OPEN
 
+**The ghost's signature is now pinned (owner evidence + pixel analysis, 2026-08-20 ~18:47):
+a ghost frame is the canvas painted COLORLESS** — every SGR color flattened to plain
+white-on-black while emoji keep their color (font glyphs, not SGR — the discriminator that
+proves the ANSI attributes specifically were lost), content CURRENT rather than stale, input
+dead for the duration, and glyph-mangle artifacts present. The owner reports ghosts are
+"black and white always". The daemon's `screen_snapshot()` serves the FORMATTED (colored)
+state, so the flattening happens client-side between the snapshot fetch and the xterm write —
+the reseed path is writing (or re-writing) the screen with its attributes stripped or
+unapplied. Trigger context: the episode rode a fleet daemon adoption (~3 minutes of
+re-attach storms across sessions; multiple rows blocked). The input-dead half is fixed as of
+the 3.1.10 GUI (read-error recovery keeps input alive on every session kind); the falsifier
+for the render half: capture the exact bytes the canvas receives during a forced re-attach —
+the xterm.js write-queue instrumentation being built by the trace-wiring lane is the decisive
+instrument.
+
 Owner evidence 2026-08-20 (two screenshots): (a) the viewport showing a
 ~30-minute-old frame of the selected session — old turns, stale spinner — while the session
 had long progressed, with the system itself aware (an "Open Session Before Redrawing …
