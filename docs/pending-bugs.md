@@ -444,6 +444,14 @@ removing user activity would not remove most of these renders.
 of 0.1/s), and the viewport repaints only for its own session's bytes. Read `Sidebar`'s
 `renders` against `root_renders` in `component_window` — with the hoist live they must separate.
 
+**CONFIRMED-ROOTS FOLD (2026-08-21 01:1x, commit `74430ab3`, live both GUIs):** the dossier's
+two standing top causes cut at their gates — `terminal_attach_host_health_sample` now ABSENT
+from causes (skips the active-visible session and a hidden sidebar; throttle 750ms→2.5s), the
+contribution ping behind a read-only precheck with non-reactive liveness (3.6→1.2/min; the
+remainder is due refetches/drains by design). Laptop window: roots **0.29/s** (from 1.22/s),
+`ui/block` 0. Remaining dossier items (restore-card 1 Hz tick, retarget noop, hot-leaf-state
+architecture split) are in the 11.12 brief §2 with risk notes.
+
 **FIRST POST-FIX WINDOW, 2026-08-20 ~21:33–22:05 (commit `2d834fd6`):** root renders
 **0.35/s** (from 1.57/s), **Sidebar 39 of 330** root renders (from 232 of 234 — the hoist
 delivers), remaining causes are real content work (`background_copy_scan_*`,
