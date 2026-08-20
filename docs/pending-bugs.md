@@ -194,6 +194,49 @@ restore is refused, the surface disarms mouse tracking (and bracketed paste) bef
 the failure state. **Falsifier:** kill a remote session behind a row, move the mouse over its
 viewport — no bytes appear.
 
+## ⚠ [11.0] SPAWN TITLES: THE MACHINE IS MISSING, AND AN APP SPAWN BYPASSES THE ONE BUILDER
+
+**Status:** PARTLY OPEN. Re-measured against the tree 2026-08-21. The owner spec asks
+for a `New {Machine} {App}` convention composed by ONE title builder, plus
+context-menu sessions reading the CLI's DISPLAY NAME rather than its slug.
+
+### ✅ THE SLUG HALF IS ALREADY FIXED, AND BY A ONE-OWNER BUILDER
+`yggterm_core::agent_cli::new_session_birth_title` is that builder, and it lives
+beside the registry that knows every CLI's display name. A context-menu spawn
+lands titled `New Claude Code Session`, not a slug. Its own doc comment records
+the defect it replaced — a birth title composed from the label of whichever row
+the menu was opened on plus the slug, which named the SPAWNER rather than the
+spawned and minted near-duplicate sidebar rows. The menu ENTRY comes from the
+same place (`new_session_label`), so the entry and the resulting row agree by
+construction.
+
+### ⛔ WHAT IS ACTUALLY OPEN
+1. **The machine is missing.** Nothing composes `{Machine}` into a birth title.
+   A browser session on the integrator host should read `New Dev Ychrome`.
+2. **An APP spawn does not use the builder at all.** `spawn_launch_app_verb`
+   takes its title straight from the manifest verb's own `label`, so the one
+   builder governs agent spawns and nothing else — the exact split the spec is
+   trying to close. A machine name added to the builder today would not reach an
+   app spawn.
+
+### ⚠ THE DESIGN FORK, RECORDED BECAUSE IT DECIDES THE SHAPE
+`New {Machine} {App}` has no room for a verb. Apps declare several — a browser
+manifest typically has a plain "new" and an incognito variant — and folding them
+into one convention would give two different launches the same birth title, which
+is the near-duplicate-rows defect the slug fix just removed.
+
+⇒ **Recommendation:** the builder takes (machine, app, verb) and composes
+`New {Machine} {App}` for an app's PRIMARY verb, appending the verb's own
+qualifier for any other. That keeps the owner's convention exactly for the case
+they named, keeps two launches distinguishable, and leaves the qualifier in the
+app's words where the libyggterm contract puts it.
+
+⚠ Related and NOT the same thing: `spawn_title_generation_for_target` is the LLM
+titler. It is not this builder and is not a head start on it.
+
+**Falsifier:** a fresh app spawn on a named host lands titled by the convention,
+and a second, non-primary verb of the same app lands distinguishable from it.
+
 ## ⚠ [11.0] THE LIBYGGTERM CONTEXT MENU: CURATION — the registry and per-host halves are DONE
 
 **Status:** PARTLY OPEN. Re-measured against the tree 2026-08-21; two of the three
