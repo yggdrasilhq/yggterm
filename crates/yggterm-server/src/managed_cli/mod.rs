@@ -2177,6 +2177,57 @@ mod tests {
         );
     }
 
+
+    /// ⭐ THE LIVE FALSIFIER, run against real npm and the real registry.
+    ///
+    /// `#[ignore]`d because it downloads: run it deliberately with
+    /// `cargo test -p yggterm-server --lib -- --ignored provisions_grok`.
+    /// It is kept in the tree because the property it checks — that a second
+    /// pass is a cheap no-op that still republishes cleanly — is exactly what
+    /// the old batched installer could not do, and a claim about provisioning
+    /// that was never run against the registry is not a measurement.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "downloads from the npm registry"]
+    fn provisions_grok_twice_in_a_row_without_a_partial_tree() {
+        let paths = provision_test_paths("e2e-grok");
+        let tool = ManagedCliTool::GrokBuild;
+        let binary = tool.binary_name();
+
+        for pass in 1..=2 {
+            install_npm_isolated(&paths, &[tool], false)
+                .unwrap_or_else(|error| panic!("pass {pass} failed: {error}"));
+
+            let generation = paths
+                .published_generation("grok-build", binary)
+                .unwrap_or_else(|| panic!("pass {pass} published nothing"));
+            assert_eq!(generation, pass, "each pass publishes the next generation");
+
+            // The published path must RESOLVE — a dangling symlink is the exact
+            // shape of the failure this layout exists to make impossible.
+            let published = paths.bin_dir.join(binary);
+            assert!(
+                published.canonicalize().is_ok(),
+                "pass {pass}: the published {binary} does not resolve"
+            );
+
+            // Exactly one generation survives: the published one.
+            let generations: Vec<String> = std::fs::read_dir(paths.cli_root())
+                .expect("cli root")
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                .filter(|name| name.starts_with("grok-build.gen"))
+                .collect();
+            assert_eq!(
+                generations,
+                vec![format!("grok-build.gen{generation}")],
+                "pass {pass}: superseded generations must be reaped"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
     /// Superseded generations are reaped, so the per-CLI layout cannot become
     /// the next unbounded store. ⚠ The one just published is never a candidate.
     #[cfg(unix)]
