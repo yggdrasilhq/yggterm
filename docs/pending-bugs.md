@@ -551,6 +551,65 @@ presentation policy) or raise a LOUD stale-GUI alarm — silent futile queuing i
 **Falsifier:** deploy a GUI-image change; within one swap-queue cycle the GUI either runs the new
 image (fresh pid, markers present in /proc/<pid>/exe) or a visible alarm names the staleness.
 
+## ⛔⛔⛔ [11.0] A SAME-VERSION REBUILD CAN NEVER BE ADOPTED, AND THE DAEMON RETRIES THE HANDOFF EVERY 20s FOREVER
+
+**Status:** OPEN
+
+*Measured 2026-08-20 14:46 on all three fleet hosts at once, from their own lifecycle traces.*
+
+Every daemon on the fleet had been in a livelock for hours, and every part of it reports success.
+
+    daemon_self_retire            519x   retire_trigger: "disk_binary_replaced"
+                                         newer_daemon_version: null
+    hot_update_handoff_prepared    36x   expected_build_id: null
+    daemon_self_retire_handoff_ok  36x   "preserving 11 live terminal runtime(s)"
+                                         outcome: "preserved_owner_handoff"
+    bind_lock_busy                116x
+    hot_restart_swap_queue_skipped 34x   "the replacement binary is not ahead of this daemon"
+                                         current_version 3.1.6, target_version 3.1.6
+
+**The loop, and it cannot break on its own.** A daemon whose on-disk binary has been replaced
+self-retires with a preserving handoff, then waits to see a successor before releasing its socket.
+`live_newer_daemon_socket` answers "who supersedes me" by walking `$YGGTERM_HOME` for
+`server-<version>.sock` files and **discarding every candidate whose version is not strictly
+greater** — the line that turns 26 probes into 0-2. A rebuild at the same version writes the same
+socket NAME, so there is no distinct socket for a successor to advertise on, the successor loses
+the bind lock to the incumbent, and the incumbent sees `newer_daemon_version: null` forever.
+
+⇒ **Convergence is keyed on the version triple, which is also the socket name, so a same-version
+rebuild is structurally unable to hand over.** Not a race, not load: it is arithmetic.
+
+⛔ **The code names this exact case and then does not act on it.** `queue_self_retire_swap` reasons
+that a same-version rebuild "is reachable in ordinary work … and the handoff below is still worth
+doing — it is only the durable 'still owed' record that would be a lie." That reasoning is right,
+and the handoff does still run — 36 times, preserving 11 runtimes each time, and never completing.
+**The half that was missing was never the handoff; it was the ability to RECOGNISE the successor.**
+
+⚠ **Why nobody noticed for hours.** Every individual signal is a success message. The daemon says
+it is preserving runtimes; the swap queue says, correctly, that no swap is owed; the version reads
+current because the version IS current — only the BUILD is stale. The only visible symptom is the
+GUI's small grey "newer build on disk", which reads as a note rather than an alarm.
+
+⚠ **Its cost is not only staleness.** Each host spawns a successor every ~20 s that binds nothing
+and dies, continuously, on every host including the laptop — worth weighing against the standing
+heat and responsiveness work.
+
+**Interim, used 2026-08-20:** bump the version. A genuinely-ahead target gives the successor a
+distinct socket name, the incumbent recognises it, and the designed preserving handover completes.
+That works and is the sanctioned path, but it means **every rebuild that does not bump is silently
+never adopted**, which is precisely the shape that made "verify against the LIVE pid" necessary.
+
+**Fix direction:** make supersession answerable at equal versions. The identity already exists —
+`current_local_build_id()` is passed to `hot_restart_detailed`, and the handoff record carries an
+`expected_build_id` field that is `null` on this path. Either carry the build id into the socket
+identity so a successor has somewhere to stand, or let the equal-version case be settled by a
+status probe comparing build id and start time. ⛔ Do not simply relax the `<=` filter: it is
+load-bearing for the probe-count optimisation, and widening it re-introduces the O(N²) sweep.
+
+**Falsifier:** replace the daemon binary WITHOUT changing the version; within one swap cycle the
+running daemon is the new build (`/proc/<pid>/exe` readlink is not "(deleted)", start time is after
+the deploy) with its live PTYs intact, and `daemon_self_retire` stops repeating.
+
 ## ⛔⛔ [11.0] A DEPLOY LEAVES NO PROVENANCE, SO "WHICH BUILD IS THIS" IS ANSWERED BY GUESSWORK
 
 **Status:** OPEN
