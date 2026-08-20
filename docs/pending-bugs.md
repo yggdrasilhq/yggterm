@@ -34,6 +34,38 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 - **Falsifier:** spawn with `--model <x>`; `/proc/<pid>/cmdline` (or the CLI's own session state)
   carries x, and the row header shows x.
 
+## ⛔⛔ [11.4] THE APP-CONTROL REQUEST PATH AND terminal_mount BLOCK THE OWNER'S UI THREAD
+
+**Status:** OPEN — first measured 2026-08-20 with the new `ui/block` watchdog live
+
+The UI-block watchdog now names what the zero-incident freeze class was. In its first 30 minutes
+on the GUI host it recorded 8 blocks, and the attribution is not the chore everyone suspected:
+
+| preceded the block | count | worst |
+|---|---:|---:|
+| `terminal_mount/ensure_begin` | 2 | 718 ms |
+| `app_control/request_begin` | 2 | 817 ms |
+| `surface_request/end` | 1 | **3223 ms** |
+| `daemon_recovery/current_daemon_existing_before_cleanup` | 1 | 509 ms |
+| `terminal_mount/retained_fault_recovery_rearm_watch_scheduled` | 1 | 794 ms |
+
+⭐ **The 3,223 ms block matches the owner's reported ~3 s keystroke-echo stall.** The freeze class
+that produced no incidents now names itself.
+
+⚠ **`app_control/request_begin` is the agent control plane.** If agent probes are stalling the
+owner's UI thread, then every agent that measures this host is also degrading it — the instrument
+and the load are the same traffic. That needs confirming with more samples before it is treated as
+established; n=2 is a lead, not a verdict.
+
+⛔ **What this entry does NOT claim:** that the title chore is innocent. Over the same window
+`copy_generation/title` ran ~1/min at p50 8.7 s with a 20.6 s worst case, and a `background/copy_scan`
+took **25.7 s** against a 76 ms median. Neither lined up with a block in this sample, but the sample
+is 8 blocks — absence here is not exoneration.
+
+**Falsifier:** with the named work moved off the UI thread, a 30-minute window on the GUI host under
+comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
+`notebooks/06-ui-blocks.ipynb`.
+
 ## ⛔⛔⛔ [11.4→11.3] THE GUI FREEZES WITH ZERO INCIDENTS RECORDED — OWNER KILLED IT; INPUT PROBES WERE BLIND AND THE TITLE CHORE OWNED THE HOUR
 
 **Status:** OPEN
