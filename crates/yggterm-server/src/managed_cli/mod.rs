@@ -338,6 +338,112 @@ impl ManagedCliPaths {
         self.home.join("cli-staging")
     }
 
+    /// The root of the PER-CLI prefixes, and the reason there is one per CLI.
+    ///
+    /// ⛔ MEASURED 2026-08-20, twice, deterministically: batching every npm CLI
+    /// into one `npm install -g --force <7 packages>` line opens a multi-second
+    /// window in which npm has unlinked ALL SEVEN published binaries and not yet
+    /// relinked any of them. A kill 12 s in left `bin/` with **zero** working
+    /// CLIs and seven orphaned `.<name>-<random>` staging symlinks — every agent
+    /// CLI on the machine gone at once, recoverable only by a full reinstall.
+    ///
+    /// The 2×2 that pins it: a SINGLE-package install, with or without
+    /// `--force`, survived the same interrupt intact; a batch WITHOUT `--force`
+    /// survived; only batch-plus-`--force` destroyed the set. `--force` is what
+    /// makes the window open on EVERY pass rather than only when something
+    /// changed — it rewrites all 164 packages and relinks all 7 bins even when
+    /// the tree is already current (`changed 164 packages` on a no-op).
+    ///
+    /// ⇒ One prefix per CLI means one CLI's install can never touch another's
+    /// binary, whatever happens to it.
+    fn cli_root(&self) -> PathBuf {
+        self.prefix.join("cli")
+    }
+
+    /// A CLI's tree for one GENERATION of its install.
+    ///
+    /// Generations exist so publishing is a single atomic `rename` of a symlink
+    /// rather than a mutation of a live tree: generation N keeps serving until
+    /// the instant N+1 is proven good. An interrupted install damages only the
+    /// unpublished N+1 directory, so the old binary keeps working — which is the
+    /// property the batch install could not offer at any point in its run.
+    ///
+    /// ⭐ It is also the vendor's own pattern rather than an invention here:
+    /// the grok npm package installs `~/.grok/bin/grok-<version>` and swaps a
+    /// `grok` symlink onto it, for the same reason.
+    fn cli_generation_dir(&self, slug: &str, generation: u64) -> PathBuf {
+        self.cli_root().join(format!("{slug}.gen{generation}"))
+    }
+
+    /// Which generation is PUBLISHED, read from the published symlink itself.
+    ///
+    /// The symlink is the single source of truth for "what is live": scanning
+    /// the directory for the highest `gen` would instead name a half-written
+    /// tree an interrupted run left behind.
+    #[cfg(unix)]
+    fn published_generation(&self, slug: &str, binary: &str) -> Option<u64> {
+        let target = fs::read_link(self.bin_dir.join(binary)).ok()?;
+        let marker = format!("{slug}.gen");
+        target.components().find_map(|component| {
+            component
+                .as_os_str()
+                .to_str()?
+                .strip_prefix(&marker)?
+                .parse::<u64>()
+                .ok()
+        })
+    }
+
+    /// Point `bin/<binary>` at `generation`, atomically.
+    ///
+    /// ⛔ Symlink-then-`rename`, never `remove`-then-`symlink`: the second form
+    /// has a window in which the binary does not exist, which is precisely the
+    /// defect this whole layout exists to close. `rename` onto an existing path
+    /// replaces it in one step and is never observable half-done.
+    #[cfg(unix)]
+    fn publish_cli_binary(&self, slug: &str, binary: &str, generation: u64) -> Result<()> {
+        // ⛔ ABSOLUTE, derived from `cli_generation_dir` — the one owner of
+        //    where a generation lives. A `../cli/...` relative target silently
+        //    assumed `bin_dir` is exactly `prefix/bin`; it is not in every
+        //    construction of these paths, and the link then pointed at a
+        //    directory that does not exist. Caught by
+        //    `an_abandoned_generation_leaves_the_published_binary_untouched`.
+        let target = self
+            .cli_generation_dir(slug, generation)
+            .join("bin")
+            .join(binary);
+        let link = self.bin_dir.join(binary);
+        let staged = self.bin_dir.join(format!(".{binary}.ygg-publish"));
+        let _ = fs::remove_file(&staged);
+        std::os::unix::fs::symlink(&target, &staged).with_context(|| {
+            format!("staging the published symlink for {}", link.display())
+        })?;
+        // A legacy install left a real FILE here; `rename` replaces it just the
+        // same, so the migration off the shared prefix needs no separate step.
+        fs::rename(&staged, &link)
+            .with_context(|| format!("publishing {}", link.display()))?;
+        Ok(())
+    }
+
+    /// Drop every generation of `slug` except the one just published, and any
+    /// partial tree an interrupted run abandoned.
+    fn prune_cli_generations(&self, slug: &str, keep: u64) {
+        let keep_name = format!("{slug}.gen{keep}");
+        let marker = format!("{slug}.gen");
+        let Ok(entries) = fs::read_dir(self.cli_root()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name == keep_name || !name.starts_with(&marker) {
+                continue;
+            }
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+
     fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.prefix)
             .with_context(|| format!("creating managed npm prefix {}", self.prefix.display()))?;
@@ -1954,6 +2060,38 @@ mod tests {
         assert_eq!(provision_step_for(codex, false), Some(ProvisionStep::Npm));
     }
 
+    /// ⛔ A SELF-UPDATER THAT IS npm IN DISGUISE MUST NOT BE PREFERRED.
+    ///
+    /// grok ships `grok update`, and the general rule prefers a CLI's own
+    /// updater over re-running the install method. Measured 2026-08-20, its own
+    /// `update --check --json` reports `"installer":"npm"` — the updater
+    /// delegates back to npm for an npm-provisioned copy. Preferring it would
+    /// move the npm call inside a process where the staged prefix, the binary
+    /// verification and the atomic publish do not apply, and where an inherited
+    /// `npm_config_prefix` would write the SHARED prefix and overwrite the
+    /// published per-CLI symlink.
+    ///
+    /// ⚠ Locks the DECISION, not the mechanism: Antigravity must keep its
+    /// self-updater, because for an unfetchable CLI it is the only step there is.
+    #[test]
+    fn a_self_updater_that_delegates_to_npm_is_not_preferred_over_our_own() {
+        let grok = ManagedCliTool::GrokBuild.descriptor();
+        assert_eq!(
+            provision_step_for(grok, true),
+            Some(ProvisionStep::Npm),
+            "grok's updater re-enters npm, so yggterm runs npm itself and keeps \
+             the generation, verification and atomic-publish guarantees"
+        );
+        // The rule it declines is still the rule for a CLI that really does
+        // update itself.
+        let agy = ManagedCliTool::Antigravity.descriptor();
+        assert_eq!(
+            provision_step_for(agy, true),
+            Some(ProvisionStep::SelfUpdate(&["update"])),
+            "an unfetchable CLI's own updater is the only step there is"
+        );
+    }
+
     /// The non-npm methods are RUN, not recorded.
     ///
     /// ⛔ Guards the exact regression the ruling reversed: `npm_package()`
@@ -1994,7 +2132,243 @@ mod tests {
         }
         // An empty batch is a no-op, not an "npm is required" error — the case a
         // machine with only uv/vendor CLIs to refresh hits every time.
-        assert!(install_npm_batch(&paths, &[], true).is_ok());
+        assert!(install_npm_isolated(&paths, &[], true).is_ok());
+    }
+
+    /// ⛔ AN INTERRUPTED UPDATE MUST LEAVE THE OLD BINARY WORKING.
+    ///
+    /// The defect this locks was measured twice, deterministically, on
+    /// 2026-08-20: one batched `npm install -g --force <7 packages>` spends
+    /// several seconds with every published binary unlinked, and a kill inside
+    /// that window left `bin/` holding **zero** CLIs and seven orphaned
+    /// `.<name>-<random>` staging symlinks.
+    ///
+    /// The generation layout makes that shape unreachable rather than unlikely:
+    /// an install writes an UNPUBLISHED directory, so a run that dies at any
+    /// point before the swap cannot be observed at all. Simulated here by
+    /// building generation 2 and abandoning it.
+    #[cfg(unix)]
+    #[test]
+    fn an_abandoned_generation_leaves_the_published_binary_untouched() {
+        let paths = provision_test_paths("interrupt");
+        std::fs::create_dir_all(paths.cli_root()).expect("cli root");
+
+        // Generation 1, published — the "already working" install.
+        let live = paths.cli_generation_dir("grok-build", 1);
+        std::fs::create_dir_all(live.join("bin")).expect("gen1 bin");
+        std::fs::write(live.join("bin").join("grok"), b"#!/bin/sh\necho 1.0.5\n")
+            .expect("gen1 binary");
+        paths
+            .publish_cli_binary("grok-build", "grok", 1)
+            .expect("publish gen1");
+        assert_eq!(paths.published_generation("grok-build", "grok"), Some(1));
+
+        // Generation 2 starts and dies half-written, exactly as a kill would
+        // leave it: a directory, no binary, nothing published.
+        let staged = paths.cli_generation_dir("grok-build", 2);
+        std::fs::create_dir_all(staged.join("lib")).expect("gen2 partial");
+
+        // The published binary is still generation 1 and still resolves.
+        assert_eq!(
+            paths.published_generation("grok-build", "grok"),
+            Some(1),
+            "an unpublished generation must not become live by existing"
+        );
+        let published = paths.bin_dir.join("grok");
+        assert!(
+            std::fs::read_to_string(&published)
+                .expect("the published symlink still resolves to a real file")
+                .contains("1.0.5"),
+            "the old binary must survive an interrupted update"
+        );
+    }
+
+    /// Publishing is a REPLACE, so a legacy install that left a real file at
+    /// `bin/<binary>` migrates without a separate step — and without a window
+    /// in which the binary is missing.
+    #[cfg(unix)]
+    #[test]
+    fn publishing_replaces_a_legacy_real_file_in_one_step() {
+        let paths = provision_test_paths("migrate");
+        std::fs::create_dir_all(paths.cli_root()).expect("cli root");
+        std::fs::write(paths.bin_dir.join("grok"), b"legacy shared-prefix install")
+            .expect("legacy binary");
+
+        let generation = paths.cli_generation_dir("grok-build", 1);
+        std::fs::create_dir_all(generation.join("bin")).expect("generation bin");
+        std::fs::write(generation.join("bin").join("grok"), b"generation install")
+            .expect("generation binary");
+        paths
+            .publish_cli_binary("grok-build", "grok", 1)
+            .expect("publish over the legacy file");
+
+        assert_eq!(paths.published_generation("grok-build", "grok"), Some(1));
+        assert_eq!(
+            std::fs::read_to_string(paths.bin_dir.join("grok")).expect("read published"),
+            "generation install"
+        );
+    }
+
+
+    /// ⭐ THE LIVE FALSIFIER, run against real npm and the real registry.
+    ///
+    /// `#[ignore]`d because it downloads: run it deliberately with
+    /// `cargo test -p yggterm-server --lib -- --ignored provisions_grok`.
+    /// It is kept in the tree because the property it checks — that a second
+    /// pass is a cheap no-op that still republishes cleanly — is exactly what
+    /// the old batched installer could not do, and a claim about provisioning
+    /// that was never run against the registry is not a measurement.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "downloads from the npm registry"]
+    fn provisions_grok_twice_in_a_row_without_a_partial_tree() {
+        let paths = provision_test_paths("e2e-grok");
+        let tool = ManagedCliTool::GrokBuild;
+        let binary = tool.binary_name();
+
+        for pass in 1..=2 {
+            install_npm_isolated(&paths, &[tool], false)
+                .unwrap_or_else(|error| panic!("pass {pass} failed: {error}"));
+
+            let generation = paths
+                .published_generation("grok-build", binary)
+                .unwrap_or_else(|| panic!("pass {pass} published nothing"));
+            assert_eq!(generation, pass, "each pass publishes the next generation");
+
+            // The published path must RESOLVE — a dangling symlink is the exact
+            // shape of the failure this layout exists to make impossible.
+            let published = paths.bin_dir.join(binary);
+            assert!(
+                published.canonicalize().is_ok(),
+                "pass {pass}: the published {binary} does not resolve"
+            );
+
+            // Exactly one generation survives: the published one.
+            let generations: Vec<String> = std::fs::read_dir(paths.cli_root())
+                .expect("cli root")
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                .filter(|name| name.starts_with("grok-build.gen"))
+                .collect();
+            assert_eq!(
+                generations,
+                vec![format!("grok-build.gen{generation}")],
+                "pass {pass}: superseded generations must be reaped"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// Superseded generations are reaped, so the per-CLI layout cannot become
+    /// the next unbounded store. ⚠ The one just published is never a candidate.
+    #[cfg(unix)]
+    #[test]
+    fn pruning_keeps_the_published_generation_and_drops_the_rest() {
+        let paths = provision_test_paths("prune");
+        std::fs::create_dir_all(paths.cli_root()).expect("cli root");
+        for generation in 1..=3 {
+            std::fs::create_dir_all(paths.cli_generation_dir("grok-build", generation))
+                .expect("generation");
+        }
+        // A different CLI's tree must be untouched by another's prune.
+        std::fs::create_dir_all(paths.cli_generation_dir("claude-code", 7)).expect("other cli");
+
+        paths.prune_cli_generations("grok-build", 3);
+
+        assert!(paths.cli_generation_dir("grok-build", 3).exists());
+        assert!(!paths.cli_generation_dir("grok-build", 1).exists());
+        assert!(!paths.cli_generation_dir("grok-build", 2).exists());
+        assert!(
+            paths.cli_generation_dir("claude-code", 7).exists(),
+            "pruning one CLI must never reach another's generations"
+        );
+    }
+
+
+    /// ⛔ NO PROVISIONING STEP MAY STAGE IN `/tmp` — CHECKED FOR ALL FOUR
+    /// METHODS, NOT JUST THE ONE THAT WAS CAUGHT.
+    ///
+    /// The npm path was given a disk-backed `TMPDIR` on 2026-08-14 and the other
+    /// three were not, so `uv tool install`, the vendor `curl … | sh` and a
+    /// CLI's own updater all still staged into a tmpfs for six more days. That
+    /// is the shape this asserts against: a fix applied per-callsite, in a file
+    /// where callsites keep being added.
+    ///
+    /// ⚠ Reads the SHIPPED source rather than a comment, because the failure
+    /// mode is a new `Command::new` that simply forgets.
+    #[test]
+    fn every_provisioning_command_stages_on_disk() {
+        let source = include_str!("mod.rs");
+        // Each provisioning method, and the marker that proves it routes temp.
+        // ⛔ NEWLINE-ANCHORED. Without the leading newline each needle matches
+        //    THIS TEST'S OWN array literal first — the test module sits above
+        //    the functions it reads — and the check then asserts against a slice
+        //    of itself and fails for a reason that has nothing to do with the
+        //    code. A string-keyed search finds the FIRST match, not the intended
+        //    one; caught while writing this.
+        for (method, marker) in [
+            ("\nfn install_via_uv(", "apply_provision_env(&mut command, paths)"),
+            ("\nfn install_via_vendor_script(", "apply_provision_env(&mut run, paths)"),
+            ("\nfn update_via_self_command(", "apply_provision_env(&mut command, paths)"),
+            ("\nfn run_npm_install(", "\"TMPDIR\""),
+        ] {
+            let body = source
+                .split_once(method)
+                .unwrap_or_else(|| panic!("{method} is the owner of one provisioning method"))
+                .1;
+            let body = body.split_once("\nfn ").map(|(head, _)| head).unwrap_or(body);
+            assert!(
+                body.contains(marker),
+                "{method} does not route its temp directory to disk; on the \
+                 desktop host /tmp is a tmpfs, so its staging is RAM"
+            );
+        }
+
+        // And the helper must actually set TMPDIR, or every check above is
+        // asserting the presence of a no-op.
+        let helper = source
+            .split_once("\nfn apply_provision_env")
+            .expect("the shared provisioning environment")
+            .1;
+        let helper = helper.split_once("\nfn ").map(|(head, _)| head).unwrap_or(helper);
+        assert!(
+            helper.contains(".env(\"TMPDIR\", paths.staging_dir())"),
+            "apply_provision_env must be what puts staging on disk"
+        );
+    }
+
+    /// ⛔ THE npm INVOCATION MUST NOT CARRY `--force`, AND THE REASON IS THE
+    /// WHOLE POINT OF THIS MODULE'S REWRITE.
+    ///
+    /// `--force` rewrote all 164 packages and relinked every binary on every
+    /// pass, including passes where nothing had changed — which is what turned
+    /// a routine refresh into the destructive window. A fresh generation
+    /// directory is empty, so there is nothing left for it to force.
+    ///
+    /// ⚠ Asserted against the SHIPPED argument list rather than a comment,
+    /// because a comment cannot fail.
+    #[test]
+    fn the_managed_npm_install_never_forces() {
+        let source = include_str!("mod.rs");
+        let install = source
+            .split_once("fn run_npm_install(")
+            .expect("run_npm_install is the one owner of the npm argument list")
+            .1;
+        let body = install
+            .split_once("\nfn ")
+            .map(|(body, _)| body)
+            .unwrap_or(install);
+        assert!(
+            !body.contains(".arg(\"--force\")"),
+            "`--force` is back in the managed npm install; it reopens the \
+             all-binaries-unlinked window this layout exists to close"
+        );
+        assert!(
+            !body.contains(".env(\"npm_config_tmp\""),
+            "npm 11 answers `Unknown env config \"tmp\"` and ignores it; \
+             TMPDIR is what actually moves staging off a tmpfs"
+        );
     }
 
     /// The status line must name the method that ACTUALLY ran.
@@ -2620,18 +2994,14 @@ fn provision_detail(paths: &ManagedCliPaths, tool: ManagedCliTool) -> String {
 /// ⛔ No prefix override: uv's default tool bin dir is `~/.local/bin`, which is
 /// user-local and already on the login PATH. Forcing it under `~/.yggterm/npm`
 /// would put a Python CLI inside the npm prefix and hide it from `uv tool list`.
-fn install_via_uv(package: &str) -> Result<()> {
+fn install_via_uv(paths: &ManagedCliPaths, package: &str) -> Result<()> {
     let uv = uv_binary().context(
         "uv is required to install this CLI and is not on the login PATH — \
          install uv (https://astral.sh/uv) and the next refresh will pick it up",
     )?;
     let mut command = Command::new(uv);
-    command
-        .arg("tool")
-        .arg("install")
-        .arg("--upgrade")
-        .arg(package)
-        .env("PATH", provision_env_path());
+    command.arg("tool").arg("install").arg("--upgrade").arg(package);
+    apply_provision_env(&mut command, paths);
     run_provision_command(command, &format!("uv tool install {package}"))
 }
 
@@ -2667,17 +3037,25 @@ fn install_via_vendor_script(paths: &ManagedCliPaths, url: &str) -> Result<()> {
         .arg(VENDOR_FETCH_TIMEOUT_SECS.to_string())
         .arg("--output")
         .arg(&script)
-        .arg(url)
-        .env("PATH", provision_env_path());
+        .arg(url);
+    apply_provision_env(&mut fetch, paths);
     run_provision_command(fetch, &format!("fetching vendor installer {url}"))?;
 
     let mut run = Command::new("bash");
-    run.arg(&script).env("PATH", provision_env_path());
+    run.arg(&script);
+    // ⛔ THE ONE THAT MATTERS MOST. A vendor installer does its own `mktemp -d`
+    //    and fetches a ~157 MB tarball into it, and does not remove it on every
+    //    path. Without a disk-backed TMPDIR that lands in RAM and stays there.
+    apply_provision_env(&mut run, paths);
     run_provision_command(run, &format!("running vendor installer {url}"))
 }
 
 /// Run a CLI's own updater, e.g. `agy update`.
-fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
+fn update_via_self_command(
+    paths: &ManagedCliPaths,
+    tool: ManagedCliTool,
+    argv: &[&str],
+) -> Result<()> {
     let binary = resolve_binary_for_launch_parity(tool.binary_name()).with_context(|| {
         format!(
             "{} advertises its own updater but is not on the login PATH",
@@ -2685,7 +3063,8 @@ fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
         )
     })?;
     let mut command = Command::new(binary);
-    command.args(argv).env("PATH", provision_env_path());
+    command.args(argv);
+    apply_provision_env(&mut command, paths);
     run_provision_command(
         command,
         &format!("{} {}", tool.binary_name(), argv.join(" ")),
@@ -2696,6 +3075,28 @@ fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
 /// the login-shell dirs. An installer that shells out to `curl`, `tar` or
 /// `python` must see what a human's shell sees, or it fails on the daemon's
 /// stripped `PATH` in ways no user can reproduce.
+/// ⛔ EVERY PROVISIONING STEP STAGES ON DISK, NOT IN RAM — AND THIS IS THE ONE
+/// PLACE THAT SAYS SO.
+///
+/// `/tmp` on the desktop host is a **tmpfs**, so a payload staged there is RAM
+/// that the kernel can never drop: tmpfs pages can be swapped but not reclaimed,
+/// so stale staging becomes permanent swap occupancy. Measured 2026-08-14 at
+/// 2.85 GB of leaked npm staging plus 630 MB from a vendor installer, on a
+/// 15 GB laptop already 11 GB into swap.
+///
+/// ⚠ THE npm PATH WAS FIXED AND THE OTHER TWO WERE NOT, which is the whole
+/// reason this is a function. Found 2026-08-20: `install_via_uv` and
+/// `install_via_vendor_script` both ran with the inherited `TMPDIR`, so a
+/// `uv tool install` and — worse — a vendor `curl … | sh` that does its own
+/// `mktemp -d` and fetches a ~157 MB tarball both staged straight into RAM. A
+/// per-callsite fix is what let that survive; a shared helper is what stops the
+/// next provisioning method being added without it.
+fn apply_provision_env<'a>(command: &'a mut Command, paths: &ManagedCliPaths) -> &'a mut Command {
+    command
+        .env("PATH", provision_env_path())
+        .env("TMPDIR", paths.staging_dir())
+}
+
 fn provision_env_path() -> OsString {
     let mut parts: Vec<PathBuf> = inherited_path_dirs();
     for dir in login_shell_path_dirs() {
@@ -3031,16 +3432,16 @@ fn install_latest(
     for (tool, step) in per_tool {
         let outcome = match step {
             ProvisionStep::Npm => unreachable!("npm tools are batched above"),
-            ProvisionStep::Uv(package) => install_via_uv(package),
+            ProvisionStep::Uv(package) => install_via_uv(paths, package),
             ProvisionStep::VendorScript(url) => install_via_vendor_script(paths, url),
-            ProvisionStep::SelfUpdate(argv) => update_via_self_command(tool, argv),
+            ProvisionStep::SelfUpdate(argv) => update_via_self_command(paths, tool, argv),
         };
         if let Err(error) = outcome {
             failures.push(format!("{}: {error}", tool.display_name()));
         }
     }
 
-    if let Err(error) = install_npm_batch(paths, &npm_tools, background) {
+    if let Err(error) = install_npm_isolated(paths, &npm_tools, background) {
         failures.push(error.to_string());
     }
 
@@ -3051,7 +3452,27 @@ fn install_latest(
     }
 }
 
-fn install_npm_batch(
+/// Install or refresh every npm-provisioned CLI — each in its OWN prefix, each
+/// published only after it is proven to run.
+///
+/// ⛔ THIS REPLACED A SINGLE BATCHED `npm install -g --force <every package>`,
+/// and the reason is measured, not stylistic. See [`ManagedCliPaths::cli_root`]
+/// for the 2×2: the batch form spends several seconds of every pass with ALL
+/// published binaries unlinked, so an interrupt anywhere in that window — a
+/// reboot, an OOM kill, a daemon restart, a closed laptop — leaves the machine
+/// with **no agent CLIs at all**. Reproduced twice, deterministically, 7 → 0.
+///
+/// Three properties this form has and that one could not:
+///
+/// - **Isolation.** One prefix per CLI, so a failure can only ever cost the CLI
+///   it belongs to. The batch line failed all seven together by construction,
+///   because npm fails a whole `install -g` on one bad name.
+/// - **Verify-then-publish.** The staged tree must produce the binary before
+///   anything is swapped; a install that "succeeds" without one is a failure
+///   here, not a silently broken CLI discovered at launch.
+/// - **Idempotence.** No `--force`, so an already-current tree is a cheap no-op
+///   instead of a full rewrite of every package and a relink of every binary.
+fn install_npm_isolated(
     paths: &ManagedCliPaths,
     npm_tools: &[ManagedCliTool],
     background: bool,
@@ -3059,59 +3480,244 @@ fn install_npm_batch(
     if npm_tools.is_empty() {
         return Ok(());
     }
-    let npm = npm_binary().context("npm is required to manage Codex tools")?;
+    let npm = npm_binary().context("npm is required to manage agent CLI toolchains")?;
     paths.ensure_dirs()?;
+    fs::create_dir_all(paths.cli_root())
+        .with_context(|| format!("creating per-CLI prefix root {}", paths.cli_root().display()))?;
     // ⛔ Reap what the last install abandoned before making more. See
     //    `staging_dir` for why this is not the package's job to be trusted with.
     paths.sweep_staging();
+
+    // ⛔ Collected, never short-circuited — the same rule the per-tool loop
+    //    above follows. One CLI's registry flake must not stop the next CLI's
+    //    refresh, which is exactly what the shared batch line could not promise.
+    let mut failures: Vec<String> = Vec::new();
+    for tool in npm_tools.iter().copied() {
+        if let Err(error) = install_one_npm_cli(paths, &npm, tool, background) {
+            append_trace_event(
+                &paths.home,
+                "managed_cli",
+                "install",
+                "npm_cli_install_failed",
+                serde_json::json!({
+                    "tool": tool.descriptor().slug,
+                    "package": tool.npm_package(),
+                    "error": error.to_string(),
+                }),
+            );
+            failures.push(format!("{}: {error}", tool.display_name()));
+        }
+    }
+
+    // ⛔ Bounded, not emptied — see `gc_npm_cache_if_due`. Runs after the
+    //    installs so a due collection never delays the binaries themselves.
+    gc_npm_cache_if_due(paths, &npm);
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", failures.join("; "))
+    }
+}
+
+
+/// How often the shared npm cache is garbage-collected.
+///
+/// ⛔ THE CACHE IS THE LARGEST SINGLE CONSUMER OF `~/.yggterm` ON EVERY FLEET
+/// HOST and nothing had ever removed anything from it: measured 2026-08-14 at
+/// 7.6 GB of a 9.5 GB tree on one host and 5.7 GB of 7.8 GB on another, with
+/// content dating back five months.
+///
+/// ⭐ The fix is a RETENTION RULE, NOT A DELETE. The cache exists so that
+/// provisioning is not a fresh download every time; emptying it on a timer
+/// trades disk for network on the one path that has to be fast. `npm cache
+/// verify` is npm's own garbage collector — it keeps everything the index
+/// references and drops orphaned content — so it bounds the store without
+/// costing a re-download of anything still in use.
+///
+/// ⚠ MEASURED 2026-08-20 on the build host: 9,322 MB → 7,669 MB, **1.65 GB
+/// reclaimed in 61 s**. And npm's own report cannot be quoted for that number —
+/// it said *"Content garbage-collected: 1306 (9,172,360,910 bytes)"*, i.e. 9.17 GB,
+/// which over-states the disk actually returned by **5.5×**, because `_cacache`
+/// deduplicates by content hash and the figure counts index entries rather than
+/// unique bytes. Quote `du`, never npm's summary line.
+const NPM_CACHE_GC_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Garbage-collect the shared npm cache, at most once per
+/// [`NPM_CACHE_GC_INTERVAL`].
+///
+/// The interval is carried by the mtime of a marker file inside the cache
+/// rather than by a new field in the refresh state: the question "when was this
+/// cache last collected" belongs to the cache, and a second store that could
+/// disagree with it is the duplicate this project's SSOT law forbids.
+///
+/// Best-effort throughout — a cache that cannot be collected is untidy, never a
+/// failed provisioning pass.
+fn gc_npm_cache_if_due(paths: &ManagedCliPaths, npm: &Path) {
+    let marker = paths.cache_dir.join(".ygg-last-gc");
+    let due = match fs::metadata(&marker).and_then(|meta| meta.modified()) {
+        Ok(last) => last
+            .elapsed()
+            .map(|since| since >= NPM_CACHE_GC_INTERVAL)
+            .unwrap_or(true),
+        // No marker yet: this host has never collected, so it is due.
+        Err(_) => true,
+    };
+    if !due {
+        return;
+    }
+    // Written BEFORE the run, not after. The collection is slow (61 s on a 9 GB
+    // cache) and may be killed; a marker written only on success would make
+    // every interrupted pass retry it immediately, which is how a weekly chore
+    // becomes a hot loop.
+    let _ = fs::write(&marker, b"");
+
+    let started = std::time::Instant::now();
+    let output = Command::new(npm)
+        .env("npm_config_cache", &paths.cache_dir)
+        .env("npm_config_update_notifier", "false")
+        .arg("cache")
+        .arg("verify")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    append_trace_event(
+        &paths.home,
+        "managed_cli",
+        "install",
+        "npm_cache_gc",
+        serde_json::json!({
+            "cache": paths.cache_dir.display().to_string(),
+            "ok": output.map(|out| out.status.success()).unwrap_or(false),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+}
+
+/// One CLI: install into an unpublished generation, prove it, then swap.
+///
+/// ⚠ On a platform without symlinks the publish step cannot be atomic, so the
+/// generation layout is not used there and the install writes the shared prefix
+/// directly, as it always did. Windows does not currently build, and widening
+/// this is that platform's work, not a silent half-measure here.
+fn install_one_npm_cli(
+    paths: &ManagedCliPaths,
+    npm: &Path,
+    tool: ManagedCliTool,
+    background: bool,
+) -> Result<()> {
+    let package = tool
+        .npm_package()
+        .expect("partitioned by the caller: only npm-provisionable tools reach here");
+
+    #[cfg(unix)]
+    {
+        let slug = tool.descriptor().slug;
+        let binary = tool.binary_name();
+        let published = paths.published_generation(slug, binary);
+        let generation = published.map(|current| current + 1).unwrap_or(1);
+        let staged = paths.cli_generation_dir(slug, generation);
+
+        // The only thing that can be here is a tree an interrupted run left.
+        let _ = fs::remove_dir_all(&staged);
+        fs::create_dir_all(&staged)
+            .with_context(|| format!("creating staged prefix {}", staged.display()))?;
+
+        run_npm_install(paths, npm, &staged, package, background)?;
+
+        // ⛔ VERIFY BEFORE PUBLISHING. npm exits 0 having installed a package
+        //    whose `bin` never materialised — a broken CLI that reports success
+        //    is worse than a failure, because nothing looks at it again until a
+        //    user tries to launch it.
+        let staged_binary = staged.join("bin").join(binary);
+        if !staged_binary.exists() {
+            let _ = fs::remove_dir_all(&staged);
+            anyhow::bail!(
+                "npm installed {package} but produced no {binary} in {}",
+                staged.display()
+            );
+        }
+
+        paths.publish_cli_binary(slug, binary, generation)?;
+        paths.prune_cli_generations(slug, generation);
+        append_trace_event(
+            &paths.home,
+            "managed_cli",
+            "install",
+            "npm_cli_published",
+            serde_json::json!({
+                "tool": slug,
+                "package": package,
+                "generation": generation,
+                "replaced": published,
+            }),
+        );
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let prefix = paths.prefix.clone();
+        run_npm_install(paths, npm, &prefix, package, background)
+    }
+}
+
+/// The npm invocation itself, with the environment every managed install shares.
+fn run_npm_install(
+    paths: &ManagedCliPaths,
+    npm: &Path,
+    prefix: &Path,
+    package: &str,
+    background: bool,
+) -> Result<()> {
     let mut command = Command::new(npm);
     command
-        .env("NPM_CONFIG_PREFIX", &paths.prefix)
-        .env("npm_config_prefix", &paths.prefix)
+        .env("NPM_CONFIG_PREFIX", prefix)
+        .env("npm_config_prefix", prefix)
         .env("npm_config_cache", &paths.cache_dir)
         // ⛔ TMPDIR, not /tmp. A package's `preinstall` stages a 78 MB tarball
         //    via `os.tmpdir()` and never removes it; on the desktop host /tmp is
-        //    a tmpfs, so that leak lands in RAM. `npm_config_tmp` is set too
-        //    because npm has its own notion and they are not the same knob.
+        //    a tmpfs, so that leak lands in RAM.
+        //
+        // ⚠ `npm_config_tmp` USED TO BE SET HERE AND IS GONE, because npm now
+        //    rejects it outright: npm 11.16 answers `Unknown env config "tmp"`
+        //    and ignores it. It bought nothing and taught the next reader that
+        //    the knob still exists. `TMPDIR` is what actually moves the staging
+        //    off RAM, and it is honoured by the package scripts that do the
+        //    leaking, which are plain Node calling `os.tmpdir()`.
         .env("TMPDIR", paths.staging_dir())
-        .env("npm_config_tmp", paths.staging_dir())
         .env("npm_config_update_notifier", "false")
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
         .env("PATH", paths.env_path())
         .arg("install")
-        .arg("-g")
-        .arg("--force");
+        .arg("-g");
     if background {
         command.arg("--silent");
     }
-    for tool in npm_tools {
-        let package = tool
-            .npm_package()
-            .expect("partitioned above: only npm-provisionable tools reach here");
-        command.arg(format!("{package}@latest"));
-    }
+    // ⛔ NO `--force`. It was here to make a re-install of an already-current
+    //    tree proceed, and what it actually bought was a full rewrite of every
+    //    package plus a relink of every binary on every pass — the thing that
+    //    turned a routine no-op refresh into the destructive window. A fresh
+    //    generation directory is empty, so there is nothing left for it to force.
+    command.arg(format!("{package}@latest"));
     let output = command
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .context("running npm install for managed Codex tools")?;
+        .with_context(|| format!("running npm install for {package}"))?;
     if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            anyhow::bail!(
-                "managed Codex npm install exited with status {}",
-                output.status
-            );
-        }
-        anyhow::bail!(
-            "managed Codex npm install exited with status {}: {}",
-            output.status,
-            stderr
-        );
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        anyhow::bail!("npm install {package} exited with status {}", output.status);
+    }
+    anyhow::bail!(
+        "npm install {package} exited with status {}: {}",
+        output.status,
+        stderr
+    )
 }
 
 fn tool_status(

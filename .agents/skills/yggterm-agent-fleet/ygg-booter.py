@@ -2130,10 +2130,13 @@ def boot(host, row, dry):
       decoration. [[finding-a-deadline-shorter-than-its-release-condition]]
       One line only — a multi-line send is one Enter per line and the rest queue.
 
-    ⚠ **KNOWN HAZARD, unchanged by this fix and filed rather than fixed here:**
-      the write APPENDS to whatever is in the composer, so a half-typed draft is
-      submitted with the boot text glued onto it. The daemon knows
-      (`session_has_pending_input_draft`); the booter does not ask."""
+    ⚠ **THE APPEND HAZARD PAID OUT 2026-08-20 AND IS NOW GUARDED TWICE** — the
+      owner's half-typed sentence was submitted with the boot text spliced in.
+      The text write asks the daemon (`--refuse-if-draft`), and the Enter is
+      gated by a screen read-back that requires the composer to hold the boot
+      text alone (see `_pty_type_and_enter`). Residual window: one write
+      round-trip; the atomic close ("submit iff line equals X", a daemon verb)
+      is requested in pending-bugs."""
     if dry:
         log(f"DRY-RUN would boot {row}")
         return "dry-run"
@@ -2231,29 +2234,33 @@ def _screen_shows_a_choice(host, row):
 
     ⛔ REFUSE ON DOUBT. `None` (could not look) is treated as a refusal by the
     caller, for the same reason the never-arm ledger is: this thing types."""
+    body = _screen_text(host, row)
+    if body is None:
+        return None                      # could not look, either way
+    low = _plain_screen(body).lower()
+    return any(m in low for m in CHOICE_PROMPT_MARKERS)
+
+
+def _screen_text(host, row):
+    """One row's rendered screen text, or None if neither instrument can look.
+
+    Two instruments, one source of truth (the PTY's screen):
+    1. `server app terminal read-buffer` — the GUI arm. ⛔⛔ IT CAN VANISH, and
+       when it did the whole fleet stopped waking: a refactor collapsed two
+       per-binary `match` blocks into one and dropped the verb from the CLI
+       dispatcher; the handler and its tests stayed, so the verb looked present
+       in the source and was absent from every built binary. Measured
+       2026-08-14 — no row on the fleet was booted for an hour.
+    2. `_daemon_screen_text` — the daemon owns the PTY, so its vt100 screen is
+       the more direct source anyway and does not depend on the GUI binary's
+       verb surface. The fallback runs only when the first could not answer;
+       refusing on doubt is the caller's job and is unchanged."""
     r = _run(host, ["server", "app", "terminal", "read-buffer", row,
                     "--mode", "screen"], "")
     body = (r.stdout or "")
     if not body.strip():
-        # ⛔⛔ THE GUI-SIDE ARM CAN VANISH, AND WHEN IT DID THE WHOLE FLEET
-        #    STOPPED WAKING. `server app terminal read-buffer` was dropped from
-        #    the CLI dispatcher by a refactor that collapsed two per-binary
-        #    `match` blocks into one; the handler and its tests stayed, so the
-        #    verb looks present in the source and is absent from every built
-        #    binary. This guard then answered "could not look" on every tick,
-        #    the caller refused on doubt, and NO ROW ON THE FLEET WAS BOOTED FOR
-        #    AN HOUR. Measured 2026-08-14.
-        # ⇒ Ask the DAEMON instead. It owns the PTY, so its vt100 screen is the
-        #   more direct source for this question anyway, and it does not depend
-        #   on the GUI binary's verb surface at all.
-        # ⚠ This is a SECOND instrument, not a second source of truth: both
-        #   read the same screen, and the fallback only runs when the first
-        #   could not answer. Refusing on doubt is unchanged.
         body = _daemon_screen_text(host, row) or ""
-    if not body.strip():
-        return None                      # could not look, either way
-    low = _plain_screen(body).lower()
-    return any(m in low for m in CHOICE_PROMPT_MARKERS)
+    return body if body.strip() else None
 
 
 def _pty_type_and_enter(host, row):
@@ -2290,6 +2297,35 @@ def _pty_type_and_enter(host, row):
     if _field(typed.stdout or "", "accepted") is not True:
         return ""
     time.sleep(0.08)
+    # ⛔⛔ VERIFY BEFORE ENTER — the Enter used to be UNGUARDED, and the owner
+    # paid for it 2026-08-20: his half-typed sentence raced into the gap
+    # between the two writes (the daemon's draft flag had nothing to see at
+    # text-write time because his keystrokes were still in flight through a
+    # lagging input pipeline), and the lone `\r` submitted HIS SENTENCE with
+    # the boot text spliced into the middle. `--refuse-if-draft` cannot guard
+    # the Enter — by now the boot text itself IS the draft. So read the screen
+    # back and press Enter ONLY if the composer holds the boot text alone:
+    # the prompt marker, and nothing foreign, must be what precedes it.
+    # ⚠ The residual window is one write round-trip. The atomic form of this
+    # ("submit iff the input line equals X") needs a daemon-side verb —
+    # requested via pending-bugs; this check is the best a caller can do.
+    plain = _plain_screen(_screen_text(host, row) or "")
+    head = BOOT_TEXT[:27]                       # "continue, the booter booted"
+    idx = plain.rfind(head)
+    prefix = plain[max(0, idx - 60):idx].rstrip() if idx >= 0 else ""
+    if idx < 0 or not prefix.endswith(("❯", ">")):
+        log(f"⛔ ABORTING BOOT of {row.rsplit('/', 1)[-1][:8]} between write and "
+            f"Enter — the composer does not hold the boot text alone "
+            f"({'boot text not visible on screen' if idx < 0 else 'a foreign draft precedes it'}). "
+            f"Enter NOT sent; boot-text residue is left in the composer.")
+        target = resolve(host, row)
+        nargs = ["server", "app", "notify", "booter: aborted mid-boot",
+                 "a draft raced the booter; the composer holds boot-text residue "
+                 "to clean up — nothing was submitted", "--tone", "warning"]
+        if target:
+            nargs += ["--session", target]
+        ygg(host, *nargs)
+        return "refused-draft-race"
     enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
     return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
 
@@ -2647,7 +2683,7 @@ def tick(args):
                 s["boots"] += 1
                 via = boot(host, row, args.dry_run)
                 if via in ("refused-draft", "refused-choice-prompt",
-                           "refused-screen-unreadable"):
+                           "refused-screen-unreadable", "refused-draft-race"):
                     # ⛔ A refusal is NOT a failed boot and must not count as one.
                     # The row is idle because its owner is mid-sentence, which is
                     # the one state where booting is worse than waiting — so give
@@ -2671,7 +2707,8 @@ def tick(args):
                     s["boots"] -= 1
                     action = {"refused-draft": "SKIP:drafting",
                               "refused-choice-prompt": "SKIP:choice-prompt",
-                              "refused-screen-unreadable": "SKIP:blind"}[via]
+                              "refused-screen-unreadable": "SKIP:blind",
+                              "refused-draft-race": "SKIP:draft-race"}[via]
                     # ⛔⛔ THE MIRROR IMAGE OF THE DOUBLE-CHARGE ABOVE, AND IT IS
                     #    WORSE: a refund means `boots` never rises, so the row
                     #    can never reach MAX_BOOTS, so it can NEVER ESCALATE. A

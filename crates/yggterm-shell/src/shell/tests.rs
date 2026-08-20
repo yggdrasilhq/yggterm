@@ -24805,6 +24805,59 @@ mod tests {
         };
         assert!(!supports_generated_session_copy(&session));
     }
+    /// The GUI surface where the defect actually lived: this scan is the one
+    /// that titled the user's app rows, because its own copy of the rule
+    /// admitted anything with a local live path.
+    #[test]
+    fn supports_generated_session_copy_rejects_a_libyggterm_app_row() {
+        let session = ManagedSessionView {
+            id: "00000000-0000-4000-8000-0000000000ab".to_string(),
+            session_path: "local://00000000-0000-4000-8000-0000000000ab".to_string(),
+            title: "New Ychrome".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Queued,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Source",
+                value: "app:ychrome:new".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+            working: None,
+            input_unanswered_ms: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+        assert!(
+            !supports_generated_session_copy(&session),
+            "a live app row carries a `local://` runtime key like every other \
+             live local row — the app token is what tells them apart"
+        );
+    }
     #[test]
     fn enrich_sidebar_rows_with_live_titles_updates_document_rows() {
         let live_sessions = vec![ManagedSessionView {
@@ -50970,10 +51023,10 @@ Updated at   Branch  Conversation\n\
     }
     #[test]
     fn copy_generation_start_policy_blocks_implicit_selection_work() {
-        assert!(!copy_generation_start_allowed(false, false, false));
-        assert!(copy_generation_start_allowed(true, false, false));
-        assert!(copy_generation_start_allowed(false, true, false));
-        assert!(copy_generation_start_allowed(false, false, true));
+        assert!(!copy_generation_start_allowed(false, false, false, false));
+        assert!(copy_generation_start_allowed(true, false, false, false));
+        assert!(copy_generation_start_allowed(false, true, false, false));
+        assert!(copy_generation_start_allowed(false, false, true, false));
         assert!(env_copy_generation_enabled(Some("true")));
         assert!(env_copy_generation_enabled(Some("1")));
         assert!(!env_copy_generation_enabled(Some("false")));
