@@ -13,6 +13,17 @@
 // Every fix in this script should leave a `// XTERM-BUG: <id>` anchor that
 // points at the matching entry in docs/xterm-bugs.md.
 // ============================================================================
+/// The trace-plane emitter, shared verbatim between the shipped script and
+/// `tools/xterm-harness/trace_emitter.test.js`.
+///
+/// ⭐ It lives in its own `.js` file rather than inline in the `format!` below
+/// for one reason: an emitter whose only copy is a Rust string literal can be
+/// syntax-checked by nothing and behaviour-tested by nothing, so its ring
+/// bounds, its drop accounting and its self-suspending timer would all be
+/// assertions in a comment. The harness loads THIS file, so the code under test
+/// is the code that ships — not a transcription of it.
+const TRACE_EMITTER_JS: &str = include_str!("trace_emitter.js");
+
 fn terminal_eval_script(
     host_id: &str,
     theme: &TerminalTheme,
@@ -193,6 +204,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 terminalDioxusSend(payload);
             }}
         }};
+{trace_emitter_js}
         const recvTerminalCommand = async () => {{
             if (!terminalDioxusRecv) {{
                 return null;
@@ -11275,6 +11287,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
         }}
         "#,
+        trace_emitter_js = TRACE_EMITTER_JS,
         font_size = theme.font_size,
         background = background,
         foreground = foreground,

@@ -21,6 +21,13 @@ npm test         # node --test
 (The `HTMLCanvasElement.getContext` jsdom warning is expected and harmless — we
 assert the **buffer**, not the canvas renderer.)
 
+⭐ `trace_emitter.test.js` is the one file here that needs **no `npm install`**:
+it drives `crates/yggterm-shell/src/shell/trace_emitter.js` in a `node:vm`
+context with a fake clock, so it runs on a bare checkout with
+`node --test trace_emitter.test.js`. If the rest of the suite is red with
+`Cannot find module 'jsdom'`, that is the missing install and not a regression —
+this one still tells you the truth.
+
 ## What it guards today
 
 - normal newline output grows scrollback and retains scrolled-off lines
@@ -29,6 +36,10 @@ assert the **buffer**, not the canvas renderer.)
 - reverse-index inside a scroll region does not grow scrollback (codex open-space)
 - a painted background colour survives a column-widen reflow for written cells
   (baseline for the composer bg-split invariant)
+- the trace-plane emitter does no I/O on the hot path, bounds its ring, drops the
+  oldest, accounts for every drop on a record that got out, and schedules zero
+  wakeups while idle (`trace_emitter.test.js`, see
+  `docs/spec-trace-plane-contract.md`)
 
 ## Extending (campaign next steps)
 
