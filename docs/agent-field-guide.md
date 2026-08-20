@@ -1738,3 +1738,25 @@ fixed; the rules are shared in `scripts/ygg_scan_truth.py`.
 ⭐ **`YGGTERM_CHECK_BIN=./target/release/yggterm-headless`** points an oracle at
 your own build. Without it the scripts run `~/.local/bin/yggterm-headless` — the
 INSTALLED binary — so a lane can "verify" a fix it never actually tested.
+
+### A label test that consulted the live title store, so the same code passed on one host and failed on another
+
+`shell::tests::remote_scanned_session_label_falls_back_to_short_id_not_generic_codex_session`
+was reported failing on clean `main` from one fleet host and passed on another at
+the same commit. Neither "a lane broke it" nor "the test encodes a stale
+contract" was true.
+
+`remote_scanned_session_label` opened the real `~/.yggterm/session-titles.db`
+inline. If that store happened to hold a row for the fixture's session id, the
+saved title was returned and the fallback assertion failed — so the test's
+verdict was a property of the developer's machine.
+
+**Reproduced with a control 2026-08-20:** plant a row for the fixture id in the
+live store and the old code fails with `left: "<planted>", right: "00000000"`,
+the exact shape reported; the split version passes with the same row present.
+
+⇒ The decision logic is now `remote_scanned_session_label_with_saved_title`,
+which takes the store's answer as an ARGUMENT. The wrapper does the file read and
+nothing else. **A test that consults a live store measures the machine** — and
+this is the recurring shape here, not a one-off; see
+`[[finding-a-unit-test-that-reads-the-users-settings-store]]`.
