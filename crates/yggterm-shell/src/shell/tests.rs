@@ -17219,6 +17219,7 @@ mod tests {
                 userscripts: vec!["console.log(1)".to_string()],
                 userscripts_v2: None,
                 user_agent: None,
+                user_agent_sites: Default::default(),
             },
         );
 
@@ -17258,6 +17259,7 @@ mod tests {
                 userscripts: vec!["console.log(1)".to_string()],
                 userscripts_v2: None,
                 user_agent: None,
+                user_agent_sites: Default::default(),
             },
         );
         let SurfacePolicyGate::Ready(policy) = shell.web_surface_policy_gate("local://p") else {
@@ -17495,6 +17497,7 @@ mod tests {
                 userscripts: Vec::new(),
                 userscripts_v2: None,
                 user_agent: None,
+                user_agent_sites: Default::default(),
             },
         );
         assert_eq!(
@@ -28830,6 +28833,7 @@ mod tests {
                     "default".to_string(),
                     true,
                     1.0,
+                    None,
                     1_000,
                 ),
             );

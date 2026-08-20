@@ -3004,15 +3004,48 @@ struct WebSurfacePolicy {
     /// taking its adblock ruleset down with its userscripts.
     #[serde(default)]
     userscripts_v2: Option<Vec<WireUserscript>>,
-    /// The UA string the app's surfaces identify as. Browsing config, so the app
-    /// owns it; only the GUI can apply it (WebKit fixes the UA at webview
-    /// creation), the same shape as the ruleset. `None` = WebKitGTK's default,
-    /// whose "Safari on X11/Linux" shape names a browser that does not exist:
-    /// UA-allowlisting edges 403 it outright (claude.ai answers exactly
-    /// `{"error":{"type":"forbidden","message":"Request not allowed"}}`, while
-    /// the same request from a macOS-Safari UA is served).
+    /// The UA string the app's surfaces identify as — the app's whole-browser
+    /// decision, for a surface that has no page yet. Browsing config, so the app
+    /// owns it; only the GUI can apply it, the same shape as the ruleset.
+    /// `None` = leave WebKitGTK's own UA alone.
+    ///
+    /// ⚠ An earlier revision of this comment said the engine's own UA "names a
+    /// browser that does not exist" and was 403'd by UA-allowlisting edges. That
+    /// reading is retired: the app re-measured it (ychrome `useragent.rs`) and
+    /// made the engine's own identity the DEFAULT, because a UA that claims
+    /// macOS while `navigator.platform` says Linux is the inconsistency a
+    /// managed challenge actually scores. A site that really does gate on the
+    /// string gets ONE entry in `user_agent_sites` below.
     #[serde(default)]
     user_agent: Option<String>,
+    /// Per-site identity, host -> the UA string to send, `null` for "the
+    /// engine's own". The app resolves its own preset vocabulary away, so the
+    /// GUI never learns what a preset is — the same division as `/zoom`.
+    ///
+    /// ⛔ THIS WAS ON THE WIRE AND NOWHERE ELSE. ychrome has served it since the
+    /// per-site identity shipped; this struct had no field for it, so serde
+    /// dropped it silently and a per-site identity set in the pane was stored,
+    /// reported as applied, and never sent by a single request. Only the
+    /// headless engine plane honoured it, which is why it read as "the setting
+    /// does not stick" on the visible surface alone.
+    #[serde(default)]
+    user_agent_sites: HashMap<String, Option<String>>,
+}
+
+impl WebSurfacePolicy {
+    /// The identity for one page's host: its own entry, else its parent
+    /// domain's, else the app's whole-browser choice. `None` = the engine's own.
+    ///
+    /// ⚠ The UA is a REQUEST header, so this is applied BEFORE a surface opens
+    /// and again whenever the host on screen changes — the page already fetched
+    /// keeps the identity it was fetched with, and the next request carries the
+    /// new one.
+    fn user_agent_for_host(&self, host: &str) -> Option<String> {
+        match site_override_for_host(&self.user_agent_sites, host) {
+            Some(entry) => entry.clone(),
+            None => self.user_agent.clone(),
+        }
+    }
 }
 
 /// One entry of `userscripts_v2`: a body plus the placement the app's host read
@@ -5977,6 +6010,14 @@ struct AppliedWebSurface {
     /// reconciler re-applies whenever the desired factor (the global "Web View"
     /// zoom setting; per-site overrides land later) diverges from this.
     zoom_factor: f64,
+    /// The identity last pushed to this surface — the resolved UA string, or
+    /// `None` for the engine's own. Re-applied when the host on screen moves
+    /// into (or out of) a per-site override, exactly as the zoom is.
+    ///
+    /// ⚠ It records what was PUSHED, not what the page in front of you was
+    /// FETCHED with: a header cannot be applied retroactively. Held here so the
+    /// FFI is touched on a real change only.
+    user_agent: Option<String>,
     /// Set while the surface is STASHED (session backgrounded, webview kept
     /// alive detached from the overlay). Unstashed on reveal; destroyed when
     /// the background hold expires.
@@ -6047,6 +6088,7 @@ impl AppliedWebSurface {
         // what the view carries, because that is what a rebuild would change.
         policy_attached: bool,
         zoom_factor: f64,
+        user_agent: Option<String>,
         now_ms: u64,
     ) -> Self {
         Self {
@@ -6062,6 +6104,7 @@ impl AppliedWebSurface {
             profile,
             policy_settled: policy_attached,
             zoom_factor,
+            user_agent,
             stashed_at_ms: (!want_visible).then_some(now_ms),
             ever_revealed: want_visible,
             // A surface is created BY a navigation, so it is loading from its
@@ -6112,6 +6155,11 @@ impl AppliedWebSurface {
             // carries whatever `attach_userscripts` gave the opener's window.
             policy_settled: true,
             zoom_factor,
+            // A popup is built by WebKit inside the opener's create handler and
+            // carries the OPENER's identity. We did not choose it, so we record
+            // nothing rather than a guess — the reconciler's next pass resolves
+            // the popup's own host and pushes the right one if it differs.
+            user_agent: None,
             stashed_at_ms: None,
             ever_revealed: !background,
             loading: true,
@@ -7163,6 +7211,7 @@ mod web_surface_reclaim_locks {
             profile: "default".to_string(),
             policy_settled: true,
             zoom_factor: 1.0,
+            user_agent: None,
             stashed_at_ms,
             ever_revealed: true,
             loading: false,
@@ -12119,6 +12168,7 @@ async fn web_surface_native_reconcile_loop(
             modal_over_viewport,
             global_zoom_factor,
             zoom_overrides,
+            surface_policies,
         ): (
             Vec<WebSurfaceDesiredSurface>,
             std::collections::HashSet<String>,
@@ -12127,6 +12177,7 @@ async fn web_surface_native_reconcile_loop(
             bool,
             f64,
             HashMap<String, HashMap<String, f32>>,
+            HashMap<String, Option<Arc<WebSurfacePolicy>>>,
         ) = {
             let shell = state.peek();
             let shell_ref: &ShellState = &shell;
@@ -12232,6 +12283,24 @@ async fn web_surface_native_reconcile_loop(
                     Some((session_path.clone(), overrides))
                 })
                 .collect();
+            // The app's policy per session, for the identity refinement below.
+            // Taken from the SAME peek as everything else here: reading it a
+            // moment later could hand one surface the zoom from one instant and
+            // the identity from another, and a difference found that way is TIME,
+            // not disagreement.
+            let surface_policies: HashMap<String, Option<Arc<WebSurfacePolicy>>> = shell_ref
+                .web_surfaces
+                .keys()
+                .map(|session_path| {
+                    (
+                        session_path.clone(),
+                        shell_ref
+                            .sidebar_contributions
+                            .get(session_path)
+                            .and_then(|contribution| contribution.policy.clone()),
+                    )
+                })
+                .collect();
             (
                 desired,
                 active_visible_sessions,
@@ -12240,6 +12309,7 @@ async fn web_surface_native_reconcile_loop(
                 modal_over_viewport,
                 global_zoom_factor,
                 zoom_overrides,
+                surface_policies,
             )
         };
         // Which tab each session's page area shows, from the SAME `desired` the
@@ -12291,6 +12361,18 @@ async fn web_surface_native_reconcile_loop(
                 .and_then(|overrides| zoom_override_for_host(overrides, &host))
                 .map(|percent| (percent as f64 / 100.0).clamp(0.25, 5.0))
                 .unwrap_or(global_zoom_factor)
+        };
+        // The identity for the host on screen, from the app's own policy. `None`
+        // means "leave WebKitGTK's own UA alone", which is also what a session
+        // with no app contribution gets: a plain web page is not a browser
+        // profile and has no identity of ours to present.
+        let surface_user_agent = |session_path: &str, url: &str| -> Option<String> {
+            surface_policies
+                .get(session_path)
+                .and_then(|policy| policy.as_ref())
+                .and_then(|policy| {
+                    policy.user_agent_for_host(&web_surface_tab_host_label(url))
+                })
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -12806,6 +12888,21 @@ async fn web_surface_native_reconcile_loop(
                         desktop.set_web_surface_zoom(entry.native_id, want_zoom);
                         entry.zoom_factor = want_zoom;
                     }
+                    // The browser IDENTITY for the host now on screen, on the
+                    // same tick and for the same reason: a per-site setting the
+                    // app serves has to reach the surface the user is looking
+                    // at. ⚠ Unlike zoom this cannot repaint the current page —
+                    // the UA rode the request that fetched it. What it governs
+                    // is every request AFTER this point: subresources, XHR, and
+                    // the reload a user performs when a site refuses to render.
+                    let want_identity = surface_user_agent(&key.0, &entry.page_url);
+                    if entry.user_agent != want_identity {
+                        desktop.set_web_surface_user_agent(
+                            entry.native_id,
+                            want_identity.as_deref(),
+                        );
+                        entry.user_agent = want_identity;
+                    }
                 } else {
                     // Headless materialization (agent control plane slice 2):
                     // an agent asked for this BACKGROUNDED session's surface
@@ -12964,7 +13061,14 @@ async fn web_surface_native_reconcile_loop(
                                 .adblock_rules
                                 .as_deref()
                                 .and_then(web_surface_adblock_cache),
-                            policy.user_agent.clone(),
+                            // The identity for the host this surface is ABOUT to
+                            // open, not the browser-wide one: the UA is a request
+                            // header, so the very first request is the one a
+                            // UA-gating site scores, and applying it afterwards
+                            // would be one load too late.
+                            policy.user_agent_for_host(&web_surface_tab_host_label(
+                                &effective_url,
+                            )),
                         ),
                         _ => (Vec::new(), None, None),
                     };
@@ -13160,6 +13264,10 @@ async fn web_surface_native_reconcile_loop(
                                     // by a rebuild.
                                     matches!(policy_gate, SurfacePolicyGate::Ready(_)),
                                     open_zoom,
+                                    // The identity this webview was BUILT with,
+                                    // recorded so the refinement tick does not
+                                    // re-push what is already applied.
+                                    user_agent.clone(),
                                     current_millis(),
                                 ),
                             );
@@ -15457,6 +15565,15 @@ fn web_surface_tab_host_label(url: &str) -> String {
 /// the GUI twin of ychrome's `webzoom::zoom_for_host`; both must agree, or a
 /// zoom set in the pane would apply to a different set of pages than it names.
 fn zoom_override_for_host(overrides: &HashMap<String, f32>, host: &str) -> Option<f32> {
+    site_override_for_host(overrides, host).copied()
+}
+
+/// The longest-suffix walk itself, over ANY per-site map the app serves: zoom
+/// percentages, identities, whatever comes next. ONE matcher, because a second
+/// copy is a second place for the rule to drift — and a per-site setting that
+/// matched a different set of pages than the one it names is not a bug a user
+/// can see, only one they can suffer.
+fn site_override_for_host<'a, T>(overrides: &'a HashMap<String, T>, host: &str) -> Option<&'a T> {
     if overrides.is_empty() {
         return None;
     }
@@ -15466,8 +15583,8 @@ fn zoom_override_for_host(overrides: &HashMap<String, f32>, host: &str) -> Optio
     }
     let mut candidate = host.as_str();
     loop {
-        if let Some(percent) = overrides.get(candidate) {
-            return Some(*percent);
+        if let Some(entry) = overrides.get(candidate) {
+            return Some(entry);
         }
         match candidate.split_once('.') {
             Some((_, rest)) if rest.contains('.') => candidate = rest,
@@ -69995,6 +70112,7 @@ mod web_do_verb_tests {
                 profile: "default".to_string(),
                 policy_settled: true,
                 zoom_factor: 1.0,
+                user_agent: None,
                 // BOTH are stashed: that is the point — `stashed` cannot tell
                 // "never shown" from "shown, then backgrounded".
                 stashed_at_ms: Some(1),
@@ -70089,6 +70207,7 @@ mod web_do_verb_tests {
                 "default".to_string(),
                 true,
                 1.0,
+                None,
                 1_000,
             )
         };
@@ -70203,6 +70322,7 @@ mod web_do_verb_tests {
             "default".to_string(),
             true,
             1.0,
+            None,
             1_000,
         );
 
