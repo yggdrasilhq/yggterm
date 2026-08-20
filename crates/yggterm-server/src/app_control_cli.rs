@@ -412,6 +412,56 @@ pub fn print_server_app_help(binary: &str) {
 
 /// Dispatch one `server app <verb> …` invocation. `args` is the full argv tail
 /// beginning at `server`.
+/// The one guard a PTY adoption must pass, expressed ONCE as a shell program so
+/// the local and remote arms cannot drift apart.
+///
+/// Returns `Some(reason)` when the adoption must be refused, `None` when it may
+/// proceed. ⚠ An UNREACHABLE machine yields `None` rather than a refusal: the
+/// checks are a safety net, and being unable to run them is not evidence that
+/// the pid is unadoptable. The adoption then fails visibly at reptyr time, which
+/// is the pre-existing behaviour rather than a new way to be wrong.
+fn pty_adoption_guard_script(pid: u32) -> String {
+    format!(
+        r#"if [ ! -r /proc/{pid}/stat ]; then echo "adopt_refused: pid {pid} not found or unreadable (/proc/{pid}/stat)"; exit 0; fi
+if ! command -v reptyr >/dev/null 2>&1; then echo "adopt_refused: reptyr not found in PATH (apt install reptyr)"; exit 0; fi
+__exe=$(readlink /proc/{pid}/exe 2>/dev/null | tr 'A-Z' 'a-z')
+case "$__exe" in
+  *muse*|*claude*)
+    echo "adopt_refused: pid {pid} exe $__exe is non-dumpable (muse/claude node, PR_SET_DUMPABLE 0) - reptyr -T will be blocked (Operation not permitted) and leave a plain host shell; attach the yggterm row instead: yggterm rows are already daemon-owned (no reptyr needed), use 'server connect' / 'server app open <yggterm-path>' or 'server app terminal new' with the same cwd/purpose/history via daemon snapshot, and verify history with 'server snapshot' terminal_lines / read-buffer before claiming attach"
+    exit 0;;
+esac
+echo adopt_ok"#
+    )
+}
+
+/// Run [`pty_adoption_guard_script`] on the machine that owns `pid`.
+fn pty_adoption_refusal(pid: u32, machine_key: Option<&str>) -> Option<String> {
+    let script = pty_adoption_guard_script(pid);
+    let is_remote = machine_key.is_some_and(|key| key != "localhost" && key != "local");
+    let output = if is_remote {
+        // The machine key IS the ssh destination everywhere else on this path.
+        std::process::Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(machine_key.unwrap_or_default())
+            .arg(&script)
+            .output()
+    } else {
+        std::process::Command::new("sh").arg("-c").arg(&script).output()
+    };
+    let stdout = match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        // Unreachable machine: see the note above — not a refusal.
+        Err(_) => return None,
+    };
+    stdout
+        .lines()
+        .find(|line| line.starts_with("adopt_refused:"))
+        .map(str::to_string)
+}
+
 pub fn run_app_control_cli(
     args: &[String],
     home_dir: &std::path::Path,
@@ -1527,40 +1577,18 @@ pub fn run_app_control_cli(
                     // One-shape trap 2026-08-18: `accepted:true` + `capture_faithful:true` + `problem None`
                     // prove the host Shell was created and paints, NOT that the outer PTY's history
                     // was transplanted. Verify history via `server snapshot` `terminal_lines` / `app terminal read-buffer`.
-                    #[cfg(target_os = "linux")]
-                    if !is_remote_adopt {
-                        let stat = std::fs::read_to_string(format!("/proc/{pid_num}/stat"))
-                            .map_err(|_| anyhow::anyhow!("adopt_refused: pid {} not found or unreadable (/proc/{}/stat)", pid_num, pid_num))?;
-                        if !stat.contains(&format!(" {} ", pid_num)) && !stat.is_empty() {
-                            // stat read succeeded, pid exists
-                        }
-                        // Check reptyr availability at create time so the verb refuses with a named reason instead of leaving a blank row.
-                        if std::process::Command::new("which")
-                            .arg("reptyr")
-                            .output()
-                            .map(|o| !o.status.success())
-                            .unwrap_or(true)
-                        {
-                            anyhow::bail!("adopt_refused: reptyr not found in PATH (apt install reptyr)");
-                        }
-                        // Muse/Claude node binaries are PR_SET_DUMPABLE 0 + seccomp: ptrace is blocked
-                        // even with ptrace_scope 0, so `reptyr -T` will hang → Terminated leaving a plain
-                        // host shell (1 line `pi@…:~$`) that looks like success via `accepted`/`faithful`.
-                        // Refuse early with a named reason instead of manufacturing a plain row that the
-                        // human will rightly reject as JUST PLAIN NO HISTORY.
-                        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid_num}/exe")) {
-                            let exe_str = exe.to_string_lossy().to_lowercase();
-                            if exe_str.contains("muse") || exe_str.contains("claude") {
-                                anyhow::bail!(
-                                    "adopt_refused: pid {} exe {} is non-dumpable (muse/claude node, PR_SET_DUMPABLE 0) — reptyr -T will be blocked (Operation not permitted) and leave a plain host shell; attach the yggterm row instead: yggterm rows are already daemon-owned (no reptyr needed), use `server connect` / `server app open <yggterm-path>` or `server app terminal new` with the same cwd/purpose/history via daemon snapshot, and verify history with `server snapshot` `terminal_lines` / `read-buffer` before claiming attach (see agent-field-guide one-shape row for adopt)",
-                                    pid_num,
-                                    exe.display()
-                                );
-                            }
-                        }
-                        // Also refuse if the pid's fd 0/1 are not a PTY (plain `sleep` without pty) — reptyr -T needs a PTY leader.
-                        // Leave this as a warning in the created shell's purpose rather than a hard refusal: the host shell
-                        // is still useful as a plain terminal, but the caller must not claim it as the ether row.
+                    // ⛔ The guard runs on the machine that OWNS THE PID, local or
+                    // remote. It used to run only when `!is_remote_adopt`, on the
+                    // correct reasoning that this host's `/proc` cannot answer for
+                    // another host's pid — but the remedy was to skip the guard
+                    // rather than to ask the right machine, so a remote adopt had
+                    // NO checks at all and manufactured exactly the plain shell the
+                    // local refusal exists to prevent, while reporting a started
+                    // row. Measured 2026-08-20: `--target-pid <claude> --machine-key
+                    // <host>` returned `started live::…` with purpose "adopt outer
+                    // PTY … via reptyr -T" and produced a bare prompt.
+                    if let Some(refusal) = pty_adoption_refusal(pid_num, machine_key_early) {
+                        anyhow::bail!(refusal);
                     }
                     let title_hint = args.windows(2).find_map(|window| {
                         if window[0] == "--title" {
