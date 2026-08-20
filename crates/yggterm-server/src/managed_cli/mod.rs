@@ -2253,6 +2253,59 @@ mod tests {
         );
     }
 
+
+    /// ⛔ NO PROVISIONING STEP MAY STAGE IN `/tmp` — CHECKED FOR ALL FOUR
+    /// METHODS, NOT JUST THE ONE THAT WAS CAUGHT.
+    ///
+    /// The npm path was given a disk-backed `TMPDIR` on 2026-08-14 and the other
+    /// three were not, so `uv tool install`, the vendor `curl … | sh` and a
+    /// CLI's own updater all still staged into a tmpfs for six more days. That
+    /// is the shape this asserts against: a fix applied per-callsite, in a file
+    /// where callsites keep being added.
+    ///
+    /// ⚠ Reads the SHIPPED source rather than a comment, because the failure
+    /// mode is a new `Command::new` that simply forgets.
+    #[test]
+    fn every_provisioning_command_stages_on_disk() {
+        let source = include_str!("mod.rs");
+        // Each provisioning method, and the marker that proves it routes temp.
+        // ⛔ NEWLINE-ANCHORED. Without the leading newline each needle matches
+        //    THIS TEST'S OWN array literal first — the test module sits above
+        //    the functions it reads — and the check then asserts against a slice
+        //    of itself and fails for a reason that has nothing to do with the
+        //    code. A string-keyed search finds the FIRST match, not the intended
+        //    one; caught while writing this.
+        for (method, marker) in [
+            ("\nfn install_via_uv(", "apply_provision_env(&mut command, paths)"),
+            ("\nfn install_via_vendor_script(", "apply_provision_env(&mut run, paths)"),
+            ("\nfn update_via_self_command(", "apply_provision_env(&mut command, paths)"),
+            ("\nfn run_npm_install(", "\"TMPDIR\""),
+        ] {
+            let body = source
+                .split_once(method)
+                .unwrap_or_else(|| panic!("{method} is the owner of one provisioning method"))
+                .1;
+            let body = body.split_once("\nfn ").map(|(head, _)| head).unwrap_or(body);
+            assert!(
+                body.contains(marker),
+                "{method} does not route its temp directory to disk; on the \
+                 desktop host /tmp is a tmpfs, so its staging is RAM"
+            );
+        }
+
+        // And the helper must actually set TMPDIR, or every check above is
+        // asserting the presence of a no-op.
+        let helper = source
+            .split_once("\nfn apply_provision_env")
+            .expect("the shared provisioning environment")
+            .1;
+        let helper = helper.split_once("\nfn ").map(|(head, _)| head).unwrap_or(helper);
+        assert!(
+            helper.contains(".env(\"TMPDIR\", paths.staging_dir())"),
+            "apply_provision_env must be what puts staging on disk"
+        );
+    }
+
     /// ⛔ THE npm INVOCATION MUST NOT CARRY `--force`, AND THE REASON IS THE
     /// WHOLE POINT OF THIS MODULE'S REWRITE.
     ///
@@ -2909,18 +2962,14 @@ fn provision_detail(paths: &ManagedCliPaths, tool: ManagedCliTool) -> String {
 /// ⛔ No prefix override: uv's default tool bin dir is `~/.local/bin`, which is
 /// user-local and already on the login PATH. Forcing it under `~/.yggterm/npm`
 /// would put a Python CLI inside the npm prefix and hide it from `uv tool list`.
-fn install_via_uv(package: &str) -> Result<()> {
+fn install_via_uv(paths: &ManagedCliPaths, package: &str) -> Result<()> {
     let uv = uv_binary().context(
         "uv is required to install this CLI and is not on the login PATH — \
          install uv (https://astral.sh/uv) and the next refresh will pick it up",
     )?;
     let mut command = Command::new(uv);
-    command
-        .arg("tool")
-        .arg("install")
-        .arg("--upgrade")
-        .arg(package)
-        .env("PATH", provision_env_path());
+    command.arg("tool").arg("install").arg("--upgrade").arg(package);
+    apply_provision_env(&mut command, paths);
     run_provision_command(command, &format!("uv tool install {package}"))
 }
 
@@ -2956,17 +3005,25 @@ fn install_via_vendor_script(paths: &ManagedCliPaths, url: &str) -> Result<()> {
         .arg(VENDOR_FETCH_TIMEOUT_SECS.to_string())
         .arg("--output")
         .arg(&script)
-        .arg(url)
-        .env("PATH", provision_env_path());
+        .arg(url);
+    apply_provision_env(&mut fetch, paths);
     run_provision_command(fetch, &format!("fetching vendor installer {url}"))?;
 
     let mut run = Command::new("bash");
-    run.arg(&script).env("PATH", provision_env_path());
+    run.arg(&script);
+    // ⛔ THE ONE THAT MATTERS MOST. A vendor installer does its own `mktemp -d`
+    //    and fetches a ~157 MB tarball into it, and does not remove it on every
+    //    path. Without a disk-backed TMPDIR that lands in RAM and stays there.
+    apply_provision_env(&mut run, paths);
     run_provision_command(run, &format!("running vendor installer {url}"))
 }
 
 /// Run a CLI's own updater, e.g. `agy update`.
-fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
+fn update_via_self_command(
+    paths: &ManagedCliPaths,
+    tool: ManagedCliTool,
+    argv: &[&str],
+) -> Result<()> {
     let binary = resolve_binary_for_launch_parity(tool.binary_name()).with_context(|| {
         format!(
             "{} advertises its own updater but is not on the login PATH",
@@ -2974,7 +3031,8 @@ fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
         )
     })?;
     let mut command = Command::new(binary);
-    command.args(argv).env("PATH", provision_env_path());
+    command.args(argv);
+    apply_provision_env(&mut command, paths);
     run_provision_command(
         command,
         &format!("{} {}", tool.binary_name(), argv.join(" ")),
@@ -2985,6 +3043,28 @@ fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
 /// the login-shell dirs. An installer that shells out to `curl`, `tar` or
 /// `python` must see what a human's shell sees, or it fails on the daemon's
 /// stripped `PATH` in ways no user can reproduce.
+/// ⛔ EVERY PROVISIONING STEP STAGES ON DISK, NOT IN RAM — AND THIS IS THE ONE
+/// PLACE THAT SAYS SO.
+///
+/// `/tmp` on the desktop host is a **tmpfs**, so a payload staged there is RAM
+/// that the kernel can never drop: tmpfs pages can be swapped but not reclaimed,
+/// so stale staging becomes permanent swap occupancy. Measured 2026-08-14 at
+/// 2.85 GB of leaked npm staging plus 630 MB from a vendor installer, on a
+/// 15 GB laptop already 11 GB into swap.
+///
+/// ⚠ THE npm PATH WAS FIXED AND THE OTHER TWO WERE NOT, which is the whole
+/// reason this is a function. Found 2026-08-20: `install_via_uv` and
+/// `install_via_vendor_script` both ran with the inherited `TMPDIR`, so a
+/// `uv tool install` and — worse — a vendor `curl … | sh` that does its own
+/// `mktemp -d` and fetches a ~157 MB tarball both staged straight into RAM. A
+/// per-callsite fix is what let that survive; a shared helper is what stops the
+/// next provisioning method being added without it.
+fn apply_provision_env<'a>(command: &'a mut Command, paths: &ManagedCliPaths) -> &'a mut Command {
+    command
+        .env("PATH", provision_env_path())
+        .env("TMPDIR", paths.staging_dir())
+}
+
 fn provision_env_path() -> OsString {
     let mut parts: Vec<PathBuf> = inherited_path_dirs();
     for dir in login_shell_path_dirs() {
@@ -3320,9 +3400,9 @@ fn install_latest(
     for (tool, step) in per_tool {
         let outcome = match step {
             ProvisionStep::Npm => unreachable!("npm tools are batched above"),
-            ProvisionStep::Uv(package) => install_via_uv(package),
+            ProvisionStep::Uv(package) => install_via_uv(paths, package),
             ProvisionStep::VendorScript(url) => install_via_vendor_script(paths, url),
-            ProvisionStep::SelfUpdate(argv) => update_via_self_command(tool, argv),
+            ProvisionStep::SelfUpdate(argv) => update_via_self_command(paths, tool, argv),
         };
         if let Err(error) = outcome {
             failures.push(format!("{}: {error}", tool.display_name()));
@@ -3397,11 +3477,89 @@ fn install_npm_isolated(
         }
     }
 
+    // ⛔ Bounded, not emptied — see `gc_npm_cache_if_due`. Runs after the
+    //    installs so a due collection never delays the binaries themselves.
+    gc_npm_cache_if_due(paths, &npm);
+
     if failures.is_empty() {
         Ok(())
     } else {
         anyhow::bail!("{}", failures.join("; "))
     }
+}
+
+
+/// How often the shared npm cache is garbage-collected.
+///
+/// ⛔ THE CACHE IS THE LARGEST SINGLE CONSUMER OF `~/.yggterm` ON EVERY FLEET
+/// HOST and nothing had ever removed anything from it: measured 2026-08-14 at
+/// 7.6 GB of a 9.5 GB tree on one host and 5.7 GB of 7.8 GB on another, with
+/// content dating back five months.
+///
+/// ⭐ The fix is a RETENTION RULE, NOT A DELETE. The cache exists so that
+/// provisioning is not a fresh download every time; emptying it on a timer
+/// trades disk for network on the one path that has to be fast. `npm cache
+/// verify` is npm's own garbage collector — it keeps everything the index
+/// references and drops orphaned content — so it bounds the store without
+/// costing a re-download of anything still in use.
+///
+/// ⚠ MEASURED 2026-08-20 on the build host: 9,322 MB → 7,669 MB, **1.65 GB
+/// reclaimed in 61 s**. And npm's own report cannot be quoted for that number —
+/// it said *"Content garbage-collected: 1306 (9,172,360,910 bytes)"*, i.e. 9.17 GB,
+/// which over-states the disk actually returned by **5.5×**, because `_cacache`
+/// deduplicates by content hash and the figure counts index entries rather than
+/// unique bytes. Quote `du`, never npm's summary line.
+const NPM_CACHE_GC_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Garbage-collect the shared npm cache, at most once per
+/// [`NPM_CACHE_GC_INTERVAL`].
+///
+/// The interval is carried by the mtime of a marker file inside the cache
+/// rather than by a new field in the refresh state: the question "when was this
+/// cache last collected" belongs to the cache, and a second store that could
+/// disagree with it is the duplicate this project's SSOT law forbids.
+///
+/// Best-effort throughout — a cache that cannot be collected is untidy, never a
+/// failed provisioning pass.
+fn gc_npm_cache_if_due(paths: &ManagedCliPaths, npm: &Path) {
+    let marker = paths.cache_dir.join(".ygg-last-gc");
+    let due = match fs::metadata(&marker).and_then(|meta| meta.modified()) {
+        Ok(last) => last
+            .elapsed()
+            .map(|since| since >= NPM_CACHE_GC_INTERVAL)
+            .unwrap_or(true),
+        // No marker yet: this host has never collected, so it is due.
+        Err(_) => true,
+    };
+    if !due {
+        return;
+    }
+    // Written BEFORE the run, not after. The collection is slow (61 s on a 9 GB
+    // cache) and may be killed; a marker written only on success would make
+    // every interrupted pass retry it immediately, which is how a weekly chore
+    // becomes a hot loop.
+    let _ = fs::write(&marker, b"");
+
+    let started = std::time::Instant::now();
+    let output = Command::new(npm)
+        .env("npm_config_cache", &paths.cache_dir)
+        .env("npm_config_update_notifier", "false")
+        .arg("cache")
+        .arg("verify")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    append_trace_event(
+        &paths.home,
+        "managed_cli",
+        "install",
+        "npm_cache_gc",
+        serde_json::json!({
+            "cache": paths.cache_dir.display().to_string(),
+            "ok": output.map(|out| out.status.success()).unwrap_or(false),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
 }
 
 /// One CLI: install into an unpublished generation, prove it, then swap.
