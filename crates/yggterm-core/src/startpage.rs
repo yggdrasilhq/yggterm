@@ -76,6 +76,24 @@ pub struct StartpageDurableRow {
     pub display_path: String,
 }
 
+/// Whether this CLI is scanned by a hand-written scanner instead of the generic
+/// glob walk.
+///
+/// ⛔ SINGLE OWNER of that question. `scan_all_durable_sessions` dispatches on
+/// it and the `server <area> ls` warnings consult it, so a CLI cannot be scanned
+/// and simultaneously reported as invisible. It could, until 2026-08-20:
+/// OpenCode and Kimi have empty `session_store_globs` (their stores are one
+/// SQLite DB and an md5-bucketed tree, neither of which a glob can express), so
+/// all three `ls` verbs printed "has no store globs and no declared gap —
+/// sessions will be invisible" on every run while `scan_opencode_sessions` and
+/// `scan_kimi_sessions` were reading them perfectly well.
+pub fn kind_has_dedicated_scanner(kind: crate::SessionKind) -> bool {
+    matches!(
+        kind,
+        crate::SessionKind::OpenCode | crate::SessionKind::Kimi | crate::SessionKind::Antigravity
+    )
+}
+
 /// Walk every registered agent CLI's store globs under `home` and return
 /// one entry per readable session file, using the descriptor's own
 /// `read_store_entry` so title/cwd semantics stay single-sourced.
@@ -83,6 +101,12 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
     let mut out = Vec::new();
     let mut seen_paths = HashSet::<PathBuf>::new();
     for descriptor in AGENT_CLIS {
+        debug_assert!(
+            !descriptor.session_store_globs.is_empty()
+                || kind_has_dedicated_scanner(descriptor.kind)
+                || descriptor.store_scan_gap.is_some(),
+            "a CLI with no globs must have a dedicated scanner or a declared gap",
+        );
         if descriptor.kind == crate::SessionKind::OpenCode {
             scan_opencode_sessions(home, &mut out);
             continue;
@@ -323,21 +347,126 @@ fn scan_kimi_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>, seen: &mu
     }
 }
 
+/// Parse Antigravity's per-row `last_modified_time` into epoch milliseconds.
+///
+/// The column is a Go `datetime` rendered with a SPACE between date and time
+/// (`2026-08-12 08:41:02.868930001+00:00`), which is ISO-8601 but not RFC-3339,
+/// so it needs the separator swapped before `time` will accept it. Rows that
+/// were never written carry `0001-01-01 00:00:00+00:00`; those clamp to 0
+/// rather than becoming a large negative epoch.
+pub fn parse_antigravity_last_modified_ms(raw: &str) -> Option<u128> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Only the FIRST space is the date/time separator; an offset never contains one.
+    let rfc3339 = match trimmed.find(' ') {
+        Some(ix) => format!("{}T{}", &trimmed[..ix], &trimmed[ix + 1..]),
+        None => trimmed.to_string(),
+    };
+    let parsed = time::OffsetDateTime::parse(
+        &rfc3339,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    let nanos = parsed.unix_timestamp_nanos();
+    if nanos <= 0 {
+        return Some(0);
+    }
+    Some((nanos / 1_000_000) as u128)
+}
+
+/// Whether one `conversation_summaries` row is a resumable agy CLI session.
+///
+/// ⛔ Do NOT reach for the columns that look built for this — MEASURED
+/// 2026-08-20 on a 999-row store, `source`, `status`, `agent_name`,
+/// `nesting_depth`, `parent_conversation_id`, `battle_id`, `not_fully_idle`
+/// and `last_user_input_step_index` were uniformly empty/default, and `killed`
+/// was 0 for every single row, which makes the scan's `WHERE killed=0` filter
+/// a no-op rather than the guard it reads as. The only columns carrying signal
+/// are `step_count` and `workspace_uris`.
+///
+/// The three classes that store held:
+///   * 499 rows — a real repo root PLUS an ephemeral `/tmp` scratch dir, all
+///     from one batch burst (`step_count` 6, previews like "Transcribe Video
+///     File Content"). A tool invocation, not a session someone resumes.
+///   * 494 rows — `/tmp`-only workspaces. These are what became the "/tmp
+///     forest" of one-session cwd-tree groups.
+///   * 6 rows — real roots only. 4 of them have content; 2 are empty shells.
+///
+/// So: a conversation is durable when it has at least one workspace root, none
+/// of its roots is ephemeral scratch, and it actually holds steps.
+pub fn antigravity_row_is_durable(workspace_uris: &str, step_count: i64) -> bool {
+    if step_count <= 0 {
+        return false;
+    }
+    let roots = crate::antigravity_workspace_paths(workspace_uris);
+    if roots.is_empty() {
+        return false;
+    }
+    !roots.iter().any(|root| crate::path_is_ephemeral_scratch(root))
+}
+
+/// The conversation ids the summaries DB says are resumable sessions.
+///
+/// Returns `None` when there is no readable DB, which is the signal to leave
+/// the file walk ungated rather than silently show nothing.
+fn antigravity_durable_ids(db_path: &Path) -> Option<HashSet<String>> {
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT conversation_id, workspace_uris, step_count FROM conversation_summaries")
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let uris: String = row.get(1).unwrap_or_default();
+            let steps: i64 = row.get(2).unwrap_or_default();
+            Ok((id, uris, steps))
+        })
+        .ok()?;
+    Some(
+        rows.flatten()
+            .filter(|(id, uris, steps)| !id.trim().is_empty() && antigravity_row_is_durable(uris, *steps))
+            .map(|(id, _, _)| id)
+            .collect(),
+    )
+}
+
 fn scan_antigravity_sessions(
     home: &Path,
     out: &mut Vec<StartpageDurableRow>,
     seen: &mut HashSet<PathBuf>,
 ) {
     let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::Antigravity);
+    let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    // The DB is the INDEX of conversations; a brain transcript is only storage.
+    // So the durable verdict is taken once, from the DB, and gates BOTH the file
+    // walk and the DB rows. Without this the two paths disagree: a batch
+    // conversation filtered out of the DB half would walk straight back in
+    // through its transcript file.
+    let durable_ids = antigravity_durable_ids(&db_path);
     if let Some(desc) = descriptor {
+        let mut walked = Vec::new();
         for root in desc.store_roots_absolute(home) {
             if root.exists() {
-                walk_and_collect(desc, &root, out, seen);
+                walk_and_collect(desc, &root, &mut walked, seen);
             }
         }
+        if let Some(ids) = durable_ids.as_ref() {
+            walked.retain(|row| ids.contains(&row.session_id));
+        }
+        out.append(&mut walked);
     }
 
-    let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
     if !db_path.exists() {
         return;
     }
@@ -349,8 +478,12 @@ fn scan_antigravity_sessions(
     ) else {
         return;
     };
+    // ⛔ `WHERE killed=0` used to stand here as the guard. It filters nothing:
+    // every row in a measured 999-row store had killed=0. The real filter is
+    // `antigravity_row_is_durable` below.
     let Ok(mut stmt) = conn.prepare(
-        "SELECT conversation_id, title, preview, workspace_uris, last_modified_time FROM conversation_summaries WHERE killed=0",
+        "SELECT conversation_id, title, preview, workspace_uris, last_modified_time, step_count \
+         FROM conversation_summaries WHERE killed=0",
     ) else {
         return;
     };
@@ -360,12 +493,17 @@ fn scan_antigravity_sessions(
         let preview: String = row.get(2).unwrap_or_default();
         let uris: String = row.get(3).unwrap_or_default();
         let raw_mod: String = row.get(4).unwrap_or_default();
-        Ok((id, title, preview, uris, raw_mod))
+        let steps: i64 = row.get(5).unwrap_or_default();
+        Ok((id, title, preview, uris, raw_mod, steps))
     }) else {
         return;
     };
     let mut existing_ids: HashSet<String> = out.iter().map(|r| r.session_id.clone()).collect();
-    let epoch_ms = std::fs::metadata(&db_path)
+    // ⛔ The DB FILE's mtime used to be stamped on every row, giving all of them
+    // one shared fake recency that moved whenever agy touched the store. Each
+    // row carries its own `last_modified_time`; use it, and fall back to the
+    // file mtime only when a row's own timestamp will not parse.
+    let db_file_epoch_ms = std::fs::metadata(&db_path)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -373,10 +511,15 @@ fn scan_antigravity_sessions(
         .unwrap_or(0);
 
     for row in rows.flatten() {
-        let (session_id, raw_title, raw_preview, uris, _raw_mod) = row;
+        let (session_id, raw_title, raw_preview, uris, raw_mod, step_count) = row;
         if session_id.trim().is_empty() || existing_ids.contains(&session_id) {
             continue;
         }
+        if !antigravity_row_is_durable(&uris, step_count) {
+            continue;
+        }
+        let epoch_ms =
+            parse_antigravity_last_modified_ms(&raw_mod).unwrap_or(db_file_epoch_ms);
         existing_ids.insert(session_id.clone());
         let cwd = crate::parse_antigravity_workspace_uris(&uris)
             .unwrap_or_else(|| home.display().to_string());
@@ -614,4 +757,158 @@ pub fn order_candidates_for_startpage(
             .then_with(|| left.5.cmp(&right.5))
     });
     candidates.into_iter().map(|(row, ..)| row).collect()
+}
+
+#[cfg(test)]
+mod scan_truth_tests {
+    use super::*;
+
+    fn summaries_db(dir: &Path, rows: &[(&str, &str, i64)]) -> PathBuf {
+        let agy = dir.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&agy).unwrap();
+        let db = agy.join("conversation_summaries.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id text, title text NOT NULL DEFAULT '', \
+             preview text NOT NULL DEFAULT '', step_count integer NOT NULL DEFAULT 0, \
+             last_modified_time datetime NOT NULL, workspace_uris text NOT NULL, \
+             killed numeric NOT NULL DEFAULT 0, PRIMARY KEY (conversation_id))",
+            [],
+        )
+        .unwrap();
+        for (id, uris, steps) in rows {
+            conn.execute(
+                "INSERT INTO conversation_summaries \
+                 (conversation_id, title, preview, step_count, last_modified_time, workspace_uris, killed) \
+                 VALUES (?1, '', 'p', ?2, '2026-08-12 08:41:02.868930001+00:00', ?3, 0)",
+                rusqlite::params![id, steps, uris],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    // The three shapes a real 999-row store held. A batch conversation is told
+    // from a session by its workspace, never by `killed` — every row was
+    // killed=0, so the `WHERE killed=0` filter decided nothing.
+    #[test]
+    fn a_batch_conversation_is_not_a_durable_session() {
+        // /tmp-only: the "/tmp forest" of one-session cwd-tree groups.
+        assert!(!antigravity_row_is_durable(
+            r#"["file:///tmp/claude-999/scratchpad/vn_abc"]"#,
+            6
+        ));
+        // A real root with an ephemeral scratch dir beside it — the batch signature.
+        assert!(!antigravity_row_is_durable(
+            r#"["file:///home/user/proj/sample","file:///tmp/tmpq1w2e3"]"#,
+            6
+        ));
+        // Started but never stepped: an empty shell, not a session.
+        assert!(!antigravity_row_is_durable(r#"["file:///home/user/proj/sample"]"#, 0));
+        // No workspace at all.
+        assert!(!antigravity_row_is_durable("[]", 12));
+        assert!(!antigravity_row_is_durable("not json", 12));
+        // A real interactive session survives all of it.
+        assert!(antigravity_row_is_durable(r#"["file:///home/user/proj/sample"]"#, 14));
+    }
+
+    // ⚠ Two batch conversations in the measured store still had LIVE /tmp dirs,
+    // so "does the directory still exist" kept them. The rule is on the PATH,
+    // which also keeps the scan deterministic as /tmp is reaped.
+    #[test]
+    fn the_scratch_rule_reads_the_path_not_the_filesystem() {
+        let live = std::env::temp_dir().join("ygg_scan_truth_live_probe");
+        std::fs::create_dir_all(&live).unwrap();
+        assert!(crate::path_is_ephemeral_scratch(live.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&live);
+        assert!(crate::path_is_ephemeral_scratch("/tmp"));
+        assert!(!crate::path_is_ephemeral_scratch("/tmpfoo/proj"));
+        assert!(!crate::path_is_ephemeral_scratch("/home/user/tmp/proj"));
+    }
+
+    // Every row used to be stamped with the DB FILE's mtime — one shared fake
+    // recency for the whole store, which moved every time agy touched it.
+    #[test]
+    fn each_row_keeps_its_own_recency() {
+        let a = parse_antigravity_last_modified_ms("2026-08-12 08:41:02.868930001+00:00").unwrap();
+        let b = parse_antigravity_last_modified_ms("2026-08-16 16:19:03.388933001+00:00").unwrap();
+        assert!(a < b, "distinct timestamps must stay distinct: {a} vs {b}");
+        assert_eq!(a, 1786524062868);
+        // A never-written row clamps to 0 rather than a huge negative epoch.
+        assert_eq!(parse_antigravity_last_modified_ms("0001-01-01 00:00:00+00:00"), Some(0));
+        assert_eq!(parse_antigravity_last_modified_ms(""), None);
+        assert_eq!(parse_antigravity_last_modified_ms("nonsense"), None);
+    }
+
+    #[test]
+    fn the_scan_keeps_only_real_agy_sessions_and_dates_them_apart() {
+        let tmp = std::env::temp_dir().join(format!("ygg_scan_truth_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        summaries_db(
+            &tmp,
+            &[
+                ("keep-me", r#"["file:///home/user/proj/sample"]"#, 14),
+                ("batch-tmp-only", r#"["file:///tmp/tmpaaaa"]"#, 6),
+                ("batch-mixed", r#"["file:///home/user/proj/sample","file:///tmp/tmpbbbb"]"#, 6),
+                ("empty-shell", r#"["file:///home/user/proj/sample"]"#, 0),
+            ],
+        );
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        scan_antigravity_sessions(&tmp, &mut out, &mut seen);
+        let ids: Vec<&str> = out.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["keep-me"], "only the real session survives, got {ids:?}");
+        assert_eq!(out[0].modified_epoch_ms, 1786524062868, "row recency, not DB file mtime");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ⛔ THE HIGHEST-STAKES PROPERTY IN THIS FILE. Scanning classifies; it must
+    // never remove. An agent once mass-deleted real transcripts while "clearing
+    // noise", and the muse index is exactly the sort of signal that would drive
+    // it: four sessions on this host carry prompt_count=0 with 12 KB of real
+    // lifecycle records on disk. Skipping them is right; deleting them is not.
+    #[test]
+    fn scanning_never_removes_a_session_file() {
+        let tmp = std::env::temp_dir().join(format!("ygg_scan_ro_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sessions = tmp.join(".codex/sessions/2026/08/20");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let empty = sessions.join("rollout-empty.jsonl");
+        std::fs::write(&empty, b"").unwrap();
+        let real = sessions.join("rollout-real.jsonl");
+        std::fs::write(&real, b"{\"payload\":{\"cwd\":\"/home/user/proj\"}}\n").unwrap();
+        // A muse session the index calls noise, with a non-empty file behind it.
+        let muse = tmp.join(".local/share/muse/sessions/2026/08/20/aaaa");
+        std::fs::create_dir_all(&muse).unwrap();
+        let muse_file = muse.join("session.jsonl");
+        std::fs::write(&muse_file, b"{\"schema_version\":1}\n").unwrap();
+
+        assert!(is_noise_session_file(&empty), "an empty file is noise");
+        let _ = scan_all_durable_sessions(&tmp);
+
+        for path in [&empty, &real, &muse_file] {
+            assert!(path.exists(), "scanning deleted {}", path.display());
+        }
+        assert_eq!(std::fs::read(&muse_file).unwrap(), b"{\"schema_version\":1}\n");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A CLI cannot be scanned and simultaneously warned about as invisible.
+    #[test]
+    fn a_scanned_cli_is_never_reported_invisible() {
+        for desc in crate::agent_cli::AGENT_CLIS {
+            let invisible = desc.session_store_globs.is_empty()
+                && desc.store_scan_gap.is_none()
+                && !kind_has_dedicated_scanner(desc.kind);
+            assert!(
+                !invisible,
+                "{:?} has no globs, no dedicated scanner and no declared gap",
+                desc.kind
+            );
+        }
+        assert!(kind_has_dedicated_scanner(crate::SessionKind::OpenCode));
+        assert!(kind_has_dedicated_scanner(crate::SessionKind::Kimi));
+        assert!(!kind_has_dedicated_scanner(crate::SessionKind::Codex));
+    }
 }

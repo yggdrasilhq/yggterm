@@ -20,12 +20,32 @@ struct TitlesLsOutput {
     home: String,
     durable_count: usize,
     live_count: usize,
+    /// The `--limit` in force for this reply (default 200).
+    limit: usize,
+    /// True when `rows` carries FEWER rows than `durable_count` reports, so no
+    /// reader can mistake a truncated page for the whole store.
+    truncated: bool,
     rows: Vec<StartpageDurableRow>,
     live_session_paths: Vec<String>,
     warnings: Vec<String>,
 }
 
 pub fn run_server_titles_ls(store: &yggterm_core::SessionStore, args: &[String]) -> anyhow::Result<()> {
+    // ⛔ `--help` must answer BEFORE the scan. It used to fall through to the
+    // verb, so asking a 1700-session store how to call it ran a full walk and
+    // printed the sessions — the one output that cannot be mistaken for help.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("server titles ls — lists the title each durable session resolves to, and where it came from");
+        println!();
+        println!("USAGE: server titles ls [--json] [--limit N]");
+        println!("  --json       machine-readable output");
+        println!("  --limit N    cap the rows/groups printed (default 200)");
+        println!("  --help, -h   print this and exit without scanning");
+        println!();
+        println!("The reply carries `limit` and `truncated` so a capped page is");
+        println!("never mistaken for the whole store. Oracles: scripts/check-titles.py");
+        return Ok(());
+    }
     let json = args.iter().any(|a| a == "--json");
     let limit = args
         .iter()
@@ -67,6 +87,8 @@ pub fn run_server_titles_ls(store: &yggterm_core::SessionStore, args: &[String])
         host,
         home: system_home.display().to_string(),
         durable_count: total,
+        limit,
+        truncated: rows.len() < total,
         live_count,
         rows,
         live_session_paths,
@@ -78,6 +100,9 @@ pub fn run_server_titles_ls(store: &yggterm_core::SessionStore, args: &[String])
     } else {
         println!("titles ls — host {}  home {}", output.host, output.home);
         println!("durable {}  live {}", output.durable_count, output.live_count);
+        if output.truncated {
+            println!("note: showing {} of {} rows (--limit {})", output.rows.len(), output.durable_count, output.limit);
+        }
         if !output.warnings.is_empty() {
             for w in &output.warnings {
                 println!("warn: {w}");
@@ -108,9 +133,15 @@ fn collect_warnings(home: &PathBuf, rows: &[StartpageDurableRow]) -> Vec<String>
         if let Some(gap) = desc.store_scan_gap {
             warnings.push(format!("{} store not scanned: {}", desc.display_name, gap));
         }
-        if desc.session_store_globs.is_empty() && desc.store_scan_gap.is_none() {
+        // A CLI whose store no glob can express (one SQLite DB, an md5-bucketed
+        // tree) is scanned by a dedicated scanner, not missing. Asking only about
+        // globs reported OpenCode and Kimi as invisible on every single run.
+        if desc.session_store_globs.is_empty()
+            && desc.store_scan_gap.is_none()
+            && !yggterm_core::startpage::kind_has_dedicated_scanner(desc.kind)
+        {
             warnings.push(format!(
-                "{} has no store globs and no declared gap — sessions will be invisible",
+                "{} has no store globs, no dedicated scanner and no declared gap — sessions will be invisible",
                 desc.display_name
             ));
         }

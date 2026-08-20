@@ -71,7 +71,10 @@ CLI_STORES = [
     },
     {
         "slug": "antigravity",
-        "globs": [".gemini/antigravity-cli/conversations/*.db", ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"],
+        # ⛔ agy rows come from the summaries DB (see `agy_durable_rows` below),
+        # not from a glob: `conversations/*.db` holds a single .pb and the brain
+        # transcripts are `transcript_full.jsonl`, so the old globs matched nothing.
+        "globs": [],
         "exclude": ["-shm", "-wal"],
         "kind": "antigravity",
     },
@@ -84,6 +87,13 @@ CLI_STORES = [
 ]
 
 # Hosts to check — local + fleet from yggterm's ssh targets or env.
+
+# ⛔ The durable-session RULES live in one shared module (the store tables above
+# stay per-script on purpose: the oracle must not import the Rust descriptors).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ygg_scan_truth import agy_durable_rows, muse_noise_ids  # noqa: E402
+
+
 def fleet_hosts():
     hosts = ["local"]
     # Try to discover from yggterm server daemons census
@@ -126,7 +136,13 @@ def run_on_host(host, cmd, timeout=45):
         return "", str(e)
 
 def verb_on_host(host):
-    cmd = "~/.local/bin/yggterm-headless server titles ls --json --limit 10000 2>&1 || yggterm-headless server titles ls --json --limit 10000 2>&1 || yggterm server titles ls --json --limit 10000 2>&1"
+    # A lane can point the oracle at its own build before deploying:
+    #   YGGTERM_CHECK_BIN=./target/release/yggterm-headless check-titles.py --host local
+    override = os.environ.get("YGGTERM_CHECK_BIN")
+    if override:
+        cmd = f"{override} server titles ls --json --limit 10000 2>&1"
+    else:
+        cmd = "~/.local/bin/yggterm-headless server titles ls --json --limit 10000 2>&1 || yggterm-headless server titles ls --json --limit 10000 2>&1 || yggterm server titles ls --json --limit 10000 2>&1"
     out, err = run_on_host(host, cmd)
     if err:
         return None, err, out
@@ -190,6 +206,31 @@ def manual_walk_on_host(host):
                     "mtime": mtime,
                     "parsed": parsed,
                 })
+
+    # ⛔ Antigravity keeps its index in SQLite, so a FILE walk sees none of it.
+    # Without this the oracle called every agy row the verb produced a spurious
+    # "extra" — 999 of them on a measured host — while being blind to the CLI.
+    for row in agy_durable_rows(run_on_host, host, home):
+        sessions.append({
+            "host": host,
+            "cli": "antigravity",
+            "kind": "antigravity",
+            "path": f"{home}/.gemini/antigravity-cli/conversation_summaries.db",
+            "mtime": 0,
+            "parsed": {"session_id": row["id"], "cwd": row["cwd"], "title": row["title"]},
+        })
+
+    # A zero-prompt muse placeholder is skipped by the scan, so the oracle must
+    # skip it too. ⚠ These have real files behind them; this set is for skipping,
+    # never for deleting.
+    noise = muse_noise_ids(run_on_host, host)
+    if noise:
+        sessions = [
+            s for s in sessions
+            if not (s.get("cli") == "muse"
+                    and (s.get("parsed", {}) or {}).get("session_id") in noise)
+        ]
+
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions, None
 
