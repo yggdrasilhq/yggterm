@@ -1842,3 +1842,28 @@ this is the recurring shape here, not a one-off; see
   apart; `scripts/corner-contract.sh` is the instrument that answers in pixels.
 - Sampling a compositor grab at (0,0) reads the compositor's own titlebar and reports square
   on a perfectly rounded window — sample inside the window's own geometry.
+
+## `run_app_control_focus_window` answers "was the request delivered", not "did a window take focus"
+
+It returns `Ok(())` whenever the round trip completes, and never reads
+`response.error`. So a reply whose own text is *"app-control focus request did
+not produce native window focus"* is an `Ok`.
+
+⛔ **`focus(...).is_ok()` therefore means the message arrived.** The GUI's
+startup handoff read it as "a window is up", exited on the strength of it, and
+on 2026-08-20 a deploy that retires the incumbent first left the desktop with no
+window at all for about twelve minutes.
+
+⇒ Use `app_control_focus_window_took_focus`, which reads the response. The same
+shape is worth suspecting in every other `run_app_control_*` verb: they all
+`write_stdout_payload(&response)` and return `Ok(())`, so **none of them fails
+when the operation fails** — they fail when the *transport* fails. A caller that
+needs the outcome has to read the payload.
+
+⚠ And the companion trap in the same incident: the handoff chose its target by
+executable path and recency, while a **shadow view runs the identical
+executable**. The `client_role` rule that forbids exactly this already existed
+and was already enforced for app-control routing; the question "is this the
+user's window" had simply been encoded twice. `ClientInstanceRecord::is_active_gui`
+is now the one owner. **When an instrument and a rule disagree, look for the
+second copy of the rule before doubting the instrument.**

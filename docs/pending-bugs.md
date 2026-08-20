@@ -182,41 +182,6 @@ gate-screen working/idle heuristics) must learn the agents-hint signature (dim c
 `← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
 typed-residue detector must require the footer's absence before claiming residue.
 
-## ⛔⛔ [11.8] `server app launch` CANNOT BRING UP A PRIMARY GUI WHILE A SHADOW IS REGISTERED — AND A DEPLOY LEFT THE DESKTOP WITH NO GUI FOR ~12 MINUTES
-
-**Status:** OPEN
-
-*Hit live on 2026-08-20 during the 3.1.11 deploy.* `scripts/deploy-dev.sh` ends with
-`server app launch --replace`, which correctly retired the incumbent primary — and then every
-replacement it spawned **exited immediately**, leaving the desktop with no GUI at all. Only an
-agent's shadow view remained registered, and `server app update restart` refused with *"the only
-registered Yggterm GUI client is a Shadow view client, which cannot own sessions"*.
-
-**Mechanism.** `server app launch` spawns the GUI binary with **no arguments**. A bare `yggterm`
-finds a registered client and forwards a focus request to it instead of opening a window; the
-request is handled by the shadow, fails (`app-control focus request did not produce native window
-focus`), and the process exits. So the incumbent guard is evaluated in the DAEMON while the
-single-instance decision is taken in the spawned PROCESS, and `--replace` / `--allow-duplicate`
-are consumed by the first and never reach the second. `--allow-duplicate` therefore did not help.
-
-⚠ **Two things make this worse than a flag bug.** (1) The spawned process writes its focus-request
-JSON into the launch log, so `log_path` looks like a launch record and contains no failure — the
-launch reports `registered:false, settled:false` and the log explains nothing. (2) A shadow satisfies
-the single-instance check but cannot own sessions, so the state it produces is one no verb can
-resolve: too many clients to start, none that can act.
-
-**Recovery used:** SIGTERM the shadow (and its private compositor), then `server app launch
---wait-visible` — which came up `registered:true, visible:true` on the desktop's own
-`wayland-0`, at the deployed build, with the row set intact. ⚠ That cost the shadow of the agent
-row that owned it, which has to respawn its own view.
-
-**Fix direction:** pass the duplicate override through to the spawned process (an argument or an
-env the GUI reads before deciding to forward); make the single-instance forward **refuse to target
-a shadow** — a shadow is never the thing a focus request means; and stop writing an unrelated
-app-control response into a file named for a launch. **Falsifier:** with only a shadow registered,
-one `server app launch` brings up a primary that registers and paints, and the launch log names the
-reason if it does not.
-
 ## ⚠ [11.0] THE ROW CLI DEMANDS RITUAL THE DEFAULTS SHOULD OWN — the papercut backlog
 
 **Status:** OPEN
