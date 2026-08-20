@@ -1535,6 +1535,32 @@ handoff is a cycle, not an ending:
       cells are invitations, not blanks to assume across: measure with a
       cheap non-interactive run and write the answer back here (§11's
       written-to-GROW rule).
+
+   ### ⛔⛔ THE LANE LIFECYCLE — a report is not an ending, and idle-after-report is the SPAWNER'S debt
+   Owner-observed 2026-08-20: finished lanes sat as idle rows being nagged by
+   the booter, and he could not tell design from mistake. The contract, all
+   three steps mandatory:
+   1. A lane's turn NEVER ends silently: it ends with more work self-queued,
+      or with ONE batched DONE report delivered to its spawner. The booter is
+      the LAST line, never the return path — every booter kick means this
+      contract failed somewhere.
+   2. ⭐ **A big report or brief is PARKED AS A FILE + a short pointer message.**
+      Measured twice: a ~5KB multi-line `--stdin` submit answered
+      `submitted:true` in 245ms and delivered NOTHING to a busy row; a short
+      pointer to a file on disk landed first try. Park under
+      `~/.yggterm/relay/`, name the sender and receiver in the filename.
+   3. The SPAWNER reviews, harvests (merge + verify), and then DESPAWNS the
+      reported lane. An idle lane that has reported is the spawner's debt,
+      not the lane's; a lane with follow-on work proposes it IN the report
+      and continues only on the spawner's confirmation.
+   ⛔ **Cross-orchestrator spawns:** a spawn on another orchestrator's behalf
+   takes its seat FROM that orchestrator (or spawns unseated and reports the
+   row path for seating). A number NEVER enters a title. And know the
+   identity trap: **a row's uuid is not always the CLI session's id** — a
+   uuid-keyed transcript/process check can read a LIVE working delegate as a
+   husk (it did, and a live worker's row was removed on that misread). The
+   spawner is the authority on its delegate's real identity; ask it before
+   declaring any delegate dead.
    And (f) ⛔ **ANY UNSENT OWNER DRAFT — a handover must lose no typed text**
    (owner design 2026-08-20: *"my prompt must be handed over to the next
    spawnee too, so there is no data loss"*). Check `~/.yggterm/relay/drafts/
