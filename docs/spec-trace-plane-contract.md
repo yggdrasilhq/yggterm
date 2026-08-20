@@ -294,7 +294,16 @@ it, and the bound was still 6500 spans in 42 minutes.
 
 ⇒ **"Bounded" is not the test. Measure the share.** After adding a probe, read
 what fraction of the plane it became; the answer is routinely an order of
-magnitude off the estimate. The repair is the boundary trick above: keep every
+magnitude off the estimate.
+
+⛔ **And filter that measurement on `pid`.** Several GUI generations write into
+one trace home during a deploy, so a census over the file pools processes
+running different builds — which is the one population you must not pool when
+asking "did my change reduce this". The rationing above measured as *ineffective*
+until the records were attributed: 2044 of the 2091 survivors had been written
+by an already-dead GUI on the previous build, and the process under test had
+written four. Post-fix, foreign records are **5.6% of the current GUI's lines**.
+See `docs/agent-field-guide.md` for the recipe. The repair is the boundary trick above: keep every
 outlier and every record inside an armed boundary window, aggregate the rest.
 The expensive questions are asked at boundaries, so that is where resolution is
 worth its bytes.
