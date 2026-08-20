@@ -6065,6 +6065,14 @@ version of this buys little and the thorough version is not safe unattended.
 ⇒ **A deliberate one-off reclaim, not an automatic one.** Recorded here so the space is known about
 rather than discovered later as unexplained growth.
 
+⚠ **And the new layout costs disk, which should be said plainly rather than discovered.** One
+prefix per CLI means shared dependencies are no longer hoisted across CLIs. Measured on the desktop
+host after migration: **626 MB across seven per-CLI trees, against 522 MB for the one shared
+prefix** — roughly **+100 MB, about 20%**. That is the price of the isolation, and it is worth it:
+the shared prefix is what let one CLI's install unlink another's binary, and what let one damaged
+tree fail every retry. ⭐ The npm CACHE is still shared, so nothing is re-downloaded — the extra
+bytes are unpacked trees, not traffic.
+
 *Found 2026-08-14 while independently re-measuring a peer's trace-growth figure —
 the growth reproduced, but the directory it was blamed for filling turned out to
 be full of something else entirely.*
