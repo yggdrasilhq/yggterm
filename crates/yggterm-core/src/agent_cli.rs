@@ -757,7 +757,93 @@ pub struct AgentCliDescriptor {
     pub read_store_entry: fn(&Path) -> Option<AgentStoreEntry>,
 }
 
+/// The longest a store title may be before it stops being a title and starts
+/// being the prompt it was copied from.
+const STORE_TITLE_MAX_CHARS: usize = 72;
+
+/// A CLI's own store value, reduced to something that can sit on a sidebar row.
+///
+/// ⛔ NOT every CLI's "title" column is a title. One of them records the FIRST
+/// PROMPT verbatim and never updates it, so a row on the desktop wore nine
+/// hundred characters of instructions where its name belongs — measured
+/// 2026-08-20, on two rows whose store value ran to whole paragraphs.
+///
+/// The reduction is deliberately dumb and deterministic: first sentence, then a
+/// word-boundary clamp. It costs no model call, which matters because the case
+/// it exists for is exactly the case where the model is unreachable — and a
+/// clamped first clause is never worse than the paragraph it came from, where a
+/// discarded title would leave the row wearing a short hash.
+pub fn condense_store_title(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= STORE_TITLE_MAX_CHARS && !trimmed.contains(". ") {
+        return Some(trimmed.to_string());
+    }
+    // The first sentence, when there is one — a prompt's opening sentence is
+    // what a person would have called the session.
+    let first_sentence = trimmed
+        .split_inclusive(['.', '!', '?'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim();
+    let candidate = if first_sentence.is_empty() {
+        trimmed
+    } else {
+        first_sentence
+    };
+    if candidate.chars().count() <= STORE_TITLE_MAX_CHARS {
+        return Some(candidate.to_string());
+    }
+    let mut clamped = String::new();
+    for word in candidate.split_whitespace() {
+        let projected = if clamped.is_empty() {
+            word.chars().count()
+        } else {
+            clamped.chars().count() + 1 + word.chars().count()
+        };
+        if projected > STORE_TITLE_MAX_CHARS {
+            break;
+        }
+        if !clamped.is_empty() {
+            clamped.push(' ');
+        }
+        clamped.push_str(word);
+    }
+    if clamped.is_empty() {
+        clamped = candidate.chars().take(STORE_TITLE_MAX_CHARS).collect();
+    }
+    Some(clamped)
+}
+
 impl AgentCliDescriptor {
+    /// This CLI's own record for one session file — the ONE door, because the
+    /// raw `read_store_entry` pointer is a per-CLI PARSER and this is where its
+    /// result becomes a row.
+    ///
+    /// It exists so that "a store title is clamped to a row label" is asked once
+    /// rather than at each of the four places that read a store. See
+    /// [`condense_store_title`] for what the clamp is protecting against.
+    pub fn store_entry(&self, path: &Path) -> Option<AgentStoreEntry> {
+        let mut entry = (self.read_store_entry)(path)?;
+        if let Some(raw) = entry.title.take() {
+            let condensed = condense_store_title(&raw);
+            // The full text is not thrown away — a paragraph is a fine DETAIL
+            // line, and it is what the row's detail would otherwise have to be
+            // computed from.
+            if entry.detail.is_none()
+                && condensed.as_deref().is_some_and(|title| title != raw.trim())
+            {
+                entry.detail = Some(raw.trim().to_string());
+            }
+            entry.title = condensed;
+        }
+        Some(entry)
+    }
+
     /// Tokens for resuming `session_id`, WITHOUT the binary and without
     /// transport/env wrapping — the harness owns those (spec §3).
     ///
@@ -3599,6 +3685,46 @@ pub fn assert_store_predicate_coverage(predicate_name: &str, probe: impl Fn(&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⛔ A STORE COLUMN CALLED `title` IS NOT ALWAYS A TITLE.
+    ///
+    /// One shipped CLI records the FIRST PROMPT there and never updates it, so
+    /// two rows on the desktop wore whole paragraphs of instructions where
+    /// their names belong (measured 2026-08-20). The clamp is deterministic and
+    /// model-free on purpose: the case it exists for is the case where the
+    /// model is unreachable.
+    #[test]
+    fn a_store_title_that_is_really_a_prompt_is_clamped_to_a_row_label() {
+        let prompt = "Read the campaign notes first. I want the profiling work \
+                      finished on the desktop host, and the two tracing tools \
+                      brought up to the same interface so one can drive the other.";
+        let condensed = condense_store_title(prompt).expect("a label comes back");
+        assert_eq!(condensed, "Read the campaign notes first");
+        assert!(condensed.chars().count() <= STORE_TITLE_MAX_CHARS);
+
+        // A title that is already a title is returned UNTOUCHED — the clamp
+        // must not quietly rewrite the CLIs that get this right.
+        assert_eq!(
+            condense_store_title("Daemon Lifecycle Leak Audit").as_deref(),
+            Some("Daemon Lifecycle Leak Audit")
+        );
+        // …including one that ends in a full stop but is still one clause.
+        assert_eq!(
+            condense_store_title("  Fix the resume path.  ").as_deref(),
+            Some("Fix the resume path.")
+        );
+        // A single sentence too long to be a label is cut on a WORD boundary,
+        // never mid-word: a truncated word reads as corruption.
+        let one_long_sentence = "Investigate why the background refresh keeps \
+                                 re-resolving every scanned session on the \
+                                 desktop host every few seconds forever";
+        let condensed = condense_store_title(one_long_sentence).expect("a label");
+        assert!(condensed.chars().count() <= STORE_TITLE_MAX_CHARS);
+        assert!(one_long_sentence.split_whitespace().collect::<Vec<_>>().starts_with(
+            &condensed.split_whitespace().collect::<Vec<_>>()[..]
+        ));
+        assert_eq!(condense_store_title("   "), None);
+    }
 
     /// ⭐ A SUMMARY IS NOT A TITLE. grok writes both — its own binary documents
     /// them as "`session_summary` and `generated_title` — the session summary
