@@ -163,6 +163,27 @@ app-control response into a file named for a launch. **Falsifier:** with only a 
 one `server app launch` brings up a primary that registers and paints, and the launch log names the
 reason if it does not.
 
+## ⚠ [11.0] THE ROW CLI DEMANDS RITUAL THE DEFAULTS SHOULD OWN — the papercut backlog
+
+**Status:** OPEN
+
+The steer (fleet skill) keeps growing because the CLI keeps needing compensation; the owner's
+bar: agents making the same errors repeatedly means the CLI is unpolished, not the agents.
+The measured papercuts, each already paid for at least twice: (1) a spawn without
+create-time `--title`/`--outline` sits as an unnamed, unnumbered head-of-sidebar row until
+its self-claim runs — the recipe now passes both at birth, but the CLI could DEFAULT them
+(a `--purpose` naming a seat is parseable); (2) the spawner-declared seat ledger is read on
+the delegate's host, so cross-host declarations are invisible — the declaration belongs in
+the create request or a daemon-side store, not a host-local file; (3) rename→outline
+back-to-back corrupts the title (write-lag race, documented) — one verb should do both
+atomically; (4) a freshly seated row does not settle its sidebar position until a later sort
+pass, and the sort dry-run lies (documented); (5) stored seats have evaporated (durability,
+documented); (6) remove/retire verbs report the request, not the effect, forcing every
+caller to re-verify by hand — effects belong in the reply. **Fix direction:** collapse the
+claim ritual into the create (seat+title+campaign at birth, atomically, reported as
+EFFECTS), and let `ygg-claim.sh` shrink to a wrapper. Iterate: each papercut fixed removes a
+paragraph from the skill — the steer shrinking is the acceptance test.
+
 ## ⛔⛔ [11.0→11.8] THE VIEWPORT BLINK STORM — ~2 FULL RENDERS PER SECOND UNDER STREAMING-ROW LOAD
 
 **Status:** OPEN

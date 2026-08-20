@@ -1454,12 +1454,22 @@ handoff is a cycle, not an ending:
       recomposed the exports without the row's stored options — the remote
       twin of the 2026-08-06 local-CC rebuild bug. Until a bumped daemon is
       LIVE on the mediator, the canonical REMOTE recipe stays: **spawn
-      WITHOUT a prompt → verify model (transcript/cmdline) → wrong ⇒ drive
+      WITHOUT a prompt — but WITH `--title` and `--outline <seat>` (the
+      create applies both AT BIRTH; `seat.honoured` is re-read from the
+      rendered order) → verify model (transcript/cmdline) → wrong ⇒ drive
       the in-session model command at TURN ZERO (empty session, nothing to
       re-read; law 1's side effect applies) → THEN deliver the brief via
       submit → verify by ACK token.** After the deploy, verify by transcript
-      once and retire this workaround. Local spawns apply the flag correctly
-      (proven live); still verify.
+      once and retire the model workaround. Local spawns apply the flag
+      correctly (proven live); still verify.
+      ⛔ **Title and seat go IN THE CREATE, never left for the delegate's
+      claim.** A spawn without them sits in the sidebar as "Agent unnamed" at
+      the head until the claim runs minutes later — the owner meets that
+      window every time. And the spawner-declared seat ledger
+      (`spawned-by-<uuid>.txt`) is read on the DELEGATE'S host: for a
+      cross-host spawn the declaration is invisible to the claim, so the
+      create-time `--outline` is the only seat channel that works everywhere
+      (measured: two same-day cross-host lanes claimed titled but UNSEATED).
    5. ⭐ **Per-CLI register** (yggterm's `--model` maps to each CLI's native
       flag via the descriptor; native semantics measured where marked):
       | CLI | native flag | default lives in | flag sticks? | in-session cmd sticks? | decisive verification |
