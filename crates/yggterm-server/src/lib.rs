@@ -11708,6 +11708,64 @@ fn remote_runtime_agent_session_key(kind: SessionKind, session_id: &str) -> Opti
         .map(|scheme| format!("{scheme}{session_id}"))
 }
 
+/// Does THIS host's Antigravity conversation DB hold `session_id`?
+///
+/// `None` means the DB could not be consulted at all (absent, unreadable,
+/// locked) — which is NOT the same as "the id is not there", and the two must
+/// stay distinguishable: a caller that re-births on "absent" would destroy a
+/// live conversation every time the DB happened to be busy.
+fn antigravity_local_db_holds_conversation(session_id: &str) -> Option<bool> {
+    let home = dirs::home_dir()?;
+    let index = agent_cli_descriptor(SessionKind::Antigravity)?.store_membership_index?;
+    index(&home, session_id)
+}
+
+/// Can this machine's copy of `kind`'s own store VOUCH for `session_id` — i.e.
+/// is this an id the CLI would actually recognise on a resume?
+///
+/// ⚖ Three-valued ON PURPOSE, and the third value is the whole point:
+/// * `Some(true)`  — the store holds it. Resume it.
+/// * `Some(false)` — the store was consulted and does NOT hold it. Resuming
+///   this id cannot work; the CLI will either refuse (muse exits `1` with
+///   `retained session not found`) or, worse, WARN and silently start a fresh
+///   conversation (`agy` prints `warning: conversation "…" not found` and then
+///   runs, exit `0`). Both were measured 2026-08-20.
+/// * `None`        — the store cannot answer here: not an agent CLI, a declared
+///   `store_scan_gap`, a CLI with no store at all, or a store this host does not
+///   have. ⛔ A caller must NEVER treat `None` as `Some(false)`. Re-birthing on
+///   "I could not check" destroys a live session, which is strictly worse than
+///   the miss this predicate exists to catch.
+///
+/// ⛔ LOCAL ONLY. A remote row's id lives in the OTHER machine's store, so this
+/// host answering `false` for it means nothing at all — that is exactly the
+/// false-death `remote_saved_agent_session_exists` softens for Antigravity, and
+/// the softening is why that function cannot serve as this predicate.
+fn local_agent_store_vouches_for_session(kind: SessionKind, session_id: &str) -> Option<bool> {
+    local_agent_store_vouches_for_session_in(&dirs::home_dir()?, kind, session_id)
+}
+
+/// [`local_agent_store_vouches_for_session`] against an explicit home — the test
+/// seam, so a test never reads the machine's real CLI stores (a unit test that
+/// consults the user's own store passes or fails on THEIR data, which is not a
+/// test at all).
+fn local_agent_store_vouches_for_session_in(
+    home: &Path,
+    kind: SessionKind,
+    session_id: &str,
+) -> Option<bool> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let descriptor = agent_cli_descriptor(kind)?;
+    if descriptor.store_scan_gap.is_some() {
+        return None;
+    }
+    // Only a CLI that declares a keyed index may answer here. Everything else
+    // gets `None` — "unknowable" — which the caller treats as "resume it", so
+    // codex and Claude Code keep exactly the resume behaviour they shipped with.
+    (descriptor.store_membership_index?)(home, session_id)
+}
+
 /// Does THIS host's copy of `kind`'s own store hold `session_id`?
 ///
 /// The `_ => remote_saved_codex_session_exists(...)` this replaced looked every
@@ -11724,26 +11782,8 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
             return remote_saved_codex_session_exists(session_id);
         }
         SessionKind::Antigravity => {
-            if let Some(home) = dirs::home_dir() {
-                let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
-                if db_path.exists() {
-                    if let Ok(conn) = rusqlite::Connection::open_with_flags(
-                        &db_path,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                    ) {
-                        if let Ok(mut stmt) = conn.prepare(
-                            "SELECT 1 FROM conversation_summaries WHERE conversation_id = ?1;",
-                        ) {
-                            if let Ok(exists) = stmt.exists(rusqlite::params![session_id]) {
-                                if exists {
-                                    return Ok(true);
-                                }
-                            }
-                        }
-                    }
-                }
+            if antigravity_local_db_holds_conversation(session_id) == Some(true) {
+                return Ok(true);
             }
             // Antigravity's store is a per-host SQLite DB; a `remote-agy://oc/<id>`
             // names a session on `oc`, not on this host. A local DB miss is
@@ -30180,8 +30220,75 @@ fn stored_session_launch_command_for_locality_with_options(
         // own, above, and only for a LOCAL row: CC keys its project directory
         // on the process cwd, so the transcript's cwd — not the row's — decides
         // where the resume lands.
-        _ => agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch),
+        //
+        // ⛔ But resume only an id the CLI's OWN store can vouch for. Claude
+        // Code has asked that question since the `local_cc_resume_cwd` fix; every
+        // other CLI resumed whatever id the row carried, and for a CLI that mints
+        // its own id (`id_assigned_at_birth:false`) the row uuid is a PHANTOM that
+        // its store has never held. What the CLI then does with it, measured
+        // 2026-08-20, is the user-visible bug in both its shapes:
+        //   * `muse resume <phantom>` → `retained session not found: … has no
+        //     saved log`, exit 1. The PTY dies on open, so the row never persists.
+        //   * `agy --conversation <phantom>` → `warning: conversation "…" not
+        //     found` and then a BRAND NEW conversation, exit 0. The row silently
+        //     becomes a different, empty session under the same title.
+        // The second is silent data loss; the first merely looks like one. Both
+        // are prevented by not asking for a session that is not there.
+        _ => {
+            match is_local
+                .then(|| local_agent_store_vouches_for_session(kind, session_id))
+                .flatten()
+            {
+                // Consulted, and the id is not there. Re-birth instead of
+                // resuming a session that cannot be found.
+                Some(false) => {
+                    note_agent_resume_miss(kind, cwd, session_id);
+                    // A CLI that mints its own id must be born WITHOUT one —
+                    // handing it the row uuid is what minted the phantom in the
+                    // first place. One that accepts an id at birth keeps its row
+                    // identity, exactly as the Claude Code arm above does.
+                    let birth_id = agent_cli_descriptor(kind)
+                        .is_some_and(|descriptor| descriptor.id_assigned_at_birth)
+                        .then_some(session_id);
+                    agent_launch_command_with_options(kind, Some(cwd), birth_id, launch)
+                }
+                // Vouched for, or unanswerable. ⛔ `None` must behave exactly like
+                // `Some(true)`: re-birthing because a store could not be READ
+                // would destroy live sessions on every remote row and every CLI
+                // with a declared scan gap.
+                _ => agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch),
+            }
+        }
     }
+}
+
+/// A resume was asked for an id the CLI's own store does not hold, and the row
+/// is being re-birthed instead.
+///
+/// ⚖ Recorded BEFORE the CLI runs, which is the point: the PTY scanner already
+/// catches both refusal lines after the fact (`session_not_found` in
+/// `agent-incidents.jsonl`), but by then `agy` has already created the empty
+/// replacement conversation the user reads as their lost session. This event
+/// says the miss was seen and prevented, and names the id that went missing so
+/// a store→row mapping bug is visible rather than merely survivable.
+fn note_agent_resume_miss(kind: SessionKind, cwd: &str, session_id: &str) {
+    let Ok(home) = resolve_yggterm_home() else {
+        return;
+    };
+    append_trace_event(
+        &home,
+        "server",
+        "session",
+        "agent_resume_miss",
+        json!({
+            "kind": format!("{kind:?}"),
+            "session_id": session_id,
+            "cwd": cwd,
+            "id_assigned_at_birth": agent_cli_descriptor(kind)
+                .map(|descriptor| descriptor.id_assigned_at_birth),
+            "action": "rebirth",
+        }),
+    );
 }
 
 /// [`stored_session_launch_command`] carrying the row's per-launch options.
@@ -31505,6 +31612,7 @@ mod tests {
         persisted_live_session_from_managed,
         session_metadata_value, should_fallback_to_python,
         session_path_is_remote, should_remove_local_daemon_socket_for_spawn_state,
+        agent_launch_command_with_options, local_agent_store_vouches_for_session_in,
         stored_session_launch_command, stored_session_launch_command_for_locality,
         strip_remote_payload_noise, synthesize_remote_scanned_session_view,
         try_acquire_remote_scan_lock, upsert_session_metadata, validate_server_ui_snapshot,
@@ -35557,6 +35665,140 @@ mod tests {
         assert!(
             remote.contains("--resume"),
             "a remote CC row resumes regardless of THIS machine's transcript store: {remote}"
+        );
+    }
+
+    /// Build a throwaway home whose Muse session index holds exactly
+    /// `session_ids`.
+    ///
+    /// The INDEX is the fixture, not the directory tree: membership is settled
+    /// by a keyed lookup in `session-index.db`, so a fixture that only laid out
+    /// `sessions/YYYY/MM/DD/<id>/session.jsonl` would answer "absent" for a
+    /// session that is really there.
+    fn muse_store_fixture(tag: &str, session_ids: &[&str]) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-muse-store-{tag}-{}",
+            current_millis_u64()
+        ));
+        std::fs::create_dir_all(home.join(".local/share/muse")).expect("fixture dirs");
+        let conn = rusqlite::Connection::open(home.join(".local/share/muse/session-index.db"))
+            .expect("fixture index");
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, workspace_root TEXT);",
+            [],
+        )
+        .expect("fixture schema");
+        for id in session_ids {
+            conn.execute(
+                "INSERT INTO sessions (session_id, workspace_root) VALUES (?1, ?2);",
+                rusqlite::params![id, "/tmp/workspace"],
+            )
+            .expect("fixture row");
+        }
+        home
+    }
+
+    #[test]
+    fn a_store_that_cannot_answer_is_not_the_same_as_a_store_that_says_no() {
+        // ⛔ The three-valued contract, which is the whole safety property: only
+        // `Some(false)` may trigger a re-birth. If "I could not check" collapsed
+        // into "not there", every row on a machine whose CLI store is missing —
+        // or whose store is declared unscannable — would be re-born on top of a
+        // live session.
+        let present = "00000000-0000-4000-8000-00000000d0c5";
+        let absent = "00000000-0000-4000-8000-0000000ab5e7";
+
+        let home = muse_store_fixture("three-valued", &[present]);
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(&home, SessionKind::Muse, present),
+            Some(true),
+            "a session the store holds is vouched for"
+        );
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(&home, SessionKind::Muse, absent),
+            Some(false),
+            "a store that was read and lacks the id says so"
+        );
+
+        // No index on this machine at all — unknowable, never `Some(false)`.
+        // ⛔ Note the index is opened NON-creating: a plain `open()` here would
+        // mint an empty database and then answer `Some(false)` with total
+        // confidence for every session the user has.
+        let bare = std::env::temp_dir().join(format!(
+            "yggterm-muse-nostore-{}",
+            current_millis_u64()
+        ));
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(&bare, SessionKind::Muse, present),
+            None,
+            "an absent store cannot testify that a session does not exist"
+        );
+        // A shell is not an agent CLI and has no store to consult.
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(&home, SessionKind::Shell, present),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_phantom_id_is_re_birthed_rather_than_resumed_into_a_new_session() {
+        // The owner-reported pair, measured 2026-08-20 against the real CLIs:
+        //   muse resume <phantom>       → "retained session not found", exit 1
+        //   agy --conversation <phantom> → "warning: conversation … not found",
+        //                                  then a NEW conversation, exit 0
+        // A row of a CLI that mints its own id carries the yggterm ROW uuid,
+        // which that CLI's store has never held — so this is the DEFAULT path
+        // for muse/agy, not an edge case.
+        let phantom = "00000000-0000-4000-8000-00000000beef";
+        let home = muse_store_fixture("phantom", &["00000000-0000-4000-8000-00000000feed"]);
+
+        let resumed = local_agent_store_vouches_for_session_in(&home, SessionKind::Muse, phantom);
+        assert_eq!(resumed, Some(false), "fixture must not hold the phantom id");
+
+        // muse mints its own id (`id_assigned_at_birth:false`), so a re-birth
+        // must pass NO id — handing it the row uuid is what mints the phantom.
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(SessionKind::Muse)
+            .expect("muse is registered");
+        assert!(
+            !descriptor.id_assigned_at_birth,
+            "muse mints its own session id; if that changes, this guard changes with it"
+        );
+        let rebirth = agent_launch_command_with_options(
+            SessionKind::Muse,
+            Some("/tmp/workspace"),
+            None,
+            &AgentLaunchOptions::default(),
+        );
+        assert!(
+            !rebirth.contains(phantom),
+            "a re-birth must not carry the phantom id: {rebirth}"
+        );
+        assert!(
+            !rebirth.contains("resume"),
+            "a re-birth is a fresh start, not a resume: {rebirth}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_remote_row_never_re_births_from_this_machines_store() {
+        // ⛔ A remote row's session lives in the OTHER machine's store, so this
+        // host's answer is meaningless for it. Re-birthing on that would destroy
+        // a live remote session on every open — strictly worse than the miss the
+        // guard exists to prevent.
+        let phantom = "00000000-0000-4000-8000-00000000cafe";
+        let remote = stored_session_launch_command_for_locality(
+            SessionKind::Muse,
+            "/tmp/workspace",
+            phantom,
+            false,
+        );
+        assert!(
+            remote.contains(phantom),
+            "a remote row resumes regardless of THIS machine's store: {remote}"
         );
     }
 

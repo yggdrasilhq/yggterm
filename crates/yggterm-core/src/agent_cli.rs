@@ -755,6 +755,26 @@ pub struct AgentCliDescriptor {
     /// not a readable session of this CLI (no identity records yet, truncated,
     /// or not ours). Feeds the cwd-tree scanner AND identity rebinding.
     pub read_store_entry: fn(&Path) -> Option<AgentStoreEntry>,
+    /// Answer "does this CLI's store hold `session_id`?" by a KEYED lookup,
+    /// given the home directory to resolve the store under.
+    ///
+    /// `Some(reader)` ⇒ this CLI keeps an index that can be asked about one id
+    /// directly (Muse's `session-index.db`, Antigravity's
+    /// `conversation_summaries.db`). The reader itself returns `Option<bool>`:
+    /// `None` when the index could not be consulted at all, which must stay
+    /// distinct from `Some(false)`.
+    ///
+    /// `None` ⇒ this CLI has no index, and membership could only be settled by
+    /// WALKING the store and parsing every file for the id buried inside it
+    /// (codex). ⛔ That is deliberately not offered here: this hook is called on
+    /// the resume path, and a full store walk there would put a multi-megabyte
+    /// read in front of every launch — the cost that already had to be
+    /// engineered out of the Claude Code identity refresh.
+    ///
+    /// ⚖ So this field says "can membership be settled CHEAPLY and
+    /// authoritatively", and only a CLI that answers yes may have a resume
+    /// re-routed on its say-so.
+    pub store_membership_index: Option<fn(&Path, &str) -> Option<bool>>,
 }
 
 /// The longest a store title may be before it stops being a title and starts
@@ -1376,6 +1396,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         store_home_env_override: Some(crate::ENV_YGGTERM_CODEX_HOME),
         read_store_entry: read_codex_store_entry,
+        store_membership_index: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
@@ -1480,6 +1501,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // relocates `.codex` alone. Preserving that exactly.
         store_home_env_override: None,
         read_store_entry: read_codex_store_entry,
+        store_membership_index: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::ClaudeCode,
@@ -1609,6 +1631,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         store_home_env_override: None,
         read_store_entry: read_claude_code_store_entry,
+        store_membership_index: None,
     },
     // ── The 2026-08-08 intake. Every field below was read off the CLI's own
     // source or its installed binary on this date, never from memory; the
@@ -1725,6 +1748,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_pi_store_entry,
+        store_membership_index: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::OpenCode,
@@ -1812,6 +1836,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
+        store_membership_index: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::QwenCode,
@@ -1930,6 +1955,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_qwen_store_entry,
+        store_membership_index: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
@@ -2047,6 +2073,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
+        store_membership_index: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -2180,6 +2207,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_muse_store_entry,
+        store_membership_index: Some(muse_store_index_holds_session),
     },
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
@@ -2345,6 +2373,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_antigravity_store_entry,
+        store_membership_index: Some(antigravity_store_index_holds_session),
     },
     // ── The 2026-08-13 intake. Every field below was read off the installed
     // binary (`@xai-official/grok` 1.0.3 `1a29d5bc12`, provisioned into the
@@ -2538,6 +2567,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_grok_build_store_entry,
+        store_membership_index: None,
     },
 ];
 
@@ -3146,6 +3176,52 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         title,
         detail,
     })
+}
+
+/// Open one of a CLI's SQLite indexes read-only, without ever creating it.
+///
+/// ⛔ Read-only AND non-creating on purpose: these are the CLI's own live
+/// databases. Opening one read-write would take a lock the CLI is using, and a
+/// default `open()` on a missing path CREATES an empty database — which would
+/// then answer "no such session" authoritatively forever.
+fn open_cli_index_readonly(db_path: &Path) -> Option<rusqlite::Connection> {
+    if !db_path.exists() {
+        return None;
+    }
+    rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+}
+
+/// Does Muse's session index hold `session_id`?
+///
+/// Muse keys `sessions.session_id` on the same uuid that names the session's
+/// DIRECTORY, so one indexed lookup settles what would otherwise be a walk of
+/// `sessions/YYYY/MM/DD/*/session.jsonl`.
+fn muse_store_index_holds_session(home: &Path, session_id: &str) -> Option<bool> {
+    let conn = open_cli_index_readonly(&home.join(".local/share/muse/session-index.db"))?;
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM sessions WHERE session_id = ?1;")
+        .ok()?;
+    stmt.exists(rusqlite::params![session_id]).ok()
+}
+
+/// Does Antigravity's conversation index hold `session_id`?
+///
+/// Antigravity's store IS this database — a conversation has no file of its own
+/// until it has been written to — so this is the only question that can be
+/// asked about a fresh id.
+fn antigravity_store_index_holds_session(home: &Path, session_id: &str) -> Option<bool> {
+    let conn =
+        open_cli_index_readonly(&home.join(".gemini/antigravity-cli/conversation_summaries.db"))?;
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM conversation_summaries WHERE conversation_id = ?1;")
+        .ok()?;
+    stmt.exists(rusqlite::params![session_id]).ok()
 }
 
 fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
