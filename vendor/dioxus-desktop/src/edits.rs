@@ -49,6 +49,21 @@ pub fn edit_faults() -> u64 {
     EDIT_FAULTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Times the flush gate timed out waiting for the webview to acknowledge an
+/// edit batch (see the deadline in `poll_edits_flushed`). Every hit is a
+/// window in which the whole VirtualDom — renders, effects, spawned futures —
+/// sat frozen for the full timeout while the event loop looked healthy. The
+/// gate releases and the app recovers, which is exactly why the class hid: it
+/// logged one line and left no queryable trace. Monotonic; a host process
+/// polls it and files the incident (the emitter cannot — this crate has no
+/// trace plane).
+static EDIT_FLUSH_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Flush-gate timeouts since launch. See [`EDIT_FLUSH_TIMEOUTS`].
+pub fn edit_flush_timeouts() -> u64 {
+    EDIT_FLUSH_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// This handles communication between the requests that the webview makes and the interpreter.
 #[derive(Clone)]
 pub(crate) struct WryQueue {
@@ -120,6 +135,7 @@ impl WryQueue {
         };
         if timed_out {
             let webview_id = self_mut.location.webview_id;
+            EDIT_FLUSH_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::error!(
                 webview_id,
                 timeout_ms = EDITS_FLUSH_TIMEOUT.as_millis() as u64,
