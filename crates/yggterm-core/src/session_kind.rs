@@ -26,6 +26,26 @@ pub enum SessionKind {
 }
 
 impl SessionKind {
+    /// Every kind, once — so a rule that must answer for all of them can be
+    /// TESTED against all of them rather than against the ones somebody
+    /// remembered. `all_holds_every_variant_exactly_once` is what keeps it
+    /// honest when a variant is added.
+    pub const ALL: &'static [SessionKind] = &[
+        SessionKind::Codex,
+        SessionKind::CodexLiteLlm,
+        SessionKind::ClaudeCode,
+        SessionKind::Pi,
+        SessionKind::OpenCode,
+        SessionKind::QwenCode,
+        SessionKind::Kimi,
+        SessionKind::Muse,
+        SessionKind::Antigravity,
+        SessionKind::GrokBuild,
+        SessionKind::Shell,
+        SessionKind::SshShell,
+        SessionKind::Document,
+    ];
+
     /// Whether this kind is a first-class agent CLI.
     ///
     /// DERIVED from the descriptor registry (harness spec §3): adding a CLI
@@ -78,6 +98,32 @@ impl SessionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `match` is the enforcement: a new variant cannot be added without an
+    /// arm here, and the arm cannot be written without giving the variant a slot
+    /// in `ALL` — at which point the length assertion is the reminder to bump it.
+    #[test]
+    fn all_holds_every_variant_exactly_once() {
+        for (index, kind) in SessionKind::ALL.iter().enumerate() {
+            let slot = match kind {
+                SessionKind::Codex => 0,
+                SessionKind::CodexLiteLlm => 1,
+                SessionKind::ClaudeCode => 2,
+                SessionKind::Pi => 3,
+                SessionKind::OpenCode => 4,
+                SessionKind::QwenCode => 5,
+                SessionKind::Kimi => 6,
+                SessionKind::Muse => 7,
+                SessionKind::Antigravity => 8,
+                SessionKind::GrokBuild => 9,
+                SessionKind::Shell => 10,
+                SessionKind::SshShell => 11,
+                SessionKind::Document => 12,
+            };
+            assert_eq!(index, slot, "{kind:?} is listed out of order in ALL");
+        }
+        assert_eq!(SessionKind::ALL.len(), 13);
+    }
 
     // The rendered-view question, answered once. Before this, a plain shell
     // could be routed into `Rendered` and was handed a "Terminal transcript"

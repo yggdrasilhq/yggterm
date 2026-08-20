@@ -41951,23 +41951,16 @@ fn is_local_stored_session_row(row: &BrowserRow) -> bool {
         && !is_live_sidebar_row(row)
         && !is_remote_scanned_sidebar_row(row)
 }
-fn is_local_stored_session_path(path: &str) -> bool {
-    !path.trim().is_empty()
-        && !path.starts_with("__")
-        && !is_local_live_session_path(path)
-        && !yggterm_core::agent_scheme::is_remote_agent_session_path(path)
-        && !yggterm_core::agent_scheme::is_remote_row_path(path)
-}
+/// Delegates to the ONE owner of "may yggterm generate copy for this row"
+/// (`yggterm_server::session_accepts_generated_copy`).
+///
+/// This used to be a second encoding, and it was the WIDER of the two: any
+/// `local://` path passed it, so every live local row — a libyggterm app row,
+/// a plain shell — was a title candidate on this surface and not on the
+/// daemon's. Keeping the local name is only for the call sites; the rule has
+/// one home.
 fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
-    if session.kind.self_generates_copy() {
-        return false;
-    }
-    session.kind.is_agent()
-        || session.kind == SessionKind::SshShell
-        || is_local_live_session_path(&session.session_path)
-        || is_local_stored_session_path(&session.session_path)
-        || yggterm_core::agent_scheme::is_remote_agent_session_path(&session.session_path)
-        || yggterm_core::agent_scheme::is_remote_row_path(&session.session_path)
+    yggterm_server::session_accepts_generated_copy(session)
 }
 fn copy_generation_target_for_session(
     server: &YggtermServer,

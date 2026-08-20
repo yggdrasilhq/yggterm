@@ -1265,9 +1265,66 @@ fn apply_birth_keep_alive(session: &mut ManagedSessionView) {
 /// token every launcher menu speaks, parsed by its one parser. So "which app is
 /// this row" and "is this row an app row" cannot answer differently, and adding a
 /// launcher surface never means teaching a second field about apps.
-fn session_is_app_row(session: &ManagedSessionView) -> bool {
+pub fn session_is_app_row(session: &ManagedSessionView) -> bool {
     session_metadata_value(session, "Source")
         .is_some_and(|source| app_verb_token_parts(&source).is_some())
+}
+
+/// May yggterm GENERATE copy — a title or a summary — for this row?
+///
+/// ONE owner for a question two surfaces used to answer differently. The GUI's
+/// passive copy scan asked "is this a live local path", which is true of EVERY
+/// live local row, so a libyggterm app row and a plain shell were generation
+/// candidates there while the daemon chore (which reaches candidates through a
+/// transcript file) never treated them as such. The visible cost was an app row
+/// the user deliberately launched being renamed out from under him with copy
+/// generated from whatever its terminal happened to be printing.
+///
+/// The rule, in the order it is asked:
+///
+/// 1. **An APP row is named by the app that launched it.** yggterm never renames
+///    one. An app that wants a different title asks for it explicitly, through
+///    the same rename door a human uses — there is no implicit path.
+/// 2. **A store-authoritative CLI writes its own title**, so generating one
+///    would invent a second title that disagrees with it forever.
+/// 3. **A DOCUMENT is titled from its own body** — it has no transcript, and the
+///    body is the only thing it could be named after.
+/// 4. Otherwise the row must BE an agent session: by kind, or by a path only an
+///    agent session can hold. A plain shell — local or ssh — is not one, and
+///    generating a title from its scrollback is how three ssh rows came to be
+///    called after an unrelated line of `apt` output.
+pub fn session_accepts_generated_copy(session: &ManagedSessionView) -> bool {
+    if session_is_app_row(session) {
+        return false;
+    }
+    if session.kind.self_generates_copy() {
+        return false;
+    }
+    if session.kind == SessionKind::Document {
+        return true;
+    }
+    session.kind.is_agent() || session_path_can_only_be_an_agent_transcript(&session.session_path)
+}
+
+/// The path half of [`session_accepts_generated_copy`] — for a row whose KIND
+/// did not survive the trip (a durable row rebuilt from a scan, a remote row
+/// adopted from another daemon).
+///
+/// ⛔ Deliberately NOT "is this a local live path": `local://` is the runtime key
+/// of every live local row whatever it hosts, and reading it as an agent tell is
+/// the defect this function was split out of. `local://` carries no kind in the
+/// scheme registry precisely because it cannot answer this question.
+fn session_path_can_only_be_an_agent_transcript(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.starts_with("__") {
+        return false;
+    }
+    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(trimmed) {
+        return kind.is_agent();
+    }
+    // What is left with no scheme at all is a durable row, and a durable row's
+    // path IS the CLI store file the scan found it in.
+    Path::new(trimmed).is_absolute()
 }
 
 fn set_session_keep_alive_metadata(session: &mut ManagedSessionView, keep_alive: bool) {
@@ -33780,6 +33837,151 @@ mod tests {
              with the daemon that granted it"
         );
         assert_eq!(persisted.app_launch.as_deref(), Some("app:ychrome:new"));
+    }
+
+    /// ⛔ AN APP ROW IS NAMED BY THE APP, AND YGGTERM NEVER RENAMES IT.
+    ///
+    /// The row the user reported was born `New Ychrome` and was found wearing a
+    /// generated title assembled from whatever its terminal was printing. It is
+    /// the same shape as the reap defect above — `kind` says `Shell`, so every
+    /// predicate that reads kind alone treats an app surface as a scratch shell
+    /// — except that this one renames the row instead of destroying it.
+    ///
+    /// Driven through `start_command_session` rather than a hand-built view: the
+    /// `Source` stamp IS the recognizer's input, so a fixture that set the field
+    /// itself would only assert that the test knows the answer.
+    #[test]
+    fn an_app_row_is_never_a_generated_copy_candidate() {
+        let mut server = test_server();
+        let app_row = server.start_command_session(
+            Some("/home/user"),
+            Some("New Ychrome"),
+            &local_app_verb_launch_command("'/home/user/.local/bin/ychrome' 'new'"),
+            Some("app:ychrome:new"),
+        );
+        let scratch_row = server.start_command_session(
+            Some("/home/user"),
+            Some("recipe shell"),
+            "/bin/bash -i",
+            None,
+        );
+
+        let app_session = server.sessions.get(&app_row).expect("the app row exists");
+        assert!(
+            !super::session_accepts_generated_copy(app_session),
+            "an app row is named by the app that launched it — yggterm may not \
+             generate a title over it"
+        );
+
+        // A plain shell is excluded too, and for a DIFFERENT reason worth
+        // keeping separable: it is not an agent session, so there is no
+        // transcript to name it after. Three ssh rows were once all called
+        // after a line of package-manager output for exactly this reason.
+        let scratch_session = server
+            .sessions
+            .get(&scratch_row)
+            .expect("the scratch row exists");
+        assert!(
+            !super::session_accepts_generated_copy(scratch_session),
+            "a plain shell has no transcript to be named from"
+        );
+    }
+
+    /// ⛔⛔ THE MUTATION THIS GATE MUST NOT SURVIVE: admitting a row because its
+    /// path is a LOCAL LIVE one.
+    ///
+    /// That is what the GUI's copy of this rule asked, and `local://` is the
+    /// runtime key of every live local row whatever it hosts — an agent CLI, an
+    /// app surface, a bare shell. So the widest possible answer wore the shape
+    /// of a specific one. Here all three rows differ ONLY in what they are, and
+    /// the gate must separate them; re-introducing any path-shaped arm collapses
+    /// this test.
+    #[test]
+    fn the_gate_separates_three_rows_that_share_one_local_runtime_key_shape() {
+        let mut server = test_server();
+        let app_row = server.start_command_session(
+            Some("/home/user"),
+            Some("New Ychrome"),
+            &local_app_verb_launch_command("'/home/user/.local/bin/ychrome' 'new'"),
+            Some("app:ychrome:new"),
+        );
+        let shell_row =
+            server.start_command_session(Some("/home/user"), Some("shell"), "/bin/bash -i", None);
+        let agent_row =
+            server.start_command_session(Some("/home/user"), Some("codex"), "codex", None);
+        server
+            .sessions
+            .get_mut(&agent_row)
+            .expect("the agent row exists")
+            .kind = SessionKind::Codex;
+
+        let verdicts = [&app_row, &shell_row, &agent_row].map(|path| {
+            let session = server.sessions.get(path).expect("the row exists");
+            (
+                session.session_path.starts_with("local://"),
+                super::session_accepts_generated_copy(session),
+            )
+        });
+        assert_eq!(
+            verdicts,
+            [(true, false), (true, false), (true, true)],
+            "all three carry a local runtime key; only the agent session may be \
+             titled from its transcript"
+        );
+    }
+
+    /// Every kind decides, so a NEW one cannot arrive undecided.
+    ///
+    /// The enum is walked rather than listed: a hand-list is what
+    /// `SessionKind::is_agent` was rescued from, and a gate with a hand-list
+    /// silently keeps its old answer for a kind that did not exist when it was
+    /// written.
+    #[test]
+    fn every_kind_answers_the_gate_from_the_descriptor_registry() {
+        let mut server = test_server();
+        let row = server.start_command_session(Some("/home/user"), Some("row"), "/bin/bash", None);
+        for &kind in SessionKind::ALL {
+            let session = server.sessions.get_mut(&row).expect("the row exists");
+            session.kind = kind;
+            let session = server.sessions.get(&row).expect("the row exists");
+            let expected = match kind {
+                SessionKind::Document => true,
+                kind => kind.is_agent() && !kind.self_generates_copy(),
+            };
+            assert_eq!(
+                super::session_accepts_generated_copy(session),
+                expected,
+                "{kind:?} must answer the gate from what it IS — an agent CLI \
+                 that writes no title of its own, or a document with a body"
+            );
+        }
+    }
+
+    /// A DURABLE row still qualifies on its path alone.
+    ///
+    /// The kind does not always survive the trip from a scan, and a durable
+    /// row's path IS the CLI store file it was found in — so the transcript is
+    /// right there to be named from. Losing this arm would silently stop
+    /// titling the scanned sessions the fleet sweep exists to fix.
+    #[test]
+    fn a_durable_transcript_path_is_a_candidate_even_when_the_kind_is_lost() {
+        let mut session = build_session(
+            SessionKind::Shell,
+            "/home/user/.codex/sessions/2026/04/01/rollout-2026-04-01T06-18-55.jsonl",
+            Some("00000000-0000-4000-8000-0000000000a1"),
+            Some("/home/user"),
+            None,
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        assert!(super::session_accepts_generated_copy(&session));
+
+        // …but a virtual sidebar path is not a transcript, whatever its kind.
+        session.session_path = "__remote_machine__/devhost".to_string();
+        assert!(!super::session_accepts_generated_copy(&session));
     }
 
     /// ⛔ THE ROUND-TRIP HAS TO CLOSE, AND IT DID NOT — it survived exactly one
