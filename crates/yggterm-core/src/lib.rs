@@ -1995,6 +1995,41 @@ pub fn parse_antigravity_workspace_uris(uris_json: &str) -> Option<String> {
     None
 }
 
+/// Every workspace root an Antigravity conversation was opened against.
+///
+/// `parse_antigravity_workspace_uris` answers "where does this row hang in the
+/// cwd tree" and therefore returns only the FIRST root. Deciding whether a
+/// conversation is a resumable session needs all of them, because the batch
+/// signature is a real repo root with an ephemeral scratch dir beside it.
+pub fn antigravity_workspace_paths(uris_json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(uris_json) else {
+        return Vec::new();
+    };
+    let Some(uris) = value.as_array() else {
+        return Vec::new();
+    };
+    uris.iter()
+        .filter_map(|uri| uri.as_str())
+        .map(|uri| uri.strip_prefix("file://").unwrap_or(uri))
+        .map(|p| p.trim().trim_end_matches('/').to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Whether a workspace root is an ephemeral scratch directory.
+///
+/// ⚠ This is deliberately a check on the PATH, not on whether the directory
+/// still exists. Probing the filesystem would make the scan non-deterministic
+/// (the same store row would appear and disappear as `/tmp` is reaped) and it
+/// measured WORSE: two batch conversations still had live `/tmp` workspaces and
+/// an existence test kept them.
+pub fn path_is_ephemeral_scratch(path: &str) -> bool {
+    const SCRATCH_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/private/tmp", "/private/var/folders"];
+    SCRATCH_ROOTS
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+}
+
 pub fn local_antigravity_conversations_dir() -> Option<PathBuf> {
     agent_cli_descriptor(SessionKind::Antigravity)?
         .store_roots_absolute(&dirs::home_dir()?)

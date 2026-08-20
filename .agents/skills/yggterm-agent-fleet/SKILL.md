@@ -2673,6 +2673,42 @@ cost a live session:
   whole-document parse throws *"Extra data"* and looks like a broken verb. Decode
   in a loop and read every object.
 
+### ⛔⛔ ANTIGRAVITY (`agy`): its store is a LEDGER OF EVERYTHING, not a session list
+
+Measured 2026-08-20 on a 999-row `~/.gemini/antigravity-cli/conversation_summaries.db`:
+**995 of those rows are batch tool invocations, 4 are sessions a human would
+resume.** Anything that treats a DB row as a session inherits a ~250x
+overcount — it put 452 one-session `/tmp` folders in the cwd tree.
+
+- ⛔ **`killed=0` filters NOTHING** — every row had `killed=0`. So did every other
+  column that looks built for this: `source`, `status`, `agent_name`,
+  `nesting_depth`, `parent_conversation_id`, `battle_id`, `not_fully_idle`,
+  `last_user_input_step_index` were uniformly empty or default. **Print a store
+  column's distribution before filtering on it**; a filter on a constant column
+  is indistinguishable from no filter.
+- ⭐ **The discriminator is `workspace_uris` + `step_count`:** a real workspace,
+  none of its roots an ephemeral scratch dir, and at least one step. The batch
+  signature is a real repo root with a `/tmp` scratch dir beside it.
+- ⚠ **Test the PATH, not the filesystem.** "Does the workspace still exist"
+  measured worse (batch rows with surviving scratch dirs) and makes the answer
+  change as `/tmp` is reaped.
+- ⛔ **`last_modified_time` is per-row and is ISO-8601 with a SPACE separator** —
+  RFC-3339 parsers reject it until the separator is swapped. Never substitute
+  the DB FILE's mtime: that stamps one shared fake recency on every row and it
+  moves whenever the CLI touches the store.
+- ⚠ **On-disk transcripts are `transcript_full.jsonl`**, not `transcript.jsonl`.
+  The wrong spelling matches 0 of 497 brain dirs and fails silently, which is
+  what a glob does when it is wrong.
+- ⚠ **`conversations/*.db` holds a `.pb`**, so that glob matches nothing either.
+  The summaries DB is the index; the brain dirs are storage.
+
+### ⚠ MUSE: `prompt_count = 0` does not mean the file is empty
+
+Zero-prompt muse sessions carry ~12 KB of real lifecycle records (metadata,
+route facts, a clean `session_end`). Skipping them from a session list is right;
+reading the index row as "this file is empty" is not, and **it must never drive
+a delete.**
+
 ---
 
 ## 12. Adapting this to your own setup
