@@ -98,7 +98,9 @@ CLI_STORES = [
 # ⛔ The durable-session RULES live in one shared module (the store tables above
 # stay per-script on purpose: the oracle must not import the Rust descriptors).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ygg_scan_truth import agy_durable_rows, muse_noise_ids  # noqa: E402
+from ygg_scan_truth import (  # noqa: E402
+    agy_durable_rows, muse_noise_ids, condense_store_title,
+)
 
 
 def fleet_hosts():
@@ -159,30 +161,6 @@ def verb_on_host(host):
     except Exception as e:
         return None, f"json parse: {e}", out[:2000]
 
-MUSE_NOISE_PROBE = "\n".join([
-    "import json, os, sqlite3",
-    "noise = []",
-    "db = os.path.expanduser('~/.local/share/muse/session-index.db')",
-    "if os.path.exists(db):",
-    "    conn = sqlite3.connect('file:%s?mode=ro' % db, uri=True)",
-    "    for sid, title, count in conn.execute('SELECT session_id, title, prompt_count FROM sessions'):",
-    "        if (count or 0) == 0 and str(title or '').strip().lower() in ('', 'new session', 'new muse code session'):",
-    "            noise.append(sid)",
-    "print(json.dumps(noise))",
-])
-
-def muse_noise_ids(host):
-    """Session ids the Rust scan skips as noise, so the oracle skips them too.
-
-    ⛔ NOT a fudge to make the counts agree: `is_noise_session_file` is a
-    documented scan rule (a muse session with zero prompts and a placeholder
-    title is not a session yet), and an oracle that models a DIFFERENT spec
-    reports a drift that does not exist. Four phantom `missing` ids came from
-    exactly this, every run.
-    """
-    out, err = run_on_host(host, "python3 -c " + shlex.quote(MUSE_NOISE_PROBE), timeout=60)
-    if err:
-        return set()
     try:
         return set(json.loads(out.strip().splitlines()[-1]))
     except Exception:
@@ -194,7 +172,7 @@ def manual_walk_on_host(host):
     if err:
         return sessions, f"cannot get HOME: {err}"
     home = home_out.strip() or os.path.expanduser("~")
-    noise_ids = muse_noise_ids(host)
+    noise_ids = muse_noise_ids(run_on_host, host)
     for cli in CLI_STORES:
         for glob in cli["globs"]:
             # Expand glob to find command: use find for **, else ls
@@ -257,17 +235,6 @@ def manual_walk_on_host(host):
             "mtime": 0,
             "parsed": {"session_id": row["id"], "cwd": row["cwd"], "title": row["title"]},
         })
-
-    # A zero-prompt muse placeholder is skipped by the scan, so the oracle must
-    # skip it too. ⚠ These have real files behind them; this set is for skipping,
-    # never for deleting.
-    noise = muse_noise_ids(run_on_host, host)
-    if noise:
-        sessions = [
-            s for s in sessions
-            if not (s.get("cli") == "muse"
-                    and (s.get("parsed", {}) or {}).get("session_id") in noise)
-        ]
 
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions, None
@@ -603,9 +570,23 @@ def compare(host, verb_data, manual_sessions, verbose=False):
         sid=row.get("session_id")
         if sid in manual_by_id:
             verb_title=(row.get("title") or "").strip()
-            manual_title=(manual_by_id[sid].get("parsed", {}).get("title") or "").strip()
+            # The row label is the CONDENSED store title (first sentence, word
+            # clamp at 72) — the verb ships that and keeps the full text as
+            # `detail`. Compare like for like, or every long title reads as drift.
+            manual_title=(condense_store_title(manual_by_id[sid].get("parsed", {}).get("title")) or "").strip()
             if verb_title and manual_title and verb_title != manual_title:
-                issues.append(f"title mismatch {sid[:8]}: verb {verb_title[:40]!r} vs manual {manual_title[:40]!r}")
+                # ⛔ Show WHERE they diverge. Truncating both sides to 40 chars
+                # printed two identical-looking strings and hid the difference
+                # the check exists to surface.
+                cut = next(
+                    (i for i, (a, b) in enumerate(zip(verb_title, manual_title)) if a != b),
+                    min(len(verb_title), len(manual_title)),
+                )
+                issues.append(
+                    f"title mismatch {sid[:8]} at char {cut}: "
+                    f"verb ...{verb_title[cut:cut + 40]!r} vs manual ...{manual_title[cut:cut + 40]!r} "
+                    f"(len {len(verb_title)} vs {len(manual_title)})"
+                )
     # Count check: durable vs manual
     if abs(len(verb_rows) - len([s for s in manual_sessions if s.get("parsed",{}).get("session_id") or "rollout" in s["path"]]) ) > 10:
         issues.append(f"count drift: verb {len(verb_rows)} vs manual {len(manual_sessions)} (manual includes unscanned)")

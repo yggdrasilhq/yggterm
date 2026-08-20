@@ -215,3 +215,38 @@ def locally_backed_ids(run_on_host, host, rows):
     for p in present:
         ids.update(by_path.get(p, []))
     return ids
+
+
+STORE_TITLE_MAX_CHARS = 72
+
+
+def condense_store_title(raw):
+    """Mirror of `yggterm_core::agent_cli::condense_store_title`.
+
+    ⛔ The oracle must model the SHIPPED contract, not the one it was written
+    against. A store `title` column is not always a title — one CLI records the
+    first prompt verbatim and never updates it — so a row label is the first
+    sentence, word-boundary clamped to 72 chars, with the full text kept as the
+    row's `detail`. An oracle still comparing the raw store text reports drift
+    that does not exist, which is how a checker teaches people to ignore it.
+    """
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        return None
+    if len(trimmed) <= STORE_TITLE_MAX_CHARS and ". " not in trimmed:
+        return trimmed
+    first_sentence = trimmed
+    for i, ch in enumerate(trimmed):
+        if ch in ".!?":
+            first_sentence = trimmed[: i + 1]
+            break
+    candidate = first_sentence.strip().rstrip(".!?").strip() or trimmed
+    if len(candidate) <= STORE_TITLE_MAX_CHARS:
+        return candidate
+    clamped = ""
+    for word in candidate.split():
+        projected = len(word) if not clamped else len(clamped) + 1 + len(word)
+        if projected > STORE_TITLE_MAX_CHARS:
+            break
+        clamped = word if not clamped else clamped + " " + word
+    return clamped or candidate[:STORE_TITLE_MAX_CHARS]
