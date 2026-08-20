@@ -59695,6 +59695,83 @@ mod resume_gate_wiring_locks {
 /// render paints, which signals arm fullscreen) is scanned over PRODUCT lines
 /// only, with a self-check that the scan is not reading this module.
 #[cfg(test)]
+mod terminal_loop_input_starvation_locks {
+    /// The keystroke branch must not be starved by the daemon read.
+    ///
+    /// ⛔ **`tokio::select!` IS A SERIALIZER, AND THAT IS THE WHOLE DEFECT.**
+    /// It runs the chosen branch's body to completion before polling any branch
+    /// again. The terminal event loop has a branch that handles KEYSTROKES and a
+    /// branch that polls the daemon for output. While the read branch awaited the
+    /// daemon inline, a keystroke sitting in the JS event channel could not be
+    /// serviced until the read returned — and `TerminalRead` carries the 10 s
+    /// default client IO timeout, so one slow read could hold the user's typing
+    /// for up to ten seconds. Echo waited on the read poll, not on its own PTY
+    /// write.
+    ///
+    /// ⚠ **AND IT MADE ITS OWN PROBE BLIND.** `input/keystroke` is emitted at the
+    /// top of the keystroke handler, i.e. downstream of the block, so a real
+    /// multi-second stall records nothing at all. That is why the read now runs
+    /// on its own task and `input/loop_block` is emitted from whichever branch
+    /// WAS running.
+    ///
+    /// A behavioural test cannot lock this — the loop needs a live webview, and a
+    /// re-inlined `.await` would still pass every functional assertion while
+    /// quietly restoring the stall. So this reads the source, exactly as the
+    /// daemon's own restart-ordering lock does.
+    #[test]
+    fn the_daemon_read_is_dispatched_off_the_select_loop() {
+        let source = include_str!("viewport.rs");
+
+        let start_marker = "if !terminal_read_in_flight =>";
+        let apply_marker = "terminal_read_rx.recv()";
+        let start_at = source
+            .find(start_marker)
+            .expect("the read-poll branch must be gated on an in-flight latch");
+        let apply_at = source
+            .find(apply_marker)
+            .expect("a branch must receive the read result off the channel");
+        assert!(
+            start_at < apply_at,
+            "the read must be STARTED before the branch that applies it"
+        );
+        let start_branch = &source[start_at..apply_at];
+
+        let spawn_at = start_branch
+            .find("tokio::spawn(")
+            .expect("the read-poll branch must dispatch the read onto its own task");
+        let read_at = start_branch.find("terminal_read_async(").expect(
+            "the read-poll branch must still perform the daemon read",
+        );
+        assert!(
+            spawn_at < read_at,
+            "terminal_read_async must sit INSIDE the spawned task. Awaiting it \
+             directly in the select branch is the input-freeze defect: it stops \
+             the keystroke branch from being polled until the daemon answers, \
+             for up to the 10s TerminalRead client timeout."
+        );
+
+        // The hazard the hoist introduces, and its guard. Six paths in the
+        // JS-event branch reset `cursor` to 0 to force a re-attach. That could
+        // not interleave while the read was awaited inline; now it can, and
+        // applying the stale read's `next_cursor` afterwards would skip past
+        // everything the re-attach meant to replay.
+        let apply_branch = &source[apply_at..];
+        assert!(
+            apply_branch.contains("read_issued_at_cursor != cursor"),
+            "a read issued before the cursor moved must be discarded, or a \
+             re-attach racing a read silently loses the replay it asked for"
+        );
+
+        // The probe that survives the block, because it is emitted by the branch
+        // that ran rather than the one that was starved.
+        assert!(
+            source.contains("struct TerminalLoopBranchGuard"),
+            "the loop must report when one branch holds it long enough to be felt"
+        );
+    }
+}
+
+#[cfg(test)]
 mod web_surface_immersion_locks {
     use super::*;
 

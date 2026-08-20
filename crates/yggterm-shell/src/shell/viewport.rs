@@ -6033,6 +6033,23 @@ fn TerminalCanvas(
             let mut current_terminal_rows = 0_u16;
             let mut last_sent_terminal_resize_cols = 0_u16;
             let mut last_sent_terminal_resize_rows = 0_u16;
+            // The daemon read runs on its own task so the select loop stays free to
+            // service keystrokes while it is out. Depth 1 plus the `in_flight` latch
+            // keeps exactly one read outstanding, so cursor advance stays sequential.
+            let (terminal_read_tx, mut terminal_read_rx) = tokio::sync::mpsc::channel::<(
+                u64,
+                Result<(
+                    u64,
+                    Vec<yggterm_server::TerminalStreamChunk>,
+                    bool,
+                    bool,
+                    bool,
+                    bool,
+                    u64,
+                    bool,
+                )>,
+            )>(1);
+            let mut terminal_read_in_flight = false;
             let mut startup_resize_repair_scheduled = false;
             // RE-RESUME / REFLOW-BG FIX: when the COLUMN count changes, xterm.js
             // reflows and drops the background attribute of existing cells; a
@@ -6623,6 +6640,10 @@ fn TerminalCanvas(
                         break;
                     }
                     event = eval.recv::<TerminalJsEvent>() => {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "js_event",
+                            &session_path,
+                        );
                         match event {
                             Ok(TerminalJsEvent::Ready) => {
                                 if js_ready {
@@ -9669,7 +9690,25 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    _ = tokio::time::sleep_until(next_read_deadline) => {
+                    _ = tokio::time::sleep_until(next_read_deadline),
+                        if !terminal_read_in_flight =>
+                    {
+                        // ⛔ THIS BRANCH ONLY *STARTS* THE READ — IT MUST NOT AWAIT IT.
+                        // `tokio::select!` runs the chosen branch to completion before
+                        // any other branch is polled again, so awaiting the daemon read
+                        // here stops the KEYSTROKE branch from being polled for as long
+                        // as the read takes. `TerminalRead` carries the 10 s default
+                        // client IO timeout, so one slow read could hold the user's
+                        // typing for up to ten seconds, and the `input/keystroke` probe
+                        // could not see it — the probe is emitted from the branch that
+                        // was blocked. The read now runs on its own task and its result
+                        // arrives on `terminal_read_rx`, so typing is serviced while the
+                        // daemon is answering. Locked by
+                        // `a_read_started_before_the_cursor_moved_is_discarded`.
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "read_poll_start",
+                            &session_path,
+                        );
                         if !js_ready {
                             next_read_deadline = tokio::time::Instant::now()
                                 + Duration::from_millis(read_poll_ms);
@@ -9714,14 +9753,61 @@ fn TerminalCanvas(
                                 poll_ms_override: None,
                             } => {}
                         }
-                        match terminal_read_async(
-                            endpoint.clone(),
-                            runtime_session_path.clone(),
-                            cursor,
-                            &trace_home,
-                        )
-                        .await
-                        {
+                        // Re-arm the cadence from the moment the read is ISSUED. The
+                        // completion branch reschedules too; this only guarantees the
+                        // deadline is never left in the past while a read is away.
+                        next_read_deadline =
+                            tokio::time::Instant::now() + Duration::from_millis(read_poll_ms);
+                        terminal_read_in_flight = true;
+                        let read_result_tx = terminal_read_tx.clone();
+                        let read_endpoint = endpoint.clone();
+                        let read_runtime_session_path = runtime_session_path.clone();
+                        let read_issued_at_cursor = cursor;
+                        let read_trace_home = trace_home.clone();
+                        tokio::spawn(async move {
+                            let outcome = terminal_read_async(
+                                read_endpoint,
+                                read_runtime_session_path,
+                                read_issued_at_cursor,
+                                &read_trace_home,
+                            )
+                            .await;
+                            // A closed receiver means the mount is gone; nothing to do.
+                            let _ = read_result_tx.send((read_issued_at_cursor, outcome)).await;
+                        });
+                    }
+                    Some((read_issued_at_cursor, terminal_read_outcome)) =
+                        terminal_read_rx.recv() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "read_poll_apply",
+                            &session_path,
+                        );
+                        terminal_read_in_flight = false;
+                        // ⛔ A READ THAT WAS ISSUED BEFORE THE CURSOR MOVED IS STALE.
+                        // Six paths in the JS-event branch reset `cursor` to 0 to force a
+                        // re-attach. While the read was awaited inline that could not
+                        // interleave; now it can, and applying the old read's
+                        // `next_cursor` afterwards would silently skip past everything
+                        // the re-attach was supposed to replay. Discard instead — the
+                        // next poll re-reads from the new cursor.
+                        if read_issued_at_cursor != cursor {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "terminal_read_discarded_stale_cursor",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "issued_at_cursor": read_issued_at_cursor,
+                                    "current_cursor": cursor,
+                                }),
+                            );
+                            next_read_deadline = tokio::time::Instant::now()
+                                + Duration::from_millis(read_poll_ms);
+                            continue;
+                        }
+                        match terminal_read_outcome {
                             Ok((
                                 next_cursor,
                                 mut chunks,
@@ -15361,6 +15447,66 @@ async fn terminal_force_remote_restart_async(
     );
     Ok(())
 }
+/// How long one branch of the terminal event loop may occupy it before that is
+/// worth recording. A keystroke echo above roughly a tenth of a second is
+/// perceptible, so the threshold sits just under it.
+const TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS: u64 = 120;
+
+/// Records how long ONE `tokio::select!` branch body held the terminal event
+/// loop, and reports it when that becomes user-visible.
+///
+/// ⛔ **THE LOOP IS A SERIALIZER, AND THAT IS THE POINT OF THIS PROBE.**
+/// `tokio::select!` runs the chosen branch's body to completion before any other
+/// branch is polled again. The terminal loop has three branches, and one of them
+/// — the read poll — performs a daemon round trip with no timeout, followed by
+/// replay and reconcile work. While that body is awaiting, the branch that
+/// handles KEYSTROKES is not polled at all: the user's typing sits in the JS
+/// event channel until the read returns. Echo therefore waits on the read poll,
+/// not only on its own PTY write.
+///
+/// ⚠ **AND THAT IS WHY `input/keystroke` COULD READ ZERO THROUGH A REAL STALL.**
+/// It is emitted at the top of the keystroke handler, which is downstream of the
+/// block — a blind instrument by construction, not by misconfiguration. This
+/// guard is emitted from the branch that WAS running, so a stall names its cause.
+///
+/// Drop-based on purpose: the branch bodies `continue` and `return` from many
+/// places, and an explicit timing call at the bottom would miss exactly the
+/// early exits an unusual, slow path takes.
+struct TerminalLoopBranchGuard {
+    branch: &'static str,
+    session_path: String,
+    started_ms: u64,
+}
+
+impl TerminalLoopBranchGuard {
+    fn new(branch: &'static str, session_path: &str) -> Self {
+        Self {
+            branch,
+            session_path: session_path.to_string(),
+            started_ms: current_millis(),
+        }
+    }
+}
+
+impl Drop for TerminalLoopBranchGuard {
+    fn drop(&mut self) {
+        let held_ms = current_millis().saturating_sub(self.started_ms);
+        if held_ms < TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS {
+            return;
+        }
+        yggterm_core::perf::ytrace_emit_event(
+            "shell",
+            "input",
+            "loop_block",
+            json!({
+                "session_path": self.session_path.clone(),
+                "branch": self.branch,
+                "held_ms": held_ms,
+            }),
+        );
+    }
+}
+
 async fn run_dedicated_terminal_io<T, F>(label: &str, trace_home: &Path, work: F) -> Result<T>
 where
     T: Send + 'static,
