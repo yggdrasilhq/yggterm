@@ -325,17 +325,16 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 | `sidebar merge_rows` | 2247 calls/hour | steady background jank source |
 
 **Two workstreams, one owner each:**
-- **11.4 (instrument):** a UI-thread block watchdog — a main-loop heartbeat probe that emits a
+- **11.4 (instrument), OPEN:** a UI-thread block watchdog — a main-loop heartbeat probe that emits a
   durable `ui/block` incident for any gap > ~200 ms with attribution (what ran last), so the next
   freeze names itself; plus root-cause why `input/*` recorded zero on the GUI host and make the
   echo-latency tail land there. The freeze class must never again be zero-incident.
-- **11.3 (suspect):** the title chore's 8.7–20.8 s calls must be strictly async off any lock or
-  thread the UI/snapshot path touches, and paced; likely amplified by the agy fake-recency flood
-  (~1000 rows perpetually "fresh" and eligible for re-title — 11.1's fix shrinks the queue).
+- **11.3 (the chore), FIXED in 3.1.5 and live-proven** — the entry below carries what it actually
+  was. The chore held no lock the render path wanted: it was spending nine seconds per call to be
+  told the LLM plan quota is gone, and retrying that around the clock.
 
-**Falsifier:** with the watchdog live, an induced 500 ms main-thread block raises `ui/block` with
-attribution within one tick; after the chore fix, a full title-chore tick under LLM latency ≥ 10 s
-shows keystroke echo p95 < 100 ms in the input chain on the GUI host.
+**Falsifier (11.4's half):** with the watchdog live, an induced 500 ms main-thread block raises
+`ui/block` with attribution within one tick, and the keystroke echo tail lands on the GUI host.
 
 ## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
 
@@ -359,6 +358,40 @@ line is exactly `<text>`, refuse otherwise, report which. Locality: `PtySessionR
 
 **Falsifier:** with the verb in place, a writer that types-then-submits while a synthetic
 keystroke stream is being fed into the same row can never submit a line containing both.
+
+## ⛔ [11.3] THE INTERFACE LLM'S QUOTA IS GONE, AND EVERY SURFACE KEPT ASKING
+
+**Status:** OPEN
+
+Open on the ENDPOINT half only — the retry storm it caused is fixed in 3.1.5 and live-proven on the
+GUI host 2026-08-20 (incident `title/rate_limited`, `pause_ms 1800000`, `capped true`,
+`reset_hint_epoch_s` three weeks out).
+
+**What was measured** (GUI host, `ytrace tail --category copy_generation --since 180m`): 316 title
+generations in three hours, **297 of them errors**, over **30 distinct sessions** — eleven retried
+20+ times each. `ytrace query --since 60m` scored the same loop at 125 calls and ~18 minutes of wall
+in one hour. A direct probe of the endpoint returns `429 usage_limit_reached`, `plan_type: free`,
+with a reset roughly three weeks out — and takes ~9 s to say so.
+
+**Why it looped instead of backing off:** both surfaces recorded the refusal PER SESSION, so a
+handful of permanently-failing rows round-robined and the queue never drained; and
+`error_for_status` threw the 429's body away, which is the only place the provider says when it
+will serve again.
+
+**Fixed:** the pause is process-wide and armed inside the response handler, so no caller can forget
+it; the generators refuse to spend a request while it is up; the GUI skips the passive scan
+entirely (that scan alone peaked at 25.7 s); a forced regeneration still runs, because that is a
+person waiting for an answer. The provider's absolute wake time is honoured but **capped at 30
+minutes** — obeying a three-week hint literally would trade a loud failure for a silent one, and
+the cap makes the outage cost two probe calls an hour instead of 125.
+
+**Still open, and it is the endpoint rather than the code:** nothing can be titled or summarised
+anywhere on the fleet while the configured model's quota is out. `interface_llm_model` was switched
+to `antigravity/gemini-3.7-flash-low` (measured 200 OK, ~15 s, a proper noun-phrase title and a
+usable timeline paragraph) on the two hosts that hold endpoint credentials; the third holds neither
+endpoint nor key and was left alone. **To reverse:** put the old value back in
+`~/.yggterm/settings.json` — each host kept a `settings.json.bak-title-model-<epoch>` beside it.
+The plan decision itself is his: `owner-attention.md`.
 
 ## ⛔⛔ [11.6] A LAUNCH THAT NEVER REACHED ITS CLI LEAVES A HUSK ROW THAT LOOKS IDLE
 

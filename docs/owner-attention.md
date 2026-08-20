@@ -209,6 +209,15 @@ copies.
   manifest declares no permissions at all today — so the phone lane proceeds and
   the split is a fork taken later, not a prerequisite.
 
+- **The interface LLM's plan quota is exhausted until roughly 13 September** — the
+  configured title/summary model answered every request with `usage_limit_reached`
+  (`plan_type: free`), taking ~9 s to say so, which is what the title chore spent a
+  fifth of every hour on. Only he can decide whether to upgrade that plan or keep
+  running on a different model. **Done meanwhile, and reversible in one field:** the
+  chore now pauses itself on a refusal rather than looping (`pending-bugs.md` [11.3]),
+  and `interface_llm_model` was switched to a working model on the two hosts that hold
+  endpoint credentials — the old value and a restore file are named in that entry.
+
 ## Third parties only he can chase
 
 - **The fake `Anthony Gestapo` US payments profile wants closing, in a NORMAL
