@@ -2496,6 +2496,196 @@ fn app() -> Element {
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
     let metadata_snapshot = snapshot.clone();
+    // ── Sidebar handlers, hoisted into stable callbacks ─────────────────────
+    //
+    // ⛔ An INLINE closure prop defeats component memoization outright:
+    // `Callback::eq` is ptr_eq on the generational box, and rsx allocates a
+    // fresh box per render, so `Sidebar`'s props never compared equal and it
+    // re-rendered its ~200-row tree on 232 of 234 root renders — including
+    // every render whose write changed nothing the sidebar shows (the blink
+    // storm, `dioxus_render/component_window` 2026-08-20). Verified directly
+    // against dioxus-core 0.7.9: with identical data props, an inline handler
+    // re-renders the child (1→2) and a `use_callback`-stable one skips it
+    // (1→1). These hooks keep one box alive across renders so the props
+    // boundary can do its job; the closure BODIES are unchanged, merely moved.
+    let sidebar_on_prev_search_row = use_callback(move |_: ()| {
+        if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(-1)) {
+            spawn_open_session_row(state, row);
+        }
+    });
+    let sidebar_on_next_search_row = use_callback(move |_: ()| {
+        if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(1)) {
+            spawn_open_session_row(state, row);
+        }
+    });
+    let sidebar_on_select_all_rows =
+        use_callback(move |_: ()| state.with_mut_counted(|shell| shell.select_all_tree_rows()));
+    let sidebar_on_navigate_rows = use_callback(move |(delta, to_edge): (i32, bool)| {
+        let focused =
+            state.with_mut_counted(|shell| shell.navigate_sidebar_selection(delta, to_edge));
+        // Keep the keyboard cursor visible + the sidebar the
+        // keyboard owner so the next arrow key lands here too.
+        if let Some(path) = focused {
+            scroll_sidebar_row_into_view(&path);
+        }
+    });
+    let sidebar_on_start_sidebar_resize = use_callback(move |client_x: f64| {
+        state.with_mut_counted(|shell| shell.start_sidebar_resize(client_x))
+    });
+    let sidebar_on_focus_split_pane = use_callback(move |path: String| {
+        focus_split_pane(state, &path);
+    });
+    let sidebar_on_select_row = use_callback(move |(row, mode): (BrowserRow, TreeSelectionMode)| {
+        let row_for_log = row.clone();
+        if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (should_continue, terminal_activation) = {
+                let mut continue_open = true;
+                let mut should_reopen_selected_session = true;
+                let mut terminal_activation = false;
+                state.with_mut_counted(|shell| {
+                    if shell.consume_suppressed_tree_click() {
+                        continue_open = false;
+                        return;
+                    }
+                    let row_already_selected = shell.selected_tree_paths.contains(&row.full_path)
+                        || shell.browser.selected_path() == Some(row.full_path.as_str());
+                    should_reopen_selected_session = !(mode == TreeSelectionMode::Replace
+                        && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+                        && row_already_selected
+                        && shell.server.active_session_path() == Some(row.full_path.as_str()));
+                    terminal_activation = mode == TreeSelectionMode::Replace
+                        && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+                        && preferred_open_mode_for_row(shell, &row) == WorkspaceViewMode::Terminal;
+                    shell.select_tree_row(&row, mode);
+                    if terminal_activation {
+                        arm_terminal_activation(shell, &row.full_path);
+                    }
+                });
+                (
+                    continue_open && should_reopen_selected_session,
+                    terminal_activation,
+                )
+            };
+            if terminal_activation {
+                clear_sidebar_keyboard_owner();
+            } else {
+                claim_sidebar_focus_by_path(Some(&row.full_path));
+            }
+            if !should_continue {
+                if terminal_activation {
+                    schedule_terminal_focus_after_activation(state, row.full_path.clone());
+                }
+                return;
+            }
+            if mode != TreeSelectionMode::Replace {
+                return;
+            }
+            match row.kind {
+                BrowserRowKind::Group | BrowserRowKind::Separator => {
+                    state.with_mut_counted(|shell| shell.select_row(&row))
+                }
+                BrowserRowKind::Session | BrowserRowKind::Document => {
+                    spawn_open_session_row(state, row.clone());
+                    if terminal_activation {
+                        schedule_terminal_focus_after_activation(state, row.full_path.clone());
+                    }
+                }
+            }
+        })) {
+            warn!(
+                path=%row_for_log.full_path,
+                kind=?row_for_log.kind,
+                mode=?mode,
+                panic_payload=?error,
+                "suppressed sidebar row select panic"
+            );
+        }
+    });
+    let sidebar_on_press_highlight_row =
+        use_callback(move |(row, mode): (BrowserRow, TreeSelectionMode)| {
+            // #14: instant highlight on press (no session open/switch).
+            state.with_mut_counted(|shell| shell.select_tree_row(&row, mode));
+            claim_sidebar_focus_by_path(Some(&row.full_path));
+        });
+    let sidebar_on_set_row_expanded = use_callback(move |(row, expanded): (BrowserRow, bool)| {
+        state.with_mut_counted(|shell| {
+            set_app_control_row_expanded(shell, &row, expanded);
+            shell.last_action = if expanded {
+                format!("expanded {}", row.label)
+            } else {
+                format!("collapsed {}", row.label)
+            };
+            shell.refresh_tree_debug("toggle_group_expanded");
+        });
+    });
+    let sidebar_on_delete_selected_items =
+        use_callback(move |hard_delete: bool| queue_delete_selected_items(state, hard_delete));
+    let sidebar_on_delete_row = use_callback(move |row: BrowserRow| {
+        state.with_mut_counted(|shell| shell.open_delete_dialog_for_row(&row, false));
+    });
+    let sidebar_on_open_context_menu =
+        use_callback(move |(row, position): (BrowserRow, (f64, f64))| {
+            let focus_path = row.full_path.clone();
+            state.with_mut_counted(|shell| {
+                if !shell.selected_tree_paths.contains(&row.full_path) {
+                    shell.select_tree_row(&row, TreeSelectionMode::Replace);
+                }
+                shell.open_context_menu(row, position)
+            });
+            claim_sidebar_focus_by_path(Some(&focus_path));
+        });
+    let sidebar_on_start_drag = use_callback(move |(row, pointer): (BrowserRow, (f64, f64))| {
+        state.with_mut_counted(|shell| shell.update_tree_drag_pointer(&row, pointer))
+    });
+    let sidebar_on_drag_hover = use_callback(
+        move |(row, pointer, placement): (BrowserRow, (f64, f64), DragDropPlacement)| {
+            if state
+                .read()
+                .drag_hover_update_needed(&row, pointer, placement)
+            {
+                state.with_mut_counted(|shell| shell.set_drag_hover_target(&row, pointer, placement))
+            }
+        },
+    );
+    let sidebar_on_drag_move = use_callback(move |pointer: (f64, f64)| {
+        if state.read().drag_pointer_update_needed(pointer) {
+            state.with_mut_counted(|shell| shell.update_drag_pointer(pointer))
+        } else if state.read().pending_tree_drag.is_some() {
+            state.with_mut_counted(|shell| shell.update_pending_tree_drag_pointer(pointer))
+        }
+    });
+    let sidebar_on_drag_leave = use_callback(move |_row: BrowserRow| {});
+    let sidebar_on_drop_into_row =
+        use_callback(move |_: ()| queue_drop_current_drag_target(state));
+    let sidebar_on_end_drag =
+        use_callback(move |_: ()| state.with_mut_counted(|shell| shell.clear_drag_state()));
+    let sidebar_on_begin_rename = use_callback(move |row: BrowserRow| {
+        state.with_mut_counted(|shell| shell.begin_tree_rename(&row));
+        sync_active_terminal_input_policy(state);
+    });
+    let sidebar_on_regenerate_row_title = use_callback(move |row: BrowserRow| {
+        queue_rename_field_ai_title_generation(state, row);
+    });
+    let sidebar_on_update_rename = use_callback(move |value: String| {
+        state.with_mut_counted(|shell| shell.update_tree_rename_value(value))
+    });
+    let sidebar_on_focus_rename = use_callback(move |_: ()| {
+        state.with_mut_counted(|shell| shell.note_tree_rename_input_focus())
+    });
+    let sidebar_on_commit_rename = use_callback(move |row: BrowserRow| {
+        let label = {
+            let shell = state.read();
+            if shell.tree_rename_path.as_deref() != Some(row.full_path.as_str()) {
+                return;
+            }
+            shell.tree_rename_value.clone()
+        };
+        queue_tree_rename(state, row, label);
+    });
+    let sidebar_on_cancel_rename = use_callback(move |_: ()| {
+        state.with_mut_counted(|shell| shell.cancel_tree_rename());
+        sync_active_terminal_input_policy(state);
+    });
     // A native child webview paints above ALL DOM. An auto-hidden titlebar is
     // `position:absolute` OVER the content — and a web surface would swallow
     // that whole: the titlebar (app menu, the ychrome/incognito identity, the
@@ -3808,167 +3998,30 @@ fn app() -> Element {
                         autohide: left_sidebar_autohide,
                         autohide_revealed: left_sidebar_revealed,
                         autohide_pinned: left_sidebar_pinned,
-                        on_prev_search_row: move |_| {
-                            if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(-1)) {
-                                spawn_open_session_row(state, row);
-                            }
-                        },
-                        on_next_search_row: move |_| {
-                            if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(1)) {
-                                spawn_open_session_row(state, row);
-                            }
-                        },
-                        on_select_all_rows: move |_| {
-                            state.with_mut_counted(|shell| shell.select_all_tree_rows())
-                        },
-                        on_navigate_rows: move |(delta, to_edge): (i32, bool)| {
-                            let focused = state.with_mut_counted(|shell| {
-                                shell.navigate_sidebar_selection(delta, to_edge)
-                            });
-                            // Keep the keyboard cursor visible + the sidebar the
-                            // keyboard owner so the next arrow key lands here too.
-                            if let Some(path) = focused {
-                                scroll_sidebar_row_into_view(&path);
-                            }
-                        },
-                        on_start_sidebar_resize: move |client_x: f64| {
-                            state.with_mut_counted(|shell| shell.start_sidebar_resize(client_x))
-                        },
-                        on_focus_split_pane: move |path: String| {
-                            focus_split_pane(state, &path);
-                        },
-                        on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
-                            let row_for_log = row.clone();
-                            if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                let (should_continue, terminal_activation) = {
-                                    let mut continue_open = true;
-                                    let mut should_reopen_selected_session = true;
-                                    let mut terminal_activation = false;
-                                    state.with_mut_counted(|shell| {
-                                        if shell.consume_suppressed_tree_click() {
-                                            continue_open = false;
-                                            return;
-                                        }
-                                        let row_already_selected = shell.selected_tree_paths.contains(&row.full_path)
-                                            || shell.browser.selected_path() == Some(row.full_path.as_str());
-                                        should_reopen_selected_session = !(mode == TreeSelectionMode::Replace
-                                            && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
-                                            && row_already_selected
-                                            && shell.server.active_session_path() == Some(row.full_path.as_str()));
-                                        terminal_activation = mode == TreeSelectionMode::Replace
-                                            && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
-                                            && preferred_open_mode_for_row(shell, &row) == WorkspaceViewMode::Terminal;
-                                        shell.select_tree_row(&row, mode);
-                                        if terminal_activation {
-                                            arm_terminal_activation(shell, &row.full_path);
-                                        }
-                                    });
-                                    (continue_open && should_reopen_selected_session, terminal_activation)
-                                };
-                                if terminal_activation {
-                                    clear_sidebar_keyboard_owner();
-                                } else {
-                                    claim_sidebar_focus_by_path(Some(&row.full_path));
-                                }
-                                if !should_continue {
-                                    if terminal_activation {
-                                        schedule_terminal_focus_after_activation(state, row.full_path.clone());
-                                    }
-                                    return;
-                                }
-                                if mode != TreeSelectionMode::Replace {
-                                    return;
-                                }
-                                match row.kind {
-                                    BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut_counted(|shell| shell.select_row(&row)),
-                                    BrowserRowKind::Session | BrowserRowKind::Document => {
-                                        spawn_open_session_row(state, row.clone());
-                                        if terminal_activation {
-                                            schedule_terminal_focus_after_activation(state, row.full_path.clone());
-                                        }
-                                    }
-                                }
-                            })) {
-                                warn!(
-                                    path=%row_for_log.full_path,
-                                    kind=?row_for_log.kind,
-                                    mode=?mode,
-                                    panic_payload=?error,
-                                    "suppressed sidebar row select panic"
-                                );
-                            }
-                        },
-                        on_press_highlight_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
-                            // #14: instant highlight on press (no session open/switch).
-                            state.with_mut_counted(|shell| shell.select_tree_row(&row, mode));
-                            claim_sidebar_focus_by_path(Some(&row.full_path));
-                        },
-                        on_set_row_expanded: move |(row, expanded): (BrowserRow, bool)| {
-                            state.with_mut_counted(|shell| {
-                                set_app_control_row_expanded(shell, &row, expanded);
-                                shell.last_action = if expanded {
-                                    format!("expanded {}", row.label)
-                                } else {
-                                    format!("collapsed {}", row.label)
-                                };
-                                shell.refresh_tree_debug("toggle_group_expanded");
-                            });
-                        },
-                        on_delete_selected_items: move |hard_delete: bool| queue_delete_selected_items(state, hard_delete),
-                        on_delete_row: move |row: BrowserRow| {
-                            state.with_mut_counted(|shell| shell.open_delete_dialog_for_row(&row, false));
-                        },
-                        on_open_context_menu: move |(row, position): (BrowserRow, (f64, f64))| {
-                            let focus_path = row.full_path.clone();
-                            state.with_mut_counted(|shell| {
-                                if !shell.selected_tree_paths.contains(&row.full_path) {
-                                    shell.select_tree_row(&row, TreeSelectionMode::Replace);
-                                }
-                                shell.open_context_menu(row, position)
-                            });
-                            claim_sidebar_focus_by_path(Some(&focus_path));
-                        },
-                        on_start_drag: move |(row, pointer): (BrowserRow, (f64, f64))| {
-                            state.with_mut_counted(|shell| shell.update_tree_drag_pointer(&row, pointer))
-                        },
-                        on_drag_hover: move |(row, pointer, placement): (BrowserRow, (f64, f64), DragDropPlacement)| {
-                            if state.read().drag_hover_update_needed(&row, pointer, placement) {
-                                state.with_mut_counted(|shell| shell.set_drag_hover_target(&row, pointer, placement))
-                            }
-                        },
-                        on_drag_move: move |pointer: (f64, f64)| {
-                            if state.read().drag_pointer_update_needed(pointer) {
-                                state.with_mut_counted(|shell| shell.update_drag_pointer(pointer))
-                            } else if state.read().pending_tree_drag.is_some() {
-                                state.with_mut_counted(|shell| shell.update_pending_tree_drag_pointer(pointer))
-                            }
-                        },
-                        on_drag_leave: move |_row: BrowserRow| {},
-                        on_drop_into_row: move |_| queue_drop_current_drag_target(state),
-                        on_end_drag: move |_| state.with_mut_counted(|shell| shell.clear_drag_state()),
-                        on_begin_rename: move |row: BrowserRow| {
-                            state.with_mut_counted(|shell| shell.begin_tree_rename(&row));
-                            sync_active_terminal_input_policy(state);
-                        },
-                        on_regenerate_row_title: move |row: BrowserRow| {
-                            queue_rename_field_ai_title_generation(state, row);
-                        },
-                        on_update_rename: move |value: String| state.with_mut_counted(|shell| shell.update_tree_rename_value(value)),
-                        on_focus_rename: move |_| state.with_mut_counted(|shell| shell.note_tree_rename_input_focus()),
-                        on_commit_rename: move |row: BrowserRow| {
-                            let label = {
-                                let shell = state.read();
-                                if shell.tree_rename_path.as_deref() != Some(row.full_path.as_str()) {
-                                    return;
-                                }
-                                shell.tree_rename_value.clone()
-                            };
-                            queue_tree_rename(state, row, label);
-                        },
-                        on_cancel_rename: move |_| {
-                            state.with_mut_counted(|shell| shell.cancel_tree_rename());
-                            sync_active_terminal_input_policy(state);
-                        },
+                        on_prev_search_row: sidebar_on_prev_search_row,
+                        on_next_search_row: sidebar_on_next_search_row,
+                        on_select_all_rows: sidebar_on_select_all_rows,
+                        on_navigate_rows: sidebar_on_navigate_rows,
+                        on_start_sidebar_resize: sidebar_on_start_sidebar_resize,
+                        on_focus_split_pane: sidebar_on_focus_split_pane,
+                        on_select_row: sidebar_on_select_row,
+                        on_press_highlight_row: sidebar_on_press_highlight_row,
+                        on_set_row_expanded: sidebar_on_set_row_expanded,
+                        on_delete_selected_items: sidebar_on_delete_selected_items,
+                        on_delete_row: sidebar_on_delete_row,
+                        on_open_context_menu: sidebar_on_open_context_menu,
+                        on_start_drag: sidebar_on_start_drag,
+                        on_drag_hover: sidebar_on_drag_hover,
+                        on_drag_move: sidebar_on_drag_move,
+                        on_drag_leave: sidebar_on_drag_leave,
+                        on_drop_into_row: sidebar_on_drop_into_row,
+                        on_end_drag: sidebar_on_end_drag,
+                        on_begin_rename: sidebar_on_begin_rename,
+                        on_regenerate_row_title: sidebar_on_regenerate_row_title,
+                        on_update_rename: sidebar_on_update_rename,
+                        on_focus_rename: sidebar_on_focus_rename,
+                        on_commit_rename: sidebar_on_commit_rename,
+                        on_cancel_rename: sidebar_on_cancel_rename,
                         rename_depth: tree_rename_depth,
                     }
                     }

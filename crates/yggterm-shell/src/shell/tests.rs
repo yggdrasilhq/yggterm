@@ -4133,6 +4133,65 @@ mod tests {
         );
     }
 
+    // The OTHER memo prerequisite: an INLINE closure prop defeats memoization
+    // outright — `Callback::eq` is ptr_eq on the generational box, rsx
+    // allocates a fresh box per render, so any `on_x: move |…|` in the
+    // `Sidebar` call makes its props never compare equal and the ~200-row tree
+    // repaints on every root render (232 of 234 measured, 2026-08-20).
+    // Verified against dioxus-core 0.7.9 directly: identical data props with
+    // an inline handler re-render the child; a `use_callback`-stable one
+    // skips. The handlers are hoisted into `use_callback` hooks in `app()`;
+    // this scan keeps a casual "just add a little closure" from undoing that.
+    #[test]
+    fn the_sidebar_call_site_passes_no_inline_handlers() {
+        let source = SHELL_SOURCE;
+        let anchor = "Sidebar {\n                        snapshot: sidebar_snapshot,";
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("the scan lost its anchor {anchor:?}"));
+        let body = &source[start..];
+        let end = body
+            .find("rename_depth: tree_rename_depth,")
+            .unwrap_or_else(|| panic!("the Sidebar call site lost its closing prop"));
+        let body = &body[..end];
+        assert!(
+            body.len() < 3_000,
+            "the Sidebar call-site slice is {} bytes — the scan lost its bounds",
+            body.len()
+        );
+        assert!(
+            !body.contains("move |"),
+            "an inline closure is back in the Sidebar call site — its props can \
+             never compare equal again, and the sidebar repaints on every root \
+             render. Hoist it into a `use_callback` beside the others."
+        );
+        assert!(
+            source.contains("let sidebar_on_select_row = use_callback("),
+            "the hoisted sidebar callbacks are gone from app()"
+        );
+    }
+
+    // The memo prerequisite for the whole component tree: two back-to-back
+    // snapshots of an UNCHANGED shell must compare equal. `MainSurface` and
+    // `Sidebar` receive the snapshot as a prop, and Dioxus skips their
+    // re-render exactly when the props compare equal — so any field that
+    // varies per CALL (a wall-clock read, an unseeded hash order, a counter)
+    // makes memoization structurally impossible: 233-of-234 root renders
+    // repainted both components (2026-08-20). This lock names the defect
+    // before it names a culprit.
+    #[test]
+    fn an_unchanged_shell_snapshots_equal_twice() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let shell = ShellState::new(bootstrap);
+        let first = shell.snapshot();
+        let second = shell.snapshot();
+        assert!(
+            first == second,
+            "two snapshots of an untouched shell differ — some field varies per \
+             call, and no component downstream of the snapshot can ever memoize"
+        );
+    }
+
     // The read-only twin must answer exactly "would the decider write?". A twin
     // that under-reports starves the sync — drafts never reach the crash-safe
     // store; one that over-reports reintroduces the once-per-tick root render

@@ -43214,6 +43214,18 @@ fn schedule_remote_preview_retry_tick(
     spawn(async move {
         sleep(Duration::from_millis(delay_ms)).await;
         info!(session_path=%session_path, "active title generation retry woke");
+        // When the kick below could not schedule anything (view left Rendered,
+        // session no longer active, auto-sync off), the dirty-epoch write was
+        // pure signal churn: the retry chain dies either way — nothing re-arms
+        // it — and `remote_preview_dirty_epoch` has no reader that would act
+        // on the mark. Skip both writes rather than render twice to do nothing.
+        let possible = safe_shell_read(state, "remote_preview_retry_tick_precheck", |shell| {
+            active_remote_preview_kick_is_possible(shell)
+        })
+        .unwrap_or(false);
+        if !possible {
+            return;
+        }
         let _ = safe_shell_mut(state, "remote_preview_retry_tick", |shell| {
             shell
                 .remote_preview_dirty_epoch
@@ -43588,7 +43600,30 @@ fn spawn_preview_payload_sync(
         });
     });
 }
+/// Read-only twin of the guards at the top of
+/// [`kick_active_remote_preview_sync`]'s write pass: could a kick possibly
+/// schedule anything right now? Both the kick and the retry tick ask this off
+/// a plain read first, because entering `with_mut` just to discover "not the
+/// rendered view" dirtied the whole signal — measured at ~17 no-op renders a
+/// minute while the preview retry loop churned (`component_window` 2026-08-20).
+fn active_remote_preview_kick_is_possible(shell: &ShellState) -> bool {
+    if shell.server.active_view_mode() != WorkspaceViewMode::Rendered || shell.server_busy {
+        return false;
+    }
+    let Some(session) = shell.server.active_session() else {
+        return false;
+    };
+    session_preview_syncs_from_remote(&session.session_path)
+        && remote_preview_should_auto_sync(session)
+}
 fn kick_active_remote_preview_sync(state: Signal<ShellState>, reason: &'static str) -> bool {
+    let possible = safe_shell_read(state, "kick_active_remote_preview_sync_precheck", |shell| {
+        active_remote_preview_kick_is_possible(shell)
+    })
+    .unwrap_or(false);
+    if !possible {
+        return false;
+    }
     let action = safe_shell_mut(state, "kick_active_remote_preview_sync", |shell| {
         if shell.server.active_view_mode() != WorkspaceViewMode::Rendered || shell.server_busy {
             return None;
