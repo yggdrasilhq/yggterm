@@ -6038,6 +6038,7 @@ fn TerminalCanvas(
             // keeps exactly one read outstanding, so cursor advance stays sequential.
             let (terminal_read_tx, mut terminal_read_rx) = tokio::sync::mpsc::channel::<(
                 u64,
+                u64,
                 Result<(
                     u64,
                     Vec<yggterm_server::TerminalStreamChunk>,
@@ -6048,8 +6049,22 @@ fn TerminalCanvas(
                     u64,
                     bool,
                 )>,
-            )>(1);
+            )>(2);
             let mut terminal_read_in_flight = false;
+            // ⛔ THE LATCH MUST NOT BE ABLE TO STICK. It is the only thing that
+            // re-enables the read branch, so a completion that never arrives would
+            // stop this session reading FOREVER — a terminal that goes silently
+            // dead, which is a worse failure than the stall this hoist removes.
+            // `run_dedicated_terminal_io` already turns a panic in the blocking
+            // read into an `Err` that is sent normally, so no path is known to
+            // lose one; this is the belt for the paths that are not known. After
+            // `TERMINAL_READ_OVERDUE_MS` the read is re-issued regardless.
+            //
+            // Re-issuing means two results can be outstanding, and applying both
+            // would write the same chunks twice. The GENERATION decides: only the
+            // newest read is applied, every earlier one is dropped.
+            let mut terminal_read_started_at_ms = 0_u64;
+            let mut terminal_read_generation = 0_u64;
             let mut startup_resize_repair_scheduled = false;
             // RE-RESUME / REFLOW-BG FIX: when the COLUMN count changes, xterm.js
             // reflows and drops the background attribute of existing cells; a
@@ -9691,7 +9706,11 @@ fn TerminalCanvas(
                         }
                     }
                     _ = tokio::time::sleep_until(next_read_deadline),
-                        if !terminal_read_in_flight =>
+                        if terminal_read_may_start(
+                            terminal_read_in_flight,
+                            terminal_read_started_at_ms,
+                            current_millis(),
+                        ) =>
                     {
                         // ⛔ THIS BRANCH ONLY *STARTS* THE READ — IT MUST NOT AWAIT IT.
                         // `tokio::select!` runs the chosen branch to completion before
@@ -9758,7 +9777,23 @@ fn TerminalCanvas(
                         // deadline is never left in the past while a read is away.
                         next_read_deadline =
                             tokio::time::Instant::now() + Duration::from_millis(read_poll_ms);
+                        if terminal_read_in_flight {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "terminal_read_overdue_reissued",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "outstanding_ms": current_millis()
+                                        .saturating_sub(terminal_read_started_at_ms),
+                                }),
+                            );
+                        }
                         terminal_read_in_flight = true;
+                        terminal_read_started_at_ms = current_millis();
+                        terminal_read_generation = terminal_read_generation.wrapping_add(1);
+                        let read_generation = terminal_read_generation;
                         let read_result_tx = terminal_read_tx.clone();
                         let read_endpoint = endpoint.clone();
                         let read_runtime_session_path = runtime_session_path.clone();
@@ -9773,16 +9808,37 @@ fn TerminalCanvas(
                             )
                             .await;
                             // A closed receiver means the mount is gone; nothing to do.
-                            let _ = read_result_tx.send((read_issued_at_cursor, outcome)).await;
+                            let _ = read_result_tx
+                                .send((read_generation, read_issued_at_cursor, outcome))
+                                .await;
                         });
                     }
-                    Some((read_issued_at_cursor, terminal_read_outcome)) =
+                    Some((read_generation, read_issued_at_cursor, terminal_read_outcome)) =
                         terminal_read_rx.recv() =>
                     {
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "read_poll_apply",
                             &session_path,
                         );
+                        // A superseded read (its successor was already re-issued
+                        // after this one went overdue) is dropped whole: applying
+                        // it would write the same chunks a second time. It also
+                        // must not clear the latch, which now belongs to the newer
+                        // read still outstanding.
+                        if read_generation != terminal_read_generation {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "terminal_read_discarded_superseded",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "arrived_generation": read_generation,
+                                    "current_generation": terminal_read_generation,
+                                }),
+                            );
+                            continue;
+                        }
                         terminal_read_in_flight = false;
                         // ⛔ A READ THAT WAS ISSUED BEFORE THE CURSOR MOVED IS STALE.
                         // Six paths in the JS-event branch reset `cursor` to 0 to force a
@@ -14190,6 +14246,27 @@ fn terminal_replay_source_is_retained_snapshot(source: &str) -> bool {
         source,
         "daemon_retained_snapshot" | "daemon_retained_history_screen_snapshot"
     )
+}
+
+/// How long an outstanding daemon read may go unanswered before the loop stops
+/// believing in it and issues another.
+///
+/// The client's own IO timeout for `TerminalRead` is 10s, so a live read always
+/// resolves well inside this. The window is deliberately far wider than that: it
+/// is not a latency budget, it is the backstop against a completion that is
+/// never delivered at all, and firing it early would mean two reads racing for
+/// no reason.
+const TERMINAL_READ_OVERDUE_MS: u64 = 30_000;
+
+/// May the loop start a daemon read now?
+///
+/// Normally: only when none is outstanding, so cursor advance stays sequential.
+/// The exception is the stuck-latch backstop — see `TERMINAL_READ_OVERDUE_MS`.
+/// A read admitted by that exception supersedes the one before it, and the
+/// generation check at the apply site drops the older result rather than writing
+/// its chunks twice.
+fn terminal_read_may_start(in_flight: bool, started_at_ms: u64, now_ms: u64) -> bool {
+    !in_flight || now_ms.saturating_sub(started_at_ms) >= TERMINAL_READ_OVERDUE_MS
 }
 
 fn retained_rehydrate_should_skip_before_read(
