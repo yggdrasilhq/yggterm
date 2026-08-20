@@ -1208,11 +1208,24 @@ def cmd_subscribe(args):
     # the exact failure the wrapper existed to prevent. **Whenever a wrapper fails,
     # the fallback is a hand-rolled call.** That is why this check belongs here, at
     # the moment someone can still fix it, rather than in the wrapper.
+    # ⛔⛔ A LOCAL ROW HAS NO MACHINE SEGMENT, AND REFUSING IT LEFT EVERY LOCAL
+    #    ROW UNSUPERVISED. The check demanded `<scheme>://<machine>/<uuid>` and
+    #    rejected `local://<uuid>` — which is not a malformed address, it is the
+    #    canonical path the create verb RETURNS for a row on the GUI host. The
+    #    monitor accepted the same string, so a row could be watched on one plane
+    #    and unarmable on the other, and the refusal read as caller error.
+    #    Measured 2026-08-20 arming a delegate on the GUI host.
+    #    ⇒ Both shapes are addressable; a BARE uuid is still refused, which is
+    #    the failure this check was actually written for.
     if args.row:
-        if not re.match(r"^[a-z][a-z0-9+.-]*://[^/]+/[0-9a-fA-F-]{36}$", args.row.rstrip("/")):
+        addressable = re.match(
+            r"^[a-z][a-z0-9+.-]*://([^/]+/)?[0-9a-fA-F-]{36}$", args.row.rstrip("/"))
+        if not addressable:
             log(f"⛔ REFUSING to arm — --row {args.row!r} is not an addressable row.")
-            log("   It must be <scheme>://<machine>/<full-uuid>, e.g.")
+            log("   It must be <scheme>://<machine>/<full-uuid> for a remote row, e.g.")
             log("     remote-cc://dev/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+            log("   or <scheme>://<full-uuid> for a row on the GUI host, e.g.")
+            log("     local://xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
             log("   A bare uuid resolves ABSENT on every tick, and this watchdog")
             log("   then unsubscribes it as retired — silently, and looking healthy")
             log("   in `list` until it vanishes. Fix the address, not this check.")
