@@ -211,7 +211,17 @@ renders stale while keystrokes go nowhere the user can see; the owner fought unr
 input and window switches for minutes, then replaced the GUI by hand at 23:37 (the
 replacement, launched the normal supervised way, is clean — no such log). Likely coupling:
 the swap-residue entry below (page-in storms on a swap-resident GUI can blow a 2 s ACK
-deadline), and the launch context itself (app-control launch on a loaded host). **Wanted:**
+deadline), and the launch context itself (app-control launch on a loaded host).
+
+**RECURRENCE on the replacement GUI, owner-reported "biting again and again" (23:4x), with
+heat.** Measured live: GUI 26% CPU + WebKitWebProcess 23% SUSTAINED (+ daemon 15%; temps
+56-58 °C, fans up) on a mostly-idle desktop; ytrace `ui/block` incidents ~1/min (gap 279 ms,
+`last_activity input/render`) — felt as dead keystrokes, below the 6/min freeze threshold so
+no instrument escalated. The dioxus render loop itself is ~1% (innocent); the burn is the
+xterm canvas painting a full-speed agent stream in the watched row plus the
+`terminal_attach_host_health_sample` refresh family leading the render-cause list. The 3.1.15
+roll (MainSurface subscription fix + canvas instrumentation) is the targeted medicine and was
+expedited to the lane driving it with this evidence. **Wanted:**
 the ACK-failure count surfaced as a ytrace incident (`webview_edit_faults` exists — wire it
 to ui/block so a sick webview is VISIBLE from outside), and a threshold at which the GUI
 self-restarts its webview instead of limping one frame stale.
