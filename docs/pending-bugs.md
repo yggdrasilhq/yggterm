@@ -155,11 +155,18 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 - ⚠ **Turn zero is the one safe moment** (an empty session has no history to re-read), so a
   switch immediately after a spawn repairs a launch that has just failed. That is a repair, not
   a way to re-aim a session that has run.
-- **Narrowed 2026-08-20 (sibling campaign, 2/2 spawns):** `--permission-mode bypass` from the SAME
-  call IS honoured (`--dangerously-skip-permissions` present on the process) — the drop is specific
-  to the model flag's plumbing, not general option loss. And the decisive VERIFICATION instrument
-  is the transcript's assistant-record `model` field after the first turn: the screen banner
-  false-negatives once it scrolls, and the process cmdline is blind after a `/model` repair.
+- ⛔ **THE "SELECTIVE DROP" NARROWING IS WITHDRAWN — IT WAS A FALSE INFERENCE, MADE TWICE.** Two
+  campaigns independently reported that `--permission-mode bypass` from the same call WAS honoured
+  because `--dangerously-skip-permissions` appeared on the spawned process, and concluded the loss
+  was specific to the model flag's plumbing. It is not. **`claude_code_extra_args` in the settings
+  store is `--dangerously-skip-permissions` on every fleet host**, so that flag appears on every
+  spawn whether or not per-launch options applied. It was never evidence of anything.
+  ⇒ `launch.applied` is all-or-nothing and was accurate; the "partial application" never happened.
+  ⚠ **The shape to keep:** a flag that the configured defaults ALSO supply cannot witness that a
+  per-launch option was honoured. Pick a witness that only the per-launch path can produce.
+- **The decisive VERIFICATION instrument** is the transcript's assistant-record `model` field after
+  the first turn: the screen banner false-negatives once it scrolls, and the process cmdline is
+  blind after a `/model` repair.
 - **Locality, corrected:** NOT the launch-command builder. Lane 11.2 measured that layer directly
   and found `launch.applied:True`, `launch.model:claude-fable-5` and the flag present in the
   composed command — then said plainly that the loss was downstream and not theirs. That refusal to

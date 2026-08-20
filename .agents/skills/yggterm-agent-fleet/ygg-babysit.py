@@ -79,6 +79,35 @@ def ygg(host, *args):
         return {}
 
 
+def ledger_row_path(entry):
+    """The ROW PATH inside a spawned-by ledger line.
+
+    ⛔⛔ THE LEDGER LINE IS NOT A ROW PATH, AND EVERY CONSUMER HERE WANTED THE
+    PATH. `--spawned-by` reads `<seat>|<lane>|<cwd>|<row-path>` lines and fed
+    them, whole, to code that splits on `://` to find a scheme. So for
+    `7.1|widgets|<checkout>|local://<uuid>` the "scheme" came out as
+    `7.1|widgets|<checkout>|local`, which is neither `local`
+    nor a `remote*` prefix — `row_host` fell through to None, the transcript was
+    hunted on the WRONG MACHINE, and the tool announced **"the brief was
+    dropped, re-submit it"** about a healthy row whose transcript held 8 hits of
+    that very brief.
+
+    ⚠ **And the remedy it prescribes is destructive**, which is what makes this
+    worse than a wrong label: re-submitting types a full brief into a row that is
+    mid-task. Same shape as the monitor's stand-down defect — *a warning whose
+    remedy another verb forbids is a defect in the warning* — except this one
+    would have been acted on, because a dropped brief is a real and common fault.
+
+    ⚠ **It hid behind an accident.** A `remote-cc://<host>/<uuid>` line
+    mis-parses identically, but its transcript happens to live on the machine the
+    fallback searches, so those rows read correctly and the tool looked fine on
+    every row except the one kind that exposes it. `--row` passes a bare path and
+    never had the fault at all, so the two doors into this tool disagreed.
+    """
+    entry = (entry or "").strip()
+    return entry.rsplit("|", 1)[-1].strip() if "|" in entry else entry
+
+
 def row_host(row, gui_host):
     """Which MACHINE holds this row's transcript.
 
@@ -496,7 +525,22 @@ def main():
         f = STATE / f"spawned-by-{args.spawned_by}.txt"
         if f.exists():
             rows += [l.strip() for l in f.read_text().splitlines() if l.strip()]
-    rows = sorted(set(rows))
+    # ⭐ Normalise to ROW PATHS before anything judges a row, keeping the ledger
+    #    line only as a display label. Every consumer below — row_host,
+    #    row_exists, escalate, nudge — addresses a row, and a ledger line is not
+    #    an address. See ledger_row_path.
+    labels = {}
+    paths = []
+    for entry in rows:
+        path = ledger_row_path(entry)
+        if not path:
+            continue
+        if path not in labels:
+            paths.append(path)
+        # A seat-bearing ledger line is the more useful label; keep it if we have one.
+        if path not in labels or entry != path:
+            labels[path] = entry
+    rows = sorted(set(paths))
     if not rows:
         log("no rows given (--row or --spawned-by)")
         return 2
@@ -520,7 +564,7 @@ def main():
                 # treated as finished. A watchdog that cannot tell "I could not
                 # look" from "it is dead", and resolves that toward standing down,
                 # is worse than no watchdog. BLIND is non-terminal: keep watching.
-                report.append({"row": row, "state": "BLIND", "age_min": 0,
+                report.append({"row": labels.get(row, row), "state": "BLIND", "age_min": 0,
                                "action": "STILL-WATCHING", "tail":
                                "row plane unreachable — this says nothing about the row"})
                 continue
@@ -528,7 +572,7 @@ def main():
                 # ⛔ Ask the ROW LIST before the transcript. A retired row's
                 #    transcript is frozen mid-turn and is indistinguishable from
                 #    a live wedge.
-                report.append({"row": row, "state": "GONE", "age_min": 0,
+                report.append({"row": labels.get(row, row), "state": "GONE", "age_min": 0,
                                "action": "RETIRED", "tail": ""})
                 continue
             c = classify(uuid, rhost)
