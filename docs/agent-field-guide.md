@@ -639,6 +639,38 @@ real case, and passed a test that only exercised the empty one.
 (count) is not.** Measured, not assumed — and the way to know is to test BOTH
 branches, including the one you did not change.
 
+### ⛔ A HAND-ROLLED vt100 SCORES A PAINTED BANNER AS BLANK, AND INVENTS A CUT-OFF TOP
+
+**The instrument:** any quick parser written to answer "how much of the grid did
+this TUI paint?" — including a careful one.
+
+**What it says:** that the top rows of a CLI's banner are missing, consistently,
+at every window size. Which reads as a real, reproducible rendering bug.
+
+**Why it is wrong, twice over:**
+
+1. **Gradient banners and block art are routinely drawn as SPACES carrying a
+   BACKGROUND COLOUR.** A cell can be fully painted and hold no text at all, so a
+   "is the text blank" test scores the painted half of a header as empty. This is
+   not an edge case — it is how most colour banners are drawn.
+2. **Alt-screen (`\x1b[?1049h`) and scroll regions (DECSTBM) are easy to skip**
+   and change what "row 1" even means. Miss them and the model scrolls where the
+   real terminal does not.
+
+⇒ **Use `scripts/cli-viewport-probe`**, which feeds a real PTY to the **same
+`vt100` crate `yggterm-server::terminal` parses with** — so a coverage number is
+measured by the daemon's own eyes rather than by a second implementation that can
+disagree with it. It reports `bg_only_cells` precisely so the background-painted
+case is visible instead of silent.
+
+⭐ **The general form, which is the reusable part:** when you write an instrument
+to check a renderer, you have written a SECOND renderer, and now you have two
+things that can be wrong. Prefer the one the product already trusts. Caught
+2026-08-20 — the hand-rolled probe "confirmed" a qwen cut-off top that the
+daemon's own parser then also confirmed, but only after the blank test was
+corrected; had the banner been drawn the common way, the first answer would have
+been a fabricated bug report against an innocent CLI.
+
 ## 2. Profiling recipes that work
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:

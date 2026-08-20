@@ -9828,14 +9828,17 @@ fn TerminalCanvas(
                         // the OLD session's differentials into the NEWLY mounted
                         // viewport, only noticing on the next trip round.
                         //
-                        // That is the cross-session canvas bleed, reported with
-                        // frames 2026-08-20: a freshly created row (0 user, 0
-                        // assistant turns) rendering another row's live working
-                        // stream — spinner, diff and all — while its own metadata
-                        // rail correctly said it was empty. A full repaint inside
-                        // the CLI cleared it every time, which is the tell that
-                        // the daemon's screen was never wrong and only the client
-                        // grid was poisoned.
+                        // ⚠ THE EVIDENCE FOR THIS IS THE FALSIFIER, NOT A FIELD
+                        // REPORT — and the difference is worth keeping. It was
+                        // written against a 2026-08-20 report of a row rendering
+                        // another session's live stream, which looked like a
+                        // perfect instance. That attribution was then WITHDRAWN:
+                        // the rollout file showed the canvas had been right all
+                        // along (it was that session's own work) and the metadata
+                        // rail was the thing lying about the turn counts. The race
+                        // below is real regardless — the lock test fails against
+                        // the pre-gate source — but it is claimed on that test, not
+                        // on those frames. Do not re-attach the anecdote to it.
                         //
                         // The check is cheap (one read lock) and belongs HERE, at
                         // the last instant before the bytes are used, because the

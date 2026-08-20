@@ -59748,13 +59748,14 @@ mod terminal_loop_input_starvation_locks {
     /// session's differentials into the NEWLY mounted viewport, noticing only on
     /// the next trip round.
     ///
-    /// That is the cross-session canvas bleed reported with frames on 2026-08-20:
-    /// a freshly created row showing 0 user and 0 assistant turns in its metadata
-    /// rail while its viewport rendered another row's live working stream. A
-    /// repaint inside the CLI cleared it every time — the tell that the daemon's
-    /// screen was never wrong and only the client grid was poisoned. Plain
-    /// terminal CC never shows it, so by the wrapper-vs-manual parity rule it is
-    /// ours.
+    /// ⚠ **THIS TEST IS THE EVIDENCE, NOT A FIELD REPORT.** It was written against
+    /// a 2026-08-20 sighting of a row rendering another session's live stream,
+    /// which looked like a textbook instance. That attribution was WITHDRAWN when
+    /// the rollout file was measured: the canvas had been right (it was that
+    /// session's own work) and the METADATA RAIL was lying about the turn counts.
+    /// The race is real independently — this lock fails against the pre-gate
+    /// source — so it is claimed on the source, and the anecdote must not be
+    /// re-attached to it.
     ///
     /// The gate must sit at the LAST instant before the bytes are used, not at
     /// the top of the loop, because the switch can land at any await in between.
