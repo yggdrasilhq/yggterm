@@ -2587,6 +2587,65 @@ launch — do not route around it.
 
 ---
 
+### Grok Build (grok)
+
+**The tell:** `grok --version` works, the npm package installed fine, and yet
+`~/.yggterm/npm/lib/node_modules/@xai-official/` looks almost empty — no
+per-platform payload package anywhere you would expect it.
+
+- ⭐ **The payload is nested one level down**, at
+  `@xai-official/grok/node_modules/@xai-official/grok-<platform>-<arch>`, ~45 MB
+  brotli-compressed. A `find -maxdepth 5` from `node_modules` misses it by one
+  level and reads as "npm skipped optionalDependencies", which is a different
+  and much scarier diagnosis. Count the depth before believing it.
+- ⭐ **`bin/grok` is a trampoline, not the program.** It resolves
+  `$GROK_HOME/bin/grok` (default `~/.grok/bin/grok`) and execs it; if that is
+  missing it decompresses the payload on FIRST RUN. So a first invocation after
+  an install can take seconds and write ~166 MB, and an install whose
+  `postinstall` never ran still produces a working `--version`. ⇒ **A working
+  `--version` does not prove the install completed.**
+- ⛔⛔ **`grok update` IS npm, WEARING A CLI'S CLOTHES.** Its own
+  `grok update --check --json` answers `"installer":"npm"` — for an
+  npm-provisioned copy the updater shells back out to npm. Anything you were
+  relying on the CLI's own updater to avoid (a prefix, a staging directory, a
+  verification step) is NOT avoided; it is just moved somewhere you cannot see
+  it. yggterm therefore runs npm itself for grok rather than preferring the
+  self-updater — see the descriptor's comment for the full measurement.
+- ⚠ **It installs a copy outside the managed prefix**, `~/.local/bin/grok` →
+  `~/.grok/bin/grok`, from its own postinstall. That is the vendor's layout and
+  is fine; do not "fix" it, but do not be surprised when `which grok` resolves
+  somewhere the provisioner never wrote.
+- **Versioned + symlinked, deliberately.** `~/.grok/bin/grok-<version>` with a
+  `grok` symlink swapped onto it, because replacing a binary a running process
+  has mmap'd is fatal on macOS. Worth copying rather than working around.
+
+### npm-provisioned CLIs as a CLASS — the one that cost the most
+
+**The tell:** an agent CLI is suddenly "not found" — often SEVERAL at once —
+shortly after a machine rebooted, was OOM-killed, or had a daemon restart.
+
+⛔ **`npm install -g --force <several packages>` unlinks EVERY published binary
+before relinking any of them.** Measured twice, deterministically: seven CLIs
+present, a kill 12 s in, **seven gone** and seven orphaned `.<name>-<random>`
+symlinks left in the bin directory. The 2×2 that pins it — a single-package
+install survives the same interrupt with or without `--force`; a batch without
+`--force` survives; only batch-plus-`--force` destroys the set.
+
+⭐ **And `--force` is what made it fire on every pass, not just on change:** it
+rewrites the whole tree and relinks every bin even against an already-current
+install (`changed 164 packages` on a no-op), so the destructive window was
+entered by every routine refresh.
+
+⇒ **The lesson that travels beyond npm:** a package manager's "install" is not
+atomic and its unlink phase is global. Stage into a fresh directory, prove the
+binary exists, then publish with a single `rename`. yggterm now does exactly
+that, one prefix per CLI.
+
+⚠ **A damaged shared tree then LOOKS like a race.** Once a prefix carries
+partial state, every retry re-enters the damage and fails identically — and a
+cluster of failure timestamps reads as concurrency. Check the INTERVAL between
+them before concluding anything: ~3.5 s apart is a lock working, not a race.
+
 ### Any CLI — quirks that are about the ROW, not the program
 
 These bite regardless of which agent CLI is inside the row, and they have each

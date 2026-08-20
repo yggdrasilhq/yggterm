@@ -189,23 +189,74 @@ Almost all of this is now free. What is genuinely per-CLI:
 
 `spec-cli-binary-auto-provisioning` requires a user-local install and login-shell
 PATH parity. **Every method is RUN**, per the owner's 2026-08-08 ruling
-(`settled-calls.md`): `Npm` is batched into one `npm install -g` line, `Uv` runs
-`uv tool install --upgrade`, and a `VendorScript` is fetched over pinned HTTPS
-and executed with `HOME` intact, no privilege escalation and stdin closed.
+(`settled-calls.md`): `Uv` runs `uv tool install --upgrade`, a `VendorScript` is
+fetched over pinned HTTPS and executed with `HOME` intact, no privilege
+escalation and stdin closed, and `Npm` goes through the generation layout below.
 
-⛔ **The methods never share a command line.** npm fails a whole `install -g`
-batch on one unresolvable name, so a uv package appended to that line would not
-install the wrong package — it would take every other CLI's refresh down with it
-and report the failure against all of them.
+⛔ **The methods never share a command line**, and **neither do two npm CLIs**.
+npm fails a whole `install -g` batch on one unresolvable name, so a uv package
+appended to that line would take every other CLI's refresh down with it.
+
+#### ⛔⛔ ONE PREFIX PER npm CLI, PUBLISHED ONLY AFTER IT RUNS
+
+*Superseded doctrine, stated so it is not silently reinstated: until 2026-08-20
+every npm CLI was batched into a single `npm install -g --force <all packages>`.*
+
+**That batch line spent several seconds of EVERY pass with all published
+binaries unlinked.** Measured twice, deterministically: seven CLIs before, a kill
+12 s in, **zero after**, plus seven orphaned `.<name>-<random>` staging symlinks.
+The 2×2 pins it — single-package survives the interrupt with or without
+`--force`; batch without `--force` survives; only batch-plus-`--force` destroys
+the set — and `--force` is what made the window open on every pass rather than
+only on change, because it rewrites the whole tree and relinks every bin even
+against an already-current install.
+
+So an npm CLI is provisioned as:
+
+1. **A fresh generation directory**, `~/.yggterm/npm/cli/<slug>.gen<N+1>`, never
+   the live tree. It starts empty, so it cannot inherit damage from a previous
+   partial run — which is what turned one bad install into an unrecoverable loop.
+2. **`npm install -g` into it, without `--force`**, with the shared cache so
+   nothing is re-downloaded, and `TMPDIR` on disk (see below).
+3. **Verification**: the staged tree must actually contain the binary. npm exits
+   0 having installed a package whose `bin` never materialised, and a broken CLI
+   that reports success is worse than a failure.
+4. **Publish by atomic `rename`** of a symlink onto `bin/<binary>`. Never
+   remove-then-symlink: the second form has a window in which the binary does not
+   exist, which is the whole defect. Superseded generations are then reaped.
+
+⇒ **An install that dies before step 4 is unobservable**: the old binary keeps
+working, and the next pass starts from a clean directory.
+
+⛔ **No provisioning method may stage in `/tmp`.** It is a tmpfs on the desktop
+host, so a staged payload is RAM the kernel can swap but never reclaim. All four
+methods go through `apply_provision_env`, which is the ONE owner of that policy —
+it is a shared helper precisely because the previous per-callsite fix covered npm
+and left `uv`, the vendor script and the self-updater leaking for six more days.
+`npm_config_tmp` is NOT a knob: npm 11 answers `Unknown env config "tmp"`.
+
+⭐ **The shared npm cache is bounded, not emptied.** `npm cache verify` is npm's
+own GC — it keeps what the index references and drops orphans — and runs at most
+weekly. ⚠ Do not quote its summary line for a reclaim figure: it over-reported by
+**5.5×** in the one measurement taken, because `_cacache` dedupes by hash.
 
 ⭐ **`install` and `update` are two questions, and a CLI may answer them
 differently.** `CliInstall::Manual` means only *yggterm cannot fetch this* — it
 says nothing about staying current. Antigravity is exactly that case: a 166 MB
 binary served behind a sign-in, which advertises `agy update` in its own
-`--help`. A CLI that ships its own updater has that updater PREFERRED over
-re-running its install method, because it is the only thing that knows where its
-own payload lives. A descriptor that is both unfetchable and unupdatable fails
-the registry's own test.
+`--help`. A CLI that ships its own updater normally has that updater PREFERRED
+over re-running its install method, because it is the only thing that knows where
+its own payload lives. A descriptor that is both unfetchable and unupdatable
+fails the registry's own test.
+
+⛔⛔ **BUT CHECK WHAT THE UPDATER ACTUALLY DOES BEFORE PREFERRING IT.** grok ships
+`grok update`, and `grok update --check --json` reports `"installer":"npm"`: for
+an npm-provisioned copy it delegates straight back to npm. Preferring it would
+not escape npm, it would move the npm call inside a process where the staged
+prefix, the verification and the atomic publish do not apply — and where an
+inherited `npm_config_prefix` writes the shared prefix and overwrites the
+published symlink. ⇒ **A self-updater earns the preference by being a different
+mechanism, not by existing.** Ask it, in the recon.
 
 ### Step 9 — title lifecycle (`New <CLI> Session` → generated title)
 
