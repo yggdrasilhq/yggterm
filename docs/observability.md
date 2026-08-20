@@ -221,6 +221,39 @@ built on it is wrong in the same invisible way, and nothing downstream can detec
 ⇒ **Always pass an explicit `--lines` large enough to cover the window.** `notebooks/` sets
 `TAIL_LINES_DEFAULT = 100_000` for this reason and never calls `tail` without it.
 
+### 4.4b ⛔ …AND A LARGE `--lines` CAN HAND YOU A COMPLETE-LOOKING WINDOW THAT ENDED HOURS AGO
+
+**This is the other face of §4.4, and it bites the remedy §4.4 prescribes.** Told
+to "always pass an explicit `--lines` large enough to cover the window", the
+natural move is a big number. But `ytrace` reads across **rotated generation
+files** (`event-trace.g<gen>.jsonl`, of which a busy host holds many). Ask for
+`--lines 200000` and it can return exactly 200,000 well-formed records **whose
+newest timestamp predates the live file's own tail** — a full-looking result from a
+window that closed hours ago.
+
+⚠ **The two failure modes point in opposite directions and look identical from the
+output.** Too small a `--lines` describes the last few seconds while claiming an
+hour; too large can describe an old generation while claiming the present. Neither
+warns, both are correctly ordered and correctly filtered.
+
+**The tell:** you got back *exactly* the number you asked for, and its newest
+record is old. A correct window almost never returns exactly the cap.
+
+⇒ **Check the newest returned timestamp against the wall clock before trusting any
+window**, and for a before/after read prefer the live file directly:
+
+```bash
+tail -N ~/.yggterm/ytrace.jsonl          # unambiguous: one file, newest last
+tail -1 ~/.yggterm/ytrace.jsonl          # ...and confirm it is current
+```
+
+**The instance (2026-08-20).** A post-deploy acceptance read used
+`ytrace tail --lines 200000` and returned zero events after the deploy moment,
+across every category. The natural reading was "the host went silent" — a serious
+claim about a live machine. The live `ytrace.jsonl` was current **to the second**.
+The instrument was reading elsewhere, and the size of the request is what sent it
+there.
+
 ### 4.3c The probe NAME does not tell you the record KIND, and a temporal test needs a point event
 
 `request/lock_wait_slow` and `request/lock_wait_window` read as two views of one thing. They are not:
