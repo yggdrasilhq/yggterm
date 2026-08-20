@@ -230,3 +230,114 @@ test('a malformed emit is ignored rather than throwing into the caller', () => {
   });
   assert.strictEqual(h.trace().stats().queued, 0);
 });
+
+// ── attach-stream capture ─────────────────────────────────────────────────
+// The falsifier for the ghost-frame entry: does the reseed hand the canvas
+// bytes with the SGR colour already gone, or does the canvas fail to apply
+// attributes that were present? These guard both halves of the answer — that
+// the census can tell those apart, and that finding out costs no content.
+
+test('the census answers the ghost-frame question without recording the screen', () => {
+  const h = makeSandbox();
+  const ESC = '\x1b';
+  h.trace().armStreamCapture('terminal-a', 'replay:snapshot');
+  h.trace().captureStream(
+    'terminal-a', 'reseed',
+    `${ESC}[38;5;42mledger reconciled${ESC}[0m\r\n${ESC}[31mtotals differ${ESC}[0m\r\n`,
+  );
+  h.advance(250);
+
+  const record = h.sent[0].records[0];
+  assert.strictEqual(record.payload.stage, 'reseed');
+  // (B) the bytes DID carry colour — so a colourless canvas would be an
+  // apply-side fault, not a stripping one.
+  assert.strictEqual(record.payload.sgr_colour, 2);
+  assert.strictEqual(record.payload.sgr_total, 4);
+  assert.strictEqual(record.payload.sgr_reset, 2);
+});
+
+test('a stripped reseed is distinguishable from a coloured one by the census alone', () => {
+  // (A) the other answer. If this reads zero on a live capture, the stripping
+  // happened before the canvas — and no sample needs to be read to know it.
+  const h = makeSandbox();
+  h.trace().armStreamCapture('terminal-a', 'replay:snapshot');
+  h.trace().captureStream('terminal-a', 'reseed', 'ledger reconciled\r\ntotals differ\r\n');
+  h.advance(250);
+  const record = h.sent[0].records[0];
+  assert.strictEqual(record.payload.sgr_colour, 0);
+  assert.strictEqual(record.payload.sgr_total, 0);
+});
+
+test('⛔ no printable content survives redaction, and the escapes do', () => {
+  // The whole safety argument in one assertion. The trace file is read and
+  // quoted by agents; the screen being sampled is whatever the user was working
+  // on. If a secret can reach the sample, this instrument is a worse problem
+  // than the bug it exists to solve.
+  const h = makeSandbox();
+  const ESC = '\x1b';
+  const secret = 'correct-horse-battery-staple';
+  const census = h.trace().redactPreservingControls(`${ESC}[32m${secret}${ESC}[0m`);
+
+  assert.ok(!census.sample.includes(secret), 'the content must not be in the sample');
+  assert.ok(!census.sample.includes('horse'), 'not even a fragment of it');
+  assert.match(census.sample, /·28·/, 'a run of text becomes its length');
+  assert.match(census.sample, /\\e\[32m/, 'the colour sequence is preserved verbatim');
+  assert.strictEqual(census.sgr_colour, 1);
+});
+
+test('⛔ an OSC payload is reduced to opcode and length — never copied', () => {
+  // OSC is the one escape family that IS content: window titles, and at OSC 52
+  // the clipboard. Copying escapes verbatim is right for CSI and would be a
+  // clipboard exfiltration here.
+  const h = makeSandbox();
+  const ESC = '\x1b';
+  const BEL = '\x07';
+  const clipboard = 'c;bGVkZ2VyLXNlY3JldC10b2tlbg==';
+  const census = h.trace().redactPreservingControls(`${ESC}]52;${clipboard}${BEL}done`);
+
+  assert.ok(!census.sample.includes('bGVkZ2Vy'), 'the OSC 52 payload must not survive');
+  assert.ok(!census.sample.includes(clipboard));
+  assert.match(census.sample, /\\e\]52;<\d+>/, 'opcode and length only');
+  assert.strictEqual(census.osc_count, 1);
+
+  const title = `${ESC}]0;a private window title${BEL}`;
+  const titleCensus = h.trace().redactPreservingControls(title);
+  assert.ok(!titleCensus.sample.includes('private'), 'a window title is content too');
+});
+
+test('capture is bounded per arm and per host, so a re-attach storm cannot flood', () => {
+  const h = makeSandbox();
+  h.trace().armStreamCapture('terminal-a', 'mount');
+  // One oversized chunk exhausts the arm; the next is silent until re-armed.
+  h.trace().captureStream('terminal-a', 'reseed', 'x'.repeat(9000));
+  h.trace().captureStream('terminal-a', 'reseed', 'y'.repeat(100));
+  h.advance(250);
+  assert.strictEqual(h.sent[0].records.length, 1, 'the arm budget must bind');
+
+  // And the arm count binds too: past the cap, arming stops re-opening it.
+  for (let i = 0; i < 40; i++) {
+    h.trace().armStreamCapture('terminal-a', 'storm');
+    h.trace().captureStream('terminal-a', 'reseed', 'z'.repeat(9000));
+  }
+  h.advance(250);
+  const total = h.sent.reduce((sum, batch) => sum + batch.records.length, 0);
+  assert.ok(total <= 17, `arms per host must cap the capture, got ${total}`);
+});
+
+test('an unarmed host captures nothing at all', () => {
+  const h = makeSandbox();
+  h.trace().captureStream('terminal-never-armed', 'live_stream', 'anything');
+  h.advance(250);
+  assert.strictEqual(h.sent.length, 0);
+});
+
+test('a truncated sample says so rather than looking complete', () => {
+  // A sample cut at the cap and a stream that really ended are the same string.
+  // Only the flag tells them apart, and reading a truncated sample as complete
+  // is how "there were no more colour sequences" gets concluded from a window
+  // that simply stopped.
+  const h = makeSandbox();
+  const census = h.trace().redactPreservingControls('\x1b[m'.repeat(3000));
+  assert.strictEqual(census.truncated, true);
+  assert.ok(census.sample.length <= 2048 + 16);
+});

@@ -292,7 +292,50 @@ with no reseed after it is a screen that was emptied and never refilled.
 
 ---
 
-## 8. Verification
+## 8. ⛔ A probe may not record content
+
+A foreign layer sits on top of the user's actual work: the terminal canvas holds
+whatever they are reading, and the escape stream that paints it carries window
+titles and, at OSC 52, the clipboard. The trace file is a diagnostic artefact
+that is kept for hours, read by agents, and quoted into reports.
+
+⇒ **A capture that answers a rendering question by recording the screen has
+traded a transient exposure for a durable one**, and it does so invisibly: the
+probe looks like every other probe, and the leak is in a field nobody reads
+until they do.
+
+### The rule
+
+**Capture the CONTROL plane, never the content plane.** For the escape stream
+that means, exactly:
+
+| Byte class | Treatment | Why |
+|---|---|---|
+| CSI (`ESC [ … final`) | **verbatim** | parameters are numeric; this is what rendering questions are about |
+| OSC (`ESC ] … BEL/ST`) | **opcode and length only** | ⛔ the one escape family that IS content — titles, and the clipboard at OSC 52 |
+| structural controls (CR, LF, BS, HT, BEL) | kept | they shape the screen and carry nothing |
+| printable runs | replaced by `·<length>·` | the length is the only part a rendering question needs |
+
+⭐ **This is not a weakened instrument.** For the question the capture exists to
+answer — did the bytes carry SGR colour, or did the canvas fail to apply it —
+the answer lives entirely in the escape sequences. What survives redaction *is*
+the evidence. The census (`sgr_total`, `sgr_colour`, `sgr_reset`, `osc_count`)
+goes further and answers it without reading the sample at all.
+
+⚠ **A truncated sample is flagged**, because a sample cut at the cap and a
+stream that genuinely ended are the same string — and reading the first as the
+second is how "there were no further colour sequences" gets concluded from a
+window that merely stopped.
+
+### Bound the capture twice
+
+Bytes per arm **and** arms per host. The episode a capture is armed for is
+usually a storm, so a bound on volume alone still lets a storm of boundaries
+turn the falsifier into the flood it was built to survive.
+
+---
+
+## 9. Verification
 
 * `cargo test -p yggterm-core trace` — the grammar, the refusals, the batch, and
   that a pre-contract line still parses.
@@ -302,3 +345,8 @@ with no reseed after it is a screen that was emptied and never refilled.
   install`.
 * `cargo test -p yggterm-shell render_attribution` — the aggregation guard that
   keeps the cost of measuring independent of the render rate.
+
+⭐ The §8 rule is guarded by assertions that a secret placed in a captured stream
+does not appear in the sample, and that an OSC 52 clipboard payload survives only
+as an opcode and a length. A privacy property stated in prose is a claim; these
+are the same property as a test that fails.
