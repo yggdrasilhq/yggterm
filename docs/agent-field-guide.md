@@ -1867,3 +1867,30 @@ and was already enforced for app-control routing; the question "is this the
 user's window" had simply been encoded twice. `ClientInstanceRecord::is_active_gui`
 is now the one owner. **When an instrument and a rule disagree, look for the
 second copy of the rule before doubting the instrument.**
+
+## A per-probe RATE measured off the trace file is wrong during and after a deploy
+
+Several GUI generations write into one trace home, and a retiring GUI keeps
+writing until it actually exits. So a census over the live file mixes processes
+that are running **different builds** — which is exactly the population you must
+not pool when the question is "did my change reduce this probe's volume".
+
+⚠ It cost two wrong conclusions in ten minutes on 2026-08-20: a rationing fix
+was measured as "did not work" (2091 flush spans still present) and then
+diagnosed at length, when **2044 of them had been written by an already-dead GUI
+running the previous build**. The process that mattered had written 4.
+
+⇒ **Filter on `pid`, always, before quoting a rate or a share.** Resolve the
+current GUI's pid from `server app clients` and count only its records. The
+`pid` field exists for precisely this and is easy to skip because the file reads
+as one stream:
+
+```sh
+# the pid the question is about — never "the most recent record"
+yggterm-headless server app clients | python3 -c 'import sys,json
+print([c["pid"] for c in json.load(sys.stdin)["clients"] if c["client_role"]=="active"])'
+```
+
+⭐ The same caution covers the opposite error: a probe that looks *absent* may
+simply belong to a pid whose records rotated out. Check `event-trace.g*.jsonl`
+generations before concluding a probe never fired.
