@@ -188,6 +188,25 @@ of CPU to answer with about five rows.
 resource priority is memory first. The trace streams are bounded; the discovery index that exists to
 *find* them is not.
 
+### 4.3b "Did X ever happen?" against a single file misses everything that rotated
+
+The live stream is `ytrace.jsonl`; everything older is `ytrace.g<ts>.jsonl`. A query that opens only
+the live file is asking "did X happen *recently enough to still be in the current generation*",
+which is a different question and gives the same answer shape. It has already produced a false
+negative on another lane: a cache sweep that HAD run was reported as never having run, because the
+harness checking for it read one file.
+
+⭐ **The `ytrace` CLI is rotation-safe.** `query::collect_records` reads the live file **and** globs
+every `ytrace.g*.jsonl` beside it, so `query`, `tail`, `incidents` and `health` all see the full
+retained history. That settles the rule:
+
+⇒ **Go through the CLI, never through the files.** It already handles rotation, and it already
+resolves the home the one way the writer does (§1). A raw read gets both of those wrong at once,
+and both failures return well-formed, plausible, incomplete answers. The notebooks in `notebooks/`
+make no raw trace reads for exactly this reason.
+
+⚠ If you must read files, glob `ytrace*.jsonl` — never `ytrace.jsonl`.
+
 ### 4.4 `ytrace tail --since` is silently capped by a `--lines` default you did not set
 
 `ytrace tail` computes its limit as `lines.unwrap_or(20)` **before** applying the
