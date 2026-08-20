@@ -960,6 +960,13 @@ Three rules that make this safe:
    not need it idle. You DO need to not send five times because it was quiet.
 3. ⛔ **Never inject keystrokes into a row with an open dialog on the human's
    seat.** That answer is theirs.
+4. ⛔ **PEER NAMES RECYCLE — resolve to a UUID before you trust one.** Measured
+   2026-08-20: a freshly spawned delegate came up wearing the exact peer name
+   (`<slug>-<suffix>`) of a DEAD predecessor from six days earlier, and a
+   message addressed by that name reached the right row only by luck. Same law
+   as row titles: a name identifies nothing across time. Before acting on a
+   peer name, resolve it — the socket name carries the PID, and the session
+   file for that pid names the session uuid — and address the uuid's owner.
 
 **Submitting yourself to an orchestrator** is the same verb pointed the other
 way: when work turns out to belong to a wider effort, message the orchestrating
@@ -1344,8 +1351,11 @@ handoff is a cycle, not an ending:
    of yourself you should use the same model"*; most fleet sessions are Opus,
    but some seats are deliberately Fable and a relay must not silently demote or
    promote one). ⚠ `terminal new --model` is silently DROPPED from the launch
-   (pending-bugs [11.2], measured 8/8) — verify the model on the successor's
-   PROCESS/header and repair with `/model <id>` before delivering the brief.
+   (pending-bugs [11.2]; `--permission-mode` from the same call survives, so it
+   is that flag's plumbing) — repair with `/model <id>` before the brief.
+   ⭐ THE DECISIVE VERIFICATION is the transcript's assistant-record `model`
+   field after the first turn: the screen banner false-negatives once it
+   scrolls, and the process cmdline is blind after a `/model` repair.
    And (f) ⛔ **ANY UNSENT OWNER DRAFT — a handover must lose no typed text**
    (owner design 2026-08-20: *"my prompt must be handed over to the next
    spawnee too, so there is no data loss"*). Check `~/.yggterm/relay/drafts/
