@@ -1439,6 +1439,19 @@ changes state.
 **Falsifier:** kill a CLI's launch before it execs and confirm the row shows an error state rather
 than an idle-looking frozen frame, and that a submit to it answers with the error, not a timeout.
 
+### ⛔ THE REMOTE FLAVOR — live specimens, 2026-08-20 (found by 11.10)
+
+Two `remote-cc://` rows on the GUI-host daemon sit in `launch_phase: RemoteBootstrap` with
+`working: null` — a relay wake tried to RESUME two sessions by uuid with `--require-existing`
+on a host whose store has no such transcripts, so the resume could never succeed. **No process
+exists for either row on either host**, the launch is long dead, and the rows have already
+survived one daemon restart in that state — nothing times a RemoteBootstrap out, fails it
+loudly, or marks it dead. They are also the pair whose arrangement dead-head made them
+invisible on the sidebar (the [11.10] row-set entry), so the two defects compounded: a husk
+nobody could see. The husks are left in place as specimens; the wake relay that spawned them
+(a parked-row wake addressed at a session that does not exist on the target) is its own
+defect for the plane that owns the booter's send path.
+
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
