@@ -2303,6 +2303,15 @@ pub struct ServerRuntimeStatus {
     /// set. Same fail-safe encoding as `advertises_stored_session_keys`.
     #[serde(default)]
     pub advertises_live_session_rows: bool,
+    /// Set when this daemon started from the BACKUP state document because the
+    /// primary could not be parsed. `#[serde(default)]` so a daemon without the
+    /// field reads as `None` (no recovery), never as a false alarm.
+    ///
+    /// ⚠ WHEN THIS IS SET, THE ROW LIST IS A GENERATION OLD. That is the price of
+    /// starting at all, and it is only an acceptable price while it is VISIBLE —
+    /// which is what this field is for. See [`load_persisted_state_recovering`].
+    #[serde(default)]
+    pub persisted_state_recovery: Option<PersistedStateRecovery>,
     /// PROBE (2026-07-22): running total of remote-yggterm command retries after a
     /// cache reset. A wedged remote target (the "cache reset" spin that stranded a
     /// session's viewport) shows as this CLIMBING fast between polls. `#[serde(default)]`
@@ -3971,6 +3980,11 @@ const PROXIED_WORKING_REFRESH_MS: u128 = 1_500;
 
 pub(crate) struct DaemonRuntime {
     support: GhosttyHostSupport,
+    /// Set when this daemon started from the BACKUP state document because the
+    /// primary could not be parsed. Reported on `status` so an older-than-expected
+    /// row list is visible without reading a log — see
+    /// [`load_persisted_state_recovering`].
+    persisted_state_recovery: Option<PersistedStateRecovery>,
     state_path: PathBuf,
     store: SessionStore,
     server: YggtermServer,
@@ -4193,7 +4207,9 @@ impl DaemonRuntime {
             store.home_dir(),
             crate::live_row_tombstones::now_secs(),
         );
-        if let Some(mut saved) = load_persisted_state(&state_path)? {
+        let (loaded_state, persisted_state_recovery) =
+            load_persisted_state_recovering(&state_path)?;
+        if let Some(mut saved) = loaded_state {
             // Never resurrect a predecessor's sessions from disk while it is
             // alive and owns their runtimes; it, not this file, is the truth.
             let our_pid = std::process::id();
@@ -4263,6 +4279,7 @@ impl DaemonRuntime {
             .to_vec();
         let mut runtime = Self {
             support,
+            persisted_state_recovery,
             state_path,
             store,
             server,
@@ -4741,6 +4758,7 @@ impl DaemonRuntime {
             advertises_stored_session_keys: true,
             live_terminal_sessions,
             advertises_live_session_rows: true,
+            persisted_state_recovery: self.persisted_state_recovery.clone(),
             remote_yggterm_retry_total: crate::remote_yggterm_retry_total(),
             terminal_retained_chunks: terminal_stats.retained_chunks,
             terminal_retained_bytes: terminal_stats.retained_bytes,
@@ -20555,6 +20573,113 @@ fn load_persisted_state(path: &Path) -> Result<Option<PersistedDaemonState>> {
     Ok(Some(state))
 }
 
+/// What a recovery from the backup state document did, reported loudly.
+///
+/// Every field exists to stop the recovery being mistaken for a normal start:
+/// an older-but-honest row list is only safe if the operator can SEE that it is
+/// older, and by how much.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PersistedStateRecovery {
+    /// The backup the rows actually came from.
+    pub recovered_from: String,
+    /// Where the unreadable document was moved, so it is still there to inspect.
+    pub corrupt_saved_as: String,
+    /// The parse failure, verbatim — the thing nobody could see before.
+    pub parse_error: String,
+    /// Rows the recovered document carries.
+    pub recovered_stored_sessions: usize,
+    pub recovered_live_sessions: usize,
+    /// ⚠ AN ESTIMATE, AND NAMED AS ONE. The corrupt document cannot be parsed, so
+    /// its real row count is unknowable; this counts `"session_path"` mentions in
+    /// its bytes. Reporting a confident 0 here would say "you lost nothing" or
+    /// "you lost everything" with equal authority and no evidence.
+    pub corrupt_session_path_mentions: usize,
+}
+
+/// Count the rows a document *mentions*, without parsing it. See the field doc.
+fn corrupt_state_session_path_mentions(raw: &str) -> usize {
+    raw.matches("\"session_path\"").count()
+}
+
+/// Load the daemon state, falling back to the backup when the primary cannot be
+/// parsed — and saying so loudly.
+///
+/// ⛔⛔ **AN UNPARSEABLE STATE FILE USED TO REFUSE TO START THE DAEMON**, and the
+/// operator never saw why: the parse error goes to a spawned child's stderr, so
+/// the GUI reported only "local yggterm daemon did not become reachable" and the
+/// trace showed `spawned_daemon_exit code:1`. A dead app with no cause, for a
+/// fault whose remedy is deleting one file. The realistic trigger is not operator
+/// error — a truncated document is what a mid-write crash, a full disk or a power
+/// loss produces, on a file that is rewritten whenever state changes and that
+/// holds the user's sessions.
+///
+/// ⭐ **THE REMEDY WAS ALREADY ON DISK AND UNREAD.** Every persist leaves the last
+/// DIFFERENT state in `server-state.previous.json` (see
+/// `write_persisted_state_if_changed`, which was deliberately shaped so the backup
+/// is a real generation behind rather than a copy of the current file). Nothing
+/// ever read it back.
+///
+/// ⚠ **RECOVERING QUIETLY WOULD BE ITS OWN DATA LOSS** — the daemon would come up
+/// with an OLDER row list than the user last had and nothing would say so. The
+/// answer is loudness, not refusal: the corrupt file is preserved rather than
+/// overwritten, the substitution raises a `ytrace` incident naming both files and
+/// the row counts, and `server status` carries the recovery so it is visible
+/// without reading a log.
+///
+/// ⛔ If the backup is missing or also unreadable, the ORIGINAL error is returned
+/// unchanged. Starting empty would silently discard every row the user had, which
+/// is worse than refusing to start.
+fn load_persisted_state_recovering(
+    path: &Path,
+) -> Result<(Option<PersistedDaemonState>, Option<PersistedStateRecovery>)> {
+    let parse_error = match load_persisted_state(path) {
+        Ok(state) => return Ok((state, None)),
+        Err(error) => error,
+    };
+    let backup_path = path.with_extension("previous.json");
+    let recovered = match load_persisted_state(&backup_path) {
+        Ok(Some(state)) => state,
+        // No usable backup: the caller gets the real cause, not a silent empty start.
+        Ok(None) | Err(_) => return Err(parse_error),
+    };
+    let corrupt_raw = fs::read_to_string(path).unwrap_or_default();
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    let corrupt_saved_as = path.with_file_name(format!("server-state.corrupt-{stamp}.json"));
+    // Move, never delete: the unreadable document is the only evidence of what
+    // was lost, and a recovery that destroys it cannot be audited afterwards.
+    if fs::rename(path, &corrupt_saved_as).is_err() {
+        let _ = fs::write(&corrupt_saved_as, corrupt_raw.as_bytes());
+        let _ = fs::remove_file(path);
+    }
+    let recovery = PersistedStateRecovery {
+        recovered_from: backup_path.display().to_string(),
+        corrupt_saved_as: corrupt_saved_as.display().to_string(),
+        parse_error: format!("{parse_error:#}"),
+        recovered_stored_sessions: recovered.stored_sessions.len(),
+        recovered_live_sessions: recovered.live_sessions.len(),
+        corrupt_session_path_mentions: corrupt_state_session_path_mentions(&corrupt_raw),
+    };
+    if let Ok(home) = crate::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "daemon",
+            "state",
+            "persisted_state_recovered_from_backup",
+            serde_json::json!(recovery),
+        );
+    }
+    yggterm_core::perf::ytrace_emit_event(
+        "daemon",
+        "state",
+        "persisted_state_recovered_from_backup",
+        serde_json::json!(recovery),
+    );
+    Ok((Some(recovered), Some(recovery)))
+}
+
 /// What the last successful write put on disk: the hash of the bytes written,
 /// plus the file identity observed straight afterwards. The content half
 /// answers "would this write change anything"; the file-identity half is what
@@ -29902,6 +30027,100 @@ mod tests {
     /// The backup must hold the PREVIOUS state, not a second copy of the
     /// current one.
     ///
+    /// A truncated state document recovers from the backup instead of refusing
+    /// to start — loudly, and without destroying the evidence.
+    ///
+    /// ⛔ Before this, an unparseable `server-state.json` stopped the daemon before
+    /// it bound, and the operator never saw why: the parse error goes to a spawned
+    /// child's stderr, so the GUI reported only "daemon did not become reachable".
+    /// A truncated document is what a mid-write crash, a full disk or a power loss
+    /// produces on a file that holds the user's sessions.
+    #[test]
+    fn a_truncated_state_document_recovers_from_the_backup_and_says_so() {
+        let root = persist_gate_test_root("recover-truncated");
+        let state_path = root.join("server-state.json");
+        let mut gate = None;
+
+        let first = persist_gate_test_state("remote-session://example/first");
+        write_persisted_state_if_changed(&state_path, &first, &mut gate).expect("first write");
+        let second = persist_gate_test_state("remote-session://example/second");
+        write_persisted_state_if_changed(&state_path, &second, &mut gate).expect("second write");
+
+        // Exactly what a write interrupted mid-flight leaves behind.
+        fs::write(&state_path, b"{\"remote_machines\":[{\"machine_").expect("truncate state");
+
+        let (state, recovery) =
+            super::load_persisted_state_recovering(&state_path)
+                .expect("a truncated state must recover");
+        let state = state.expect("the backup supplies a state");
+        assert_eq!(
+            state.active_session_path.as_deref(),
+            Some("remote-session://example/first"),
+            "recovery must come from the backup generation"
+        );
+
+        let recovery = recovery.expect("a recovery must be REPORTED, never silent");
+        assert!(
+            recovery.parse_error.contains("parsing daemon state"),
+            "the cause nobody could see before must be carried: {}",
+            recovery.parse_error
+        );
+        // The unreadable document is the only evidence of what was lost. A
+        // recovery that deletes it cannot be audited afterwards.
+        let saved = std::path::Path::new(&recovery.corrupt_saved_as);
+        assert!(saved.exists(), "the corrupt document must be kept aside");
+        assert_eq!(
+            fs::read_to_string(saved).expect("read preserved corrupt file"),
+            "{\"remote_machines\":[{\"machine_",
+            "kept aside VERBATIM — a rewritten copy is not evidence"
+        );
+        assert!(
+            !state_path.exists() || load_persisted_state(&state_path).is_ok(),
+            "the corrupt document must not be left in place to fail the next start too"
+        );
+    }
+
+    /// With no usable backup the ORIGINAL error is returned, not an empty start.
+    ///
+    /// ⛔ Coming up empty would silently discard every row the user had, which is
+    /// worse than refusing to start: a refusal is loud and reversible, an empty
+    /// row list looks like a normal day.
+    #[test]
+    fn a_corrupt_state_with_no_backup_refuses_rather_than_starting_empty() {
+        let root = persist_gate_test_root("recover-no-backup");
+        let state_path = root.join("server-state.json");
+        fs::write(&state_path, b"{not json at all").expect("write corrupt state");
+
+        let error = super::load_persisted_state_recovering(&state_path)
+            .expect_err("with no backup the real cause must surface");
+        assert!(
+            format!("{error:#}").contains("parsing daemon state"),
+            "the operator must get the parse failure, not a substituted one: {error:#}"
+        );
+        assert!(
+            state_path.exists(),
+            "nothing may be moved aside when no recovery happened — the file is \
+             still the only copy"
+        );
+    }
+
+    /// The lost-row figure is an ESTIMATE and is named as one.
+    ///
+    /// The corrupt document cannot be parsed, so its true row count is unknowable.
+    /// Reporting a confident `0` would say "you lost nothing" with exactly as much
+    /// evidence as "you lost everything".
+    #[test]
+    fn the_corrupt_row_figure_counts_mentions_because_the_real_count_is_unknowable() {
+        assert_eq!(super::corrupt_state_session_path_mentions("{}"), 0);
+        assert_eq!(
+            super::corrupt_state_session_path_mentions(
+                "{\"live_sessions\":[{\"session_path\":\"a\"},{\"session_path\":\"b\"}"
+            ),
+            2,
+            "a truncated document still mentions the rows it was carrying"
+        );
+    }
+
     /// It is taken by hard link rather than by copying 2.26 MB through the
     /// daemon's global runtime lock, and a link makes `server-state.json` and
     /// `server-state.previous.json` the same inode until the temp file is
