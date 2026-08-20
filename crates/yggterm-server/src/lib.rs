@@ -28830,6 +28830,25 @@ enum StoredPreviewHydrationMode {
     Eager,
 }
 
+/// The session id a CLI STORE path names, asked of the CLI that owns the store.
+///
+/// ⛔ The last path SEGMENT cannot answer this, and that was the fallback: for
+/// Muse every session file is literally `session.jsonl`
+/// (`sessions/YYYY/MM/DD/<session-id>/session.jsonl`), so every Muse row opened
+/// from its store collapsed onto the id `session.jsonl` — one key, therefore ONE
+/// ROW, no matter how many sessions were opened. Claude Code hid the flaw
+/// because its filename really is its id.
+///
+/// Each descriptor already knows where its own identity lives — a directory
+/// name for Muse, a field inside the file for codex, the filename for Claude
+/// Code — so the reader is asked rather than the path being guessed at.
+fn agent_store_session_id_for_path(path: &str) -> Option<String> {
+    let descriptor = yggterm_core::agent_cli::agent_cli_for_store_session_file(path)?;
+    let entry = (descriptor.read_store_entry)(Path::new(path))?;
+    let session_id = entry.session_id.trim();
+    (!session_id.is_empty()).then(|| session_id.to_string())
+}
+
 fn build_session(
     kind: SessionKind,
     path: &str,
@@ -28844,6 +28863,7 @@ fn build_session(
 ) -> ManagedSessionView {
     let session_id = session_id
         .map(ToOwned::to_owned)
+        .or_else(|| agent_store_session_id_for_path(path))
         .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
     let title = title_hint
         .filter(|t| !t.trim().is_empty() && !looks_like_generated_fallback_title(t))
