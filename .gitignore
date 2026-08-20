@@ -37,3 +37,6 @@ tools/xterm-harness/package-lock.json
 
 # Local-only cargo overrides (the libyggterm path patch); never tracked
 .cargo/
+
+# Standalone dev probe: build artefacts only, the source is tracked.
+/scripts/cli-viewport-probe/target/
