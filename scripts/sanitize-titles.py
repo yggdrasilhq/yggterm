@@ -14,8 +14,8 @@ Phase 2 (rescue): batches weird sessions to the wired LiteLLM endpoint
   Writes back via SessionTitleStore when --write is passed; otherwise dry-run.
 
 Usage:
-  python3 scripts/sanitize-titles.py --host *** --host oc --host local --verbose
-  python3 scripts/sanitize-titles.py --host *** --rescue --model chatgpt/gpt-5.6-luna
+  python3 scripts/sanitize-titles.py --host <gui-host> --host <build-host> --host local --verbose
+  python3 scripts/sanitize-titles.py --host <gui-host> --rescue --model chatgpt/gpt-5.6-luna
   python3 scripts/sanitize-titles.py --rescue --write --model chatgpt/gpt-5.6-luna
 
 Env:

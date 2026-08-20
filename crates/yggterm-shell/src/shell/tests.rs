@@ -32646,7 +32646,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "canvas_count": 0,
                 "host_stdin_enabled": true,
                 "effective_input_focus": true,
-                "text_sample": "pi@***:~$",
+                "text_sample": "user@examplehost:~$",
                 "resume_overlay_visible": false,
                 "resume_overlay_text": "",
                 "resume_overlay_excerpt": "",

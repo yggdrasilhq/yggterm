@@ -5402,7 +5402,7 @@ fn TerminalCanvas(
     // alone, so the second click was silently dropped and the row refused keystrokes).
     // Previously the code cleared `bootstrap_task_identity` on lease-acquire failure
     // to force the next render to be a candidate again — but that made EVERY render
-    // a candidate while the lease was held (67×/s, 397 shellstate_mut in 7.6s on ***,
+    // a candidate while the lease was held (67×/s, 397 shellstate_mut in 7.6s on the GUI host,
     // 100% CPU). Keeping the combined key removes the spin while preserving the
     // repeat-click fix.
     let combined_bootstrap_key = format!("{}:{}", bootstrap_identity, latest_open_request_id);
@@ -10875,7 +10875,7 @@ fn TerminalCanvas(
                                             // read-only precheck the storm autopsy sees
                                             // `terminal_open_attempt_first_protocol_only_output 105` in 7s
                                             // and the render storm re-renders for a signal write that mutates
-                                            // nothing. This was the secondary 100% CPU contributor on ***
+                                            // nothing. This was the secondary 100% CPU contributor on the GUI host
                                             // (primary was the bootstrap lease spin at 5455).
                                             let already_latched = state.with(|shell| {
                                                 shell

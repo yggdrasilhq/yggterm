@@ -61,7 +61,7 @@ This spec generalizes the `server startpage ls` fix (2026-08-16, durable 106 vs 
 * Core: `crates/yggterm-core/src/startpage.rs` `scan_all_durable_sessions` + `order_for_startpage`
 * Verb: `crates/yggterm-server/src/startpage_ls.rs` `run_server_startpage_ls`
 * Checker: `scripts/check-startpage.py`
-* Proven on `***`: `durable 106 (codex 70 / claude_code 32 / antigravity 4) live 44` vs manual `106` — fixed literal-prefix bug (`.claude/projects/*` → `.claude/projects`) and antigravity central-DB lookup.
+* Proven on a headless host: `durable 106 (codex 70 / claude_code 32 / antigravity 4) live 44` vs manual `106` — fixed literal-prefix bug (`.claude/projects/*` → `.claude/projects`) and antigravity central-DB lookup.
 
 ### 3.2 Titles — `server titles ls` (next)
 
@@ -74,7 +74,7 @@ Same shape, same files, title-specific rank:
 
 * Sweep verb: `server titles sweep [--dry-run] [--limit N] [--prune] [--kind <slug>] [--json]` — the ACT half of the same answer. It classifies every durable row with the SAME recognizer `ls` reports through (`looks_like_generated_fallback_title`), resolves the bad ones store-first then by generation, stops the moment the endpoint refuses (a report that kept going would blame the sessions for the endpoint), and with `--prune` forgets copy for sessions that exist nowhere — never younger than 7 days, never while the daemon is unreachable, because a live row's copy is keyed by its runtime id and would otherwise read as an orphan.
 
-**Acceptance:** `check-titles.py` `0` on `***`, `oc`, `dev` with no `verb has X ids not in manual` and no `title mismatch` where both present.
+**Acceptance:** `check-titles.py` `0` on every fleet host with no `verb has X ids not in manual` and no `title mismatch` where both present.
 
 ### 3.3 Resume readiness — replacing the Re-resume gate
 
@@ -118,4 +118,4 @@ The verb+checker pair is the harness `docs/integration-testing.md` Phase A asks 
 * [x] `server resume ls` fully wired 2026-08-16 — probe-based, no glyph heuristic (daemon_owns_runtime + attach_ready_seen + was_ever_ready + working/idle_secs/pty gauge). Gates neutered: `resume_gate.rs` ceilings 0, `retained_remote_surface_should_wait=>false`, `INPUT_GATE_STUCK_*` 1ms. Muse Re-resume stuck gone for ALL sessions.
 * [ ] Delete `resume_gate.rs` type entirely (currently delete-not-deprecate with 0 constants) + ship `check-resume.py` oracle
 * [ ] `build_local_cwd_tree` → `scan_all_durable_sessions` (remove 3 hardcoded scanners)
-* [ ] CI: run both checkers on `***`/`oc`/`dev` per push (read-only, no daemon restart)
+* [ ] CI: run both checkers on every headless fleet host per push (read-only, no daemon restart)
