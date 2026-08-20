@@ -341,3 +341,22 @@ test('a truncated sample says so rather than looking complete', () => {
   assert.strictEqual(census.truncated, true);
   assert.ok(census.sample.length <= 2048 + 16);
 });
+
+test('the sender list is bounded, so a long-lived GUI does not accumulate dead channels', () => {
+  // Every terminal MOUNT registers a fresh closure, and identity dedup cannot
+  // catch a remount because the function really is a different one. Unbounded,
+  // this grows one dead channel per mount for the life of the process.
+  const h = makeSandbox();
+  for (let i = 0; i < 50; i++) {
+    h.trace().registerSender(() => {});
+  }
+  assert.ok(h.trace().stats().senders <= 8, `senders must be bounded, got ${h.trace().stats().senders}`);
+
+  // And the NEWEST must still win: the drain tries from the end, so the live
+  // channel is the one a batch actually goes through.
+  const delivered = [];
+  h.trace().registerSender((payload) => { delivered.push(payload); });
+  h.trace().emit({ category: 'xterm_write', name: 'enqueue' });
+  h.advance(250);
+  assert.strictEqual(delivered.length, 1, 'the most recently mounted channel drains the ring');
+});

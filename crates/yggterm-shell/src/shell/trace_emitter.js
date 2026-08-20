@@ -26,6 +26,10 @@ const YGG_TRACE_FLUSH_INTERVAL_MS = 250;
 // while it is still a burst, not averaged into the quarter-second
 // after it.
 const YGG_TRACE_HIGH_WATER = 64;
+// How many terminal channels to keep as drain fallbacks. More than one so a
+// mid-flush unmount cannot strand a batch; few enough that a long-lived GUI
+// does not accumulate them.
+const YGG_TRACE_SENDERS_MAX = 8;
 if (!window.__yggtermTrace) {
     const ring = [];
     const senders = [];
@@ -86,9 +90,19 @@ if (!window.__yggtermTrace) {
         );
     };
     window.__yggtermTrace = {
+        // ⚠ Bounded, because every terminal MOUNT installs a fresh closure.
+        // Dedup by identity cannot help — a remount produces a genuinely
+        // different function — so an unbounded list grows one dead channel per
+        // mount for the life of the GUI. The drain tries newest-first and stops
+        // at the first that works, so stale entries cost nothing but memory,
+        // which is exactly the leak that stays invisible until it is large.
         registerSender: (send) => {
-            if (typeof send === "function" && senders.indexOf(send) === -1) {
-                senders.push(send);
+            if (typeof send !== "function" || senders.indexOf(send) !== -1) {
+                return;
+            }
+            senders.push(send);
+            while (senders.length > YGG_TRACE_SENDERS_MAX) {
+                senders.shift();
             }
         },
         emit: (record) => {
