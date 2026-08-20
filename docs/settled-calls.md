@@ -895,10 +895,12 @@ connected should die (gracefully is recommended)."*
 Stated while locked out of typing to every session on the desktop GUI, via a temporary session
 spawned just to say it: the optimization wave's aims (cooler machine, lower RAM) are understood
 and wanted — **but yggterm has to stay usable too.** The ordering is a LAW for every optimization
-and deploy decision: a change that trades interactivity for watts is the wrong trade, and a
-half-applied deploy that leaves an input fix dead on disk while the owner cannot type is the
-canonical violation (measured that day: total input lockout on the desktop host while the remedy
-awaited one process restart).
+and deploy decision: a change that trades interactivity for watts is the wrong trade. The
+canonical case (that day): a total input lockout on the desktop host whose cause the instruments
+could not even SEE — keystroke→PTY delivery measured ~1:1 through the lockout window — because
+the input chain proves DELIVERY to the pseudo-terminal and never CONSUMPTION by the program
+behind it. The owner's eyes outranked every probe, per the standing rule; the half-applied
+deploy prolonged the diagnostic fog by leaving newer instruments dead on disk.
 
 ⇒ Concretely: deploy verification is against the RUNNING process; input-path regressions are
 release-blocking; and any watch/optimization that could degrade interactivity must prove it did
