@@ -890,3 +890,17 @@ connected should die (gracefully is recommended)."*
    reap does NOT tombstone — that is contract death (second-class shells die
    with their GUI), not an explicit close; the import admission predicate's
    owns-runtime refusal is what keeps those husks from coming back.
+
+## ★★★ USABILITY OUTRANKS THE RESOURCE GOALS (owner-settled 2026-08-20)
+
+Stated while locked out of typing to every session on the desktop GUI, via a temporary session
+spawned just to say it: the optimization wave's aims (cooler machine, lower RAM) are understood
+and wanted — **but yggterm has to stay usable too.** The ordering is a LAW for every optimization
+and deploy decision: a change that trades interactivity for watts is the wrong trade, and a
+half-applied deploy that leaves an input fix dead on disk while the owner cannot type is the
+canonical violation (measured that day: total input lockout on the desktop host while the remedy
+awaited one process restart).
+
+⇒ Concretely: deploy verification is against the RUNNING process; input-path regressions are
+release-blocking; and any watch/optimization that could degrade interactivity must prove it did
+not (the ui/block + input latency instruments are the proof surface).
