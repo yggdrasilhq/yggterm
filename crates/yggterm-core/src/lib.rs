@@ -144,9 +144,11 @@ pub use titles::{
     AGENT_PLANE_TITLE_PREFIX, LIVE_SUMMARY_REFRESH_HORIZON, SessionSummaryTimelineEntry,
     SessionTitleResolver, SessionTitleStore, best_effort_context_from_session_path,
     best_effort_precis_from_context, best_effort_summary_from_context,
-    best_effort_title_from_context, is_agent_plane_composed_title,
-    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
-    request_generated_short_name, session_title_store_open_count,
+    best_effort_title_from_context, clear_copy_generation_pause,
+    copy_generation_is_paused, copy_generation_pause_remaining_ms, error_is_endpoint_refusal,
+    is_agent_plane_composed_title, looks_like_generated_fallback_title,
+    looks_like_low_signal_generated_copy, request_generated_short_name,
+    session_title_store_open_count,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,

@@ -11764,7 +11764,7 @@ fn copy_target_context(
 }
 
 fn background_copy_error_is_rate_limit(error: &anyhow::Error) -> bool {
-    let rate_limited = format!("{error:#}").contains("429");
+    let rate_limited = yggterm_core::error_is_endpoint_refusal(error);
     if rate_limited && let Ok(home) = crate::resolve_yggterm_home() {
         append_trace_event(
             &home,
