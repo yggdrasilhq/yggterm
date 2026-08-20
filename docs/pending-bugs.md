@@ -723,9 +723,19 @@ instrument that could name the split.
 the binary; a verb reads it back out of a RUNNING process, not a file. `strings` on the
 live image stays the fallback for a binary that predates the stamp.
 
+⚠ **A SECOND SOURCE OF THE SAME CONFUSION, measured 2026-08-20:** the deploy census and the
+binary disagree about which commit a build IS. `deploy-fleet.sh` reports *"this build is 3.1.7 from
+commit 4899a8b09e8b"* by reading the CHECKOUT's current commit, while the same binary answers
+`--build-commit` with `ca9dba12fc15-dirty` — the commit it was actually compiled from, plus the
+dirty marker for the then-uncommitted patch. Both are honest about different questions, and
+building before committing (the ordinary order) makes them disagree every time. ⇒ The census must
+read the ARTEFACT's stamp, not the tree beside it; a census that names a commit the binary does not
+carry is exactly the false provenance this entry is about.
+
 **Falsifier:** on any host, a single verb names the running daemon's commit and build
 time; two daemons of the same version built from different commits are distinguishable
-by it; and it reads from `/proc/<pid>` so a replaced-on-disk binary cannot forge it.
+by it; it reads from `/proc/<pid>` so a replaced-on-disk binary cannot forge it; and the
+deploy census's commit equals the deployed binary's own `--build-commit`.
 
 ## ⛔⛔⛔ [11.0] A PLAIN SHELL BREAKS apt's BOTTOM-ANCHORED PROGRESS BAR — SO THE RENDER FAULT IS **NOT** SESSION-ONLY
 
