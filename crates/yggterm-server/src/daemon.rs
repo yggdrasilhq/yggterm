@@ -2576,6 +2576,12 @@ pub struct HotRestartGateScreen {
     /// What `screen_text_shows_agent_working` said about the WHOLE screen — not
     /// about the tail returned above, which is a display convenience.
     pub shows_agent_working: bool,
+    /// Whether any registered CLI's usage-limit-wait phrases are on the WHOLE
+    /// screen — the third state a caller must not read as "idle, safe to move
+    /// on": the CLI's auto-continue is armed and the turn resumes when the
+    /// window opens. serde(default) keeps older daemons' answers readable.
+    #[serde(default)]
+    pub shows_limit_wait: bool,
 }
 
 /// How much of the screen a gate-screen reading returns when the caller does not
@@ -5179,6 +5185,14 @@ impl DaemonRuntime {
                 session.working = screen_text
                     .as_deref()
                     .map(|screen| descriptor.screen_shows_working(screen));
+                // The third state: waiting out a usage limit. `working` stays
+                // honest (`Some(false)` — no turn is in flight), and this flag
+                // is what stops every consumer from rendering that as "idle"
+                // — and stops the working→done edge from firing a false
+                // "done" the moment the limit engages.
+                session.limit_wait = screen_text
+                    .as_deref()
+                    .is_some_and(|screen| descriptor.screen_shows_limit_wait(screen));
             } else if session.kind == SessionKind::Shell
                 && crate::launch_command_is_local_app_verb(&session.launch_command)
             {
@@ -7060,6 +7074,9 @@ impl DaemonRuntime {
                     shows_agent_working: screen
                         .as_deref()
                         .is_some_and(yggterm_core::screen_text_shows_agent_working),
+                    shows_limit_wait: screen
+                        .as_deref()
+                        .is_some_and(yggterm_core::screen_text_shows_agent_limit_wait),
                     screen_tail: screen.map(|screen| gate_screen_tail(&screen, tail_lines)),
                 }
             })
@@ -26778,6 +26795,7 @@ mod tests {
             pty_cols: None,
             pty_rows: None,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,

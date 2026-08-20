@@ -629,6 +629,17 @@ pub struct AgentCliDescriptor {
     /// summary `Worked for 12s` contains `worked for `, and matched the naive
     /// `working` needle.
     pub working_screen_negations: &'static [&'static str],
+    /// Whole-SCREEN phrases meaning the CLI is WAITING ON A USAGE LIMIT — a
+    /// third state that is neither working nor idle. A limit-wait screen says
+    /// none of the working phrases, so without these it reads as "confirmed
+    /// idle" on every daemon-owned surface at once (the metadata Status, the
+    /// sidebar dot, `gate-screen`, and the working→done notification edge —
+    /// which then fires a false "done" at the exact moment nothing finished).
+    ///
+    /// ⛔ EMPTY means UNMEASURED, same law as `working_screen_phrases`: the
+    /// state then folds into idle for that CLI because nothing was observed,
+    /// and the gap belongs here where the next session can see it.
+    pub limit_wait_screen_phrases: &'static [ScreenWorkingPhrase],
     /// How an existing session id is named on resume.
     pub resume_selector: ResumeSelector,
     /// Whether resuming into a known cwd passes it explicitly.
@@ -1038,6 +1049,25 @@ impl AgentCliDescriptor {
         })
     }
 
+    /// Whether this CLI's SCREEN says it is waiting on a usage limit — a
+    /// third state beside working/idle. Same window and folding as
+    /// [`Self::screen_shows_working`], and deliberately NOT subject to the
+    /// working negations: those describe lines that fake a WORK signal.
+    pub fn screen_shows_limit_wait(&self, sample: &str) -> bool {
+        sample.lines().rev().take(10).any(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            self.limit_wait_screen_phrases.iter().any(|phrase| {
+                lower.contains(phrase.needle)
+                    && (phrase.also_any.is_empty()
+                        || phrase.also_any.iter().any(|also| lower.contains(also)))
+            })
+        })
+    }
+
     /// Tokens for the CLI's own resume PICKER (no session id).
     pub fn resume_picker_tokens(&self) -> Vec<String> {
         match self.resume_selector {
@@ -1353,6 +1383,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         // `Worked for 12s` is codex's COMPLETION summary, not active work.
         working_screen_negations: &["worked for "],
+        limit_wait_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // `codex resume <id>` reopens the session's ORIGINAL cwd unless
         // re-rooted; the cwd tree's whole promise is that a row opens where the
@@ -1504,6 +1535,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             },
         ],
         working_screen_negations: &["worked for "],
+        limit_wait_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // ⚠ Deliberately FALSE, preserving shipped behavior exactly: the
         // pre-descriptor builder gated `-C "$PWD"` on `SessionKind::Codex`
@@ -1604,6 +1636,18 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             also_any: &[],
         }],
         working_screen_negations: &[],
+        // Measured from the owner's report 2026-08-20: a session mid
+        // usage-limit wait paints a footer of the form
+        // `Usage limit reached · continuing shortly · esc to cancel` while
+        // the working phrase is absent — which is why the state read as
+        // "confirmed idle" everywhere until this existed. The also_any
+        // guard keeps conversation text that merely MENTIONS a usage limit
+        // from arming the state: the wait footer carries its own
+        // continuation/cancel wording on the same line.
+        limit_wait_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "usage limit reached",
+            also_any: &["continuing", "esc to cancel"],
+        }],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -1742,6 +1786,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             },
         ],
         working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         // `pi` takes `process.cwd()`; there is no `--cwd`, and `--session-dir`
         // relocates STORAGE, not the working directory.
@@ -1851,6 +1896,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             also_any: &[],
         }],
         working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -1939,6 +1985,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             also_any: &[],
         }],
         working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -2073,6 +2120,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // not `thinking...` — kept explicit so a future needle widening cannot
         // silently swallow it.
         working_screen_negations: &["thought for "],
+        limit_wait_screen_phrases: &[],
         // ⭐ CONFIRMED 2026-08-08 against a real `kimi --help` on guihost (yggterm
         // provisioned it via uv the same day): `--session,--resume  -S,-r`. The
         // value was read from source at intake and is now MEASURED — recorded
@@ -2190,6 +2238,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             },
         ],
         working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
         // ⭐ MEASURED 2026-08-08 on guihost, from `muse resume --help` on a real
         // install: `muse resume` / `muse resume --last` / `muse resume
         // <session-uuid>`. ⛔ The placeholder here said `Flag("--resume")`,
@@ -2332,6 +2381,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             },
         ],
         working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
         resume_selector: ResumeSelector::Flag("--conversation"),
@@ -2541,6 +2591,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             },
         ],
         working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
         resume_selector: ResumeSelector::Flag("--resume"),
         // grok takes the process cwd (`--cwd <CWD>` exists but the launch
@@ -3879,6 +3930,31 @@ pub fn assert_store_predicate_coverage(predicate_name: &str, probe: impl Fn(&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⛔ A LIMIT-WAIT IS NOT IDLE. A session waiting out a usage limit paints
+    /// a footer with no working phrase, so every daemon-owned surface called
+    /// it "confirmed idle" at once and the working→done edge fired a false
+    /// "done". The phrases are per-CLI descriptor data like the working set.
+    #[test]
+    fn a_usage_limit_wait_is_a_third_state_not_idle() {
+        let cc = agent_cli_descriptor(SessionKind::ClaudeCode).expect("cc descriptor");
+        let wait_screen = "some earlier output\n\
+             Usage limit reached · continuing shortly · esc to cancel";
+        assert!(cc.screen_shows_limit_wait(wait_screen));
+        assert!(
+            !cc.screen_shows_working(wait_screen),
+            "the wait footer carries no working phrase — that gap is the bug"
+        );
+        // Conversation text that merely MENTIONS the limit is not the state:
+        // the also_any guard requires the wait footer's own wording on the
+        // same line.
+        let prose = "the user asked what usage limit reached means\n\u{276f} ";
+        assert!(!cc.screen_shows_limit_wait(prose));
+        // A genuinely working screen is working, not limit-waiting.
+        let working = "thinking…\nesc to interrupt";
+        assert!(cc.screen_shows_working(working));
+        assert!(!cc.screen_shows_limit_wait(working));
+    }
 
     /// ⛔ A STORE COLUMN CALLED `title` IS NOT ALWAYS A TITLE.
     ///

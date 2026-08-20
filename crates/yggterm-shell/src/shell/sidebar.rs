@@ -1065,6 +1065,14 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         if session.working == Some(true) {
             return SidebarBusyState::busy("agent_working_daemon");
         }
+        // A usage-limit wait is not idle: the CLI's auto-continue is armed and
+        // the turn resumes when the window opens. The screen carries no
+        // working phrase during the wait, so without this arm the dot went
+        // dark at the exact moment the owner most wanted to see the row was
+        // still in flight (queue: the limit-wait tri-state entry).
+        if session.limit_wait {
+            return SidebarBusyState::busy("limit_wait");
+        }
         return SidebarBusyState::idle();
     }
     // Issue #1: a plain shell's working state has the SAME daemon-authoritative

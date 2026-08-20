@@ -45,9 +45,32 @@ frame — all four corners must be the window's own paint, not black.
 
 ## ⛔⛔ [11.0] A USAGE-LIMIT WAIT READS AS "IDLE" ON EVERY STATE SURFACE THE DAEMON OWNS
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Root-caused 2026-08-20 15:52; fix not yet implemented.* Owner-reported with a
+*Fix implemented 2026-08-20 by 11.10 (daemon + GUI; activates on the next version-bump
+deploy). The shape shipped:* the per-CLI descriptor grew `limit_wait_screen_phrases`
+(claude-code measured: needle `usage limit reached` guarded by `continuing`/`esc to cancel`
+on the same line; every other CLI's set is EMPTY = UNMEASURED, per the descriptor's own
+law — observe and fill). The daemon's snapshot SSOT sets an additive `limit_wait: bool`
+beside `working` (serde-default, wire-safe both directions); `working` stays honest
+(`Some(false)` — no turn in flight). Consumers: the metadata Status renders "waiting on
+limit"; the sidebar dot shows busy with reason `limit_wait` instead of going dark;
+`gate-screen` answers `screen_shows_limit_wait: true — … NOT idle` beside its working
+field (kind-agnostic union `screen_text_shows_agent_limit_wait`); and the working→done
+notification edge skips limit-waiting rows exactly like unknowns, so the limit engaging
+no longer fires a false "done" (and the genuine finish after the window still notifies
+once). Lock: `a_usage_limit_wait_is_a_third_state_not_idle` (core).
+
+**Still open under this heading:** the booter's classifier keeps its own python
+`RATE_LIMITED` derivation — it should consume the daemon's `limit_wait` once a bumped
+daemon is live (the booter deploys on its own plane); and every non-CC CLI's limit-wait
+phrases are unmeasured.
+
+**Falsifier (needs the bump deploy):** a row painted with the limit-wait footer must not
+read `idle` on the metadata panel, the dot, or `gate-screen`; a row at a genuine prompt
+still must; and a limit engaging mid-turn must not fire a "done" notification.
+
+*Original root-cause record (2026-08-20 15:52), kept:* Owner-reported with a
 screenshot: a session row mid usage-limit wait (footer painting `Usage limit reached ·
 continuing shortly · esc to cancel`, auto-continue armed, spinner animating) while the Session
 Metadata panel reads `running · idle`. Reported as recurring across many rows recently — which
