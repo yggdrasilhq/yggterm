@@ -36021,6 +36021,47 @@ mod tests {
         );
     }
 
+    /// Live proof for the `/proc` half, which no fixture can exercise: the pure
+    /// selection rule is unit-tested above, but "does the fd walk find a real
+    /// CLI's real session" can only be answered against a running process.
+    ///
+    /// `#[ignore]` so the suite stays deterministic — a test that needs a live
+    /// agent CLI would otherwise pass or fail on what happens to be running.
+    /// Run it deliberately:
+    ///   `YGGTERM_LIVE_PID=<pid> YGGTERM_LIVE_KIND=muse \
+    ///      cargo test -p yggterm-server --lib live_agent_runtime -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a live agent CLI process; pass YGGTERM_LIVE_PID"]
+    fn live_agent_runtime_identity_resolves_against_a_running_cli() {
+        let Ok(pid) = std::env::var("YGGTERM_LIVE_PID") else {
+            panic!("set YGGTERM_LIVE_PID to the pid of a running agent CLI");
+        };
+        let pid: u32 = pid.trim().parse().expect("YGGTERM_LIVE_PID must be a pid");
+        let kind = match std::env::var("YGGTERM_LIVE_KIND")
+            .unwrap_or_else(|_| "muse".to_string())
+            .as_str()
+        {
+            "muse" => SessionKind::Muse,
+            other => panic!("no live-identity route declared for {other}"),
+        };
+        let resolved = crate::agent_runtime_session_id_from_root_pid(kind, pid);
+        println!("resolved session id for pid {pid}: {resolved:?}");
+        assert!(
+            resolved.is_some(),
+            "a running CLI must name the session it is in"
+        );
+        let resolved = resolved.expect("checked above");
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(
+                &dirs::home_dir().expect("home"),
+                kind,
+                &resolved
+            ),
+            Some(true),
+            "the id the fd walk found must be one the CLI's own store holds —              that round trip is what makes it a resume target rather than a guess"
+        );
+    }
+
     #[test]
     fn a_remote_row_never_re_births_from_this_machines_store() {
         // ⛔ A remote row's session lives in the OTHER machine's store, so this
