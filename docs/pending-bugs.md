@@ -128,6 +128,30 @@ gate-screen working/idle heuristics) must learn the agents-hint signature (dim c
 `← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
 typed-residue detector must require the footer's absence before claiming residue.
 
+## ⛔⛔⛔ [11.0→6.1] AN ADOPTION CHAIN LOSES THE PRESERVED-OWNER TABLE, AND EVERY OLD-GENERATION ROW MOUNTS AS A GHOST
+
+**Status:** OPEN
+
+Caught live on a specimen row mid-ghost (2026-08-20 ~19:0x), all instruments simultaneous:
+the row's viewport renders its CURRENT transcript with every SGR color flattened
+(white-on-black; emoji keep color), launch phase stuck `bootstrapping`, metadata
+`Conversation: 0 user · 0 assistant`; a direct `terminal screen` read against the target
+host's newest daemon answers **`chars=0`** for a session that is visibly streaming; and that
+daemon self-reports **`0 preserved`** while an older deferring generation still holds the
+session's PTY. Mechanism: the preserved-owner proxy DOES cover the read verbs
+(TerminalRead/Snapshot/RetainedSnapshot/History/AppDeclares — verified in code), but after a
+multi-generation adoption chain the NEWEST daemon's preserved-owner table is EMPTY, so the
+proxy never engages: reads serve locally, answer empty, and the client mounts with no seeded
+screen — the colorless ghost, previously mis-filed as a pure render defect. The render half
+that remains: with an empty seed the client paints plain fallback content instead of failing
+loudly (a ghost LOOKS like a session; an empty view would at least say what is wrong).
+**Fix direction:** the handover must carry the predecessor's preserved-owner map into the
+successor (transitively — generation N+2 must still reach N's PTYs), and a read that finds
+no runtime AND no owner for a key the row table lists must answer a typed refusal, never an
+empty screen. **Falsifier:** run two same-day adoptions, then read every listed session's
+screen through the newest daemon — every answer is either content or a named refusal;
+no `chars=0` on a streaming row; no colorless mount.
+
 ## ⛔⛔ [11.0] A REMOTE CC SPAWN'S --model NEVER REACHES THE PROCESS — AND THREE LAYERS HIDE IT
 
 **Status:** OPEN
