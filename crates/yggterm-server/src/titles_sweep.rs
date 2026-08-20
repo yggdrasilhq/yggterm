@@ -222,7 +222,10 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
         let outcome = resolve_one(store, &settings, row);
         match outcome {
             Ok((title, source, context_chars)) => {
-                if source == "generated" {
+                // A REJECTED title spent a request too — counting only the
+                // successes would let a host that can produce nothing usable
+                // spend an unbounded number of them.
+                if source == "generated" || source == "rejected" {
                     attempted += 1;
                 }
                 resolved.push(ResolvedRow {
@@ -360,6 +363,29 @@ fn resolve_one(
                 &context,
                 force,
             )?;
+            // ⛔ A GENERATOR CAN RETURN A TITLE THE SCAN WILL NOT SHOW, and
+            // counting that as a success is how a sweep reports 117 titles
+            // while its own after-scan says nothing changed. Measured on a host
+            // with no endpoint credentials: every fallback title began with a
+            // question word, which the display filter drops on read — so the
+            // copy was written, the row stayed blank, and only the re-scan
+            // disagreed with the report.
+            //
+            // The junk is deleted rather than left: it occupies the session's
+            // one slot, and a reader who looks in the store sees a title that
+            // no surface will ever paint.
+            if let Some(candidate) = title.as_deref() {
+                if looks_like_generated_fallback_title(candidate)
+                    || yggterm_core::looks_like_low_signal_generated_copy(candidate)
+                {
+                    if let Ok(title_store) =
+                        SessionTitleStore::open(&dirs::home_dir().unwrap_or_default())
+                    {
+                        let _ = title_store.delete_title(&row.session_id);
+                    }
+                    return Ok((None, "rejected", Some(context_chars)));
+                }
+            }
             Ok((title, "generated", Some(context_chars)))
         }
     }
@@ -470,6 +496,19 @@ fn print_human(report: &SweepReport, bad_total: usize) {
             (None, Some(error)) => println!("  ! {} {}", &row.session_id[..8.min(row.session_id.len())], error),
             (None, None) => println!("  · {} [{}] nothing to name it from", &row.session_id[..8.min(row.session_id.len())], row.source),
         }
+    }
+    let rejected = report
+        .resolved
+        .iter()
+        .filter(|row| row.source == "rejected")
+        .count();
+    if rejected > 0 {
+        println!(
+            "{rejected} generated title(s) were REJECTED as unshowable and deleted — the \
+             generator produced them, the display filter would have dropped them. On a host with \
+             no endpoint credentials that is every one of them: the heuristic answers a stub \
+             session with its own question."
+        );
     }
     let thin = report
         .resolved
