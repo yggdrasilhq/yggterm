@@ -65,6 +65,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ygg_host import resolve_gui_host  # noqa: E402
+from ygg_rowarg import add_row_argument, bare_uuid, resolve_row  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 STATE = Path.home() / ".yggterm" / "relay"
@@ -444,8 +445,11 @@ def _bare_uuid(v):
     FileNotFoundError on `.../monitor/cc-runtime:/<uuid>.json`. ygg-claim.sh has
     always stripped it (`${SESSION##*/}`); this did not, so every session that
     subscribed the documented way crashed and only `--uuid` worked. Reported by a
-    cluster 2026-08-13. Take the last path segment, exactly as the claim does."""
-    return (v or "").rsplit("/", 1)[-1].strip()
+    cluster 2026-08-13. Take the last path segment, exactly as the claim does.
+
+    ⭐ The rule now lives in `ygg_rowarg`, which both watchdogs share, so the
+    booter and the monitor cannot drift about what a row name means."""
+    return bare_uuid(v)
 
 
 def cmd_subscribe(a):
@@ -1722,7 +1726,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("subscribe")
-    p.add_argument("--uuid", default="")
+    # ⛔ `subscribe --uuid X` beside `unsubscribe X` — one tool, two spellings
+    #    for one argument. Both verbs now take both. See ygg_rowarg.
+    add_row_argument(p)
     p.add_argument("--machine", default="")
     p.add_argument("--role", choices=["orchestrator", "relay", "standalone"], default="relay")
     p.add_argument("--escalate-to", default="", help="orchestrator UUID; empty = escalate to a human")
@@ -1736,7 +1742,7 @@ def main():
     p.set_defaults(fn=cmd_subscribe)
 
     pu = sub.add_parser("unsubscribe")
-    pu.add_argument("uuid")
+    add_row_argument(pu, required=True)
     pu.add_argument("--note", default="",
                     help="why this row is standing down; kept in the release ledger")
     pu.set_defaults(fn=cmd_unsubscribe)
@@ -1744,7 +1750,7 @@ def main():
     for name, fn in (("demote", cmd_demote),
                      ("promote", cmd_promote), ("park", cmd_park), ("unpark", cmd_unpark)):
         p = sub.add_parser(name)
-        p.add_argument("uuid")
+        add_row_argument(p, required=True)
         if name == "demote":
             p.add_argument("--reason", default="")
         if name == "park":
@@ -1777,6 +1783,18 @@ def main():
         p.set_defaults(fn=fn)
 
     a = ap.parse_args()
+    # ⭐ Fold whichever spelling the caller used into the one attribute the
+    #    commands read. Verbs that take no row simply have no `_row_dest`.
+    if getattr(a, "_row_dest", None):
+        try:
+            row = resolve_row(a, env_fallback=os.environ.get("YGGTERM_SESSION_ID", "")
+                              if a.cmd == "subscribe" else "")
+        except ValueError as exc:
+            log(f"⛔ {exc}")
+            return 64
+        if not row and getattr(a, "_row_required", False):
+            log(f"{a.cmd}: name a row — `{a.cmd} <uuid>` or `{a.cmd} --row <uuid>`")
+            return 64
     return a.fn(a) or 0
 
 
