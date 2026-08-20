@@ -1944,7 +1944,7 @@ fn scan_agent_store_directory(
         if path.is_dir() {
             scan_agent_store_directory(descriptor, &path, depth + 1, sessions);
         } else if descriptor.store_path_is_session_file(&path.display().to_string()) {
-            if let Some(entry) = (descriptor.read_store_entry)(&path) {
+            if let Some(entry) = descriptor.store_entry(&path) {
                 sessions.push(LocalAgentSessionSummary {
                     kind: descriptor.kind,
                     file_path: path,
@@ -2199,7 +2199,7 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
         for root in desc.store_roots_absolute(home) {
             let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");
             if candidate.exists() {
-                if let Some(entry) = (desc.read_store_entry)(&candidate) {
+                if let Some(entry) = desc.store_entry(&candidate) {
                     if let Some(t) = entry.title.filter(|t| !t.trim().is_empty()) {
                         return Ok(Some(t));
                     }
@@ -2274,7 +2274,7 @@ pub fn local_antigravity_session_cwd(session_id: &str) -> Option<String> {
         for root in desc.store_roots_absolute(&home) {
             let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");
             if candidate.exists() {
-                if let Some(entry) = (desc.read_store_entry)(&candidate) {
+                if let Some(entry) = desc.store_entry(&candidate) {
                     if !entry.cwd.trim().is_empty() {
                         return Some(entry.cwd);
                     }

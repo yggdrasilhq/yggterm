@@ -593,7 +593,7 @@ fn walk_and_collect(
             if is_noise_session_file(&path) {
                 continue;
             }
-            if let Some(entry) = (descriptor.read_store_entry)(&path) {
+            if let Some(entry) = descriptor.store_entry(&path) {
                 let mut row = StartpageDurableRow::from_entry(entry, descriptor.kind, &path);
                 // Weird-title filtering on sight (heading 9): if title/detail looks generated, try heuristic.
                 if let Some(ref tt) = row.title {
