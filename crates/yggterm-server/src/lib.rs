@@ -2309,6 +2309,98 @@ fn codex_storage_path_from_process_fds(pid: u32) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
+/// The session id named by a set of open-file targets, given the marker file a
+/// live session of this CLI holds and the store roots its sessions live under.
+///
+/// Pure so the SELECTION RULE can be tested without a live process — the rule is
+/// the part that has to be right, and the `/proc` read around it is not where
+/// the mistakes live.
+///
+/// ⛔ `None` unless exactly ONE session directory is marked. A process holding
+/// two markers is ambiguous, and an ambiguous bind is strictly worse than none:
+/// mis-attributing one row to another row's session is how a live Claude Code
+/// row got repointed at a foreign transcript and then refused every relaunch
+/// with "session id already in use". Silence is recoverable; a wrong id is not.
+pub(crate) fn agent_session_dir_identity_from_open_paths<'a>(
+    marker: &str,
+    roots: &[PathBuf],
+    open_paths: impl IntoIterator<Item = &'a Path>,
+) -> Option<String> {
+    let mut ids = open_paths
+        .into_iter()
+        .filter(|target| target.file_name().is_some_and(|name| name == marker))
+        // The marker must sit inside THIS CLI's own store, or any process that
+        // happens to hold a file of the same name would name a session.
+        .filter(|target| roots.iter().any(|root| target.starts_with(root)))
+        .filter_map(|target| target.parent()?.file_name()?.to_str().map(str::to_string))
+        .filter(|id| !id.trim().is_empty())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    match ids.len() {
+        1 => ids.into_iter().next(),
+        _ => None,
+    }
+}
+
+/// The session id a live process of `kind` is running, read from the session
+/// DIRECTORY it holds a marker file open in.
+#[cfg(target_os = "linux")]
+pub(crate) fn agent_session_dir_identity_from_process_fds(
+    descriptor: &'static yggterm_core::agent_cli::AgentCliDescriptor,
+    home: &Path,
+    pid: u32,
+) -> Option<String> {
+    let marker = descriptor.live_session_dir_marker?;
+    let roots = descriptor.store_roots_absolute(home);
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return None;
+    };
+    let targets = entries
+        .flatten()
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .collect::<Vec<_>>();
+    agent_session_dir_identity_from_open_paths(
+        marker,
+        &roots,
+        targets.iter().map(PathBuf::as_path),
+    )
+}
+
+/// Walk a live PTY's process tree for the session id its agent CLI is running.
+///
+/// The tree walk is needed for the same reason codex's is: the PTY's direct
+/// child is a shell, and the CLI itself is one or more levels below it.
+#[cfg(target_os = "linux")]
+pub(crate) fn agent_runtime_session_id_from_root_pid(
+    kind: SessionKind,
+    root_pid: u32,
+) -> Option<String> {
+    let descriptor = agent_cli_descriptor(kind)?;
+    descriptor.live_session_dir_marker?;
+    let home = dirs::home_dir()?;
+    let mut queue = VecDeque::from([root_pid]);
+    let mut seen = HashSet::new();
+    while let Some(pid) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(id) = agent_session_dir_identity_from_process_fds(descriptor, &home, pid) {
+            return Some(id);
+        }
+        queue.extend(linux_proc_child_pids(pid));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn agent_runtime_session_id_from_root_pid(
+    _kind: SessionKind,
+    _root_pid: u32,
+) -> Option<String> {
+    None
+}
+
 fn claude_code_storage_path_from_process_fds(pid: u32) -> Option<PathBuf> {
     let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
         return None;
@@ -6234,6 +6326,74 @@ impl YggtermServer {
                     .map(|_| key.clone())
             })
             .collect()
+    }
+
+    /// Live rows whose CLI mints its own session id and whose CURRENT id its
+    /// store does not hold — i.e. rows still carrying the yggterm row uuid as a
+    /// phantom, which is what every muse/agy row does from birth.
+    ///
+    /// ⭐ Self-limiting by construction: the moment a row is rebound to a real
+    /// id the store vouches for it and it drops out of this list, so the poll
+    /// costs nothing on a settled fleet. `None` (unknowable) drops out too — a
+    /// row is only worth chasing when the store positively denies its id.
+    pub(crate) fn live_agent_session_keys_needing_runtime_identity(&self) -> Vec<(String, SessionKind)> {
+        self.live_session_order
+            .iter()
+            .filter_map(|key| {
+                let session = self.sessions.get(key)?;
+                if !managed_session_is_live_runtime_session(key, session) {
+                    return None;
+                }
+                let descriptor = agent_cli_descriptor(session.kind)?;
+                descriptor.live_session_dir_marker?;
+                if local_agent_store_vouches_for_session(session.kind, &session.id) != Some(false) {
+                    return None;
+                }
+                Some((key.clone(), session.kind))
+            })
+            .collect()
+    }
+
+    /// Bind a live row to the session id its CLI actually minted.
+    ///
+    /// Returns TRUE only when the row MOVED. The launch command is re-pointed in
+    /// the same step: a row whose id is corrected but whose stored command still
+    /// names the phantom would resume the phantom on the next cold attach, which
+    /// is the drift `repoint_stored_launch_command_session_id` exists to close.
+    pub(crate) fn apply_agent_runtime_session_id_to_live_session(
+        &mut self,
+        key_or_path: &str,
+        session_id: &str,
+    ) -> bool {
+        if session_id.trim().is_empty() {
+            return false;
+        }
+        let Some(key) = self
+            .resolve_session_storage_key(key_or_path)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return false;
+        };
+        if !matches!(
+            session.source,
+            SessionSource::LiveLocal | SessionSource::LiveSsh
+        ) {
+            return false;
+        }
+        if session.id == session_id {
+            return false;
+        }
+        repoint_stored_launch_command_session_id(session, session_id);
+        session.id = session_id.to_string();
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Launch",
+            user_visible_launch_command(&session.launch_command),
+        );
+        true
     }
 
     pub(crate) fn live_claude_code_session_keys_for_runtime_identity(&self) -> Vec<String> {
@@ -31612,7 +31772,8 @@ mod tests {
         persisted_live_session_from_managed,
         session_metadata_value, should_fallback_to_python,
         session_path_is_remote, should_remove_local_daemon_socket_for_spawn_state,
-        agent_launch_command_with_options, local_agent_store_vouches_for_session_in,
+        agent_launch_command_with_options, agent_session_dir_identity_from_open_paths,
+        local_agent_store_vouches_for_session_in,
         stored_session_launch_command, stored_session_launch_command_for_locality,
         strip_remote_payload_noise, synthesize_remote_scanned_session_view,
         try_acquire_remote_scan_lock, upsert_session_metadata, validate_server_ui_snapshot,
@@ -35676,10 +35837,17 @@ mod tests {
     /// `sessions/YYYY/MM/DD/<id>/session.jsonl` would answer "absent" for a
     /// session that is really there.
     fn muse_store_fixture(tag: &str, session_ids: &[&str]) -> std::path::PathBuf {
+        // ⛔ Millisecond-stamped names alone COLLIDE: two of these tests can be
+        // built inside the same millisecond, and the second then finds the
+        // first's index already populated. A per-process counter makes the
+        // fixture name unique by construction rather than by luck.
+        static FIXTURE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let home = std::env::temp_dir().join(format!(
-            "yggterm-muse-store-{tag}-{}",
-            current_millis_u64()
+            "yggterm-muse-store-{tag}-{}-{seq}",
+            std::process::id()
         ));
+        let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join(".local/share/muse")).expect("fixture dirs");
         let conn = rusqlite::Connection::open(home.join(".local/share/muse/session-index.db"))
             .expect("fixture index");
@@ -35726,7 +35894,7 @@ mod tests {
         // confidence for every session the user has.
         let bare = std::env::temp_dir().join(format!(
             "yggterm-muse-nostore-{}",
-            current_millis_u64()
+            std::process::id()
         ));
         assert_eq!(
             local_agent_store_vouches_for_session_in(&bare, SessionKind::Muse, present),
@@ -35781,6 +35949,76 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_live_session_marker_names_one_session_out_of_many_open_files() {
+        // The fd set below is the SHAPE measured from a live muse process on
+        // 2026-08-20: it held `cron.db` (+`-shm`/`-wal`) open for TWO session
+        // directories, and `.session.lock` for only the one it was running.
+        // Picking any open file under the store would have been a coin flip
+        // between the two; the marker is what makes it a fact.
+        let root = PathBuf::from("/fixture/.local/share/muse/sessions");
+        let roots = vec![root.clone()];
+        let running = root.join("2026/01/01/00000000-0000-4000-8000-00000000d0c5");
+        let carried = root.join("2026/01/01/00000000-0000-4000-8000-0000000ab5e7");
+        let open = vec![
+            carried.join("cron.db"),
+            carried.join("cron.db-wal"),
+            running.join("cron.db"),
+            running.join("cron.db-shm"),
+            running.join(".session.lock"),
+            // Same marker name, but outside this CLI's store — must not count.
+            PathBuf::from("/somewhere/else/00000000-0000-4000-8000-00000000face/.session.lock"),
+        ];
+        assert_eq!(
+            agent_session_dir_identity_from_open_paths(
+                ".session.lock",
+                &roots,
+                open.iter().map(PathBuf::as_path)
+            )
+            .as_deref(),
+            Some("00000000-0000-4000-8000-00000000d0c5"),
+        );
+    }
+
+    #[test]
+    fn two_marked_sessions_bind_nothing_rather_than_guessing() {
+        // ⛔ The safety half. A wrong id is not a smaller version of no id: it
+        // points a live row at ANOTHER session, and the relaunch then collides
+        // with the row that really owns it.
+        let root = PathBuf::from("/fixture/.local/share/muse/sessions");
+        let roots = vec![root.clone()];
+        let open = vec![
+            root.join("2026/01/01/00000000-0000-4000-8000-00000000d0c5/.session.lock"),
+            root.join("2026/01/01/00000000-0000-4000-8000-0000000ab5e7/.session.lock"),
+        ];
+        assert_eq!(
+            agent_session_dir_identity_from_open_paths(
+                ".session.lock",
+                &roots,
+                open.iter().map(PathBuf::as_path)
+            ),
+            None,
+            "an ambiguous process must bind nothing"
+        );
+
+        // The same directory seen twice is NOT ambiguity — a live process holds
+        // the lock on more than one fd (measured: two), and de-duplicating by id
+        // is what keeps that from reading as a conflict.
+        let twice = vec![
+            root.join("2026/01/01/00000000-0000-4000-8000-00000000d0c5/.session.lock"),
+            root.join("2026/01/01/00000000-0000-4000-8000-00000000d0c5/.session.lock"),
+        ];
+        assert_eq!(
+            agent_session_dir_identity_from_open_paths(
+                ".session.lock",
+                &roots,
+                twice.iter().map(PathBuf::as_path)
+            )
+            .as_deref(),
+            Some("00000000-0000-4000-8000-00000000d0c5"),
+        );
     }
 
     #[test]
