@@ -519,8 +519,41 @@ never reached its CLI must surface an error state on the row rather than a corps
 ⚠ The provisioner fix makes this **rarer, not impossible**: any launch failure that is not an npm
 install still lands here.
 
+### ✅ THE WRITE-PATH HALF IS DONE (11.2, code landed; live proof owed)
+
+⭐ **Root cause, and it was one line of ownership rather than a missing mechanism.**
+`TerminalLaunchPhase::Failed` and `last_launch_error` already existed. The ONLY thing that set
+them was the **pre-spawn** refusal (missing binary) on the ensure funnel — nothing watched what
+happened AFTER a PTY existed, so a launch that died one step later kept `Running` over a corpse.
+
+A write to such a row now answers *"this row's launch process has exited, so there is nothing to
+type into — last screen: …"* instead of a bare write failure, marks the row `Failed`, and traces
+`terminal_write/launch_process_exited`. The last non-empty screen line becomes the error: for a
+failed wrapper the frozen frame IS the diagnosis, and marking the row is about to make it the only
+surviving copy.
+
+⚖ **Why the WRITE path and not a sweep, deliberately.** The check runs only because a write already
+failed, so no idle healthy row is ever inspected — let alone relabelled. A periodic sweep over live
+rows would have to separate launch-failure from an ordinary user quit on every pass, and a
+mislabelled healthy row is a worse bug than the one being fixed. ⛔ `session_has_exited` is
+three-valued for the same reason and only `Some(true)` acts: `session_is_running` folds a failed
+`waitpid` into "not running", which is right for a display question and wrong for anything that
+changes state.
+
+### ⛔ WHAT IS STILL OPEN
+
+1. **The row badge** — the sidebar does not yet render a failed row differently, so the state is
+   readable by a caller and by the inspector but not yet by the eye.
+2. **Notification addressed AT the row**, so a launch death is noticed without visiting it.
+3. **A death nobody writes to** stays unmarked, by design of the above. Closing that needs the
+   quit-vs-failure discriminator the write path is able to skip: the daemon has
+   `runtime_output_seen`, `eof_without_output` and `last_output_ms`, but no record of whether a CLI
+   ever became READY (`attach_ready_seen` is remote-resume-attach only, not general readiness).
+   ⇒ Settle readiness FIRST; a time window ("died young") is a guess and would mislabel a quick
+   user quit.
+
 **Falsifier:** kill a CLI's launch before it execs and confirm the row shows an error state rather
-than an idle-looking frozen frame.
+than an idle-looking frozen frame, and that a submit to it answers with the error, not a timeout.
 
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
