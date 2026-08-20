@@ -154,7 +154,7 @@ pub use titles::{
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_foreign_trace_batch,
-    append_trace_event, event_trace_path, follow_trace_lines, read_trace_tail,
+    append_tagged_trace_event, append_trace_event, event_trace_path, follow_trace_lines, read_trace_tail,
 };
 pub use trace_contract::{
     ForeignRecordFault, ForeignTraceRecord, MAX_FOREIGN_BATCH_RECORDS, MAX_FOREIGN_PAYLOAD_BYTES,

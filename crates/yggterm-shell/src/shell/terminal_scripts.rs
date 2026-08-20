@@ -205,6 +205,162 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
         }};
 {trace_emitter_js}
+        // ── xterm.js probes (layer=xterm) ──────────────────────────────────
+        // These serve the open ghost-frame / glyph-soup entry in
+        // docs/pending-bugs.md, whose fix direction asks for "the xterm.js write
+        // queue instrumented to see what actually interleaves". Ordering is what
+        // that question needs, and `ts_ms` cannot answer it: a reset, the reseed
+        // that follows it and a bridge flush that lands between them routinely
+        // share a millisecond. Every probe below therefore carries the emitter's
+        // `seq`, which totally orders them because one emitter numbers them all.
+        //
+        // ⛔ RESOLUTION IS RATIONED ON PURPOSE. The ring is bounded, so a probe
+        // that fires per steady-state event spends the whole budget describing
+        // the boring case and evicts the switch that was the point. The split
+        // below is the same floor-plus-window discipline the Rust probes use:
+        // an always-on aggregate keeps the RATE honest, and point events are
+        // spent only on outliers and on the boundaries where corruption lives.
+        const YGG_XTERM_WINDOW_MS = 1000;
+        // A write-queue depth past which one enqueue is worth a point event of
+        // its own. Below it the aggregate carries the story.
+        const YGG_XTERM_QUEUE_DEPTH_FLOOR = 16384;
+        // A backlog older than this has stopped being a queue and become a lag.
+        const YGG_XTERM_BACKLOG_AGE_FLOOR_MS = 250;
+        // A gap between painted frames past which the canvas visibly stutters.
+        const YGG_XTERM_FRAME_GAP_FLOOR_MS = 250;
+        const xtermProbeWindows = {{}};
+        // Close a window LAZILY, on the next event rather than on a timer.
+        //
+        // ⚠ The consequence, stated so no reader has to discover it: when output
+        // stops, the final window stays open until something happens again, so
+        // its `window_ms` can be far larger than the nominal interval. That is
+        // why `window_ms` is measured and reported rather than assumed — a
+        // consumer dividing by the constant would compute a rate that is wrong
+        // by exactly the length of the silence. The alternative, a timer per
+        // host, would spend wakeups on an idle terminal to report that nothing
+        // happened, which is a worse trade for a laptop than a self-describing
+        // window.
+        const xtermProbeWindow = (name, seed) => {{
+            let bucket = xtermProbeWindows[name];
+            const now = Date.now();
+            if (bucket && now - bucket.startedAtMs >= YGG_XTERM_WINDOW_MS) {{
+                closeXtermProbeWindow(name);
+                bucket = null;
+            }}
+            if (!bucket) {{
+                bucket = Object.assign({{ startedAtMs: now, count: 0 }}, seed || {{}});
+                xtermProbeWindows[name] = bucket;
+            }}
+            return bucket;
+        }};
+        const closeXtermProbeWindow = (name) => {{
+            const bucket = xtermProbeWindows[name];
+            if (!bucket || !bucket.count) {{
+                delete xtermProbeWindows[name];
+                return;
+            }}
+            delete xtermProbeWindows[name];
+            const payload = Object.assign({{}}, bucket, {{
+                host_id: hostId,
+                window_ms: Math.max(0, Date.now() - bucket.startedAtMs),
+            }});
+            delete payload.startedAtMs;
+            ytrace.window(name.split("/")[0], name.split("/")[1], payload);
+        }};
+        // Close every open window NOW. Called at the boundaries a corrupted
+        // switch is investigated across, so the aggregate covering the moment
+        // before a reset is on the plane BEFORE the reset's own point event
+        // rather than folded into the window that follows it.
+        const closeXtermProbeWindows = () => {{
+            for (const name of Object.keys(xtermProbeWindows)) {{
+                closeXtermProbeWindow(name);
+            }}
+        }};
+        const traceXtermEnqueue = (chars, depth, backlogAgeMs) => {{
+            const bucket = xtermProbeWindow("xterm_write/enqueue_window", {{
+                chars: 0,
+                max_depth: 0,
+                max_backlog_age_ms: 0,
+            }});
+            bucket.count += 1;
+            bucket.chars += chars;
+            bucket.max_depth = Math.max(bucket.max_depth, depth);
+            bucket.max_backlog_age_ms = Math.max(bucket.max_backlog_age_ms, backlogAgeMs);
+            if (depth >= YGG_XTERM_QUEUE_DEPTH_FLOOR || backlogAgeMs >= YGG_XTERM_BACKLOG_AGE_FLOOR_MS) {{
+                ytrace.emit({{
+                    category: "xterm_write",
+                    name: "enqueue_backlog",
+                    payload: {{
+                        host_id: hostId,
+                        chars,
+                        depth,
+                        backlog_age_ms: backlogAgeMs,
+                    }},
+                }});
+            }}
+        }};
+        const traceXtermFlush = (elapsedMs, detail) => {{
+            // Every flush, as a span. Unlike the enqueue probe this one is rate
+            // -bounded by the write-frame budget rather than by how fast the PTY
+            // talks, so it cannot flood the ring — and a flush is the unit the
+            // interleave question is actually asked in.
+            ytrace.emit({{
+                category: "xterm_write",
+                name: "flush",
+                kind: "span",
+                clock: "wall",
+                duration_ms: Math.max(0, Number(elapsedMs) || 0),
+                payload: Object.assign({{ host_id: hostId }}, detail || {{}}),
+            }});
+        }};
+        const traceXtermRender = (rowStart, rowEnd, rows) => {{
+            const now = Date.now();
+            const bucket = xtermProbeWindow("xterm_render/frame_window", {{
+                max_rows_painted: 0,
+                full_canvas_frames: 0,
+                max_gap_ms: 0,
+                lastFrameAtMs: 0,
+            }});
+            const rowsPainted = Math.max(0, (Number(rowEnd) - Number(rowStart)) + 1);
+            const gapMs = bucket.lastFrameAtMs ? now - bucket.lastFrameAtMs : 0;
+            bucket.count += 1;
+            bucket.lastFrameAtMs = now;
+            bucket.max_rows_painted = Math.max(bucket.max_rows_painted, rowsPainted);
+            bucket.max_gap_ms = Math.max(bucket.max_gap_ms, gapMs);
+            // ⭐ A full-canvas repaint is the shape of the glyph-soup symptom —
+            // the corruption reported is the WHOLE viewport unreadable, not a
+            // damaged line. Counting them separately is what lets a reader ask
+            // "how many times did this session repaint everything" without
+            // reading every frame.
+            if (rows > 0 && rowsPainted >= rows) {{
+                bucket.full_canvas_frames += 1;
+            }}
+            if (gapMs >= YGG_XTERM_FRAME_GAP_FLOOR_MS) {{
+                ytrace.emit({{
+                    category: "xterm_render",
+                    name: "frame_gap",
+                    payload: {{
+                        host_id: hostId,
+                        gap_ms: gapMs,
+                        rows_painted: rowsPainted,
+                        rows,
+                    }},
+                }});
+            }}
+        }};
+        // The interleave anchor. A reset wipes the screen and something must
+        // reseed it; if a bridge flush lands between the two, the canvas holds
+        // half of one screen and half of another — which is what unreadable
+        // output looks like from the inside. `seq` on these three probes is what
+        // turns that from a story into a total order a reader can check.
+        const traceXtermScreenEvent = (name, detail) => {{
+            closeXtermProbeWindows();
+            ytrace.emit({{
+                category: "xterm_screen",
+                name,
+                payload: Object.assign({{ host_id: hostId }}, detail || {{}}),
+            }});
+        }};
         const recvTerminalCommand = async () => {{
             if (!terminalDioxusRecv) {{
                 return null;
@@ -5524,6 +5680,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         : (term && term._core && term._core._writeBuffer && typeof term._core._writeBuffer.writeSync === "function"
                             ? term._core._writeBuffer.writeSync.bind(term._core._writeBuffer) : null);
                     try {{
+                        traceXtermScreenEvent("reset", {{ reason: "persisted_restore", chars: restoredText.length }});
                         if (typeof term.reset === "function") {{ term.reset(); }}
                         // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
                         window.__yggtermArmOsc52Suppress(hostId, 400);
@@ -5599,6 +5756,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     ? term._core._writeBuffer.writeSync.bind(term._core._writeBuffer)
                     : null;
             try {{
+                traceXtermScreenEvent("reset", {{ reason: "snapshot_reseed" }});
                 if (typeof term.reset === "function") {{
                     term.reset();
                 }}
@@ -9376,6 +9534,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (!terminalTextHasInternalTransportLeak(readTerminalBufferSample())) {{
                     return false;
                 }}
+                traceXtermScreenEvent("reset", {{ reason: "transport_leak_scrub" }});
                 if (term && typeof term.reset === "function") {{
                     term.reset();
                 }}
@@ -9995,6 +10154,22 @@ fn terminal_eval_script_with_canvas_renderer(
             }} else {{
                 requestRenderProbe('write_flush');
             }}
+                // ⛔ The SAME numbers as the perf event below, deliberately, and
+                // taken from the same locals rather than re-measured — two
+                // instruments reporting one flush must not be able to disagree
+                // about how long it took. What differs is the plane and the
+                // grammar: this row carries `layer`, `clock` and `seq`, so it
+                // can be ordered against a reset and a render frame; the perf
+                // row keeps feeding the existing rollups unchanged.
+                traceXtermFlush(flushElapsedMs, {{
+                    callback_fired: Boolean(callbackFired),
+                    flush_should_follow: Boolean(flushShouldFollow),
+                    paint_repair_reason: String(paintRepairReason || ''),
+                    pending_chars: currentEntry ? String(currentEntry.writeBridgePendingData || '').length : 0,
+                    raw_payload_length: currentEntry ? Number(currentEntry.lastRawPayloadLength || 0) : 0,
+                    raw_payload_line_count: currentEntry ? Number(currentEntry.lastRawPayloadLineCount || 0) : 0,
+                    effective_frame_ms: currentEntry ? Number(currentEntry.effectiveTerminalWriteFrameMs || 0) : effectiveTerminalWriteFrameMs(),
+                }});
                 emitPerf("xterm_write_flush", {{
                     callback_fired: Boolean(callbackFired),
                     flush_should_follow: Boolean(flushShouldFollow),
@@ -10325,12 +10500,25 @@ fn terminal_eval_script_with_canvas_renderer(
                 schedulePrimarySelectionSync();
             }})
             : null;
-        const renderDisposable = term.onRender(() => {{
+        const renderDisposable = term.onRender((renderRange) => {{
             renderEventCount += 1;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].renderEventCount = renderEventCount;
                 window.__yggtermXtermHosts[hostId].lastRenderEventAtMs = Date.now();
             }}
+            // The row RANGE, which the old counter threw away. It is the
+            // difference between "one line was repainted" and "the whole
+            // viewport was repainted", and the reported corruption is a
+            // whole-viewport symptom — so without the range the counter cannot
+            // tell a healthy busy terminal from a session repainting everything
+            // it owns, over and over.
+            try {{
+                traceXtermRender(
+                    renderRange ? renderRange.start : 0,
+                    renderRange ? renderRange.end : 0,
+                    term ? Number(term.rows || 0) : 0
+                );
+            }} catch (_error) {{}}
             // XTERM-BUG: webgl-stale-atlas-garble — residual glyph-corruption
             // paths (occlusion throttle, monitor wake, any path the focus/switch
             // activation repaint misses) render against a glyph atlas that went
@@ -11059,6 +11247,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     window.__yggtermXtermHosts[hostId].terminalContentSource = 'empty';
                     window.__yggtermXtermHosts[hostId].terminalSourceMismatchReason = '';
                 }}
+                traceXtermScreenEvent("reset", {{ reason: "clear_to_empty" }});
                 if (typeof term.reset === 'function') {{
                     term.reset();
                 }} else {{
@@ -11278,6 +11467,14 @@ fn terminal_eval_script_with_canvas_renderer(
                     if (__ygPendingLen > 0 && !Number(window.__yggtermXtermHosts[hostId].writeBridgePendingSinceMs || 0)) {{
                         window.__yggtermXtermHosts[hostId].writeBridgePendingSinceMs = Date.now();
                     }}
+                    const __ygBacklogSince = Number(
+                        window.__yggtermXtermHosts[hostId].writeBridgePendingSinceMs || 0
+                    );
+                    traceXtermEnqueue(
+                        incomingWriteData.length,
+                        __ygPendingLen,
+                        __ygBacklogSince ? Math.max(0, Date.now() - __ygBacklogSince) : 0
+                    );
                 }}
                 const forceLowLatencyWrite = terminalPayloadShouldFlushImmediately(incomingWriteData);
                 schedulePendingWriteFlush(forceLowLatencyWrite);
@@ -12810,6 +13007,27 @@ fn terminal_replay_retained_data_script_for_session(
             const replayResetPrefix = replaySource === 'daemon_retained_history_screen_snapshot'
               ? "\x1bc\x1b[H"
               : "\x1bc\x1b[2J\x1b[3J\x1b[H";
+            // ⭐ THE PAIR THE GHOST-FRAME ENTRY ASKS ABOUT. This path wipes the
+            // screen and reseeds it, and the open question is whether anything
+            // lands in between — a half-old, half-new canvas is what unreadable
+            // output looks like from the inside. Both ends are marked, so the
+            // total order the emitter's `seq` provides can answer it directly
+            // instead of by inference from timestamps that collide.
+            //
+            // ⛔ Emitted through the page-global emitter, not the per-host
+            // helper: this script is generated by a different function and has
+            // no probe helpers in scope. Guarded, because the emitter is
+            // installed by the terminal script and this one can run first.
+            if (window.__yggtermTrace) {{
+              window.__yggtermTrace.emit({{
+                category: "xterm_screen",
+                name: "replay_reset",
+                payload: {{
+                  host_id: String(entry.hostId || ''),
+                  replay_source: String(replaySource || ''),
+                }},
+              }});
+            }}
             try {{
               if (typeof entry.term.reset === "function") {{
                 entry.term.reset();
@@ -12846,6 +13064,22 @@ fn terminal_replay_retained_data_script_for_session(
                 if (writeSync) {{
                   entry.writeBridgeInFlight = false;
                 }}
+              }}
+              // The closing half of the pair. A `replay_reset` with no
+              // `replay_reseed` after it is a screen that was wiped and never
+              // refilled — the stale/blank viewport symptom — and any foreign
+              // record whose `seq` falls BETWEEN the two wrote into a screen
+              // that was mid-replacement.
+              if (window.__yggtermTrace) {{
+                window.__yggtermTrace.emit({{
+                  category: "xterm_screen",
+                  name: "replay_reseed",
+                  payload: {{
+                    host_id: String(entry.hostId || ''),
+                    replay_source: String(replaySource || ''),
+                    chars: String(payload || '').length,
+                  }},
+                }});
               }}
               // Record which runtime spawn this buffer is now seeded from — the
               // comparison anchor for the cold-re-resume vacuum guard above.
@@ -13059,6 +13293,17 @@ fn terminal_replay_retained_data_script_for_session(
                 return;
               }}
             }}
+            if (window.__yggtermTrace) {{
+              window.__yggtermTrace.emit({{
+                category: "xterm_screen",
+                name: "replay_reset",
+                payload: {{
+                  host_id: String(entry.hostId || ''),
+                  replay_source: String(replaySource || ''),
+                  stage: "follow_retry",
+                }},
+              }});
+            }}
             try {{
               if (typeof entry.term.reset === "function") {{
                 entry.term.reset();
@@ -13098,6 +13343,18 @@ fn terminal_replay_retained_data_script_for_session(
                 if (writeSync) {{
                   entry.writeBridgeInFlight = false;
                 }}
+              }}
+              if (window.__yggtermTrace) {{
+                window.__yggtermTrace.emit({{
+                  category: "xterm_screen",
+                  name: "replay_reseed",
+                  payload: {{
+                    host_id: String(entry.hostId || ''),
+                    replay_source: String(replaySource || ''),
+                    stage: "follow_retry",
+                    chars: String(data || '').length,
+                  }},
+                }});
               }}
             }} catch (_error) {{
               entry.writeBridgeInFlight = false;

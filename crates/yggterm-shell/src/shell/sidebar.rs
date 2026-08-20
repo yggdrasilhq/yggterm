@@ -41,6 +41,7 @@ fn Sidebar(
     on_commit_rename: EventHandler<BrowserRow>,
     on_cancel_rename: EventHandler<()>,
 ) -> Element {
+    let _render_span = crate::render_attribution::ComponentRenderSpan::start("Sidebar");
     // A hidden sidebar leaves the FLOW entirely (see `sidebar_panel_outer_style`):
     // the viewport keeps its full width and the reveal happens on the z axis, so
     // hovering the edge never re-fits the xterm and never touches the daemon's

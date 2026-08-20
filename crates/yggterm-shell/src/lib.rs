@@ -21,6 +21,7 @@ mod hot_update_policy;
 #[allow(dead_code)]
 mod keytip;
 mod netscape_cookie_jar;
+mod render_attribution;
 // The ONE owner of "how long may the remote-resume readiness gate keep the
 // user's terminal blank and un-typeable". The 60 s failure timer is armed per
 // BOOTSTRAP identity; the gate is re-armed per RECOVERY, so every re-arm after

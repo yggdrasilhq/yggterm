@@ -211,6 +211,57 @@ pub fn append_trace_event(
     ytrace_trace_provider().event(component_s, category_s, name_s, payload);
 }
 
+/// Append one NATIVE record that carries contract tags.
+///
+/// `append_trace_event` is the hot, untagged path — it writes the implicit
+/// `rust`/`point` case and pays no bytes to say so. This is its counterpart for
+/// the native call sites that genuinely have more to declare: a Dioxus render
+/// aggregate is on the `dioxus` layer and is a `window`, and both facts have to
+/// be in the record or a reader has to know them by reputation.
+///
+/// ⛔ Unlike the foreign path there is no validation here, because there is
+/// nothing to validate: the caller is in-process, its pid is this pid, and a
+/// `TraceClock` it hands over is a clock it actually read.
+#[allow(clippy::too_many_arguments)]
+pub fn append_tagged_trace_event(
+    home: &Path,
+    layer: crate::trace_contract::TraceLayer,
+    kind: crate::trace_contract::TraceKind,
+    component: impl Into<String>,
+    category: impl Into<String>,
+    name: impl Into<String>,
+    clock: Option<crate::trace_contract::TraceClock>,
+    duration_ms: Option<f64>,
+    payload: Value,
+) {
+    let component_s = component.into();
+    let category_s = category.into();
+    let name_s = name.into();
+    crate::ui_block::note_activity(&format!("{category_s}/{name_s}"));
+    let record = EventTraceRecord {
+        ts_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+        pid: std::process::id(),
+        component: component_s.clone(),
+        category: category_s.clone(),
+        name: name_s.clone(),
+        payload: payload.clone(),
+        layer: Some(layer.as_str().to_string()),
+        kind: Some(kind.as_str().to_string()),
+        clock: clock.map(|clock| clock.as_str().to_string()),
+        duration_ms,
+        seq: None,
+    };
+    let Ok(mut line) = serde_json::to_vec(&record) else {
+        return;
+    };
+    line.push(b'\n');
+    write_trace_line(home, &line);
+    ytrace_trace_provider().event(component_s, category_s, name_s, payload);
+}
+
 fn write_trace_line(home: &Path, line: &[u8]) {
     let path = event_trace_path(home);
     let mut writers = trace_writers()

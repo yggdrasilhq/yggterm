@@ -9,6 +9,7 @@ fn MainSurface(
     on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
     on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput, bool)>,
 ) -> Element {
+    let _render_span = crate::render_attribution::ComponentRenderSpan::start("MainSurface");
     let active_session_path = snapshot.active_session_path.clone();
     let surface_key = format!(
         "{}:{}",

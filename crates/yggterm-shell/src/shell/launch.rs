@@ -383,12 +383,17 @@ fn render_cause_field_hashes(
     ]
 }
 fn app() -> Element {
+    let _render_span = crate::render_attribution::ComponentRenderSpan::start("app");
     let bootstrap = BOOTSTRAP
         .get()
         .expect("shell bootstrap not initialized")
         .clone();
     let linux_transparent_window = bootstrap.linux_window_transparent;
     let trace_home = perf_home_dir(&bootstrap.settings_path);
+    // Report any elapsed attribution window from the render loop itself. It is
+    // the one clock guaranteed to tick whenever there is something to report,
+    // and a separate timer would have to wake on an idle app to say nothing.
+    crate::render_attribution::flush_component_render_windows(&trace_home);
     // RENDER-STORM PROBE (the unpinned ~37 renders/s wake storm — implicated
     // in two CPU-spin incidents and the main-thread ensure starvation): count
     // app() executions and trace the rate once a minute, so the storm's
