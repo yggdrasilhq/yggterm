@@ -2207,6 +2207,18 @@ def boot(host, row, dry):
     if dry:
         log(f"DRY-RUN would boot {row}")
         return "dry-run"
+    # ⛔ A LIMIT-WAITING ROW IS NOT STALLED — its CLI's auto-continue is armed
+    # and the turn resumes when the window opens, so a boot here types into a
+    # composer that is about to be consumed by the continuation. The daemon
+    # detects the wait footer per-CLI (3.1.13+) and this consumes ITS verdict
+    # instead of re-deriving one from screen text; on older daemons the field
+    # is absent and the guard is inert. Per-row and self-resolving: no fleet
+    # hold, no escalation, no boot counted — just wait the window out.
+    # (Ships while booters are HELD fleet-wide; the un-hold is its activation.)
+    if _daemon_limit_wait(host, row):
+        log(f"   ⏸ refusing the boot: the daemon reports this row is waiting "
+            f"out a usage limit (auto-continue armed); it resumes by itself")
+        return "refused-limit-wait"
     outcome = _pty_type_and_enter(host, row)
     if outcome:
         return outcome
@@ -2278,6 +2290,42 @@ def _daemon_screen_text(host, row):
             return None                  # it said plainly that it could not look
         return "\n".join(e.get("screen_tail") or [])
     return None                          # the daemon has no screen for this row
+
+
+def _daemon_limit_wait(host, row):
+    """True ONLY when the row's own daemon says `shows_limit_wait: true`.
+
+    The daemon (3.1.13+) detects the CLI's usage-limit wait footer per-CLI and
+    publishes it on the gate-screen reading — the SSOT this replaces was our own
+    python re-derivation of the same screen, which is the second-encoding shape
+    the queue's limit-wait entry exists to end. A limit-waiting row has
+    auto-continue armed and resumes by itself; typing into it is at best noise
+    and at worst lands in the composer of a turn that is about to continue.
+
+    ⛔ ANYTHING SHORT OF AN EXPLICIT true IS false — deliberately NOT the
+    choice-guard's refuse-on-doubt. An older daemon's JSON simply lacks the
+    field, and "the daemon is too old to say" must leave the boot behaviour
+    exactly as it was, or shipping this guard would silently stop the whole
+    fleet's wake plane on mixed versions. The choice guard refuses on doubt
+    because its Enter can change billing; this one only defers a wake."""
+    uuid = row.rsplit("/", 1)[-1]
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "gate-screen", f"cc-runtime://{uuid}",
+                     "--tail", "1", "--json"], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    try:
+        entries = json.loads((r.stdout or "").strip() or "[]")
+    except Exception:
+        return False
+    if not isinstance(entries, list):
+        return False
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("session_key") or "").rsplit("/", 1)[-1] != uuid:
+            continue
+        return e.get("shows_limit_wait") is True
+    return False
 
 
 def _screen_shows_a_choice(host, row):
@@ -2862,7 +2910,8 @@ def tick(args):
                 s["boots"] += 1
                 via = boot(host, row, args.dry_run)
                 if via in ("refused-draft", "refused-choice-prompt",
-                           "refused-screen-unreadable", "refused-draft-race"):
+                           "refused-screen-unreadable", "refused-draft-race",
+                           "refused-limit-wait"):
                     # ⛔ A refusal is NOT a failed boot and must not count as one.
                     # The row is idle because its owner is mid-sentence, which is
                     # the one state where booting is worse than waiting — so give

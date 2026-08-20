@@ -105,10 +105,15 @@ notification edge skips limit-waiting rows exactly like unknowns, so the limit e
 no longer fires a false "done" (and the genuine finish after the window still notifies
 once). Lock: `a_usage_limit_wait_is_a_third_state_not_idle` (core).
 
-**Still open under this heading:** the booter's classifier keeps its own python
-`RATE_LIMITED` derivation — it should consume the daemon's `limit_wait` once a bumped
-daemon is live (the booter deploys on its own plane); and every non-CC CLI's limit-wait
-phrases are unmeasured.
+**Still open under this heading:** every non-CC CLI's limit-wait phrases are unmeasured.
+The booter half is WRITTEN and DORMANT (2026-08-20): `boot()` now consumes the daemon's
+`shows_limit_wait` from the gate-screen JSON and refuses with `refused-limit-wait` (per-row,
+no fleet hold, boot not counted; an older daemon's JSON lacks the field and the guard is
+inert). Booters are HELD fleet-wide — the un-hold is the activation — and the supervision
+tools still have no deployment step (their own open entry), so the change reaches hosts
+with the checkout. The wire half is verified live on the 3.1.14 dev daemon: `limit_wait` is
+present (false) on all 47 live rows; the true-state proof self-arms at the next real
+plan-limit window.
 
 **Falsifier (needs the bump deploy):** a row painted with the limit-wait footer must not
 read `idle` on the metadata panel, the dot, or `gate-screen`; a row at a genuine prompt
@@ -449,62 +454,21 @@ decomposed into four distinct defects, each proven from the trace or `/proc`:
    deploy that relied on it left daemons unconverged — plausibly the parent of today's
    generation pile-up.
 
-## ⛔⛔ [11.0] A REMOTE CC SPAWN'S --model NEVER REACHES THE PROCESS — AND THREE LAYERS HIDE IT
+## ⚠ [11.0→11.10] `launch.applied` IS STILL COMPUTED AGAINST A RE-DERIVED COMMAND
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-*Root-caused and fixed 2026-08-20 by 11.10 (daemon-side; activates on the next version-bump
-deploy). The drop was never in the create:* the create composes the model correctly and
-`launch.applied` reports it truthfully. **What erases it is a LAUNCH-COMMAND REBUILD that
-fires between the row's birth and its first spawn:** `TerminalRestart` refreshes the very
-path it is about to spec, and `SyncTerminalIdentity` (sent around client opens and
-theme/profile syncs) sweeps every session — and BOTH remote rebuild sites
-(`refresh_remote_codex_terminal_identity_launch_command` and the `launch_binary_cache_miss`
-rebuild) composed their exports through the options-free `claude_extra_args_remote_exports()`,
-writing a configured-only `YGGTERM_CC_EXTRA_ARGS` into the command the PTY then executed.
-This is the exact remote twin of the local-CC rebuild bug fixed 2026-08-06 ("the rebuild
-fires ~1 ms after a delegate row is born"), and the row already carries the cure: the
-per-launch options are persisted on the session precisely so rebuilds can consult them.
-Both sites now compose from `session.agent_launch_options` (CC via
-`claude_extra_args_remote_exports_with_launch`; the general lane via
-`agent_launch_options_remote_exports` + configured). Lock:
-`the_remote_launch_command_rebuilds_carry_the_rows_launch_options` (source-contract, same
-idiom as the local twin's lock).
-
-**⛔ THE REBUILD HALF ALONE DID NOT CURE IT — measured live on the 3.1.12 deploy
-(2026-08-20 ~21:0x), and the failed proof found the second half.** A remote CC spawn with
-`--model` on 3.1.12 (which carries the rebuild fix) still landed without the flag: the
-wrapper's composed command on the target read `claude --dangerously-skip-permissions
---session-id <id>` and the child env's `YGGTERM_CC_EXTRA_ARGS` carried configured args
-only. Cause: **the remote create composed a correct command and never STORED the options
-on the row** (`start_remote_agent_session_with_launch_options` had no
-`session.agent_launch_options = launch.clone()`, unlike the local create) — so the
-identity-refresh rebuild honestly composed from an empty set and erased the model before
-the PTY spawned. The storage line is now in code, and the source-contract lock grew a
-clause requiring it. Both halves activate together on the next bump after 3.1.12.
-
-Original measurement, kept because the masking layers are still real: measured end-to-end
-2026-08-20 with every component on the same current build (client, GUI-host
-daemon, and target-host daemon all 3.1.9): `server app terminal new --kind claude-code
---machine-key <target> --model <id>` starts the remote row with `YGGTERM_CC_EXTRA_ARGS`
-carrying only the configured args — the requested model is absent from the export, the wrapper
-command, and the process cmdline (verified in the claude process's /proc environ). A direct
-daemon-socket request with `launch_options` set reproduces it with the GUI fully bypassed, and
-a unit round-trip of those exact bytes through `ClientRequestEnvelope` deserializes the model
-intact — so the drop is at runtime between the daemon's `StartRemoteClaudeSession` handler and
-`remote_agent_start_exports`, in code whose source reads correct.
-
-**Three layers hide it:** (1) the snapshot post-processor re-derives remote rows'
-`launch_command` from configured args alone, so the stored command cannot be told from the
-composed one; (2) `launch.applied` is computed against that re-derived command, so it reports
-`false` truthfully but for an unverifiable reason; (3) on fleets whose configured default IS
-the requested model, the row lands on the right tier anyway and the drop is invisible — which
-is exactly this fleet today, and why it survives. It bites whenever requested ≠ default (the
-dossier campaign's spawner has carried a `/model`-at-turn-zero workaround for precisely this).
-**Falsifier for the fix:** the claude process env on the target host carries the requested
-model in `YGGTERM_CC_EXTRA_ARGS` — and still carries it after a `SyncTerminalIdentity` sweep
-and after a `TerminalRestart` of the row, the two rebuilds that used to erase it. The
-`launch.applied`-against-a-re-derivation masking layer remains open under this heading.
+*The narrowed residue of the remote `--model` drop, closed 2026-08-20 on live proof against
+the 3.1.14 dev daemon: a remote CC spawn with a non-default model reached its process with
+the flag on the cmdline, an explicit `sync_terminal_identity` refreshed the launch command
+("refreshed 1") and the model SURVIVED, and the row's `agent_launch_options` carried the
+stored model.* What remains is the reporting mask the original entry named: the snapshot
+post-processor re-derives a remote row's `launch_command`, and `launch.applied` is computed
+against that re-derivation rather than against the command the create composed — so it can
+read `false` for an unverifiable reason (observed on the 3.1.12 probe) and its verdict
+cannot be told from a re-derivation artifact. **Falsifier:** `launch.applied` reflects the
+command the create actually composed, and a spawn whose flag reached the process never
+answers `applied: false`.
 
 ## ⛔⛔ [11.5] SESSION SWITCHES PAINT GHOST FRAMES AND FULL-CANVAS GLYPH SOUP — EVIDENCE FILED, MECHANISM UNPROVEN
 
