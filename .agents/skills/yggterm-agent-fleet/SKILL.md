@@ -2602,11 +2602,23 @@ launch — do not route around it.
 
 **2026-08-18 — Terminal in cwdtree (depth-3 `ssh://` Data Shell).** `REMOTE_DAEMON_SHELL_SCAN_SCRIPT` in `yggterm-server/src/lib.rs:17596` pushed `ssh://` shells into `RemoteScannedSession` → `__remote_folder__/oc/...` as scanned sessions, duplicating the live rail. `Plain SSH terminals remain Live Sessions only` (state.rs:50340) — removed the daemon shell scan’s push (now `let _ = REMOTE_DAEMON_SHELL_SCAN_SCRIPT`) so shells appear only in `__live_sessions__`.
 
+**2026-08-20 — a Muse row's uuid is NOT a Muse session id, and the store proves it.** `id_assigned_at_birth: false` means Muse mints its own id via RPC; the row uuid yggterm carries is a phantom its store has never held. ⛔ **`muse resume <phantom>` exits 1** with `retained session not found: session <id> has no saved log` — the PTY dies at open, which is why the symptom reads as *"the session does not persist"* rather than as an error.
+
+*Where a live Muse session's real id is:* the directory name in `~/.local/share/muse/sessions/YYYY/MM/DD/<session-id>/`, and the running process names it by holding **`<session-dir>/.session.lock`** open. ⚠ **Do not use any other open file**: a live Muse process holds `cron.db` (+`-shm`/`-wal`) open for SEVERAL session directories at once — including ones it merely carried forward — and only `.session.lock` for the one it is actually running. Two `.session.lock` fds pointing at the SAME directory is normal, not ambiguity.
+
+*Checking membership without a walk:* `session-index.db` `sessions(session_id, workspace_root, title, prompt_count, updated_at_us)` answers by key. ⭐ **`prompt_count = 0` rows in one cwd are the fingerprint of repeated resume-misses** — each failed attach mints a fresh empty session, so a stack of them is the bug's own audit trail.
+
 ### Antigravity (agy)
 
 **Like Claude Code: Store-authoritative.** `title_authority: Store` (already correct). `agy` writes `conversation_summaries.db` (`conversation_summaries.title`) and yggterm respects it, writing back only on explicit rename. `install: Manual` (`agy update` self-updates, measured `agy --help` 2026-08-08) — yggterm provisions by invoking `agy update`, not `npm`.
 
 **No standalone trust gate observed** — but `agy` is Manual-install and can be absent (`not_supported_on_platform` probe), and `id_assigned_at_birth: false` so remote rebind applies. If a first-run gate appears, drive it with `terminal send --data $'\r'` after confirming `❯` like Claude §11.1 and record the tell here.
+
+**⛔⛔ 2026-08-20 — `conversation_summaries.db` CANNOT answer "does this conversation exist", and treating it as authoritative destroys sessions.** Measured: a conversation the CLI creates gets `brain/<id>/` and `conversations/<id>.db` **immediately**, and is **still absent from `conversation_summaries.db`** afterwards — yet `agy --conversation <id>` resumes it without complaint. So that table produces false NEGATIVES for live, resumable conversations. Ask the per-conversation artefacts instead: `conversations/<id>.db` or `brain/<id>/`, a **path check** rather than a query, because the file NAME is the id. Keep the summaries table only as an additional *yes*, never as a *no*.
+
+**⛔ 2026-08-20 — a resume miss is a WARNING, not a failure, and that is what makes it dangerous.** `agy --conversation <unknown>` prints `warning: conversation "<id>" not found` and then **starts a brand new conversation, exit 0**. The caller sees a clean launch, so the row silently becomes a different, empty session under the same title. Never treat agy's exit code as evidence that a resume attached.
+
+**2026-08-20 — where agy's live id is.** At LAUNCH the process holds only the shared index — a fresh row has nothing to bind to because *the conversation does not exist yet*, so expect no id until the first turn. After a turn it holds **`~/.gemini/antigravity-cli/presence/<conversation-id>.lock`**, where the id is the file's **stem** (contrast Muse, where it is the enclosing directory's name). ⭐ To confirm a mapping by hand without an interactive session: `agy -p "<prompt>" --output-format json` returns `{"conversation_id": …}` directly. ⚠ The `crashes/crash_<pid>_<uuid>.log` uuid is NOT a conversation id — it is a run instance.
 
 ---
 
