@@ -353,8 +353,12 @@ removing user activity would not remove most of these renders.
    re-allocates per render, so Sidebar's 24 inline handlers alone guaranteed 232-of-234. Verified
    against dioxus-core 0.7.9 in isolation (inline: child renders 1→2; `use_callback`-stable:
    1→1). All 24 hoisted; two locks added (snapshot self-equality, no-inline-handlers source scan).
-   ⚠ `MainSurface` reads `state` in its body, so it subscribes directly — parent memoization
-   cannot shield it; its narrowing is still open.
+   ⚠→**WORKED (11.12, second pass, in 3.1.15):** `MainSurface`'s direct subscription was ONE
+   reactive read in its render body (the preview-history busy indicator, now a `RenderSnapshot`
+   field arriving via props) plus six inline handler props (hoisted like Sidebar's). Locked by
+   `the_main_surface_neither_subscribes_nor_takes_inline_handlers`. `TerminalCanvas` also gained
+   the `ComponentRenderSpan` it never had — its renders were invisible to `component_window`.
+   Live separation proof owed from the post-roll window.
 3. **The next layer stood exposed once the chores fell:** the remote-preview retry loop
    (`kick_active_remote_preview_sync` entered `with_mut` before its own bails, ~17 no-op
    renders/min) — now behind a shared read-only twin. And `app_control`'s defer-background-refresh
