@@ -221,6 +221,33 @@ fresh as that row's last prompt, so classification falls through to the transcri
 is unenforceable** — that is why the hook exists and this section no longer relies
 on you choosing to look.
 
+### ⛔⛔ THE CONTEXT RITUAL — you GROSSLY underestimate your own context; VERIFY before you relay
+
+**Owner-directed 2026-08-20, after the opposite failure of the one above: the gauge hook
+divided a Fable session's 186k tokens by a 200k window it did not have — the true window was
+1M and `/context` said 19% — and the session relayed TWICE off the false wall, spinning
+successors the owner had to kill by hand.** The wall-death above cost one session; the false
+wall cost successor churn, seat confusion, and owner time — both ends of the same instrument
+failing in opposite directions.
+
+⇒ **THE RITUAL, mandatory before ANY relay/handover decision that cites context:**
+1. **Verify with the CLI's own instrument, never the gauge alone.** In Claude Code that is
+   `/context` — and if a `/context` result is already in your transcript this session, you
+   can simply READ it. For every other CLI, **read the PTY frame** (`server terminal screen`,
+   `gate-screen`) where the CLI paints its own usage — the frame read is the safest
+   cross-CLI method because it types nothing.
+2. **Probing ANOTHER row's context costs a live composer.** If you must type a context
+   command into a row (only when the frame carries no usage), the sequence is: **save any
+   draft in its composer first, send the context command, read the result, then restore the
+   draft** — a handover must lose no typed text, and neither may a probe (§8(f)).
+3. **A gauge and the instrument disagreeing means the GAUGE is wrong** — fix it in the same
+   session (stale-doc law; an instrument that lies is a stale doc with a trigger). The
+   window table lives in `~/.claude/hooks/context-relay-gauge.py`; Fable is natively 1M with
+   no `[1m]` suffix anywhere, which is exactly the case the old table missed.
+4. **When in doubt, assume you have MORE context than you feel.** The documented bias runs
+   one way: sessions under-estimate their remaining window and land too early, shredding
+   continuity into micro-relays. The wall is real but it is measured, not felt.
+
 ### The interactive check, for when you want the CLI's own breakdown
 
 You cannot read your own token count directly — but you can ask
