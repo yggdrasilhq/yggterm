@@ -12,6 +12,52 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.1] AN UNRESOLVABLE ROW KIND IS A **PERMANENT, DEADLINE-EXEMPT** HOT-RESTART BLOCKER, SO ONE agy ROW PINS A DAEMON FOREVER
+
+**Status:** OPEN
+
+*Measured 2026-08-20 on the GUI host, while proving a scan fix that the host could not pick up.*
+
+The GUI host's daemon reported `hot_restart_pending: true` with three blockers of
+`kind: not_restorable, permanent: true` — **all three `remote-agy://` rows**. On the same
+daemon, `remote-cc://` rows on the same peer classified normally (`recently_active`,
+`working`). So this is not "the machine is busy"; it is a kind that never resolves.
+
+`daemon.rs:4851` fails CLOSED, which is right on a PTY-destroying decision:
+
+```rust
+if !self.server.live_session_kind(key).map(session_kind_state_survives_pty_loss)
+    .unwrap_or(false)          // a key whose kind we cannot read is not provably restorable
+```
+
+but `not_restorable` is also in `hot_restart_blocker_is_deadline_exempt`, so §5's
+30-minute forced swap **never fires for it**. The two are individually defensible and
+together mean: *one row whose kind the daemon cannot read pins that daemon on its
+current build permanently.* `session_kind_state_survives_pty_loss` returns true for
+every agent kind, so Antigravity is supposed to be restorable — the failure is the
+LOOKUP, not the policy.
+
+Cost, measured: the host ran a build that was two deploys stale, its fleet view served
+1016 sessions from a scan that had been corrected at source, and nothing in the normal
+deploy proof shows it — every binary on disk reads back at the new commit.
+
+⚠ **How one of the three rows came to exist is the second half.** `remote-agy://dev/00101528…`
+is a BATCH conversation (`step_count` 6, an ephemeral scratch workspace) that only appeared
+in the cwd tree because the agy scan published every store row as a session. It was
+clickable, so it got opened, and the resulting row is un-retirable. A scan defect
+manufactured a permanent blocker for the constitution's core mechanism.
+
+**Falsifier:** with a fix, `live_session_kind` resolves a `remote-agy://<machine>/<id>` key
+to `SessionKind::Antigravity`, the blocker moves off `not_restorable`, and a daemon
+carrying only agy rows retires onto a newer build within the deadline. Until then, verify
+by kind and not by count: a host can be fully deployed on disk and fully stale in process.
+
+**Owner:** the attach/kind-resolution lane — this is the same family as the
+`remote-agy://` connect-kind hand-list in `docs/cli-integration.md` §14 item (4), which was
+closed by deriving the mapping from `remote_agent_row_schemes()`. Check whether
+`live_session_kind` needs the same treatment.
+
+
 ## ⛔ [11.2] `terminal new --model` IS ACCEPTED AND SILENTLY DROPPED FROM THE LAUNCH COMMAND
 
 **Status:** OPEN
