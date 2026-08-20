@@ -617,6 +617,41 @@ presentation policy) or raise a LOUD stale-GUI alarm — silent futile queuing i
 **Falsifier:** deploy a GUI-image change; within one swap-queue cycle the GUI either runs the new
 image (fresh pid, markers present in /proc/<pid>/exe) or a visible alarm names the staleness.
 
+## ⛔⛔ [11.0] CLICKING A HEALTHY LOCAL AGENT ROW SELECTS IT AND OPENS NOTHING — THE PANE STAYS ON THE START PAGE
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-20 ~15:00 with a frame, on a row spawned minutes earlier.*
+
+The sidebar row highlights, and the pane keeps rendering the **start page** while the metadata rail
+reads **`State: No session selected`**. The session is not broken and the daemon does not think it
+is:
+
+    outline_prefix 11.1   presence live_rail   live_member true   live_keep_alive true
+    busy true             busy_reason "agent_working_daemon"      wedge_suspected false
+    icon_kind claude-code host_label localhost  machine_key null
+
+— and the same daemon simultaneously names that session as a hot-restart blocker *because it is
+working*. Its transcript was growing throughout. ⇒ **The row, the runtime and the agent are all
+fine; the click does not produce a mounted view.**
+
+⚠ **Distinguish it from the frozen-view case, which was reported the same hour and is NOT this.**
+There, a row shows a live *attach-wait banner* (`already running under yggterm (pid …); waiting to
+attach`) with `Conversation 0 user · 0 assistant`, because its launch wrapper was orphaned
+(`ppid 1`) when the daemon owning its PTY died, so the PTY master is gone. **That row mounts a view
+and the view is stuck. This row mounts no view at all.** Two different faults; do not let one
+diagnosis absorb the other without deriving it.
+
+**What is suspicious, and is only a lead:** the row is `local://<uuid>` with `machine_key: null`,
+created headlessly with `--no-activate`, whereas remote rows on the same screen open normally. A
+remote row of mine rendered TWO entries (live rail + cwd tree) in the same listing while this local
+one rendered one — but those samples were taken at different instants, so that asymmetry is not yet
+evidence. ⛔ Sample the row listing and the screen at the SAME moment before building on it; that
+error has already produced one published-and-withdrawn finding on this campaign.
+
+**Falsifier:** clicking a live local agent row mounts its terminal view and the metadata rail names
+that session, matching a faithful screenshot sampled at the same instant.
+
 ## ⛔⛔⛔ [11.0] A SAME-VERSION REBUILD CAN NEVER BE ADOPTED, AND THE DAEMON RETRIES THE HANDOFF EVERY 20s FOREVER
 
 **Status:** OPEN
