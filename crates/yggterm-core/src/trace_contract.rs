@@ -198,6 +198,15 @@ pub const MAX_FOREIGN_BATCH_RECORDS: usize = 256;
 pub struct ForeignTraceRecord {
     /// Epoch millis **at the moment of emission**, not of arrival.
     ///
+    /// ⛔ `u64`, NOT `u128`, and that is a wire constraint rather than a taste.
+    /// The record crosses the webview bridge as a `serde_json::Value`, whose
+    /// number type is `u64`/`i64`/`f64` — a `u128` field fails to deserialize
+    /// with `u128 is not supported`, and the bridge answers by discarding the
+    /// WHOLE batch. It reached the trace as `js_event_ignored` and looked
+    /// exactly like a layer that had nothing to say. u64 millis run to the year
+    /// 584 million, so nothing is lost; the record widens to the trace plane's
+    /// `u128` at the boundary, where it is no longer JSON.
+    ///
     /// ⛔ This field is the reason the batch is worth building and the reason
     /// it is dangerous. The emitter buffers and flushes off the hot path, so
     /// arrival can trail emission by the whole flush interval. Stamping on
@@ -205,7 +214,7 @@ pub struct ForeignTraceRecord {
     /// with how busy the UI thread was — i.e. it would be *most* wrong exactly
     /// during the stalls the plane exists to explain, and the resulting
     /// timeline would show the probe firing after the fault it was measuring.
-    pub ts_ms: u128,
+    pub ts_ms: u64,
     pub layer: String,
     pub component: String,
     pub category: String,
@@ -273,7 +282,7 @@ impl ForeignRecordFault {
 /// requires either validated or known-absent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedForeignRecord {
-    pub ts_ms: u128,
+    pub ts_ms: u64,
     pub layer: TraceLayer,
     pub component: String,
     pub category: String,
@@ -384,6 +393,54 @@ mod tests {
             dropped: None,
             payload: json!({}),
         }
+    }
+
+    #[test]
+    fn a_record_decodes_from_the_wire_shape_the_bridge_actually_delivers() {
+        // ⛔⛔ EVERY OTHER TEST HERE BUILDS THE STRUCT IN RUST AND THEREFORE
+        // SKIPS THE WIRE. That gap shipped a real defect: `ts_ms` was `u128`,
+        // which a `serde_json::Value` cannot represent, so the bridge failed
+        // the whole batch with "u128 is not supported" and dropped it. On the
+        // trace it appeared as `js_event_ignored` — indistinguishable from a
+        // foreign layer that simply had nothing to say, which is the failure
+        // mode this contract spends most of its rules trying to prevent.
+        //
+        // ⇒ This test decodes from a `Value`, the way the bridge does. A
+        // contract test that constructs its own input is testing the
+        // constructor.
+        let wire = json!({
+            "ts_ms": 1_787_234_359_561u64,
+            "layer": "xterm",
+            "component": "ui",
+            "category": "xterm_write",
+            "name": "flush",
+            "kind": "span",
+            "clock": "wall",
+            "duration_ms": 1.4,
+            "seq": 8817,
+            "payload": { "host_id": "terminal-a", "pending_chars": 0 },
+        });
+        let raw: ForeignTraceRecord =
+            serde_json::from_value(wire).expect("the bridge's own wire shape must decode");
+        let validated = validate_foreign_record(raw).expect("and then validate");
+        assert_eq!(validated.ts_ms, 1_787_234_359_561);
+        assert_eq!(validated.layer, TraceLayer::Xterm);
+        assert_eq!(validated.kind, TraceKind::Span);
+        assert_eq!(validated.seq, Some(8817));
+
+        // And the minimum an emitter may send: no kind, no clock, no payload.
+        let minimal: ForeignTraceRecord = serde_json::from_value(json!({
+            "ts_ms": 1_787_234_359_561u64,
+            "layer": "xterm",
+            "component": "ui",
+            "category": "xterm_screen",
+            "name": "reset",
+        }))
+        .expect("a minimal record must decode");
+        assert_eq!(
+            validate_foreign_record(minimal).unwrap().kind,
+            TraceKind::Point
+        );
     }
 
     #[test]

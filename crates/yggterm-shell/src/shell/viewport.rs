@@ -9683,8 +9683,8 @@ fn TerminalCanvas(
                                         .map(|record| record.ts_ms)
                                         .max()
                                         .unwrap_or_default();
-                                    let flush_lag_ms = u128::from(current_millis())
-                                        .saturating_sub(newest_ts_ms);
+                                    let flush_lag_ms =
+                                        current_millis().saturating_sub(newest_ts_ms);
                                     let submitted = records.len();
                                     let outcome =
                                         append_foreign_trace_batch(&trace_home, records);
