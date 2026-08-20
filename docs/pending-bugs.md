@@ -1378,7 +1378,8 @@ row reads as more broken than it is.
 
 ## ⛔⛔ [6.2] THE GUI CLOSE PATH NEVER RUNS, SO THE "DIES WITH THE GUI" TIER IS VESTIGIAL
 
-**Status:** AWAITING A DECISION
+**Status:** OPEN
+**Decided (owner, 2026-08-20, via the 11.x Q/A):** RETIRE the "dies with the GUI" tier rather than repair it — align the spec with the survival behaviour users already rely on. Owner lane: 11.2 after the husk work.
 
 **Who decides:** the owner, or 6.0 on his behalf. Repairing this would START
 destroying rows that survive today — see "why this is a decision" below.
@@ -6230,72 +6231,6 @@ source cannot be triaged. Not done in-session on purpose: the service was mid-
 trial and collecting the data the entries above rest on, so restarting it would
 have destroyed the measurement.
 
-## ⛔⛔ [6.7] THE DESKTOP-HOST IDLE-CPU A/B CANNOT RESOLVE ITS OWN EFFECT — STOP SCHEDULING IT
-
-**Status:** AWAITING A DECISION
-
-*Decided by whoever owns cluster sequencing: the orchestrator holds a granted
-window for this A/B, and this entry argues it should not be spent here.*
-
-*measured 2026-08-13 from the recorder's own history; no new instrument needed*
-
-Three attempts at a desktop-host before/after have now come out confounded. The
-reason is not workload discipline, it is arithmetic: **the quantity being
-measured has a noise floor an order of magnitude larger than the effect.**
-
-### The do-nothing floor, same pid, same build, nothing changed
-
-| | windows | min | mean | max | **sd** |
-|---|---|---|---|---|---|
-| GUI, 5-min windows | 33 | 11.5% | 31.1% | 57.9% | **12.65** |
-| GUI, 30-min windows | 5 | 12.2% | 31.6% | 47.7% | **11.65** |
-| web_content, 5-min | 33 | 17.0% | 27.1% | 38.1% | 5.29 |
-
-**The GUI's idle CPU swings 11.5% → 57.9% of a core on ONE build with no change
-of any kind.** ⭐ **And lengthening the window does not help: sd falls only
-12.65 → 11.65 from 5 to 30 minutes.** That is the whole finding — the variance is
-**low-frequency workload drift, not sampling noise**, so it does not average out
-and a longer window buys almost nothing.
-
-### The power calculation, stated BEFORE any arm is run
-
-At sd = 11.65, 80% power, α = 0.05, `n ≈ 16·(sd/effect)²` per arm:
-
-| effect | windows/arm | wall-clock at 30 min/window |
-|---|---|---|
-| **3 pp** (the plausible effect) | **241** | **~10 days per arm** |
-| 10 pp | 22 | ~22 h per arm |
-
-**The fix's measured effect is 0.1 pp on the build host** (1.5% → 1.4%). Even
-scaling generously for the `hpet` clock penalty the arm difference is ~1–3 pp —
-**below what this design can resolve, by roughly 10×.**
-
-⇒ **A "result" from a handful of windows here is noise with a sign.** That is how
-three prior attempts produced confident, contradictory numbers, including one in
-which the *older* process was the cheaper one.
-
-### What to do instead
-
-1. ⭐ **The fix is ALREADY attributed by the instrument that can attribute it.**
-   The sandbox gap fingerprint is deterministic, not statistical: idle renders
-   **1.65 → 0.65/s (61%)**, with the 1001 ms gap population going **31.3% → 0%**.
-   Killing a timer removes its period from the histogram — that is causation, and
-   it needed no quiet host at all.
-2. **If a host-level number is genuinely wanted, the only valid design is
-   INTERLEAVED, not sequential** — alternate arms every ~10 min for many hours so
-   drift lands on both arms equally, and compare *adjacent* pairs. Sequential
-   arms cannot beat a drifting confound at any sample size. ⚠ That means a GUI
-   restart every 10 minutes for hours on the owner's daily driver, which is a
-   far larger intrusion than the number is worth.
-3. **Spend a quiet host on something whose signal exceeds its noise instead** —
-   e.g. the web-process plateau test, where the quantity grows ~366 MB/h
-   monotonically against a much smaller variance.
-
-⛔ **The general rule this entry exists to install:** *state the do-nothing floor
-before designing the comparison.* One query against the recorder answers it, and
-it would have saved three attempts. A perf number quoted without its floor is not
-a measurement.
-
 ## ⛔⛔ [6.7] OUR MANAGED npm CACHE IS 13.3 GB ACROSS THE FLEET AND NOTHING EVER PRUNES IT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -8310,30 +8245,6 @@ it**, not a missing mapping — find the one composing the title from `session_k
 SLUG accessor) and hand it the descriptor instead. A second mapping is the defect the slug-as-SSOT
 rule exists to prevent.
 
-## ⚠ A ROW ADOPTED BY A CAMPAIGN MAY HAVE BEEN THE OWNER'S, AND THE FIELD THAT WOULD SETTLE IT IS UNKNOWN
-
-**Status:** AWAITING A DECISION
-
-A row titled `Agent unnamed shell` (uuid tail `0462c0fb66e1`) was seated under another campaign's
-sub-seat, re-titled by that campaign, and is now driving a live surface for it.
-
-⛔ **It may be an owner-created row that a delegate simply attached to**, rather than a stray. The
-standing row-hygiene law is that an agent may name its own row and the rows it spawned and nothing
-else — and **adopting** a row is that same act wearing a different name, so it needs the same
-permission. Only the owner can say which this was.
-
-**Recommendation, and what the campaign is doing meanwhile: leave it exactly as it is.** The row is
-in active use, the current title is accurate, and reversing it mid-flow costs more than waiting.
-**Reversal is two calls** — `rename` back to `Agent unnamed shell`, then `outline ""` to clear the
-seat — after which the campaign opens its own surface instead.
-
-⚠ **And the identifying chips are NOT stored in `detail_label`.** Dumped before any rename, six
-near-identical rows all already read the generic *"Interactive shell rooted at …"* boilerplate. The
-one chip that proved recoverable came from the application's own banner line on the row's screen,
-not from the row record. ⇒ **Where the sidebar renders those chips from is unknown, and finding it
-is the real engineering here** — it is the field that actually carries a human's identification of
-a row, so no restore of a mis-tidied row can be promised until it is known.
-
 ## ⚠ ~1700 COMMITS LIVE ONLY IN ONE CLONE'S REMOTE-TRACKING REFS — KEEP OR DROP?
 
 **Status:** OPEN
@@ -9840,7 +9751,8 @@ path is a true statement that tells the reader nothing about what to do.
 
 ## ⛔ FIVE PRE-3.0 DAEMONS STILL WALK THE WHOLE TRANSCRIPT CORPUS, AND A DEPLOY CANNOT REACH THEM
 
-**Status:** AWAITING A DECISION
+**Status:** OPEN
+**Decided (owner, 2026-08-20, via the 11.x Q/A):** the held sessions MAY be dropped — archive each daemon's held transcripts/scrollback to disk first, then retire the daemons.
 
 **Decided by:** the owner — only he can say whether the sessions these daemons
 still hold may be dropped.
@@ -14380,7 +14292,8 @@ before and after `cargo test -p yggterm-shell`; if no mtime moves, this is wrong
 
 ## ★★★ FIVE VERBS REPORT THE REQUEST, NOT THE EFFECT — one rule, not five patches
 
-**Status:** AWAITING A DECISION
+**Status:** OPEN
+**Decided (owner, 2026-08-20, via the 11.x Q/A):** the RESPONSE-LAYER RULE, not five patches — the family provably grows (the 11.x wave found new members). Interim per-verb fixes continue in the pattern the rule generalises.
 
 *(The shape of the fix is the decision: a response-layer rule, or five separate
 patches. recorded framing, 2026-08-07.)*
@@ -15296,7 +15209,8 @@ phantom exists, that closes both this and the judder entry at once.
 
 ## `~/.yggterm`'s 700 sockets are ALIASES, not corpses — the real growth is `client-instances`
 
-**Status:** AWAITING A DECISION
+**Status:** OPEN
+**Decided (owner, 2026-08-20, via the 11.x Q/A):** keep the aliases (load-bearing addressing); AGE-PRUNE `client-instances`, which is the real growth — wire it into the existing sweep policy.
 
 *(The user decides. Pruning the alias source is a behaviour change, not a
 cleanup — see the decision paragraph below.)*
@@ -18115,7 +18029,8 @@ rendered and report a null active path.
 
 ## 💬 DISCUSSION for the dev agent
 
-**Status:** AWAITING A DECISION
+**Status:** OPEN
+**Decided (owner, 2026-08-20, via the 11.x Q/A):** defer past the 11.x wave; the direction is a surface-kind declaration in the app-declare protocol so chrome follows what the surface declares.
 
 💬 DISCUSSION for the dev agent — a remote desktop wears browser chrome, and the protocol cannot say otherwise (2026-08-01)
 
