@@ -136,11 +136,20 @@ pub fn run_server_titles_sweep(store: &SessionStore, args: &[String]) -> Result<
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(900);
     let only_kind = flag_value(args, "--kind").map(str::to_string);
+    // ⛔ `--model` exists so a sweep never has to EDIT the user's settings to
+    // run. An earlier one did, and the running GUI wrote its own copy back over
+    // the file within the hour — a config edit under a live GUI does not hold,
+    // and fighting it would have made the interface model an agent's decision
+    // rather than the owner's.
+    let model_override = flag_value(args, "--model").map(str::to_string);
 
     let started_at = Instant::now();
     let home = store.home_dir().to_path_buf();
     let system_home = dirs::home_dir().unwrap_or_else(|| home.clone());
-    let settings = store.load_settings().unwrap_or_default();
+    let mut settings = store.load_settings().unwrap_or_default();
+    if let Some(model) = model_override {
+        settings.interface_llm_model = model;
+    }
 
     let rows = scan_all_durable_sessions(&system_home);
     let before = counts_by_kind(&rows);
