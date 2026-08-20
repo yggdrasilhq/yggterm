@@ -62,6 +62,14 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
             "input/keystroke",
             "input/pty",
             "input/render",
+            // ⛔ THE PROBE ABOVE CANNOT SEE ITS OWN STALL. `input/keystroke` is
+            // emitted from inside the terminal event loop's JS-event branch, so
+            // an hour containing a real multi-second echo stall can record ZERO
+            // input events — not because the probe is misconfigured, but because
+            // the code that emits it is exactly what is blocked. `input/loop_block`
+            // is emitted from the branch that DID run, so the stall is attributed
+            // to whoever caused it instead of vanishing.
+            "input/loop_block",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }
