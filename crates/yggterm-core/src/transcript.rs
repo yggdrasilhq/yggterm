@@ -2763,3 +2763,142 @@ mod claude_code_transcript_tests {
         );
     }
 }
+
+/// How many prose turns a transcript actually holds.
+///
+/// ⛔ THE QUESTION THE RAIL WAS ANSWERING WITH A WINDOW. "Conversation N user ·
+/// M assistant" was derived two different ways, and neither read the
+/// conversation: the live path counted preview BLOCKS (an excerpt, routinely
+/// empty for a terminal-view row, so a 774-record session read `0 user · 0
+/// assistant`), and the scan path counted the tail 12 messages, so the number
+/// could never exceed twelve however long the session ran. Both measured a
+/// window and named it a total.
+///
+/// Reads through [`read_agent_transcript_messages_limited`], the one door onto
+/// "what this session said", so a CLI whose records this crate can already parse
+/// is counted correctly without a second encoding of its format.
+///
+/// ⚠ Bounded on purpose. The cap is far above any real conversation and exists
+/// so that a pathological store file cannot turn a metadata read into an
+/// out-of-memory: `capped` says the answer is a floor, and a caller that renders
+/// it should say so rather than print a number it knows is short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranscriptMessageCounts {
+    pub user: usize,
+    pub assistant: usize,
+    pub total: usize,
+    pub capped: bool,
+}
+
+/// Far above any real conversation; a guard against a pathological file, not a window.
+pub const TRANSCRIPT_COUNT_CAP: usize = 200_000;
+
+pub fn count_agent_transcript_messages(path: &Path) -> Result<TranscriptMessageCounts> {
+    let messages = read_agent_transcript_messages_limited(path, TRANSCRIPT_COUNT_CAP)?;
+    let user = messages
+        .iter()
+        .filter(|message| message.role == TranscriptRole::User)
+        .count();
+    let assistant = messages
+        .iter()
+        .filter(|message| message.role == TranscriptRole::Assistant)
+        .count();
+    Ok(TranscriptMessageCounts {
+        user,
+        assistant,
+        total: messages.len(),
+        capped: messages.len() >= TRANSCRIPT_COUNT_CAP,
+    })
+}
+
+/// [`count_agent_transcript_messages`], memoised on the file's identity.
+///
+/// The key is `(path, len, mtime)` — never the path alone, because a live
+/// session's transcript grows while the rail is open and a path-keyed cache
+/// would pin the first answer for the life of the process. A growing file
+/// changes both len and mtime, so it re-counts exactly when it should.
+pub fn count_agent_transcript_messages_cached(path: &Path) -> Result<TranscriptMessageCounts> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    type Key = (std::path::PathBuf, u64, Option<std::time::SystemTime>);
+    static CACHE: OnceLock<Mutex<HashMap<Key, TranscriptMessageCounts>>> = OnceLock::new();
+
+    let metadata = std::fs::metadata(path)?;
+    let key: Key = (
+        path.to_path_buf(),
+        metadata.len(),
+        metadata.modified().ok(),
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key) {
+            return Ok(*hit);
+        }
+    }
+    let counts = count_agent_transcript_messages(path)?;
+    if let Ok(mut guard) = cache.lock() {
+        // A session's transcript changes size constantly, so every growth mints a
+        // new key. Bound the map rather than let one long-lived GUI accumulate an
+        // entry per keystroke-sized append.
+        if guard.len() > 512 {
+            guard.clear();
+        }
+        guard.insert(key, counts);
+    }
+    Ok(counts)
+}
+
+#[cfg(test)]
+mod conversation_count_tests {
+    use super::*;
+
+    fn cc_line(role: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"{role}","timestamp":"2026-08-20T05:54:13.924Z","message":{{"role":"{role}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    // ⛔ The rail reported `0 user · 0 assistant` for a session holding hundreds
+    // of turns, because the number came from a preview excerpt. A count must
+    // rise with the conversation and must not stop at a window boundary — the
+    // other encoding capped at the tail 12.
+    #[test]
+    fn a_conversation_count_is_a_total_not_a_window() {
+        let dir = std::env::temp_dir().join(format!("ygg_count_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+
+        let mut lines = Vec::new();
+        for i in 0..40 {
+            lines.push(cc_line("user", &format!("ask {i}")));
+            lines.push(cc_line("assistant", &format!("reply {i}")));
+            lines.push(cc_line("assistant", &format!("more {i}")));
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let counts = count_agent_transcript_messages(&path).unwrap();
+        assert_eq!(counts.user, 40, "every user turn counts, not the last twelve");
+        assert_eq!(counts.assistant, 80);
+        assert!(!counts.capped);
+        assert!(
+            counts.total > 12,
+            "a total that stops at 12 is the window bug this replaces",
+        );
+
+        // The cache keys on (path, len, mtime), so a GROWING transcript re-counts
+        // rather than pinning the first answer for the life of the process.
+        let before = count_agent_transcript_messages_cached(&path).unwrap();
+        assert_eq!(before, counts);
+        let mut grown = lines.join("\n");
+        grown.push('\n');
+        grown.push_str(&cc_line("user", "one more"));
+        grown.push('\n');
+        std::fs::write(&path, grown).unwrap();
+        let after = count_agent_transcript_messages_cached(&path).unwrap();
+        assert_eq!(after.user, 41, "a live session's count must follow the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

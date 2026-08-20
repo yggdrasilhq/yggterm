@@ -158,7 +158,9 @@ pub use trace::{
 pub use transcript::{
     TranscriptEntry, TranscriptEntryKind, TranscriptMessage, TranscriptRole, TranscriptTail,
     TranscriptToolCall, TranscriptViewMessage, TranscriptWriter,
-    generation_context_from_messages, message_lines_from_payload,
+    TranscriptMessageCounts, count_agent_transcript_messages,
+    count_agent_transcript_messages_cached, generation_context_from_messages,
+    message_lines_from_payload,
     newest_transcript_writer, newest_transcript_writer_in_tail, read_agent_transcript_entries,
     read_agent_transcript_entries_tail_limited, read_agent_transcript_messages,
     read_agent_transcript_messages_limited, read_agent_transcript_messages_tail_limited,

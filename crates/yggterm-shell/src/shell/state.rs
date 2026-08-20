@@ -51849,25 +51849,47 @@ fn remote_scanned_session_from_live(
     let storage_path = metadata_value(session, "Storage");
     let started_at = metadata_value(session, "Started");
     let recent_context = preview_context_from_session(session).unwrap_or_default();
-    let user_message_count = session
+    // ⛔ COUNT THE CONVERSATION, NOT THE PREVIEW. These feed the metadata rail's
+    // "Conversation N user · M assistant", and they used to count preview BLOCKS
+    // by tone. A preview is an excerpt built for display and is routinely EMPTY
+    // for a terminal-view row, so a live session holding 774 records reported
+    // `0 user · 0 assistant` — a number that reads as "new session" and so never
+    // announced that the instrument had nothing to measure.
+    //
+    // The transcript is the only thing that knows. It is read on demand for THIS
+    // session and memoised on (path, len, mtime), which is what keeps it off the
+    // bulk scan path: a rail describes one selected session, not a store.
+    let counted = (!storage_path.trim().is_empty())
+        .then(|| {
+            yggterm_core::count_agent_transcript_messages_cached(Path::new(
+                storage_path.trim(),
+            ))
+            .ok()
+        })
+        .flatten();
+    let preview_user = session
         .preview
         .blocks
         .iter()
         .filter(|block| block.tone == PreviewTone::User)
         .count();
-    let assistant_message_count = session
+    let preview_assistant = session
         .preview
         .blocks
         .iter()
         .filter(|block| block.tone == PreviewTone::Assistant)
         .count();
+    // Fall back to the preview only when there is no readable transcript — a
+    // window is still better than nothing, and it is what was shipping.
+    let user_message_count = counted.map(|c| c.user).unwrap_or(preview_user);
+    let assistant_message_count = counted.map(|c| c.assistant).unwrap_or(preview_assistant);
     RemoteScannedSession {
         session_path: session.session_path.clone(),
         session_id: session_id.to_string(),
         cwd,
         started_at,
         modified_epoch: 0,
-        event_count: session.preview.blocks.len(),
+        event_count: counted.map(|c| c.total).unwrap_or_else(|| session.preview.blocks.len()),
         user_message_count,
         assistant_message_count,
         title_hint: session.title.clone(),
