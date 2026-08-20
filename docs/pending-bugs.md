@@ -318,6 +318,18 @@ Both sites now compose from `session.agent_launch_options` (CC via
 `the_remote_launch_command_rebuilds_carry_the_rows_launch_options` (source-contract, same
 idiom as the local twin's lock).
 
+**⛔ THE REBUILD HALF ALONE DID NOT CURE IT — measured live on the 3.1.12 deploy
+(2026-08-20 ~21:0x), and the failed proof found the second half.** A remote CC spawn with
+`--model` on 3.1.12 (which carries the rebuild fix) still landed without the flag: the
+wrapper's composed command on the target read `claude --dangerously-skip-permissions
+--session-id <id>` and the child env's `YGGTERM_CC_EXTRA_ARGS` carried configured args
+only. Cause: **the remote create composed a correct command and never STORED the options
+on the row** (`start_remote_agent_session_with_launch_options` had no
+`session.agent_launch_options = launch.clone()`, unlike the local create) — so the
+identity-refresh rebuild honestly composed from an empty set and erased the model before
+the PTY spawned. The storage line is now in code, and the source-contract lock grew a
+clause requiring it. Both halves activate together on the next bump after 3.1.12.
+
 Original measurement, kept because the masking layers are still real: measured end-to-end
 2026-08-20 with every component on the same current build (client, GUI-host
 daemon, and target-host daemon all 3.1.9): `server app terminal new --kind claude-code
@@ -450,102 +462,23 @@ what happens after a boot decision.
 silence; a live stalled row is booted with exactly one typed copy and one Enter; `ps` shows
 exactly one watcher after two racing starts.
 
-## ⛔⛔ [11.10] A ROW-SET ENTRY WHOSE HEAD IS DEAD HIDES ITS MEMBERS FROM THE SIDEBAR — AND THE START PAGE, WHICH IGNORES ARRANGEMENT, KEPT COUNTING THEM
+## ⚠ [11.10] `RowArrangement::retain_live` STILL HAS NO PRODUCTION CALLER, SO DEAD-HEAD GARBAGE ACCUMULATES IN SETTINGS
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-*Caught 2026-08-20 ~19:4x re-running the closed count-universe falsifier under practice
-traffic: shadow-rendered start page header **785**, both `startpage ls` and `cwdtree ls`
-`durable_count` **783**, bracketed and re-rendered fresh — a standing, not a timing, gap.*
-
-The two extras are two remote live sessions stuck in `RemoteBootstrap` (a relay wake spawned
-them; the [11.6] husk class), but the husk-ness is NOT why they hid. Their paths sit in
-`settings.row_arrangement` as MEMBERS of a row set whose head row no longer exists anywhere —
-no live session, no row, no transcript. The chain:
-
-1. **`RowArrangement::retain_live` — written precisely so "a departed head DISSOLVES … a
-   closed session never takes its members off the screen with it" — has NO production call
-   site.** Only its own unit tests call it. The cure existed and was inert (second instance
-   of that shape this week). The dead-head entry therefore persists in settings forever.
-2. **`RowSets::visible_rows` skipped every row with a stored parent**, and a member is only
-   drawn through its head — so a head absent from the drawn rows made its members VANISH:
-   no rail row, no tree row, invisible to `server app rows` and to both count verbs (whose
-   live-session injection iterates sidebar rows). Two LIVE sessions, hidden by layout state.
-3. **The start page builds its universe with `RowArrangement::default()`** — it ignores the
-   user's arrangement — so it kept showing them. Three surfaces, two answers, one universe
-   by contract.
-
-**Fixed in code (render side, non-destructive):** `visible_rows` now draws a member with no
-DRAWN ancestor at top level — arrangement may nest and order, it may not make a row
-disappear. With membership-neutral visibility the page's default-arrangement build and the
-sidebar's user-arrangement build count the same set again. Tests:
-`row_set::a_member_of_an_absent_head_draws_at_top_level_not_nowhere`,
-`…reaches_the_surface_through_an_absent_intermediate_head`, and shell
-`a_live_row_arranged_under_a_dead_head_still_reaches_the_sidebar`.
-
-**Open halves:** (a) the stored dead entry is now harmless but still garbage — `retain_live`
-still wants a production call site at a NON-TRANSIENT departure point (the GUI close/remove
-paths already call `dissolve`/`detach`; the gap is heads that die daemon-side or remotely,
-and a naive per-frame prune against a flickering universe would DESTROY user arrangement
-during a daemon restart, which is presumably why it was never wired); (b) the two live husk
-specimens on the GUI host (spawned by a campaign's parked-row wake relay, seated under a
-head that has since died) are evidence for the [11.6] husk entry and for the wake plane
-that spawned them — do not silently reap them.
-
-**Falsifier (re-arms the count-universe closure):** on the live GUI, with the dead-head
-arrangement entry still in settings, one simultaneous window must answer: shadow start page
-header == `startpage ls durable_count` == `cwdtree ls durable_count`, AND the two husk
-sessions each have a visible sidebar row (`server app rows` carries their paths).
-
-## ⛔⛔⛔ [11.10] A REMOTE AGY SPAWN RUNS THE AGENT ON THE MEDIATOR — THE RESTORED-RUNTIME REPAIR REWRITES REMOTE ROWS, AND FIVE INSTRUMENTS MISS ACROSS THE SPELLING GAP
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*Daemon-side: the fix activates on the next version-bump deploy. Root-caused 2026-08-20
-~19:5x from a live probe, after the practice lane reported `session
-remove` answering an unactionable `verified:false` on a remote antigravity row.*
-
-**The spawn.** `terminal new --kind antigravity --machine-key <target>` composes a correct
-remote row (`remote-agy://<machine>/<id>`, ssh launch) — then
-`refresh_restored_remote_runtime_codex_launch_command`, the repair meant for RESTORED
-daemon-runtime rows, rewrites it: session_path → `agy-runtime://<id>`, source → LiveLocal,
-launch → a LOCAL resume. The daemon then spawns `agy` **on the mediator host** (verified: the
-process's direct parent is the mediator daemon) while the row keeps claiming the remote
-machine (`host_label`, "Workspace: <target>").
-
-**Why the repair misfires for agy and not for remote CC.** Its eligibility sniff is
-(a) session-id metadata the CLI's `session_metadata_label` names — which every healthy REMOTE
-row also carries — and (b) an already-resume check on the launch command. Antigravity's start
-flag IS its resume flag (`--conversation`), so (b) passes and the local-store existence
-lookup is skipped; remote Claude Code survives only because its start spells `--session-id`
-while its resume needle is `--resume`, so (b) fails and the store lookup (no local
-transcript) refuses. Survival by flag spelling, not by design.
-
-**The five measured consequences, one cause.** The terminals map keys the PTY as
-`remote-agy://<machine>/<id>` (the spawn path) while the session view says
-`agy-runtime://<id>`, so: (1) `terminal_process_id` reads None — pid unobservable — although
-the daemon is the process's parent; (2) `launch_phase` sticks at `RemoteBootstrap` forever
-(the local run never signals a remote handshake); (3) `working` stays null; (4) `session
-remove` answers `verified:false / runtime_pid_unobservable` — honestly — and (5) **the agy
-process survives the removal as an orphan** (held live: removal answered
-`row_still_listed:false, live_processes:[]` with the process still running after).
-
-**The practice lane's half:** the reply DOES name its refusal — `verified_refusal` in data
-plus the `error` string. There is no `reason` field; reading one reports null and looks like
-a bare refusal. `runtime_pid_unobservable` on these rows was the instrument telling the
-truth about this defect.
-
-**Fixed in code:** the repair refuses any key or session_path that parses as a remote agent
-row, by scheme, before consulting metadata (remote rows have their own repair). Tests:
-`restored_runtime_repair_tests::{a_remote_agent_row_is_never_repaired_into_a_local_runtime,
-a_runtime_keyed_restored_row_still_repairs}`.
-
-**Falsifier (needs a daemon bump deploy):** a `--machine-key` agy spawn keeps its
-`remote-agy://` path; the mediator holds an ssh process and the TARGET host runs `agy`; the
-snapshot carries a `terminal_process_id`; and `session remove` either verifies true or names
-a `remote_runtime_*` refusal — with no agy process left on the mediator afterwards.
-⚠ Until that deploy, every remote agy spawn lands the agent on the mediator — the practice
-lane should treat remote agy results before the deploy as measuring the defect, not the lane.
+*The narrowed residue of the dead-head visibility entry, closed 2026-08-20 on live proof:
+with the dead-head arrangement entry still stored, one simultaneous window answered start
+page 825 == `startpage ls` 825 == `cwdtree ls` 825, and both formerly-hidden live rows
+render in the rail at top level.* Visibility no longer depends on pruning — `visible_rows`
+draws an orphaned member at top level — but the STORED arrangement still keeps entries for
+rows that no longer exist anywhere, forever: `retain_live` (which dissolves a departed head
+and detaches departed members) is called only by its own unit tests. The wiring needs a
+NON-TRANSIENT departure point — a naive per-frame prune against a flickering universe would
+destroy user arrangement during every daemon restart, which is presumably why it was never
+wired. The GUI close/remove paths already call `dissolve`/`detach` for the row being closed;
+the gap is heads that die daemon-side or remotely. **Falsifier:** close a head row through a
+daemon-side removal, and the arrangement entry for it is gone from settings within the
+session, with members re-parented per `retain_live`'s own contract.
 
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
