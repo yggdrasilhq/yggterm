@@ -32,6 +32,37 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 - **Falsifier:** spawn with `--model <x>`; `/proc/<pid>/cmdline` (or the CLI's own session state)
   carries x, and the row header shows x.
 
+## ⛔⛔⛔ [11.4→11.3] THE GUI FREEZES WITH ZERO INCIDENTS RECORDED — OWNER KILLED IT; INPUT PROBES WERE BLIND AND THE TITLE CHORE OWNED THE HOUR
+
+**Status:** OPEN — instance 2026-08-20 ~11:06 IST (GUI killed and relaunched by the owner)
+
+**Owner report:** the GUI froze hard enough to need a manual kill; separately, typed prompt
+characters echoed only after ~3 s of stuckness. No coredump for today (the GL SIGSEGV entries are
+from earlier days) — the process was alive and blocked, i.e. a UI-thread stall, not a crash.
+
+**What the instruments said about the freeze hour (GUI host, `ytrace --since 60m`):**
+
+| instrument | reading | verdict |
+|---|---|---|
+| `ytrace incidents` | **0** | a freeze the owner had to kill produced no incident — the UI-block class is invisible to every probe we have |
+| `ytrace tail --category input` | **0 events** | the keystroke→pty→render chain (wired for exactly this symptom) recorded NOTHING on the GUI host during an hour containing a real 3 s input stall — blind instrument, cause unknown (wrong host? wrong build path? category name?) |
+| `copy_generation title` | **132 calls, p50 8.7 s, p95 10.4 s, max 20.8 s — ~19 min of wall in one hour** | the title/LLM re-resolve loop dominated the hour; if any call holds a lock the render/input path needs, 3 s echo stalls follow |
+| `render gui cpu` + `render web_content cpu` | ~1238 s + ~1390 s CPU over the hour | ~70% of a core at "rest", consistent with the standing burning-core entries |
+| `sidebar merge_rows` | 2247 calls/hour | steady background jank source |
+
+**Two workstreams, one owner each:**
+- **11.4 (instrument):** a UI-thread block watchdog — a main-loop heartbeat probe that emits a
+  durable `ui/block` incident for any gap > ~200 ms with attribution (what ran last), so the next
+  freeze names itself; plus root-cause why `input/*` recorded zero on the GUI host and make the
+  echo-latency tail land there. The freeze class must never again be zero-incident.
+- **11.3 (suspect):** the title chore's 8.7–20.8 s calls must be strictly async off any lock or
+  thread the UI/snapshot path touches, and paced; likely amplified by the agy fake-recency flood
+  (~1000 rows perpetually "fresh" and eligible for re-title — 11.1's fix shrinks the queue).
+
+**Falsifier:** with the watchdog live, an induced 500 ms main-thread block raises `ui/block` with
+attribution within one tick; after the chore fix, a full title-chore tick under LLM latency ≥ 10 s
+shows keystroke echo p95 < 100 ms in the input chain on the GUI host.
+
 ## ⛔⛔ [11.6] THE CLI PROVISIONER'S npm AUTO-UPDATE RACES ITSELF ACROSS CONCURRENT LAUNCHES
 
 **Status:** OPEN — evidence captured 2026-08-20 (log paths below)
