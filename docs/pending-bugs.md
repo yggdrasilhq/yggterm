@@ -14,9 +14,10 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔ [11.0] A DAEMON BORN INSIDE AN AGENT SESSION MARKS EVERY CLI IT SPAWNS AS A CHILD — TRANSCRIPTS SILENTLY OFF, AND THE POISON IS HEREDITARY
 
-**Status:** OPEN (code fix owed; fleet-wide interim mitigation in place)
+**Status:** OPEN
 
-Found 2026-08-20 ~23:2x from two incidents that turned out to be one bug.
+*Code fix owed; a fleet-wide interim mitigation is in place.* Found 2026-08-20 ~23:2x from
+two incidents that turned out to be one bug.
 
 **Mechanism.** A yggterm daemon started from inside a Claude Code session (an agent's
 shell, an ssh command from an agent, or a daemon whose ANCESTOR was) inherits the
