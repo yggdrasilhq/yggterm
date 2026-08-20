@@ -1503,6 +1503,24 @@ a relay of five rows all called `6. campaign` is unreadable, and the sidebar is
 the human's working instrument. `ygg-claim.sh --replace <predecessor>` does the
 kill, the seat and the rename as one step.
 
+### ⭐ Owner questions are a structured picker, not prose (standing, 2026-08-20)
+
+When a session genuinely needs the owner's decision — and the owner is present and has asked
+to be consulted — present the fork through the harness's structured question TUI (Claude
+Code: the `AskUserQuestion` tool): one call, each question carrying selectable options, with
+the agent's recommended option FIRST and labelled "(Recommended)". The owner answers by
+selecting, not by composing text. Do not ask the same thing again as free prose — the picker
+IS the ask.
+
+Agent CLIs that have no question TUI emulate the shape instead: end the turn with the
+questions as enumerated option lists (A/B/C…), the recommendation marked, and "something
+else entirely" always offered as the last option, so the owner can answer with a single
+token per question.
+
+This does not touch the relay-mode law below: mid-relay there is no asking at all — file the
+fork to the campaign's questions file with a recommendation and continue. The picker form is
+for the moments the owner is actually at the table.
+
 ### ⛔ The brief has TWO sections, and conflating them makes fixes stupid
 
 A brief that opens *"NO research, NO subagents, every fact is inlined"* is wrong,
