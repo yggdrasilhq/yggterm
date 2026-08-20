@@ -6049,6 +6049,22 @@ this campaign keeps catching. Quote `du`, taken either side.
 ⇒ The original falsifier below is now answered: the accumulation was **historical**, not
 provisioning re-downloading, so a retention rule reclaims it.
 
+### ⚠ AND THE PER-CLI MIGRATION LEAVES AN ORPHAN THAT IS **NOT** AUTO-DELETED
+
+Once a CLI is republished out of `~/.yggterm/npm/cli/<slug>.gen<N>`, its old copy under the shared
+`~/.yggterm/npm/lib/node_modules` is orphaned — nothing points at it and nothing reads it.
+Measured before migration: **522 MB** of shared prefix on the desktop host.
+
+⛔ **Deliberately left in place rather than swept.** That directory is the default global prefix
+for any `npm i -g` run inside a yggterm session, because the managed shell exports put
+`npm_config_prefix` there — so it can hold packages that are **not ours**, and a blanket
+`remove_dir_all` would delete a user's own global install to reclaim our disk. Pruning only our own
+package directories would leave the hoisted dependencies, which are most of the bytes, so the cheap
+version of this buys little and the thorough version is not safe unattended.
+
+⇒ **A deliberate one-off reclaim, not an automatic one.** Recorded here so the space is known about
+rather than discovered later as unexplained growth.
+
 *Found 2026-08-14 while independently re-measuring a peer's trace-growth figure —
 the growth reproduced, but the directory it was blamed for filling turned out to
 be full of something else entirely.*
