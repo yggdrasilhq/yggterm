@@ -430,9 +430,10 @@ sessions each have a visible sidebar row (`server app rows` carries their paths)
 
 ## ⛔⛔⛔ [11.10] A REMOTE AGY SPAWN RUNS THE AGENT ON THE MEDIATOR — THE RESTORED-RUNTIME REPAIR REWRITES REMOTE ROWS, AND FIVE INSTRUMENTS MISS ACROSS THE SPELLING GAP
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (daemon-side; activates on the next version-bump deploy)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Root-caused 2026-08-20 ~19:5x from a live probe, after the practice lane reported `session
+*Daemon-side: the fix activates on the next version-bump deploy. Root-caused 2026-08-20
+~19:5x from a live probe, after the practice lane reported `session
 remove` answering an unactionable `verified:false` on a remote antigravity row.*
 
 **The spawn.** `terminal new --kind antigravity --machine-key <target>` composes a correct
