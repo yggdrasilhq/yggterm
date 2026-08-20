@@ -612,6 +612,12 @@ out. A working alternative is measured and named in `owner-attention.md` — `an
 returned 200 OK in ~15 s with a proper noun-phrase title and a usable timeline paragraph, on the
 same endpoint and key.
 
+**Measured fleet state after the first sweep (`server titles sweep`, 2026-08-20):** the two hosts
+with endpoint credentials went from 168 and 167 untitled codex rows to 19 and 23; every remaining
+one is a session with nothing to name it from. The third host holds no endpoint credentials, so a
+sweep run there can only resolve store-first — its rows are titled from the GUI host's remote scan,
+which persists the copy back to it, and that path is idle for the same quota reason.
+
 ⚠ **Setting it is HIS, and not only by preference — an agent cannot make it stick.** A settings.json
 edit under a running GUI was written back over within the hour from the GUI's own in-memory copy, so
 the file is not the place to change this from the outside. Both edits were reverted to the values he
