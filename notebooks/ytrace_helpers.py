@@ -338,3 +338,23 @@ class Verdict:
 def describe_source(host: str, window: str) -> None:
     """Print what was read, so a verdict is never separated from its provenance."""
     print(f"host={host}  window={window}  read_at={datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+
+def window_minutes(window: str) -> float | None:
+    """Length of a ytrace `--since` window in minutes.
+
+    A rate must be divided by the window it was measured over, never by the
+    span between the first and last event: a burst of six blocks four seconds
+    apart spans 0.06 minutes, and dividing by that reports 93 per minute for a
+    window that contained six.
+    """
+    text = window.strip().lower()
+    for suffix, minutes in (("ms", 1 / 60000), ("s", 1 / 60), ("m", 1.0), ("h", 60.0), ("d", 1440.0)):
+        if text.endswith(suffix):
+            try:
+                return float(text[: -len(suffix)]) * minutes
+            except ValueError:
+                return None
+    try:
+        return float(text) / 60000  # bare number is raw ms, as ytrace reads it
+    except ValueError:
+        return None
