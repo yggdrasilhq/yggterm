@@ -18781,6 +18781,30 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             "endpoint": format!("{endpoint:?}"),
         }),
     );
+    // ⛔ Win the server-socket bind lock BEFORE binding the pty-handoff
+    // listener. The listener bind unlinks the socket path unconditionally, so a
+    // starter that later loses the lock used to destroy the WINNING daemon's
+    // handoff listener on its way out: the path then pointed at the loser's
+    // dead socket, every retiring predecessor dialed it into `Connection
+    // refused` "before the commit point", and no drain could converge.
+    // Measured live 2026-08-20: four losing starters re-broke the path at
+    // ~15 s intervals while a predecessor with 21 preserved PTYs knocked on the
+    // corpse once a minute for an hour.
+    #[cfg(unix)]
+    let daemon_socket_lock = if let ServerEndpoint::UnixSocket(path) = endpoint {
+        match try_acquire_daemon_socket_lock(path, &home_dir)? {
+            Some(lock) => Some(lock),
+            None => {
+                info!(
+                    path = %path.display(),
+                    "another yggterm daemon owns the socket bind lock"
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     // Accept PTY handoffs before anything else could look for us: a predecessor
     // derives our address from our VERSION, so it can knock the moment we exist.
     #[cfg(target_os = "linux")]
@@ -19122,12 +19146,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
 
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {
-        let Some(daemon_socket_lock) = try_acquire_daemon_socket_lock(path, &home_dir)? else {
-            info!(
-                path = %path.display(),
-                "another yggterm daemon owns the socket bind lock"
-            );
-            return Ok(());
+        let Some(daemon_socket_lock) = daemon_socket_lock else {
+            // Held since before the pty-handoff listener bound (bind-order law
+            // above): a unix-socket endpoint cannot reach this point unlocked.
+            unreachable!("unix daemon serving path reached without the bind lock");
         };
         if server_socket_path_lexists(path)
             && ping(&ServerEndpoint::UnixSocket(path.clone())).is_ok()
