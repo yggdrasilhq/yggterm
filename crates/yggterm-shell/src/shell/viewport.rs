@@ -12577,23 +12577,21 @@ fn TerminalCanvas(
                                             terminal_live_host_connected,
                                             false,
                                         );
-                                        // ⛔ A READ error must not hold the WRITE path hostage.
-                                        // For a LOCAL session the daemon owns the PTY and a
-                                        // keystroke is its own request — it queues behind a slow
-                                        // daemon and still lands. Disabling input here turned
-                                        // every slow `terminal_read` (10s IO timeout × 4 retries)
-                                        // into ~a minute of dead composer per episode (measured
-                                        // 2026-08-20: 8 episodes/90min, every error "reading
-                                        // daemon response"). Remote resume keeps the stricter
-                                        // gate: its transport is the failing leg for writes too.
-                                        // The write-error twin of this branch keeps its disable
-                                        // unconditionally — there the write path itself failed.
-                                        if is_remote_resume_session {
-                                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
-                                                enabled: false,
-                                                focus: false,
-                                            });
-                                        }
+                                        // ⛔ A READ error must not hold the WRITE path hostage —
+                                        // on ANY session. For a LOCAL row the daemon owns the
+                                        // PTY and a keystroke is its own request; for a REMOTE
+                                        // row the keystroke queues at the local daemon and lands
+                                        // when the peer answers (queued, not discarded). In both
+                                        // cases only the READ stream is known-broken here, and
+                                        // disabling input turned every slow read (10s IO timeout
+                                        // × retries) into a dead composer for the whole episode.
+                                        // Measured twice, 2026-08-20: 8 local episodes/90min;
+                                        // then, after the local-only fix, a remote-row episode
+                                        // froze typing again while the peer daemon was loaded by
+                                        // a spawn burst — same defect, second branch. The
+                                        // write-error twin of this branch keeps its disable
+                                        // unconditionally — there the write path itself failed,
+                                        // and an enabled composer would silently eat keystrokes.
                                         let (notification_title, notification_message) =
                                             if is_remote_resume_session {
                                                 (
@@ -12691,6 +12689,15 @@ fn TerminalCanvas(
                                             );
                                         },
                                     );
+                                    // The peer's PTY is alive (only the read stream failed);
+                                    // an earlier mount stage may have disabled input, and this
+                                    // break is the last exit on the path — the composer must
+                                    // not stay dead behind it. Symmetric with the local
+                                    // read-exhaust re-enable below.
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: true,
+                                        focus: false,
+                                    });
                                     maybe_spawn_missing_remote_machine_refreshes(state);
                                     maybe_spawn_missing_managed_cli_refreshes(state);
                                     warn!(session=%session_path, error=%error, "terminal read failed after attach");

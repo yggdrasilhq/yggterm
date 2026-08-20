@@ -7381,8 +7381,15 @@ impl YggtermServer {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let cwd =
-            normalize_remote_attach_cwd(&ssh_target, prefix.as_deref(), requested_cwd.as_deref());
+        // ⛔ No ssh here: this method runs under the daemon's ONE runtime lock,
+        // and cwd resolution shells out to the target host. The dispatch hoists
+        // the resolution to its PRE-LOCK stage (`hoist_remote_start_cwd`), so
+        // the cwd arriving here is already resolved; the remote wrapper's own
+        // walk-up covers any path that skips the dispatch. Measured before the
+        // hoist: a burst of remote creates deafened the daemon for seconds per
+        // create (ssh ConnectTimeout=5 under the lock) and stalled every other
+        // client's reads behind it.
+        let cwd = requested_cwd.clone();
         let title = title_hint
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -7456,8 +7463,15 @@ impl YggtermServer {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let cwd =
-            normalize_remote_attach_cwd(&ssh_target, prefix.as_deref(), requested_cwd.as_deref());
+        // ⛔ No ssh here: this method runs under the daemon's ONE runtime lock,
+        // and cwd resolution shells out to the target host. The dispatch hoists
+        // the resolution to its PRE-LOCK stage (`hoist_remote_start_cwd`), so
+        // the cwd arriving here is already resolved; the remote wrapper's own
+        // walk-up covers any path that skips the dispatch. Measured before the
+        // hoist: a burst of remote creates deafened the daemon for seconds per
+        // create (ssh ConnectTimeout=5 under the lock) and stalled every other
+        // client's reads behind it.
+        let cwd = requested_cwd.clone();
         let machine_key = machine_key_from_ssh_target(&ssh_target);
         let target_label = self
             .ssh_targets
@@ -7631,8 +7645,15 @@ impl YggtermServer {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let cwd =
-            normalize_remote_attach_cwd(&ssh_target, prefix.as_deref(), requested_cwd.as_deref());
+        // ⛔ No ssh here: this method runs under the daemon's ONE runtime lock,
+        // and cwd resolution shells out to the target host. The dispatch hoists
+        // the resolution to its PRE-LOCK stage (`hoist_remote_start_cwd`), so
+        // the cwd arriving here is already resolved; the remote wrapper's own
+        // walk-up covers any path that skips the dispatch. Measured before the
+        // hoist: a burst of remote creates deafened the daemon for seconds per
+        // create (ssh ConnectTimeout=5 under the lock) and stalled every other
+        // client's reads behind it.
+        let cwd = requested_cwd.clone();
         let machine_key = machine_key_from_ssh_target(&ssh_target);
         let target_label = self
             .ssh_targets
