@@ -328,6 +328,40 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 **Falsifier (11.4's half):** with the watchdog live, an induced 500 ms main-thread block raises
 `ui/block` with attribution within one tick, and the keystroke echo tail lands on the GUI host.
 
+## ⛔⛔ [leak] A FLEET HOST NAME SITS IN 33 TRACKED LINES, AND THE GUARD NEVER KNEW IT WAS A TERM
+
+**Status:** OPEN
+
+Found 2026-08-20 by lane 11.5 (surfaced as a context line in their own diff; their additions were
+clean), routed to the leak plane by 11.0. The desktop host's name appears in **33 lines across 14
+tracked files** on main — CHANGELOG, five docs, three briefs, an onboarding skill, two demo
+artifact bundles, **shipped source** (`crates/yggterm-shell/src/shell/viewport.rs` — measurement
+provenance comments), and **three scripts where it is a FUNCTIONAL host roster**
+(`ygg-memory.py`, `ygg-memory-sync`, `scripts/sanitize-titles.py`).
+
+⛔ **Why every push was green:** the pre-push guard's `MESH` tuple is a fleet-SYNC roster (which
+hosts to reconcile), not a scan list — the guard had no concept of fleet host names as private
+terms at all. **The writer is FIXED first, 2026-08-20 13:0x:** the name is now in the private-terms
+answer key on all three hosts (32 terms, fingerprint `bd535410`), so any push ADDING a line with it
+refuses. Existing lines bite only when edited — expect guard refusals on these files and REWRITE,
+never override.
+
+**The sweep (this entry's work), in three grades:**
+1. Prose mentions (docs, briefs, CHANGELOG, source comments): rewrite to role names — "the GUI
+   host" / "the desktop host". Mechanical, but do it file-aware, not by blind sed.
+2. ⛔ FUNCTIONAL rosters in the three scripts: the name is load-bearing there. Externalize to
+   config outside the repo (the answer-key pattern; `scripts/ygg-live-host.sh` is the existing
+   owner of "which host is live"), never just rename.
+3. Demo artifact bundles: regenerate or scrub; a bundle is generated output and may simply be
+   rebuilt.
+
+**History:** the name is throughout git history. Do NOT run a lone rewrite for it — batch it into
+the standing `[6.4]` history-rewrite entry (three identifiers already pending there), with the
+documented `filter-repo` signature and reflog traps. Tree sweep and writer fix do not wait on it.
+
+**Falsifier:** `git grep` for the term on main returns zero prose/source hits and the three scripts
+read their roster from outside the tree; a push adding the term to any public repo refuses.
+
 ## ⛔ [11.0] SEAT DERIVATION CROSSES CAMPAIGN ERAS AND SEATS ORCHESTRATORS BARE — TWO MIS-SEATS IN ONE SPAWN BATCH
 
 **Status:** OPEN
