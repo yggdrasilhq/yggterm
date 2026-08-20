@@ -10,6 +10,13 @@ For each host (local + fleet ssh targets), this script:
    and re-parses each file in Python, *independently* of Rust, to produce
    ground truth. Compares counts, missing/extra session_ids, title mismatches,
    and ordering.
+3. Judges the titles themselves: a title must not be a short hash, a raw path
+   or a generic placeholder. The recognizer here is a deliberate Python
+   RE-DERIVATION of the Rust one — that is the point of an oracle, and a
+   disagreement between them is a finding rather than a bug in this file.
+4. Checks the copy gate: a libyggterm APP row and a plain shell are named by
+   whoever launched them, so generated copy on one is a failure. yggterm may
+   generate a title only for an agent session.
 
 Usage:
   python3 scripts/check-titles.py                          # all hosts
@@ -152,6 +159,34 @@ def verb_on_host(host):
     except Exception as e:
         return None, f"json parse: {e}", out[:2000]
 
+MUSE_NOISE_PROBE = "\n".join([
+    "import json, os, sqlite3",
+    "noise = []",
+    "db = os.path.expanduser('~/.local/share/muse/session-index.db')",
+    "if os.path.exists(db):",
+    "    conn = sqlite3.connect('file:%s?mode=ro' % db, uri=True)",
+    "    for sid, title, count in conn.execute('SELECT session_id, title, prompt_count FROM sessions'):",
+    "        if (count or 0) == 0 and str(title or '').strip().lower() in ('', 'new session', 'new muse code session'):",
+    "            noise.append(sid)",
+    "print(json.dumps(noise))",
+])
+
+def muse_noise_ids(host):
+    """Session ids the Rust scan skips as noise, so the oracle skips them too.
+
+    ⛔ NOT a fudge to make the counts agree: `is_noise_session_file` is a
+    documented scan rule (a muse session with zero prompts and a placeholder
+    title is not a session yet), and an oracle that models a DIFFERENT spec
+    reports a drift that does not exist. Four phantom `missing` ids came from
+    exactly this, every run.
+    """
+    out, err = run_on_host(host, "python3 -c " + shlex.quote(MUSE_NOISE_PROBE), timeout=60)
+    if err:
+        return set()
+    try:
+        return set(json.loads(out.strip().splitlines()[-1]))
+    except Exception:
+        return set()
 def manual_walk_on_host(host):
     """Manually find and parse raw files on host, independent of Rust."""
     sessions = []
@@ -159,6 +194,7 @@ def manual_walk_on_host(host):
     if err:
         return sessions, f"cannot get HOME: {err}"
     home = home_out.strip() or os.path.expanduser("~")
+    noise_ids = muse_noise_ids(host)
     for cli in CLI_STORES:
         for glob in cli["globs"]:
             # Expand glob to find command: use find for **, else ls
@@ -189,6 +225,8 @@ def manual_walk_on_host(host):
             for f in files:
                 # Exclude by path fragment when fragment contains '/', else file name only — mirrors Rust store_path_is_session_file
                 if any((ex in f) if "/" in ex else (ex in os.path.basename(f)) for ex in cli["exclude"]):
+                    continue
+                if cli["slug"] == "muse" and os.path.basename(os.path.dirname(f)) in noise_ids:
                     continue
                 # Quick stat for mtime
                 stat_out, _ = run_on_host(host, f"stat -c %Y {shlex.quote(f)} 2>/dev/null || stat -f %m {shlex.quote(f)} 2>/dev/null")
@@ -393,6 +431,137 @@ def parse_file_on_host(host, path, cli_slug):
                 break
         return {"session_id": session_id, "cwd": cwd, "title": title, "raw": out[:500]}
 
+# ── Title health ────────────────────────────────────────────────────────────
+# An independent re-derivation of `looks_like_generated_fallback_title`
+# (crates/yggterm-core/src/titles.rs). Deliberately NOT imported and deliberately
+# not exhaustive: it covers the classes the owner named — a short hash, a raw
+# path, a generic placeholder — and if the Rust side stops agreeing with it, that
+# disagreement is the finding.
+GENERIC_TITLES = {
+    "untitled session", "new session", "new terminal", "yggterm", "yggterm shell",
+    "local shell", "local codex", "local claude code", "local claude-code",
+    "yggterm codex", "yggterm claude code", "yggterm claude-code", "yggterm session",
+    "muse code stays attached daemon", "muse stays attached daemon",
+    "local shell stay alive daemon", "command bin bash",
+    "daemon pty request main viewport", "new muse code session",
+    "new antigravity session", "new ychrome", "new ychrome session",
+}
+BREEDS = {
+    "codex", "codex litellm", "claude", "claude code", "claude-code", "muse",
+    "muse code", "antigravity", "pi", "qwen", "qwen code", "grok", "grok build",
+    "opencode", "kimi", "local", "ssh", "shell", "terminal", "new", "ychrome",
+}
+
+def is_hexish(word):
+    return bool(word) and all(c in "0123456789abcdefABCDEF" for c in word)
+
+def looks_like_fallback_title(title):
+    """Why this title is not a title, or None when it is one."""
+    compact = (title or "").strip()
+    if not compact:
+        return "empty"
+    lower = compact.lower()
+    words = compact.split()
+    if lower in GENERIC_TITLES:
+        return "generic placeholder"
+    if len(compact) in (7, 8) and is_hexish(compact):
+        return "bare short hash"
+    if compact.startswith("/") or "/home/" in compact or lower.startswith("c:\\"):
+        return "raw path"
+    for prefix in ("local::", "live::", "document::", "codex::", "codex-litellm::"):
+        if compact.startswith(prefix) and len(compact[len(prefix):]) == 36:
+            return "session key, not a name"
+    if len(words) >= 2 and words[0].lower() == "remote" and is_hexish(words[-1]) \
+            and len(words[-1]) in (7, 8):
+        return "remote + short hash"
+    if len(words) >= 2 and words[-1].lower() == "session" \
+            and " ".join(words[:-1]).lower() in BREEDS:
+        return "breed placeholder"
+    if len(words) >= 2 and words[0].lower() in ("local", "new") \
+            and " ".join(words[1:]).lower() in BREEDS:
+        return "breed placeholder"
+    return None
+
+def title_health(host, verb_data):
+    """Fail on a title that is not a title; report the ones with no title at all."""
+    issues = []
+    missing = 0
+    for row in verb_data.get("rows", []):
+        title = (row.get("effective_title") or "").strip()
+        if not title:
+            missing += 1
+            continue
+        why = looks_like_fallback_title(title)
+        if why:
+            issues.append(
+                "bad title on %s %s: %r (%s)"
+                % (row.get("kind"), str(row.get("session_id"))[:8], title, why)
+            )
+    if missing:
+        # NOT a failure: a session whose whole transcript is one word has
+        # nothing to be named from, and `server titles sweep --dry-run` is the
+        # verb that separates those from the ones that could be titled.
+        issues.append("note: %d session(s) carry no title at all (not a failure)" % missing)
+    return issues
+
+# ── The copy gate ───────────────────────────────────────────────────────────
+# A libyggterm APP row and a plain shell are named by whoever launched them.
+# yggterm may generate copy only for an agent session, so generated copy on one
+# of those rows is a gate failure — the defect the owner reported as his browser
+# rows acquiring "horrible titles".
+GATE_PROBE = "\n".join([
+    "import json, os, sqlite3, subprocess",
+    "out = {'rows': [], 'generated': {}, 'error': None}",
+    "try:",
+    "    raw = subprocess.run(['sh','-c','~/.local/bin/yggterm-headless server snapshot 2>/dev/null'],",
+    "        capture_output=True, text=True, timeout=60).stdout",
+    "    snap = json.loads(raw)",
+    "    for s in snap.get('live_sessions', []):",
+    "        md = {e['label']: e['value'] for e in s.get('metadata', [])}",
+    "        out['rows'].append({'id': s.get('id'), 'kind': s.get('kind'), 'source': md.get('Source','')})",
+    "except Exception as exc:",
+    "    out['error'] = 'snapshot: %s' % exc",
+    "try:",
+    "    db = os.path.expanduser('~/.yggterm/session-titles.db')",
+    "    if os.path.exists(db):",
+    "        conn = sqlite3.connect('file:%s?mode=ro' % db, uri=True)",
+    "        for sid, title, source in conn.execute('SELECT session_id, title, source FROM session_titles'):",
+    "            out['generated'][sid] = {'title': title, 'source': source}",
+    "except Exception as exc:",
+    "    out['error'] = (out['error'] or '') + ' titles-db: %s' % exc",
+    "print(json.dumps(out))",
+])
+
+def copy_gate_issues(host):
+    out, err = run_on_host(host, "python3 -c " + shlex.quote(GATE_PROBE), timeout=90)
+    if err:
+        return ["copy-gate probe failed: %s" % err]
+    try:
+        data = json.loads(out.strip().splitlines()[-1])
+    except Exception as exc:
+        return ["copy-gate probe returned no JSON: %s" % exc]
+    if data.get("error") and not data.get("rows"):
+        # A host with no daemon cannot answer, and cannot fail either.
+        return ["note: copy gate not checked (%s)" % data["error"].strip()]
+    issues = []
+    generated = data.get("generated", {})
+    for row in data.get("rows", []):
+        is_app = str(row.get("source", "")).startswith("app:")
+        is_shell = row.get("kind") in ("shell", "ssh_shell")
+        if not (is_app or is_shell):
+            continue
+        entry = generated.get(row.get("id"))
+        if not entry:
+            continue
+        if (entry.get("source") or "") == "manual":
+            continue  # a human named it, which is always allowed
+        issues.append(
+            "copy gate: %s %s carries generated copy (%s): %r"
+            % ("app row" if is_app else "plain shell", str(row.get("id"))[:8],
+               entry.get("source"), str(entry.get("title"))[:40])
+        )
+    return issues
+
 def compare(host, verb_data, manual_sessions, verbose=False):
     issues = []
     if verb_data is None:
@@ -475,7 +644,16 @@ def main():
             all_ok = False
             continue
         issues = compare(host, verb_data, manual_sessions, verbose=args.verbose)
-        ok = len(issues)==0
+        # The parity check above asks whether the verb SEES the right sessions.
+        # These two ask whether what it shows is a name at all, and whether it
+        # named something it may not name.
+        issues += title_health(host, verb_data)
+        issues += copy_gate_issues(host)
+        # A line that starts with "note:" is information, not a failure — the
+        # difference matters because a checker that dies on a session with
+        # nothing to be named from can never pass, and a checker that can never
+        # pass stops being read.
+        ok = not [issue for issue in issues if not issue.startswith("note:")]
         if not ok:
             all_ok=False
         report[host] = {
