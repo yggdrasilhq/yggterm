@@ -666,6 +666,60 @@ real case, and passed a test that only exercised the empty one.
 (count) is not.** Measured, not assumed — and the way to know is to test BOTH
 branches, including the one you did not change.
 
+### ⛔⛔ `strings <binary>` PROVES A DEPLOY REACHED THE DISK, NEVER THAT IT IS RUNNING
+
+**The instrument:** `strings -a ~/.local/bin/yggterm | grep -c "<marker>"`, the
+wave rule's own deploy check — chosen precisely because `--version` and md5 cannot
+catch a peer overwrite.
+
+**What it cannot see:** a deploy writes binaries; a PROCESS only adopts a new one
+when it restarts. The daemon swaps itself. **The GUI does not** — it cannot
+hot-swap its own image in place. So the marker is on disk, the check is green, and
+the fix is not running.
+
+⇒ **Ask the live pid instead:**
+
+```bash
+grep -c "<marker>" /proc/<pid>/exe      # the image actually executing
+readlink /proc/<pid>/exe                # a "(deleted)" suffix = replaced underneath it
+ps -o lstart= -p <pid>                  # started BEFORE the deploy? then it is the old image
+```
+
+**The instance (2026-08-20).** A ledger line read "marker-verified" for a GUI
+marker. On disk: present. In the running GUI — started an hour before the deploy,
+exe showing `(deleted)` — `grep -c` returned **0**. Three GUI-side fixes were
+reported live and were not, including the one the owner was waiting on. The daemon
+half of the same deploy *was* live, which is what makes the half-state so easy to
+miss: the deploy genuinely worked, for half the product.
+
+⚠ **The follow-on symptom looks like a broken probe.** A new probe added by a
+GUI-side fix reads ZERO after its "successful" deploy — and the natural reading is
+"the probe is misconfigured". It is not; the code that emits it is not running.
+Same shape as the `input/keystroke` blindness, one layer out.
+
+⚠ **And the state does not converge by itself.** The old GUI queues a hot swap
+every ~70s; the daemon answers, correctly, *"the replacement binary is not ahead of
+this daemon, so no swap can be owed."* Both are right, nothing resolves, and it
+repeats until the GUI PROCESS is restarted. Do not read the swap machinery's
+presence as the problem being handled.
+
+### ⚠ `ytrace tail --lines N` CAN HAND YOU A COMPLETE-LOOKING OLD WINDOW
+
+`ytrace` reads across ROTATED generation files (`event-trace.g<gen>.jsonl`). Ask
+for a large `--lines` and it can return exactly N records **whose newest predates
+the live file's own tail** — a full-looking result from a window that ended hours
+ago.
+
+**The tell:** the result is exactly the number you asked for, and its newest
+timestamp is old. It made a before/after read conclude a host had gone silent
+since a deploy, while the live `ytrace.jsonl` was current to the second.
+
+⇒ For a before/after window, read the live file directly (`tail -N
+~/.yggterm/ytrace.jsonl`) or keep `--lines` modest and **check the newest
+timestamp against `date` before trusting the window**. (Separately: `--since`
+without an explicit `--lines` silently caps at 20 records — the opposite failure,
+same consequence.)
+
 ### ⛔ A HAND-ROLLED vt100 SCORES A PAINTED BANNER AS BLANK, AND INVENTS A CUT-OFF TOP
 
 **The instrument:** any quick parser written to answer "how much of the grid did

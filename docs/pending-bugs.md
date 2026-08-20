@@ -303,6 +303,25 @@ and worth factoring once.
 problem from a busy one, so the proxied call arguably wants a much shorter budget
 than the direct one. Not done.
 
+**⭐ PRE-FIX BASELINE, for the acceptance read — captured on `dev` 2026-08-20 13:0x,
+before the hoist was deployed** (`ytrace tail --category request --lines 200000`,
+explicit lines; `waited_us` is MICROSECONDS — reading it as ms turns an 84 s stall
+into a non-event):
+
+| | |
+|---|---|
+| slow lock waits | **262** |
+| `terminal_read` | **164 (62.6%)** |
+| `status` | 91 (34.7%) |
+| p50 · p95 | 112.3 ms · 10,247 ms |
+| max | **84,693 ms** |
+| worst five | 84,693 / 10,351 / 10,304 / 10,295 / 10,289 ms |
+
+The cluster just past 10 s is the client IO ceiling being hit routinely. The 84.7 s
+max is worse than the 68.8 s seen on the GUI host. **ACCEPTANCE: after the hoist
+deploys, `terminal_read` must fall out of the top of this distribution. If it does
+not, the hoist is wrong and that belongs in this entry, loudly.**
+
 ⛔ **DO NOT CITE `ui/block` AS EVIDENCE FOR THIS ENTRY, OR THIS AS EVIDENCE FOR IT.**
 The convergence was proposed and then TESTED by 11.4: temporal correlation of 16 GUI
 blocks against these 204 lock waits is at or below chance at every window from 500 ms
