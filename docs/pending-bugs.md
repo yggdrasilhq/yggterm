@@ -18254,3 +18254,27 @@ flaky — **not itself**. Six tests did exactly this.
 ⭐ **The tidy explanation was wrong and was killed by a control:** *"extra tests
 just perturb the schedule"* did not survive **six DECOY tests that left the suite
 green**. A flake that moves when you add unrelated tests still has a cause.
+
+## ⛔ [app-control] `terminal new --model` IS HONOURED IN THE REPLY AND DROPPED IN THE LAUNCH
+
+**Status:** OPEN — measured 2026-08-20 (GUI 3.1.5 / headless 3.1.4)
+
+`server app terminal new --kind claude-code --model claude-opus-5 …` (issued over
+ssh to the GUI host, `--machine-key` naming a different work host) created the row,
+and the resulting invocation on the work host was
+`claude --dangerously-skip-permissions --session-id <uuid>` — **no `--model` flag
+and no model env var** — so the agent came up on the ACCOUNT DEFAULT model,
+silently. A lane whose doctrine pins a model cannot trust the spawn verb: the
+caller now has to read `/proc/<pid>/cmdline` on the work host and repair by
+driving `/model` into the row before the brief. `--permission-mode bypass` from
+the SAME call was honoured (`--dangerously-skip-permissions` is present), so the
+drop is specific to the model flag, not to option plumbing generally.
+
+**Same incident, second defect:** the create's reply arrived as EMPTY stdout over
+ssh (exit 0) while the create succeeded server-side — the calling wrapper printed
+"create failed" about a row that existed, and a caller that believes that invites
+a DUPLICATE agent. Callers now cross-check the rows list; the verb should not
+lose its reply in the first place.
+
+**Falsifier:** spawn a claude-code row with an explicit `--model` and read the
+process cmdline on the work host — the flag (or an equivalent env) is present.
