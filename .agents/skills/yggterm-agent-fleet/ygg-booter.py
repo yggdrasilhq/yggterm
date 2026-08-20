@@ -2309,9 +2309,29 @@ def _pty_type_and_enter(host, row):
             enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
             return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
         _capture_draft(row, pre, head)
-        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — composer holds boot-text "
-            f"residue PLUS other content; captured to the draft store, typing nothing.")
-        return "refused-draft-race"
+        # ⭐ MULTI-COPY RESIDUE CLEANER — measured 2026-08-20 12:28: three aborted
+        # boots left three (glyph-mangled) copies, the LAST copy's prefix is the
+        # END of the previous one, so this branch refused forever and the row was
+        # stuck unbootable. When the composer content is provably BOOT-MATERIAL
+        # ONLY (and it is already captured durably above, so nothing can be
+        # lost), clear it with ONE Ctrl+C and boot clean. A real owner draft —
+        # text before the first copy, or a substantial tail after the last —
+        # still refuses untouched.
+        if _composer_is_boot_residue_only(pre, head):
+            log(f"⭐ RESIDUE CLEANER {row.rsplit('/', 1)[-1][:8]} — composer is "
+                f"boot-material only (captured first); clearing with one Ctrl+C "
+                f"and booting clean.")
+            _run(host, ["server", "terminal", "write", row, "--stdin"], "\x03")
+            time.sleep(1.2)
+            post = _plain_screen(_screen_text(host, row) or "")
+            if post.rfind(head) >= 0:
+                log(f"  ⚠ residue survived the clear — refusing rather than typing more.")
+                return "refused-draft-race"
+            # fall through to a normal typed boot below
+        else:
+            log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — composer holds boot-text "
+                f"residue PLUS other content; captured to the draft store, typing nothing.")
+            return "refused-draft-race"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
                         "--refuse-if-draft"], BOOT_TEXT)
     if _field(typed.stdout or "", "refused_for_draft") is True:
@@ -2361,6 +2381,35 @@ def _pty_type_and_enter(host, row):
         return "refused-draft-race"
     enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
     return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
+
+
+def _composer_is_boot_residue_only(plain_screen, boot_head):
+    """True iff the composer segment is boot-text copies (possibly glyph-mangled
+    by the render defect) and nothing of the owner's. Conservative both ways:
+    - owner text BEFORE the first copy (the original splice shape) ⇒ False;
+    - a chunk much longer than one boot copy (an appended owner tail) ⇒ False —
+      glyph drops only SHORTEN a copy, so length is a safe one-sided test.
+    The caller has ALREADY captured the full content durably, so a wrong True
+    loses nothing that cannot be re-delivered."""
+    m = plain_screen.rfind("❯")
+    if m < 0:
+        return False
+    seg = plain_screen[m + 1:].strip()
+    # Token density, not head-splitting: the render defect drops glyphs, so even
+    # the HEAD arrives mangled ("boot▮d") and a split-by-head fuses copies. Six
+    # distinctive tokens per copy survive scattered drops; every estimate errs
+    # toward False (refuse), never toward clearing an owner's text.
+    tokens = ("booter boot", "RELAY session", "ygg-booter.py unsubscribe",
+              "MONITOR is never", "handover yourself", "DECIDE and ACT")
+    hits = {t: seg.count(t) for t in tokens}
+    if sum(1 for c in hits.values() if c) < 3:
+        return False                      # not recognisably boot material
+    copies = max(hits.values())
+    first = min((seg.find(t) for t in tokens if t in seg), default=-1)
+    if first < 0 or len(seg[:first].strip()) > 24:
+        return False                      # owner text before the copies
+    limit = copies * int(len(_plain_screen(BOOT_TEXT)) * 1.25) + 220  # footer slack
+    return len(seg) <= limit
 
 
 def _capture_draft(row, plain_screen, boot_head):
