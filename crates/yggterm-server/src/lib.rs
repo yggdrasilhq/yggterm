@@ -21783,6 +21783,55 @@ fn tail_text_file_lines(path: &std::path::Path, lines: usize) -> Vec<String> {
     read_trace_tail(path, lines.max(1))
 }
 
+impl ClientInstanceRecord {
+    /// Is this record the USER'S window — the one an untargeted verb means?
+    ///
+    /// ⛔ **THE ONE OWNER OF THAT QUESTION, and it exists because the answer was
+    /// already encoded twice and the copies diverged.** The `client_role` field
+    /// three screens down states the law in its own doc comment — *a live
+    /// Shadow must never swallow the user's default routing* — and app-control
+    /// routing was brought under it when that was live-caught. The GUI's
+    /// startup handoff kept its own "newest wins" selection, filtered on
+    /// executable path alone, and a shadow runs the same executable. So the
+    /// newest shadow was picked as "the window already running", and the fix
+    /// from July never reached the one call site that could cost the desktop
+    /// its GUI.
+    ///
+    /// A missing role reads as active: legacy records predate the field, and a
+    /// user's window is what they were.
+    pub fn is_active_gui(&self) -> bool {
+        self.client_role
+            .as_deref()
+            .map(|role| role.eq_ignore_ascii_case("active"))
+            .unwrap_or(true)
+    }
+}
+
+/// Ask the running GUI to focus itself, and report whether a window ACTUALLY
+/// took focus.
+///
+/// ⛔ **`run_app_control_focus_window` answers a different question and its name
+/// does not say so.** It returns `Ok(())` whenever the request completed a round
+/// trip, without ever reading `response.error` — so a reply whose own text is
+/// *"app-control focus request did not produce native window focus"* is an
+/// `Ok`. A caller writing `focus(...).is_ok()` therefore learns that the
+/// message was delivered and believes it learned that a window is now up.
+///
+/// That is not a hypothetical reading: the GUI's startup handoff did exactly
+/// this, exited on the strength of it, and left the desktop with no window at
+/// all. Use this when the answer decides whether to exit.
+pub fn app_control_focus_window_took_focus(timeout_ms: u64) -> anyhow::Result<bool> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::FocusWindow, timeout_ms)?;
+    Ok(app_control_response_took_focus(&response))
+}
+
+/// Pure half, so the verdict is testable without a daemon, a display or a
+/// filesystem — the same split `app_launch_duplicate_decision` uses.
+pub fn app_control_response_took_focus(response: &AppControlResponse) -> bool {
+    response.error.is_none()
+}
+
 pub fn request_app_control(
     home: &std::path::Path,
     command: AppControlCommand,

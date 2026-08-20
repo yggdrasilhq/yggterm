@@ -2257,13 +2257,7 @@ fn app_launch_retire_incumbents(pids: &[u32]) {
 fn active_gui_pids(records: &[crate::ClientInstanceRecord]) -> Vec<u32> {
     records
         .iter()
-        .filter(|record| {
-            record
-                .client_role
-                .as_deref()
-                .map(|role| role.eq_ignore_ascii_case("active"))
-                .unwrap_or(true)
-        })
+        .filter(|record| record.is_active_gui())
         .map(|record| record.pid)
         .collect()
 }
@@ -2567,6 +2561,23 @@ mod app_launch_duplicate_guard_tests {
             .chain(extra.iter().copied())
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn the_active_gui_predicate_is_the_one_owner_of_whose_window_it_is() {
+        // ⛔ This question was encoded twice and the copies diverged. The GUI's
+        // startup handoff selected a focus target by executable path alone —
+        // and a shadow runs the same executable — so the newest shadow was
+        // picked as "the window already running". The role rule existed and
+        // simply had not reached that call site, which is how a deploy left the
+        // desktop with no GUI at all.
+        assert!(record(1, Some("active")).is_active_gui());
+        assert!(record(2, None).is_active_gui(), "a legacy record is a user window");
+        assert!(!record(3, Some("shadow")).is_active_gui());
+        assert!(
+            !record(4, Some("SHADOW")).is_active_gui(),
+            "the role compare must stay case-insensitive"
+        );
     }
 
     #[test]

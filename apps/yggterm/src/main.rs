@@ -40,7 +40,8 @@ use yggterm_server::{
     run_app_control_reorder_sessions,
     run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
-    run_app_control_dump_state, run_app_control_focus_window,
+    app_control_focus_window_took_focus, run_app_control_dump_state,
+    run_app_control_focus_window,
     run_app_control_grid, run_app_control_key, run_app_control_list_clients,
     run_app_control_memory_profile,
     run_app_control_move_window_by, run_app_control_launch_app, run_app_control_open_path,
@@ -3536,6 +3537,28 @@ fn signal_client_instance_dirs_for_scan(
     dirs
 }
 
+/// Which running client, if any, this fresh process should hand off to.
+///
+/// Pure, because the bug it now forbids shipped in the filter chain and nothing
+/// could fail over it: the executable-only predicate matched a shadow, the
+/// shadow was the newest record, and the newest record won.
+fn select_focus_handoff_target(
+    records: &[ClientInstanceRecord],
+    current_exe: &std::path::Path,
+) -> Option<u32> {
+    records
+        .iter()
+        .filter(|record| record_matches_executable(record.executable_path.as_deref(), current_exe))
+        // ⛔ AND IT MUST BE THE USER'S WINDOW, NOT MERELY THE SAME BINARY. A
+        // shadow view runs the identical executable, so an executable-only
+        // filter picks the newest shadow as "the GUI already running" — which
+        // is the routing rule `ClientInstanceRecord::client_role` was added to
+        // forbid, arriving at the one call site the July fix never reached.
+        .filter(|record| record.is_active_gui())
+        .max_by_key(|record| record.started_at_ms)
+        .map(|record| record.pid)
+}
+
 fn maybe_focus_existing_client(
     home_dir: &std::path::Path,
     args: &[String],
@@ -3549,18 +3572,22 @@ fn maybe_focus_existing_client(
     }
     let endpoint = default_endpoint(home_dir);
     let active_records = active_client_instance_records(home_dir, &endpoint)?;
-    let Some(target_pid) = active_records
-        .iter()
-        .filter(|record| record_matches_executable(record.executable_path.as_deref(), current_exe))
-        .max_by_key(|record| record.started_at_ms)
-        .map(|record| record.pid)
-    else {
+    let Some(target_pid) = select_focus_handoff_target(&active_records, current_exe) else {
         return Ok(());
     };
     unsafe {
         std::env::set_var("YGGTERM_APP_CONTROL_PID", target_pid.to_string());
     }
-    let focused = run_app_control_focus_window(3_000).is_ok();
+    // ⛔ THE VERDICT COMES FROM THE RESPONSE, NOT FROM THE CALL. The old line
+    // was `run_app_control_focus_window(3_000).is_ok()`, which is true whenever
+    // the request completed a round trip — including when the reply's own text
+    // is "app-control focus request did not produce native window focus". This
+    // process then exited, having handed off to a window that never took focus.
+    //
+    // ⚠ An unreadable answer must not read as "focus succeeded": on error we
+    // keep going and open a window. Two windows is a nuisance; zero windows is
+    // a desktop with no terminal, which is what happened.
+    let focused = app_control_focus_window_took_focus(3_000).unwrap_or(false);
     unsafe {
         std::env::remove_var("YGGTERM_APP_CONTROL_PID");
     }
@@ -6473,6 +6500,91 @@ mod tests {
         assert!(should_retire_superseded_client(
             &old, 9999, &current, &scope
         ));
+    }
+
+    use crate::select_focus_handoff_target;
+
+    fn handoff_record(pid: u32, started_at_ms: u128, role: Option<&str>, exe: &str) -> ClientInstanceRecord {
+        ClientInstanceRecord {
+            pid,
+            started_at_ms,
+            client_id: None,
+            linux_desktop_app_id: None,
+            client_role: role.map(str::to_string),
+            build_commit: None,
+            process_start_ticks: None,
+            executable_path: Some(exe.to_string()),
+            display: None,
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_shadow_is_never_the_window_a_fresh_gui_hands_off_to() {
+        // ⛔⛔ THE REGRESSION THIS EXISTS FOR COST THE DESKTOP ITS GUI. The
+        // selection filtered on executable path alone, and a shadow view runs
+        // the identical executable — so the newest shadow was chosen as "the
+        // window already running", the focus request went to something that is
+        // not the user's window, and the fresh process exited. A deploy that
+        // retires the incumbent first then leaves the desktop with nothing.
+        let exe = std::path::Path::new("/opt/example-app/bin/example-gui");
+        let records = vec![
+            handoff_record(10, 100, Some("active"), "/opt/example-app/bin/example-gui"),
+            // Newer, same binary, and NOT the user's window.
+            handoff_record(11, 900, Some("shadow"), "/opt/example-app/bin/example-gui"),
+        ];
+        assert_eq!(
+            select_focus_handoff_target(&records, exe),
+            Some(10),
+            "the active window wins even when a shadow is newer"
+        );
+
+        // And with ONLY a shadow registered there is no handoff target at all,
+        // so the fresh process must go on to open its own window.
+        let shadow_only = vec![handoff_record(11, 900, Some("shadow"), "/opt/example-app/bin/example-gui")];
+        assert_eq!(select_focus_handoff_target(&shadow_only, exe), None);
+    }
+
+    #[test]
+    fn a_legacy_record_without_a_role_is_still_a_handoff_target() {
+        // Reading `None` as a shadow would break handoff for every client that
+        // predates the role field — the opposite failure, equally real.
+        let exe = std::path::Path::new("/opt/example-app/bin/example-gui");
+        let records = vec![handoff_record(12, 100, None, "/opt/example-app/bin/example-gui")];
+        assert_eq!(select_focus_handoff_target(&records, exe), Some(12));
+    }
+
+    #[test]
+    fn a_focus_reply_that_reports_failure_is_not_a_handoff() {
+        // ⛔ The other half of the same outage. The old call site read
+        // `run_app_control_focus_window(..).is_ok()`, which is true whenever the
+        // request completed a round trip — including for this reply, whose own
+        // text says focus did not happen. The process exited on it.
+        let refused = yggterm_server::AppControlResponse {
+            request_id: "r-1".to_string(),
+            handled_by_pid: 4242,
+            completed_at_ms: 1,
+            output_path: None,
+            data: None,
+            error: Some(
+                "app-control focus request did not produce native window focus".to_string(),
+            ),
+        };
+        assert!(!yggterm_server::app_control_response_took_focus(&refused));
+
+        let accepted = yggterm_server::AppControlResponse {
+            request_id: "r-2".to_string(),
+            handled_by_pid: 4242,
+            completed_at_ms: 1,
+            output_path: None,
+            data: None,
+            error: None,
+        };
+        assert!(yggterm_server::app_control_response_took_focus(&accepted));
     }
 
     #[test]
