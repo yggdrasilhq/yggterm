@@ -17840,7 +17840,12 @@ fn terminal_recipe_drag_enabled() -> bool {
     env_copy_generation_enabled(value.as_deref())
 }
 fn implicit_copy_generation_start_allowed(force: bool, announce: bool) -> bool {
-    copy_generation_start_allowed(force, announce, implicit_copy_generation_enabled())
+    copy_generation_start_allowed(
+        force,
+        announce,
+        implicit_copy_generation_enabled(),
+        yggterm_core::copy_generation_is_paused(),
+    )
 }
 fn background_copy_retry_ready(shell: &ShellState, prefix: &str, session_path: &str) -> bool {
     let key = background_copy_retry_key(prefix, session_path);
@@ -43655,10 +43660,16 @@ fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
     let scan = {
         let shell = state.read();
         let now = current_millis();
+        // ⛔ While the endpoint pause is up there is nothing this scan could
+        // produce, and the scan itself is not free: it opens the title store,
+        // builds a resolver and walks every live and scanned session (measured
+        // max 25.7 s on the desktop host). Skipping it is most of the reason
+        // the quota storm stopped costing the GUI a fifth of every hour.
         if shell.background_copy_scan_in_flight
             || shell.needs_initial_server_sync
             || PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
             || shell.passive_copy_suspended
+            || yggterm_core::copy_generation_is_paused()
             || !shell.title_requests_in_flight.is_empty()
             || !shell.summary_requests_in_flight.is_empty()
             || shell.next_background_copy_scan_after_ms > now

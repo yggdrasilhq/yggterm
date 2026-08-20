@@ -51023,10 +51023,10 @@ Updated at   Branch  Conversation\n\
     }
     #[test]
     fn copy_generation_start_policy_blocks_implicit_selection_work() {
-        assert!(!copy_generation_start_allowed(false, false, false));
-        assert!(copy_generation_start_allowed(true, false, false));
-        assert!(copy_generation_start_allowed(false, true, false));
-        assert!(copy_generation_start_allowed(false, false, true));
+        assert!(!copy_generation_start_allowed(false, false, false, false));
+        assert!(copy_generation_start_allowed(true, false, false, false));
+        assert!(copy_generation_start_allowed(false, true, false, false));
+        assert!(copy_generation_start_allowed(false, false, true, false));
         assert!(env_copy_generation_enabled(Some("true")));
         assert!(env_copy_generation_enabled(Some("1")));
         assert!(!env_copy_generation_enabled(Some("false")));

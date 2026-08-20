@@ -15,6 +15,183 @@ use tracing::{info, warn};
 
 const TITLE_DB_FILENAME: &str = "session-titles.db";
 
+/// ⛔⛔ A QUOTA REFUSAL IS A FACT ABOUT THE ENDPOINT, NOT ABOUT THE SESSION —
+/// and recording it per session is how a title chore came to own a fifth of
+/// every hour on the desktop host.
+///
+/// Measured 2026-08-20 on the GUI host: 316 title generations in three hours,
+/// **297 of them errors**, over only 30 distinct sessions — eleven of them
+/// retried 20+ times each. Every one cost ~9 s of wall, because the upstream
+/// provider takes that long to say `429 usage_limit_reached`. Both surfaces
+/// backed off *per session*, so with a handful of permanently-failing rows the
+/// scan simply round-robined and hammered on, forever, at roughly one blocking
+/// call every thirty seconds. The provider's own answer said the quota resets
+/// in three WEEKS; nothing in yggterm could hear that, because the 429's body
+/// was dropped on the floor by `error_for_status`.
+///
+/// So the pause is process-wide and armed at the ONE door where the truth
+/// appears — the HTTP response itself. A caller cannot forget to consult it,
+/// because the generators consult it before they would spend the request.
+///
+/// ⚖ The reset hint is honoured but CAPPED: an absolute wake time from the
+/// server is the right instrument (a relative delay decays; an absolute one is
+/// idempotent), yet obeying a three-week one would turn a loud failure into a
+/// silent one, and "blind is not broken" has cost this project enough already.
+/// Capped, the worst case is two probe calls an hour instead of a hundred and
+/// twenty-five, and the day the quota comes back the titles resume by
+/// themselves.
+static COPY_GENERATION_PAUSED_UNTIL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Longest an endpoint refusal may silence generation. See the note above: the
+/// cap is what keeps a quota outage self-healing and visible.
+const COPY_GENERATION_PAUSE_MAX_MS: u64 = 30 * 60 * 1000;
+/// Shortest, so a burst limit still gets real air.
+const COPY_GENERATION_PAUSE_MIN_MS: u64 = 5 * 60 * 1000;
+
+fn unix_millis_now() -> u64 {
+    let seconds = OffsetDateTime::now_utc().unix_timestamp();
+    if seconds <= 0 {
+        return 0;
+    }
+    (seconds as u64).saturating_mul(1000)
+}
+
+/// Milliseconds left on the endpoint pause, if one is armed.
+///
+/// For a REPORTING caller (a sweep, a status verb): a paused endpoint is why a
+/// run produced nothing, and printing "0 titles generated" without it is the
+/// kind of true-but-useless answer that sends someone to read the wrong code.
+pub fn copy_generation_pause_remaining_ms() -> Option<u64> {
+    let until = COPY_GENERATION_PAUSED_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let now = unix_millis_now();
+    (until > now).then(|| until - now)
+}
+
+pub fn copy_generation_is_paused() -> bool {
+    copy_generation_pause_remaining_ms().is_some()
+}
+
+/// TEST-ONLY door: the pause is process-wide by design, so a test that arms it
+/// has to be able to put it back.
+pub fn clear_copy_generation_pause() {
+    COPY_GENERATION_PAUSED_UNTIL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Arm the pause from an endpoint refusal. `reset_hint_epoch_s` is the
+/// provider's own absolute wake time when it sent one.
+fn arm_copy_generation_pause(reset_hint_epoch_s: Option<u64>, detail: &str) {
+    let now = unix_millis_now();
+    let requested = reset_hint_epoch_s
+        .map(|seconds| seconds.saturating_mul(1000))
+        .filter(|until| *until > now)
+        .map(|until| until - now)
+        .unwrap_or(COPY_GENERATION_PAUSE_MAX_MS);
+    let pause = requested.clamp(COPY_GENERATION_PAUSE_MIN_MS, COPY_GENERATION_PAUSE_MAX_MS);
+    let until = now.saturating_add(pause);
+    let previous = COPY_GENERATION_PAUSED_UNTIL_MS.swap(until, std::sync::atomic::Ordering::Relaxed);
+    // Only the FIRST refusal of a spell is news; a fresh incident per retry
+    // would bury the one that named the cause.
+    if previous <= now {
+        warn!(
+            pause_ms = pause,
+            reset_hint_epoch_s,
+            "copy generation paused: the interface LLM endpoint refused on quota"
+        );
+        let payload = serde_json::json!({
+            "pause_ms": pause,
+            "reset_hint_epoch_s": reset_hint_epoch_s,
+            "capped": reset_hint_epoch_s.is_some_and(|seconds| {
+                seconds.saturating_mul(1000) > until
+            }),
+            "detail": detail.chars().take(300).collect::<String>(),
+        });
+        crate::perf::ytrace_emit_event("copy_generation", "title", "rate_limited", payload.clone());
+        crate::perf::ytrace_provider().incident("copy_generation", "title", "rate_limited", payload);
+    }
+}
+
+/// Is this generation error the ENDPOINT refusing, rather than this session
+/// being unsummarisable?
+///
+/// One owner for the question both surfaces ask before they decide whether to
+/// keep spending. It matches the armed pause as well as the status text,
+/// because a caller that starts while the pause is up gets the pause's own
+/// error and must classify it the same way.
+pub fn error_is_endpoint_refusal(error: &anyhow::Error) -> bool {
+    let rendered = format!("{error:#}");
+    rendered.contains("429")
+        || rendered.contains("402")
+        || rendered.contains(COPY_GENERATION_PAUSED_MARKER)
+}
+
+const COPY_GENERATION_PAUSED_MARKER: &str = "copy generation is paused";
+
+/// The error every generator returns instead of spending a request while the
+/// endpoint pause is up.
+fn copy_generation_paused_error(remaining_ms: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{COPY_GENERATION_PAUSED_MARKER}: the interface LLM endpoint refused on quota, \
+         {}s remaining before the next probe",
+        remaining_ms / 1000
+    )
+}
+
+/// The provider's absolute wake time, wherever it put it.
+///
+/// LiteLLM nests the upstream body inside its own error message as ESCAPED
+/// JSON, so the field arrives as `\"resets_at\":1789326303` rather than
+/// anything `serde_json` will hand back from a typed parse. Scanning for the
+/// key is deliberate: a strict parse of a doubly-encoded body is the version
+/// that silently finds nothing.
+fn rate_limit_reset_epoch_seconds(body: &str) -> Option<u64> {
+    for key in ["resets_at", "reset_at", "retry_at"] {
+        let mut search = body;
+        while let Some(index) = search.find(key) {
+            let tail = &search[index + key.len()..];
+            let digits = tail
+                .trim_start_matches(|ch: char| !ch.is_ascii_digit())
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(seconds) = digits.parse::<u64>() {
+                // Seconds since the epoch, not milliseconds and not a duration.
+                if seconds > 1_600_000_000 && seconds < 4_000_000_000 {
+                    return Some(seconds);
+                }
+            }
+            search = &search[index + key.len()..];
+        }
+    }
+    None
+}
+
+/// Classify a response that failed, arming the endpoint pause when the failure
+/// says the endpoint — not this request — is the problem.
+///
+/// ⛔ Consumes the response BODY, which `error_for_status` throws away. The
+/// body is the only place the reset time lives.
+fn refusal_error(kind: &str, response: reqwest::blocking::Response) -> anyhow::Error {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| OffsetDateTime::now_utc().unix_timestamp().max(0) as u64 + seconds);
+    let body = response.text().unwrap_or_default();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::PAYMENT_REQUIRED
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        arm_copy_generation_pause(retry_after.or_else(|| rate_limit_reset_epoch_seconds(&body)), &body);
+    }
+    anyhow::anyhow!(
+        "LiteLLM {kind} refused with {status}: {}",
+        body.chars().take(300).collect::<String>()
+    )
+}
+
 pub struct SessionTitleStore {
     conn: Connection,
 }
@@ -763,6 +940,12 @@ pub(crate) fn extract_tail_context(path: &Path) -> Result<String> {
 }
 
 fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String> {
+    // ⛔ The pause is checked HERE, at the one door where a request would be
+    // spent, so no caller can forget it — and every caller's own backoff
+    // bookkeeping still runs, just without nine seconds of blocked thread.
+    if let Some(remaining_ms) = copy_generation_pause_remaining_ms() {
+        return Err(copy_generation_paused_error(remaining_ms));
+    }
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -790,22 +973,24 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
         .json(&body)
         .send()
     {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => response,
-            Err(error) => {
-                // Rate limiting (HTTP 429) is TRANSIENT: falling back to a
-                // heuristic title here would persist a junk title that then
-                // permanently blocks LLM regeneration (the resolver gate sees
-                // "a title exists"). Propagate so the chore retries next tick.
-                if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
-                    return Err(error).context("LiteLLM rate limited (429)");
-                }
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            // A refusal is TRANSIENT and endpoint-wide: falling back to a
+            // heuristic title here would persist a junk title that then
+            // permanently blocks LLM regeneration (the resolver gate sees "a
+            // title exists"). `refusal_error` reads the body — which is where
+            // the provider says when it will serve again — and arms the
+            // process-wide pause, so the retry is one probe rather than a
+            // hundred.
+            let status = response.status();
+            let error = refusal_error("title", response);
+            if status.is_client_error() && !copy_generation_is_paused() {
                 if let Some(title) = heuristic_title_from_context(context) {
                     return Ok(title);
                 }
-                return Err(error).context("LiteLLM returned an error status");
             }
-        },
+            return Err(error);
+        }
         Err(error) => {
             if let Some(title) = heuristic_title_from_context(context) {
                 return Ok(title);
@@ -836,6 +1021,12 @@ fn parse_copy_timestamp(value: &str) -> Result<OffsetDateTime> {
 }
 
 fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<String> {
+    // ⛔ The pause is checked HERE, at the one door where a request would be
+    // spent, so no caller can forget it — and every caller's own backoff
+    // bookkeeping still runs, just without nine seconds of blocked thread.
+    if let Some(remaining_ms) = copy_generation_pause_remaining_ms() {
+        return Err(copy_generation_paused_error(remaining_ms));
+    }
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -863,19 +1054,18 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
         .json(&body)
         .send()
     {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => response,
-            Err(error) => {
-                // 429 is transient — never persist a heuristic over it (see title arm).
-                if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
-                    return Err(error).context("LiteLLM rate limited (429)");
-                }
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            // Never persist a heuristic over a refusal — see the title arm.
+            let status = response.status();
+            let error = refusal_error("summary", response);
+            if status.is_client_error() && !copy_generation_is_paused() {
                 if let Some(summary) = heuristic_summary_from_context(context) {
                     return Ok(summary);
                 }
-                return Err(error).context("LiteLLM returned an error status");
             }
-        },
+            return Err(error);
+        }
         Err(error) => {
             if let Some(summary) = heuristic_summary_from_context(context) {
                 return Ok(summary);
@@ -918,6 +1108,12 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
 /// rename is an explicit gesture, so an empty field the user can retry beats a
 /// junk name they have to notice and undo.
 pub fn request_generated_short_name(settings: &AppSettings, text: &str) -> Result<String> {
+    // ⛔ The pause is checked HERE, at the one door where a request would be
+    // spent, so no caller can forget it — and every caller's own backoff
+    // bookkeeping still runs, just without nine seconds of blocked thread.
+    if let Some(remaining_ms) = copy_generation_pause_remaining_ms() {
+        return Err(copy_generation_paused_error(remaining_ms));
+    }
     let text = text.trim();
     if text.is_empty() {
         anyhow::bail!("nothing to name");
@@ -951,9 +1147,12 @@ pub fn request_generated_short_name(settings: &AppSettings, text: &str) -> Resul
         .bearer_auth(settings.litellm_api_key.trim())
         .json(&body)
         .send()
-        .context("LiteLLM request failed")?
-        .error_for_status()
-        .context("LiteLLM returned an error status")?;
+        .context("LiteLLM request failed")?;
+    let response = if response.status().is_success() {
+        response
+    } else {
+        return Err(refusal_error("short name", response));
+    };
     let value: Value = response.json().context("failed to parse LiteLLM response")?;
     let raw = extract_completion_text(&value).context("LiteLLM returned no completion text")?;
     sanitize_generated_title(&raw).context("LiteLLM returned an unusable name")
@@ -1055,12 +1254,84 @@ fn strip_auxiliary_image_sentences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_SUMMARY_CONTEXT_CHARS, SessionTitleResolver, SessionTitleStore,
-        best_effort_summary_from_context, best_effort_title_from_context, extract_tail_context,
+        COPY_GENERATION_PAUSE_MAX_MS, COPY_GENERATION_PAUSE_MIN_MS, MIN_SUMMARY_CONTEXT_CHARS,
+        SessionTitleResolver, SessionTitleStore, arm_copy_generation_pause,
+        best_effort_summary_from_context, best_effort_title_from_context,
+        clear_copy_generation_pause, copy_generation_pause_remaining_ms,
+        copy_generation_paused_error, error_is_endpoint_refusal, extract_tail_context,
         heuristic_title_from_context, looks_like_generated_fallback_title,
-        looks_like_low_signal_generated_title, sanitize_generated_summary,
+        looks_like_low_signal_generated_title, rate_limit_reset_epoch_seconds,
+        sanitize_generated_summary,
     };
     use crate::AppSettings;
+
+    /// ⛔ THE BODY IS THE ONLY PLACE THE WAKE TIME LIVES, and LiteLLM nests the
+    /// provider's body inside its own message as escaped JSON — so the field
+    /// arrives with backslashes around its quotes and no typed parse will find
+    /// it. This is the exact shape measured from the endpoint on 2026-08-20.
+    #[test]
+    fn the_reset_time_is_read_out_of_a_doubly_encoded_refusal() {
+        let body = r#"{"error":{"message":"litellm.RateLimitError: RateLimitError: "#.to_string()
+            + r#"Exception - {"error":{"type":"usage_limit_reached","message":"The usage "#
+            + r#"limit has been reached","plan_type":"free","resets_at":1789326303}}"}}"#;
+        assert_eq!(rate_limit_reset_epoch_seconds(&body), Some(1789326303));
+        // A refusal with no wake time at all is the common case, and it must
+        // not invent one.
+        assert_eq!(
+            rate_limit_reset_epoch_seconds(r#"{"error":{"message":"too many requests"}}"#),
+            None
+        );
+        // Nor may a duration masquerading as one: `resets_at: 60` is not a
+        // date, and honouring it as seconds-since-epoch would waive the pause.
+        assert_eq!(rate_limit_reset_epoch_seconds(r#"{"resets_at":60}"#), None);
+    }
+
+    /// ⚖ The provider's own wake time is honoured, and CAPPED.
+    ///
+    /// The measured refusal said the quota returns in three weeks. Obeying that
+    /// literally would trade a loud failure for a silent one — no titles, no
+    /// retries, nothing in any instrument — which is the failure mode this
+    /// project keeps paying for. Capped, the outage costs two probe calls an
+    /// hour and heals itself the moment the quota does.
+    #[test]
+    fn a_three_week_reset_hint_is_capped_and_a_short_one_gets_a_floor() {
+        clear_copy_generation_pause();
+        let now_s = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+
+        arm_copy_generation_pause(Some(now_s + 21 * 24 * 3600), "three weeks out");
+        let remaining = copy_generation_pause_remaining_ms().expect("a pause is armed");
+        assert!(
+            remaining <= COPY_GENERATION_PAUSE_MAX_MS,
+            "a three-week refusal must not silence generation for three weeks"
+        );
+
+        clear_copy_generation_pause();
+        arm_copy_generation_pause(Some(now_s + 1), "one second out");
+        let remaining = copy_generation_pause_remaining_ms().expect("a pause is armed");
+        assert!(
+            remaining >= COPY_GENERATION_PAUSE_MIN_MS.saturating_sub(2_000),
+            "a burst limit still gets real air, or the storm just resumes"
+        );
+
+        clear_copy_generation_pause();
+        assert!(copy_generation_pause_remaining_ms().is_none());
+    }
+
+    /// The pause's own error must classify as an endpoint refusal, or the
+    /// caller that meets it treats a quota outage as "this session cannot be
+    /// summarised" and burns its per-session retry budget on it.
+    #[test]
+    fn the_pause_error_reads_as_an_endpoint_refusal() {
+        assert!(error_is_endpoint_refusal(&copy_generation_paused_error(
+            120_000
+        )));
+        assert!(error_is_endpoint_refusal(&anyhow::anyhow!(
+            "LiteLLM title refused with 429 Too Many Requests: quota"
+        )));
+        assert!(!error_is_endpoint_refusal(&anyhow::anyhow!(
+            "no context supplied for title generation"
+        )));
+    }
     use anyhow::Result;
     use std::fs;
     use std::path::PathBuf;

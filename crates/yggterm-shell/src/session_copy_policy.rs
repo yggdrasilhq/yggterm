@@ -18,12 +18,27 @@ pub(crate) fn implicit_copy_generation_enabled_from_env(value: Option<&str>) -> 
     value.map_or(true, |value| env_copy_generation_enabled(Some(value)))
 }
 
+/// May a copy-generation job START?
+///
+/// `endpoint_paused` is the process-wide endpoint refusal
+/// (`yggterm_core::copy_generation_is_paused`). It stops everything the app
+/// decided to do on its own — the passive scan and the announced
+/// auto-generation both — and stops nothing the USER asked for: a forced
+/// regeneration is someone waiting for an answer, and the honest answer while
+/// the quota is out is the error, delivered now, not a job that never runs.
 pub(crate) fn copy_generation_start_allowed(
     force: bool,
     announce: bool,
     implicit_enabled: bool,
+    endpoint_paused: bool,
 ) -> bool {
-    force || announce || implicit_enabled
+    if force {
+        return true;
+    }
+    if endpoint_paused {
+        return false;
+    }
+    announce || implicit_enabled
 }
 
 pub(crate) fn shell_title_case_words(value: &str) -> String {
@@ -144,10 +159,15 @@ mod tests {
 
     #[test]
     fn copy_generation_start_policy_blocks_implicit_selection_work() {
-        assert!(!copy_generation_start_allowed(false, false, false));
-        assert!(copy_generation_start_allowed(true, false, false));
-        assert!(copy_generation_start_allowed(false, true, false));
-        assert!(copy_generation_start_allowed(false, false, true));
+        assert!(!copy_generation_start_allowed(false, false, false, false));
+        assert!(copy_generation_start_allowed(true, false, false, false));
+        assert!(copy_generation_start_allowed(false, true, false, false));
+        assert!(copy_generation_start_allowed(false, false, true, false));
+        // A refused endpoint stops what the app decided to do…
+        assert!(!copy_generation_start_allowed(false, true, true, true));
+        assert!(!copy_generation_start_allowed(false, false, true, true));
+        // …and never what the user asked for.
+        assert!(copy_generation_start_allowed(true, false, false, true));
         assert!(env_copy_generation_enabled(Some("true")));
         assert!(env_copy_generation_enabled(Some("1")));
         assert!(!env_copy_generation_enabled(Some("false")));
