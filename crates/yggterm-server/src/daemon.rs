@@ -19871,6 +19871,97 @@ fn daemon_request_response(
     if let ServerRequest::RefreshRemoteMachine { machine_key } = request {
         return daemon_queue_remote_machine_refresh(runtime, machine_key, request_name);
     }
+    // ⛔⛔ A PROXIED READ MUST NOT HOLD THE RUNTIME LOCK ACROSS ITS ROUND TRIP.
+    //
+    // Every request is served under ONE runtime lock, so a handler that performs
+    // slow IO *inside* itself deafens this daemon to every other client for the
+    // duration. `TerminalRead` is the worst offender by a wide margin: when a row
+    // is owned by a DIFFERENT daemon it calls `terminal_read` against that owner
+    // — a second daemon round trip — and it used to do that from inside the
+    // handler, i.e. with the lock held.
+    //
+    // Measured on the GUI host over 85 minutes: 204 slow lock waits, of which
+    // `terminal_read` was **110 (54%)**, p95 10,079 ms, worst 68,764 ms. And the
+    // trigger is the version-coexisting-daemon mechanism itself — after every
+    // hot-update this daemon holds rows whose owner is its predecessor — so the
+    // condition recurs on whatever schedule we deploy on, which is not rare.
+    //
+    // ⇒ Resolve the target under a SHORT lock, drop it, then make the call. This
+    // is the shape `build_background_copy_updates` already uses for the chore that
+    // used to hold the lock across a multi-second disk walk: read what you need
+    // under the lock, do the slow thing outside it.
+    //
+    // ⚠ The bounded transport this lane also shipped caps how long such a call can
+    // run. That treats the symptom; this is the disease — a bounded wait is still
+    // a wait every other client serves behind.
+    //
+    // ⭐ **AND YES, THIS ADDS A SECOND LOCK ACQUISITION TO THE COMMON CASE** — a
+    // row with no preserved owner is resolved here and then handled below, taking
+    // the lock twice. That is deliberate and it is not a regression, because what
+    // queues other clients is lock HOLD TIME, not acquisition count: the resolve
+    // holds it for a hashmap lookup, while the handler holds it for the whole
+    // handler either way. Total held time on the common path is unchanged to
+    // within microseconds; on the proxied path it drops from a multi-second round
+    // trip to that same lookup. Do not "optimize" this back into the handler.
+    if let ServerRequest::TerminalRead { path, cursor } = &request {
+        let resolved = {
+            let mut guard = lock_daemon_runtime(runtime, "terminal_read_owner_resolve");
+            let runtime_path = guard.terminal_runtime_key_for_path(path);
+            guard
+                .preserved_owner_endpoint_for_request(&runtime_path)
+                .map(|endpoint| (runtime_path, endpoint))
+        };
+        if let Some((runtime_path, owner_endpoint)) = resolved {
+            // ⇣ No lock is held across this line. That is the entire point.
+            match terminal_read(&owner_endpoint, &runtime_path, *cursor) {
+                Ok((
+                    cursor,
+                    chunks,
+                    running,
+                    runtime_output_seen,
+                    eof_without_output,
+                    post_resize_output_seen,
+                    last_resize_seq,
+                    resync_required,
+                )) => {
+                    return ServerResponse::TerminalStream {
+                        cursor,
+                        chunks,
+                        running,
+                        runtime_output_seen,
+                        eof_without_output,
+                        post_resize_output_seen,
+                        last_resize_seq,
+                        resync_required,
+                    };
+                }
+                Err(error) => {
+                    // Booking the failure needs the lock again, but only for the
+                    // bookkeeping — never for the call that failed.
+                    let still_owned = {
+                        let mut guard =
+                            lock_daemon_runtime(runtime, "terminal_read_owner_error");
+                        guard.handle_preserved_owner_request_error(
+                            &runtime_path,
+                            &owner_endpoint,
+                            &error,
+                        );
+                        guard
+                            .preserved_owner_endpoint_for_request(&runtime_path)
+                            .is_some()
+                    };
+                    if still_owned {
+                        return ServerResponse::Error {
+                            message: error.to_string(),
+                        };
+                    }
+                    // The owner was cleared by the error handler, so fall through:
+                    // the locked handler below now finds no owner and serves the
+                    // row locally, exactly as it did before this hoist existed.
+                }
+            }
+        }
+    }
     // The Lane-A plane is answered WITHOUT the runtime lock, deliberately.
     //
     // A WPE verb can honestly take tens of seconds (a page that paints slowly,
@@ -30138,6 +30229,73 @@ mod tests {
     /// The backup must hold the PREVIOUS state, not a second copy of the
     /// current one.
     ///
+    /// The proxied terminal read must not hold the runtime lock across its
+    /// round trip.
+    ///
+    /// ⛔⛔ **ONE LOCK SERVES EVERY REQUEST**, so a handler doing slow IO inside
+    /// itself deafens this daemon to every other client for the duration.
+    /// `TerminalRead` proxies to the daemon that owns the row when that is a
+    /// different process, and it used to make that second round trip from inside
+    /// the handler — with the lock held.
+    ///
+    /// Measured on the GUI host over 85 minutes: 204 slow lock waits, of which
+    /// `terminal_read` was 110 (54%), p95 10,079 ms, worst 68,764 ms. The trigger
+    /// is the version-coexisting-daemon mechanism itself, so it recurs on whatever
+    /// schedule we deploy on.
+    ///
+    /// A behavioural test would need two daemons and process control to hold one
+    /// still while proving the other stays responsive; the fleet's own
+    /// `request/lock_wait_slow` distribution is the real acceptance measure. This
+    /// locks the STRUCTURE, which is what a refactor would quietly undo: the
+    /// resolve happens under a short lock, that guard's scope CLOSES, and only
+    /// then is the call made.
+    #[test]
+    fn the_proxied_terminal_read_happens_with_no_lock_held() {
+        let source = include_str!("daemon.rs");
+        let dispatch_at = source
+            .find("fn daemon_request_response(")
+            .expect("the request dispatcher must exist");
+        let dispatch = &source[dispatch_at..];
+
+        let request_lock_at = dispatch
+            .find("lock_daemon_runtime_for_request(")
+            .expect("the dispatcher must take the per-request lock somewhere");
+        let branch_at = dispatch
+            .find("if let ServerRequest::TerminalRead { path, cursor } = &request {")
+            .expect(
+                "TerminalRead must be intercepted in the dispatcher, before the \
+                 per-request lock, or the proxy round trip runs under it",
+            );
+        assert!(
+            branch_at < request_lock_at,
+            "the TerminalRead interception must come BEFORE the per-request lock"
+        );
+
+        // The guard used to resolve the owner must go out of scope before the
+        // call. Holding it across `terminal_read` is exactly the defect.
+        let resolve_at = dispatch
+            .find("let resolved = {")
+            .expect("the owner must be resolved into a local before the call");
+        let resolve_scope_end = dispatch[resolve_at..]
+            .find("\n        };")
+            .map(|offset| resolve_at + offset)
+            .expect("the resolve block must close its scope explicitly");
+        let call_at = dispatch
+            .find("terminal_read(&owner_endpoint,")
+            .expect("the proxied read must still happen");
+        assert!(
+            resolve_scope_end < call_at,
+            "the resolving guard must be DROPPED before the proxied read — if the \
+             call sits inside that block the lock is held across the round trip, \
+             which is the 68s stall this exists to prevent"
+        );
+        assert!(
+            call_at < request_lock_at,
+            "the proxied read must complete before the dispatcher takes the \
+             per-request lock at all"
+        );
+    }
+
     /// A truncated state document recovers from the backup instead of refusing
     /// to start — loudly, and without destroying the evidence.
     ///

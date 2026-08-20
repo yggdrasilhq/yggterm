@@ -277,13 +277,31 @@ schedule — minutes — on the cross-daemon proxy path, while the lock is held.
 now carry a deadline (`daemon_request_total_deadline_ms`, a multiple of the
 per-syscall budget so a merely-large response still completes).
 
-**Still open — the lock itself.** Bounding the wait does not stop `terminal_read`
-holding the runtime lock across a second daemon round trip. Candidate directions:
-resolve the proxy target and release the lock before the round trip (the shape
-`build_background_copy_updates` already uses — read what you need under the lock,
-do the slow thing outside it); or give the proxied read a much shorter budget than
-the direct one, since a preserved owner that has not answered in ~1 s is a
-different problem from a busy one.
+✅ **AND THE OTHER HALF IS NOW FIXED FOR `terminal_read` — the 54% case.** The
+proxied read is resolved under a SHORT lock in `daemon_request_response`, that
+guard is dropped, and only then is the round trip made; on success it returns
+without ever taking the per-request lock. This is the shape
+`build_background_copy_updates` already uses. Locked by
+`the_proxied_terminal_read_happens_with_no_lock_held`, confirmed to fail against
+the pre-hoist source.
+
+⭐ It adds a second lock ACQUISITION to the common path and that is deliberate:
+what queues other clients is lock HOLD TIME, not acquisition count. The resolve
+holds it for a hashmap lookup; the handler holds it for the whole handler either
+way. Do not fold it back in.
+
+**STILL OPEN — the same shape in the other proxying handlers.** `TerminalSnapshot`,
+`TerminalRetainedSnapshot` and the rest of the preserved-owner family still make
+their round trip from inside the handler, with the lock held. They were 30
+(`terminal_app_declares`), 19 (`status`), 17 (`working_flags`) and 7
+(`terminal_resize`) of the 204 slow waits — together about as much as
+`terminal_read` alone. The hoist above is the pattern to copy; doing them as one
+sweep is better than one at a time, because the resolve/booking dance is identical
+and worth factoring once.
+
+**Also still open:** a preserved owner that has not answered in ~1 s is a different
+problem from a busy one, so the proxied call arguably wants a much shorter budget
+than the direct one. Not done.
 
 ⛔ **DO NOT CITE `ui/block` AS EVIDENCE FOR THIS ENTRY, OR THIS AS EVIDENCE FOR IT.**
 The convergence was proposed and then TESTED by 11.4: temporal correlation of 16 GUI
