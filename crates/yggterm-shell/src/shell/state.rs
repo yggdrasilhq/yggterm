@@ -405,17 +405,19 @@ static FORCED_WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
 // fingerprint as "shellstate_mut"; per-context histogram emitted each render so
 // the hot write reasons during a load are nameable. Gated YGGTERM_TRACE_RENDER=1.
 static SHELLSTATE_MUT_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// ⛔ THE KEY IS A `String` AND THAT IS THE WHOLE POINT (2026-08-14). It was
-/// `&'static str`, which is exactly what a labelled `safe_shell_mut` context is
-/// and exactly what a raw `with_mut` call site is NOT — so every raw write
-/// collapsed into the single bucket `raw_unlabelled`, and four storm autopsies
-/// on the live host reported `raw_unlabelled: 517` against 512 renders without
-/// being able to name one line. `#[track_caller]` on
-/// [`ShellStateWriteCounted::with_mut_counted`] turns that into `file:line`, but
-/// a `Location` cannot be borrowed as `&'static str`, so the map had to own its
-/// keys. The allocation only happens while the probe or the bounded autopsy
-/// window is armed.
-static SHELLSTATE_MUT_HIST: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
+/// ⭐ THE PER-SITE HISTOGRAM MOVED TO [`crate::render_attribution`] AND IS NOW
+/// ALWAYS ON (2026-08-20). It used to live here keyed on `String`, formatting a
+/// `file:line` per write, and that cost is why it sat behind an env flag or a
+/// storm-armed window — with the consequence on the record: twenty-one detected
+/// render storms, every one unattributed, because the attribution was off at
+/// the moment it was needed.
+///
+/// The 2026-08-14 note that the key "had to own its keys" was true of the shape
+/// it had. `Location::caller()` returns a `&'static Location`, whose `file()` is
+/// therefore `&'static str`, so a `(&'static str, u32)` tuple names a source
+/// position AND a labelled context without allocating — and the gate that hid
+/// every storm dissolves along with the cost that justified it. Formatting
+/// happens once, at report time.
 // Storm autopsy (telemetry campaign run 4): the render-cause probe above is
 // env-gated, so it has never been on when a storm actually happened — 21
 // `app_render_storm` detections between 2026-07-10 and 2026-07-20 were all
@@ -32710,31 +32712,13 @@ trait ShellStateWriteCounted {
 impl ShellStateWriteCounted for Signal<ShellState> {
     #[track_caller]
     fn with_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R {
-        // Same accounting as `safe_shell_mut`: the total is always counted (one
-        // relaxed add beside a signal write), the histogram only while a probe
-        // or the bounded autopsy window is armed. `Location::caller()` is read
-        // INSIDE that gate — resolving and formatting it per write on the quiet
-        // path would tax every write in the app to serve a window that is armed
-        // for a few seconds a day.
+        // Same accounting as `safe_shell_mut`, and both are now UNGATED:
+        // `Location::caller()` is a static pointer the caller already passed in,
+        // and the site tuple allocates nothing, so there is no cost left to
+        // arm around.
         SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
-        if render_trace_enabled() || storm_autopsy_armed() {
-            let caller = std::panic::Location::caller();
-            let key = format!(
-                "{}:{}",
-                caller
-                    .file()
-                    .rsplit_once('/')
-                    .map(|(_, name)| name)
-                    .unwrap_or_else(|| caller.file()),
-                caller.line()
-            );
-            if let Ok(mut hist) = SHELLSTATE_MUT_HIST
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-            {
-                *hist.entry(key).or_insert(0) += 1;
-            }
-        }
+        let caller = std::panic::Location::caller();
+        crate::render_attribution::note_state_write((caller.file(), caller.line()));
         self.with_mut(operation)
     }
 }
@@ -32743,20 +32727,13 @@ fn safe_shell_mut<R>(
     context: &'static str,
     operation: impl FnOnce(&mut ShellState) -> R,
 ) -> std::thread::Result<R> {
-    // The total is always counted (one relaxed add on a path that already does
-    // catch_unwind + a signal write). The per-context histogram is the costly
-    // half, so it is kept for the env-gated probe and for the bounded storm
-    // autopsy window — that window is precisely when knowing WHICH write
-    // context is spinning is the whole answer.
+    // Both halves are always counted. Knowing WHICH context is spinning is the
+    // whole answer during a storm, and a probe that has to be armed in advance
+    // is armed by someone who already knew.
     SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if render_trace_enabled() || storm_autopsy_armed() {
-        if let Ok(mut hist) = SHELLSTATE_MUT_HIST
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            *hist.entry(context.to_string()).or_insert(0) += 1;
-        }
-    }
+    // Line 0 marks the label as a human-written context rather than a source
+    // position — see `render_attribution::WriteSite`.
+    crate::render_attribution::note_state_write((context, 0));
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.with_mut(operation))).map_err(
         |error| {
             warn!(%context, panic_payload=?error, "suppressed shell state panic");

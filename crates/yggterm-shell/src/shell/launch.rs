@@ -384,6 +384,10 @@ fn render_cause_field_hashes(
 }
 fn app() -> Element {
     let _render_span = crate::render_attribution::ComponentRenderSpan::start("app");
+    // Close the causal gap: every ShellState write since the previous root
+    // render is a cause of THIS one, and this is the moment that set is still
+    // separable from the writes the render itself will provoke.
+    crate::render_attribution::begin_root_render();
     let bootstrap = BOOTSTRAP
         .get()
         .expect("shell bootstrap not initialized")
@@ -504,11 +508,7 @@ fn app() -> Element {
                                 prev.clear();
                             }
                         }
-                        if let Some(hist) = SHELLSTATE_MUT_HIST.get() {
-                            if let Ok(mut hist) = hist.lock() {
-                                hist.clear();
-                            }
-                        }
+                        crate::render_attribution::clear_state_write_totals();
                         STORM_AUTOPSY_UNATTRIBUTED.store(0, AtomicOrdering::Relaxed);
                         STORM_AUTOPSY_RENDERS_LEFT
                             .store(STORM_AUTOPSY_RENDER_BUDGET, AtomicOrdering::Relaxed);
@@ -663,10 +663,13 @@ fn app() -> Element {
                         "first": first,
                     }),
                 );
-                if let Some(hist) = SHELLSTATE_MUT_HIST.get() {
-                    if let Ok(hist) = hist.lock() {
+                {
+                    {
                         let snapshot: serde_json::Map<String, Value> =
-                            hist.iter().map(|(k, v)| (k.clone(), json!(*v))).collect();
+                            crate::render_attribution::state_write_totals(None)
+                                .into_iter()
+                                .map(|(site, count)| (site, json!(count)))
+                                .collect();
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -748,19 +751,11 @@ fn app() -> Element {
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut_hist: serde_json::Map<String, Value> = SHELLSTATE_MUT_HIST
-                .get()
-                .and_then(|hist| hist.lock().ok())
-                .map(|hist| {
-                    let mut entries: Vec<(&String, &u64)> = hist.iter().collect();
-                    entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-                    entries
-                        .into_iter()
-                        .take(24)
-                        .map(|(k, v)| (k.clone(), json!(*v)))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mut_hist: serde_json::Map<String, Value> =
+                crate::render_attribution::state_write_totals(Some(24))
+                    .into_iter()
+                    .map(|(site, count)| (site, json!(count)))
+                    .collect();
             append_trace_event(
                 &trace_home,
                 "ui",

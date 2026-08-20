@@ -8784,6 +8784,73 @@ mod tests {
         assert_eq!(clamped.font_size, 5.0);
     }
     #[test]
+    fn the_composed_terminal_script_is_valid_javascript() {
+        // ⛔⛔ THE ONE FAILURE THAT TAKES EVERY TERMINAL AT ONCE. The script is
+        // assembled from a `format!` template plus an `include_str!`'d emitter,
+        // and a syntax error anywhere in it does not degrade one feature — the
+        // whole bootstrap fails to parse and no session paints at all. Checking
+        // the emitter file alone is not enough: the composition is where a
+        // brace-escaping mistake in the template lives, and that file is 13k
+        // lines of JS-inside-Rust-string.
+        //
+        // Skipped rather than failed when `node` is absent, because a missing
+        // toolchain is not a defect in the script — but on any machine that has
+        // it, this is the cheapest possible guard against a total blackout.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-script-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("terminal.js");
+        // The template is an async body; wrap it so top-level `await` parses.
+        std::fs::write(&path, format!("(async () => {{\n{script}\n}})();\n"))
+            .expect("write the composed script");
+        let checked = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match checked {
+            Ok(output) => assert!(
+                output.status.success(),
+                "the composed terminal script must parse:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(_) => eprintln!("node not available; composed-script syntax check skipped"),
+        }
+    }
+
+    #[test]
+    fn the_terminal_script_carries_the_trace_emitter_and_its_probes() {
+        // The emitter reaches the script through an `include_str!` interpolated
+        // into the template. If that interpolation is ever dropped the script
+        // still parses and every probe silently becomes a no-op — a failure
+        // that looks exactly like a quiet terminal.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        for marker in [
+            "window.__yggtermTrace",
+            "registerSender(sendTerminalEvent)",
+            "traceXtermEnqueue(",
+            "traceXtermFlush(",
+            "traceXtermRender(",
+            "traceXtermScreenEvent(",
+            "captureStream(hostId, \"live_stream\"",
+        ] {
+            assert!(
+                script.contains(marker),
+                "the composed script must carry `{marker}`"
+            );
+        }
+    }
+
+    #[test]
     fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
