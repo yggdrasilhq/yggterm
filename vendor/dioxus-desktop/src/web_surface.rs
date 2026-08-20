@@ -5408,6 +5408,34 @@ impl WebSurfaceHost {
         }
     }
 
+    /// Set the User-Agent an open surface sends from its NEXT request onwards.
+    /// `None` restores WebKitGTK's own — which is a real value, not "leave it":
+    /// without the explicit reset a surface that once visited an overridden site
+    /// would keep that identity for every site after it.
+    ///
+    /// ⚠ This cannot change the page already on screen. A UA is a REQUEST
+    /// header, so the document in front of you was fetched under whatever was
+    /// set when it loaded; this governs subresources, XHR and the next
+    /// navigation. The surface reconciler therefore also resolves the identity
+    /// BEFORE a surface is created, which is the load that matters to a site
+    /// that gates on the string.
+    pub fn set_user_agent(&self, id: u64, user_agent: Option<&str>) {
+        // ⚠ `settings()` is ambiguous by NAME here: WebKit's `WebViewExt` and
+        // GTK's `WidgetExt` both define one, and a bare method call picks
+        // neither. Named through the trait, so a future import cannot silently
+        // move which `settings` this reads.
+        use webkit2gtk::SettingsExt as _;
+        use webkit2gtk::WebViewExt;
+        use wry::WebViewExtUnix as _;
+        if let Some(s) = self.surfaces.borrow().get(&id) {
+            let webkit = s.webview.webview();
+            let settings: webkit2gtk::Settings =
+                WebViewExt::settings(&webkit).unwrap_or_default();
+            settings.set_user_agent(user_agent);
+            WebViewExt::set_settings(&webkit, &settings);
+        }
+    }
+
     /// Current page (uri, title, loading) as the ENGINE reports them. In-page
     /// navigations (link clicks, redirects, pushState) never pass through the
     /// shell's nav model, so this is the only truth for "where is this tab

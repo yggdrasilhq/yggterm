@@ -366,6 +366,27 @@ impl DesktopService {
         let _ = (id, factor);
     }
 
+    /// Set the User-Agent an open web surface sends from its next request on.
+    /// `None` = WebKitGTK's own identity.
+    pub fn set_web_surface_user_agent(&self, id: u64, user_agent: Option<&str>) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_user_agent(id, user_agent);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = (id, user_agent);
+    }
+
     /// Show/hide an open web surface without destroying it (tab/session switch).
     /// The engine's own (can_back, can_forward) for surface `id`.
     pub fn web_surface_nav_state(&self, id: u64) -> Option<(bool, bool)> {
