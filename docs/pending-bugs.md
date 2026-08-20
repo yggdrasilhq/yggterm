@@ -346,6 +346,15 @@ proxy never engages: reads serve locally, answer empty, and the client mounts wi
 screen — the colorless ghost, previously mis-filed as a pure render defect. The render half
 that remains: with an empty seed the client paints plain fallback content instead of failing
 loudly (a ghost LOOKS like a session; an empty view would at least say what is wrong).
+**PRIORITY ESCALATION 2026-08-20 ~22:3x — THIS BUG NOW BLOCKS FLEET STEERING ENTIRELY.**
+After the 3.1.12 adoption, the target host's newest daemon holds neither the lanes' runtimes
+nor a preserved-owner map for them: `terminal submit` from the GUI host refuses blind
+(fail-safe against an unreadable screen), and `terminal write` on the host itself answers
+"terminal session not found". Every idle lane is unreachable by every input channel — the
+orchestrator's steers are parked as relay files their recipients cannot be told about. This
+is the first entry to fix; nothing else in the fleet moves until reads and writes reach
+old-generation sessions again.
+
 **MERGED SCOPE (2026-08-20 ~20:2x, on the trace lane's evidence):** this entry now OWNS the
 ghost-frame investigation that was filed under [11.5]. The reseed probe measured ALL NINE
 reseed batches at **29 chars, zero SGR** while the same window's live stream carried 148 SGR
