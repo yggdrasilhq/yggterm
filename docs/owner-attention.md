@@ -30,6 +30,19 @@ copies.
 
 ## Decisions only he makes
 
+- **Do we read the embedded controller to get a true fan RPM?** Every ACPI fan interface on the
+  reference client was enumerated and sampled and all of them are stubs — there is no tachometer to
+  read, which confirms rather than contradicts the "fan speed has to be interpolated" reading. The
+  only remaining route to a real RPM is `nbfc-linux` talking to the EC directly, which needs root, a
+  board-specific config, and a tool whose primary purpose is to **take over the fan curve**.
+  **Recommendation: do not.** Socket power plus package temperature are both live and responsive and
+  are what the fan curve actually follows, so the proxy answers the question the fan reading was
+  wanted for, without putting a third party in charge of cooling his laptop. **Done meanwhile:**
+  power and temperature are sampled, carried in the panic incident, and graded in the fleet-heat
+  notebook, labelled as a proxy throughout. **To reverse:** install nbfc read-only and add one field.
+  Detail: `docs/idle-cost-model.md` §7b.
+  *Meanwhile:* nothing waits on this; the heat grading uses the proxy.
+
 - **Should the panic heartbeat ACTUATE, or only report?** The detector is live and files a durable
   `heartbeat/panic` incident plus one addressed notification when the client host crosses the
   memory/CPU/thermal thresholds, in that priority order. What it deliberately does **not** do is act
