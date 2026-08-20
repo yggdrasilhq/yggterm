@@ -45,7 +45,7 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 | instrument | reading | verdict |
 |---|---|---|
 | `ytrace incidents` | **0** | a freeze the owner had to kill produced no incident — the UI-block class is invisible to every probe we have |
-| `ytrace tail --category input` | **0 events** | the keystroke→pty→render chain (wired for exactly this symptom) recorded NOTHING on the GUI host during an hour containing a real 3 s input stall — blind instrument, cause unknown (wrong host? wrong build path? category name?) |
+| `ytrace tail --category input` | **0 events** | the keystroke→pty→render chain (wired for exactly this symptom) recorded NOTHING on the GUI host during an hour containing a real 3 s input stall. ⚠ Narrowed 2026-08-20 11:30: the chain DOES emit on the post-restart GUI (332 events/20 min, ~1 ms keystroke→pty p50) — but ONLY for one remote row; while the owner typed into a fresh claude session and felt lag again, zero keystrokes were recorded from it. So the probe is path-limited (which paths emit `keystroke` is the open question — remote-mounted only?), and the frozen GUI emitted nothing at all (emitter starved by the block, or events lost with the process) |
 | `copy_generation title` | **132 calls, p50 8.7 s, p95 10.4 s, max 20.8 s — ~19 min of wall in one hour** | the title/LLM re-resolve loop dominated the hour; if any call holds a lock the render/input path needs, 3 s echo stalls follow |
 | `render gui cpu` + `render web_content cpu` | ~1238 s + ~1390 s CPU over the hour | ~70% of a core at "rest", consistent with the standing burning-core entries |
 | `sidebar merge_rows` | 2247 calls/hour | steady background jank source |
@@ -62,6 +62,27 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 **Falsifier:** with the watchdog live, an induced 500 ms main-thread block raises `ui/block` with
 attribution within one tick; after the chore fix, a full title-chore tick under LLM latency ≥ 10 s
 shows keystroke echo p95 < 100 ms in the input chain on the GUI host.
+
+## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
+
+**Status:** OPEN — requested 2026-08-20 after a supervision tool typed over the owner's draft
+
+Any out-of-band writer that types text into a row and then submits it (two discrete writes, per
+the composer contract) races the human: keystrokes landing in the gap get submitted glued to the
+injected text. Measured live 2026-08-20: a watchdog's boot text was spliced into the middle of the
+owner's half-typed sentence and submitted — his keystrokes were still in flight through a lagging
+input pipeline at text-write time, so `--refuse-if-draft` saw an empty line, and the Enter write
+had no guard at all.
+
+The caller-side mitigation now in the watchdog (screen read-back between text and Enter; abort +
+warning card unless the composer holds the injected text alone) shrinks the window to one write
+round-trip but cannot close it. The atomic close is daemon-side, where the line buffer lives:
+`server terminal write --submit-iff-line-equals <text>` — press Enter only if the current input
+line is exactly `<text>`, refuse otherwise, report which. Locality: `PtySessionRuntime`
+(`terminal.rs`, beside `has_pending_input_draft`, which already reconstructs the line state).
+
+**Falsifier:** with the verb in place, a writer that types-then-submits while a synthetic
+keystroke stream is being fed into the same row can never submit a line containing both.
 
 ## ⛔⛔ [11.6] THE CLI PROVISIONER'S npm AUTO-UPDATE RACES ITSELF ACROSS CONCURRENT LAUNCHES
 
