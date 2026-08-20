@@ -613,6 +613,45 @@ independently and identically that day; one version stripped tests and comments
 and one did not. Both were green. Only the decoy separated the fix from the
 placebo.
 
+### ⛔⛔ A DAEMON'S BINARY PATH CANNOT TELL A SANDBOX INSTANCE FROM THE REAL ONE — `HOME` CAN
+
+**Measured 2026-08-20, during an input lockout the owner had to report through a temporary
+session.** The diagnosis in flight was "two daemons are fighting over one socket path", naming the
+real installed daemon and a build out of a lane's worktree, and the remedy on the table was to kill
+the second one. Both halves were wrong about that process, and killing it would have destroyed a
+lane's fixture without touching the lockout.
+
+`pgrep -af yggterm-headless` shows the binary path, and that is the one fact which does NOT settle
+it: a sandbox daemon, a lane's test daemon and the real one are all `…/yggterm-headless server
+daemon`. What separates them is the HOME they were started with.
+
+```sh
+for p in $(pgrep -x yggterm-headless); do
+  printf '%s %s\n  %s\n  %s\n' "$p" "$(readlink /proc/$p/exe)" \
+    "$(tr '\0' '\n' < /proc/$p/environ | grep -E '^(HOME|YGGTERM_HOME)=' | tr '\n' ' ')" \
+    "$(ss -xlp 2>/dev/null | grep "pid=$p" | awk '{print $5}' | tr '\n' ' ')"
+done
+```
+
+Three daemons on one host that day, and the environ read them apart in one pass: the real one on
+`$HOME/.yggterm/server-<ver>.sock`; one under the under-glass sandbox's throwaway home
+(`/run/user/<uid>/yggterm-uglass/<arm>/home`), listening on a socket INSIDE that home; one under a
+lane's scratchpad `fakehome`. **Three homes, three socket paths, no contention** — the
+`another yggterm daemon owns the socket bind lock` line in `daemon.log` is a losing bind attempt
+from a start-up race, and the repeated `writing daemon response: Broken pipe` beside it is CLIENTS
+hanging up before reading their reply, which is a client-timeout signature and not a server fight.
+
+⇒ **Before naming a daemon as a suspect, ask three questions in this order, and none of them is
+"which binary is it":**
+1. **Which HOME?** `/proc/<pid>/environ` — a fake home cannot affect the user's rows at all.
+2. **What does it LISTEN on?** `ss -xlp` — a daemon on a different socket path is not competing.
+3. **Does it own a PTY?** `ls -l /proc/<pid>/fd | grep /dev/pts` — zero means killing it destroys
+   no session, and also means it was never the thing holding a keystroke.
+
+⚠ And the shape worth carrying past this incident: **an agent's own sandboxes and fixtures look
+exactly like production to a process listing.** Any instrument that identifies a component by its
+image path will accuse them, most loudly during an incident, when the pressure to act is highest.
+
 ### ⛔⛔ A `settings.json` EDIT UNDER A RUNNING GUI DOES NOT HOLD — THE GUI WRITES ITS OWN COPY BACK
 
 **Measured 2026-08-20.** The interface LLM's plan quota ran out, so the title chore was spending
