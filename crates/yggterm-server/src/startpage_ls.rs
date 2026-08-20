@@ -373,24 +373,12 @@ fn try_faithful_startpage_rows(
             let cwd = brow.get("session_cwd").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_else(|| "/home/user".to_string()));
             let label = brow.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty());
             // Map icon_kind to SessionKind
-            let kind = match icon_kind {
-                "claude-code" => SessionKind::ClaudeCode,
-                "codex" => SessionKind::Codex,
-                "muse" => SessionKind::Muse,
-                "antigravity" => SessionKind::Antigravity,
-                "pi" => SessionKind::Pi,
-                "opencode" => SessionKind::OpenCode,
-                "qwen" => SessionKind::QwenCode,
-                "kimi" => SessionKind::Kimi,
-                "grok" => SessionKind::GrokBuild,
-                _ => {
-                    // Fallback: try to infer from full_path scheme
-                    if full_path.starts_with("remote-cc://") || full_path.contains("claude") { SessionKind::ClaudeCode }
-                    else if full_path.starts_with("remote-session://") { SessionKind::Codex }
-                    else if full_path.starts_with("local://") { SessionKind::Muse }
-                    else { SessionKind::ClaudeCode }
-                }
-            };
+            // ONE owner for "which CLI is this row", shared with the cwd tree.
+            // The hand-list this replaces spelled three registry slugs wrong and
+            // had no arm for the codex family at all, then guessed **Muse** for
+            // anything `local://` — the birth scheme every local CLI row uses.
+            let kind = yggterm_core::agent_scheme::session_kind_for_row(&full_path, icon_kind)
+                .unwrap_or(SessionKind::ClaudeCode);
             let display_path = full_path.clone();
             let storage_path = brow.get("session_cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
