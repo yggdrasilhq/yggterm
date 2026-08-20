@@ -128,6 +128,26 @@ gate-screen working/idle heuristics) must learn the agents-hint signature (dim c
 `← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
 typed-residue detector must require the footer's absence before claiming residue.
 
+## ⛔⛔ [11.0→11.8] THE VIEWPORT BLINK STORM — ~2 FULL RENDERS PER SECOND UNDER STREAMING-ROW LOAD
+
+**Status:** OPEN
+
+Owner-reported as rapid viewport blinks, "a storm processed semi-gracefully"; measured live
+on the GUI while ~8 remote agent rows streamed: **898 `render` events in 8 minutes (~1.9/s;
+the app's own `app_render_rate` window agrees at 1.1/s)** against a same-day quiet baseline
+of ~3/min. Not the reconcile path (1 forced reconcile in the window). The drivers and the
+amplifier, same 8 minutes: `dispatch` 236, `merge_rows` 84, `daemon_declare_absent` 111 —
+about 0.9 driver events/second, each producing ~2 full renders. Two defects compose:
+(1) **churn** — streaming rows dirty every poll, and `daemon_declare_absent` re-derives a
+NEGATIVE answer ~14×/min forever; (2) **amplification** — one driver event re-renders the
+whole tree about twice, and a background row's stream repaints the foreground viewport.
+**Fix direction:** per-component render attribution first (the trace-wiring lane's Dioxus
+instrumentation is the missing instrument — measure WHICH component invalidates), then
+render granularity (sidebar/preview updates must not repaint the terminal viewport), signal
+coalescing (bound renders per second), and a cached negative for the declare probe.
+**Falsifier:** under the same streaming-row load, renders track user-visible changes (order
+of 0.1/s), and the viewport repaints only for its own session's bytes.
+
 ## ⛔⛔⛔ [11.0→6.1] AN ADOPTION CHAIN LOSES THE PRESERVED-OWNER TABLE, AND EVERY OLD-GENERATION ROW MOUNTS AS A GHOST
 
 **Status:** OPEN
