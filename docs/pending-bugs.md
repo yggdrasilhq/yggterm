@@ -480,6 +480,25 @@ the gap is heads that die daemon-side or remotely. **Falsifier:** close a head r
 daemon-side removal, and the arrangement entry for it is gone from settings within the
 session, with members re-parented per `retain_live`'s own contract.
 
+## ⚠ [11.10] THE SERVER AND SHELL TEST SUITES FLAKE UNDER CONCURRENT RUNS — A DIFFERENT TEST EACH TIME, EVERY ONE GREEN IN ISOLATION
+
+**Status:** OPEN
+
+*Observed three times in one evening (2026-08-20) while landing fixes on a host where other
+lanes build and test continuously.* Full-suite runs failed exactly one test each time — a
+PTY reader test, a sidebar search test, a relaunch-rebuild test — and every failure passed
+in isolation and in the next clean solo run. Two of the three observations had two cargo
+test processes racing (self-inflicted); the third had only the ordinary background load of
+other lanes' builds. The pattern says some tests share mutable state — process-global
+(env, settings-store home, cwd) within a binary under thread parallelism, or filesystem
+paths across binaries — and this fleet runs concurrent lanes as a matter of course, so
+"re-run until green" is being paid repeatedly and silently. Same family as the settled
+finding that a unit test may not read the user's real settings store. **Fix direction:**
+identify the shared state in the three named tests first (they are the observed instances,
+not the population); an isolation harness (per-test temp home, serialized group) beats a
+retry culture. **Falsifier:** two full workspace suites running concurrently on one machine
+both pass.
+
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
 **Status:** OPEN
