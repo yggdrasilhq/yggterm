@@ -34,6 +34,46 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 - **Falsifier:** spawn with `--model <x>`; `/proc/<pid>/cmdline` (or the CLI's own session state)
   carries x, and the row header shows x.
 
+## ⛔⛔ [11.4→11.5] THE DAEMON RUNTIME LOCK IS HELD FOR TENS OF SECONDS, PAST ITS OWN TIMEOUT
+
+**Status:** OPEN
+
+Measured 2026-08-20 on the GUI host, 85-minute window, from `request/lock_wait_slow` — the
+**point-event** probe, not the windowed aggregate beside it (see `docs/observability.md` §4.3c).
+204 individual slow waits:
+
+| request | count | share |
+|---|---:|---:|
+| `terminal_read` | 110 | **54%** |
+| `terminal_app_declares` | 30 | 15% |
+| `status` | 19 | 9% |
+| `working_flags` | 17 | 8% |
+| `terminal_resize` / `ping` | 12 | 6% |
+
+Distribution: **p50 95.8 ms · p95 10,079.6 ms · max 68,764 ms.**
+
+Worst individual waits: `terminal_read` **68,764 ms**, `terminal_read` **41,597 ms**, then `status`
+10,240 ms, `working_flags` 10,239 ms, `status` 10,235 ms.
+
+⭐ **Two readings the shape of that distribution gives for free:**
+
+1. **The 10 s timeout is a live, repeatedly-hit ceiling, not a theoretical bound.** A p95 at
+   10,079 ms with a cluster at 10,234–10,240 ms across three different request kinds is what a
+   timeout looks like when it is being reached routinely.
+2. ⛔ **Two waits went straight past it — 41.6 s and 68.8 s, both `terminal_read`.** So the timeout
+   does not bound the wait on every path. A caller can sit on the runtime lock for over a minute.
+
+⛔ **What this entry does NOT claim.** It does **not** explain the UI-thread blocks in the entry
+above. That bridge was tested and refused: across 16 blocks and 204 point events, at window sizes
+from 500 ms to 10 s, the observed co-occurrence was **at or below the chance base rate every time**.
+The lock is real and serious; it is a different mechanism from the UI blocks, and neither finding
+may borrow the other's evidence. ⚠ n=16 is underpowered for a weak effect — it would have caught a
+strong one, which is what the shared-lock hypothesis predicts. Re-run as blocks accumulate.
+
+**Falsifier:** with the offending path fixed, an 85-minute window shows no individual
+`lock_wait_slow` above the configured timeout, and `terminal_read`'s share of slow waits falls
+below a third.
+
 ## ⛔⛔ [11.4] THE APP-CONTROL REQUEST PATH AND terminal_mount BLOCK THE OWNER'S UI THREAD
 
 **Status:** OPEN
