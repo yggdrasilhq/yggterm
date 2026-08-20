@@ -1771,6 +1771,13 @@ fn snap_theme_editor_axis_px(value: f64, snapping: bool) -> f64 {
 /// `box-shadow` declaration with it and leaving the snap state invisible with
 /// nothing in the log. Only the shape that can carry alpha gets it; anything else
 /// falls back to a neutral halo that always renders.
+///
+/// Today the hex branch is the live one and the fallback is a guard rather than a
+/// path: `dominant_accent` returns either a gradient stop's colour or a fallback,
+/// and `clamp_theme_spec` puts every stop through `normalize_hex_color`, which
+/// emits `#rrggbb` (libyggterm ▸ yggui/src/theme.rs). Checked rather than assumed,
+/// because the accent crosses a crate boundary and nothing here would notice the
+/// day it stops being hex — it would simply stop drawing.
 fn theme_editor_snap_halo(accent: &str) -> String {
     let hex = accent.trim();
     if hex.len() == 7
