@@ -865,44 +865,6 @@ fn dup_master_for_poll(master: &(dyn MasterPty + Send)) -> Option<std::os::fd::O
     (duped >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(duped) })
 }
 
-fn is_narrow_tui_session(key: &str, launch_command: &str) -> bool {
-    if launch_command.trim_start().starts_with("ssh ") {
-        return false;
-    }
-    const SCHEME_PREFIXES: &[&str] = &[
-        "remote-grok://",
-        "grok-runtime://",
-        "remote-opencode://",
-        "opencode-runtime://",
-        "remote-qwen://",
-        "qwen-runtime://",
-        "remote-kimi://",
-        "kimi-runtime://",
-        "remote-muse://",
-        "muse-runtime://",
-        "remote-agy://",
-        "agy-runtime://",
-        "remote-pi://",
-        "pi-runtime://",
-    ];
-    if SCHEME_PREFIXES.iter().any(|prefix| key.starts_with(prefix)) {
-        return true;
-    }
-    const CLI_BINARIES: &[&str] = &[
-        "grok", "opencode", "qwen", "kimi", "muse", "agy", "antigravity", "pi",
-    ];
-    for token in launch_command.split_whitespace() {
-        let binary_name = std::path::Path::new(token)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if CLI_BINARIES.contains(&binary_name) {
-            return true;
-        }
-    }
-    false
-}
-
 impl TerminalManager {
     pub fn new() -> Self {
         Self {
@@ -943,26 +905,28 @@ impl TerminalManager {
             );
             let _ = runtime.shutdown(None);
         }
-        // Clamp PTY size for TUIs that don't fill a wide viewport (grok, opencode,
-        // qwen, kimi) - they render at a fixed width (e.g. 100 cols) and leave
-        // large dead margins on a 173-col viewport. Limiting the PTY makes the
-        // TUI fill the available area and reduces blank_rows_below_cursor.
-        let effective_initial_size = initial_size.map(|(cols, rows)| {
-            if is_narrow_tui_session(key, launch_command) {
-                trace_terminal_event(
-                    "pty_size_clamped",
-                    serde_json::json!({
-                        "path": key,
-                        "from": (cols, rows),
-                        "to": (cols.min(120), rows.min(40)),
-                    }),
-                );
-                (cols.min(120), rows.min(40))
-            } else {
-                (cols, rows)
-            }
-        });
-        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, effective_initial_size)?;
+        // ⛔ THE PTY IS CREATED AT THE GRID THE VIEWER ACTUALLY HAS — no per-CLI
+        // clamp. A previous revision shrank eight named CLIs to 120x40 here, on
+        // the premise that they "render at a fixed width (e.g. 100 cols)" and so
+        // a smaller PTY would make them fill the viewport. Measured against the
+        // daemon's own vt100 (`scripts/cli-viewport-probe`), the premise is false
+        // and the arithmetic never worked:
+        //   * given a 173x63 PTY, grok paints to column 171, opencode to 172 and
+        //     pi to 173 — they fill whatever grid they are handed;
+        //   * the one CLI that genuinely renders narrow paints the same 102
+        //     columns at 120 as at 173, so the clamp did not help it either;
+        //   * shrinking the PTY cannot make a TUI fill the VIEWPORT, because the
+        //     viewport is xterm's grid and that is unchanged — it only shrinks
+        //     the app's world and leaves the remainder dead.
+        // The dead margin that motivated the clamp is the STALE-GEOMETRY bug
+        // (a PTY left at a default/preserved size while the client renders
+        // wider), and clamping made that symptom permanent instead of curing it:
+        // the restart path has no grid resync behind it, so every clamped row
+        // stayed 120x40 inside a full-size viewport until something re-attached.
+        // ⇒ An axis here must be a property of WHERE THE PTY LIVES, never of
+        // WHICH CLI is talking (`agent_arm_shell_matrix.rs`). Reading the CLI was
+        // the hole. Locked by `pty_is_created_at_the_requested_grid_for_every_cli`.
+        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, initial_size)?;
         self.sessions.insert(key.to_string(), runtime);
         Ok(())
     }
@@ -1659,22 +1623,16 @@ impl TerminalManager {
             let rows = runtime.current_rows.load(Ordering::SeqCst);
             (cols > 0 && rows > 0).then_some((cols, rows))
         });
-        let mut effective_initial_size = initial_size.or(preserved_size);
-        // Clamp narrow TUIs (grok, opencode, qwen, kimi, muse) to a smaller grid so they
-        // fill the viewport without large dead margins (see ensure_session_with_size).
-        if let Some((cols, rows)) = effective_initial_size {
-            if is_narrow_tui_session(key, launch_command) {
-                trace_terminal_event(
-                    "pty_size_clamped_restart",
-                    serde_json::json!({
-                        "path": key,
-                        "from": (cols, rows),
-                        "to": (cols.min(120), rows.min(40)),
-                    }),
-                );
-                effective_initial_size = Some((cols.min(120), rows.min(40)));
-            }
-        }
+        // ⛔ NO PER-CLI CLAMP HERE EITHER, AND THIS IS THE SITE THAT MADE IT
+        // PERMANENT. The attach path resizes the PTY to the client's grid right
+        // after `ensure_session_with_size` (the D1 `reattach_grid_resync`), so a
+        // clamp applied there self-healed on the next attach. Nothing resyncs
+        // behind a RESTART — and the client only emits a Resize when its own grid
+        // CHANGES, which a daemon-side restart does not do. So a row restarted at
+        // a clamped grid kept painting 120x40 inside a full-size viewport for the
+        // rest of its life, which is the "TUI does not cover the viewport" fault.
+        // See the note in `ensure_session_with_size` for the measurements.
+        let effective_initial_size = initial_size.or(preserved_size);
         let (initial_cols, initial_rows) =
             effective_initial_size.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
         trace_terminal_event(
@@ -8110,6 +8068,110 @@ line-two on the real screen\r\n\
              handed it over, and the prune kills that child if it does not know"
         );
 
+        let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
+    /// The PTY is created at the grid the VIEWER has, whatever CLI is talking.
+    ///
+    /// This locks the removal of a per-CLI clamp that shrank eight named agent
+    /// CLIs to 120x40 at spawn. Its stated premise was that those TUIs "render
+    /// at a fixed width (e.g. 100 cols)", so a smaller PTY would let them fill
+    /// the viewport. Measured against the daemon's own vt100 parser
+    /// (`scripts/cli-viewport-probe`), three of the clamped CLIs paint to within
+    /// two columns of whatever grid they are handed, and the one that really
+    /// does render narrow painted the same 102 columns at 120 as at 173 — so the
+    /// clamp helped nobody. It also could not do what it claimed: the viewport is
+    /// xterm's grid, which a smaller PTY does not change, so the clamp only
+    /// shrank the app's world and left the rest of the screen dead.
+    ///
+    /// ⇒ The invariant is the one `agent_arm_shell_matrix.rs` states: an axis
+    /// here is a property of WHERE THE PTY LIVES, never of WHICH CLI is talking.
+    /// A test that only checked one CLI would pass against a re-introduced clamp
+    /// that named a different one, so this walks the whole former list, by BOTH
+    /// routes the old predicate matched — the row scheme and a bare binary name
+    /// anywhere in the launch command.
+    #[test]
+    fn pty_is_created_at_the_requested_grid_for_every_cli() {
+        let mut manager = TerminalManager::new();
+        // Invented row schemes, one per CLI family the clamp used to name.
+        let schemes = [
+            "grok-runtime://",
+            "opencode-runtime://",
+            "qwen-runtime://",
+            "kimi-runtime://",
+            "muse-runtime://",
+            "agy-runtime://",
+            "pi-runtime://",
+            "remote-grok://",
+            "remote-opencode://",
+        ];
+        for (index, scheme) in schemes.iter().enumerate() {
+            let key = format!("{scheme}sized-{index}");
+            manager
+                .ensure_session_with_size(&key, "sh -c 'sleep 5'", None, Some((173, 63)))
+                .expect("spawn at the caller's grid");
+            assert_eq!(
+                manager.session_size(&key),
+                Some((173, 63)),
+                "{key} must hold the grid the viewer has; a per-CLI clamp here \
+                 paints the TUI into a corner of the viewport and leaves the rest dead"
+            );
+        }
+        // The second route: the old predicate also matched a bare CLI binary name
+        // ANYWHERE in the launch command, on a basename compare — so a path token
+        // ending in one of those names pulled in rows that were never agent rows
+        // at all, plain shells included.
+        let key = "local://token-route";
+        manager
+            .ensure_session_with_size(&key, "sh -c 'sleep 5; : /opt/demo/grok'", None, Some((173, 63)))
+            .expect("spawn a row whose command merely mentions a CLI name");
+        assert_eq!(
+            manager.session_size(key),
+            Some((173, 63)),
+            "a launch command that merely CONTAINS a CLI's name must not resize \
+             anyone's terminal — the old matcher compared basenames, so an \
+             ordinary path token was enough to shrink a row"
+        );
+        let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
+    /// A restart keeps the client's grid — the path where the clamp was permanent.
+    ///
+    /// The attach path resizes the PTY to the client's grid immediately after
+    /// `ensure_session_with_size` (the D1 `reattach_grid_resync` in `daemon.rs`),
+    /// so a clamp applied there was corrected on the next attach and looked
+    /// survivable. Nothing resyncs behind a RESTART, and the client emits a
+    /// Resize only when its OWN grid changes — which a daemon-side restart does
+    /// not do. So a restarted row kept the clamped grid for the rest of its life,
+    /// painting into 120x40 of a full-size viewport. Since a daemon hot-update
+    /// restarts every live row, that is the state the affected CLIs were usually
+    /// found in.
+    #[test]
+    fn a_restart_keeps_the_client_grid_for_a_formerly_clamped_cli() {
+        let mut manager = TerminalManager::new();
+        let key = "opencode-runtime://restart-grid";
+        manager
+            .ensure_session_with_size(key, "sh -c 'sleep 5'", None, Some((173, 63)))
+            .expect("spawn");
+        assert_eq!(manager.session_size(key), Some((173, 63)));
+        manager
+            .restart_session_with_size(key, "sh -c 'sleep 5'", None, None, Some((173, 63)))
+            .expect("restart with the client's grid");
+        assert_eq!(
+            manager.session_size(key),
+            Some((173, 63)),
+            "a restart must hand the row back at the grid the client is showing"
+        );
+        // And with no explicit grid the outgoing runtime's size carries forward,
+        // so a restart never silently narrows a row either.
+        manager
+            .restart_session_with_size(key, "sh -c 'sleep 5'", None, None, None)
+            .expect("restart with no explicit grid");
+        assert_eq!(
+            manager.session_size(key),
+            Some((173, 63)),
+            "a restart with no caller grid must preserve the running one"
+        );
         let _ = manager.shutdown_all(|_key| None::<String>);
     }
 }

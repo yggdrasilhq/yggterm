@@ -139,7 +139,94 @@ The protocol system enforces uniform, structured compliance across all 10 regist
 * **Implementation:** `crates/yggterm-core/src/startpage.rs::is_noise_session_file` and `crates/yggterm-core/src/lib.rs::build_local_cwd_tree` (inline walk) — both call `std::fs::remove_file` and `SessionTitleStore::delete`.
 
 ### Issue Heading 10: Per-CLI Rendering Quirks, Workarounds & Viewport Invariants
-* **Rule:** Each CLI has unique TUI rendering patterns and terminal control behaviors. Yggterm isolates these quirks inside `crates/yggterm-server/src/managed_cli/{cli}.rs` and xterm.js viewport integration, ensuring zero rendering artifacts across attach, switch, or resize.
+
+⚠ **WHERE THIS CODE ACTUALLY LIVES — corrected 2026-08-20.** This heading used to
+say the quirks are isolated in `crates/yggterm-server/src/managed_cli/{cli}.rs`.
+They are not, and following that pointer costs a session: every per-CLI file in
+that directory is a **five-line placeholder** (`README.md` there says so — the
+split is a rename plus stubs, and extraction is still pending). The render
+behaviour is in the shared paths: `managed_cli/mod.rs` (launch/identity),
+`yggterm-server/src/terminal.rs` (PTY spawn/restart/resize + the vt100 screen
+model), `yggterm-server/src/daemon.rs` (the attach-time grid resync), and
+`yggterm-shell/src/shell/viewport.rs` (client seeding, geometry gates, replay).
+
+⛔ **AND THE FIRST RULE IS THAT THERE IS NO PER-CLI GEOMETRY.**
+`agent_arm_shell_matrix.rs` states the invariant: **every axis must be a property
+of WHERE THE PTY LIVES, never of WHICH CLI is talking.** A quirk entry below
+describes what a CLI *does*; it is not a licence to branch the geometry on which
+CLI it is. The one place that did is written up in the next paragraph, because it
+caused the fault it was meant to fix.
+
+* **Rule:** Each CLI has unique TUI rendering patterns and terminal control behaviors. Yggterm absorbs them in the shared PTY/viewport paths named above, aiming at zero rendering artifacts across attach, switch, or resize.
+
+#### ⛔ REMOVED 2026-08-20: the narrow-TUI PTY clamp (`is_narrow_tui_session`)
+
+*The fault it produced:* "many CLIs have their TUI not covering the entire
+viewport and looks broken (Grok Build, OpenCode)".
+
+`terminal.rs` shrank eight named CLIs (`grok`, `opencode`, `qwen`, `kimi`,
+`muse`, `agy`/`antigravity`, `pi`) to **120x40** at PTY spawn *and* at restart, on
+the premise that they "render at a fixed width (e.g. 100 cols) and leave large
+dead margins on a 173-col viewport", so a smaller PTY would make them "fill the
+available area and reduce `blank_rows_below_cursor`".
+
+**Measured against the daemon's own vt100** (`scripts/cli-viewport-probe`, which
+feeds a real PTY to the same `vt100` crate `terminal.rs` parses with — see the
+tell below for why that matters), given a 173x63 PTY:
+
+| CLI | max column painted | verdict |
+|---|---|---|
+| `grok` | 171 / 173 (98.8%) | fills whatever grid it is given |
+| `opencode` | 172 / 173 (99.4%) | fills whatever grid it is given |
+| `pi` | 173 / 173 (100%) | fills whatever grid it is given |
+| `qwen` | 102 / 173 | genuinely narrow — **and paints the same 102 columns at 120**, so the clamp did not help it either |
+
+⇒ **The premise was false for the CLIs it damaged and irrelevant for the one it
+described.** It also could not do what it claimed: the *viewport* is xterm's
+grid, which shrinking the PTY does not change — so the clamp only shrank the
+app's world and left the remainder of the screen dead. That is the reported
+symptom, produced by the workaround.
+
+⭐ **Why it read as plausible, and the general lesson.** The dead margin that
+motivated it is real — but its cause is **stale PTY geometry** (a PTY left at a
+default or preserved size while the client renders wider), the same class as the
+codex squish. Someone saw a CLI painting ~120 columns inside a 173-column
+viewport, concluded *this CLI renders narrow*, and made the PTY officially 120 —
+**cementing the symptom and giving it a justification**. The tell was in the
+comment: it justified itself with `blank_rows_below_cursor`, a telemetry number,
+never with a pixel.
+
+⛔ **The half that made it permanent, and the reason it was usually seen.** The
+attach path resizes the PTY to the client's grid immediately after
+`ensure_session_with_size` (the D1 `reattach_grid_resync`, `daemon.rs`), so a
+clamp applied *there* self-healed on the next attach and looked survivable.
+**Nothing resyncs behind a RESTART** (`daemon.rs` `restart_session_with_size`
+call sites), and the client emits a `Resize` only when its OWN grid changes —
+which a daemon-side restart does not do. So a restarted row kept 120x40 for the
+rest of its life. **A daemon hot-update restarts every live row**, which is why
+the affected CLIs were nearly always found in the broken state.
+
+⚠ **A latent second route, now gone with it.** The predicate also matched a bare
+CLI binary name ANYWHERE in the launch command, by `file_name()` compare — so an
+ordinary path token whose basename happened to be `pi`, `muse` or `grok` pulled
+in rows that were never agent rows, **plain shells included**. On the current
+fleet's launch-command shape that fired on 1 of 54 live rows and that one was a
+genuine match, so it was latent rather than active — but it is exactly the
+"axis that reads the CLI" the matrix invariant forbids.
+
+**Locked by:** `terminal::tests::pty_is_created_at_the_requested_grid_for_every_cli`
+(walks the whole former list, both match routes) and
+`terminal::tests::a_restart_keeps_the_client_grid_for_a_formerly_clamped_cli`.
+Both were confirmed to FAIL against a re-introduced clamp before being trusted.
+
+⚠ **THE PROBE IS PART OF THE FINDING — a hand-rolled vt100 lied first.** The
+first measurement used a quick hand-written parser and reported qwen's banner as
+"cut off from the top". It ignored alt-screen (`?1049h`) and scroll regions, and
+counted a cell as blank when its TEXT was blank — but **gradient banners are
+routinely drawn as SPACES with a background colour**, which such a test scores as
+unpainted. `scripts/cli-viewport-probe` exists so a coverage number is measured
+by the daemon's own eyes, and it reports `bg_only_cells` so that failure mode is
+visible rather than silent.
 * **Claude Code (`claude-code`):**
   - *Bottom Status Bar / Prompt Overwrite:* The Ink terminal engine uses CUF cursor-forward skipping for whitespace. When yggterm's frame-like write detector (`\x1b[?25l`) suppressed forced full refreshes, partial renders latched permanently. Fixed via refresh latching + 1500ms recovery ceiling.
   - *Edge Asymmetry & Padding Overflow:* Claude Code expects full terminal column width. PTY column padding must be symmetrically aligned with xterm container boundaries.

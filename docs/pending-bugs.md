@@ -400,7 +400,7 @@ entry is void and only the unbounded-growth half stands.
 3. **Aggregate Multi-CLI Sessions by Recency (SHIPPED & VERIFIED):** Aggregate all sessions across all 10 CLIs sorted strictly by `modified_epoch_ms` descending.
 4. **Elimination of Shorthashes & Corrupt Titles (SHIPPED & VERIFIED):** Plumbed SQLite and context heuristics; eliminated 8-hex shorthashes (`a8f6dbd1`) and low-signal placeholders.
 5. **Built-in Interface LLM Title Rescue (SHIPPED):** Background Interface LLM title rescue (`request_litellm_title` via LiteLLM) wired into `SessionTitleStore`.
-6. **Per-CLI Rendering Quirk Isolation (SHIPPED):** Modularized launch/resume in `crates/yggterm-server/src/managed_cli/` and fixed PTY narrow clamp helper `is_narrow_tui_session` in `terminal.rs`.
+6. **Per-CLI Rendering Quirk Isolation (PARTIAL):** Launch/resume was modularized to `crates/yggterm-server/src/managed_cli/`, but the per-CLI files there are still five-line placeholders and `mod.rs` holds the logic — do not send readers there for render behaviour. The PTY narrow clamp (`is_narrow_tui_session`, 120×40 keyed on CLI name) added by that work was REMOVED 2026-08-20: measured against the daemon's own vt100, the clamped CLIs fill whatever grid they are handed, and behind a restart — which has no grid resync — the clamp made "TUI does not cover the viewport" permanent. See `docs/cli-integration.md` Issue 10.
 
 **Owner doc:** [`docs/cli-integration.md`](cli-integration.md) (11 issue headings, status matrix, dual-oracle verification).
 

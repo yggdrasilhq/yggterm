@@ -20,4 +20,18 @@ per-CLI modules are the launch-side owners that read it.
 
 Phase 1 is a pure rename (`codex_cli` → `managed_cli` shim); per-CLI extraction
 is incremental as restore/PTY/viewport nuances are fixed (e.g. Muse/AGY
-keep-alive restore, PTY clamp 120×40, webview Rendered scaffold).
+keep-alive restore, webview Rendered scaffold).
+
+⚠ **THE PER-CLI FILES ARE STILL FIVE-LINE PLACEHOLDERS.** The bullets above
+describe what each file is *intended* to own, not what it holds today — every one
+of them is a stub, and `mod.rs` holds the logic. Docs elsewhere have pointed
+readers here for per-CLI render behaviour and cost them the trip; the render
+paths are `terminal.rs` (PTY spawn/restart/resize + vt100 model), `daemon.rs`
+(attach-time grid resync) and `yggterm-shell/src/shell/viewport.rs`.
+
+⛔ **GEOMETRY IS NOT A PER-CLI NUANCE AND MUST NOT MOVE IN HERE.**
+`agent_arm_shell_matrix.rs`: every axis must be a property of WHERE THE PTY
+LIVES, never of WHICH CLI is talking. A 120×40 PTY clamp keyed on the CLI name
+used to live in `terminal.rs`; it produced the "TUI does not cover the viewport"
+fault it was meant to fix and was removed 2026-08-20 (`docs/cli-integration.md`
+Issue 10).
