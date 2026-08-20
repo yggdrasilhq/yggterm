@@ -8150,6 +8150,51 @@ impl YggtermServer {
         ];
     }
 
+    /// Record that a row's launch process EXITED before its CLI ever took
+    /// input — the husk: a PTY that spawned, printed an error frame, and died.
+    ///
+    /// ⚖ Distinct from [`Self::record_launch_refusal_for_path`], which is the
+    /// PRE-spawn case (yggterm declined to start anything). This is the
+    /// post-spawn one, and it was the gap: a refusal is caught on the one funnel
+    /// every launch passes through, but nothing watched what happened AFTER the
+    /// PTY existed. The row kept `launch_phase: Running` over a dead process, so
+    /// it read as idle — indistinguishable, to a human or to a caller, from a
+    /// CLI sitting quietly at its prompt.
+    ///
+    /// The screen the process died on is the error message: for a wrapper that
+    /// failed, the frozen frame IS the diagnosis, and it is about to become the
+    /// only surviving copy of it.
+    ///
+    /// Returns whether the row MOVED, so a sweep can trace real transitions
+    /// rather than one line per pass per dead row.
+    pub fn record_launch_death_for_path(&mut self, path: &str, detail: &str) -> bool {
+        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
+            return false;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return false;
+        };
+        if session.launch_phase == TerminalLaunchPhase::Failed {
+            return false;
+        }
+        let detail = detail.trim();
+        let message = if detail.is_empty() {
+            "the launch process exited before this CLI became usable".to_string()
+        } else {
+            format!("the launch process exited before this CLI became usable: {detail}")
+        };
+        session.launch_phase = TerminalLaunchPhase::Failed;
+        session.last_launch_error = Some(message.clone());
+        upsert_session_metadata(&mut session.metadata, "Launch Error", message.clone());
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Status",
+            "launch process exited".to_string(),
+        );
+        session.status_line = format!("launch failed · {message}");
+        true
+    }
+
     pub fn ensure_managed_cli_for_session_path(
         &self,
         path: &str,
@@ -43285,6 +43330,68 @@ terminal_window_id: None,
         assert!(!server.sessions.contains_key(&phantom_path));
         assert_ne!(server.active_session_path(), Some(phantom_path.as_str()));
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+    }
+
+    #[test]
+    fn a_row_whose_launch_process_died_stops_reading_as_idle() {
+        // The husk: a launch that spawned a PTY, printed an error frame and
+        // exited before its CLI could take input. The row kept
+        // `launch_phase: Running` over a dead process, so it read as IDLE — a
+        // human and a caller both saw a session sitting quietly at its prompt.
+        let runtime_key = "local://00000000-0000-4000-8000-00000000husk";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.to_string(),
+            id: "00000000-0000-4000-8000-00000000husk".to_string(),
+            title: "New Muse Code Session".to_string(),
+            kind: SessionKind::Muse,
+            keep_alive: false,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/tmp/workspace".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        server.request_terminal_launch_for_path(runtime_key);
+
+        assert!(
+            server.record_launch_death_for_path(runtime_key, "provisioner: command not found"),
+            "a row over a dead launch must move"
+        );
+        // Idempotent: a repeated sweep must not re-report a row it already
+        // marked, or the trace fills with one line per pass per dead row and a
+        // genuine transition becomes unfindable among them.
+        assert!(!server.record_launch_death_for_path(runtime_key, "provisioner: command not found"));
+
+        let session = server
+            .snapshot()
+            .live_sessions
+            .into_iter()
+            .find(|live| live.session_path == runtime_key)
+            .expect("the row survives — it is the row, not the process, that is the product");
+        assert_eq!(
+            session.launch_phase,
+            TerminalLaunchPhase::Failed,
+            "`Running` over a corpse is the lie this exists to remove"
+        );
+        let error = session
+            .last_launch_error
+            .expect("the row must carry WHY, readable without opening the terminal");
+        assert!(
+            error.contains("provisioner: command not found"),
+            "the screen the process died on is the diagnosis: {error}"
+        );
     }
 
     #[test]

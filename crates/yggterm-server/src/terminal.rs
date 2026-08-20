@@ -1119,6 +1119,22 @@ impl TerminalManager {
             .is_some_and(|session| session.is_running())
     }
 
+    /// Has this session's PTY child EXITED?
+    ///
+    /// ⛔ Deliberately NOT `!session_is_running()`. That accessor folds a failed
+    /// probe into `false`, which is right for a display question and wrong for
+    /// anything that CHANGES STATE on the answer: `waitpid` really can fail, and
+    /// a swallowed error would then read as "the process exited" and let a
+    /// caller mark a perfectly healthy row dead. Callers that act must be able
+    /// to tell "it exited" from "I could not find out".
+    ///
+    /// `None` = no such session here, or the probe itself failed.
+    pub fn session_has_exited(&self, key: &str) -> Option<bool> {
+        let session = self.sessions.get(key)?;
+        let mut child = session.child.lock().ok()?;
+        child.is_running().ok().map(|running| !running)
+    }
+
     pub fn session_has_output(&self, key: &str) -> bool {
         self.sessions
             .get(key)
