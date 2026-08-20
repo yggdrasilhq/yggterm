@@ -428,6 +428,55 @@ arrangement entry still in settings, one simultaneous window must answer: shadow
 header == `startpage ls durable_count` == `cwdtree ls durable_count`, AND the two husk
 sessions each have a visible sidebar row (`server app rows` carries their paths).
 
+## ⛔⛔⛔ [11.10] A REMOTE AGY SPAWN RUNS THE AGENT ON THE MEDIATOR — THE RESTORED-RUNTIME REPAIR REWRITES REMOTE ROWS, AND FIVE INSTRUMENTS MISS ACROSS THE SPELLING GAP
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED (daemon-side; activates on the next version-bump deploy)
+
+*Root-caused 2026-08-20 ~19:5x from a live probe, after the practice lane reported `session
+remove` answering an unactionable `verified:false` on a remote antigravity row.*
+
+**The spawn.** `terminal new --kind antigravity --machine-key <target>` composes a correct
+remote row (`remote-agy://<machine>/<id>`, ssh launch) — then
+`refresh_restored_remote_runtime_codex_launch_command`, the repair meant for RESTORED
+daemon-runtime rows, rewrites it: session_path → `agy-runtime://<id>`, source → LiveLocal,
+launch → a LOCAL resume. The daemon then spawns `agy` **on the mediator host** (verified: the
+process's direct parent is the mediator daemon) while the row keeps claiming the remote
+machine (`host_label`, "Workspace: <target>").
+
+**Why the repair misfires for agy and not for remote CC.** Its eligibility sniff is
+(a) session-id metadata the CLI's `session_metadata_label` names — which every healthy REMOTE
+row also carries — and (b) an already-resume check on the launch command. Antigravity's start
+flag IS its resume flag (`--conversation`), so (b) passes and the local-store existence
+lookup is skipped; remote Claude Code survives only because its start spells `--session-id`
+while its resume needle is `--resume`, so (b) fails and the store lookup (no local
+transcript) refuses. Survival by flag spelling, not by design.
+
+**The five measured consequences, one cause.** The terminals map keys the PTY as
+`remote-agy://<machine>/<id>` (the spawn path) while the session view says
+`agy-runtime://<id>`, so: (1) `terminal_process_id` reads None — pid unobservable — although
+the daemon is the process's parent; (2) `launch_phase` sticks at `RemoteBootstrap` forever
+(the local run never signals a remote handshake); (3) `working` stays null; (4) `session
+remove` answers `verified:false / runtime_pid_unobservable` — honestly — and (5) **the agy
+process survives the removal as an orphan** (held live: removal answered
+`row_still_listed:false, live_processes:[]` with the process still running after).
+
+**The practice lane's half:** the reply DOES name its refusal — `verified_refusal` in data
+plus the `error` string. There is no `reason` field; reading one reports null and looks like
+a bare refusal. `runtime_pid_unobservable` on these rows was the instrument telling the
+truth about this defect.
+
+**Fixed in code:** the repair refuses any key or session_path that parses as a remote agent
+row, by scheme, before consulting metadata (remote rows have their own repair). Tests:
+`restored_runtime_repair_tests::{a_remote_agent_row_is_never_repaired_into_a_local_runtime,
+a_runtime_keyed_restored_row_still_repairs}`.
+
+**Falsifier (needs a daemon bump deploy):** a `--machine-key` agy spawn keeps its
+`remote-agy://` path; the mediator holds an ssh process and the TARGET host runs `agy`; the
+snapshot carries a `terminal_process_id`; and `session remove` either verifies true or names
+a `remote_runtime_*` refusal — with no agy process left on the mediator afterwards.
+⚠ Until that deploy, every remote agy spawn lands the agent on the mediator — the practice
+lane should treat remote agy results before the deploy as measuring the defect, not the lane.
+
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
 **Status:** OPEN
