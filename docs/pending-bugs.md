@@ -199,6 +199,23 @@ the supervisor to respawn on clean child exit), honouring the active-viewport co
 until the viewer is idle, bounded). **Falsifier:** swap the binary, run the verb, and the new
 pid runs the new image with the supervisor alive and every row intact.
 
+## ⚠ [11.0] A WEBVIEW THAT STOPS ACKING EDIT BATCHES IS DEAD INPUT WEARING A LIVE WINDOW
+
+**Status:** OPEN (incident evidence; owner-reported as "input blocked — trauma")
+
+2026-08-20 ~23:2x-23:37: the GUI instance launched at 23:20 (via app-control, unsupervised
+after the raw-kill-loses-the-supervisor gap below) logged **13 ×** `webview never
+acknowledged an edit batch; releasing the flush gate so the VirtualDom keeps running (the
+UI may be one frame stale)` (timeout_ms=2000). Each is a 2 s flush-gate stall and a UI that
+renders stale while keystrokes go nowhere the user can see; the owner fought unresponsive
+input and window switches for minutes, then replaced the GUI by hand at 23:37 (the
+replacement, launched the normal supervised way, is clean — no such log). Likely coupling:
+the swap-residue entry below (page-in storms on a swap-resident GUI can blow a 2 s ACK
+deadline), and the launch context itself (app-control launch on a loaded host). **Wanted:**
+the ACK-failure count surfaced as a ytrace incident (`webview_edit_faults` exists — wire it
+to ui/block so a sick webview is VISIBLE from outside), and a threshold at which the GUI
+self-restarts its webview instead of limping one frame stale.
+
 ## ⚠ [11.0] SWAP RESIDUE MAKES EVERY FIRST TOUCH CRAWL, AND TWO INSTRUMENTS CALLED IT HEALTHY
 
 **Status:** OPEN
