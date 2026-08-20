@@ -100,7 +100,8 @@ are distinguished by the record's `layer` field, **not** by `component` — both
 |---|---|---|---|
 | `xterm` | `xterm_write/enqueue_window` | window | write-queue arrivals: `count`, `chars`, `max_depth`, `max_backlog_age_ms` |
 | `xterm` | `xterm_write/enqueue_backlog` | point | one arrival that crossed the depth or backlog-age floor — the outlier the window would otherwise average away |
-| `xterm` | `xterm_write/flush` | span (wall) | one bridge flush: latency, chars written, chars still pending, paint-repair reason |
+| `xterm` | `xterm_write/flush` | span (wall) | one bridge flush: latency, chars written, chars still pending, paint-repair reason. ⚠ **Rationed** — kept for a flush at/over 8 ms, a repaired flush, or any flush inside the 4 s window a screen boundary arms; the rest fold into `flush_window` |
+| `xterm` | `xterm_write/flush_window` | window | the flushes the line above did not keep: `count`, `total_ms`, `max_ms`, `chars` |
 | `xterm` | `xterm_render/frame_window` | window | painted frames: `count`, `max_rows_painted`, `full_canvas_frames`, `max_gap_ms` |
 | `xterm` | `xterm_render/frame_gap` | point | a gap between painted frames past the stutter floor |
 | `xterm` | `xterm_screen/reset` | point | the canvas was wiped, with the reason |

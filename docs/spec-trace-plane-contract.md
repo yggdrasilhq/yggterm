@@ -279,6 +279,26 @@ on boundaries where corruption lives.
 or a boundary. A probe that is none of them is a probe that will be dropped by
 the ones that are.
 
+### ⛔⛔ The ring is not the only budget — the PLANE has one, and it is bytes
+
+Rationing for the ring's sake is the easy half and it is not sufficient. The
+trace file's retention is a **byte budget**, so the retained window is roughly
+`budget / write rate`: **a probe that doubles the rate halves how far back
+anyone can look** — including the investigation the probe was added to serve.
+
+⚠ Measured on the live host the first time these probes ran under real load:
+**foreign records were 38% of lines and 48.7% of BYTES**, and one probe — a span
+per bridge flush — was 63% of them. The reasoning that shipped it was that the
+write-frame budget bounds the flush rate so it could not flood. It does bound
+it, and the bound was still 6500 spans in 42 minutes.
+
+⇒ **"Bounded" is not the test. Measure the share.** After adding a probe, read
+what fraction of the plane it became; the answer is routinely an order of
+magnitude off the estimate. The repair is the boundary trick above: keep every
+outlier and every record inside an armed boundary window, aggregate the rest.
+The expensive questions are asked at boundaries, so that is where resolution is
+worth its bytes.
+
 ### Ordering: use `seq`, not `ts_ms`
 
 `ts_ms` has millisecond resolution, and the questions worth asking of a
