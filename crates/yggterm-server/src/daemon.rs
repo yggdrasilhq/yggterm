@@ -27086,6 +27086,7 @@ mod tests {
             active_session: Some(live_sessions[0].clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -27500,6 +27501,7 @@ mod tests {
         );
         let active_path = remote_scanned_session_path("dev", "missing-runtime");
         let remote_machine = RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -27599,6 +27601,7 @@ mod tests {
             active_session: Some(active.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -31008,6 +31011,7 @@ mod tests {
     #[test]
     fn collect_remote_copy_candidates_carry_routing_only_never_the_machine() {
         let machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -31076,6 +31080,7 @@ mod tests {
     fn collect_remote_copy_candidates_preserve_machine_order_across_duplicates() {
         let machines = vec![
             RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -31122,6 +31127,7 @@ mod tests {
                 ],
             },
             RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "oc".to_string(),
                 label: "oc".to_string(),

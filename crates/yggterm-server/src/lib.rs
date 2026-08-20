@@ -3326,6 +3326,16 @@ pub struct RemoteMachineSnapshot {
     /// blanking the menus of a momentarily unreachable host.
     #[serde(default)]
     pub apps: Vec<AppManifest>,
+    /// Which agent CLIs are on THIS machine's `PATH`, as the machine itself
+    /// reported them, or empty when it has never been reached.
+    ///
+    /// ⛔ **Empty means NOT PROBED, and the modal must render it that way.** It
+    /// does NOT mean the host has no CLIs: a machine that is offline, or whose
+    /// yggterm predates the `cli-presence` verb, produces exactly this. Reading
+    /// empty as absence would offer to install ten CLIs onto a host nobody has
+    /// managed to contact.
+    #[serde(default)]
+    pub cli_presence: Vec<yggterm_core::cli_install::CliPresenceReport>,
 }
 
 /// The routing half of a machine — everything needed to REACH the host, and
@@ -3372,6 +3382,12 @@ pub(crate) struct RemoteMachineRefreshScan {
     /// apps. Collapsing them would blank a host's launcher menu on one flaky
     /// ssh round trip.
     pub apps: Option<Vec<AppManifest>>,
+    /// Which agent CLIs this machine has on its own `PATH`, or `None` when the
+    /// fetch failed. Same `None`-vs-`Some(vec![])` discipline as `apps`, and it
+    /// matters more here: `None` must render as "not probed" while an empty
+    /// report would render as "this host has none of them", and only one of
+    /// those is a reason to offer installs.
+    pub cli_presence: Option<Vec<yggterm_core::cli_install::CliPresenceReport>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7853,6 +7869,7 @@ impl YggtermServer {
             remote_binary_expr,
             remote_deploy_state,
             apps: fetch_remote_machine_apps(target),
+            cli_presence: fetch_remote_machine_cli_presence(target),
             scan_result: scan_remote_machine_sessions(target),
         }
     }
@@ -7871,6 +7888,12 @@ impl YggtermServer {
         let apps = scan
             .apps
             .unwrap_or_else(|| self.remote_machines[entry_ix].apps.clone());
+        // Same rule as `apps`: a failed fetch keeps what this machine last told
+        // us rather than blanking it, so one flaky round trip does not turn a
+        // fully-provisioned host into "not probed".
+        let cli_presence = scan
+            .cli_presence
+            .unwrap_or_else(|| self.remote_machines[entry_ix].cli_presence.clone());
         match scan.scan_result {
             Ok(mut sessions) => {
                 sessions.sort_by(|left, right| {
@@ -7893,6 +7916,7 @@ impl YggtermServer {
                     health: RemoteMachineHealth::Healthy,
                     sessions,
                     apps,
+                    cli_presence,
                 };
                 let refreshed_machine_key = self.remote_machines[entry_ix].machine_key.clone();
                 let pruned_live_sessions = self
@@ -7937,6 +7961,7 @@ impl YggtermServer {
                     },
                     sessions: existing_sessions,
                     apps,
+                    cli_presence,
                 };
                 if let Ok(home) = resolve_yggterm_home() {
                     append_trace_event(
@@ -11621,6 +11646,9 @@ impl YggtermServer {
             // A stub has not been reached yet, so it can claim no apps. The
             // first refresh fills this in.
             apps: Vec::new(),
+            // Likewise: empty here is "not probed", which is exactly what a
+            // machine we have never contacted should report.
+            cli_presence: Vec::new(),
         });
         self.remote_machines.sort_by(|left, right| {
             left.label
@@ -18439,6 +18467,34 @@ fn fetch_remote_machine_apps(target: &SshConnectTarget) -> Option<Vec<AppManifes
             .lines()
             .filter(|line| !line.trim().is_empty())
             .filter_map(|line| serde_json::from_str::<AppManifest>(line).ok())
+            .collect(),
+    )
+}
+
+/// Ask a remote machine which agent CLIs are on its own `PATH`.
+///
+/// ⭐ It invokes the REMOTE yggterm's own `server remote cli-presence`, so the probe
+/// runs the same core function on that host that the GUI runs on itself — one
+/// implementation of "is this binary here", not an ssh-side reimplementation that
+/// could answer differently. A machine whose yggterm predates the verb simply fails
+/// the call and reports `None`, which renders as "not probed" rather than as absence.
+fn fetch_remote_machine_cli_presence(
+    target: &SshConnectTarget,
+) -> Option<Vec<yggterm_core::cli_install::CliPresenceReport>> {
+    let output = run_remote_yggterm_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        &["server", "remote", "cli-presence"],
+        None,
+    )
+    .ok()?;
+    Some(
+        output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| {
+                serde_json::from_str::<yggterm_core::cli_install::CliPresenceReport>(line).ok()
+            })
             .collect(),
     )
 }
@@ -28001,6 +28057,22 @@ pub fn run_remote_apps() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `server remote cli-presence` — this machine reporting its own agent-CLI `PATH`.
+///
+/// ⛔ A `PATH` lookup, never an execution. Running each CLI's `--version` to decide
+/// presence costs a process per CLI per refresh, and at least one vendor CLI unpacks a
+/// large payload on first invocation — a probe that expensive changes the machine it is
+/// measuring, on every fleet refresh.
+pub fn run_remote_cli_presence() -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for row in yggterm_core::cli_install::local_presence_report() {
+        writeln!(out, "{}", serde_json::to_string(&row)?)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
     let requested_home = codex_home
         .map(|value| value.trim())
@@ -33484,8 +33556,9 @@ mod tests {
         session_id: &str,
         live_runtime: bool,
     ) -> RemoteMachineSnapshot {
-        let session_path = remote_scanned_session_path(machine_key, session_id);
+            let session_path = remote_scanned_session_path(machine_key, session_id);
         RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: machine_key.to_string(),
             label: machine_key.to_string(),
@@ -34177,6 +34250,7 @@ mod tests {
         let mut server = test_server();
         let session_path = "remote-session://alpha-host/0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "alpha-host".to_string(),
             label: "Alpha".to_string(),
@@ -34355,6 +34429,7 @@ mod tests {
             cwd: None,
         });
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "alpha-host".to_string(),
             label: "Alpha".to_string(),
@@ -34366,6 +34441,7 @@ mod tests {
             sessions: Vec::new(),
         });
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "beta-host".to_string(),
             label: "Beta".to_string(),
@@ -38096,6 +38172,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -38788,6 +38865,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -38844,6 +38922,7 @@ terminal_window_id: None,
         );
         let session_id = "019cf00a-57bd-7480-a642-495ac1389b8e";
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -39057,6 +39136,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -39098,6 +39178,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "practice".to_string(),
             label: "practice".to_string(),
@@ -39170,6 +39251,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -39216,6 +39298,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "oc".to_string(),
             label: "oc".to_string(),
@@ -39238,6 +39321,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -40038,6 +40122,7 @@ terminal_window_id: None,
         );
         let path = remote_scanned_session_path("dev", "abc");
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -40978,6 +41063,7 @@ terminal_window_id: None,
                     cwd: None,
                 }],
                 remote_machines: vec![RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "localhost".to_string(),
                     label: "localhost".to_string(),
@@ -41019,6 +41105,7 @@ terminal_window_id: None,
                     cwd: Some("/home/user/gh/yggterm".to_string()),
                 }],
                 remote_machines: vec![RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "dev".to_string(),
                     label: "dev".to_string(),
@@ -41083,6 +41170,7 @@ terminal_window_id: None,
                 cwd: Some("/home/user/gh/yggterm".to_string()),
             }],
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -41136,6 +41224,7 @@ terminal_window_id: None,
                 active_view_mode: WorkspaceViewMode::Rendered,
                 ssh_targets: Vec::new(),
                 remote_machines: vec![RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "dev".to_string(),
                     label: "dev".to_string(),
@@ -41240,6 +41329,7 @@ terminal_window_id: None,
             .apply_remote_machine_refresh_scan(
                 &target,
                 RemoteMachineRefreshScan {
+                    cli_presence: None,
                     apps: None,
                     remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
                     remote_deploy_state: RemoteDeployState::Ready,
@@ -41315,6 +41405,7 @@ terminal_window_id: None,
             .apply_remote_machine_refresh_scan(
                 &target,
                 RemoteMachineRefreshScan {
+                    cli_presence: None,
                     apps: None,
                     remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
                     remote_deploy_state: RemoteDeployState::Ready,
@@ -41338,6 +41429,7 @@ terminal_window_id: None,
         );
         let remote_path = remote_scanned_session_path("dev", "abc123");
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -42821,6 +42913,7 @@ terminal_window_id: None,
                     cwd: Some("/srv/dev".to_string()),
                 }],
                 remote_machines: vec![RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "dev".to_string(),
                     label: "dev".to_string(),
@@ -43109,6 +43202,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "practice".to_string(),
             label: "practice".to_string(),
@@ -43498,6 +43592,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -43569,6 +43664,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: machine_key.to_string(),
             label: machine_key.to_string(),
@@ -44236,6 +44332,7 @@ terminal_window_id: None,
         };
         server.ssh_targets.push(practice_target.clone());
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "practice".to_string(),
             label: "practice".to_string(),
@@ -44253,6 +44350,7 @@ terminal_window_id: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -44464,6 +44562,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -44511,6 +44610,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -44580,6 +44680,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -44652,6 +44753,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -44731,6 +44833,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -44901,6 +45004,7 @@ terminal_window_id: None,
             );
             crate::sync_terminal_identity_appearance("dark");
             server.remote_machines.push(RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -44963,6 +45067,7 @@ terminal_window_id: None,
                 UiTheme::ZedLight,
             );
             server.remote_machines.push(RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -45231,6 +45336,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -45309,6 +45415,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -45383,6 +45490,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -45427,6 +45535,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -45532,6 +45641,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -45620,6 +45730,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.remote_machines.push(RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -46497,6 +46608,7 @@ terminal_window_id: None,
     #[test]
     fn synthesize_remote_scanned_session_uses_machine_launch_metadata() {
         let machine = RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "oc".to_string(),
             label: "oc".to_string(),

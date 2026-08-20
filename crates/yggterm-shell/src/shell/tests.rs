@@ -22955,6 +22955,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "pi-raspberry".to_string(),
                 label: "raspberry".to_string(),
@@ -23007,6 +23008,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -23074,6 +23076,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -23136,6 +23139,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "pi-raspberry".to_string(),
                 label: "raspberry".to_string(),
@@ -23336,6 +23340,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -23493,6 +23498,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -23557,6 +23563,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -23604,6 +23611,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "oc".to_string(),
                 label: "oc [ok]".to_string(),
@@ -24127,6 +24135,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "oc".to_string(),
                 label: "oc [ok]".to_string(),
@@ -24244,6 +24253,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
@@ -24318,6 +24328,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
@@ -24400,6 +24411,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
@@ -24479,6 +24491,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
@@ -24557,6 +24570,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "oc".to_string(),
             label: "oc [ok]".to_string(),
@@ -24611,6 +24625,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "oc".to_string(),
                 label: "oc [ok]".to_string(),
@@ -24729,6 +24744,7 @@ mod tests {
     #[test]
     fn live_session_label_prefers_remote_cached_generated_title() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -24821,6 +24837,7 @@ mod tests {
             storage_path: format!("/home/user/.codex/sessions/{id}.jsonl"),
         };
         RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
@@ -25880,6 +25897,7 @@ mod tests {
             session_kind: None,
         }];
         let machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -26454,6 +26472,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -26609,6 +26628,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -26734,6 +26754,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[stored_remote_folder],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
@@ -26837,6 +26858,7 @@ mod tests {
             &visible_stored_rows,
             &projection_rows,
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
@@ -26908,6 +26930,7 @@ mod tests {
             &[],
             &projection_rows,
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
@@ -26945,6 +26968,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -26974,6 +26998,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -27023,6 +27048,7 @@ mod tests {
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -27165,6 +27191,7 @@ mod tests {
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
@@ -27236,6 +27263,7 @@ mod tests {
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -27598,6 +27626,7 @@ mod tests {
             active_session: None,
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
@@ -27952,6 +27981,7 @@ mod tests {
         }];
         set_sidebar_search_context(
             &[RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
@@ -28050,6 +28080,7 @@ mod tests {
     fn search_expanded_paths_include_collapsed_remote_sessions() {
         let stored_rows = Vec::<BrowserRow>::new();
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "oc".to_string(),
             label: "oc [ok]".to_string(),
@@ -29411,6 +29442,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_include_stale_offline_machine() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -29442,6 +29474,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_include_restored_machine_without_target() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -29482,6 +29515,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_respect_retry_cooldown() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -29515,6 +29549,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_refresh_healthy_machines_by_ttl() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -29615,6 +29650,7 @@ mod tests {
     #[test]
     fn pending_managed_cli_refreshes_include_local_and_new_machine() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -40064,6 +40100,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // unknown) machines must bypass the deferral; Healthy machines keep
         // deferring.
         let machine = |key: &str, health: RemoteMachineHealth| RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: key.to_string(),
             label: key.to_string(),
@@ -40125,6 +40162,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(
             pending_remote_machine_refreshes(
                 &[RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "oc".to_string(),
                     label: "oc".to_string(),
@@ -40500,6 +40538,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: None,
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
@@ -45332,6 +45371,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -45492,6 +45532,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -45571,6 +45612,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![
                 RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "dev".to_string(),
                     label: "dev".to_string(),
@@ -45587,6 +45629,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     ],
                 },
                 RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "oc".to_string(),
                     label: "oc".to_string(),
@@ -45690,6 +45733,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![
                 RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "dev".to_string(),
                     label: "dev".to_string(),
@@ -45701,6 +45745,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     sessions: vec![remote_session("dev", "dev-home", "/home/user", 50)],
                 },
                 RemoteMachineSnapshot {
+                    cli_presence: Vec::new(),
                     apps: Vec::new(),
                     machine_key: "practice".to_string(),
                     label: "practice".to_string(),
@@ -46150,6 +46195,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
@@ -47592,6 +47638,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: Some(snapshot_session_view_for_ui(session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
@@ -47755,6 +47802,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: Some(snapshot_session_view_for_ui(session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
                 apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
