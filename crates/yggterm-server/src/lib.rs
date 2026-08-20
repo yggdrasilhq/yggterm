@@ -7760,6 +7760,15 @@ impl YggtermServer {
         session.ssh_target = Some(ssh_target.clone());
         session.ssh_prefix = prefix.clone();
         session.launch_command = launch_command;
+        // ⛔ THE ROW CARRIES ITS OPTIONS, not merely the command string — the
+        // same law as the local create. The command composed above DOES carry
+        // them, but the identity refresh rebuilds it (SyncTerminalIdentity
+        // fires around the very client interactions that reveal this create),
+        // and a rebuild can only compose from what the row stores. This line
+        // missing is why the remote `--model` drop survived the rebuild fix:
+        // the rebuild read an empty options set and honestly composed without
+        // the model (measured live on the 3.1.12 deploy, 2026-08-20).
+        session.agent_launch_options = launch.clone();
         session.terminal_lines = vec![
             format!("Queue new remote {} session {uuid}", descriptor.display_name),
             format!("Target host: {ssh_target}"),
@@ -32200,6 +32209,22 @@ mod tests {
             rebuild_head.contains("claude_extra_args_remote_exports_with_launch"),
             "the binary-cache-miss rebuild must also compose from the row's \
              launch options"
+        );
+        // And the rebuilds can only compose from what the row STORES — the
+        // remote create composed a correct command and stored nothing, so the
+        // first rebuild honestly erased the model from an empty options set
+        // (measured live on the first deploy carrying the rebuild fix alone).
+        let create = source
+            .split("pub fn start_remote_agent_session_with_launch_options(")
+            .nth(1)
+            .expect("the remote agent create")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of the create");
+        assert!(
+            create.contains("session.agent_launch_options = launch.clone()"),
+            "the remote create must store the launch options on the row; a \
+             command string alone does not survive the identity-refresh rebuild"
         );
     }
 
