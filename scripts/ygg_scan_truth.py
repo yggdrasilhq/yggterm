@@ -147,12 +147,39 @@ def muse_noise_ids(run_on_host, host):
 _EXISTS_DUMP = r"""
 import json, os, sys
 paths = json.loads(sys.stdin.read())
-print(json.dumps([p for p in paths if p and os.path.exists(p)]))
+# ⛔ isfile, not exists. A LIVE session with no transcript yet is injected with
+# its CWD as storage_path (dual presence is spec), and a cwd is a directory that
+# exists — so an existence test calls it store-backed and then reports it as
+# drift for not being in a file walk it can never be in.
+print(json.dumps([p for p in paths if p and os.path.isfile(p)]))
 """
 
 
+def row_is_peer_scanned(row):
+    """A row the daemon scanned from ANOTHER machine.
+
+    ⛔ The honest discriminator is the machine segment in the display path, not
+    the filesystem. A peer row is published as `remote-<slug>://<machine>/<id>`
+    while a LOCAL row of the same CLI is `remote-<slug>://<id>` with no machine.
+    Path existence cannot tell them apart: fleet hosts share home layouts, so a
+    legacy store file scanned on one machine exists at the same path on another
+    and reads as local.
+    """
+    display = (row.get("display_path") or "").strip()
+    if "://" not in display:
+        return False
+    scheme, _, rest = display.partition("://")
+    if not scheme.startswith("remote-"):
+        return False
+    return "/" in rest
+
+
 def locally_backed_ids(run_on_host, host, rows):
-    """Of `rows`, the ids whose store file actually exists on THIS host.
+    """Of `rows`, the ids backed by a real store FILE on THIS host.
+
+    Everything else is a row a local file walk cannot contain, for one of two
+    honest reasons: the daemon scanned it from a peer machine, or it is a live
+    session with no transcript written yet.
 
     ⛔ `startpage`/`cwdtree` show the FLEET: the daemon merges sessions scanned
     over ssh from peer machines. A local file walk cannot see those, so counting
@@ -167,7 +194,11 @@ def locally_backed_ids(run_on_host, host, rows):
     for r in rows:
         sid = r.get("session_id")
         sp = r.get("storage_path") or ""
-        if sid and sp:
+        if not sid:
+            continue
+        if row_is_peer_scanned(r):
+            continue  # another machine's row; never in a local walk
+        if sp:
             by_path.setdefault(sp, []).append(sid)
     if not by_path:
         return set()

@@ -443,7 +443,7 @@ def compare(host, verb_data, manual_sessions, verbose=False):
         remote_only = verb_only - backed
         verb_only = verb_only & backed
     if remote_only:
-        print(f"[{host}] note: {len(remote_only)} verb rows come from peer machines (no local store file) — not counted as drift")
+        print(f"[{host}] note: {len(remote_only)} verb rows have no local store file (peer-scanned, or live with no transcript yet) — not counted as drift")
     if verb_only:
         issues.append(f"verb has {len(verb_only)} ids not in manual walk (extra): {sorted(list(verb_only))[:5]}")
     if manual_only:
