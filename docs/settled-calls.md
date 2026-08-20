@@ -313,9 +313,8 @@ firing, **241 minutes after the last successful swap**.
 
 ## ★★★ NOISE DELETION IS QUARANTINE-FIRST (2026-08-20)
 
-**Relayed through the wave orchestrator, not heard first-hand by this lane** —
-recorded with that provenance on purpose, because a relay may direct future work
-and only the owner may re-open a call. It refines, and does not overturn, the
+**Owner-answered** in the wave Q/A and relayed to this lane by the orchestrator,
+which confirmed the provenance when asked. It refines, and does not overturn, the
 2026-08-08 ruling below: noise still goes, and it still never goes by `unlink`.
 
 Fleet-wide, a noise session is **renamed into a `.noise/` sidecar beside its own

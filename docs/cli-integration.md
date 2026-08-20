@@ -72,7 +72,7 @@ does NOT mean gapped — see §Scanned, not gapped.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **codex** | `codex` | `remote-session://` / `codex-runtime://` `local://` | `~/.codex/sessions/**/rollout-*.jsonl` (id inside file, name carries timestamp) | `Generated` (none in file) | **Works** ✅ `order_for_startpage` `modified_epoch` | **Works** ✅ `>_` `#0f766e` — generated title via `SessionTitleStore` | **Works** ✅ `>_` `#0f766e` `build_local_cwd_tree` | **Works** ✅ `codex` `codex-runtime://` `RemoteBootstrap` | **Works** ✅ `server resume ls` probes `daemon_owns_runtime+attach_ready_seen` (gates neutered 2026-08-16) | `codex resume <id>` measured | `check-startpage/titles/cwdtree` `0` |
 | **claude-code** | `claude-code` | `remote-cc://` / `cc-runtime://` | `~/.claude/projects/*/*.jsonl` (filename is id, `custom-title` > `ai-title`) | `Store` (`custom` > `ai`) | **Works** ✅ | **Works** ✅ `*_ #c2410c` | **Works** ✅ `*_` | **Works** ✅ `claude_code` `cc-runtime://` | **Works** ✅ | `claude -r <id>` | `0` |
-| **muse** | `muse` | `remote-muse://` / `muse-runtime://` | `~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db` (`sessions.workspace_root→cwd, title, updated_at_us`, fallback `route_facts.cwd` → `heuristic_title_from_context`) | `Store` (tightened 2026-08-17, `session-index.db.title` authoritative, shorthash/weird filtered) | **Works** ✅ `scan_all_durable_sessions` (`M_ #86198f`, noise DELETE, weird-title filtered, `is_agent_session` gated) | **Works** ✅ `server titles ls` (`M_` + `effective_title` Store-heuristic, shorthash `a8f6dbd1` filtered) | **Works** ✅ `M_ #86198f` | **Works** ✅ `remote-muse://` restored as `LiveSsh` with `kind: SessionKind::Muse` and `resume-muse` | **Works** ✅ `working_screen_phrases` wired | `muse resume <uuid>` / `muse --yolo` | `0` |
+| **muse** | `muse` | `remote-muse://` / `muse-runtime://` | `~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db` (`sessions.workspace_root→cwd, title, updated_at_us`, fallback `route_facts.cwd` → `heuristic_title_from_context`) | `Store` (tightened 2026-08-17, `session-index.db.title` authoritative, shorthash/weird filtered) | **Works** ✅ `scan_all_durable_sessions` (`M_ #86198f`, noise SKIPPED — not deleted, see Issue 8 — weird-title filtered, `is_agent_session` gated) | **Works** ✅ `server titles ls` (`M_` + `effective_title` Store-heuristic, shorthash `a8f6dbd1` filtered) | **Works** ✅ `M_ #86198f` | **Works** ✅ `remote-muse://` restored as `LiveSsh` with `kind: SessionKind::Muse` and `resume-muse` | **Works** ✅ `working_screen_phrases` wired | `muse resume <uuid>` / `muse --yolo` | `0` |
 | **antigravity** | `antigravity` | `remote-agy://` / `agy-runtime://` | `~/.gemini/antigravity-cli/conversation_summaries.db` (the INDEX — 999 rows, of which 4 are sessions), `brain/*/.system_generated/logs/transcript_full.jsonl`, `history.jsonl` | `Store` (`conversation_summaries`) | **Works** ✅ `4` durable `A_ #1557b0` — the other 995 are batch conversations, see §The agy durable rule | **Works** ✅ `conversation_summaries` title + `history.jsonl` / prompt fallback | **Works** ✅ `A_ #1557b0` | **Works** ✅ `remote-agy://` restored as `LiveSsh` with `kind: SessionKind::Antigravity` and `resume-agy` | **Works** ✅ `working_screen_phrases` wired | `agy --conversation <id>` | `0` |
 | **pi** | `pi` | `remote-pi://` / `pi-runtime://` | `~/.pi/agent/sessions/*/*.jsonl` (first line `id`/`cwd`) | `Store` | **Works** ✅ | **Works** ✅ `π_ #be185d` | **Works** ✅ `π_` | **Works** ✅ `remote-pi://` restored as `LiveSsh` with `SessionKind::Pi` | **Works** ✅ | `pi --session <id>` | `0` |
 | **qwen** | `qwen` | `remote-qwen://` / `qwen-runtime://` | `~/.qwen/projects/*/chats/*.jsonl` (first line `id`/`cwd`, exclude `.runtime.`) | `Store` | **Works** ✅ | **Works** ✅ `Q_ #6d28d9` | **Works** ✅ `Q_` | **Works** ✅ `remote-qwen://` restored as `LiveSsh` with `SessionKind::QwenCode` | **Works** ✅ | `qwen --resume <id>` | `0` | ⚠ **render: UPSTREAM, not ours** — qwen paints a 3-row header, not the 6-row banner its ASCII art implies, and only ~102 columns, at every grid from 100x30 to 173x200 **in a bare PTY with no yggterm involved** (measured 2026-08-20, `scripts/cli-viewport-probe`). "qwen's motd is cut off at the top" is qwen's own rendering by the wrapper-vs-manual parity rule. Do not add a flag or a clamp for it. |
@@ -85,7 +85,7 @@ does NOT mean gapped — see §Scanned, not gapped.
 
 ## 2. The 9-CLI Integration Protocol System
 
-The protocol system enforces uniform, structured compliance across all 10 registered CLIs (`codex`, `claude-code`, `muse`, `antigravity`, `pi`, `qwen`, `opencode`, `kimi`, `grok-build`, `codex-litellm`). Every CLI is evaluated across nine core engineering pillars (seven original + 2026-08-17 noise DELETE and weird-title filtering):
+The protocol system enforces uniform, structured compliance across all 10 registered CLIs (`codex`, `claude-code`, `muse`, `antigravity`, `pi`, `qwen`, `opencode`, `kimi`, `grok-build`, `codex-litellm`). Every CLI is evaluated across nine core engineering pillars (seven original + 2026-08-17 noise classification — skip, never delete, see Issue 8 — and weird-title filtering):
 
 ### Issue Heading 1: Durable Store Discovery & Multi-Root Indexing
 * **Rule:** Every agent CLI declares its exact store globs in `AGENT_CLIS` (`crates/yggterm-core/src/agent_cli.rs`). No hardcoded store directory paths may exist in product code outside the descriptor registry (enforced by `no_store_path_literal_outside_the_agent_cli_registry`).
@@ -134,9 +134,34 @@ The protocol system enforces uniform, structured compliance across all 10 regist
 
 ---
 
-### Issue Heading 8: Noise and Empty Session Deletion (DELETE)
-* **Rule (2026-08-17):** yggterm must DELETE any CLI session file that is noise — no agent turn or empty session — as it is seen. A session is noise if `is_noise_session_file(path)` returns true: file < 20 bytes, or JSONL contains no `agent turn` / `role=assistant` record and `extract_tail_context` is < 20 chars after trimming. Guard: mtime < 60 s is kept to avoid deleting a session the CLI is still writing. On detection the verb deletes the file and removes any `session-titles.db` entry for that `session_id` so the next scan is clean. This applies to both startpage (`scan_all_durable_sessions` walk) and cwd tree (`build_local_cwd_tree`) and is verified by the oracles finding zero noise rows on a rescan.
-* **Implementation:** `crates/yggterm-core/src/startpage.rs::is_noise_session_file` and `crates/yggterm-core/src/lib.rs::build_local_cwd_tree` (inline walk) — both call `std::fs::remove_file` and `SessionTitleStore::delete`.
+### Issue Heading 8: Noise and Empty Session CLASSIFICATION (the scan never deletes)
+⛔⛔ **CORRECTED 2026-08-20 — THIS SECTION DESCRIBED CODE THAT NEVER SHIPPED, AND IT WAS BELIEVED.**
+It specified a delete: `remove_file` plus `SessionTitleStore::delete` from both the startpage walk
+and `build_local_cwd_tree`, a 20-byte size rule, an `extract_tail_context` rule, and a 60-second
+write guard. **None of that exists.** `is_noise_session_file` tests exactly two things — a
+zero-length file, and a muse session whose `session-index.db` row has `prompt_count = 0` with a
+placeholder title — it has exactly two callers, and **both `continue`**. There is no delete path
+in the scan and there never was.
+
+⚠ This is why the correction is written at this length rather than quietly edited: the claim was
+carried out of this file into a lane brief as an established fact about our own code, under the
+heading *"treat deletion as the highest-stakes code in your lane"*. A doc that describes an
+implementation which does not exist is worse than one that says nothing, because it is
+authoritative-looking and nobody re-reads the callers.
+
+* **What the scan actually does:** it CLASSIFIES. Noise is skipped in memory, never removed from
+  disk. `scanning_never_removes_a_session_file` pins that, and it also pins the case that matters:
+  a muse session the index calls noise still has real bytes behind it (measured: four such
+  sessions carrying ~12 KB of lifecycle records each, a clean `session_end`, ~12 minutes of
+  uptime). Skipping them is right; reading the index row as *"the file is empty"* is not.
+* **What may delete, and how:** [`spec-sweep-policy.md`](spec-sweep-policy.md) is the one owner of
+  that question. Its §9.2a carries the owner's 2026-08-20 ruling: quarantine first — a `.noise/`
+  sidecar beside the store (⛔ never a temp directory; `/tmp` is a tmpfs on at least one fleet
+  host, so "quarantine" there is deletion that also spends RAM), swept after 7 days, a ytrace
+  incident per action carrying path and reason, and direct `rm` only once quarantine has earned
+  trust.
+* **Implementation:** `crates/yggterm-core/src/startpage.rs::is_noise_session_file` — a predicate,
+  and only a predicate.
 
 ### Issue Heading 10: Per-CLI Rendering Quirks, Workarounds & Viewport Invariants
 

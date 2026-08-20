@@ -236,8 +236,8 @@ then a second TTL before the bytes are actually released. A **hold** is
 `zfs hold`: a held session is C4 and no class may take it.
 
 **9.2a Noise sessions: QUARANTINE FIRST, and the destination is named.**
-*Owner ruling relayed through the wave orchestrator, 2026-08-20 — recorded here
-because this file owns the mechanism; the ruling itself is in
+*Owner ruling, 2026-08-20, answered in the wave Q/A — recorded here because this
+file owns the mechanism; the ruling itself is in
 [`settled-calls.md`](settled-calls.md).* It sharpens the trash hop of 9.2 for the
 noise class specifically:
 
