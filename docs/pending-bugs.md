@@ -105,20 +105,41 @@ closed by deriving the mapping from `remote_agent_row_schemes()`. Check whether
 `live_session_kind` needs the same treatment.
 
 
-## ⛔⛔ [11.2] `terminal new --model` IS ACCEPTED AND SILENTLY DROPPED — AND IT IS NOW THE ONLY SANCTIONED WAY TO SET A MODEL
+## ⛔⛔ [11.2→11.0] A SPAWN AIMED AT A STALE DAEMON DROPS `--model` AND SAYS SO IN A FIELD NOBODY READ
 
 **Status:** OPEN
 
-*Measured 2026-08-20, reproduced on 8 of 8 spawns in one batch.*
+*Re-diagnosed 2026-08-20 14:30 by 11.0. The original heading read "`terminal new --model` IS
+ACCEPTED AND SILENTLY DROPPED"; that was wrong, and it stood as a BLOCKER for hours.*
+
+⭐ **THE FLAG WORKS. Proven end to end against a current daemon, on all three instruments:**
+
+    /proc/<pid>/cmdline   ->  claude --model claude-fable-5 --dangerously-skip-permissions …
+    the CLI's own banner  ->  "Fable 5 with xhigh effort"
+    transcript assistant  ->  "model":"claude-fable-5"      <- the decisive one
+
+⛔ **WHAT ACTUALLY FAILS is a spawn aimed at a host whose RUNNING daemon predates the flag.** The
+same call to a stale target answers `data.launch.applied: false` with `launch.model` still echoed
+back, and the spawned process carries no model flag. **The reply was telling the truth the whole
+time, in a field nobody was reading** — the recipe documents `applied:false` as the honest answer
+from an older daemon, and the 8-of-8 batch that produced the original finding was aimed at a host
+whose daemon was, and still is, the pre-deploy image.
+
+⇒ **The defect is NOT in the flag's plumbing.** It is that a spawn cannot succeed against a stale
+daemon and nothing makes the caller look. Two things are wanted: `applied:false` should be LOUD at
+the point of spawn rather than a field in a JSON body, and the daemon-adoption gap it depends on is
+its own entry ([11.2→6.1], the swap that never converges).
+
+⚠ **Nothing downstream flags the substitution**, which is why it survived: the row launches, works,
+and reports healthily on whatever default the CLI last saved.
 
 `server app terminal new --kind claude-code --model <id> …` answers success and creates the row,
 but the spawned process command line is `claude --dangerously-skip-permissions --session-id <id>`
 — no model flag at all. The row silently launches on the CLI's saved default model. Reproduced on
 every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 
-- **Consequence:** an orchestrator directed to spawn delegates on a specific model cannot; every
-  delegate lands on whatever default the CLI last saved. Nothing downstream flags the substitution
-  (same shape as the fleet skill's "silently mangled id yields a working row on the wrong model").
+- **Consequence, corrected:** an orchestrator CAN aim a delegate at a model — provided the target
+  host's daemon is current. Against a stale one the delegate lands on the CLI's saved default.
 - ⛔⛔ **THE OLD WORKAROUND IS WITHDRAWN BY OWNER RULING, 2026-08-20.** It read *"drive `/model
   <id>` into the row after it reaches its composer"*. Do not do this to a session that has done
   any work: a conversation is prompt-cached AGAINST ONE MODEL, so an in-session switch re-reads
@@ -127,11 +148,10 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
   history gets re-read on your next message."*). Owner: *"Never attempt to switch like this,
   because it will burn tokens … model switching should be done in always new spawning with the
   --model flag. All CLIs have some equivalent."*
-- ⇒ **THIS RAISES THE ENTRY FROM NUISANCE TO BLOCKER.** With the switch forbidden on a warm
-  session, `--model` at spawn is the ONLY sanctioned mechanism for aiming a seat at a model — and
-  it does not work. A seat ordered onto a specific model therefore cannot be delivered at all
-  today; it runs its whole life on the CLI's saved default. **A session already on the wrong
-  model finishes its work there and hands over** — the correction rides the next spawn.
+- ⇒ **THE BLOCKER IS WITHDRAWN.** It was raised on the belief that `--model` at spawn never
+  worked, so an owner-ordered model could not be delivered at all. It can: spawn against a current
+  daemon and verify on the transcript's `model` field. **A session already on the wrong model still
+  finishes its work there and hands over** — the correction rides the next spawn, never a switch.
 - ⚠ **Turn zero is the one safe moment** (an empty session has no history to re-read), so a
   switch immediately after a spawn repairs a launch that has just failed. That is a repair, not
   a way to re-aim a session that has run.
@@ -140,12 +160,13 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
   to the model flag's plumbing, not general option loss. And the decisive VERIFICATION instrument
   is the transcript's assistant-record `model` field after the first turn: the screen banner
   false-negatives once it scrolls, and the process cmdline is blind after a `/model` repair.
-- **Locality:** launch-command construction for agent kinds — the same
-  `persistent_agent_resume_command` / managed_cli family lane 11.2 is auditing for resume-id
-  mapping. Check whether `--permission-mode` and other per-launch options survive, too: the
-  spawned cmdline shows `--dangerously-skip-permissions` did, so the drop is selective.
-- **Falsifier:** spawn with `--model <x>`; `/proc/<pid>/cmdline` (or the CLI's own session state)
-  carries x, and the row header shows x.
+- **Locality, corrected:** NOT the launch-command builder. Lane 11.2 measured that layer directly
+  and found `launch.applied:True`, `launch.model:claude-fable-5` and the flag present in the
+  composed command — then said plainly that the loss was downstream and not theirs. That refusal to
+  claim a fix they could not evidence is what made the real cause findable.
+- **Falsifier:** spawn with `--model <x>` at a host whose daemon is CURRENT; `/proc/<pid>/cmdline`
+  carries x and the transcript's assistant `model` field reads x. Against a stale daemon the same
+  call refuses visibly rather than answering success with `applied:false` buried in the body.
 
 ## ⛔⛔ [11.4→11.5] THE DAEMON RUNTIME LOCK IS HELD FOR TENS OF SECONDS, PAST ITS OWN TIMEOUT
 
