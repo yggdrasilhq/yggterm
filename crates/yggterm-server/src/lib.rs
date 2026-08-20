@@ -69,6 +69,7 @@ mod codex_cli {
 mod daemon;
 pub mod daemon_bridge;
 pub mod grid_overlay;
+pub mod host_panic;
 // §4 of docs/spec-hot-restart-relay-gate.md — the durable "this host owes a
 // swap" record. PUBLIC because the intent outlives the daemon being replaced:
 // the GUI forms it, a daemon poll drains it, and `server daemons` reports it.
