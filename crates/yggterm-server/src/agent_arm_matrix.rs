@@ -338,7 +338,7 @@ const ARMS: &[Arm] = &[
         re_roots_with_cwd: false,
         store_globs: &[
             ".gemini/antigravity-cli/conversations/*.db",
-            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
+            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl",
             ".antigravitycli/*.json",
         ],
     },
@@ -355,7 +355,7 @@ const ARMS: &[Arm] = &[
         re_roots_with_cwd: false,
         store_globs: &[
             ".gemini/antigravity-cli/conversations/*.db",
-            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
+            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl",
             ".antigravitycli/*.json",
         ],
     },

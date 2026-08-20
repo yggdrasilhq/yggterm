@@ -2248,7 +2248,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // and legacy `~/.antigravitycli/*.json`.
         session_store_globs: &[
             ".gemini/antigravity-cli/conversations/*.db",
-            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
+            // MEASURED 2026-08-20: every file on disk is `transcript_full.jsonl`.
+            // The old `transcript.jsonl` spelling matched 0 of 497 brain dirs, so the
+            // file half of the agy scan had been dead while reading as wired up.
+            ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl",
             ".antigravitycli/*.json",
         ],
         store_excluded_name_fragments: &["-shm", "-wal"],
@@ -2803,7 +2806,7 @@ pub fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
 
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-        // Layout: ~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl
+        // Layout: ~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript_full.jsonl
         let session_id = path
             .parent()?
             .parent()?
@@ -4575,9 +4578,12 @@ mod tests {
             // closes it instead of rediscovering it.
             // OpenCode and Kimi have empty globs but a dedicated scanner hook in
             // scan_all_durable_sessions (opencode DB, kimi MD5 buckets) — they are
-            // scanned despite empty globs, so no gap is required.
+            // scanned despite empty globs, so no gap is required. That exemption is
+            // asked of `kind_has_dedicated_scanner`, the one owner of the question,
+            // so this test and the `ls` warnings cannot drift apart from the
+            // scanner dispatch the way they had by 2026-08-20.
             if descriptor.session_store_globs.is_empty()
-                && !matches!(descriptor.kind, SessionKind::OpenCode | SessionKind::Kimi)
+                && !crate::startpage::kind_has_dedicated_scanner(descriptor.kind)
             {
                 let gap = descriptor.store_scan_gap.unwrap_or_else(|| {
                     panic!(

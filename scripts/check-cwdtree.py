@@ -40,13 +40,23 @@ CLI_STORES = [
     {"slug": "claude-code", "globs": [".claude/projects/*/*.jsonl"], "exclude": ["agent-", "/subagents/", "/workflows/"], "kind": "claude-code", "glyph": "*_", "color": "#c2410c"},
     {"slug": "pi", "globs": [".pi/agent/sessions/*/*.jsonl"], "exclude": [], "kind": "pi", "glyph": "π_", "color": "#be185d"},
     {"slug": "qwen", "globs": [".qwen/projects/*/chats/*.jsonl"], "exclude": [".runtime."], "kind": "qwen", "glyph": "Q_", "color": "#6d28d9"},
-    {"slug": "antigravity", "globs": [".gemini/antigravity-cli/conversations/*.db", ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"], "exclude": ["-shm", "-wal"], "kind": "antigravity", "glyph": "A_", "color": "#1557b0"},
+    # ⛔ agy comes from the summaries DB (see `agy_durable_rows`), not a glob.
+    {"slug": "antigravity", "globs": [], "exclude": ["-shm", "-wal"], "kind": "antigravity", "glyph": "A_", "color": "#1557b0"},
     {"slug": "grok", "globs": [".grok/sessions/*/*/summary.json"], "exclude": [], "kind": "grok-build", "glyph": "G_", "color": "#000000"},
     {"slug": "muse", "globs": [".local/share/muse/sessions/**/session.jsonl"], "exclude": ["/subagent/", "/tool-outputs/"], "kind": "muse", "glyph": "M_", "color": "#86198f"},
 ]
 
 KIND_TO_GLYPH = {c["kind"]: c["glyph"] for c in CLI_STORES}
 KIND_TO_COLOR = {c["kind"]: c["color"] for c in CLI_STORES}
+
+
+
+# ⛔ The durable-session RULES live in one shared module (the store tables above
+# stay per-script on purpose: the oracle must not import the Rust descriptors).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ygg_scan_truth import (  # noqa: E402
+    agy_durable_rows, muse_noise_ids, locally_backed_ids,
+)
 
 
 def fleet_hosts():
@@ -88,7 +98,13 @@ def run_on_host(host, cmd, timeout=45):
 
 
 def verb_on_host(host):
-    cmd = "~/.local/bin/yggterm-headless server cwdtree ls --json --limit 10000 2>&1 || yggterm-headless server cwdtree ls --json --limit 10000 2>&1 || yggterm server cwdtree ls --json --limit 10000 2>&1"
+    # A lane can point the oracle at its own build before deploying:
+    #   YGGTERM_CHECK_BIN=./target/release/yggterm-headless check-cwdtree.py --host local
+    override = os.environ.get("YGGTERM_CHECK_BIN")
+    if override:
+        cmd = f"{override} server cwdtree ls --json --limit 10000 2>&1"
+    else:
+        cmd = "~/.local/bin/yggterm-headless server cwdtree ls --json --limit 10000 2>&1 || yggterm-headless server cwdtree ls --json --limit 10000 2>&1 || yggterm server cwdtree ls --json --limit 10000 2>&1"
     out, err = run_on_host(host, cmd)
     if err:
         return None, err, out
@@ -335,6 +351,30 @@ def manual_walk_on_host(host):
                     "session_id": session_id,
                     "glyph": cli["glyph"],
                 })
+
+    # ⛔ Antigravity keeps its index in SQLite, so a FILE walk sees none of it.
+    # Without this the oracle called every agy row the verb produced a spurious
+    # "extra" — 999 of them on a measured host — while being blind to the CLI.
+    for row in agy_durable_rows(run_on_host, host, home):
+        sessions.append({
+            "host": host,
+            "cli": "antigravity",
+            "kind": "antigravity",
+            "path": f"{home}/.gemini/antigravity-cli/conversation_summaries.db",
+            "cwd": row["cwd"],
+            "mtime": 0,
+            "session_id": row["id"],
+            "glyph": "A_",
+        })
+
+    # A zero-prompt muse placeholder is skipped by the scan, so the oracle must
+    # skip it too. ⚠ These have real files behind them; this set is for skipping,
+    # never for deleting.
+    noise = muse_noise_ids(run_on_host, host)
+    if noise:
+        sessions = [s for s in sessions
+                    if not (s.get("cli") == "muse" and s.get("session_id") in noise)]
+
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions, None
 
@@ -364,25 +404,46 @@ def compare(host, verb_data, manual_sessions, verbose=False):
     # Symmetric diff on ids
     verb_only = verb_ids - manual_ids
     manual_only = manual_ids - verb_ids
+    # Rows the daemon scanned from PEER machines cannot appear in a local walk.
+    remote_only = set()
+    if verb_only:
+        backed = locally_backed_ids(run_on_host, host, [r for r in verb_rows if r.get("session_id") in verb_only])
+        remote_only = verb_only - backed
+        verb_only = verb_only & backed
+    if remote_only:
+        print(f"[{host}] note: {len(remote_only)} verb rows come from peer machines (no local store file) — not counted as drift")
     if verb_only:
         issues.append(f"verb has {len(verb_only)} ids not in manual walk (extra): {sorted(list(verb_only))[:5]}")
     if manual_only:
         issues.append(f"manual has {len(manual_only)} ids not in verb (missing): {sorted(list(manual_only))[:5]}")
-    # Cwd grouping drift
+    # Cwd grouping drift. A cwd that exists ONLY because of peer rows is not drift.
+    # ⚠ Groups are keyed by (cwd, HOST), so one cwd can appear once per machine.
+    # A cwd is peer-only when EVERY group carrying it is peer-only — testing one
+    # group at a time deletes the local group that shares the same cwd.
+    ids_by_cwd = defaultdict(set)
+    for g in verb_groups:
+        ids_by_cwd[g.get("cwd")].update(r.get("session_id") for r in g.get("sessions", []))
+    remote_cwds = {cwd for cwd, ids in ids_by_cwd.items() if ids and ids <= remote_only}
+    verb_group_cwds = verb_group_cwds - remote_cwds
     missing_cwds = manual_group_cwds - verb_group_cwds
     extra_cwds = verb_group_cwds - manual_group_cwds
     if missing_cwds:
         issues.append(f"manual groups missing from verb: {sorted(list(missing_cwds))[:5]}")
     if extra_cwds:
         issues.append(f"verb groups extra vs manual: {sorted(list(extra_cwds))[:5]}")
-    # Count check
-    manual_count = len(manual_sessions)
-    verb_count = len(verb_rows)
-    if abs(verb_count - manual_count) > 10:
-        issues.append(f"count drift: verb {verb_count} vs manual {manual_count}")
-    # Group-count check
-    if abs(len(verb_groups) - len(manual_groups)) > 2:
-        issues.append(f"group count drift: verb {len(verb_groups)} vs manual {len(manual_groups)}")
+    # Count check. ⛔ EXACT, on the LOCAL half. The old ±10 / ±2 slack could hide
+    # ten missing sessions and two whole missing folders — precisely the absences
+    # a count is worst at noticing.
+    manual_count = len(manual_ids)
+    verb_count = len(verb_ids - remote_only)
+    if verb_count != manual_count:
+        issues.append(f"count drift: verb {verb_count} local rows vs manual {manual_count} ({len(remote_only)} peer rows excluded)")
+    if len(verb_group_cwds) != len(manual_groups):
+        issues.append(f"group count drift: verb {len(verb_group_cwds)} local groups vs manual {len(manual_groups)}")
+    # `durable_count` must describe the rows it ships with, not a pre-dedup total.
+    declared = verb_data.get("durable_count")
+    if declared is not None and not verb_data.get("truncated") and declared != len(verb_rows):
+        issues.append(f"durable_count {declared} disagrees with {len(verb_rows)} rows shipped")
     if verbose:
         print(f"[{host}] verb {verb_count} rows in {len(verb_groups)} groups, manual {manual_count} in {len(manual_groups)}")
         if verb_groups[:3]:

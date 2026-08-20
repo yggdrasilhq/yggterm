@@ -71,7 +71,10 @@ CLI_STORES = [
     },
     {
         "slug": "antigravity",
-        "globs": [".gemini/antigravity-cli/conversations/*.db", ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"],
+        # ⛔ agy rows come from the summaries DB (see `agy_durable_rows` below),
+        # not from a glob: `conversations/*.db` holds a single .pb and the brain
+        # transcripts are `transcript_full.jsonl`, so the old globs matched nothing.
+        "globs": [],
         "exclude": ["-shm", "-wal"],
         "kind": "antigravity",
     },
@@ -84,6 +87,15 @@ CLI_STORES = [
 ]
 
 # Hosts to check — local + fleet from yggterm's ssh targets or env.
+
+# ⛔ The durable-session RULES live in one shared module (the store tables above
+# stay per-script on purpose: the oracle must not import the Rust descriptors).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ygg_scan_truth import (  # noqa: E402
+    agy_durable_rows, muse_noise_ids, locally_backed_ids,
+)
+
+
 def fleet_hosts():
     hosts = ["local"]
     # Try to discover from yggterm server daemons census
@@ -128,7 +140,13 @@ def run_on_host(host, cmd, timeout=45):
 def verb_on_host(host):
     # Use large limit so verb returns the full durable set — default 200 truncates
     # and would make the oracle's full walk (10000) always mismatch.
-    cmd = "~/.local/bin/yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm server startpage ls --json --limit 10000 2>&1"
+    # A lane can point the oracle at its own build before deploying:
+    #   YGGTERM_CHECK_BIN=./target/release/yggterm-headless check-startpage.py --host local
+    override = os.environ.get("YGGTERM_CHECK_BIN")
+    if override:
+        cmd = f"{override} server startpage ls --json --limit 10000 2>&1"
+    else:
+        cmd = "~/.local/bin/yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm-headless server startpage ls --json --limit 10000 2>&1 || yggterm server startpage ls --json --limit 10000 2>&1"
     out, err = run_on_host(host, cmd)
     if err:
         return None, err, out
@@ -195,6 +213,31 @@ def manual_walk_on_host(host):
                     "mtime": mtime,
                     "parsed": parsed,
                 })
+
+    # ⛔ Antigravity keeps its index in SQLite, so a FILE walk sees none of it.
+    # Without this the oracle called every agy row the verb produced a spurious
+    # "extra" — 999 of them on a measured host — while being blind to the CLI.
+    for row in agy_durable_rows(run_on_host, host, home):
+        sessions.append({
+            "host": host,
+            "cli": "antigravity",
+            "kind": "antigravity",
+            "path": f"{home}/.gemini/antigravity-cli/conversation_summaries.db",
+            "mtime": 0,
+            "parsed": {"session_id": row["id"], "cwd": row["cwd"], "title": row["title"]},
+        })
+
+    # A zero-prompt muse placeholder is skipped by the scan, so the oracle must
+    # skip it too. ⚠ These have real files behind them; this set is for skipping,
+    # never for deleting.
+    noise = muse_noise_ids(run_on_host, host)
+    if noise:
+        sessions = [
+            s for s in sessions
+            if not (s.get("cli") == "muse"
+                    and (s.get("parsed", {}) or {}).get("session_id") in noise)
+        ]
+
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions, None
 
@@ -392,6 +435,15 @@ def compare(host, verb_data, manual_sessions, verbose=False):
     # Symmetric diff
     verb_only = verb_ids - manual_ids
     manual_only = manual_ids - verb_ids
+    # Rows the daemon scanned from PEER machines cannot appear in a local walk.
+    # Split them out instead of reporting them as drift.
+    remote_only = set()
+    if verb_only:
+        backed = locally_backed_ids(run_on_host, host, [r for r in verb_rows if r.get("session_id") in verb_only])
+        remote_only = verb_only - backed
+        verb_only = verb_only & backed
+    if remote_only:
+        print(f"[{host}] note: {len(remote_only)} verb rows come from peer machines (no local store file) — not counted as drift")
     if verb_only:
         issues.append(f"verb has {len(verb_only)} ids not in manual walk (extra): {sorted(list(verb_only))[:5]}")
     if manual_only:
@@ -404,9 +456,19 @@ def compare(host, verb_data, manual_sessions, verbose=False):
             manual_title=(manual_by_id[sid].get("parsed", {}).get("title") or "").strip()
             if verb_title and manual_title and verb_title != manual_title:
                 issues.append(f"title mismatch {sid[:8]}: verb {verb_title[:40]!r} vs manual {manual_title[:40]!r}")
-    # Count check: durable vs manual
-    if abs(len(verb_rows) - len([s for s in manual_sessions if s.get("parsed",{}).get("session_id") or "rollout" in s["path"]]) ) > 10:
-        issues.append(f"count drift: verb {len(verb_rows)} vs manual {len(manual_sessions)} (manual includes unscanned)")
+    # Count check. ⛔ EXACT, and on the LOCAL half only. This used to allow a
+    # ±10 slack, which is a checker that cannot see up to ten missing sessions —
+    # the absence a count is least able to notice is the one it is asked to find.
+    local_verb_ids = verb_ids - remote_only
+    if len(local_verb_ids) != len(manual_ids):
+        issues.append(
+            f"count drift: verb {len(local_verb_ids)} local rows vs manual {len(manual_ids)} "
+            f"({len(remote_only)} peer rows excluded)"
+        )
+    # `durable_count` must describe the row list it ships with, not a pre-dedup total.
+    declared = verb_data.get("durable_count")
+    if declared is not None and not verb_data.get("truncated") and declared != len(verb_rows):
+        issues.append(f"durable_count {declared} disagrees with {len(verb_rows)} rows shipped")
     if verbose:
         print(f"[{host}] verb {len(verb_rows)} rows, manual {len(manual_sessions)} files")
         if verb_rows[:3]:

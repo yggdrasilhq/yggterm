@@ -21,6 +21,11 @@ struct StartpageLsOutput {
     home: String,
     durable_count: usize,
     live_count: usize,
+    /// The `--limit` in force for this reply (default 200).
+    limit: usize,
+    /// True when `rows` carries FEWER rows than `durable_count` reports, so no
+    /// reader can mistake a truncated page for the whole store.
+    truncated: bool,
     rows: Vec<yggterm_core::startpage::StartpageDurableRow>,
     live_session_paths: Vec<String>,
     faithful: bool,
@@ -28,6 +33,21 @@ struct StartpageLsOutput {
 }
 
 pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    // ⛔ `--help` must answer BEFORE the scan. It used to fall through to the
+    // verb, so asking a 1700-session store how to call it ran a full walk and
+    // printed the sessions — the one output that cannot be mistaken for help.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("server startpage ls — re-derives the startpage RECENT WORK list from the stores");
+        println!();
+        println!("USAGE: server startpage ls [--json] [--limit N]");
+        println!("  --json       machine-readable output");
+        println!("  --limit N    cap the rows/groups printed (default 200)");
+        println!("  --help, -h   print this and exit without scanning");
+        println!();
+        println!("The reply carries `limit` and `truncated` so a capped page is");
+        println!("never mistaken for the whole store. Oracles: scripts/check-startpage.py");
+        return Ok(());
+    }
     let json = args.iter().any(|a| a == "--json");
     let limit = args
         .iter()
@@ -83,7 +103,7 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
                 remote_total = rtotal;
             }
             let warnings = collect_warnings(&system_home, &rows);
-            let total = rows.len() + remote_total;
+            let _ = remote_total;
             let live_set: std::collections::HashSet<String> = live_paths_headless.iter().cloned().collect();
             // Also collect remote epochs for ordering
             let mut remote_epoch_by_id: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -98,6 +118,13 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
             for row in rows { all_rows_map.insert(row.session_id.clone(), row); }
             for row in remote_rows { all_rows_map.entry(row.session_id.clone()).or_insert(row); }
             let all_rows: Vec<yggterm_core::startpage::StartpageDurableRow> = all_rows_map.into_values().collect();
+            // ⛔ `durable_count` is the size of the DEDUPLICATED set, taken here.
+            // It used to be `rows.len() + remote_total`, computed BEFORE this
+            // merge, so it counted every session that exists both locally and on
+            // a remote machine twice: 1677 local + 717 remote read as 2394 while
+            // the row list it shipped alongside held 1742. One question, two
+            // answers, in the same JSON object.
+            let total = all_rows.len();
             let mut candidates: Vec<(yggterm_core::startpage::StartpageDurableRow, bool, bool, i64, String, usize)> = Vec::new();
             for (idx, row) in all_rows.into_iter().enumerate() {
                 let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || remote_epoch_by_id.contains_key(&row.session_id);
@@ -121,6 +148,8 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
         host,
         home: system_home.display().to_string(),
         durable_count: total,
+        limit,
+        truncated: rows.len() < total,
         live_count,
         rows,
         live_session_paths,
@@ -133,6 +162,9 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
     } else {
         println!("startpage ls — host {}  home {}", output.host, output.home);
         println!("durable {}  live {}", output.durable_count, output.live_count);
+        if output.truncated {
+            println!("note: showing {} of {} rows (--limit {})", output.rows.len(), output.durable_count, output.limit);
+        }
         if !output.warnings.is_empty() {
             for w in &output.warnings {
                 println!("warn: {w}");
@@ -161,10 +193,15 @@ fn collect_warnings(home: &PathBuf, rows: &[yggterm_core::startpage::StartpageDu
         if let Some(gap) = desc.store_scan_gap {
             warnings.push(format!("{} store not scanned: {}", desc.display_name, gap));
         }
-        if desc.session_store_globs.is_empty() && desc.store_scan_gap.is_none() {
-            // Historical missing: not declared scanned nor gap — should be either.
+        // A CLI whose store no glob can express (one SQLite DB, an md5-bucketed
+        // tree) is scanned by a dedicated scanner, not missing. Asking only about
+        // globs reported OpenCode and Kimi as invisible on every single run.
+        if desc.session_store_globs.is_empty()
+            && desc.store_scan_gap.is_none()
+            && !yggterm_core::startpage::kind_has_dedicated_scanner(desc.kind)
+        {
             warnings.push(format!(
-                "{} has no store globs and no declared gap — sessions will be invisible",
+                "{} has no store globs, no dedicated scanner and no declared gap — sessions will be invisible",
                 desc.display_name
             ));
         }
