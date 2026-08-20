@@ -13347,6 +13347,105 @@ const WORKING_FLAG_OWNER_DISCOVERY_INTERVAL_MS: u64 = 30_000;
 /// ⛔ It records a DOT answer, not an ownership claim — see
 /// `discovered_working_flag_owners`.
 #[cfg(unix)]
+/// How long input may sit unanswered before the row is worth reporting as
+/// possibly-unconsumed.
+///
+/// Generous on purpose. A child may legitimately take input and stay silent — a
+/// password prompt, `read -s`, a long command with echo off — so this is the
+/// cheap trigger for a look, never the verdict.
+const INPUT_UNCONSUMED_SUSPECT_MS: u64 = 4_000;
+
+/// Don't re-report the same stuck row every tick; once it is named, it is named.
+const INPUT_UNCONSUMED_REPEAT_MS: u64 = 60_000;
+
+/// Report rows that have taken input and said nothing back.
+///
+/// ⛔⛔ **THE INPUT CHAIN PROVES DELIVERY, NEVER CONSUMPTION, AND THAT IS THE GAP
+/// "I CANNOT TYPE" FALLS THROUGH.** `input/keystroke → input/pty → input/render`
+/// answers *were the bytes handed to the pseudo-terminal*. It has no leg for *did
+/// the process on the other side read them*. A CLI that has stopped reading its
+/// PTY produces a perfect run on all three and a dead row: from the user, "I
+/// cannot type"; from every probe, "input is fine".
+///
+/// ⇒ Measured 2026-08-20 during a reported total input lockout: **486
+/// `input/keystroke` against 488 `input/pty`** across the exact window — a ~1:1
+/// delivery ratio, indistinguishable from a healthy machine, while the owner
+/// could not type at all. The cause turned out to be frozen VIEWS over live
+/// agents whose PTY masters had died with their daemon; the non-consuming reader
+/// was a correct double-resume refusal. Nothing in the chain could see it.
+///
+/// ⚠ **THIS EMITS A SUSPICION, NOT A VERDICT, AND THE NAME SAYS SO.** The
+/// definitive check costs a marker and an echo — i.e. it TYPES INTO THE ROW — and
+/// that is destructive on a session a human is using. This probe exists precisely
+/// so nobody needs to reach for the destructive one to find the candidate.
+///
+/// ⛔⛔ **IT CANNOT FIRE WHILE THE TTY ECHOES, AND THAT IS NOT A BUG — IT IS THE
+/// SHAPE OF THE SIGNAL.** `input_unanswered_ms` is "input newer than output", and
+/// on a cooked-mode tty the KERNEL LINE DISCIPLINE echoes every byte written,
+/// which counts as output. So a plain shell sitting at its prompt — even one whose
+/// child has stopped reading — keeps answering and never becomes a suspect.
+/// Verified while building this: writing into a row running `exec sleep 300`
+/// produced echo and `unanswered: None` forever; the same write into a row that
+/// had done `stty raw -echo` first produced `unanswered: 4008` beside a
+/// still-climbing output-idle, and this probe named it.
+///
+/// ⇒ **That restriction points the probe exactly where it is needed.** Every agent
+/// CLI puts its tty in raw mode with echo off — that is what a TUI is — so the
+/// rows that can wedge invisibly are precisely the rows this can see. A cooked
+/// shell cannot go silently deaf in the first place, because the kernel answers
+/// for it.
+///
+/// Rides the existing chore tick rather than adding a timer: on a daemon where
+/// every row is answering, the whole pass is a few atomic loads.
+fn run_input_consumption_watch(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    last_reported: &mut HashMap<String, u64>,
+) {
+    let now = crate::current_millis_u64();
+    let suspects: Vec<(String, u64, Option<u64>)> = {
+        let guard = lock_daemon_runtime(runtime, "input_consumption_watch");
+        guard
+            .terminals
+            .session_keys()
+            .into_iter()
+            .filter_map(|key| {
+                let unanswered = guard.terminals.input_unanswered_ms(&key)?;
+                (unanswered >= INPUT_UNCONSUMED_SUSPECT_MS).then(|| {
+                    let idle = guard.terminals.session_idle_for_ms(&key);
+                    (key, unanswered, idle)
+                })
+            })
+            .collect()
+    };
+    // Rows that started answering again drop out of the throttle, so a row that
+    // wedges twice is reported twice rather than silently suppressed by its own
+    // earlier incident.
+    let live: std::collections::HashSet<&str> =
+        suspects.iter().map(|(key, _, _)| key.as_str()).collect();
+    last_reported.retain(|key, _| live.contains(key.as_str()));
+    for (key, unanswered_ms, output_idle_ms) in suspects {
+        let due = last_reported
+            .get(&key)
+            .is_none_or(|last| now.saturating_sub(*last) >= INPUT_UNCONSUMED_REPEAT_MS);
+        if !due {
+            continue;
+        }
+        last_reported.insert(key.clone(), now);
+        yggterm_core::perf::ytrace_emit_event(
+            "daemon",
+            "input",
+            "unconsumed",
+            serde_json::json!({
+                "session_path": key,
+                "unanswered_ms": unanswered_ms,
+                "output_idle_ms": output_idle_ms,
+                // Named so a reader cannot mistake it for a verdict.
+                "verdict": "suspected",
+            }),
+        );
+    }
+}
+
 fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) {
     let now_ms = current_millis_u64();
     let (wanted, endpoints, home_dir) = {
@@ -18806,9 +18905,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             // An `Instant`, not a wall clock: the grace is "how long have I been
             // up", which a clock adjustment must not be able to satisfy.
             let chore_started_at = std::time::Instant::now();
+            // Per-row throttle for the consumption watch; see
+            // `run_input_consumption_watch`.
+            let mut input_unconsumed_reported: HashMap<String, u64> = HashMap::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 run_preserved_owner_revalidation_if_due(&runtime);
+                // The fourth leg of the input chain. Rides this EXISTING tick for
+                // the same reason its neighbours do, and is a few atomic loads on
+                // a daemon whose rows are all answering.
+                run_input_consumption_watch(&runtime, &mut input_unconsumed_reported);
                 // Rides this EXISTING tick for the same reason the reap below
                 // does: a timer of its own would be a standing idle cost, and
                 // this pass is a no-op on any daemon that owns all its rows.
@@ -30229,6 +30335,76 @@ mod tests {
     /// The backup must hold the PREVIOUS state, not a second copy of the
     /// current one.
     ///
+    /// A row that takes input and never answers is reported, and a row that is
+    /// merely quiet is not.
+    ///
+    /// ⛔ This is the leg the other three do not have. `keystroke → pty → render`
+    /// all pass for a CLI that has stopped reading its PTY, because every one of
+    /// them is about DELIVERY. Measured during a real total-lockout report: 486
+    /// keystrokes against 488 PTY writes — a healthy-looking 1:1 — while the user
+    /// could not type at all.
+    ///
+    /// ⚠ The throttle must FORGET a row that starts answering again, or a row
+    /// that wedges twice is silently suppressed by its own earlier incident. That
+    /// is the failure mode a naive "report once" would have.
+    #[test]
+    fn the_consumption_watch_throttles_but_forgets_a_row_that_recovers() {
+        use std::collections::HashMap;
+
+        // The throttle's contract, exercised directly: a suspect is due when it
+        // has never been reported, or when the repeat window has elapsed.
+        let now = 1_000_000u64;
+        let mut reported: HashMap<String, u64> = HashMap::new();
+        let due = |reported: &HashMap<String, u64>, key: &str, now: u64| {
+            reported
+                .get(key)
+                .is_none_or(|last| now.saturating_sub(*last) >= super::INPUT_UNCONSUMED_REPEAT_MS)
+        };
+
+        assert!(due(&reported, "row-a", now), "a fresh suspect is reported");
+        reported.insert("row-a".to_string(), now);
+        assert!(
+            !due(&reported, "row-a", now + 1_000),
+            "the same stuck row must not be re-reported every tick"
+        );
+        assert!(
+            due(&reported, "row-a", now + super::INPUT_UNCONSUMED_REPEAT_MS),
+            "a row still stuck a full window later is worth naming again"
+        );
+
+        // Recovery clears the memory: the row answered, so its next wedge is a
+        // NEW incident rather than one suppressed by the old one.
+        let live: std::collections::HashSet<&str> = ["row-b"].into_iter().collect();
+        reported.retain(|key, _| live.contains(key.as_str()));
+        assert!(
+            due(&reported, "row-a", now + 1_000),
+            "a row that recovered and wedged again must be reported immediately, \
+             not silenced by its own earlier incident"
+        );
+    }
+
+    /// The suspicion threshold must leave room for legitimate silence.
+    ///
+    /// A child can take input and say nothing for good reasons — a password
+    /// prompt, `read -s`, a long command with echo off. The probe is the cheap
+    /// trigger for a look, never the verdict, and the definitive check costs a
+    /// marker typed INTO the row, which is destructive on a session a human is
+    /// using. A threshold tuned tight enough to catch every wedge would send
+    /// people to that destructive check constantly.
+    #[test]
+    fn the_suspicion_threshold_leaves_room_for_a_password_prompt() {
+        assert!(
+            super::INPUT_UNCONSUMED_SUSPECT_MS >= 3_000,
+            "a threshold under ~3s fires on ordinary echo-off input and turns a \
+             suspicion probe into noise"
+        );
+        assert!(
+            super::INPUT_UNCONSUMED_REPEAT_MS > super::INPUT_UNCONSUMED_SUSPECT_MS,
+            "the repeat window must exceed the suspicion threshold, or a stuck row \
+             re-reports on every tick"
+        );
+    }
+
     /// The proxied terminal read must not hold the runtime lock across its
     /// round trip.
     ///
