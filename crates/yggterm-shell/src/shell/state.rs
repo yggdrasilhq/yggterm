@@ -12918,6 +12918,28 @@ async fn web_surface_native_reconcile_loop(
                         writable.with_mut(|shell| {
                             shell.set_web_tab_media_playing(&key.0, key.1, media_playing);
                         });
+                        // EDGES ONLY. The renewal fires every couple of seconds
+                        // for as long as a tab plays, and a trace line per
+                        // heartbeat would bury the trace under a tab nobody is
+                        // even looking at. What a reader ever wants from here is
+                        // WHEN the light turned on or off, and whether the
+                        // surface was stashed at the time — which is the one
+                        // question "why is my dot not lit" turns into.
+                        if media_edge {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "web_surface",
+                                "media_light",
+                                json!({
+                                    "session_path": key.0,
+                                    "tab_id": key.1,
+                                    "native_id": entry.native_id,
+                                    "playing": media_playing,
+                                    "stashed": entry.stashed_at_ms.is_some(),
+                                }),
+                            );
+                        }
                     }
                     // Observe engine-side page state: in-page navigations
                     // (link clicks, redirects, form submits) never pass
