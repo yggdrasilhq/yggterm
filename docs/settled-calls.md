@@ -311,6 +311,27 @@ where repair is impossible. Do not re-litigate it by citing the old ⛔.
 `block_reason: null` — the gate reporting that nothing blocks it while not
 firing, **241 minutes after the last successful swap**.
 
+## ★★★ NOISE DELETION IS QUARANTINE-FIRST (2026-08-20)
+
+**Relayed through the wave orchestrator, not heard first-hand by this lane** —
+recorded with that provenance on purpose, because a relay may direct future work
+and only the owner may re-open a call. It refines, and does not overturn, the
+2026-08-08 ruling below: noise still goes, and it still never goes by `unlink`.
+
+Fleet-wide, a noise session is **renamed into a `.noise/` sidecar beside its own
+store** (⛔ never a temp directory — `/tmp` is a tmpfs on at least one host, so
+"quarantine" there is deletion that also spends RAM), swept after **7 days**,
+with a **ytrace incident per action carrying the path and the reason**. Direct
+`rm` returns only when quarantine has earned trust.
+
+Mechanism and the reason the sidecar beats a suffix:
+[`spec-sweep-policy.md`](spec-sweep-policy.md) §9.2a.
+
+⚠ **This is not a change to scanning.** `is_noise_session_file` classifies and
+never removes — both callers `continue`, and a test pins it. There was no `rm`
+in the scan to convert.
+
+
 ## ★★★ A LOST SESSION SHOWS; A NOISE SESSION IS DELETED (2026-08-08)
 
 **Two rulings, minutes apart, on what the sweep surfaced.** Verbatim: *"They
