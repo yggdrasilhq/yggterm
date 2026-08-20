@@ -128,6 +128,41 @@ gate-screen working/idle heuristics) must learn the agents-hint signature (dim c
 `← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
 typed-residue detector must require the footer's absence before claiming residue.
 
+## ⛔⛔ [11.8] `server app launch` CANNOT BRING UP A PRIMARY GUI WHILE A SHADOW IS REGISTERED — AND A DEPLOY LEFT THE DESKTOP WITH NO GUI FOR ~12 MINUTES
+
+**Status:** OPEN
+
+*Hit live on 2026-08-20 during the 3.1.11 deploy.* `scripts/deploy-dev.sh` ends with
+`server app launch --replace`, which correctly retired the incumbent primary — and then every
+replacement it spawned **exited immediately**, leaving the desktop with no GUI at all. Only an
+agent's shadow view remained registered, and `server app update restart` refused with *"the only
+registered Yggterm GUI client is a Shadow view client, which cannot own sessions"*.
+
+**Mechanism.** `server app launch` spawns the GUI binary with **no arguments**. A bare `yggterm`
+finds a registered client and forwards a focus request to it instead of opening a window; the
+request is handled by the shadow, fails (`app-control focus request did not produce native window
+focus`), and the process exits. So the incumbent guard is evaluated in the DAEMON while the
+single-instance decision is taken in the spawned PROCESS, and `--replace` / `--allow-duplicate`
+are consumed by the first and never reach the second. `--allow-duplicate` therefore did not help.
+
+⚠ **Two things make this worse than a flag bug.** (1) The spawned process writes its focus-request
+JSON into the launch log, so `log_path` looks like a launch record and contains no failure — the
+launch reports `registered:false, settled:false` and the log explains nothing. (2) A shadow satisfies
+the single-instance check but cannot own sessions, so the state it produces is one no verb can
+resolve: too many clients to start, none that can act.
+
+**Recovery used:** SIGTERM the shadow (and its private compositor), then `server app launch
+--wait-visible` — which came up `registered:true, visible:true` on the desktop's own
+`wayland-0`, at the deployed build, with the row set intact. ⚠ That cost the shadow of the agent
+row that owned it, which has to respawn its own view.
+
+**Fix direction:** pass the duplicate override through to the spawned process (an argument or an
+env the GUI reads before deciding to forward); make the single-instance forward **refuse to target
+a shadow** — a shadow is never the thing a focus request means; and stop writing an unrelated
+app-control response into a file named for a launch. **Falsifier:** with only a shadow registered,
+one `server app launch` brings up a primary that registers and paints, and the launch log names the
+reason if it does not.
+
 ## ⛔⛔ [11.0→11.8] THE VIEWPORT BLINK STORM — ~2 FULL RENDERS PER SECOND UNDER STREAMING-ROW LOAD
 
 **Status:** OPEN
@@ -245,6 +280,22 @@ three routinely share a millisecond, which is why the emitter numbers its own ou
 `sample` field is deliberately NOT a transcript: printable runs are replaced by their length and
 OSC payloads by an opcode and a size, because the screen being sampled is the user's actual work.
 Grammar and rules: `docs/spec-trace-plane-contract.md` §8; probe table: `docs/observability.md` §2.3.
+
+**FIRST READING, 2026-08-20 on the live GUI (3.1.11) — a reading, not a verdict.** Across a real
+re-attach the wipe/refill pair balanced (9 `replay_reset`, 9 `replay_reseed`, source
+`daemon_terminal_read` via the follow-retry path) and **every one of the nine `reseed` samples
+carried `sgr_total: 0`** — no SGR at all, not merely no colour — at 29 chars each (one at 149).
+The `live_stream` sample from the same window carried `sgr_total: 148, sgr_colour: 69` in 8570
+chars. ⇒ On this replay source the canvas is handed colourless, near-empty content, which is
+**answer (A): the bytes arrive stripped, rather than the attributes failing to apply.**
+
+⚠ **What this does NOT establish.** No ghost frame was observed concurrently, and one replay source
+is not every replay source — a colourless reseed is the ghost's SHAPE, not proof of its mechanism.
+⭐ And the 29-char size points somewhere specific: a reseed that small is not a formatted screen at
+all, which lines up with the adoption-chain entry below (a read answering `chars=0` for a session
+that is visibly streaming). **Treat these two entries as one investigation until the reseed's
+SOURCE is checked** — if the daemon read is returning near-empty, then nothing downstream of it can
+paint colour, and the render half has been chasing a consequence.
 
 Owner evidence 2026-08-20 (two screenshots): (a) the viewport showing a
 ~30-minute-old frame of the selected session — old turns, stale spinner — while the session
@@ -19352,6 +19403,8 @@ failure. The verb losing its reply is the defect.
 or a distinguishable transport error, under the same ssh conditions (repeat under load).
 
 ## ygg-monitor calls a row on another host DEAD — the probe is single-host (2026-08-20)
+
+**Status:** OPEN
 
 **Seen:** `ygg-monitor.py list` prints `⇒ DEAD — no agent process on dev holds it.
 unsubscribe it.` for a subscription whose row is alive on a DIFFERENT host (a `local://` row
