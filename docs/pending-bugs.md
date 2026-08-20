@@ -262,8 +262,33 @@ unattributed. Reading instructions and probe table: `docs/observability.md` §2.
 ⚠ `renders_preceded` means the site wrote before that render, not that it was the sole cause —
 several sites can precede one render, and these three sets overlap. What it does establish is that
 removing user activity would not remove most of these renders.
+
+**WORKED 2026-08-20 (11.12), falsifier NOT yet met — what shipped, and what the stream now says:**
+
+1. **The chore writes are silenced at the source** (main `fd1d1394`, live): the draft-sync tick
+   runs behind a read-only twin predicate; the restore ask ledger moved out of `ShellState` into
+   the poll loop; `safe_finish_job_notification` peeks before writing; the tree-refresh in-flight
+   bail no longer dirties. **Live-verified:** post-deploy `causes[]` no longer contain any of the
+   four sites.
+2. **The memoization root cause is proven, and Sidebar is fixed** (main `3f4d63b8`): an INLINE
+   closure prop defeats memoization outright — `Callback::eq` is ptr_eq on a generational box rsx
+   re-allocates per render, so Sidebar's 24 inline handlers alone guaranteed 232-of-234. Verified
+   against dioxus-core 0.7.9 in isolation (inline: child renders 1→2; `use_callback`-stable:
+   1→1). All 24 hoisted; two locks added (snapshot self-equality, no-inline-handlers source scan).
+   ⚠ `MainSurface` reads `state` in its body, so it subscribes directly — parent memoization
+   cannot shield it; its narrowing is still open.
+3. **The next layer stood exposed once the chores fell:** the remote-preview retry loop
+   (`kick_active_remote_preview_sync` entered `with_mut` before its own bails, ~17 no-op
+   renders/min) — now behind a shared read-only twin. And `app_control`'s defer-background-refresh
+   wrote the signal per agent probe (`current_millis` always advances a `max`) — now 1s hysteresis.
+4. ⚠ Found while proving 3, still open: `remote_preview_dirty_epoch` is a **write-only map** (six
+   insert sites, no reader beyond a debug `len`, grows per session forever), and
+   `recent_ui_telemetry` — a telemetry dedup ledger — lives inside the render signal, same disease
+   as the restore ledger was.
+
 **Falsifier:** under the same streaming-row load, renders track user-visible changes (order
-of 0.1/s), and the viewport repaints only for its own session's bytes.
+of 0.1/s), and the viewport repaints only for its own session's bytes. Read `Sidebar`'s
+`renders` against `root_renders` in `component_window` — with the hoist live they must separate.
 
 ## ⛔⛔⛔ [11.0→6.1] AN ADOPTION CHAIN LOSES THE PRESERVED-OWNER TABLE, AND EVERY OLD-GENERATION ROW MOUNTS AS A GHOST
 
@@ -767,6 +792,22 @@ anyone experiences. Grading the median would have called this healthy.
 Only **4 of 4,105** keystrokes lost their pty leg, so the bytes are not being dropped; they are
 being delayed. That points at the same UI-thread blocking as the entry above rather than at a
 transport fault.
+
+**WORKED 2026-08-20 (11.12), falsifier NOT yet met — the write leg's serializer is gone:**
+
+- The Input arm awaited the keystroke's own daemon write inline, so one write sitting on the
+  daemon's runtime lock held every LATER keystroke — the max-4,345 ms tail's client half. Writes
+  now flow through an ordered channel to a dedicated task; only failures return, on their own
+  select branch running the same attach-retry recovery. Locked by
+  `the_keystroke_write_is_dispatched_off_the_select_loop`.
+- The PRE-SELECT loop body (screen reconcile, incl. a daemon snapshot round trip when due) ran
+  before any branch could be polled and was covered by no guard — `input/loop_block` could never
+  name it. It now runs under a `pre_select` `TerminalLoopBranchGuard`.
+- The foreign trace batch (validate + serialize + write, blamed by live `ui/block` attributions)
+  moved to `spawn_blocking`, faults accounting included.
+- Still ON the loop, known and open: `HostHealth`'s 8 inline daemon awaits, `read_poll_apply`'s
+  ~2900-line body with 8 recovery awaits, and app-control's synchronous snapshot/merge serving
+  (`DescribeState`/`DescribeRows` rebuild the full sidebar merge per probe on the UI thread).
 
 **Falsifier:** with the named work moved off the UI thread, a 30-minute window on the GUI host under
 comparable load shows no `ui/block` above 1 s and `blocks/min` below 1. Read it with
