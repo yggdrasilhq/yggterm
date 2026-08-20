@@ -1960,6 +1960,33 @@ struct WebSurfaceTab {
     /// both tab homes. A tab with no webview yet (restored, never activated) is
     /// never loading — it is a URL in the tree until it is selected.
     loading: bool,
+    /// Is this tab's page PLAYING MEDIA right now, as the ENGINE reports it?
+    ///
+    /// Written from `webkit_web_view_is_playing_audio` by the native-surface
+    /// reconciler and rendered as the tab's blinking dot when the tab is in the
+    /// BACKGROUND — the "which of these rows is making noise" signal.
+    ///
+    /// ⛔ **The engine is the only admissible source.** Anything the shell could
+    /// infer from outside — the URL's host, the title, whether a media site was
+    /// ever loaded here — blinks on rows that are silent, and an indicator the
+    /// user has caught lying once is worth less than no indicator at all.
+    ///
+    /// Not persisted: it is a property of a live web process, and a restored
+    /// tab has none.
+    media_playing: bool,
+    /// When the engine last CONFIRMED `media_playing` — re-stamped while it
+    /// stays true, so the claim decays if the thing that makes it stops running.
+    ///
+    /// ⛔⛔ The twin of [`WebSurfaceTab::loading_since_ms`]'s lesson (*a positive
+    /// claim with no expiry is a permanent lie when its clearer never runs*), and
+    /// deliberately the OTHER instrument. A load is bounded, so a ceiling is
+    /// honest for it; playback is not — an hour-long album must keep its dot —
+    /// so the honest shape here is a HEARTBEAT: every confirmation re-stamps, and
+    /// [`web_surface_tab_media_is_live`] believes the flag only while the stamp is
+    /// fresh. A surface that stops being polled at all (destroyed, session gone,
+    /// reconciler not running) therefore decays to silent within seconds, with no
+    /// clearer that anyone has to remember to call.
+    media_seen_ms: u64,
     /// This tab's page theme color, verbatim as the page declared it (its
     /// `<meta name="theme-color">`, else its painted body background). Written
     /// from the ENGINE by the native-surface reconciler — the only place that
@@ -5534,6 +5561,15 @@ struct WebSurfaceOverlayTabView {
     /// The page is loading right now — drawn as the blinking dot, in BOTH tab
     /// homes (the rail rows and the classic strip's chips).
     loading: bool,
+    /// This tab is in the BACKGROUND and the engine says it is playing media —
+    /// drawn as the same blinking dot, in the same two homes.
+    ///
+    /// The "in the background" half is resolved HERE, once, rather than at the
+    /// two paint sites: the owner's ask is for the row the user cannot see, and
+    /// a rule that lives in the renderers is a rule the two renderers can come
+    /// to disagree about. The freshness gate is resolved here too, so no paint
+    /// site ever sees a raw flag it could believe for too long.
+    media_playing: bool,
 }
 /// The name a tab ROW shows, in one place. Precedence: the name the USER gave
 /// it, then the page's own title, then the app tab's app name / the URL host.
@@ -5947,6 +5983,58 @@ const WEB_SURFACE_LOADING_MAX_MS: u64 = 30_000;
 fn web_surface_tab_loading_is_live(loading: bool, loading_since_ms: u64, now_ms: u64) -> bool {
     loading && now_ms.saturating_sub(loading_since_ms) <= WEB_SURFACE_LOADING_MAX_MS
 }
+
+/// How long a tab's MEDIA light is believed after the last engine confirmation.
+///
+/// Not a ceiling on playback — playback is unbounded and a two-hour album must
+/// keep its dot. It is the width of the heartbeat window: the reconciler
+/// re-confirms every [`WEB_SURFACE_MEDIA_HEARTBEAT_MS`], so anything past a few
+/// missed beats means the confirmer itself has stopped, and the honest reading
+/// of a claim nobody is renewing is that it has lapsed.
+const WEB_SURFACE_MEDIA_MAX_MS: u64 = 6_000;
+/// How often the reconciler re-stamps a media light that is still true.
+///
+/// ⚠ Comfortably inside [`WEB_SURFACE_MEDIA_MAX_MS`] so an ordinarily busy tick
+/// never lets a genuinely playing tab lapse, and far above the reconcile beat
+/// (16 ms) so a playing tab costs ONE shell write every two seconds rather than
+/// sixty a second. The edge itself is written through immediately and does not
+/// wait for a heartbeat — this only governs the RENEWAL of a claim already made.
+const WEB_SURFACE_MEDIA_HEARTBEAT_MS: u64 = 2_000;
+
+/// Does a tab's media light still deserve its dot?
+///
+/// ⛔ A LAPSED CLAIM IS SILENT. `media_playing` is only ever true because some
+/// tick asked the engine and the engine said yes; if no tick has asked recently,
+/// what the flag records is the last answer to a question nobody is putting any
+/// more. The surface may have been destroyed by a session close, replaced by a
+/// profile change or a reload's destroy-and-recreate, or left behind by a
+/// reconciler that no longer walks it — and from here those are indistinguishable
+/// from each other and from real playback, which is exactly why a freshness
+/// window is the honest answer rather than a guess about which one it is.
+fn web_surface_tab_media_is_live(media_playing: bool, media_seen_ms: u64, now_ms: u64) -> bool {
+    media_playing && now_ms.saturating_sub(media_seen_ms) <= WEB_SURFACE_MEDIA_MAX_MS
+}
+
+/// Does this tab earn the media dot? The WHOLE rule, in one function.
+///
+/// Both halves live here rather than at the two paint sites, because both are
+/// rules the rail and the classic strip could otherwise come to answer
+/// differently — and a signal the user is meant to trust cannot mean one thing
+/// in one tab home and another thing in the other.
+///
+/// - `is_active` — the foreground tab never wears it. The owner's ask is for the
+///   row they cannot see; a dot on the page they are watching states something
+///   they already know, and every mark that says nothing new makes the marks
+///   that do say something harder to find.
+/// - freshness — see [`web_surface_tab_media_is_live`].
+fn web_tab_earns_media_dot(
+    is_active: bool,
+    media_playing: bool,
+    media_seen_ms: u64,
+    now_ms: u64,
+) -> bool {
+    !is_active && web_surface_tab_media_is_live(media_playing, media_seen_ms, now_ms)
+}
 /// ⭐ **WHO HOLDS THE KEYBOARD OVER A WEB SURFACE — one rule, one answer.**
 ///
 /// This is not a nicety. Every legacy browser chord (`WEB_PAGE_CHORDS`) is
@@ -6070,6 +6158,19 @@ struct AppliedWebSurface {
     /// loading light. Only a CHANGE is written through to the tab, so a page
     /// that sits loaded does not re-render the rail every tick.
     loading: bool,
+    /// Last engine-reported `is-playing-audio` — the poll baseline for the
+    /// tab's media light. Same edge discipline as `loading`.
+    ///
+    /// ⚠ Unlike `loading`, the poll that maintains this one runs OUTSIDE the
+    /// not-stashed guard, and that is the whole point rather than an oversight:
+    /// a soft-stashed surface is precisely a BACKGROUND tab, which is the only
+    /// case this signal exists for. Polled under the same guard as the rest, the
+    /// instrument would read silence from every tab it was built to find.
+    media_playing: bool,
+    /// When the media claim above was last written through. The renewal clock,
+    /// so a tab that keeps playing costs one shell write every couple of seconds
+    /// rather than one per reconcile beat.
+    media_seen_ms: u64,
     /// Last engine-reported page (uri, title) — the poll baseline for
     /// observing in-page navigation (address bar follow, tab title, history).
     page_url: String,
@@ -6148,6 +6249,8 @@ impl AppliedWebSurface {
             loading: want_visible,
             page_title: String::new(),
             page_theme_color: None,
+            media_playing: false,
+            media_seen_ms: 0,
             generation: next_web_surface_generation(),
         }
     }
@@ -6200,6 +6303,8 @@ impl AppliedWebSurface {
             loading: true,
             page_title: String::new(),
             page_theme_color: None,
+            media_playing: false,
+            media_seen_ms: 0,
             generation: next_web_surface_generation(),
         }
     }
@@ -7253,6 +7358,8 @@ mod web_surface_reclaim_locks {
             page_url: String::new(),
             page_title: String::new(),
             page_theme_color: None,
+            media_playing: false,
+            media_seen_ms: 0,
             generation: 1,
         }
     }
@@ -12780,6 +12887,38 @@ async fn web_surface_native_reconcile_loop(
                     // attributed to the human, and the page-visibility work needs
                     // the same bit.
                     entry.latch_reveal();
+                    // ⭐ THE MEDIA LIGHT — and it is deliberately ABOVE the
+                    // not-stashed guard below, not inside it.
+                    //
+                    // A soft-stashed surface IS a background tab, and a
+                    // background tab is the only thing this signal was asked
+                    // for. Polled under the same guard as the page state, the
+                    // instrument would go quiet on exactly the rows it exists to
+                    // find, and would do it in the reassuring direction: every
+                    // silent row silent, no dot anywhere, nothing obviously
+                    // broken. `is_playing_audio` reads the engine's own media
+                    // session, which a detached, unpainted webview still has —
+                    // stash is a paint decision and explicitly never a mute.
+                    let media_playing = desktop.web_surface_is_playing_audio(entry.native_id);
+                    // The EDGE is written through at once so the dot appears and
+                    // disappears on the beat the engine changed its answer. While
+                    // the answer stays true the claim is RENEWED on a slow
+                    // heartbeat instead, because it is the renewal that keeps
+                    // `web_surface_tab_media_is_live` believing it — and renewing
+                    // it every 16 ms beat would repaint the rail sixty times a
+                    // second for a tab that is only doing what it did last tick.
+                    let media_edge = entry.media_playing != media_playing;
+                    let media_stale = media_playing
+                        && now_ms.saturating_sub(entry.media_seen_ms)
+                            >= WEB_SURFACE_MEDIA_HEARTBEAT_MS;
+                    if media_edge || media_stale {
+                        entry.media_playing = media_playing;
+                        entry.media_seen_ms = now_ms;
+                        let mut writable = state;
+                        writable.with_mut(|shell| {
+                            shell.set_web_tab_media_playing(&key.0, key.1, media_playing);
+                        });
+                    }
                     // Observe engine-side page state: in-page navigations
                     // (link clicks, redirects, form submits) never pass
                     // through the shell's nav model, so poll the engine and
@@ -19780,6 +19919,8 @@ impl ShellState {
             custom_title: None,
             loading: true,
             loading_since_ms: current_millis(),
+            media_playing: false,
+            media_seen_ms: 0,
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
@@ -19870,6 +20011,8 @@ impl ShellState {
                 // is loading in it.
                 loading: false,
                 loading_since_ms: 0,
+                media_playing: false,
+                media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
@@ -19990,6 +20133,8 @@ impl ShellState {
             custom_title: None,
             loading: false,
             loading_since_ms: 0,
+            media_playing: false,
+            media_seen_ms: 0,
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
@@ -21193,6 +21338,8 @@ impl ShellState {
                 custom_title: None,
                 loading: false,
                 loading_since_ms: 0,
+                media_playing: false,
+                media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
@@ -21295,6 +21442,8 @@ impl ShellState {
                 // WebKit began the load the moment it made the view.
                 loading: true,
                 loading_since_ms: current_millis(),
+                media_playing: false,
+                media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 // A script opened it, so a script may close it.
@@ -22002,6 +22151,16 @@ impl ShellState {
                 active: tab.id == active_tab_id,
                 folder: tab.folder.clone(),
                 loading: tab.loading,
+                // FOREGROUND IS NOT THE INTERESTING CASE — the user is already
+                // looking at it, and a dot beside the page they are watching
+                // teaches them nothing. The signal exists to answer "which of
+                // these rows is the one making noise".
+                media_playing: web_tab_earns_media_dot(
+                    tab.id == active_tab_id,
+                    tab.media_playing,
+                    tab.media_seen_ms,
+                    now_ms,
+                ),
             })
             .collect();
         // ENGINE TRUTH. The shell's own stack only ever recorded navigations the
@@ -22094,6 +22253,23 @@ impl ShellState {
                 tab.loading_since_ms = current_millis();
             }
             tab.loading = loading;
+        }
+    }
+    /// Write the ENGINE's media answer onto a tab, and stamp WHEN it was heard.
+    ///
+    /// The stamp is what makes the claim decay ([`web_surface_tab_media_is_live`]),
+    /// so it is refreshed on every confirmation, not only on the rising edge —
+    /// the opposite discipline to [`ShellState::set_web_tab_loading`] above, and
+    /// for the opposite reason. There a re-stamp would push the ceiling out
+    /// forever and the light could never expire; here a re-stamp IS the signal
+    /// that the light is still earned, and a rising-edge-only stamp would put a
+    /// two-hour album dark after six seconds.
+    fn set_web_tab_media_playing(&mut self, session_path: &str, tab_id: u64, playing: bool) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.media_playing = playing;
+            tab.media_seen_ms = if playing { current_millis() } else { 0 };
         }
     }
     /// Write the PAGE's declared theme color onto a tab. Twin of
@@ -45747,23 +45923,52 @@ fn app_pane_row_status_dot_style(palette: Palette, status: &str) -> Option<Strin
 fn live_session_keep_alive_dot_style(palette: Palette) -> String {
     live_session_status_dot_style(palette, true, false)
 }
-/// A web tab's loading light — the SAME traffic-signal vocabulary the live
+/// A web tab's ACTIVITY light — the SAME traffic-signal vocabulary the live
 /// session rows use (DESIGN.md "Status indicator vocabulary"): a hard step-end
 /// BLINK means work is in flight right now, and a tab carries no durability
 /// class of its own, so the carrier is GREEN. One home for the rule, drawn in
 /// both tab homes (the rail rows and the classic strip).
 ///
+/// TWO signals, ONE dot, and that is a decision rather than a shortcut. The
+/// vocabulary says colour encodes durability and blink encodes activity, and it
+/// forbids minting a colour without amending that section first. A background
+/// tab playing media is not a new durability class — it is the same fact the
+/// loading light states, *this row is alive right now*, arriving from a second
+/// source. So it joins the existing light rather than opening a second slot
+/// beside it, which would also cost every tab row 7px of width for a mark that
+/// is absent almost always.
+///
+/// ⚠ What the two causes do NOT share is the tooltip: the callers title the dot,
+/// so a user who wants to know WHY a row is lit can hover it. If a visual split
+/// is ever wanted, DESIGN.md is the first file to edit, not this function.
+///
 /// The slot is laid out whether or not it blinks: a dot that appears must not
 /// shove the tab's title sideways.
-fn web_tab_loading_dot_style(loading: bool) -> String {
+fn web_tab_activity_dot_style(loading: bool, media_playing: bool) -> String {
+    let lit = loading || media_playing;
     let paint = format!(
         "background:{};{}",
-        if loading { "#22c55e" } else { "transparent" },
-        status_dot_blink_opacity_css(loading)
+        if lit { "#22c55e" } else { "transparent" },
+        status_dot_blink_opacity_css(lit)
     );
     format!(
         "display:inline-block; flex:0 0 auto; width:7px; min-width:7px; height:7px; border-radius:999px; {paint}",
     )
+}
+
+/// What a lit tab dot means, in words, for the row's `title`.
+///
+/// `None` for an unlit dot: an empty tooltip slot is silent, and a tooltip that
+/// says "not loading" on every idle row in the rail is noise the user has to
+/// read past. Loading is named first because it is the transient of the two — a
+/// row that is both is a page still arriving, and that is the more useful thing
+/// to say about it while it lasts.
+fn web_tab_activity_dot_title(loading: bool, media_playing: bool) -> Option<&'static str> {
+    match (loading, media_playing) {
+        (true, _) => Some("Loading"),
+        (false, true) => Some("Playing media in the background"),
+        (false, false) => None,
+    }
 }
 fn preview_block_cache() -> &'static Mutex<PreviewBlockCache> {
     PREVIEW_BLOCK_CACHE.get_or_init(|| Mutex::new(PreviewBlockCache::default()))
@@ -70137,6 +70342,8 @@ mod web_do_verb_tests {
         fn applied(native_id: u64, ever_revealed: bool) -> AppliedWebSurface {
             AppliedWebSurface {
                 engine_nav: None,
+                media_playing: false,
+                media_seen_ms: 0,
                 native_id,
                 url: "https://example.invalid/".to_string(),
                 bounds: (0, 0, 800, 600),
