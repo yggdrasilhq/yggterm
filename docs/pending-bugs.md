@@ -194,6 +194,26 @@ is driving renders, and the reverse if it is only churning. ⭐ The attribution 
 `YGGTERM_TRACE_RENDER` or the storm-armed window — the reason it was gated (a formatted `String`
 key per write) is gone, which is why the previous twenty-one detected storms were all
 unattributed. Reading instructions and probe table: `docs/observability.md` §2.3.
+
+**FIRST READING, 2026-08-20 on the live GUI (3.1.11), 149.5 s under streaming-row load.**
+234 root renders (**1.57/s**, agreeing with the 1.9/s and 1.1/s already measured here).
+
+1. ⛔ **Nothing is memoized, and the granularity defect is total rather than partial.**
+   `MainSurface` rendered **233 of 234** root renders and `Sidebar` **232 of 234**. So the answer to
+   "which component invalidates" is *every one of them, every time* — the terminal viewport
+   repaints on essentially every root render regardless of what changed.
+2. **11% of renders (26 of 234) had no state write in front of them at all** — forced wakes or
+   second passes, i.e. amplification, and the number a coalescing fix has to move.
+3. ⭐ **The two hottest causes are BACKGROUND CHORES, not user activity**, and both write exactly
+   once per render they precede (56 writes / 56 renders each, on a ~2.5 s tick): the **app-surface
+   restore chore** marking restore-attempted, and the **debounced draft-sync chore**. Next is
+   `finish_job_notification` at 32. ⇒ Housekeeping that touches nothing the viewport displays is
+   repainting the viewport, because it marks the whole `ShellState` dirty and nothing downstream
+   narrows that.
+
+⚠ `renders_preceded` means the site wrote before that render, not that it was the sole cause —
+several sites can precede one render, and these three sets overlap. What it does establish is that
+removing user activity would not remove most of these renders.
 **Falsifier:** under the same streaming-row load, renders track user-visible changes (order
 of 0.1/s), and the viewport repaints only for its own session's bytes.
 
