@@ -14,7 +14,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.2] `terminal new --model` IS ACCEPTED AND SILENTLY DROPPED FROM THE LAUNCH COMMAND
 
-**Status:** OPEN — measured 2026-08-20, reproduced on 8 of 8 spawns in one batch
+**Status:** OPEN
+
+*Measured 2026-08-20, reproduced on 8 of 8 spawns in one batch.*
 
 `server app terminal new --kind claude-code --model <id> …` answers success and creates the row,
 but the spawned process command line is `claude --dangerously-skip-permissions --session-id <id>`
@@ -34,7 +36,9 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 
 ## ⛔⛔⛔ [11.4→11.3] THE GUI FREEZES WITH ZERO INCIDENTS RECORDED — OWNER KILLED IT; INPUT PROBES WERE BLIND AND THE TITLE CHORE OWNED THE HOUR
 
-**Status:** OPEN — instance 2026-08-20 ~11:06 IST (GUI killed and relaunched by the owner)
+**Status:** OPEN
+
+*Instance 2026-08-20 ~11:06 IST (GUI killed and relaunched by the owner).*
 
 **Owner report:** the GUI froze hard enough to need a manual kill; separately, typed prompt
 characters echoed only after ~3 s of stuckness. No coredump for today (the GL SIGSEGV entries are
@@ -65,7 +69,9 @@ shows keystroke echo p95 < 100 ms in the input chain on the GUI host.
 
 ## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
 
-**Status:** OPEN — requested 2026-08-20 after a supervision tool typed over the owner's draft
+**Status:** OPEN
+
+*Requested 2026-08-20 after a supervision tool typed over the owner's draft.*
 
 Any out-of-band writer that types text into a row and then submits it (two discrete writes, per
 the composer contract) races the human: keystrokes landing in the gap get submitted glued to the
@@ -84,31 +90,66 @@ line is exactly `<text>`, refuse otherwise, report which. Locality: `PtySessionR
 **Falsifier:** with the verb in place, a writer that types-then-submits while a synthetic
 keystroke stream is being fed into the same row can never submit a line containing both.
 
-## ⛔⛔ [11.6] THE CLI PROVISIONER'S npm AUTO-UPDATE RACES ITSELF ACROSS CONCURRENT LAUNCHES
+## ⛔⛔ [11.6] A LAUNCH THAT NEVER REACHED ITS CLI LEAVES A HUSK ROW THAT LOOKS IDLE
 
-**Status:** OPEN — evidence captured 2026-08-20 (log paths below)
+**Status:** OPEN
 
-Six agent rows spawned in one batch on one host. Each launch ran the provisioner's npm update into
-the shared prefix `~/.yggterm/npm`. Two launches died mid-update and their rows dropped to a bare
-shell with the agent never started:
+*The npm half of this entry is fixed and re-diagnosed below.*
 
-- `MODULE_NOT_FOUND` requiring `…/@anthropic-ai/claude-code/install.cjs` (a half-reified tree),
-- `postinstall Failed to place binary: ENOENT … link` (a sibling unlinked what this run was
-  linking).
+*Originally filed 2026-08-20 as "the npm auto-update races itself across concurrent launches".
+**Both halves of that title were wrong**, and the correction is worth more than the entry was.*
 
-Four npm runs within 11 s in `~/.yggterm/npm-cache/_logs/2026-08-20T05_18_*.log`. There is no
-lock around the prefix and reify is not atomic, so concurrent updates corrupt each other. This is
-the same failure class reported for grok-build provisioning ("npm breaking every time").
+### ⛔⛔ THE DIAGNOSIS WAS WRONG TWICE, AND BOTH ERRORS READ AS EVIDENCE
 
-- **Second defect in the same incident:** a row whose launch dies this way is a husk born broken —
-  its PTY write path answers `remote terminal write failed`, the frozen npm error frame renders as
-  the screen, and nothing marks the row as failed. A launch that never reached its CLI must surface
-  an error state on the row, not a corpse that looks idle.
-- **Owner lane:** 11.6 (`docs/cli-integration.md`). Fix class: single-flight lock per prefix +
-  install-to-temp-then-rename on disk (never tmpfs) + skip-if-fresh TTL so N concurrent launches
-  cause at most one update.
-- **Falsifier:** spawn 6 rows concurrently twice; zero npm failures, zero husk rows, and at most
-  one update run per prefix per TTL window.
+The entry said *"There is no lock around the prefix"* and *"concurrent updates corrupt each
+other"*. Checked against the source and the logs it cited:
+
+- **The lock exists and shipped in the very version that was running.** `install_latest` takes
+  `acquire_managed_cli_install_lock` for its whole body, across processes via `flock`, waiting up
+  to **5 minutes** and *bailing* rather than proceeding unlocked. Every one of its three call sites
+  is behind it.
+- **The cited logs are SEQUENTIAL, which is that lock working.** Seven runs at
+  `05_17_41`, `05_17_59`, `05_18_03`, `05_18_06`, `05_18_10`, `05_18_14`, `05_18_17` —
+  **~3.5 s apart, never overlapping**. "Four npm runs within 11 s" is true and is not concurrency;
+  reading it as concurrency is what produced the wrong root cause.
+- **All seven are the SAME package**, `install --global --force @anthropic-ai/claude-code@latest`.
+  Not six rows each updating; one package retried seven times because each attempt failed.
+
+⭐ **The lesson, which is the durable half:** a timestamp cluster is not a race. The interval
+between the runs was in the evidence the whole time and settles it in one line. ⚠ And an inherited
+"there is no lock" is a claim — this one was contradicted by a `git log -S` against the deployed
+version in under a minute.
+
+### ✅ WHAT ACTUALLY BROKE IT, AND IT IS FIXED
+
+`--force` re-reifying a **shared, already-damaged** live tree. The failure is
+`[@anthropic-ai/claude-code postinstall] Failed to place binary: ENOENT ... link
+'.../node_modules/...'` — the package's own postinstall hard-linking into a subtree `--force` had
+just torn down. Once the shared prefix carries that damage, **every subsequent retry re-enters it**
+and fails identically, so the row dies, the next launch retries, and the loop is mistaken for a
+race. It is damage persistence, not contention.
+
+Measured 2026-08-20: with a clean tree, that same install succeeds with `--force`, without
+`--force`, over a live tree, and into a fresh directory — **all four**. The tree's prior state is
+the whole variable.
+
+**Fixed by the per-CLI generation layout** (see the provisioner commits): every install goes to a
+fresh empty directory that cannot inherit damage, `--force` is gone, and a tree that fails to
+produce its binary is **never published**, so a failed install leaves the previous working one in
+place instead of a broken CLI. The `skip-if-fresh TTL` the original entry asked for already existed.
+
+### ⛔ WHAT REMAINS OPEN — AND IT IS NOT THE PROVISIONER'S
+
+A row whose launch dies before reaching its CLI is **a husk that looks idle**: its PTY write path
+answers `remote terminal write failed`, the frozen error frame renders as the screen, and nothing
+marks the row failed. That is the launch/row error-surfacing path, not provisioning — a launch that
+never reached its CLI must surface an error state on the row rather than a corpse.
+
+⚠ The provisioner fix makes this **rarer, not impossible**: any launch failure that is not an npm
+install still lands here.
+
+**Falsifier:** kill a CLI's launch before it execs and confirm the row shows an error state rather
+than an idle-looking frozen frame.
 
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
@@ -226,6 +267,30 @@ vendor installer hands temp-file policy to a script nobody here controls. The
 other six `ygg-*` units on that host were checked at the same time: none sets
 `TMPDIR`, but none stages a payload of this size, so this was the only one worth
 changing today.
+
+### ⛔⛔ AND THREE OF THE FOUR PROVISIONING METHODS WERE NEVER COVERED AT ALL
+
+*2026-08-20. The `TMPDIR` relocation above was applied to the npm path and to nothing else.*
+
+`install_via_uv`, `install_via_vendor_script` and `update_via_self_command` all still ran with the
+**inherited** `TMPDIR`, so for six days after this entry was written:
+
+- a `uv tool install` staged wherever `/tmp` pointed,
+- a CLI's own updater did too — and those download whole platform binaries (~166 MB for one of
+  them),
+- and worst, the vendor `curl … | sh`, **the very `mktemp -d` + ~157 MB tarball this entry names
+  three paragraphs above**, was still landing in RAM. The entry diagnosed that installer correctly
+  and the fix went to a different function.
+
+⭐ **The shape, and why it is the reusable part:** the fix was applied *at the callsite that was
+being debugged*, in a file where callsites keep being added. A per-callsite fix to a policy
+question does not travel, and nothing fails when the next one forgets — the leak is silent by
+construction.
+
+**Fixed** by giving the policy one owner, `apply_provision_env`, which every provisioning method
+now goes through, plus a test that reads the shipped source for each of the four and fails if one
+stops routing its temp. `npm_config_tmp` was dropped in the same pass: npm 11 answers
+`Unknown env config "tmp"` and ignores it, so only `TMPDIR` was ever doing the work.
 
 **Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
 entry is void and only the unbounded-growth half stands.
@@ -5963,7 +6028,26 @@ a measurement.
 
 ## ⛔⛔ [6.7] OUR MANAGED npm CACHE IS 13.3 GB ACROSS THE FLEET AND NOTHING EVER PRUNES IT
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+### ✅ THE RETENTION RULE EXISTS NOW, AND IT IS npm'S OWN GC
+
+`npm cache verify` keeps everything the index references and drops orphaned content, so it bounds
+the store **without costing a re-download of anything still in use** — which is what this entry
+asked for and why a timed `npm cache clean` was the wrong answer. It now runs at most weekly from
+the provisioner, keyed off a marker file *inside the cache*, so there is no second store that could
+disagree with it about when it last ran.
+
+⚠ **Measured on the build host 2026-08-20: 9,322 MB → 7,669 MB, 1.65 GB reclaimed in 61 s.**
+
+⛔ **AND npm'S OWN REPORT CANNOT BE QUOTED FOR THAT NUMBER.** It said *"Content garbage-collected:
+1306 (9,172,360,910 bytes)"* — **9.17 GB, over-stating the disk actually returned by 5.5×** — because
+`_cacache` deduplicates by content hash and that figure counts index entries, not unique bytes.
+A reclaim quoted from the tool's summary line would have been a fabricated win of exactly the kind
+this campaign keeps catching. Quote `du`, taken either side.
+
+⇒ The original falsifier below is now answered: the accumulation was **historical**, not
+provisioning re-downloading, so a retention rule reclaims it.
 
 *Found 2026-08-14 while independently re-measuring a peer's trace-growth figure —
 the growth reproduced, but the directory it was blamed for filling turned out to
