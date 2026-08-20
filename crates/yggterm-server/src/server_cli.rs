@@ -290,9 +290,17 @@ pub fn run_server_gate_screen_cli(store: &SessionStore, args: &[String]) -> anyh
             None => "not blocking".to_string(),
         };
         println!(
-            "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}\n   screen: {screen}",
+            "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}{limit_wait}\n   screen: {screen}",
             key = session.session_key,
             working = session.shows_agent_working,
+            // Printed only when armed, and loudly: a limit-waiting row reads
+            // `working: false` above, and "false means idle, safe to move on"
+            // is exactly the misread this third state exists to prevent.
+            limit_wait = if session.shows_limit_wait {
+                "\n   screen_shows_limit_wait: true — waiting out a usage limit, auto-continue armed; NOT idle"
+            } else {
+                ""
+            },
             screen = if session.screen_available {
                 "readable"
             } else {

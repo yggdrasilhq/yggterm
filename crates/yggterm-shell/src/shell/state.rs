@@ -17305,6 +17305,7 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        limit_wait: session.limit_wait,
         // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
         // reads, so dropping the field here would leave the daemon knowing a row
         // had gone deaf and the human still unable to see it — the exact gap
@@ -17366,6 +17367,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        limit_wait: session.limit_wait,
         // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
         // reads, so dropping the field here would leave the daemon knowing a row
         // had gone deaf and the human still unable to see it — the exact gap
@@ -25821,6 +25823,11 @@ impl ShellState {
             // confirm streak current so we don't fire a backlog of edges the
             // moment notifications are enabled.
             for session in self.server.live_sessions() {
+                if session.limit_wait {
+                    // A limit-wait is not an idle verdict — see the twin skip
+                    // below.
+                    continue;
+                }
                 if let Some(working) = session.working {
                     let previous = self
                         .session_working_prev
@@ -25842,6 +25849,16 @@ impl ShellState {
                 // drop the "was working" memory nor reset a genuine work streak.
                 continue;
             };
+            if session.limit_wait {
+                // Waiting out a usage limit is NOT "finished". The screen has
+                // no working phrase, so `working` reads `Some(false)` — and
+                // treating that as the done edge fired a toast at the exact
+                // moment nothing finished (the queue's limit-wait entry).
+                // Leave the remembered verdict and the streak intact, exactly
+                // like an unknown: when the limit lifts mid-turn the streak
+                // resumes, and the genuine finish still notifies once.
+                continue;
+            }
             let previous = self
                 .session_working_prev
                 .insert(session.session_path.clone(), working);

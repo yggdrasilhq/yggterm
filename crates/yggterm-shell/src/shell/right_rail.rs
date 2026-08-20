@@ -4390,10 +4390,19 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
 
     let connect = session_connect_command(session, &cwd);
 
-    let working = match session.working {
-        Some(true) => "working",
-        Some(false) => "idle",
-        None => "—",
+    // The limit-wait check comes FIRST: a session waiting out a usage limit
+    // has no working phrase on screen, so `working` reads `Some(false)` — and
+    // rendering that as "idle" was the owner-reported lie (the row's own
+    // footer said "Usage limit reached · continuing shortly" while this field
+    // said idle).
+    let working = if session.limit_wait {
+        "waiting on limit"
+    } else {
+        match session.working {
+            Some(true) => "working",
+            Some(false) => "idle",
+            None => "—",
+        }
     };
     let mut runtime = vec![SessionMetadataEntry {
         label: "Status",

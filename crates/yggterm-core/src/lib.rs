@@ -1458,6 +1458,17 @@ pub fn screen_text_shows_agent_working(sample: &str) -> bool {
         .any(|descriptor| descriptor.screen_shows_working(sample))
 }
 
+/// Kind-agnostic union of every CLI's usage-limit-wait phrases — the same
+/// shape as [`screen_text_shows_agent_working`], for callers with no kind in
+/// hand. A limit-waiting screen carries no working phrase, so without this a
+/// gate reader calls the row "idle, safe to move on" while the CLI's own
+/// footer says it is waiting to continue.
+pub fn screen_text_shows_agent_limit_wait(sample: &str) -> bool {
+    agent_cli::AGENT_CLIS
+        .iter()
+        .any(|descriptor| descriptor.screen_shows_limit_wait(sample))
+}
+
 /// How long input may go unanswered before a row is worth pointing
 /// `terminal input-check` at.
 ///

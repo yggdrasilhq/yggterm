@@ -3480,6 +3480,16 @@ pub struct SnapshotSessionView {
     // serde(default) keeps back-compat with older snapshots.
     #[serde(default)]
     pub working: Option<bool>,
+    /// The session is WAITING OUT A USAGE LIMIT — a third state beside
+    /// working/idle, detected from the CLI's own wait footer (per-CLI
+    /// descriptor phrases). While true, `working` reads `Some(false)`
+    /// truthfully — no turn is in flight — but rendering that as "idle" is the
+    /// lie this field exists to end: the metadata Status, the sidebar dot and
+    /// `gate-screen` all called a limit-waiting row idle at once, and the
+    /// working→done edge fired a false "done". Additive + serde(default), so
+    /// older snapshots read `false` and nothing breaks across versions.
+    #[serde(default)]
+    pub limit_wait: bool,
     /// How long this session has been WRITTEN TO without answering, when that is
     /// outstanding at all — the gap between the last byte written toward the
     /// child and the last byte it produced. `None` = the child has answered at
@@ -3893,6 +3903,8 @@ pub struct ManagedSessionView {
     /// Daemon-authoritative working state — see [`SnapshotSessionView::working`].
     /// `Some(true)` working, `Some(false)` confirmed idle, `None` unknown.
     pub working: Option<bool>,
+    /// Waiting out a usage limit — see [`SnapshotSessionView::limit_wait`].
+    pub limit_wait: bool,
     /// Input written with nothing said back — see
     /// [`SnapshotSessionView::input_unanswered_ms`]. `None` = answering, or not
     /// reported. ⚠ A trigger, never a verdict.
@@ -14074,6 +14086,7 @@ mod restored_runtime_repair_tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -28687,6 +28700,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         pty_cols: None,
         pty_rows: None,
         working: session.working,
+        limit_wait: session.limit_wait,
         input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options,
         title_is_explicit: session.title_is_explicit,
@@ -28803,6 +28817,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         pty_cols: None,
         pty_rows: None,
         working: session.working,
+        limit_wait: session.limit_wait,
         input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options.clone(),
         title_is_explicit: session.title_is_explicit,
@@ -29001,6 +29016,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         ssh_prefix: session.ssh_prefix,
         stored_preview_hydrated: true,
         working: session.working,
+        limit_wait: session.limit_wait,
         input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options,
     }
@@ -29372,6 +29388,7 @@ terminal_window_id: None,
         ssh_prefix: None,
         stored_preview_hydrated: should_hydrate_stored_preview,
         working: None,
+        limit_wait: false,
         // A row being built has no runtime yet; the daemon's snapshot overlay is
         // the only thing that can answer this, and it does so every snapshot.
         input_unanswered_ms: None,
@@ -29736,6 +29753,7 @@ fn build_live_session_with_launch_options(
         ssh_prefix: target.prefix.clone(),
         stored_preview_hydrated: true,
         working: None,
+        limit_wait: false,
         // A row being built has no runtime yet; the daemon's snapshot overlay is
         // the only thing that can answer this, and it does so every snapshot.
         input_unanswered_ms: None,
@@ -31112,6 +31130,7 @@ mod recipe_tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -33334,6 +33353,7 @@ mod tests {
             pty_cols: None,
             pty_rows: None,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -36942,6 +36962,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                limit_wait: false,
                 input_unanswered_ms: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
@@ -37037,6 +37058,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -37093,6 +37115,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -37884,6 +37907,7 @@ terminal_window_id: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -40844,6 +40868,7 @@ terminal_window_id: None,
             pty_cols: None,
             pty_rows: None,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -43913,6 +43938,7 @@ terminal_window_id: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: false,
                 working: None,
+                limit_wait: false,
                 input_unanswered_ms: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
@@ -44003,6 +44029,7 @@ terminal_window_id: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
@@ -44123,6 +44150,7 @@ terminal_window_id: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            limit_wait: false,
             input_unanswered_ms: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
