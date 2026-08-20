@@ -12,6 +12,42 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.0] THE BOOTER'S SEND PLANE HAS THREE NON-CONVERGING LOOPS, AND TWO WATCHERS RAN AT ONCE
+
+**Status: OPEN.** Diagnosed 2026-08-20 15:10–15:40 from the boot log after the owner reported
+"the booter is patched today and I think it is not sending properly to ANY session." The
+classification plane (WORKING / RATE_LIMITED / NO_TRANSCRIPT) is healthy; every defect is in
+what happens after a boot decision.
+
+1. **A boot refusal against a GONE row never converges.** A subscription whose row is absent
+   from every listing still gets a boot attempt each tick; both screen arms rightly return
+   nothing; the boot refuses fail-safe ("Blind is not clear") — and repeats forever. Measured:
+   51 refusals across ~8 defunct uuids in under an hour, which reads exactly like "the booter
+   sends to nobody" while every LIVE row was correctly WORKING/RATE_LIMITED. The LAPSED
+   detector exists but only marks the record; the boot loop does not consult it. **Fix
+   direction:** a row absent from listings AND screen-unreadable escalates ONCE and stands
+   down with a visible record; the boot loop skips stood-down husks.
+2. **On a glyph-mangling row the typewriter is unbounded.** Residue detection keys on the
+   literal boot-text head; when the render defect mangles the echo, the booter cannot
+   recognise its own prior copy and types a fresh one every tick (three copies observed on one
+   orchestrator row, 12:12–12:28, none submitted — the Enter guard correctly refused each).
+   The mangling is a RENDER artifact: the underlying bytes were intact and were delivered and
+   submitted later, when the row's own rate-limit stall ended (queued, not discarded). **Fix
+   direction:** typing must be render-independent — a per-row typed-but-unverified ledger;
+   never type a second copy without a verified submit or an explicit clear in between.
+3. **`_screen_text`'s app-control arm swallows the whole JSON envelope as "screen text".**
+   For a live row it works by accident (the embedded `data.text` is inside the blob it
+   pattern-matches); for an empty/invalid row path the verb answers `accepted:true, text:""`,
+   indistinguishable from a genuinely blank screen. Parse `data.text`; treat an empty
+   `session_path` echo as "could not look", not "empty screen".
+4. **The watcher singleton check raced:** two watchers started 15 s apart ran concurrently for
+   ~3 h on the integrator host (double-typist hazard — this is what compounds defect 2 into
+   multi-copy residue). The already-running check must take a lock, not read a pid file.
+
+**Falsifier for the fix:** a defunct-row subscription produces exactly one escalation then
+silence; a live stalled row is booted with exactly one typed copy and one Enter; `ps` shows
+exactly one watcher after two racing starts.
+
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
 **Status:** OPEN

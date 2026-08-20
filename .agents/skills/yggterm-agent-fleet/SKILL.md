@@ -1351,6 +1351,12 @@ handoff is a cycle, not an ending:
    of yourself you should use the same model"*; most fleet sessions are Opus,
    but some seats are deliberately Fable and a relay must not silently demote or
    promote one).
+   ⛔⛔ **THE MODEL IS NOT INHERITED, BY ANY MECHANISM.** A spawn that omits
+   `--model` silently hands the choice to the CLI's configured default — it does
+   NOT copy the spawner's model, and nothing warns. This is how two orchestrator
+   relays in one day landed on the wrong model while every other part of the
+   handover succeeded. ⇒ **Every relay and every delegate spawn writes `--model
+   <id>` explicitly, even when "the same model" is intended — ESPECIALLY then.**
    ⛔⛔ **THE MODEL IS SET AT SPAWN, WITH THE CLI'S `--model` FLAG — NEVER BY AN
    IN-SESSION SWITCH.** Owner-directed 2026-08-20, after the CLI's own
    confirmation dialog stopped a switch mid-flight: *"Never attempt to switch
@@ -1368,15 +1374,26 @@ handoff is a cycle, not an ending:
    ⚠ The one safe moment is TURN ZERO — an empty session has no history to
    re-read — so a switch there repairs a spawn that has just failed. It is
    never a way to re-aim a session that has already done work.
-   ⛔⛔ **AND THE FLAG IS CURRENTLY BROKEN, WHICH MAKES THIS A BLOCKER RATHER
-   THAN A PREFERENCE:** `terminal new --model` is silently DROPPED from the
-   launch (pending-bugs [11.2]; `--permission-mode` from the same call
-   survives, so it is that flag's plumbing). Until it is repaired the only
-   sanctioned way to set a seat's model does not work — so the drop is not a
-   nuisance, it is the thing standing between the fleet and the law above.
-   ⭐ THE DECISIVE VERIFICATION is the transcript's assistant-record `model`
-   field after the first turn: the screen banner false-negatives once it
-   scrolls, and the process cmdline is blind about the model either way.
+   ⭐⭐ **THE FLAG WORKS — the "silently dropped" finding was a MISDIAGNOSIS,
+   corrected 2026-08-20 (33a7fc2c).** `terminal new --model` reaches the process
+   and the cmdline carries it. What actually fails is a spawn aimed at a host
+   whose RUNNING daemon predates the flag: that call answers
+   **`data.launch.applied: false`** while echoing the model back, and nothing
+   reaches the process. The reply was truthful all along, in a field nobody
+   read. ⇒ Do not re-cite the old blocker; it licenses spawning without the
+   flag, which is the exact mistake it grew from.
+   ⭐ **THE SPAWN-TIME MODEL CHECKLIST — four steps, all mandatory:**
+   1. Write `--model <id>` explicitly in the create call (it is never inherited).
+   2. Read **`data.launch.applied`** in the create reply. `false` ⇒ the flag did
+      NOT reach the process (stale daemon on the target host); the row is on the
+      wrong model NOW, at turn zero — the one safe moment to kill and respawn.
+   3. After the first turn, verify the transcript's assistant-record `model`
+      field: `grep -o '"model":"[^"]*"' <transcript> | sort | uniq -c`. This is
+      the ONLY decisive instrument — the screen banner false-negatives once it
+      scrolls, and the cmdline proves the REQUEST, not the model answering.
+   4. Wrong model discovered after work has begun ⇒ say so plainly, FINISH the
+      unit on the wrong model, and hand over — the correction rides the next
+      spawn, where it is free. Never switch in-session (the law above).
    And (f) ⛔ **ANY UNSENT OWNER DRAFT — a handover must lose no typed text**
    (owner design 2026-08-20: *"my prompt must be handed over to the next
    spawnee too, so there is no data loss"*). Check `~/.yggterm/relay/drafts/
