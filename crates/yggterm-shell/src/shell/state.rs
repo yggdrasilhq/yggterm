@@ -52160,8 +52160,35 @@ fn remote_scanned_session_label_with_saved_title(
             return short_id.clone();
         }
     }
-    humanized_terminal_title(SessionKind::Codex, &session.cwd, None)
+    // The kind comes from the row's own scheme. It used to be hardcoded to
+    // Codex, so a muse or agy row that reached this line was humanized as a
+    // Codex session — a second CLI's name on a first CLI's row.
+    let kind = yggterm_core::agent_scheme::session_kind_for_path(&session.session_path)
+        .unwrap_or(SessionKind::Codex);
+    humanized_terminal_title(kind, &session.cwd, None)
         .filter(|title| !memoized_generated_fallback_title(title))
+        // ⛔ A ROW WITH NO TURNS YET IS NOT UNTITLED — IT IS NEW, and the CLI's
+        // own lifecycle has a name for that state. Three muse rows on the
+        // desktop wore a 7-character hash because every title source was
+        // legitimately empty: they had been spawned minutes earlier and nobody
+        // had typed into them. Falling to the short id there is the shorthash
+        // the title law forbids, arrived at honestly.
+        //
+        // It sits BELOW the cwd-derived name on purpose: "New Codex Session"
+        // says less than the folder the session is rooted in, so the
+        // placeholder is the answer only when nothing else has one. And the
+        // placeholder IS a fallback by the recognizer's reckoning — chosen
+        // here, not found upstream, so the chore keeps treating it as
+        // replaceable while the row still shows a name.
+        .or_else(|| {
+            (session.user_message_count == 0)
+                .then(|| {
+                    yggterm_core::agent_scheme::session_kind_for_path(&session.session_path)
+                        .and_then(yggterm_core::agent_cli::agent_cli_descriptor)
+                        .map(|descriptor| descriptor.new_session_label())
+                })
+                .flatten()
+        })
         .or_else(|| short_ids.get(&session.session_path).cloned())
         .unwrap_or_else(|| fallback_label_for_session_path(&session.session_path))
 }
