@@ -182,6 +182,34 @@ gate-screen working/idle heuristics) must learn the agents-hint signature (dim c
 `← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
 typed-residue detector must require the footer's absence before claiming residue.
 
+## ⚠ [11.0] A DEAD SESSION'S SURFACE ECHOES MOUSE-TRACKING AS TEXT
+
+**Status:** OPEN
+
+Owner screenshot 2026-08-20 ~21:4x: a row whose session had died on the remote host filled
+its viewport with literal `^[[<35;79;48M`-family bytes — SGR mouse-tracking reports echoed as
+text. The dead surface left mouse reporting armed (`?1003h`/`?1006h`); with no application
+consuming the events, every pointer move prints. **Fix:** when a session's runtime dies or a
+restore is refused, the surface disarms mouse tracking (and bracketed paste) before showing
+the failure state. **Falsifier:** kill a remote session behind a row, move the mouse over its
+viewport — no bytes appear.
+
+## ⚠ [11.0] THE LIBYGGTERM CONTEXT MENU: CURATION, REGISTRY, AND PER-HOST TRUTH (owner spec)
+
+**Status:** OPEN
+
+Owner screenshot 2026-08-20: the row context menu lists Fleet topology and Fleet booter
+TWICE, plus tools that do not belong there at all. The spec, verbatim in intent: (1) REMOVE
+Fleet topology, Fleet booter, and ytop from the menu — terminal-invoked tools, meaningless as
+row spawns; (2) the list is REGISTRY-DRIVEN — updated when any libyggterm app registers on
+first launch (app writes manifest, menu reads registry, one owner — the duplicate listing is
+the one-app-N-manifests trap); (3) PER-HOST filtering — an entry shows only if the app is
+available on the host of the right-clicked session. Related owner spec, same family: every
+libyggterm app spawn defaults to a row titled "New {Machine} {App}" (e.g. a browser session
+on the integrator host titles "New Dev Ychrome"), composed by ONE title builder.
+**Falsifier:** right-click a row on each host — each menu lists exactly that host's installed
+apps, once each, no monitors/booters/ytop; a fresh app spawn lands titled by the convention.
+
 ## ⚠ [11.0] THE ROW CLI DEMANDS RITUAL THE DEFAULTS SHOULD OWN — the papercut backlog
 
 **Status:** OPEN
