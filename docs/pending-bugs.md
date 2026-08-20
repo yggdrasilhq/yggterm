@@ -12,6 +12,72 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.1] THE START PAGE HEADER, THE SIDEBAR AND THE `ls` VERBS COUNT DIFFERENT UNIVERSES
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Reported 2026-08-20 with a frame: the start page header read four fewer than both `ls` verbs
+on the same host. Root-caused the same day with a SIMULTANEOUS sample — GUI (shadow render)
+789, both verbs 793, in one 7.5 s window — so the gap is systematic, not timing.*
+
+**The one owner of "how many durable sessions are there":** the deduplicated union of
+`scan_all_durable_sessions(<agent store home>)` + every machine scan + live agent rows, keyed
+by session id. Both `server startpage ls` and `server cwdtree ls` already compute exactly this
+(they agree with each other and with their own row payloads). The GUI did not, in two ways:
+
+1. **−5: the GUI's local tree scanned the WRONG HOME and found nothing.** The 2026-08-17 scan
+   unification passed the yggterm home (`~/.yggterm`) into `scan_all_durable_sessions`, whose
+   descriptor roots join onto it — so the GUI walked `~/.yggterm/.codex/…`, a tree where no CLI
+   store exists, and returned zero local durable rows. Every local durable session WITHOUT a
+   live row vanished from the sidebar tree and the start page (the ones with live rows were
+   masked by their live row, which is why the hole read as "a few rows off" instead of "the
+   local store is gone"). The verbs had hit this identical trap earlier and each grew a private
+   resolution; the GUI never did. The resolution now has ONE owner —
+   `yggterm_core::startpage::agent_store_home` — read by the tree builder and all four verb
+   sites, locked by `the_local_tree_scan_walks_the_agent_store_home_not_the_yggterm_home`.
+2. **+1: the header counted a workspace document.** A terminal-recipe document passed
+   `is_start_page_candidate`, so the page held (and counted) one card that is not a durable
+   session and that no verb counts. RECENT WORK's universe is now durable agent sessions only
+   (`a_workspace_document_is_not_a_start_page_candidate`); recipes stay reachable from the
+   sidebar tree. *Reversible call, taken in relay mode: restoring the old behaviour is one
+   predicate arm in `BrowserRow::is_start_page_candidate` — but then the header and the verbs
+   must be taught to disagree by design, which is the state this entry exists to end.*
+
+**CLOSED AS BY-DESIGN — the sidebar machine-node counts.** The per-machine numbers (which sum
+to roughly double the fleet-unique count) are per-scan-scope INSTANCE counts: each machine node
+counts the sessions reachable under that machine's own store scan, and one session reachable
+under two machine keys legitimately counts in both (two of the fleet's machine keys name one
+physical host, so their stores overlap almost entirely). Per the dual-presence law, dedup is
+per-view: the fleet-unique number answers "how many sessions exist", a machine node answers
+"how many are reachable HERE", and the two must not be reconciled by deduplicating the tree.
+
+**The Live Sessions rail count is a THIRD defect and already has an owner entry.** Sampled in
+one window: daemon `live_sessions` 50, verb `live_count` 50, GUI live-rail rows **52** — same
+path SET, two rows rendered twice at two depths. That is the already-open *ONE SESSION, TWO
+ROWS, SAME VIEW* entry below, now with live evidence recorded there.
+
+**Falsifier for the fix:** a shadow-rendered start page's `dom.start_page_recent_count`, `server
+startpage ls --json --limit 100000` `durable_count`, and `server cwdtree ls --json --limit
+100000` `durable_count` — all three sampled in ONE window — are equal, and the sidebar's local
+subtree shows the local store's cwd folders again.
+
+## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
+
+**Status:** OPEN
+
+*Found 2026-08-20 while fixing the count-universe entry above — same defect class, different
+store.* `SessionTitleStore::open(home)` joins `session-titles.db` onto whatever it is given,
+and its call sites disagree about what to give it: the sweep's junk-title delete passes the
+bare user home, the sweep's main open passes the "system home", and the scan-side readers try
+`<home>/.yggterm` then fall back to `<home>` — three spellings of one path decision. The
+consequence is not hypothetical: **a stray `~/session-titles.db` exists on at least two fleet
+hosts** (40 KB and 32 KB, beside the real ~3 MB and ~1.5 MB stores at
+`~/.yggterm/session-titles.db`), meaning some writers and readers have been using a SECOND,
+silently diverging title store. A junk-title delete aimed at the stray store deletes nothing
+from the store every surface reads. Same shape as the count fix above: the home needs ONE
+resolver (`agent_store_home` now exists for the agent stores; the title store needs the
+yggterm-home equivalent), and the stray DBs need a migration-or-delete decision when fixed.
+
 ## ⛔⛔ [11.1] THE METADATA RAIL'S "CONVERSATION N user · M assistant" COUNTS A PREVIEW, NOT A CONVERSATION
 
 **Status:** OPEN
@@ -1838,6 +1904,16 @@ first hypothesis is that a session which has died while a member of a row set is
 emitted both as a live-rail member and as a set descendant. **Not yet tested**,
 and the husk should be preserved rather than cleared until it is — it is
 currently the only known reproduction.
+
+**2026-08-20, from the 11.1 count investigation — the husk half of that hypothesis is DEAD.**
+Two LIVE, healthy rows (both row-set members, both mid-campaign) each rendered twice in one
+`server app rows` payload: identical `full_path`, identical label, both `presence: live_rail`,
+depths 2 and 3. So the duplication is a property of ROW-SET MEMBERSHIP in the live rail, not of
+death — a member is emitted once as a rail row and once as a set descendant. Measured in the
+same window: daemon `live_sessions` 50, `startpage ls` `live_count` 50, rail rows 52 with a
+path SET of exactly 50 — which is how the rail's header count drifts above every other live
+count while the sets still match. Repro no longer depends on the preserved husk; any set member
+in the rail shows it.
 
 ⚠ It also wears a **legacy number inside its title text** while carrying a
 different one in `outline_prefix`, so it renders with two numbers. That is the

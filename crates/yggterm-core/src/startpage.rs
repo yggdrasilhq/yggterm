@@ -94,6 +94,25 @@ pub fn kind_has_dedicated_scanner(kind: crate::SessionKind) -> bool {
     )
 }
 
+/// The home the AGENT CLI STORES live under (`~/.codex`, `~/.claude`, …).
+///
+/// ⛔ SINGLE OWNER of that question, and it is NOT the yggterm home
+/// (`~/.yggterm`). The distinction has now cost two surfaces independently:
+/// `server startpage ls` walked the yggterm home and reported 0 rows before
+/// growing its own resolution, and the local cwd tree passed the yggterm home
+/// to [`scan_all_durable_sessions`] after the 2026-08-17 unification — so
+/// every local durable session without a live row vanished from the sidebar
+/// and the start page while the `ls` verbs, resolving correctly, still counted
+/// it. One resolver, called by every scanner entry point, so a caller cannot
+/// pick the wrong home again.
+///
+/// The yggterm home is the fallback only for the environments where no user
+/// home resolves at all (containers with no `$HOME`), where it degrades to the
+/// old behaviour instead of panicking.
+pub fn agent_store_home(yggterm_home: &Path) -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| yggterm_home.to_path_buf())
+}
+
 /// Walk every registered agent CLI's store globs under `home` and return
 /// one entry per readable session file, using the descriptor's own
 /// `read_store_entry` so title/cwd semantics stay single-sourced.

@@ -60,8 +60,10 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
     let host = hostname().unwrap_or_else(|_| "unknown".to_string());
     // System HOME is where the CLI stores live (~/.codex, ~/.claude, …),
     // not YGGTERM_HOME (which is ~/.yggterm). The earlier version passed
-    // the yggterm home and therefore walked the wrong tree (0 rows).
-    let system_home = dirs::home_dir().unwrap_or_else(|| home.clone());
+    // the yggterm home and therefore walked the wrong tree (0 rows) — and the
+    // GUI's local tree later repeated the same mistake, which is why the
+    // resolution now has ONE owner in core.
+    let system_home = yggterm_core::startpage::agent_store_home(&home);
 
     // Faithful path — re-derive exactly as the GUI does, so the verb can show the same
     // 1835 as the screenshot when the GUI is buggy. Falls back to store-only ground truth

@@ -79,7 +79,7 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
 
     let home = store.home_dir().to_path_buf();
     let host = hostname().unwrap_or_else(|_| "unknown".to_string());
-    let system_home = dirs::home_dir().unwrap_or_else(|| home.clone());
+    let system_home = yggterm_core::startpage::agent_store_home(&home);
 
     let mut rows = scan_all_durable_sessions(&system_home);
     // Track host per row for SSOT grouping (host-aware, like GUI's __remote_folder__/host/cwd)
