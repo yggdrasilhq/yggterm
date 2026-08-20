@@ -292,28 +292,80 @@ def isme(r):  return uuid in (r.get("full_path") or "")
 def ispred(r):return bool(pred) and r.get("full_path")==pred.get("full_path")
 others=[r for r in sess if not isme(r) and not ispred(r)]
 
+# A BARE MAJOR IS NOT A SEAT. A top-level row sits at "N.0", never at "N".
+# Two orchestrators in one spawn batch landed bare ("11", "12") while their own
+# delegates sat at N.x, so each parent rendered as a sibling of its children and
+# sorted away from them. The ".0" was kept by some callers and dropped by others,
+# which is worse than either convention alone: the sidebar stopped reading as a
+# tree. Every derivation path now funnels through seat(), so the law is ENFORCED
+# BY THE TOOL rather than remembered by the caller.
+def seat(major, minor=None):
+    return f"{int(major)}.{int(minor) if minor is not None else 0}"
+
+# THE SPAWNER LEDGER OUTRANKS ANY INFERENCE FROM THE ROW TABLE.
+# An orchestrator records every delegate it launches as "<seat>|<lane>|<cwd>|<row>"
+# in ~/.yggterm/relay/spawned-by-<orchestrator-uuid>.txt BEFORE that delegate ever
+# claims. The file is the spawner DECLARING the seat, which is evidence; matching a
+# campaign token against row titles is a GUESS about what someone meant. Read the
+# declaration first and the guess never runs.
+def seat_from_spawn_ledger(u):
+    import glob
+    for f in sorted(glob.glob(os.path.expanduser("~/.yggterm/relay/spawned-by-*.txt"))):
+        try: lines=open(f).read().splitlines()
+        except OSError: continue
+        for line in lines:
+            if u not in line: continue
+            parts=[x.strip() for x in line.split("|")]
+            if len(parts)<2: continue
+            m=re.match(r"^(\d+)(?:\.(\d+))?$", parts[0])
+            if m: return seat(m.group(1), m.group(2))
+    return ""
+
 n=os.environ.get("NUMBER","")
+if n:
+    m=re.match(r"^\s*(\d+)(?:\.(\d+))?\s*$", n)
+    if m: n=seat(m.group(1), m.group(2))   # an explicit bare 11 still means 11.0
 if not n:
     # PRECEDENCE, most specific first. Re-running claim must be a NO-OP, so a
     # number this row already carries outranks anything derived.
+    n=seat_from_spawn_ledger(uuid)
+if not n:
+    # SIBLING MATCHING MUST NOT CROSS CAMPAIGN ERAS. The token match below finds
+    # every row whose title mentions the campaign word, and campaign words are
+    # REUSED across generations: a 12.x wave matched the retired 2.x rows of an
+    # older wave that used the same word, and a delegate was seated at 2.2, live
+    # and invisible to the orchestrator that spawned it. Taking the LOWEST major is
+    # precisely backwards, because the lowest is the OLDEST era. Prefer the era this
+    # session was actually spawned into (the replaced predecessor major when there
+    # is one), and otherwise take the HIGHEST major, which is the newest.
     sibs=[r for r in others if num(r) and camp in title(r).lower()]
-    if os.environ.get("INHERIT")=="1" and pred and num(pred):
-        n=str(num(pred)[0])                       # take the seat we are replacing
-    elif pred and num(pred):
-        n=str(num(pred)[0])                       # replacing implies inheriting the seat
+    if pred and num(pred):
+        # INHERIT THE WHOLE SEAT, NOT ITS MAJOR. This read num(pred)[0] and threw
+        # the minor away, so a successor to 11.4 landed on 11 and the relay handover
+        # silently promoted a lane to a top-level row. Both branches did it, which is
+        # why they are now one branch: --inherit-number and a plain --replace agreed
+        # on the outcome all along.
+        n=seat(num(pred)[0], num(pred)[1])
+    elif num(mine):
+        # AN EXISTING SEAT IS ABSOLUTE AND OUTRANKS SIBLING INFERENCE. This test
+        # used to sit BELOW the sibling branch, so a row that was already seated
+        # got RENUMBERED whenever the campaign token happened to match somebody --
+        # which is how an already-verified 12.2 was moved into a retired era on its
+        # own second claim. Every session is under standing orders to claim unasked,
+        # so re-claiming is the COMMON path, not the rare one, and the documented
+        # contract for it has always been: re-running the claim is a NO-OP.
+        n=seat(num(mine)[0], num(mine)[1])
     elif sibs:
         # the campaign already has rows: join it as a SUB-number (5 -> 5.3),
         # which is what keeps a multi-row campaign readable in a long sidebar.
-        major=sorted(num(r)[0] for r in sibs)[0]
+        major=sorted((num(r)[0] for r in sibs), reverse=True)[0]
         used={num(r)[1] for r in sibs if num(r)[0]==major and num(r)[1] is not None}
         k=1
         while k in used: k+=1
-        n=f"{major}.{k}"
-    elif num(mine):
-        n=(f"{num(mine)[0]}.{num(mine)[1]}" if num(mine)[1] is not None else str(num(mine)[0]))
+        n=seat(major, k)
     else:
         majors={num(r)[0] for r in others if num(r)}
-        n=str((max(majors)+1) if majors else 1)
+        n=seat((max(majors)+1) if majors else 1)
 
 # ⛔⛔ WHATEVER WAS DERIVED, NEVER HAND OUT A SEAT SOMEONE ALREADY HOLDS.
 # Reported 2026-08-13: a claim with --campaign and no --number derived 6.1, which

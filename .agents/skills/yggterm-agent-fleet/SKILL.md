@@ -1689,8 +1689,38 @@ today, and sorts correctly** because segments compare as integers (`6.0` < `6.1`
 `session outline` call beats a rendering feature that costs a release, and it also
 survives every future change to how labels are composed.
 
-⚠ **A childless top-level row is a different case** and still wants `N.` from the
-renderer — that one has no sub-seats to be consistent with.
+### ⛔⛔ `N.0` IS NOW ENFORCED BY `ygg-claim.sh`, BECAUSE A CONVENTION WAS NOT ENOUGH
+
+**Owner-directed 2026-08-20**, after two orchestrators in one spawn batch landed at
+bare `11` and bare `12` while their own delegates sat at `11.x` and `12.x`. His
+ruling: *the numbering is `N.0`; the `.0` was being skipped by some orchestrators
+and kept by others.*
+
+⚠ **The inconsistency was worse than either convention on its own.** A parent at
+bare `N` renders as a SIBLING of its children and sorts away from them, so the
+sidebar stops reading as a tree — and because half the rows did carry the `.0`, the
+shape looked deliberate rather than broken.
+
+⭐ **The fix is in the tool, not in this page.** Every derivation path in
+`ygg-claim.sh` now funnels through one `seat()` helper, so a bare major is
+normalised to `N.0` no matter which branch produced it — including an explicit
+`--number 11`. **A rule an agent must REMEMBER is a rule that holds until the next
+cold session; a rule the claim script enforces holds for everyone.** Three
+derivation defects were fixed in the same pass, each with a regression test in
+`test-ygg-claim-seat.py`:
+
+| defect | what it did | now |
+|---|---|---|
+| bare major | top-level claims landed at `N` | every path returns `N.0` |
+| inherit dropped the minor | a successor to `11.4` landed at **`11`** — the handover silently PROMOTED a lane to a top-level row | the whole seat is inherited |
+| sibling match crossed eras | campaign words are REUSED between waves; matching took the **lowest** major, i.e. the OLDEST, and seated a `12.x` delegate at `2.2` — live and invisible to its own orchestrator | newest era wins, and the spawner ledger outranks the guess entirely |
+
+⭐⭐ **AND THE REAL LESSON IS THE PRECEDENCE, NOT THE ARITHMETIC.** The seat is
+DECLARED by the spawner in `~/.yggterm/relay/spawned-by-<uuid>.txt` before the
+delegate ever claims. That file is **evidence**; matching a campaign token against
+row titles is a **guess about what someone meant**, over a title namespace that is
+deliberately reused across generations. ⇒ `ygg-claim.sh` reads the declaration
+first, and the guess now runs only when nobody declared anything.
 
 ### ⛔⛔⛔ NEVER RENAME A ROW THE OWNER CREATED. HYGIENE APPLIES TO **YOUR** ROWS ONLY.
 
