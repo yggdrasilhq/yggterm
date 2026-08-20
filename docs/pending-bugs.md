@@ -73,6 +73,11 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
   delegate lands on whatever default the CLI last saved. Nothing downstream flags the substitution
   (same shape as the fleet skill's "silently mangled id yields a working row on the wrong model").
 - **Workaround (proven):** drive `/model <id>` into the row after it reaches its composer.
+- **Narrowed 2026-08-20 (sibling campaign, 2/2 spawns):** `--permission-mode bypass` from the SAME
+  call IS honoured (`--dangerously-skip-permissions` present on the process) — the drop is specific
+  to the model flag's plumbing, not general option loss. And the decisive VERIFICATION instrument
+  is the transcript's assistant-record `model` field after the first turn: the screen banner
+  false-negatives once it scrolls, and the process cmdline is blind after a `/model` repair.
 - **Locality:** launch-command construction for agent kinds — the same
   `persistent_agent_resume_command` / managed_cli family lane 11.2 is auditing for resume-id
   mapping. Check whether `--permission-mode` and other per-launch options survive, too: the
@@ -355,9 +360,22 @@ Two faces of the claim/seat derivation (`ygg-claim.sh` and callers that inherit 
    own convention is `N.0` for an orchestrator seat with delegates at `N.1+` — the tool should
    derive it that way when `--campaign` is given.
 
+**Mechanism sharpened by the victim's own timeline (2026-08-20):** the spawner's wrapper had a
+GENUINE sidebar read-back of seat `12.2` at 12:34:21 — the mis-seat happened AFTERWARDS, when the
+delegate ran `ygg-claim` minutes into its first turn (the global standing order tells every session
+to claim unasked) and the derivation token-matched the retired-era rows, **RENUMBERING an
+already-seated row**. That breaks the tool's own documented contract ("a row that already has a
+number KEEPS it; re-running the claim is a no-op") — either the derivation ignores an existing
+`outline_prefix` when the campaign token matches siblings, or the known seat-durability evaporation
+struck between verify and claim and the re-derivation then crossed eras. Fix must make an existing
+`outline_prefix` ABSOLUTE (claim = no-op), and token inference must exclude rows outside the
+spawner's own seat prefix. Victim's interim mitigation: briefs now say "you are already claimed and
+seated — skip ygg-claim".
+
 **Falsifier:** with old-era `2.x` rows present and an orchestrator seated `12.0`, a campaign-token
-spawn lands at `12.1` (never `2.x`), and a fresh campaign claim with no explicit number lands at
-the next free `N.0`.
+spawn lands at `12.1` (never `2.x`), a fresh campaign claim with no explicit number lands at the
+next free `N.0`, and re-running `ygg-claim` on an already-seated row changes NOTHING even when the
+token matches foreign-era siblings.
 
 ## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
 
@@ -18464,28 +18482,21 @@ flaky — **not itself**. Six tests did exactly this.
 just perturb the schedule"* did not survive **six DECOY tests that left the suite
 green**. A flake that moves when you add unrelated tests still has a cause.
 
-## ⛔ [app-control] `terminal new --model` IS HONOURED IN THE REPLY AND DROPPED IN THE LAUNCH
+## ⛔ [11.2] `terminal new`'s CREATE REPLY CAN ARRIVE AS EMPTY STDOUT WHILE THE CREATE SUCCEEDS
 
 **Status:** OPEN
 
-Measured 2026-08-20 (GUI 3.1.5 / headless 3.1.4).
+Measured 2026-08-20 by a sibling campaign (GUI 3.1.5 / headless 3.1.4), filed here by them and
+re-scoped by 11.0 — the `--model` half of the original filing is deduped into the standing
+`[11.2] terminal new --model` entry above, which now carries its flag-specific narrowing.
 
-`server app terminal new --kind claude-code --model claude-opus-5 …` (issued over
-ssh to the GUI host, `--machine-key` naming a different work host) created the row,
-and the resulting invocation on the work host was
-`claude --dangerously-skip-permissions --session-id <uuid>` — **no `--model` flag
-and no model env var** — so the agent came up on the ACCOUNT DEFAULT model,
-silently. A lane whose doctrine pins a model cannot trust the spawn verb: the
-caller now has to read `/proc/<pid>/cmdline` on the work host and repair by
-driving `/model` into the row before the brief. `--permission-mode bypass` from
-the SAME call was honoured (`--dangerously-skip-permissions` is present), so the
-drop is specific to the model flag, not to option plumbing generally.
+`server app terminal new …` issued over ssh to the GUI host returned **EMPTY stdout with exit 0**
+while the create succeeded server-side — the row existed with the correct title and seat. The
+calling wrapper printed "create failed" about a row that existed, and a caller that believes an
+empty reply invites a DUPLICATE agent (averted that day only by a trap-ledger check; cost ~10 min).
+Same family as "verbs report the request, not the effect", but worse: this verb reported NOTHING.
+Caller mitigation now in the wild: fall back to a unique exact-title rows match before declaring
+failure. The verb losing its reply is the defect.
 
-**Same incident, second defect:** the create's reply arrived as EMPTY stdout over
-ssh (exit 0) while the create succeeded server-side — the calling wrapper printed
-"create failed" about a row that existed, and a caller that believes that invites
-a DUPLICATE agent. Callers now cross-check the rows list; the verb should not
-lose its reply in the first place.
-
-**Falsifier:** spawn a claude-code row with an explicit `--model` and read the
-process cmdline on the work host — the flag (or an equivalent env) is present.
+**Falsifier:** a create whose row lands never answers empty — the reply carries the session_path,
+or a distinguishable transport error, under the same ssh conditions (repeat under load).
