@@ -21171,6 +21171,68 @@ fn shadow_client_refusal(
     })
 }
 
+/// How long a whole daemon request may take, end to end.
+///
+/// ⛔⛔ **`set_read_timeout` BOUNDS ONE `read()` SYSCALL, NOT THE REQUEST.**
+/// `read_line` loops until it sees a newline, and every chunk that arrives inside
+/// the per-syscall window restarts the clock — so a peer that answers slowly but
+/// *steadily* is never timed out, and the total is unbounded. That is invisible
+/// in the code, because the timeout is right there and looks like it covers the
+/// read.
+///
+/// It is not theoretical. Measured on the GUI host over 85 minutes, `terminal_read`
+/// was 54% of all slow runtime-lock waits, with a live ceiling clustered at
+/// 10,234-10,240 ms (the per-syscall budget, hit routinely) — **and two waits that
+/// went straight past it at 41.6 s and 68.8 s.** A `terminal_read` response carries
+/// terminal output chunks, so it is exactly the request that needs many reads, and
+/// the daemon holds its one runtime lock across the whole thing.
+///
+/// This is a CEILING, not a tightening: it is deliberately a multiple of the
+/// per-syscall budget so that every response that legitimately streams for a while
+/// still completes, and only the runaway is cut off.
+fn daemon_request_total_deadline_ms(request: &ServerRequest) -> u64 {
+    daemon_request_io_timeout_ms(request).saturating_mul(3)
+}
+
+/// `BufReader::read_line` with a deadline that bounds the WHOLE read.
+///
+/// Reads through `fill_buf`/`consume` so each loop turn performs at most one
+/// `read()` — already bounded by `SO_RCVTIMEO` — and the deadline is re-checked
+/// between them. See [`daemon_request_total_deadline_ms`] for why the per-syscall
+/// timeout is not enough on its own.
+fn read_response_line_before(
+    reader: &mut dyn BufRead,
+    line: &mut Vec<u8>,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "daemon response exceeded the request deadline",
+            ));
+        }
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            // EOF before a newline: the caller's parse reports it with the
+            // partial payload, which is more useful than a bare "unexpected eof".
+            return Ok(());
+        }
+        if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
+            line.extend_from_slice(&available[..position]);
+            reader.consume(position + 1);
+            return Ok(());
+        }
+        let consumed = available.len();
+        line.extend_from_slice(available);
+        reader.consume(consumed);
+    }
+}
+
 /// Send a request declaring this client's slice-4.0 identity/role.
 fn send_request_as(
     endpoint: &ServerEndpoint,
@@ -21184,6 +21246,8 @@ fn send_request_as(
     let io_timeout = Some(std::time::Duration::from_millis(
         daemon_request_io_timeout_ms(request),
     ));
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(daemon_request_total_deadline_ms(request));
     match endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => {
@@ -21200,10 +21264,10 @@ fn send_request_as(
                 .context("writing daemon request")?;
             stream.flush().context("flushing daemon request")?;
             let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
+            let mut raw = Vec::new();
+            read_response_line_before(&mut reader, &mut raw, deadline)
                 .context("reading daemon response")?;
+            let line = String::from_utf8_lossy(&raw).into_owned();
             serde_json::from_str(line.trim_end()).with_context(|| {
                 let trimmed = line.trim_end();
                 let snippet = if trimmed.len() > 240 {
@@ -21215,8 +21279,30 @@ fn send_request_as(
             })
         }
         ServerEndpoint::Tcp { host, port } => {
-            let mut stream = std::net::TcpStream::connect((host.as_str(), *port))
-                .with_context(|| format!("connecting to {}:{}", host, port))?;
+            // ⛔ `TcpStream::connect` HAS NO TIMEOUT — it waits out the OS SYN
+            // retry schedule, which is minutes. On the cross-daemon proxy path
+            // that wait happens while this daemon holds its one runtime lock, so
+            // an unreachable peer stalls every other client behind it.
+            let mut stream = {
+                use std::net::ToSocketAddrs;
+                let connect_budget = std::time::Duration::from_millis(
+                    daemon_request_io_timeout_ms(request),
+                );
+                let mut addresses = (host.as_str(), *port)
+                    .to_socket_addrs()
+                    .with_context(|| format!("resolving {}:{}", host, port))?;
+                let first = addresses
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no address for {}:{}", host, port))?;
+                let mut connected = std::net::TcpStream::connect_timeout(&first, connect_budget);
+                for address in addresses {
+                    if connected.is_ok() {
+                        break;
+                    }
+                    connected = std::net::TcpStream::connect_timeout(&address, connect_budget);
+                }
+                connected.with_context(|| format!("connecting to {}:{}", host, port))?
+            };
             stream
                 .set_read_timeout(io_timeout)
                 .context("setting daemon request read timeout")?;
@@ -21228,10 +21314,10 @@ fn send_request_as(
                 .context("writing daemon request")?;
             stream.flush().context("flushing daemon request")?;
             let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
+            let mut raw = Vec::new();
+            read_response_line_before(&mut reader, &mut raw, deadline)
                 .context("reading daemon response")?;
+            let line = String::from_utf8_lossy(&raw).into_owned();
             serde_json::from_str(line.trim_end()).with_context(|| {
                 let trimmed = line.trim_end();
                 let snippet = if trimmed.len() > 240 {
@@ -30832,6 +30918,107 @@ mod tests {
             stamped <= current,
             "STAMPED_AT_VERSION {STAMPED_AT_VERSION} is ahead of CARGO_PKG_VERSION \
              {SERVER_PROTOCOL_VERSION} — the stamp must be taken at (not beyond) the shipped version",
+        );
+    }
+}
+
+#[cfg(test)]
+mod daemon_request_deadline_locks {
+    use super::{daemon_request_total_deadline_ms, read_response_line_before};
+    use std::io::{BufRead, Read};
+    use std::time::{Duration, Instant};
+
+    /// A peer that answers slowly but STEADILY, which is the case the per-syscall
+    /// timeout cannot catch: every chunk arrives well inside `SO_RCVTIMEO`, so the
+    /// clock restarts every time and the total never expires.
+    struct TricklingPeer {
+        chunk: Vec<u8>,
+        delay: Duration,
+    }
+
+    impl Read for TricklingPeer {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let n = self.chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.chunk[..n]);
+            Ok(n)
+        }
+    }
+
+    /// ⛔ THE READ IS BOUNDED END TO END, NOT PER SYSCALL.
+    ///
+    /// Measured on the GUI host: `terminal_read` was 54% of all slow runtime-lock
+    /// waits, and two of them ran 41.6 s and 68.8 s — straight past the 10 s
+    /// per-syscall budget that looked like it covered them. The daemon holds its
+    /// one runtime lock across the whole request, so an unbounded read there
+    /// stalls every other client behind it.
+    ///
+    /// This peer never stops making progress, so nothing below the deadline can
+    /// end the read. If the deadline is ever removed, this test hangs rather than
+    /// failing fast — which is exactly what the product did.
+    #[test]
+    fn a_steadily_trickling_peer_cannot_outlast_the_request_deadline() {
+        let peer = TricklingPeer {
+            chunk: b"xxxxxxxx".to_vec(),
+            delay: Duration::from_millis(5),
+        };
+        let mut reader: Box<dyn BufRead> = Box::new(std::io::BufReader::new(peer));
+        let mut line = Vec::new();
+
+        let started = Instant::now();
+        let result = read_response_line_before(
+            reader.as_mut(),
+            &mut line,
+            started + Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+
+        let error = result.expect_err("a peer that never sends a newline must not read forever");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the deadline must end the read promptly; took {elapsed:?}"
+        );
+    }
+
+    /// The ordinary case still completes, and consumes exactly its own line.
+    #[test]
+    fn a_well_behaved_response_reads_one_line_and_stops() {
+        let payload = b"{\"ok\":true}\n{\"next\":1}\n".to_vec();
+        let mut reader: Box<dyn BufRead> = Box::new(std::io::BufReader::new(&payload[..]));
+
+        let mut first = Vec::new();
+        read_response_line_before(
+            reader.as_mut(),
+            &mut first,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("a complete line reads cleanly");
+        assert_eq!(String::from_utf8_lossy(&first), "{\"ok\":true}");
+
+        // The newline was consumed, so the next read starts at the next record
+        // rather than re-reading the delimiter.
+        let mut second = Vec::new();
+        read_response_line_before(
+            reader.as_mut(),
+            &mut second,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("the reader advanced past the delimiter");
+        assert_eq!(String::from_utf8_lossy(&second), "{\"next\":1}");
+    }
+
+    /// The bound is a CEILING over the per-syscall budget, never a tightening of
+    /// it — a response that legitimately streams for a while must still complete.
+    #[test]
+    fn the_total_deadline_is_a_multiple_of_the_per_syscall_budget() {
+        let request = super::ServerRequest::Ping;
+        let per_syscall = super::daemon_request_io_timeout_ms(&request);
+        let total = daemon_request_total_deadline_ms(&request);
+        assert!(
+            total > per_syscall,
+            "a total deadline at or below the per-syscall budget would fail reads \
+             that are merely large, which is a regression rather than a fix"
         );
     }
 }

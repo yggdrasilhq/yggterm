@@ -172,12 +172,39 @@ question is not whether the lock is contended but **which handler holds it
 longest**, and whether the proxied `TerminalRead` is in that set on a host with
 preserved-owner rows.
 
-**Candidate directions, not yet chosen.** Resolve the proxy target and release
-the lock before the second round trip (the shape `build_background_copy_updates`
-already uses: read what you need under the lock, do the slow thing outside it);
-or give the proxied read a much shorter timeout than the direct one, since a
-preserved owner that has not answered in ~1 s is a different problem from a busy
-one.
+**MEASURED 2026-08-20 by 11.4, on the GUI host, 85 minutes, 204 slow lock waits
+(`request/lock_wait_slow`):** `terminal_read` **110 (54%)** · `terminal_app_declares`
+30 · `status` 19 · `working_flags` 17 · `terminal_resize` 7 · `ping` 5. Distribution
+p50 **95.8 ms**, p95 **10,079.6 ms**, max **68,764 ms**. ⇒ The request named above is
+the majority of the problem, and the 10 s client IO budget is a **live, routinely-hit
+ceiling** (a cluster at 10,234-10,240 ms across three request kinds), not a
+theoretical bound.
+
+✅ **ONE HALF IS FIXED: the two waits that went PAST that ceiling — 41.6 s and
+68.8 s, both `terminal_read` — were an unbounded transport, now bounded.**
+`set_read_timeout` bounds ONE `read()` syscall, not the request; `read_line` loops
+until a newline, so a peer answering slowly but *steadily* restarted the clock on
+every chunk and the total never expired. A `terminal_read` response carries terminal
+output chunks, so it is exactly the request that needs many reads. Separately,
+`TcpStream::connect` had **no timeout at all** and waits out the OS SYN retry
+schedule — minutes — on the cross-daemon proxy path, while the lock is held. Both
+now carry a deadline (`daemon_request_total_deadline_ms`, a multiple of the
+per-syscall budget so a merely-large response still completes).
+
+**Still open — the lock itself.** Bounding the wait does not stop `terminal_read`
+holding the runtime lock across a second daemon round trip. Candidate directions:
+resolve the proxy target and release the lock before the round trip (the shape
+`build_background_copy_updates` already uses — read what you need under the lock,
+do the slow thing outside it); or give the proxied read a much shorter budget than
+the direct one, since a preserved owner that has not answered in ~1 s is a
+different problem from a busy one.
+
+⛔ **DO NOT CITE `ui/block` AS EVIDENCE FOR THIS ENTRY, OR THIS AS EVIDENCE FOR IT.**
+The convergence was proposed and then TESTED by 11.4: temporal correlation of 16 GUI
+blocks against these 204 lock waits is at or below chance at every window from 500 ms
+to 10 s. **The daemon lock and the GUI-thread blocks are different mechanisms** and
+each needs its own falsifier. (Honest limit: n=16 is underpowered for a weak effect;
+it would have caught the strong one the convergence predicted.)
 
 **Falsifier:** with hold-time by request name in hand, if no handler holds the
 runtime lock longer than ~100 ms during a reported stall, this framing is wrong
