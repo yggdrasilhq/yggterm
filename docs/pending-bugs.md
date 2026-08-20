@@ -145,6 +145,20 @@ whole tree about twice, and a background row's stream repaints the foreground vi
 instrumentation is the missing instrument — measure WHICH component invalidates), then
 render granularity (sidebar/preview updates must not repaint the terminal viewport), signal
 coalescing (bound renders per second), and a cached negative for the declare probe.
+
+**That instrument now exists and is always on.** Trace plane, `layer:"dioxus"`, probe
+`dioxus_render/component_window`. Read it in three steps: `root_renders` is the denominator, so a
+component whose `renders` equals it was memoized by nothing; `renders_unattributed` counts root
+renders with **no state write in front of them**, which is the ~2x amplification measured rather
+than inferred and the number a coalescing fix must move; `causes[]` names the write site, ranked by
+`renders_preceded`. ⛔ **Rank by `renders_preceded`, never by `writes`** — ten writes before one
+render and one write before each of ten renders carry the same total and opposite costs, which is
+precisely how a chatty-but-cheap site outranks the one doing the damage. For the declare probe
+specifically, expect a high `renders_preceded` against a low `writes` if the negative re-derivation
+is driving renders, and the reverse if it is only churning. ⭐ The attribution is no longer behind
+`YGGTERM_TRACE_RENDER` or the storm-armed window — the reason it was gated (a formatted `String`
+key per write) is gone, which is why the previous twenty-one detected storms were all
+unattributed. Reading instructions and probe table: `docs/observability.md` §2.3.
 **Falsifier:** under the same streaming-row load, renders track user-visible changes (order
 of 0.1/s), and the viewport repaints only for its own session's bytes.
 
