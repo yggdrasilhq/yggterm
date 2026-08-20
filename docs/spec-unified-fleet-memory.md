@@ -30,7 +30,7 @@ Currently, each CLI harness maintains its own isolated memory store. When one ha
 
 ### 1.3 Scope & Non-Goals (What This Spec Does NOT Cover)
 - **Does NOT replace harness-native session context:** Each CLI harness continues to manage its own active conversation window and internal prompt memory.
-- **Does NOT commit memory into the git repository:** Per `feedback-no-session-data-in-repo`, all memory files live exclusively in user-space (`~/.yggterm/memory/` and `~/.claude/...`) and travel between fleet hosts (`***`, `dev`, `oc`) over SSH.
+- **Does NOT commit memory into the git repository:** Per `feedback-no-session-data-in-repo`, all memory files live exclusively in user-space (`~/.yggterm/memory/` and `~/.claude/...`) and travel between fleet hosts over SSH, the roster read from `~/.config/ygg-fleet/mesh`.
 - **Does NOT parse raw LLM transcripts into memory doors:** Distillation of transcripts into memory doors is performed by the working session during its handover ritual, not by a background heuristic parser.
 
 ### 1.4 Harness Isolation Law (No Cross-Harness Private Writes)
@@ -148,7 +148,7 @@ The CLI tool lives in `.agents/skills/yggterm-agent-fleet/ygg-memory.py` and is 
 | `ack` | Advances harness watermark globally (`--all`) or for specific files | **~10–20 tokens** |
 | `publish` | Ingests a memory door with optional `--target-harness` scope | **~20 tokens** |
 | `sync-harness` | Two-way sync between harness-local directory and matching unified doors | Local filesystem |
-| `sync-fleet` | Multi-host mesh synchronization across `***`, `dev`, `oc` over SSH | Network |
+| `sync-fleet` | Multi-host mesh synchronization across the configured fleet roster over SSH | Network |
 
 ### 4.2 Example Interaction Workflows
 
@@ -169,13 +169,23 @@ $ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness gemini
 
 ## 5. Multi-Host Fleet Synchronization Mesh
 
-Unified memory syncs across the fleet hosts (`***`, `dev`, `oc`, `manin`) following the established fleet protocol (`reference-fleet-memory-sync.md`):
+Unified memory syncs across the fleet hosts named by `~/.config/ygg-fleet/mesh`, following the established fleet protocol (`reference-fleet-memory-sync.md`):
 
 1. **Snapshot First:** Local memory is snapshotted to `~/.yggterm/memory-backups/<timestamp>/` before sync.
 2. **Two-Pass Mesh:** Pull from every reachable peer, then push to every reachable peer over SSH.
 3. **Newest-Wins per Door File (`rsync -az -u`):** Preserves recent edits without clobbering.
 4. **Append-Only Journal Merge:** Merges `journal.jsonl` entries deterministically sorted by timestamp and sequence ID.
 5. **No Auto-Delete:** Pruning is an intentional fleet archive operation (`~/.yggterm/memory-archive/`), never a local unilateral deletion.
+
+**⛔ The roster is configuration, and it lives outside every checkout.** `sync-fleet`
+resolves the peer list in one place — `resolve_fleet_mesh` in `ygg-memory.py` — reading
+`--mesh`, then `$YGG_FLEET_MESH`, then `~/.config/ygg-fleet/mesh` (one ssh alias per line,
+`#` comments). There is deliberately **no built-in default**: a default would put private
+host names back into a public tree, which is exactly where they used to be — hardcoded as
+the `--mesh` default here and a second time in `ygg-memory-sync`, so every push carried
+them and the two copies could drift. `ygg-memory-sync` now passes no roster at all, which
+is what leaves one owner. An unresolved roster raises, naming the three sources it tried;
+it never degrades to a silent no-op that reports success.
 
 ---
 

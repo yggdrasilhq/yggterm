@@ -43,7 +43,13 @@ done
 
 # Background: full sync for all namespaces + fleet mesh
 # Use systemd-run if available (kernel-optimized, coalesced), fallback to setsid
-TRIGGER_CMD="\"$YGG_MEM\" sync-harness --harness \"$HARNESS\" --all >/dev/null 2>&1; \"$YGG_MEM\" sync-fleet --mesh \"*** dev oc\" >/dev/null 2>&1"
+#
+# ⛔ NO --mesh HERE. This file used to name the fleet's hosts inline, which made
+# it a SECOND copy of the roster in a PUBLIC repo — private names on every push,
+# and two places to keep in step. `ygg-memory sync-fleet` is the one owner of
+# "who is in the mesh" and resolves it from $YGG_FLEET_MESH or
+# ~/.config/ygg-fleet/mesh; passing nothing is what lets it do that.
+TRIGGER_CMD="\"$YGG_MEM\" sync-harness --harness \"$HARNESS\" --all >/dev/null 2>&1; \"$YGG_MEM\" sync-fleet >/dev/null 2>&1"
 
 if command -v systemd-run >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1; then
   systemd-run --user --on-active=2 --unit="ygg-memory-sync-${HARNESS}-$$" --quiet \
