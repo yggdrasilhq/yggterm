@@ -25463,11 +25463,21 @@ mod tests {
         );
     }
 
+    /// ⛔ THE ID HAS TO BE INVENTED, and not only for the public-repo rule.
+    ///
+    /// This label falls through to the generated-copy store, so a test that
+    /// names a session which EXISTS on the machine running it asserts against
+    /// whatever that machine happens to have titled. It went red the day a
+    /// title sweep gave that session a real name — a true result reported as a
+    /// regression. An id no store can hold is what makes the fallback the only
+    /// path left. Same root as the settings-store tests in `pending-bugs.md`:
+    /// a test must not read the developer's `~/.yggterm`.
     #[test]
     fn remote_scanned_session_label_falls_back_to_short_id_not_generic_codex_session() {
         let session = RemoteScannedSession {
-            session_path: "remote-session://dev/019dfc5a-f5ca-7793-a44f-ee7f423aed38".to_string(),
-            session_id: "019dfc5a-f5ca-7793-a44f-ee7f423aed38".to_string(),
+            session_path: "remote-session://devhost/00000000-0000-4000-8000-0000000000d1"
+                .to_string(),
+            session_id: "00000000-0000-4000-8000-0000000000d1".to_string(),
             cwd: "/home/user/gh/yggterm".to_string(),
             started_at: String::new(),
             modified_epoch: 0,
@@ -25482,11 +25492,11 @@ mod tests {
             title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/example.jsonl".to_string(),
         };
-        let short_ids = HashMap::from([(session.session_path.clone(), "019dfc5a".to_string())]);
+        let short_ids = HashMap::from([(session.session_path.clone(), "00000000".to_string())]);
 
         let label = remote_scanned_session_label(&session, &short_ids);
 
-        assert_eq!(label, "019dfc5a");
+        assert_eq!(label, "00000000");
         assert_ne!(label, "Codex Session");
     }
     #[test]
