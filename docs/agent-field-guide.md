@@ -613,6 +613,33 @@ independently and identically that day; one version stripped tests and comments
 and one did not. Both were green. Only the decoy separated the fix from the
 placebo.
 
+### ⛔⛔ A `settings.json` EDIT UNDER A RUNNING GUI DOES NOT HOLD — THE GUI WRITES ITS OWN COPY BACK
+
+**Measured 2026-08-20.** The interface LLM's plan quota ran out, so the title chore was spending
+nine seconds per call to be refused. `interface_llm_model` was edited in `~/.yggterm/settings.json`
+on the desktop host, the write was read back and confirmed, and a probe against the new model
+returned 200. **Thirty-four minutes later the file said the old value again.**
+
+Nothing failed and nothing warned. The GUI holds settings in memory and persists the whole
+structure when anything in it changes; that write is a snapshot of what the GUI believes, and it
+does not merge. So an outside edit survives exactly until the next time the user or the app touches
+any setting at all.
+
+⇒ **Rules:**
+- **Never configure the app by editing its settings file underneath it.** A read-back proves the
+  write landed, not that it will still be there — and the interval before it is overwritten is
+  unbounded, so a check a minute later is not evidence either.
+- **A maintenance verb takes the value as a FLAG.** `server titles sweep --model <id>` names the
+  model for one run and touches no state, which is the shape any agent-run sweep should have.
+- **If a default genuinely must change, it is the owner's to change, through the app.** The file is
+  the app's output, not its input.
+
+⚠ The general form, and it is the reason this sits in the field guide rather than in a bug entry:
+**a long-lived process that owns a file will restore it from memory, so the file cannot be used as
+a channel INTO that process.** Same shape as reading `/proc/<pid>/environ` for flags applied with
+`set_var` after exec — the artefact on disk and the state in the process are two different things,
+and only one of them is running.
+
 ### ⛔⛔ A CHECKER THAT DIES WHEN IT PASSES — the success path is the least-exercised one
 
 **The tell:** a status hook that has run for weeks suddenly ends in a shell error

@@ -214,9 +214,11 @@ copies.
   (`plan_type: free`), taking ~9 s to say so, which is what the title chore spent a
   fifth of every hour on. Only he can decide whether to upgrade that plan or keep
   running on a different model. **Done meanwhile, and reversible in one field:** the
-  chore now pauses itself on a refusal rather than looping (`pending-bugs.md` [11.3]),
-  and `interface_llm_model` was switched to a working model on the two hosts that hold
-  endpoint credentials — the old value and a restore file are named in that entry.
+  chore now pauses itself on a refusal rather than looping (`pending-bugs.md` [11.3]), and
+  the fleet title sweep runs with `--model <id>` so it needs no settings change at all. A working
+  model is measured and named in that entry: `antigravity/gemini-3.7-flash-low`, same endpoint,
+  same key, ~15 s per title. ⚠ Changing the default is his because an agent CANNOT — a settings.json
+  edit under a running GUI is written back over from the GUI's own copy within the hour.
 
 ## Third parties only he can chase
 

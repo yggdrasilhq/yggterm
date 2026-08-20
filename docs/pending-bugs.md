@@ -343,7 +343,9 @@ from earlier days) — the process was alive and blocked, i.e. a UI-thread stall
 
 ## ⛔ [11.0] SEAT DERIVATION CROSSES CAMPAIGN ERAS AND SEATS ORCHESTRATORS BARE — TWO MIS-SEATS IN ONE SPAWN BATCH
 
-**Status:** OPEN — measured 2026-08-20 on a sibling campaign's spawn batch; owner-reported both
+**Status:** OPEN
+
+Measured 2026-08-20 on a sibling campaign's spawn batch; owner-reported both faces.
 
 Two faces of the claim/seat derivation (`ygg-claim.sh` and callers that inherit its rules):
 
@@ -426,13 +428,17 @@ person waiting for an answer. The provider's absolute wake time is honoured but 
 minutes** — obeying a three-week hint literally would trade a loud failure for a silent one, and
 the cap makes the outage cost two probe calls an hour instead of 125.
 
-**Still open, and it is the endpoint rather than the code:** nothing can be titled or summarised
-anywhere on the fleet while the configured model's quota is out. `interface_llm_model` was switched
-to `antigravity/gemini-3.7-flash-low` (measured 200 OK, ~15 s, a proper noun-phrase title and a
-usable timeline paragraph) on the two hosts that hold endpoint credentials; the third holds neither
-endpoint nor key and was left alone. **To reverse:** put the old value back in
-`~/.yggterm/settings.json` — each host kept a `settings.json.bak-title-model-<epoch>` beside it.
-The plan decision itself is his: `owner-attention.md`.
+**Still open, and it is the endpoint rather than the code:** nothing the GUI or the daemon
+generates can be titled or summarised anywhere on the fleet while the configured model's quota is
+out. A working alternative is measured and named in `owner-attention.md` — `antigravity/gemini-3.7-flash-low`
+returned 200 OK in ~15 s with a proper noun-phrase title and a usable timeline paragraph, on the
+same endpoint and key.
+
+⚠ **Setting it is HIS, and not only by preference — an agent cannot make it stick.** A settings.json
+edit under a running GUI was written back over within the hour from the GUI's own in-memory copy, so
+the file is not the place to change this from the outside. Both edits were reverted to the values he
+had. The maintenance path needs no setting at all: `server titles sweep --model <id>` names the
+model for one run and touches nothing.
 
 ## ⛔⛔ [11.6] A LAUNCH THAT NEVER REACHED ITS CLI LEAVES A HUSK ROW THAT LOOKS IDLE
 
