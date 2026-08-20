@@ -12,6 +12,50 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.0] A DAEMON BORN INSIDE AN AGENT SESSION MARKS EVERY CLI IT SPAWNS AS A CHILD — TRANSCRIPTS SILENTLY OFF, AND THE POISON IS HEREDITARY
+
+**Status:** OPEN (code fix owed; fleet-wide interim mitigation in place)
+
+Found 2026-08-20 ~23:2x from two incidents that turned out to be one bug.
+
+**Mechanism.** A yggterm daemon started from inside a Claude Code session (an agent's
+shell, an ssh command from an agent, or a daemon whose ANCESTOR was) inherits the
+agent's environment, including `CLAUDE_CODE_CHILD_SESSION=1`. The daemon passes its
+environment to every CLI it spawns or re-resumes, and claude-code reads the marker as
+"I am a nested child session" and turns transcript persistence OFF — silently except
+for a footer warning nobody instruments. The poison is HEREDITARY: a daemon spawning
+its version-bump successor passes the same environment, so it survives every roll and
+never washes out until some daemon in the lineage is started from a clean shell.
+
+**The two incidents it explains.**
+1. An orchestrator row re-resumed during a daemon swap came back with transcript
+   saving off — its JSONL froze at the re-resume moment while the session kept
+   working. The successor-harvest path (fleet skill §6) reads that file.
+2. The husk misread that removed a WORKING delegate row: the delegate, spawned by a
+   poisoned daemon, never wrote a transcript at all while committing 564 lines across
+   two repos. A transcript-keyed liveness check then read the live worker as a husk —
+   with the CORRECT uuid (for claude-code rows the row uuid IS `--session-id`; the
+   lane that measured this falsified the earlier "uuid mismatch" theory). Recurrence
+   armed: the replacement delegate spawned tonight carries the same marker and runs
+   transcript-less right now.
+
+**Fix direction (code, next roll):** scrub agent-session markers
+(`CLAUDE_CODE_CHILD_SESSION`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, and kin) at BOTH
+spawn points — the launch environment composed for first-class agent rows, and the
+environment a daemon hands its own successor. A first-class row is never anyone's
+child session by construction.
+
+**Interim (in force since 2026-08-20 ~23:2x):** `~/.claude/settings.json` on all three
+hosts sets `env.CLAUDE_CODE_FORCE_SESSION_PERSISTENCE="1"`, so every NEW claude spawn
+persists regardless of inherited markers. Known side effect: one-shot `claude -p`
+couriers also persist transcripts. Live poisoned processes (the orchestrator row, the
+replacement delegate) stay transcript-less until their next restart — bounce each at a
+safe boundary, never mid-turn.
+
+**Falsifier:** start a daemon from inside an agent session, spawn a row through it,
+and read the row's `/proc/<pid>/environ` — no agent-session marker may appear, and the
+row's JSONL must exist and grow from turn one.
+
 ## [11.11] A COMPOSITOR-DRIVEN FULLSCREEN KEEPS ITS ROUNDED CORNERS, SO THEY COMPOSITE ONTO BLACK
 
 **Status:** OPEN
