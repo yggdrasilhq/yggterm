@@ -65,18 +65,19 @@ Multiple agent sessions repeatedly struggled or reported misleading success on m
 "Works" means **verified** by `server <area> ls --json` + `scripts/check-<area>.py` `0` on
 `***`/`dev`/`***` **and** a faithful screenshot with the right glyph/colour/title.
 "Shipped" means code landed but the verb/oracle still reports a lie. "Gap" means the descriptor
-declares `store_scan_gap` (honest `unknown`, not `false`).
+declares `store_scan_gap` (honest `unknown`, not `false`). ⚠ Empty `session_store_globs`
+does NOT mean gapped — see §Scanned, not gapped.
 
 | CLI | slug | schemes | store | `TitleAuthority` | startpage `durable` | titles `effective_title` | cwdtree `icon` | live `kind`/`source` | resume `ready` | launch/resume cmd | `check-*` oracle |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | **codex** | `codex` | `remote-session://` / `codex-runtime://` `local://` | `~/.codex/sessions/**/rollout-*.jsonl` (id inside file, name carries timestamp) | `Generated` (none in file) | **Works** ✅ `order_for_startpage` `modified_epoch` | **Works** ✅ `>_` `#0f766e` — generated title via `SessionTitleStore` | **Works** ✅ `>_` `#0f766e` `build_local_cwd_tree` | **Works** ✅ `codex` `codex-runtime://` `RemoteBootstrap` | **Works** ✅ `server resume ls` probes `daemon_owns_runtime+attach_ready_seen` (gates neutered 2026-08-16) | `codex resume <id>` measured | `check-startpage/titles/cwdtree` `0` |
 | **claude-code** | `claude-code` | `remote-cc://` / `cc-runtime://` | `~/.claude/projects/*/*.jsonl` (filename is id, `custom-title` > `ai-title`) | `Store` (`custom` > `ai`) | **Works** ✅ | **Works** ✅ `*_ #c2410c` | **Works** ✅ `*_` | **Works** ✅ `claude_code` `cc-runtime://` | **Works** ✅ | `claude -r <id>` | `0` |
 | **muse** | `muse` | `remote-muse://` / `muse-runtime://` | `~/.local/share/muse/sessions/**/session.jsonl` + `session-index.db` (`sessions.workspace_root→cwd, title, updated_at_us`, fallback `route_facts.cwd` → `heuristic_title_from_context`) | `Store` (tightened 2026-08-17, `session-index.db.title` authoritative, shorthash/weird filtered) | **Works** ✅ `scan_all_durable_sessions` (`M_ #86198f`, noise DELETE, weird-title filtered, `is_agent_session` gated) | **Works** ✅ `server titles ls` (`M_` + `effective_title` Store-heuristic, shorthash `a8f6dbd1` filtered) | **Works** ✅ `M_ #86198f` | **Works** ✅ `remote-muse://` restored as `LiveSsh` with `kind: SessionKind::Muse` and `resume-muse` | **Works** ✅ `working_screen_phrases` wired | `muse resume <uuid>` / `muse --yolo` | `0` |
-| **antigravity** | `antigravity` | `remote-agy://` / `agy-runtime://` | `~/.gemini/antigravity-cli/conversations/*.db`, `brain/*/.system_generated/logs/transcript.jsonl`, `history.jsonl` | `Store` (`conversation_summaries`) | **Works** ✅ `4` durable `A_ #1557b0` | **Works** ✅ `conversation_summaries` title + `history.jsonl` / prompt fallback | **Works** ✅ `A_ #1557b0` | **Works** ✅ `remote-agy://` restored as `LiveSsh` with `kind: SessionKind::Antigravity` and `resume-agy` | **Works** ✅ `working_screen_phrases` wired | `agy --conversation <id>` | `0` |
+| **antigravity** | `antigravity` | `remote-agy://` / `agy-runtime://` | `~/.gemini/antigravity-cli/conversation_summaries.db` (the INDEX — 999 rows, of which 4 are sessions), `brain/*/.system_generated/logs/transcript_full.jsonl`, `history.jsonl` | `Store` (`conversation_summaries`) | **Works** ✅ `4` durable `A_ #1557b0` — the other 995 are batch conversations, see §The agy durable rule | **Works** ✅ `conversation_summaries` title + `history.jsonl` / prompt fallback | **Works** ✅ `A_ #1557b0` | **Works** ✅ `remote-agy://` restored as `LiveSsh` with `kind: SessionKind::Antigravity` and `resume-agy` | **Works** ✅ `working_screen_phrases` wired | `agy --conversation <id>` | `0` |
 | **pi** | `pi` | `remote-pi://` / `pi-runtime://` | `~/.pi/agent/sessions/*/*.jsonl` (first line `id`/`cwd`) | `Store` | **Works** ✅ | **Works** ✅ `π_ #be185d` | **Works** ✅ `π_` | **Works** ✅ `remote-pi://` restored as `LiveSsh` with `SessionKind::Pi` | **Works** ✅ | `pi --session <id>` | `0` |
 | **qwen** | `qwen` | `remote-qwen://` / `qwen-runtime://` | `~/.qwen/projects/*/chats/*.jsonl` (first line `id`/`cwd`, exclude `.runtime.`) | `Store` | **Works** ✅ | **Works** ✅ `Q_ #6d28d9` | **Works** ✅ `Q_` | **Works** ✅ `remote-qwen://` restored as `LiveSsh` with `SessionKind::QwenCode` | **Works** ✅ | `qwen --resume <id>` | `0` |
-| **opencode** | `opencode` | `remote-opencode://` / `opencode-runtime://` | `~/.local/share/opencode/opencode.db` single SQLite (`session` table `id/directory/title`) — **declared-unscannable** (`store_scan_gap` true) | `Store` | **Gap — by design** — `scan` is honest `unknown` (`true` not `false`): `server <area> ls` declares `store_scan_gap` warning. | **Gap** | **Gap** | **Works** ✅ `remote-opencode://` restored as `LiveSsh` | **Works** ✅ | `opencode --session <id>` | `Gap` by design |
-| **kimi** | `kimi` | `remote-kimi://` / `kimi-runtime://` | `~/.kimi/sessions/<md5(cwd)>/<id>/context.jsonl` — **declared-unscannable** (`md5(cwd)` bucket, `cwd` not recoverable from path) | `Store` | **Gap — by design** — same `true` honest unknown; closing needs `md-5` or indexing `kimi.json` directly. | **Gap** | **Gap** | **Works** ✅ `remote-kimi://` restored as `LiveSsh` | **Works** ✅ | `kimi --resume <id>` | `Gap` by design |
+| **opencode** | `opencode` | `remote-opencode://` / `opencode-runtime://` | `~/.local/share/opencode/opencode.db` single SQLite (`session` table `id/directory/title`) — **scanned by `scan_opencode_sessions`**, no glob can express one DB file | `Store` | **Works** ✅ dedicated scanner (corrected 2026-08-20 — see §Scanned, not gapped) | **Works** ✅ | **Works** ✅ | **Works** ✅ `remote-opencode://` restored as `LiveSsh` | **Works** ✅ | `opencode --session <id>` | `0` |
+| **kimi** | `kimi` | `remote-kimi://` / `kimi-runtime://` | `~/.kimi/sessions/<md5(cwd)>/<id>/context.jsonl` — **scanned by `scan_kimi_sessions`**, which reverses the md5 bucket via `kimi.json` `work_dirs[].path` | `Store` | **Works** ✅ dedicated scanner (corrected 2026-08-20 — see §Scanned, not gapped) | **Works** ✅ | **Works** ✅ | **Works** ✅ `remote-kimi://` restored as `LiveSsh` | **Works** ✅ | `kimi --resume <id>` | `0` |
 | **grok-build** | `grok-build` | `remote-grok://` / `grok-runtime://` | `~/.grok/sessions/*/*/summary.json` (`info.id`/`cwd`) | `Store` | **Works** ✅ | **Works** ✅ `G_ #000000` | **Works** ✅ `G_` | **Works** ✅ `remote-grok://` restored as `LiveSsh` | **Works** ✅ `working_screen_phrases` wired | `grok --resume <id>` | `0` |
 | **codex-litellm** | `codex-litellm` | `codex-litellm://` | `~/.codex-litellm/sessions/**/rollout-*.jsonl` (`.bak.` excluded) | `Generated` | **Works** ✅ | **Works** ✅ | **Works** ✅ | **Works** ✅ | **Works** ✅ | `codex-litellm resume <id>` | `0` |
 
@@ -94,7 +95,7 @@ The protocol system enforces uniform, structured compliance across all 10 regist
 * **Antigravity:** Multi-root discovery across `~/.gemini/antigravity-cli/conversations/*.db`, `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`, and legacy `~/.antigravitycli/*.json`. Discovers additional sessions from `conversation_summaries.db`.
 * **Pi / Qwen:** Globs `~/.pi/agent/sessions/*/*.jsonl` and `~/.qwen/projects/*/chats/*.jsonl`. Parses session ID and cwd from initial turn JSON.
 * **Grok-Build:** Glob `~/.grok/sessions/*/*/summary.json`. Extracts `info.id` and `info.cwd`.
-* **OpenCode / Kimi:** Declared `store_scan_gap` (honest unknown `true`).
+* **OpenCode / Kimi:** Scanned by `scan_opencode_sessions` / `scan_kimi_sessions`. Empty `session_store_globs`, no declared gap — see §Scanned, not gapped.
 
 ### Issue Heading 2: Titling Authority & Prompt Extraction
 * **Rule:** Titling authority is governed by `TitleAuthority` in `AgentCliDescriptor`: `Store` (CLI transcript/DB holds authoritative user/AI titles) vs `Generated` (`SessionTitleStore` synthesizes or records titles).
@@ -200,3 +201,76 @@ The protocol system enforces uniform, structured compliance across all 10 regist
 
 
 
+
+---
+
+## Scanned, not gapped — what empty `session_store_globs` actually means
+
+**Corrected 2026-08-20.** This file recorded OpenCode and Kimi as
+*declared-unscannable*, `store_scan_gap: true`, "Gap by design". None of that was
+true of the shipped code, and had not been for some time:
+
+* every descriptor in `AGENT_CLIS` carries `store_scan_gap: None`;
+* `scan_all_durable_sessions` dispatches OpenCode to `scan_opencode_sessions`
+  (one SQLite `session` table) and Kimi to `scan_kimi_sessions` (md5 buckets
+  reversed through `kimi.json` `work_dirs[].path`), and both return rows.
+
+The reason it read as a gap is that all three `ls` verbs printed
+
+> `OpenCode has no store globs and no declared gap — sessions will be invisible`
+
+on **every single run**, because they asked only whether a descriptor has globs.
+A store that is one DB file, or a tree bucketed by a hash of the cwd, cannot be
+expressed as a glob — that is why these two have a hand-written scanner instead,
+not evidence that they are unscanned.
+
+⇒ The question has one owner now:
+`yggterm_core::startpage::kind_has_dedicated_scanner`. The scanner dispatch, the
+three warnings and `every_agent_cli_declares_a_store` all ask it, so a CLI cannot
+be scanned and advertised as invisible at the same time. A CLI with no globs must
+have a dedicated scanner **or** a declared gap; `a_scanned_cli_is_never_reported_invisible`
+fails the build otherwise.
+
+⚠ The general shape, worth carrying: **a warning that fires on every run stops
+being read.** Both of these had been printing for long enough that a whole doc
+section was written around them as though they described reality.
+
+## The agy durable rule — why 999 conversations are 4 sessions
+
+`conversation_summaries.db` is an INDEX of everything the CLI has ever done, not
+a list of sessions to resume. Measured 2026-08-20 on a 999-row store:
+
+| class | rows | shape |
+|---|---|---|
+| batch, mixed workspace | 499 | a real repo root **plus** an ephemeral scratch dir; one burst, `step_count` 6 |
+| batch, scratch-only workspace | 494 | scratch roots only — these became the "/tmp forest" of one-session cwd-tree groups |
+| real sessions | 6 | real roots only; 4 hold steps, 2 are empty shells |
+
+⛔ **Do not reach for the columns that look built for this.** `source`, `status`,
+`agent_name`, `nesting_depth`, `parent_conversation_id`, `battle_id`,
+`not_fully_idle` and `last_user_input_step_index` were uniformly empty or default
+across all 999 rows, and **`killed` was 0 for every row** — so the scan's
+`WHERE killed=0`, which reads like a guard, filters nothing. Only `step_count`
+and `workspace_uris` carry signal.
+
+⇒ `antigravity_row_is_durable`: a workspace exists, none of its roots is
+ephemeral scratch, and `step_count > 0`. 999 → 4, matching the `4` this file had
+already recorded from an independent count.
+
+⚠ **The rule reads the PATH, not the filesystem.** "Does the workspace dir still
+exist" is the tempting version and it measured worse — two batch conversations
+still had live scratch dirs and survived it — besides making the scan
+non-deterministic as temp dirs are reaped.
+
+⚠ **The DB is authoritative for BOTH halves.** The durable verdict gates the file
+walk as well, or a filtered batch conversation returns through its brain
+transcript. That was not hypothetical: the descriptor's glob said
+`transcript.jsonl` while all 497 files on disk are `transcript_full.jsonl`, so
+the file half of the agy scan had been dead while reading as fully wired.
+
+Per-row recency: each row's own `last_modified_time` is parsed
+(`parse_antigravity_last_modified_ms`). It is ISO-8601 with a **space**
+separator, so it needs converting before RFC-3339 will accept it, and
+never-written rows carry `0001-01-01` and clamp to 0. Every row used to be
+stamped with the DB **file's** mtime — one shared fake recency for the whole
+store, which moved every time the CLI touched it.

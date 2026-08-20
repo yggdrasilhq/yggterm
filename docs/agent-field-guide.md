@@ -1546,3 +1546,82 @@ Diagnostics available
 - `~/.yggterm/agent-incidents.jsonl` — durable agent resume-error incidents.
 - `scripts/render_fail_patterns.py` — groups render fail patterns.
 
+
+### `killed=0` in the agy store filters nothing, and the columns that look built for this are empty
+
+`scan_antigravity_sessions` selected `WHERE killed=0` and read like a guard.
+Measured 2026-08-20 across a 999-row `conversation_summaries.db`: **every row had
+`killed=0`**, so the clause decided nothing. The same store had `source`,
+`status`, `agent_name`, `nesting_depth`, `parent_conversation_id`, `battle_id`,
+`not_fully_idle` and `last_user_input_step_index` uniformly empty or default —
+eight more columns that each look like the discriminator and are not one.
+
+⇒ **Before filtering on a store column, print its distribution.** A column whose
+name promises a distinction can hold one value for the whole table, and a filter
+on it is indistinguishable from no filter until you look. Only `step_count` and
+`workspace_uris` carried signal; the rule built on them is
+`antigravity_row_is_durable` (`docs/cli-integration.md` §The agy durable rule).
+
+### A count computed before a dedup, shipped beside the rows it disagrees with
+
+`server startpage ls` reported `durable_count: 2394` in the same JSON object as
+1742 rows. The count was `rows.len() + remote_total`, taken **before** the
+`all_rows_map` merge that produced the rows — so every session present both
+locally and on a peer was counted twice.
+
+⇒ **A total and the list it describes must be derived from the same value.** The
+failure is invisible from either side alone: the rows were right, the arithmetic
+was right, and only holding them together shows it. Both oracles now assert
+`durable_count == len(rows)` whenever the reply is not truncated.
+
+### `--json` capped at 200 while the human format did not, and said `group_count: 527` beside 8 groups
+
+The default `--limit 200` truncated the payload with nothing in it saying so, so
+a machine reader saw a full-looking reply with a header count 65× its own
+contents. The replies now carry `limit` and `truncated`.
+
+⚠ Related, same verbs: `server cwdtree ls --help` **ran the verb** — a full store
+walk that printed sessions, the one output nobody reads as help. `--help` is now
+answered before the scan in all three `ls` verbs.
+
+### A warning that fires on every run stops being read
+
+All three `ls` verbs printed `OpenCode has no store globs and no declared gap —
+sessions will be invisible` on every invocation, while `scan_opencode_sessions`
+read that store perfectly well. The predicate asked only about globs; a store
+that is one SQLite file cannot have one. It had been printing long enough that
+`docs/cli-integration.md` documented both CLIs as *"Gap — by design"*, which was
+never true of the shipped code.
+
+⇒ Owner: `kind_has_dedicated_scanner`, shared by the scanner dispatch, the three
+warnings and the registry test.
+
+### `prompt_count = 0` does not mean the file is empty — and must never drive a delete
+
+Four muse sessions on one host carry `prompt_count: 0` and `title: "New session"`
+in `session-index.db` with **12 KB of real records** behind them: metadata,
+route facts, a clean `session_end`, ~12 minutes of uptime. They are correctly
+SKIPPED by the scan (nobody typed, so there is nothing to resume) — but the index
+row is not evidence that the file is empty.
+
+⛔ `is_noise_session_file` classifies; it has exactly two callers and both
+`continue`. **There is no delete path in the scan**, and a claim that one exists
+has circulated — do not build on it. `scanning_never_removes_a_session_file` pins
+this, because the cost of getting it wrong is somebody else's transcripts.
+
+### An oracle can be blind to an entire CLI and report it as the verb's fault
+
+`check-startpage/cwdtree/titles` walked FILES only. Antigravity keeps its index
+in SQLite, so the walk found none of it and reported all 999 agy rows as
+`verb has ids not in manual walk (extra)` — the checker's own blind spot,
+attributed to the code under test.
+
+Two more of the same shape in those scripts: the manual walk compared with
+`abs(verb - manual) > 10` and `> 2` slack, which cannot see ten missing sessions
+or two missing folders; and rows the daemon scanned from **peer machines** can
+never appear in a local walk, so they showed as permanent drift. All three are
+fixed; the rules are shared in `scripts/ygg_scan_truth.py`.
+
+⭐ **`YGGTERM_CHECK_BIN=./target/release/yggterm-headless`** points an oracle at
+your own build. Without it the scripts run `~/.local/bin/yggterm-headless` — the
+INSTALLED binary — so a lane can "verify" a fix it never actually tested.
