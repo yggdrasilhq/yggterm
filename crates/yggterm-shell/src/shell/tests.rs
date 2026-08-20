@@ -25525,6 +25525,49 @@ mod tests {
         );
     }
 
+    /// ⛔ A ROW WITH NO TURNS IS NEW, NOT UNTITLED.
+    ///
+    /// Three muse rows on the desktop wore a 7-character hash: spawned minutes
+    /// earlier, nobody had typed into them, so every title source was
+    /// legitimately empty and the chain fell to the short id — the shorthash
+    /// the title law forbids, arrived at honestly. The CLI's own lifecycle has
+    /// a name for that state and this is where it belongs.
+    ///
+    /// The second half is the one that would go unnoticed: the humanized
+    /// fallback used to be hardcoded to Codex, so any other CLI's row that
+    /// reached it was named after a CLI it is not.
+    #[test]
+    fn a_scanned_row_with_no_turns_shows_its_cli_placeholder_not_a_short_hash() {
+        let mut session = RemoteScannedSession {
+            session_path: "remote-muse://devhost/00000000-0000-4000-8000-0000000000e1".to_string(),
+            session_id: "00000000-0000-4000-8000-0000000000e1".to_string(),
+            cwd: "/home/user".to_string(),
+            started_at: String::new(),
+            modified_epoch: 0,
+            event_count: 0,
+            user_message_count: 0,
+            assistant_message_count: 0,
+            title_hint: String::new(),
+            recent_context: String::new(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: false,
+            title_is_explicit: false,
+            storage_path: String::new(),
+        };
+        let short_ids =
+            HashMap::from([(session.session_path.clone(), "0000000".to_string())]);
+
+        let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
+        assert_eq!(label, "New Muse Code Session");
+
+        // Once a turn exists the placeholder is no longer the truth, and the
+        // ordinary chain takes over again.
+        session.user_message_count = 1;
+        let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
+        assert_ne!(label, "New Muse Code Session");
+    }
+
     #[test]
     fn remote_scanned_session_label_falls_back_to_short_id_not_generic_codex_session() {
         let session = RemoteScannedSession {
