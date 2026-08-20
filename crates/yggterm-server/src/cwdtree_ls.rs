@@ -181,14 +181,12 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
                             // mis-classified codex-runtime as Muse and local:// as
                             // Muse, producing the kind mismatch seen on oc (019da16a
                             // codex labelled as claude-code).
-                            yggterm_core::agent_scheme::session_kind_for_path(&full_path)
-                                .or_else(|| yggterm_core::agent_cli::agent_cli_for_store_path(&full_path).map(|d| d.kind))
-                                .unwrap_or_else(|| {
-                                    if full_path.starts_with("remote-cc://") { SessionKind::ClaudeCode }
-                                    else if full_path.starts_with("remote-session://") || full_path.starts_with("codex-runtime://") { SessionKind::Codex }
-                                    else if full_path.starts_with("remote-muse://") { SessionKind::Muse }
-                                    else { SessionKind::ClaudeCode }
-                                })
+                            // Shared with the start page — see
+                            // `session_kind_for_row`. The prefix ladder this
+                            // replaces duplicated what the registry already
+                            // knows, and the start page's copy of it had drifted.
+                            yggterm_core::agent_scheme::session_kind_for_row(&full_path, &icon_kind)
+                                .unwrap_or(SessionKind::ClaudeCode)
                         }
                     };
                     let display_path = full_path.clone();

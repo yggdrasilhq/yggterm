@@ -72,7 +72,7 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         kind: None,
         agent: true,
         legacy: false,
-        example: "local://00000000-0000-4000-8000-000000000001",
+        example: "local://00000000-0000-4000-8000-00000000qw01",
     },
     SchemeDescriptor {
         // Historical name — this is the remote CODEX row scheme
@@ -84,7 +84,7 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         kind: Some(SessionKind::Codex),
         agent: true,
         legacy: false,
-        example: "remote-session://devhost/00000000-0000-4000-8000-000000000002",
+        example: "remote-session://devhost/00000000-0000-4000-8000-00000000gr02",
     },
     SchemeDescriptor {
         prefix: "remote-cc://",
@@ -93,7 +93,7 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         kind: Some(SessionKind::ClaudeCode),
         agent: true,
         legacy: false,
-        example: "remote-cc://devhost/00000000-0000-4000-8000-000000000003",
+        example: "remote-cc://devhost/00000000-0000-4000-8000-00000000cx03",
     },
     // ── Runtime keys ───────────────────────────────────────────────────────
     SchemeDescriptor {
@@ -103,7 +103,7 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         kind: Some(SessionKind::Codex),
         agent: true,
         legacy: false,
-        example: "codex-runtime://00000000-0000-4000-8000-000000000004",
+        example: "codex-runtime://00000000-0000-4000-8000-00000000ms04",
     },
     SchemeDescriptor {
         prefix: "cc-runtime://",
@@ -112,7 +112,7 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         kind: Some(SessionKind::ClaudeCode),
         agent: true,
         legacy: false,
-        example: "cc-runtime://00000000-0000-4000-8000-000000000005",
+        example: "cc-runtime://00000000-0000-4000-8000-00000000un05",
     },
     // ── The 2026-08-08 intake. Every row here is DERIVED from its
     // `AgentCliDescriptor` (`remote_row_scheme` / `runtime_key_scheme`) and the
@@ -420,6 +420,49 @@ pub fn session_kind_for_path(path: &str) -> Option<SessionKind> {
         .and_then(|scheme| scheme.kind)
 }
 
+/// The [`SessionKind`] a SIDEBAR/START-PAGE row is, from the path it carries and
+/// the icon slug it reports.
+///
+/// ⚖ ONE owner for a question two surfaces were answering separately, and
+/// getting differently. The start page kept its own `match icon_kind` hand-list
+/// whose arms spelled three slugs wrong — `"qwen"`/`"grok"` where the registry
+/// says `qwen-code`/`grok-build`, and no arm at all for the codex family, which
+/// reports the historical `"session"`. Every one of those fell through to a
+/// guess-by-prefix that answered **Muse** for anything `local://`, which is the
+/// birth scheme EVERY local CLI row uses. So a local codex, qwen or grok row was
+/// labelled Muse on the start page while the cwd tree, which had already been
+/// made registry-derived, labelled it correctly.
+///
+/// Resolution order, most authoritative first:
+/// 1. the path's own registered scheme,
+/// 2. the store the path points into,
+/// 3. the icon slug, matched against the registry rather than a hand-list.
+///
+/// `None` ⇒ genuinely unknown. ⛔ Callers must not turn that into a default CLI:
+/// naming a row after the wrong CLI is what sends its clicks down the wrong
+/// resume path.
+pub fn session_kind_for_row(full_path: &str, icon_kind: &str) -> Option<SessionKind> {
+    if let Some(kind) = session_kind_for_path(full_path) {
+        return Some(kind);
+    }
+    if let Some(descriptor) = crate::agent_cli::agent_cli_for_store_path(full_path) {
+        return Some(descriptor.kind);
+    }
+    let icon_kind = icon_kind.trim();
+    if icon_kind.is_empty() {
+        return None;
+    }
+    // `"session"` is the codex family's historical mark, kept because it is what
+    // ships on the wire; every other CLI reports its own slug.
+    if icon_kind == "session" {
+        return Some(SessionKind::Codex);
+    }
+    crate::agent_cli::AGENT_CLIS
+        .iter()
+        .find(|descriptor| descriptor.slug == icon_kind)
+        .map(|descriptor| descriptor.kind)
+}
+
 /// Builds the canonical remote session path for an agent kind, machine key, and session id.
 pub fn remote_agent_session_path(kind: SessionKind, machine_key: &str, session_id: &str) -> String {
     let prefix = remote_agent_row_schemes()
@@ -689,5 +732,48 @@ mod tests {
         assert_eq!(sorted_remotes, sorted_expected);
         assert!(remotes.contains(&"remote-session://"));
         assert!(remotes.contains(&"cc-runtime://"));
+    }
+
+    #[test]
+    fn a_row_is_named_by_the_registry_not_by_a_prefix_guess() {
+        use crate::SessionKind;
+        // ⛔ `local://` is the birth scheme EVERY local CLI row uses, so it can
+        // never identify one. The start page used to read it as Muse, which
+        // mislabelled every local codex, qwen and grok row.
+        assert_eq!(
+            session_kind_for_row("local://00000000-0000-4000-8000-00000000qw01", "qwen-code"),
+            Some(SessionKind::QwenCode),
+        );
+        assert_eq!(
+            session_kind_for_row("local://00000000-0000-4000-8000-00000000gr02", "grok-build"),
+            Some(SessionKind::GrokBuild),
+        );
+        // The codex family reports the historical mark rather than its slug.
+        assert_eq!(
+            session_kind_for_row("local://00000000-0000-4000-8000-00000000cx03", "session"),
+            Some(SessionKind::Codex),
+        );
+        // A path that names its own scheme outranks the icon entirely.
+        assert_eq!(
+            session_kind_for_row("remote-muse://workstation/00000000-0000-4000-8000-00000000ms04", "session"),
+            Some(SessionKind::Muse),
+        );
+        // ⛔ A directory that merely CONTAINS a CLI's name is not that CLI —
+        // the old ladder matched any path containing "claude".
+        assert_eq!(
+            session_kind_for_row("local://00000000-0000-4000-8000-00000000un05", ""),
+            None,
+            "unknown must stay unknown rather than defaulting to a CLI"
+        );
+        // Every registered CLI's own slug round-trips.
+        for descriptor in crate::agent_cli::AGENT_CLIS.iter() {
+            let resolved = session_kind_for_row("", descriptor.slug);
+            assert!(
+                resolved.is_some(),
+                "{} reports slug {} and must resolve",
+                descriptor.display_name,
+                descriptor.slug
+            );
+        }
     }
 }
