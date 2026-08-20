@@ -791,6 +791,38 @@ daemon's own parser then also confirmed, but only after the blank test was
 corrected; had the banner been drawn the common way, the first answer would have
 been a fabricated bug report against an innocent CLI.
 
+### ⛔⛔ A REMOTE BRANCH THAT SKIPS THE GUARD BLOCK INVERTS THE SAFETY GRADIENT
+
+*Measured 2026-08-20, `server app terminal adopt`.* The verb returned
+success-shaped — `started live::…`, `purpose: "adopt outer PTY … via reptyr -T"`
+— and produced a bare remote shell with **no adoption at all**.
+
+Every check (pid exists · `reptyr` present · the non-dumpable refusal · PTY
+leader) sat inside `if !is_remote_adopt`. The reasoning above it was **right**:
+this host's `/proc` cannot answer for another host's pid. The remedy was wrong —
+it SKIPPED the guard instead of asking the right machine.
+
+⚠ **The path with LESS local knowledge got LESS checking**, which is backwards,
+and it reads as caution — the local check genuinely *would* have been wrong —
+which is exactly why it survives review. ⇒ **Whenever a local verb grows an
+over-ssh twin, ask where the guard belongs: on the machine that owns the thing,
+never on the machine that happens to be running the verb.**
+
+⭐ **The tell that it ran on the right machine** is that the refusal names the
+REMOTE artefact: `adopt_refused: pid … exe /…/@anthropic-ai/claude-code/bin/claude.exe
+is non-dumpable …`. A guard that cannot name what it inspected did not inspect it.
+And an unreachable machine must yield NO refusal rather than a false one — being
+unable to check is not evidence of a fault.
+
+⛔ **Claude Code and Muse can never be `reptyr`-adopted**, at any `ptrace_scope`:
+node binaries with `PR_SET_DUMPABLE 0` + seccomp. So **adoption is not a recovery
+for a frozen agent row.** When an agent's PTY master dies with its daemon the
+terminal is gone for good; the CONVERSATION is not, because it is in the CLI's
+transcript. Recovery is a relay **handover** while the agent still works, or —
+once it is idle — killing the orphan and resuming that session id in a fresh row.
+⭐ The double-resume guard is CORRECT and unblocks by itself once the orphan is
+gone: the guard was never the bug, the missing recovery path was.
+
 ## 2. Profiling recipes that work
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
