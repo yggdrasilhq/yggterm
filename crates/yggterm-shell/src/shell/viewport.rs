@@ -13338,7 +13338,7 @@ fn TerminalCanvas(
                                 onclick: {
                                     let new_tab_path = web_surface_session_path.clone();
                                     // The ONE opener. It places the tab
-                                    // (`WebTabOrigin::Append` — nothing opened
+                                    // (`WebTabOrigin::Top` — nothing opened
                                     // it) and focuses the omnibox, because the
                                     // request says the tab is Blank. The
                                     // hand-copied `setTimeout` snippet that used

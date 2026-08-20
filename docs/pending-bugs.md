@@ -19662,3 +19662,36 @@ downgrade the verdict to `UNPROVEN (row lives on <host>; probe ran on <this host
 reader knows the instrument's reach ended before the answer did.
 
 ---
+
+## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
+
+**Status:** OPEN. Hit 2026-08-20 on the shared `~/gh/yggterm` checkout.
+
+The shared checkout is used by several lanes at once. Something rebased it onto `origin/main`
+mid-flight; to do that it ran a `stash` first. The rebase finished, the branch moved, and the
+stash **was never popped**.
+
+⇒ A lane holding a finished, tested, uncommitted unit came back to `git status` reporting a
+single modified lock file. The unit was not lost — it was sitting in `stash@{0}` — but nothing
+in the tree said so, and the obvious reading of that status is *"my work is gone"* or, worse,
+*"my work was never here, I must redo it"*.
+
+**Why this is the dangerous shape and not merely annoying.**
+
+1. ⛔ **It fails silently and in the reassuring direction.** A clean tree is what a healthy
+   checkout looks like. There is no error, no marker file, no conflict — the one signal is a
+   stash entry nobody thought to list.
+2. ⛔ **The recovery instinct is the destructive one.** An agent that reads "my edits are gone"
+   redoes them from memory, and then a later `stash pop` collides with the redo. The cheap
+   check — `git stash list` before concluding anything about missing work — is the one nobody
+   runs, because stashes are something *you* make, not something that happens to you.
+3. ⚠ **The blast radius is every lane sharing the checkout**, and the lane that loses work is
+   never the lane that ran the rebase.
+
+**What is wanted.** A helper that rebases a shared checkout must (a) refuse outright when the
+tree is dirty, or (b) pop what it stashed, in the same run, and fail loudly if the pop
+conflicts. A stash it opens and does not close is a trap it leaves for a different lane.
+
+⇒ **Until that exists, the standing rule for any lane on a shared checkout:** before
+concluding work is missing, run `git stash list` and `git reflog`. A tree that looks
+innocent has still been edited by someone.
