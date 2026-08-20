@@ -4171,6 +4171,49 @@ mod tests {
         );
     }
 
+    // The epoch cache's two obligations, and the property that makes it sound.
+    // `snapshot_shared` may serve a cached merge ONLY while nothing wrote to
+    // `ShellState`; its key is `SHELLSTATE_MUT_TOTAL`, which every write path
+    // bumps — so (a) no write between calls ⇒ the SAME Arc comes back (the
+    // dedup that collapses probe bursts and forced-wake renders), and (b) any
+    // counted write ⇒ a fresh merge. The scan half locks the soundness: a raw
+    // `state.with_mut(` outside the counted wrappers would mutate WITHOUT
+    // bumping the epoch, and the cache would serve stale rows to the render
+    // and to every agent probe at once.
+    #[test]
+    fn the_snapshot_cache_dedups_without_writes_and_invalidates_on_one() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let shell = ShellState::new(bootstrap);
+        let first = shell.snapshot_shared();
+        let second = shell.snapshot_shared();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "no write happened between two snapshot_shared calls, yet the merge ran twice"
+        );
+        SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let third = shell.snapshot_shared();
+        assert!(
+            !std::sync::Arc::ptr_eq(&second, &third),
+            "the write epoch moved and the cache still served the old merge"
+        );
+    }
+
+    #[test]
+    fn every_shellstate_write_goes_through_a_counted_wrapper() {
+        let source = SHELL_SOURCE;
+        let raw_writes = source.matches("state.with_mut(").count();
+        // The three hits inside the wrapper machinery itself: `safe_shell_mut`'s
+        // own `state.with_mut(operation)` call, and the two doc sentences that
+        // name the raw form. Everything else must go through `with_mut_counted`
+        // or `safe_shell_mut`, or the snapshot cache serves stale state.
+        assert!(
+            raw_writes <= 3,
+            "{raw_writes} raw `state.with_mut(` sites — a write that does not bump \
+             SHELLSTATE_MUT_TOTAL makes snapshot_shared serve a stale merge to the \
+             render and to app-control at once. Route it through with_mut_counted."
+        );
+    }
+
     // The memo prerequisite for the whole component tree: two back-to-back
     // snapshots of an UNCHANGED shell must compare equal. `MainSurface` and
     // `Sidebar` receive the snapshot as a prop, and Dioxus skips their

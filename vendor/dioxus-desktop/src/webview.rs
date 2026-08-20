@@ -789,10 +789,37 @@ impl WebviewInstance {
     pub fn poll_vdom(&mut self) {
         let mut cx = std::task::Context::from_waker(&self.waker);
 
+        // ⛔ ONE DISPATCH USED TO RUN UNTIL THE WORK RAN OUT — and on a busy
+        // host it does not run out. This loop executes ready task polls and
+        // render passes back to back; while it runs, the OS event loop that
+        // called it cannot deliver ANYTHING — including the webview IPC
+        // message that carries the user's keystroke. Under fleet load
+        // (streaming rows, agent probes, adoption storms) the UI-block
+        // watchdog measured dispatches of 300 ms to multi-second, felt
+        // directly as typing latency (yggterm docs/pending-bugs.md, the
+        // input-chain entry).
+        //
+        // The budget bounds the AGGREGATE, not any single chunk: after
+        // `POLL_VDOM_DISPATCH_BUDGET` of loop iterations this dispatch wakes
+        // itself (the waker posts a Poll user event) and returns, so pending
+        // input events interleave between dispatches. A single long task poll
+        // or render pass still holds the thread for its own duration — those
+        // are bounded at their own sites — but an unbounded QUEUE of ready
+        // work no longer serializes into one uninterruptible dispatch.
+        const POLL_VDOM_DISPATCH_BUDGET: std::time::Duration =
+            std::time::Duration::from_millis(12);
+        let dispatch_deadline = std::time::Instant::now() + POLL_VDOM_DISPATCH_BUDGET;
+
         // Continuously poll the virtualdom until it's pending
         // Wait for work will return Ready when it has edits to be sent to the webview
         // It will return Pending when it needs to be polled again - nothing is ready
         loop {
+            if std::time::Instant::now() >= dispatch_deadline {
+                // More work may be ready; hand the thread back to the event
+                // loop and resume on the wake we just posted.
+                self.waker.wake_by_ref();
+                return;
+            }
             // Check if there is a new edit channel we need to send. On IOS,
             // the websocket will be killed when the device is put into sleep. If we
             // find the socket has been closed, we create a new socket and send it to
