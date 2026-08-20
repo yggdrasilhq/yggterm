@@ -508,6 +508,34 @@ presentation policy) or raise a LOUD stale-GUI alarm — silent futile queuing i
 **Falsifier:** deploy a GUI-image change; within one swap-queue cycle the GUI either runs the new
 image (fresh pid, markers present in /proc/<pid>/exe) or a visible alarm names the staleness.
 
+## ⛔⛔⛔ [11.0] A PLAIN SHELL BREAKS apt's BOTTOM-ANCHORED PROGRESS BAR — SO THE RENDER FAULT IS **NOT** SESSION-ONLY
+
+**Status:** OPEN
+
+Owner-reported 2026-08-20 13:58, with a frame: running `apt update` **in a plain terminal**, and
+apt's bottom-mounted progress bar breaks up as it redraws.
+
+⛔⛔ **THIS FALSIFIES THE STANDING [6.7] FRAMING, AND THE FRAMING IS LOAD-BEARING.** That entry
+reads *"THE RENDER FAULTS ARE IN SESSIONS AND NOT IN PLAIN SHELLS — THE CANVAS IS PROBABLY THE
+WRONG SUSPECT"*, and a plain shell was treated as the CONTROL that exonerated the canvas. The
+control now reproduces the fault. ⇒ Either the canvas was never exonerated, or there are two
+faults and the plain-shell one was invisible because nobody ran a bottom-anchored redraw in it.
+**Do not carry the session-only claim into any further work without re-deriving it.**
+
+**Why apt is a sharper probe than anything used so far.** Its progress bar is not ordinary scrolled
+output: it reserves the last line via a scroll region (`DECSTBM`), parks the cursor with
+save/restore, and repaints that line out of band while normal output continues to scroll above it.
+So it exercises scroll-region handling, cursor save/restore, and bottom-row repaint TOGETHER — the
+exact trio that the wrapper-vs-manual parity rule cares about, and the trio a plain `ls` or a
+scrolling build log never touches.
+
+**First diagnostic, and it is cheap:** run the same `apt update` in a bare terminal emulator on the
+same host and compare. Per the parity rule in CLAUDE.md, if it renders correctly outside and breaks
+inside, the defect is ours and it is in the emulator/compositing path, not in apt.
+
+**Falsifier:** a bottom-anchored `DECSTBM` redraw in a PLAIN SHELL row paints identically to the
+same command in a bare terminal emulator, across a window resize and a scrollback scroll.
+
 ## ⛔⛔ [leak] A FLEET HOST NAME SITS IN 33 TRACKED LINES, AND THE GUARD NEVER KNEW IT WAS A TERM
 
 **Status:** OPEN
