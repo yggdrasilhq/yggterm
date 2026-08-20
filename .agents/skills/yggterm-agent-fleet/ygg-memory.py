@@ -12,7 +12,7 @@ etc.) to:
   - Publish new memory findings/campaign ledgers
   - Support harness-scoped steering (`target_harness`) to avoid cross-harness conflation
   - Bidirectionally sync with harness-native memory stores
-  - Mesh sync with peer hosts (jojo, dev, oc) over SSH
+  - Mesh sync with peer hosts over SSH (roster resolved by `resolve_fleet_mesh`)
 """
 
 import argparse
@@ -32,6 +32,49 @@ DEFAULT_MEMORY_ROOT = Path(os.environ.get("YGGTERM_MEMORY_ROOT", Path.home() / "
 BACKUP_ROOT = Path.home() / ".yggterm" / "memory-backups"
 ARCHIVE_ROOT = Path.home() / ".yggterm" / "memory-archive"
 LOCK_FILE = DEFAULT_MEMORY_ROOT / ".ygg-memory.lock"
+
+# ⛔ THE FLEET ROSTER IS CONFIGURATION, NOT A CONSTANT. It used to be the
+# literal string of three host aliases, hardcoded here as the `--mesh` default
+# and again in `ygg-memory-sync`. Both files ship in a PUBLIC repo, so every
+# push carried the fleet's private host names, and a second copy meant the two
+# could drift. The roster now lives outside every checkout, one alias per line,
+# beside the privacy guard's own answer key — the same pattern for the same
+# reason.
+#
+# ⇒ Resolution order, each step answering what the next cannot:
+#   1. --mesh          — an operator said so; nothing outranks that.
+#   2. $YGG_FLEET_MESH — a one-run override, space- or comma-separated.
+#   3. the roster file — the machine's own standing answer.
+# There is deliberately NO built-in fallback: a default would put the names
+# back in the tree, and a silent empty mesh would make `sync-fleet` a no-op
+# that reports success. An unresolved roster raises instead.
+FLEET_MESH_FILE = Path(os.environ.get("YGG_FLEET_MESH_FILE", Path.home() / ".config" / "ygg-fleet" / "mesh"))
+
+
+def resolve_fleet_mesh(explicit=None):
+    """Return the fleet's peer ssh aliases. The ONE owner of that question."""
+    def _split(raw):
+        return [h for h in re.split(r"[\s,]+", raw.strip()) if h and not h.startswith("#")]
+
+    if explicit:
+        return _split(explicit)
+    env = os.environ.get("YGG_FLEET_MESH", "")
+    if env.strip():
+        return _split(env)
+    if FLEET_MESH_FILE.is_file():
+        hosts = []
+        for line in FLEET_MESH_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                hosts.extend(_split(line))
+        if hosts:
+            return hosts
+    raise SystemExit(
+        "ygg-memory: no fleet mesh roster.\n"
+        f"  tried: --mesh (not given), $YGG_FLEET_MESH (unset), {FLEET_MESH_FILE} (absent or empty).\n"
+        "  Write one ssh alias per line into that file, or pass --mesh explicitly."
+    )
+
 
 STEERING_HEADER = """# Memory Index
 
@@ -667,7 +710,7 @@ def _merge_journals(local_path: Path, peer_content: str):
 def cmd_sync_fleet(args):
     """Mesh synchronize ~/.yggterm/memory across reachable fleet hosts over SSH."""
     root = Path(args.root)
-    mesh = [h.strip() for h in args.mesh.split() if h.strip()]
+    mesh = resolve_fleet_mesh(args.mesh)
     lock = _flock_open(LOCK_FILE)
 
     try:
@@ -782,7 +825,9 @@ def main():
 
     # sync-fleet
     p_sync_f = subparsers.add_parser("sync-fleet", parents=[common_parser], help="Mesh sync ~/.yggterm/memory across SSH peers")
-    p_sync_f.add_argument("--mesh", default="jojo dev oc", help="Space-separated list of peer SSH hosts")
+    p_sync_f.add_argument("--mesh", default=None,
+                          help="Space-separated peer SSH hosts; default reads $YGG_FLEET_MESH "
+                               "then ~/.config/ygg-fleet/mesh")
 
     args = parser.parse_args()
 
