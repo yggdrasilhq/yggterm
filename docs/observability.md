@@ -221,6 +221,29 @@ built on it is wrong in the same invisible way, and nothing downstream can detec
 ⇒ **Always pass an explicit `--lines` large enough to cover the window.** `notebooks/` sets
 `TAIL_LINES_DEFAULT = 100_000` for this reason and never calls `tail` without it.
 
+### 4.3c The probe NAME does not tell you the record KIND, and a temporal test needs a point event
+
+`request/lock_wait_slow` and `request/lock_wait_window` read as two views of one thing. They are not:
+
+| probe | shape | timestamp means | usable for correlation? |
+|---|---|---|---|
+| `request/lock_wait_slow` | `{request, waited_us}` | **the moment of the stall** | yes |
+| `request/lock_wait_window` | `{window_ms, requests:{name:{count,mean_us,max_us,p50/p95/p99}}}` | **the end of a summary window** | **no** |
+
+⚠ A correlation run over both — matching on the substring `lock_wait`, which is the obvious thing to
+write — compares an event against a *bookkeeping tick*. It produced a confident "no correlation"
+that meant nothing, and the aggregates outnumbered nothing: 83 windows against 204 point events in
+one sample. The same test restricted to point events gave a genuinely interpretable answer.
+
+⇒ **Before any temporal analysis on `request/*`, establish whether the probe is a point or a
+window.** The rule generalises: an aggregate carries the numbers it summarises faithfully, so its
+*values* are trustworthy while its *timestamp* is not, and nothing in the record says so.
+
+⭐ **And always compare a hit count against the chance base rate.** With N events over a window T,
+the expected number of blocks with an event inside `gap + 2W` is
+`Σ (1 − exp(−(N/T)·(gapᵢ + 2W)))`. Without it, "3 of 16 blocks had a lock wait nearby" reads as a
+finding when 3 is exactly what randomness produces.
+
 ### 4.4 A probe that is registered but never emitted looks identical to one that is healthy
 
 There is no "declared but silent" report. §2.2 exists because the only way to notice was to diff the
