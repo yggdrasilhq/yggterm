@@ -36,7 +36,9 @@ every spawn of a 6-row batch plus 2 respawns; the flag never appeared once.
 
 ## ⛔⛔ [11.4] THE APP-CONTROL REQUEST PATH AND terminal_mount BLOCK THE OWNER'S UI THREAD
 
-**Status:** OPEN — first measured 2026-08-20 with the new `ui/block` watchdog live
+**Status:** OPEN
+
+First measured 2026-08-20, with the `ui/block` watchdog live.
 
 The UI-block watchdog now names what the zero-incident freeze class was. In its first 30 minutes
 on the GUI host it recorded 8 blocks, and the attribution is not the chore everyone suspected:
@@ -18257,7 +18259,9 @@ green**. A flake that moves when you add unrelated tests still has a cause.
 
 ## ⛔ [app-control] `terminal new --model` IS HONOURED IN THE REPLY AND DROPPED IN THE LAUNCH
 
-**Status:** OPEN — measured 2026-08-20 (GUI 3.1.5 / headless 3.1.4)
+**Status:** OPEN
+
+Measured 2026-08-20 (GUI 3.1.5 / headless 3.1.4).
 
 `server app terminal new --kind claude-code --model claude-opus-5 …` (issued over
 ssh to the GUI host, `--machine-key` naming a different work host) created the row,
