@@ -307,6 +307,41 @@ push_one() {  # host, local_file, remote_path, expected_md5
   else printf "  ⛔ %-14s %s  READ BACK %s WANTED %s\n" "$host" "$dest" "${got:-<none>}" "$want"; return 1; fi
 }
 
+# ⛔⛔ THE CANONICAL FOUR ARE A FLOOR, NOT THE SET — DISCOVER THE REST.
+#
+# This table used to BE the answer to "which copies exist", and a host that had
+# picked up copies outside it was invisible to the deploy forever. Measured
+# 2026-08-20: one fleet host held SIX copies across three roots at FOUR
+# different versions — `~/.cargo/bin` at 3.0.162 and 3.1.0, `~/.local/bin` at
+# 3.1.3, `~/.yggterm/bin` at 3.1.4 — because `cargo install` had once put a pair
+# in a root this script does not know about, and every deploy since wrote four
+# copies and walked past the other two.
+#
+# ⇒ A hardcoded destination list cannot notice a destination it does not name.
+# Ask the HOST which copies it actually has, write the union, and the split
+# cannot re-open: the next unexpected root is discovered rather than missed.
+#
+# ⚠ Home-rooted only. A copy under /usr needs privilege this deploy does not
+# take, so one found there is REPORTED by name and left alone — an unattended
+# deploy that starts using sudo is a worse failure than a stale binary.
+discover_copies() {  # host  → prints "abs_path KIND" per line
+  run_on "$1" '''for d in "$HOME/.local/bin" "$HOME/.yggterm/bin" "$HOME/.cargo/bin" \
+                        "$HOME/bin" "$HOME/.bun/bin" "$HOME/go/bin"; do
+                   for n in yggterm yggterm-headless; do
+                     [ -f "$d/$n" ] && echo "$d/$n"
+                   done
+                 done
+                 for n in yggterm yggterm-headless; do
+                   p=$(command -v "$n" 2>/dev/null) && [ -f "$p" ] && echo "$p"
+                 done' 2>/dev/null | sort -u | while read -r path; do
+    [ -n "$path" ] || continue
+    case "$(basename "$path")" in
+      yggterm-headless) echo "$path HL" ;;
+      yggterm)          echo "$path GUI" ;;
+    esac
+  done
+}
+
 FAILED=0
 for host in $HOSTS; do classify_host "$host"; done
 
@@ -339,8 +374,22 @@ fi
 
 for host in $HOSTS; do
   [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] && continue
-  for dest in "${!COPY[@]}"; do
-    if [ "${COPY[$dest]}" = "GUI" ]; then src="$GUI"; want="$GUI_SUM"; else src="$HL"; want="$HL_SUM"; fi
+
+  # The canonical four are written whether or not they exist yet; anything else
+  # this host already carries is written because it exists. Union, deduped by
+  # the resolved path so a symlinked root is not written twice.
+  declare -A DEST_KIND=()
+  for dest in "${!COPY[@]}"; do DEST_KIND["$dest"]="${COPY[$dest]}"; done
+  canon=$(run_on "$host" 'echo "$HOME/.local/bin/yggterm $HOME/.local/bin/yggterm-headless $HOME/.yggterm/bin/yggterm $HOME/.yggterm/bin/yggterm-headless"' 2>/dev/null)
+  while read -r path kind; do
+    [ -n "$path" ] || continue
+    case " $canon " in *" $path "*) continue ;; esac
+    DEST_KIND["$path"]="$kind"
+    echo "  ⚠ $host: $path is an EXTRA copy this deploy would once have skipped — writing it too."
+  done < <(discover_copies "$host")
+
+  for dest in "${!DEST_KIND[@]}"; do
+    if [ "${DEST_KIND[$dest]}" = "GUI" ]; then src="$GUI"; want="$GUI_SUM"; else src="$HL"; want="$HL_SUM"; fi
     if [ "$DRY" = 1 ]; then
       printf "  · %-14s %s ← %s%s\n" "$host" "$dest" "$(basename "$src")" \
         "$(is_self "$host" && echo "  (this machine — no ssh)")"
@@ -348,6 +397,7 @@ for host in $HOSTS; do
     fi
     push_one "$host" "$src" "$dest" "$want" || FAILED=1
   done
+  unset DEST_KIND
 done
 
 [ "$DRY" = 1 ] && exit 0
@@ -392,9 +442,19 @@ for host in $HOSTS; do
   # The floor is the version whose deployed copy was OBSERVED answering the flag,
   # not the version whose source first contained it — those differ, and only the
   # first one is evidence.
+  # ⛔ THE CENSUS ENUMERATES WHAT THE HOST HAS, NOT WHAT THIS SCRIPT EXPECTS.
+  # It listed the same hardcoded four as the write loop, so a host holding a
+  # copy in an unknown root reported ✅ across the board while running a build
+  # from a path nobody was looking at. Same defect, same file, twice — a
+  # hardcoded path list is the bug, and repeating it in the verification step is
+  # what made the split survive every deploy that was supposed to catch it.
   cen='MINV=3.0.125
-       for p in $HOME/.local/bin/yggterm $HOME/.local/bin/yggterm-headless \
-                $HOME/.yggterm/bin/yggterm $HOME/.yggterm/bin/yggterm-headless; do
+       for p in $(for d in "$HOME/.local/bin" "$HOME/.yggterm/bin" "$HOME/.cargo/bin" \
+                           "$HOME/bin" "$HOME/.bun/bin" "$HOME/go/bin"; do
+                    for n in yggterm yggterm-headless; do
+                      [ -f "$d/$n" ] && echo "$d/$n"
+                    done
+                  done | sort -u); do
          v=$("$p" --version 2>/dev/null || echo ERR)
          c="(pre-flag)"
          case "$v" in

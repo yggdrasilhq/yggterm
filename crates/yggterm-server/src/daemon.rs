@@ -11206,6 +11206,16 @@ fn collect_live_copy_candidates(
         if session.session_path.starts_with("remote-session://") {
             continue;
         }
+        // ⛔ The one gate, shared with the GUI's passive scan
+        // (`session_accepts_generated_copy`): an app row is named by the app
+        // that launched it and a plain shell is not named at all. Asked here
+        // rather than left to the transcript-shaped checks below, because those
+        // exclude a shell by ACCIDENT — they are looking for a JSONL, not
+        // asking whether this row may be renamed — and an accident is not a
+        // rule two surfaces can share.
+        if !crate::session_accepts_generated_copy(session) {
+            continue;
+        }
         // Working-indicator trigger ([[spec-title-summary-working-indicator]]):
         // a LIVE agent session becomes a title/summary candidate only while it
         // is (recently) WORKING — generation rides real turns instead of
@@ -11754,7 +11764,7 @@ fn copy_target_context(
 }
 
 fn background_copy_error_is_rate_limit(error: &anyhow::Error) -> bool {
-    let rate_limited = format!("{error:#}").contains("429");
+    let rate_limited = yggterm_core::error_is_endpoint_refusal(error);
     if rate_limited && let Ok(home) = crate::resolve_yggterm_home() {
         append_trace_event(
             &home,
@@ -27276,6 +27286,66 @@ mod tests {
             out.iter()
                 .any(|c| c.session_path == key && c.live_local_agent),
             "working live agent session must become a title candidate"
+        );
+        let _ = std::fs::remove_file(&jsonl);
+    }
+
+    /// ⛔ AN APP ROW IS NOT A TITLE CANDIDATE, AND NOT BY ACCIDENT.
+    ///
+    /// Before the shared gate, this collector excluded app rows and shells
+    /// only as a SIDE EFFECT of hunting for a transcript file — it was looking
+    /// for a JSONL, not asking whether the row may be renamed. The GUI's own
+    /// copy of the rule asked a different question and admitted them, which is
+    /// how rows the user launched from an app menu ended up wearing generated
+    /// copy. An accident is not a rule two surfaces can share.
+    ///
+    /// The second half is the one that would fail without the gate: give the
+    /// same app row an agent kind and a transcript and it still must not be
+    /// retitled, because what forbids it is the app's ownership of the name,
+    /// not the absence of a file to read.
+    #[test]
+    fn an_app_row_is_never_a_live_title_candidate() {
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let key = server.start_command_session(
+            Some("/home/user"),
+            Some("New Ychrome"),
+            &crate::local_app_verb_launch_command("'/home/user/.local/bin/ychrome' 'new'"),
+            Some("app:ychrome:new"),
+        );
+        let dir = std::env::temp_dir().join("yggterm-test-app-row-title-gate");
+        let _ = std::fs::create_dir_all(&dir);
+        let jsonl = dir.join("rollout-test-app-row-title-gate.jsonl");
+        let _ = std::fs::write(&jsonl, "{}\n");
+        if let Some(session) = server.sessions.get_mut(&key) {
+            crate::upsert_session_metadata(
+                &mut session.metadata,
+                "Storage",
+                jsonl.to_string_lossy().to_string(),
+            );
+        }
+        let store = yggterm_core::SessionStore::open_or_init().expect("store");
+        let working: std::collections::HashSet<String> = [key.clone()].into_iter().collect();
+
+        let mut out = Vec::new();
+        super::collect_live_copy_candidates(&store, &server.live_sessions(), &working, &mut out);
+        assert!(
+            out.iter().all(|candidate| candidate.session_path != key),
+            "a working app row must not become a title candidate"
+        );
+
+        if let Some(session) = server.sessions.get_mut(&key) {
+            session.kind = crate::SessionKind::Codex;
+        }
+        let mut out = Vec::new();
+        super::collect_live_copy_candidates(&store, &server.live_sessions(), &working, &mut out);
+        assert!(
+            out.iter().all(|candidate| candidate.session_path != key),
+            "the app token outranks the kind: a row an app owns keeps its name \
+             even when everything else about it says `title me`"
         );
         let _ = std::fs::remove_file(&jsonl);
     }
