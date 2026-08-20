@@ -335,7 +335,85 @@ turn the falsifier into the flood it was built to survive.
 
 ---
 
-## 9. Verification
+## 9. Versioning — and why this bridge does not need a version field
+
+The ytrace bus carries `v` because it is a **cross-app** bus: any process may
+write it, and a reader has no way to know which build produced a line.
+
+This bridge is not that. **The emitter is shipped inside the binary that
+receives it** — the JS is `include_str!`'d into the same executable that
+validates the records — so emitter and receiver are the same version by
+construction, and there is no skew to negotiate. A version field here would
+record a fact that cannot vary.
+
+⇒ The contract is therefore the FIELD SET, with one rule: **additive only**, and
+an unknown field is ignored rather than refused, so a newer emitter is readable
+by an older reader.
+
+⭐ **The recommendation for the case this does not cover.** If a separately
+shipped foreign emitter ever appears — a proprietary webapp inside the viewport,
+an extension, anything whose release cycle is not the app's — it should join the
+**ytrace bus**, which is built for exactly that and already carries `v`, rather
+than being let onto this bridge. The moment emitter and receiver can differ in
+version, the intra-process assumption above stops holding, and everything this
+section relies on stops being true silently.
+
+---
+
+## 10. ⚠ Known reader gaps — where these fields do NOT survive
+
+The contract fields are additive, so every reader keeps working. That is not the
+same as every reader *seeing* them, and the difference matters when someone
+concludes from a query that the foreign layers are silent.
+
+| Reader | Sees `layer` / `kind` / `seq`? | Consequence |
+|---|---|---|
+| the trace file, read directly | ✅ all of them | the full picture |
+| the ytrace bus (records mirrored at write time) | the probe's own registered policy applies | correct, but the layer tag is not a queryable column |
+| the ytrace **compat shim**, re-reading the trace file as bus records | ❌ dropped | see below |
+
+⛔ **The compat shim also DERIVES `clock` from the category and ignores the
+`clock` field the record now carries.** That derivation was correct when nothing
+wrote the field; it is now a second encoding of one fact, and the two can
+disagree. It cannot bite today — a foreign record is always `wall`, and the
+derivation returns `wall` for every category except `render` — but a future
+foreign probe in a category named `render` would be relabelled `cpu` by the
+reader, which is precisely the lie §4 refuses at the writer.
+
+⇒ **Read the trace file directly when the question is about a layer.** The gap
+is on the reader's side and belongs to the `ytrace` crate; it is recorded here
+so nobody re-derives it from a confusing result.
+
+---
+
+## 11. Where the hooks are, and the two forks that were closed
+
+**xterm.js needs no fork.** Every hook point is either the app's own bootstrap
+(which already owns the write bridge, so queue depth and flush latency are
+measured in code we wrote) or a public xterm.js API (`onRender`, whose row range
+was being discarded). Patching or vendoring xterm.js for instrumentation would
+have bought nothing and cost the ability to take an upstream release.
+
+**The Dioxus layer is measured in Rust, not in the interpreter JS.** The
+reactive tree's work — deciding what to render — happens in Rust; the
+interpreter only applies pre-computed mutations. Instrumenting the component
+functions therefore measures the cost that exists, and it needs no vendor patch.
+
+⛔ The alternative was rejected on evidence, not taste: the vendored interpreter
+ships as a **minified single-line bundle** built from TypeScript, so the only
+editable copy is the build artefact. A probe added there is a diff no reviewer
+can read, is silently lost the next time the bundle is regenerated, and sits on
+the hottest path in the app.
+
+⚠ **What that leaves unmeasured, stated plainly:** the time the webview spends
+*applying* mutations, as distinct from the time Rust spends producing them. If a
+future stall is ever traced to the apply half, the seam to reach for is the
+Rust-side edit dispatch in the vendored desktop crate — where the serialized
+edits are already counted on their way out — and not the minified bundle.
+
+---
+
+## 12. Verification
 
 * `cargo test -p yggterm-core trace` — the grammar, the refusals, the batch, and
   that a pre-contract line still parses.
