@@ -12577,10 +12577,23 @@ fn TerminalCanvas(
                                             terminal_live_host_connected,
                                             false,
                                         );
-                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
-                                            enabled: false,
-                                            focus: false,
-                                        });
+                                        // ⛔ A READ error must not hold the WRITE path hostage.
+                                        // For a LOCAL session the daemon owns the PTY and a
+                                        // keystroke is its own request — it queues behind a slow
+                                        // daemon and still lands. Disabling input here turned
+                                        // every slow `terminal_read` (10s IO timeout × 4 retries)
+                                        // into ~a minute of dead composer per episode (measured
+                                        // 2026-08-20: 8 episodes/90min, every error "reading
+                                        // daemon response"). Remote resume keeps the stricter
+                                        // gate: its transport is the failing leg for writes too.
+                                        // The write-error twin of this branch keeps its disable
+                                        // unconditionally — there the write path itself failed.
+                                        if is_remote_resume_session {
+                                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                                enabled: false,
+                                                focus: false,
+                                            });
+                                        }
                                         let (notification_title, notification_message) =
                                             if is_remote_resume_session {
                                                 (
@@ -12649,6 +12662,14 @@ fn TerminalCanvas(
                                                 "attempts": post_attach_read_recovery_attempts,
                                             }),
                                         );
+                                        // The PTY is alive (only the read stream failed), so the
+                                        // composer must not stay dead behind the failure overlay:
+                                        // before this, the only recovery from an exhausted read
+                                        // loop was switching rows until a fresh attach won.
+                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                            enabled: true,
+                                            focus: false,
+                                        });
                                     }
                                 }
                                 if is_remote_resume_session && attached_or_visible {
