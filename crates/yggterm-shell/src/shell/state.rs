@@ -39694,8 +39694,32 @@ fn spawn_launch_app_verb_here(
 /// context menu, the start page. One derivation, so they cannot show different
 /// apps, and adding a surface never means copying a list.
 fn app_launcher_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
+    // ⛔ ONE APP'S VERB IS OFFERED ONCE. The user reported a launcher listing the
+    // same two verbs TWICE, from a screenshot.
+    //
+    // A single manifest cannot do that on its own — `is_usable` requires its
+    // `name` to equal its own file stem, so one app is one file and one file is
+    // read once. A repeated verb therefore means the LIST reaching here was
+    // assembled with the same registration in it twice, and the honest defence
+    // is at the point where the list becomes a menu: whatever went wrong
+    // upstream, a menu must not offer the user a choice in which both answers do
+    // the same thing.
+    //
+    // ⚠ Keyed on (app, verb) and deliberately NOT on the resolved command, which
+    // was the first attempt and over-reaches: two genuinely different apps may
+    // share a binary — `launcher_entries_flatten_every_app_verb_in_registry_order`
+    // has exactly that shape — and collapsing them would delete a real entry to
+    // fix a cosmetic one. ⇒ A tool installed under two DIFFERENT names is a
+    // separate case this does not claim to cover; it needs a decision about
+    // which registration is the real one, not a silent pick here.
+    //
+    // FIRST WINS, and the registry scan sorts its paths, so the survivor does
+    // not wander between renders — a menu whose entries reorder under the cursor
+    // is its own bug.
+    let mut seen = std::collections::HashSet::new();
     apps.iter()
         .flat_map(|app| app.verbs.iter().map(move |verb| (app.clone(), verb.clone())))
+        .filter(|(app, verb)| seen.insert((app.name.clone(), verb.id.clone())))
         .collect()
 }
 /// Launch a libyggterm app's verb: open a terminal session wherever the user

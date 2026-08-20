@@ -20752,6 +20752,50 @@ mod tests {
         assert!(web_tab_activity_dot_style(false, false).contains("transparent"));
     }
 
+    /// ⛔ THE DUPLICATE LISTING, reported from a screenshot of a real launcher:
+    /// the same two verbs offered twice in one menu.
+    ///
+    /// One manifest cannot cause it — its `name` must equal its own file stem,
+    /// so one app is one file — which means the list reaching the menu builder
+    /// already held the registration twice. The defence belongs where the list
+    /// becomes a menu, because that is the one place that can be sure, whatever
+    /// went wrong upstream.
+    #[test]
+    fn one_apps_verb_is_offered_once_however_often_it_is_registered() {
+        let verb = |id: &str, label: &str, args: &[&str]| AppVerb {
+            id: id.to_string(),
+            label: label.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            ..Default::default()
+        };
+        let meter = AppManifest {
+            name: "meter".into(),
+            label: "Meter".into(),
+            binary: "/opt/demo/meter".into(),
+            verbs: vec![
+                verb("open", "Cluster meter", &[]),
+                verb("boot", "Cluster boot", &["--tab", "boot"]),
+            ],
+            ..Default::default()
+        };
+        // The reported shape: the same registration present twice.
+        let entries = app_launcher_entries(&[meter.clone(), meter.clone()]);
+        let labels: Vec<&str> = entries.iter().map(|(_, v)| v.label.as_str()).collect();
+        assert_eq!(labels, vec!["Cluster meter", "Cluster boot"]);
+
+        // ⚠ ...and the over-reach this must NOT have. Two DIFFERENT apps that
+        // happen to share a binary are two real entries, and a key built on the
+        // resolved command would silently delete one of them.
+        let twin = AppManifest {
+            name: "gauge".into(),
+            label: "Gauge".into(),
+            binary: "/opt/demo/meter".into(),
+            verbs: vec![verb("open", "Gauge", &[])],
+            ..Default::default()
+        };
+        assert_eq!(app_launcher_entries(&[meter, twin]).len(), 3);
+    }
+
     /// A lit dot says WHY when hovered; an unlit one says nothing at all, so the
     /// rail is not full of rows announcing that they are idle.
     #[test]
