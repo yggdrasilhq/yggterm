@@ -12934,7 +12934,10 @@ async fn web_surface_native_reconcile_loop(
                                 && announced_jarless_profiles.insert(lock_key.clone())
                             {
                                 let mut writable_state = state;
-                                writable_state.with_mut(|shell| {
+                                // Counted like every other write: this was the
+                                // last raw `with_mut` in the crate, i.e. the one
+                                // write the storm autopsy could not see.
+                                writable_state.with_mut_counted(|shell| {
                                     shell.push_notification(
                                         NotificationTone::Warning,
                                         title,
@@ -15526,6 +15529,18 @@ struct SidebarResizeDrag {
 }
 #[derive(Clone)]
 struct ShellState {
+    /// One render's worth of [`RenderSnapshot`], reused while nothing wrote.
+    ///
+    /// `snapshot()` rebuilds the full sidebar merge (~10-20 ms at fleet row
+    /// counts), and it is called from the root render, from app-control's
+    /// describe verbs, and from dozens of event handlers — several of which
+    /// build the whole thing to read one field. The cache key is
+    /// `SHELLSTATE_MUT_TOTAL`, which every write path bumps (the counted-write
+    /// contract at [`safe_shell_mut`]/`with_mut_counted`), plus a short TTL
+    /// for the snapshot's few wall-clock-dependent bits (busy-hint expiry).
+    /// Interior mutability on purpose: filling the cache is not a state
+    /// change, and must not dirty the signal.
+    render_snapshot_cache: std::cell::RefCell<Option<(u64, u64, SharedSnapshot)>>,
     bootstrap: ShellBootstrap,
     browser: SessionBrowserState,
     server: YggtermServer,
@@ -18198,6 +18213,7 @@ impl ShellState {
         let keytip_config = load_keytip_config_from_disk();
         let keymap = keymap_from_keytip_config(&keytip_config);
         let mut state = Self {
+            render_snapshot_cache: std::cell::RefCell::new(None),
             settings,
             bootstrap,
             row_menu_page: None,
@@ -18668,6 +18684,29 @@ impl ShellState {
         if !cursor_line.is_empty() {
             session.status_line = cursor_line.to_string();
         }
+    }
+    /// [`Self::snapshot`], deduplicated across a stable write epoch.
+    ///
+    /// Returns the SAME `Arc` while `SHELLSTATE_MUT_TOTAL` has not moved and
+    /// the entry is younger than the TTL — so the root render, app-control's
+    /// describe verbs and every handler that "just needs one field" share one
+    /// merge instead of each paying their own. The TTL exists because a few
+    /// snapshot inputs are wall-clock reads (the optimistic busy-hint filter):
+    /// 500 ms bounds how stale those can be served when no write happens.
+    fn snapshot_shared(&self) -> SharedSnapshot {
+        const RENDER_SNAPSHOT_CACHE_TTL_MS: u64 = 500;
+        let epoch = SHELLSTATE_MUT_TOTAL.load(Ordering::Relaxed);
+        let now = current_millis();
+        if let Some((cached_epoch, cached_at_ms, cached)) =
+            self.render_snapshot_cache.borrow().as_ref()
+            && *cached_epoch == epoch
+            && now.saturating_sub(*cached_at_ms) < RENDER_SNAPSHOT_CACHE_TTL_MS
+        {
+            return cached.clone();
+        }
+        let fresh: SharedSnapshot = std::sync::Arc::new(self.snapshot());
+        *self.render_snapshot_cache.borrow_mut() = Some((epoch, now, fresh.clone()));
+        fresh
     }
     fn snapshot(&self) -> RenderSnapshot {
         let active_theme_spec = if self.theme_editor_open {
@@ -56637,7 +56676,10 @@ fn describe_app_state_snapshot(
     // its own peek at the same signal.
     let agent_leases = live_agent_leases(&state.peek(), current_millis() as u64);
     let shell = state.read();
-    let snapshot = shell.snapshot();
+    // Shared, not rebuilt: agent probes arrive in bursts on a fleet host, and
+    // every DescribeState used to pay its own full sidebar merge on the UI
+    // thread (`app_control/request_begin` blocks, 2026-08-20).
+    let snapshot = shell.snapshot_shared();
     // The rail's rendered truth, resolved by the SAME call the component makes.
     let rail_view = rail_render_view(&snapshot);
     let rendered_app_pane = match &rail_view.rendered_mode {
@@ -57903,7 +57945,10 @@ fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
 
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     let shell = state.read();
-    let mut snapshot = shell.snapshot();
+    // Clone of the shared snapshot, not a rebuild: this verb annotates its
+    // copy below, but the expensive half is the merge, and that is what the
+    // epoch cache dedups across a probe burst.
+    let mut snapshot = (*shell.snapshot_shared()).clone();
     // The rows the SCREEN is showing, so a row can still report whether the
     // user has it folded away.
     let rendered: std::collections::HashSet<String> = snapshot

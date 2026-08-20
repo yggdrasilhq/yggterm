@@ -2044,7 +2044,10 @@ fn app() -> Element {
     // both builds reflected identical ShellState — collapsing to one is
     // behavior-equivalent and removes a whole row-clone pass per render.
     // See [[finding-gui-latency-render-path-campaign]].
-    let snapshot: SharedSnapshot = Arc::new(state.read().snapshot());
+    // Shared through the epoch cache: a root render with no state write in
+    // front of it (the measured ~11% forced-wake amplification) reuses the
+    // previous merge instead of rebuilding it.
+    let snapshot: SharedSnapshot = state.read().snapshot_shared();
     // External search-value sync: the titlebar input is UNCONTROLLED (typing
     // never re-renders its value — the controlled rewrite raced the
     // per-keystroke tree rebuild and ate characters), so external writers
