@@ -10771,10 +10771,21 @@ impl YggtermServer {
                             } else {
                                 remote_agent_resume_subcommand(session.kind)
                             };
+                            // The row's stored per-launch options ride this
+                            // rebuild too — same law as the identity refresh:
+                            // a rebuilt command without them puts the row on
+                            // the default tier.
                             let extra_exports = if session.kind == SessionKind::ClaudeCode {
-                                claude_extra_args_remote_exports()
+                                claude_extra_args_remote_exports_with_launch(
+                                    &session.agent_launch_options,
+                                )
                             } else {
-                                configured_extra_args_remote_exports(session.kind)
+                                let mut exports = agent_launch_options_remote_exports(
+                                    &session.agent_launch_options,
+                                );
+                                exports
+                                    .extend(configured_extra_args_remote_exports(session.kind));
+                                exports
                             };
                             if let Some(verb) = verb {
                                 if starts_new {
@@ -13744,10 +13755,22 @@ fn refresh_remote_codex_terminal_identity_launch_command(
             "--require-existing",
         ]
     };
+    // The row's per-launch options ride the rebuild — the REMOTE twin of the
+    // local-CC fix dated 2026-08-06 a few thousand lines up. This refresh
+    // fires between a remote row's birth and its first spawn (TerminalRestart
+    // refreshes the path it is about to spec; SyncTerminalIdentity sweeps
+    // every session), so composing the exports without the row's stored
+    // options silently erased `--model`/`--permission-mode` from the command
+    // the PTY then executed: the row landed on the CLI's saved default tier
+    // while `launch.applied` had truthfully reported the create composed it.
+    // That is the measured remote `--model` drop — three layers masked it
+    // because the snapshot post-processor re-derives this very command.
     let extra_exports = if session.kind == SessionKind::ClaudeCode {
-        claude_extra_args_remote_exports()
+        claude_extra_args_remote_exports_with_launch(&session.agent_launch_options)
     } else {
-        configured_extra_args_remote_exports(session.kind)
+        let mut exports = agent_launch_options_remote_exports(&session.agent_launch_options);
+        exports.extend(configured_extra_args_remote_exports(session.kind));
+        exports
     };
     let launch_command = remote_ssh_launch_command_with_extra_exports(
         &ssh_target,
@@ -32057,6 +32080,58 @@ mod tests {
         assert!(
             !rebuild.contains("stored_session_launch_command(SessionKind::ClaudeCode"),
             "the options-free builder is what dropped --model in the first place"
+        );
+    }
+
+    /// ⛔ THE REMOTE TWIN OF THE ABOVE, root-caused 2026-08-20: a remote CC
+    /// spawn's `--model` never reached the process although the create
+    /// composed it correctly (`launch.applied: true`) — because BOTH remote
+    /// launch-command rebuilds (the identity refresh, which TerminalRestart
+    /// runs on the very path it is about to spec and SyncTerminalIdentity
+    /// sweeps over every session, and the binary-cache-miss rebuild) composed
+    /// their exports through the options-free `claude_extra_args_remote_
+    /// exports()`, erasing the per-launch options from the command the PTY
+    /// then executed. Same structural law: the option lives on the session and
+    /// every rebuild must consult it. Scanned over the product half of the
+    /// file so this test's own text cannot satisfy it.
+    #[test]
+    fn the_remote_launch_command_rebuilds_carry_the_rows_launch_options() {
+        let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let refresh = source
+            .split("fn refresh_remote_codex_terminal_identity_launch_command(")
+            .nth(1)
+            .expect("the remote identity refresh")
+            .split("\nfn ")
+            .next()
+            .expect("the end of the refresh");
+        assert!(
+            refresh.contains("claude_extra_args_remote_exports_with_launch(&session.agent_launch_options)"),
+            "the remote identity refresh must compose its CC exports from the \
+             ROW's launch options; the options-free variant is what erased \
+             --model between a remote row's birth and its first spawn"
+        );
+        assert!(
+            !refresh.contains("claude_extra_args_remote_exports()"),
+            "no options-free export composition may remain in the refresh"
+        );
+        let cache_miss = source
+            .split("\"launch_binary_cache_miss\"")
+            .nth(1)
+            .expect("the cache-miss rebuild")
+            .split("\nfn ")
+            .next()
+            .expect("the end of the rebuild scope");
+        let rebuild_head = &cache_miss[..cache_miss
+            .find("remote_deploy_state_after_refresh")
+            .unwrap_or(cache_miss.len().min(4000))];
+        assert!(
+            rebuild_head.contains("claude_extra_args_remote_exports_with_launch"),
+            "the binary-cache-miss rebuild must also compose from the row's \
+             launch options"
         );
     }
 
