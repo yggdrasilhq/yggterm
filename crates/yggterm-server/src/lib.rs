@@ -17414,7 +17414,58 @@ fn remote_muse_session_path(machine_key: &str, session_id: &str) -> String {
 
 const REMOTE_AGY_SCAN_SCRIPT: &str = r##"
 import json, os, sys, sqlite3
+from datetime import datetime
 from pathlib import Path
+
+# ⛔ MIRROR of yggterm_core::startpage::antigravity_row_is_durable. The store is a
+# ledger of every invocation, not a session list: measured 2026-08-20, 995 of 999
+# rows were batch work. `killed` is 0 for every row and decides nothing; only
+# step_count and workspace_uris carry signal. Keeping this in step with the Rust
+# rule is the price of the remote scan being a second encoding at all.
+SCRATCH_ROOTS = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/folders")
+
+def _is_scratch(path):
+    return any(path == r or path.startswith(r + "/") for r in SCRATCH_ROOTS)
+
+def agy_row_is_durable(uris, step_count):
+    try:
+        raw = json.loads(uris) if uris else []
+    except Exception:
+        return False
+    if not isinstance(raw, list) or (step_count or 0) <= 0:
+        return False
+    roots = []
+    for u in raw:
+        if isinstance(u, str):
+            cand = u.replace("file://", "").strip().rstrip("/")
+            if cand:
+                roots.append(cand)
+    return bool(roots) and not any(_is_scratch(r) for r in roots)
+
+def agy_row_mtime(raw_mod):
+    """Per-row recency. ISO-8601 with a SPACE separator and up to 9 fractional
+    digits; never the DB FILE's mtime, which stamps one shared fake recency on
+    every row and moves whenever the CLI touches the store."""
+    if not raw_mod:
+        return 0
+    text = str(raw_mod).strip().replace(" ", "T", 1)
+    if "." in text:
+        head, _, tail = text.partition(".")
+        digits = ""
+        for ch in tail:
+            if ch.isdigit():
+                digits += ch
+            else:
+                tail = tail[len(digits):]
+                break
+        else:
+            tail = ""
+        text = head + "." + digits[:6] + tail
+    try:
+        stamp = int(datetime.fromisoformat(text).timestamp())
+    except Exception:
+        return 0
+    return stamp if stamp > 0 else 0
 
 def clean_prompt_first_line(raw):
     if not raw:
@@ -17437,7 +17488,7 @@ def scan_agy_session(path_str):
     session_id = None
     if s.endswith(".db"):
         session_id = p.stem.strip()
-    elif s.endswith("transcript.jsonl"):
+    elif s.endswith("transcript_full.jsonl"):
         parts = p.parts
         if ".system_generated" in parts:
             idx = parts.index(".system_generated")
@@ -17464,25 +17515,35 @@ def scan_agy_session(path_str):
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             cur = conn.cursor()
-            cur.execute("SELECT title, preview, workspace_uris, last_modified_time FROM conversation_summaries WHERE conversation_id=? AND killed=0", (session_id,))
+            cur.execute("SELECT title, preview, workspace_uris, last_modified_time, step_count FROM conversation_summaries WHERE conversation_id=?", (session_id,))
             row = cur.fetchone()
-            if row:
-                t, prev, uris, raw_mod = row
-                if t and t.strip():
-                    title = clean_prompt_first_line(t)
-                elif prev and prev.strip():
-                    title = clean_prompt_first_line(prev)
-                if uris:
-                    try:
-                        u_list = json.loads(uris)
-                        for u in u_list:
-                            if isinstance(u, str):
-                                cand = u.replace("file://", "").rstrip("/")
-                                if cand:
-                                    cwd = cand
-                                    break
-                    except:
-                        pass
+            # The DB is the INDEX; a brain transcript is only storage. A file whose
+            # conversation is not indexed, or is indexed as batch work, is not a
+            # session — same verdict the local scan reaches via `durable_ids`, so
+            # the two scans cannot disagree about what a session is.
+            if not row:
+                conn.close()
+                return None
+            t, prev, uris, raw_mod, steps = row
+            if not agy_row_is_durable(uris, steps):
+                conn.close()
+                return None
+            mtime = agy_row_mtime(raw_mod) or mtime
+            if t and t.strip():
+                title = clean_prompt_first_line(t)
+            elif prev and prev.strip():
+                title = clean_prompt_first_line(prev)
+            if uris:
+                try:
+                    u_list = json.loads(uris)
+                    for u in u_list:
+                        if isinstance(u, str):
+                            cand = u.replace("file://", "").rstrip("/")
+                            if cand:
+                                cwd = cand
+                                break
+                except:
+                    pass
             conn.close()
         except:
             pass
@@ -17503,7 +17564,7 @@ def scan_agy_session(path_str):
             except:
                 pass
 
-    t_file = s if s.endswith("transcript.jsonl") else str(home / f".gemini/antigravity-cli/brain/{session_id}/.system_generated/logs/transcript.jsonl")
+    t_file = s if s.endswith("transcript_full.jsonl") else str(home / f".gemini/antigravity-cli/brain/{session_id}/.system_generated/logs/transcript_full.jsonl")
     if (not title or not cwd) and os.path.exists(t_file):
         try:
             with open(t_file, 'r', errors='ignore') as f:
@@ -17551,6 +17612,9 @@ for pattern in [a for a in sys.argv[1:] if a.strip()]:
         seen.add(key)
         data=scan_agy_session(str(p))
         if data:
+            if data['session_id'] in seen:
+                continue
+            seen.add(data['session_id'])
             print(json.dumps(data, ensure_ascii=False))
 
 db_path = home / ".gemini/antigravity-cli/conversation_summaries.db"
@@ -17558,10 +17622,12 @@ if db_path.exists():
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cur = conn.cursor()
-        cur.execute("SELECT conversation_id, title, preview, workspace_uris, last_modified_time FROM conversation_summaries WHERE killed=0")
+        cur.execute("SELECT conversation_id, title, preview, workspace_uris, last_modified_time, step_count FROM conversation_summaries")
         for row in cur.fetchall():
-            session_id, t, prev, uris, raw_mod = row
+            session_id, t, prev, uris, raw_mod, steps = row
             if not session_id or session_id in seen:
+                continue
+            if not agy_row_is_durable(uris, steps):
                 continue
             seen.add(session_id)
             title = clean_prompt_first_line(t) if t else ""
@@ -17579,11 +17645,7 @@ if db_path.exists():
                                 break
                 except:
                     pass
-            mtime = 0
-            try:
-                mtime = int(os.path.getmtime(str(db_path)))
-            except:
-                pass
+            mtime = agy_row_mtime(raw_mod)
             data = {
                 'session_id': session_id,
                 'cwd': cwd or str(home),
@@ -30908,6 +30970,48 @@ mod tests {
             reason: "fallback brain transcript lookup for remote Antigravity sessions",
         },
     ];
+
+    /// ⛔ The remote agy scan is a SECOND ENCODING of the durable rule — it runs
+    /// as Python over ssh, so it cannot call `antigravity_row_is_durable`. This
+    /// pins the two together on the properties that matter, because the first
+    /// version of this scan shipped the exact defect the Rust one had: every
+    /// `killed=0` row emitted as a session, all stamped with the DB FILE's mtime.
+    #[test]
+    fn the_remote_agy_scan_applies_the_same_durable_rule_as_the_local_one() {
+        let script = crate::REMOTE_AGY_SCAN_SCRIPT;
+        assert!(
+            script.contains("def agy_row_is_durable"),
+            "the remote scan must carry the durable rule, not emit every row",
+        );
+        assert!(
+            script.contains("step_count"),
+            "step_count is one of only two columns in that store that carry signal",
+        );
+        assert!(
+            script.contains("SCRATCH_ROOTS"),
+            "the batch signature is an ephemeral scratch workspace",
+        );
+        // The rule replaced `killed`, which is 0 for every row and filters nothing.
+        assert!(
+            !script.contains("WHERE killed=0"),
+            "`killed=0` reads as a guard and decides nothing — it must not be the filter",
+        );
+        // Per-row recency, never the DB file's mtime shared across every row.
+        assert!(
+            script.contains("def agy_row_mtime"),
+            "each row must keep its own last_modified_time",
+        );
+        assert!(
+            !script.contains("os.path.getmtime(str(db_path))"),
+            "the DB file's mtime stamps one shared fake recency on the whole store",
+        );
+        // The on-disk transcripts are `transcript_full.jsonl`; the shorter
+        // spelling matches nothing and fails silently.
+        assert!(
+            !script.contains("\"transcript.jsonl\"") && !script.contains("/transcript.jsonl"),
+            "the dead transcript.jsonl spelling must not come back",
+        );
+    }
 
     #[test]
     fn no_store_path_literal_outside_the_agent_cli_registry() {
