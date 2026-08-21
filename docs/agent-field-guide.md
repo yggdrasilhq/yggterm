@@ -2099,9 +2099,10 @@ the path in its own command line, so it reports a stray that is your own probe.
 ## A single red in the server suite is not automatically a flake (measured 2026-08-21)
 
 `cargo test -p yggterm-server --lib` runs ~1,220 tests in one binary on a loaded host,
-and it is not reliably green: **two of the first four full runs failed on a single test
-each, a DIFFERENT test each time, and both passed when run alone.** So "one failure,
-probably a flake, re-run it" is a tempting and mostly-correct reflex.
+and it is not reliably green: **two of five full runs failed on a single test each, a
+DIFFERENT test each time, and both passed when run alone** (32-core host, load average
+~25, other lanes compiling). So "one failure, probably a flake, re-run it" is a
+tempting and mostly-correct reflex.
 
 ⛔ **It is also how a real defect ships.** The reaping lock on the owner-notification
 path failed in exactly that shape — one test, red in the suite, green alone. It was not
