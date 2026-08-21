@@ -210,49 +210,6 @@ falsified and was not testable there:** that host's GUI is parented to pid 1, so
 supervised pair to lose. Re-test the supervisor claim where the GUI actually runs under one
 before treating this entry as closed.
 
-## ⛔⛔ [11.9] THE HOT-RESTART GATE COMPARES VERSION STRINGS, SO A SAME-VERSION REBUILD NEVER ROLLS
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*Measured 2026-08-21 ~00:15 by the cli-practice lane.*
-
-A rebuilt binary installed at the SAME version answers `already_ready:true` from the deploy
-gate while `/proc/<daemon>/exe` md5 differs from disk — the daemon keeps running the old
-code and every instrument agrees the deploy landed. Any lane that ships a fix without
-bumping the version is then live-testing code that is not running, with green instruments.
-This composes with the known "deploy race has no instrument" trap into a closed loop: the
-same-version path both skips the roll AND hides that it skipped. **Fix direction:** the
-gate must compare BUILD IDENTITY (build id / exe hash), not the version string; a
-same-version different-build install is a roll, and `already_ready` must name the build id
-it verified. **Falsifier:** rebuild at an unchanged version with a one-line observable
-change, install, and the gate must roll the daemon and the change must be observable live.
-
-**LANDED 2026-08-21 (11.15).** `status_matches_expected` defaulted `expected_version` to
-the compiled-in version and treated `expected_build_id` as optional, so with no explicit
-`--expected-build-id` the build half was skipped entirely and the version string WAS the
-identity. The facts needed were already on the wire and simply not consulted: the daemon
-holds `running_build_id` (captured at process start) against `on_disk_build_id` (read now),
-and already publishes their disagreement as `hot_restart_pending` — the same signal
-`server daemons` renders as `(deleted) REPLACED ON DISK`. Now (1) a daemon whose running
-build is superseded on disk is never the expected daemon, which also governs the two
-coverage checks that pick which daemon may adopt another's sessions; (2) `already_ready`
-names what it verified, and `server_status_json` carries `running_build_id` /
-`on_disk_build_id` / `server_build_commit` / `build_superseded_on_disk` for every consumer
-— the old report showed only `server_build_id`, which is the ON-DISK file's stamp read at
-status time and therefore describes the new file while the process runs the old one; (3)
-the request forces past the daemon's own same-version refusal when the build is superseded,
-without which the fix only moves the identical wrong test one layer down. A daemon too old
-to report the fields answers false and is governed by the version check alone, so unknown
-is not confused with stale. Tests:
-`a_daemon_running_a_superseded_build_is_never_the_expected_daemon`,
-`the_status_report_names_the_running_build_not_just_the_file_on_disk`.
-
-⚠ This does NOT fix the sibling entry "A SAME-VERSION REBUILD CAN NEVER BE ADOPTED" below —
-that one is about socket NAMING (a same-version rebuild writes the same `server-<version>.sock`
-name, so no successor can advertise), and it stays open on its own terms.
-
-**The observation still owed:** the falsifier above, run on a real roll.
-
 ## ⛔⛔ [11.15] A GATE THAT JUDGES THE STORED ANSWER REOPENS ITSELF WHEN THE ANSWER IS BAD
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
