@@ -76,6 +76,94 @@ lingering daemons retire, and while they linger their sessions stay split across
 ⛔ **And the daemons whose names were already taken cannot be rescued by this fix or any
 other.** Their sockets are unlinked; there is no path to them. They end when they end.
 
+## ⛔⛔⛔ [11.0] LEGENDARY — THE APP RE-RENDERED 44 TIMES A SECOND BECAUSE THE BRANCH THAT FOUND NOTHING TO DO ASKED ITSELF AGAIN
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Measured on the GUI host 2026-08-21 at 3.1.31. Filed separately from the mount churn
+above, and deliberately: this is the same symptom family — the interface blinking, input
+arriving late — with an independent root that is not a mount at all. The churn entry's own
+rule is that independent roots split out.*
+
+**What was measured.** Ten consecutive `render/storm` incidents, one per minute, unbroken
+from 21:21:46 to 21:30:46, then silence:
+
+```
+21:21:46  41.7 renders/s   21:26:46  43.7/s
+21:22:46  44.8/s           21:27:46  41.5/s
+21:23:46  44.5/s           21:28:46  42.6/s
+21:24:46  43.9/s           21:29:46  41.1/s
+21:25:46  44.0/s           21:30:46  44.0/s
+```
+
+The GUI had started at 21:20:40. So this is a **ten-minute burst immediately after launch
+that then stops on its own**, which is why it has always presented as "startup feels
+janky" rather than as a defect with a location.
+
+**The instrument named the location outright.** `dioxus_render/component_window` carries a
+`causes` list of signal-write sites against the renders each one preceded. Aggregated over
+the storm:
+
+| | writes | share |
+|---|---|---|
+| `launch.rs:2029` | 23,210 | **95.9%** |
+| `remote_preview_retry_tick` | 359 | 1.5% |
+| `kick_active_remote_preview_sync` | 359 | 1.5% |
+| everything else | 277 | 1.1% |
+
+Root `app` renders in the same window: **23,456, costing 141 s of CPU** — a quarter of one
+core spent rendering nothing, on a laptop whose resource priority is memory first. For
+scale, in the sixteen quiet minutes afterwards the same site wrote 570 times.
+
+**The mechanism, and each half looked reasonable alone.** `launch.rs:2029` is the
+preview-refresh effect's *no fetch target* branch. Two independent defects met there:
+
+1. **It erased its own dedup marker.** The effect opens with a guard comparing the
+   incoming `refresh_marker` against the stored one, and every sibling branch stores
+   `Some(refresh_marker)`. This one stored `None`. A stored `None` can never equal an
+   incoming `Some`, so the guard was inert and the branch re-entered on every pass.
+2. **It took a mutable borrow in order to be refused.** It called
+   `schedule_remote_preview_sync` inside `state.with_mut_counted(…)`, and both of that
+   function's refusals — a sync already in flight, a debounce not yet expired — are
+   read-only. `with_mut` marks the signal dirty unconditionally; the effect reads `state`;
+   so a refused schedule re-ran the effect that asked for it.
+
+Half 1 guaranteed re-entry, half 2 guaranteed the re-entry could fire immediately.
+**Fixing either alone leaves it spinning**, which is why both are locked.
+
+⚠ **The fix for this was already sitting one frame down the same call chain.**
+`schedule_remote_preview_retry_tick` prechecks read-only and returns before writing, with a
+comment that reads *"skip both writes rather than render twice to do nothing"*. Somebody
+found this exact class in the tick and never looked at the frame above it. ⇒ **When a
+defect is found in a callee, walk its callers before closing it** — the same author writes
+the same shape twice in one afternoon.
+
+**Why it self-heals after ten minutes, which is what kept it invisible.** The no-target
+branch is reached when a remote session has no preview fetch target yet, and targets appear
+as remote binaries resolve. `remote/resolve_yggterm_binary` was 6.3× hotter inside the storm
+window than after it, and `background/local_tree_scan` 127× hotter. Once the scans settle,
+the sessions stop entering the branch and the loop starves. Nothing fixed it; it ran out of
+sessions to spin on.
+
+**The fix.** `can_schedule_remote_preview_sync` is the two refusals asked without a mutable
+borrow; both call sites read before they write, in a scoped block so the read borrow is
+released before the write borrow is taken; and the no-target branch stores its marker like
+its siblings. Storing the marker does not strand a session whose target appears later:
+`schedule_remote_preview_retry_tick` writes `remote_preview_dirty_epoch`, that epoch is a
+field of the marker, and a changed epoch makes a new marker the guard admits. Erasing the
+marker was never what re-armed the branch.
+
+**Regression lock:** `preview_refresh_render_loop_locks`, four tests — one per half, a
+self-check that the scan is not reading its own module, and a control asserting the precheck
+still refuses for *both* reasons and is still the single decision the scheduler makes, so
+the locks cannot pass over a precheck hollowed out to `true`.
+
+**Falsifier — the observation still owed.** Restart the GUI on a build carrying this and
+watch the first fifteen minutes: **no `render/storm` incident may fire**, and
+`dioxus_render/component_window` must not attribute a plurality of writes to the
+preview-refresh effect. ⚠ Count by `payload.incident_id` and `app_version`, not by event
+name — `heartbeat/panic` taught that lesson the same evening.
+
 ## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
 
 **Status:** OPEN

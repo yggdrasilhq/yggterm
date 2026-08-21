@@ -44947,23 +44947,44 @@ fn preview_snapshot_loading_state(
         || preview_failure_pending
         || (!preview_failure_present && stale_placeholder_content && !readable_fallback_context)
 }
-fn schedule_remote_preview_sync(
-    shell: &mut ShellState,
-    session_path: &str,
-    debounce_ms: u64,
-) -> bool {
+/// Both of `schedule_remote_preview_sync`'s refusals, asked WITHOUT a mutable
+/// borrow.
+///
+/// ⛔⛔ TAKING `with_mut` TO DISCOVER THERE IS NOTHING TO DO IS A WHOLE-APP
+/// RENDER. `with_mut_counted` marks the signal dirty unconditionally — that is
+/// what `with_mut` means — so a caller that wraps this refusal in one pays a
+/// full root render (measured 5.35 ms mean) to learn that the debounce has not
+/// expired. The `app` component then re-runs the very effect that asked, and
+/// the refusal repeats: measured 2026-08-21 on the GUI host at 23,210 writes
+/// in nine minutes from a single call site, 95.9% of every render cause in the
+/// window, 141 s of CPU burnt rendering nothing.
+///
+/// ⇒ The read-only precheck is the same shape `schedule_remote_preview_retry_tick`
+/// already uses one frame down the chain ("skip both writes rather than render
+/// twice to do nothing"). This is that fix at the frame above it.
+fn can_schedule_remote_preview_sync(shell: &ShellState, session_path: &str) -> bool {
     if remote_preview_sync_in_flight_for_session(shell, session_path) {
         return false;
     }
-    let now = current_millis();
     let next_allowed = shell
         .remote_preview_sync_after_ms
         .get(session_path)
         .copied()
         .unwrap_or(0);
-    if next_allowed > now {
+    next_allowed <= current_millis()
+}
+fn schedule_remote_preview_sync(
+    shell: &mut ShellState,
+    session_path: &str,
+    debounce_ms: u64,
+) -> bool {
+    // ⚠ Still re-asked here, and deliberately: the precheck above runs under a
+    // read borrow that is released before this one is taken, so it is advice,
+    // never a guarantee. This stays the one place that decides.
+    if !can_schedule_remote_preview_sync(shell, session_path) {
         return false;
     }
+    let now = current_millis();
     shell
         .remote_preview_sync_after_ms
         .insert(session_path.to_string(), now.saturating_add(debounce_ms));
