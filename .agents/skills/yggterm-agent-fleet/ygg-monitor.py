@@ -89,6 +89,9 @@ SCREEN_FREEZE_SAMPLE_SECS = 6
 # Three samples, so a thinking agent that happens to render two identical frames
 # is not mistaken for a frozen one.
 SCREEN_FREEZE_SAMPLES = 3
+# A busy process whose transcript has been static this long is spinning, not
+# thinking. Generous on purpose: a long thought must never read as a stall.
+SPINNING_SECS = 8 * 60
 
 
 def log(m):
@@ -479,6 +482,29 @@ def refine(state, uuid, host=None):
     if pct is None:
         return "STUCK", f"mid-turn, pid {proc['pid']} vanished while sampling"
     if pct > IDLE_CPU_PCT:
+        # ⛔⛔ BUSY IS NOT PROGRESS, AND THIS ARM SAID IT WAS FOR 13 MINUTES WHILE
+        # THE ORCHESTRATOR WAS STUCK. The owner caught it by hand — *"within 5 mins
+        # you stopped with one line as output which seemed suspicious"* — and he was
+        # right; the row's turn had been cut by a daemon swap. The monitor's own log
+        # for that window reads `WORKING 10.0m` then `WORKING 13.0m`, and WORKING is
+        # not a state anything escalates, so the verdict was both wrong and
+        # terminal.
+        #
+        # ⭐ CPU answers "is this process running instructions", never "is this turn
+        # advancing". An agent CLI holding a spinner, retrying a wedged call, or
+        # sitting in a re-resume loop burns CPU indefinitely while producing
+        # nothing. ⇒ The transcript is the progress plane: if it has not grown
+        # while the process burned CPU, the row is SPINNING, not working.
+        #
+        # ⚠ Deliberately generous — a model can think for minutes before writing a
+        # word, and calling that stuck would be worse than the fault. This only
+        # fires once a busy row has produced NOTHING for far longer than any
+        # single thought.
+        t = _transcript_for(uuid, host)
+        if t and (time.time() - t[2]) >= SPINNING_SECS:
+            quiet_m = int((time.time() - t[2]) // 60)
+            return "SPINNING", (f"mid-turn, burning {pct:.1f}% cpu, and its transcript has not "
+                                f"grown in {quiet_m}m — busy is not progress")
         return "WORKING", f"mid-turn and BUSY ({pct:.1f}% cpu) — thinking, leave it alone"
     if state["age"] < ABANDONED_SECS:
         return "STUCK", f"mid-turn, at rest ({pct:.1f}%) but only {state['age']//60}m — too early to call"
@@ -1879,6 +1905,13 @@ def tick(a):
             elif raw["age"] >= IDLE_ESCALATE_SECS:
                 once("idle", f"idle {raw['age']//60}m — it has most likely FINISHED its scope. "
                              "Read its last prose turn: give it more work, relay it, or reap it")
+        elif state == "SPINNING":
+            # ⛔ A row that is BUSY and not progressing is the state the owner had
+            # to catch by hand. It is not woken — a wake types into a row that is
+            # mid-turn, and mid-turn is exactly what this is — it is ESCALATED, so
+            # a human or its orchestrator looks at a row that would otherwise have
+            # gone on reading WORKING forever.
+            once("spinning", why or "busy but not progressing")
         elif state == "STUCK":
             once("stuck", why or f"STUCK for {raw['age']//60}m")
         elif state == "NO_TRANSCRIPT":
@@ -1924,9 +1957,44 @@ def watcher_procs():
 
 
 def cmd_watch(a):
+    """⛔⛔ RE-EXEC WHEN THIS FILE CHANGES, OR EVERY FIX SHIPS INTO A PROCESS THAT
+    CANNOT SEE IT.
+
+    Measured 2026-08-21 and it invalidated a whole day of work: this watcher had
+    been running for **23 hours** while its source was edited five times that
+    morning. Python reads a module once, so the descendant-age discriminator, the
+    invisible-worker classifier and the guarded write path were all sitting in the
+    file and NONE of them were in the process. The board looked supervised; the
+    supervision was a day old.
+
+    ⇒ **The exact class this campaign has now found three times in one day** — a
+    stale daemon, a stale GUI, and now a stale watchdog. Long-lived processes
+    reading code from a checkout that moves under them, with nothing anywhere
+    saying how far behind they are. It is the worst of the three, because the
+    watchdog is the thing that is supposed to notice.
+
+    ⚠ Re-exec, never `importlib.reload`: the tick already loads the booter and the
+    babysitter as modules, and reloading a subset leaves two generations of code
+    disagreeing about what a state means, which is strictly worse than being
+    uniformly old. A fresh process cannot be half-updated. State is on disk, so
+    nothing is lost across it."""
+    try:
+        own_mtime = os.path.getmtime(__file__)
+    except OSError:
+        own_mtime = None
     deadline = time.time() + a.watch
     while time.time() < deadline:
         tick(a)
+        if own_mtime is not None:
+            try:
+                now_mtime = os.path.getmtime(__file__)
+            except OSError:
+                now_mtime = own_mtime
+            if now_mtime != own_mtime:
+                log(f"⭐ source changed on disk — re-execing so the new classifiers "
+                    f"are actually in this process (was {time.strftime('%H:%M:%S', time.localtime(own_mtime))})")
+                sys.stdout.flush()
+                os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
         time.sleep(a.interval)
     # ⛔⛔ AN EXPIRING SUPERVISOR IS INDISTINGUISHABLE FROM A HEALTHY QUIET ONE.
     # This loop used to just fall off its deadline and exit silently. Measured
