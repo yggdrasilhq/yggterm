@@ -4640,6 +4640,7 @@ fn TerminalCanvas(
                         post_resize_output_seen,
                         last_resize_seq,
                         _runtime_spawn_id,
+                        ..,
                     )) if running
                         && runtime_output_seen
                         && remote_resume_screen_snapshot_is_replayable_for_blank_host(
@@ -5080,6 +5081,7 @@ fn TerminalCanvas(
                                 screen_post_resize_output_seen,
                                 screen_last_resize_seq,
                                 screen_runtime_spawn_id,
+                                ..,
                             )) => {
                                 if screen_runtime_spawn_id != 0 {
                                     runtime_spawn_id = screen_runtime_spawn_id;
@@ -5436,6 +5438,7 @@ fn TerminalCanvas(
                                 screen_post_resize_output_seen,
                                 screen_last_resize_seq,
                                 screen_runtime_spawn_id,
+                                ..,
                             )) => {
                                 if screen_runtime_spawn_id != 0 {
                                     runtime_spawn_id = screen_runtime_spawn_id;
@@ -8717,6 +8720,7 @@ fn TerminalCanvas(
                                                 post_resize_output_seen,
                                                 last_resize_seq,
                                                 _runtime_spawn_id,
+                                                ..,
                                             ))
                                                 if remote_resume_non_prompt_snapshot_is_replayable(
                                                     &snapshot_text,
@@ -8819,6 +8823,7 @@ fn TerminalCanvas(
                                                 post_resize_output_seen,
                                                 last_resize_seq,
                                                 _runtime_spawn_id,
+                                                ..,
                                             )) => {
                                                 append_trace_event(
                                                     &trace_home,
@@ -8977,6 +8982,7 @@ fn TerminalCanvas(
                                             post_resize_output_seen,
                                             last_resize_seq,
                                             _runtime_spawn_id,
+                                            ..,
                                         ))
                                             if remote_resume_screen_snapshot_is_replayable_for_blank_host(
                                                 &snapshot_text,
@@ -9080,6 +9086,7 @@ fn TerminalCanvas(
                                             post_resize_output_seen,
                                             last_resize_seq,
                                             _runtime_spawn_id,
+                                            ..,
                                         )) => {
                                             append_trace_event(
                                                 &trace_home,
@@ -10936,6 +10943,7 @@ fn TerminalCanvas(
                                             snapshot_post_resize_output_seen,
                                             snapshot_last_resize_seq,
                                             _runtime_spawn_id,
+                                            ..,
                                         ))
                                             if remote_resume_screen_snapshot_is_replayable_for_blank_host(
                                                 &snapshot_text,
@@ -11039,6 +11047,7 @@ fn TerminalCanvas(
                                             snapshot_post_resize_output_seen,
                                             snapshot_last_resize_seq,
                                             _runtime_spawn_id,
+                                            ..,
                                         )) => {
                                             append_trace_event(
                                                 &trace_home,
@@ -16990,10 +16999,12 @@ async fn probe_terminal_input_consumption(
 ) -> TerminalInputProbeVerdict {
     let started = Instant::now();
     let mut composer_shown = false;
-    let mut composer_held_draft = false;
+    // ⛔ THE OPENING VALUE IS "NOBODY HAS ANSWERED", NOT "THERE IS NO DRAFT".
+    // A `false` here would be a permission granted before anything was read.
+    let mut composer_held_draft: Option<bool> = None;
     let mut activity = AgentRowActivity::Unknown;
     while started.elapsed() < timeout {
-        if let Ok((screen, ..)) = terminal_snapshot_async(
+        if let Ok((screen, .., daemon_draft)) = terminal_snapshot_async(
             endpoint.clone(),
             session_path.clone(),
             trace_home,
@@ -17002,7 +17013,16 @@ async fn probe_terminal_input_consumption(
             && terminal_chunk_has_agent_composer_row(&screen)
         {
             composer_shown = true;
-            composer_held_draft = terminal_composer_row_holds_draft(&screen);
+            // ⛔⛔ ASK THE DAEMON, NEVER THE SCREEN BYTES. This used to walk the
+            // escape stream for the last line beginning with the composer glyph
+            // and read the SGR the text after it opened in — faint meant chrome,
+            // anything else meant a person had typed. Every premise of that has
+            // since been measured false on this fleet (2026-08-21): the stream
+            // is not row-shaped, the glyph also prefixes DELIVERED transcript
+            // messages, and the CLI now draws a person's own typing faint too.
+            // The daemon holds the input line the keystrokes actually built and
+            // the rendered grid a person actually sees; this is its answer.
+            composer_held_draft = daemon_draft;
             // The session's own kind — never inferred from the composer glyph,
             // which several CLIs share.
             activity = terminal_chunk_agent_activity(session_kind, &screen);
@@ -17023,7 +17043,7 @@ async fn probe_terminal_input_consumption(
     // The freshest reading of "is somebody mid-sentence in there", carried across
     // iterations so every write is authorised by a reading taken AFTER the last
     // one. `Some(false)` is the only value that lets a write through.
-    let mut composer_draft_now = Some(composer_held_draft);
+    let mut composer_draft_now = composer_held_draft;
     let mut retry_backoff = TERMINAL_INPUT_PROBE_RETRY_MIN;
     while started.elapsed() < timeout {
         // ⛔ CHECKED BEFORE EVERY WRITE, never once at the top. A human can start
@@ -17052,10 +17072,12 @@ async fn probe_terminal_input_consumption(
         )
         .await;
         sleep(Duration::from_millis(180)).await;
-        let screen = terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
-            .await
-            .ok()
-            .map(|(screen, ..)| screen);
+        let reading =
+            terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
+                .await
+                .ok();
+        let fresh_draft = reading.as_ref().and_then(|(.., draft)| *draft);
+        let screen = reading.map(|(screen, ..)| screen);
         let echoed = screen
             .as_deref()
             .is_some_and(|screen| screen.contains(TERMINAL_INPUT_ECHO_PROBE));
@@ -17074,19 +17096,17 @@ async fn probe_terminal_input_consumption(
             return TerminalInputProbeVerdict {
                 consuming_input: true,
                 composer_shown: true,
-                composer_held_draft,
+                composer_held_draft: composer_held_draft.unwrap_or(false),
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: TERMINAL_INPUT_CONSUMING_REASON,
             };
         }
-        // ⭐ The marker did NOT echo, so it is not on this screen — which makes
-        // this reading a clean discriminator: any text in the composer now is
-        // somebody else's. Re-read before the Ctrl+U, because the echo wait is
-        // 180 ms and a person can easily start typing inside it.
-        composer_draft_now = screen
-            .as_deref()
-            .map(terminal_composer_row_holds_draft);
+        // ⭐ Re-read before the Ctrl+U, because the echo wait is 180 ms and a
+        // person can easily start typing inside it — and the fresh reading is
+        // the daemon's, taken on the snapshot we just fetched. ⛔ `None` (it
+        // could not say) stays `None` and refuses; it is not a clean composer.
+        composer_draft_now = fresh_draft;
         if !probe_write_is_permitted(composer_draft_now) {
             // ⛔ Return WITHOUT the Ctrl+U. The clear is the destructive half.
             return TerminalInputProbeVerdict {
@@ -17117,7 +17137,7 @@ async fn probe_terminal_input_consumption(
     TerminalInputProbeVerdict {
         consuming_input: false,
         composer_shown: true,
-        composer_held_draft,
+        composer_held_draft: composer_held_draft.unwrap_or(false),
         activity,
         waited_ms: started.elapsed().as_millis() as u64,
         reason: TERMINAL_INPUT_WEDGED_REASON,
@@ -17141,7 +17161,7 @@ fn spawn_screen_reconcile_fetch(
         let fetched = terminal_snapshot_async(endpoint, session_path, &trace_home)
             .await
             .ok()
-            .map(|(screen_text, _running, _out, _post, _seq, _spawn)| screen_text);
+            .map(|(screen_text, _running, _out, _post, _seq, _spawn, ..)| screen_text);
         // The loop dropping its receiver means the session unmounted: nothing
         // left to reconcile.
         let _ = result_tx.send((reconcile_reason, reveal_incomplete, fetched));
@@ -17152,7 +17172,7 @@ async fn terminal_snapshot_async(
     endpoint: ServerEndpoint,
     session_path: String,
     trace_home: &Path,
-) -> Result<(String, bool, bool, bool, u64, u64)> {
+) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>)> {
     run_dedicated_terminal_io("terminal_snapshot", trace_home, move || {
         terminal_snapshot(&endpoint, &session_path)
     })

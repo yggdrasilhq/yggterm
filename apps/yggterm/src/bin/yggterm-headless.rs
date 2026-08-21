@@ -1315,16 +1315,25 @@ fn main() -> Result<()> {
         let refused = yggterm_server::terminal_write_was_refused_for_draft(message.as_deref());
         let refused_for_line =
             yggterm_server::terminal_submit_was_refused_for_line(message.as_deref());
+        // ⛔⛔ A CONDITIONAL SUBMIT IS ANSWERED AFFIRMATIVELY OR NOT AT ALL.
+        // It carries no data, so a daemon that never evaluated the condition
+        // answers a plain write of zero bytes — nothing refused, nothing
+        // pressed. Scoring "neither refusal fired" as success told a watchdog
+        // its wake had landed while the text sat unsent in the composer, and
+        // the next cycle typed a second copy on top of it.
+        let submitted = yggterm_server::terminal_submit_landed(message.as_deref());
+        let conditional = submit_iff_line_equals.is_some();
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
                 // ⛔ Either refusal means nothing was submitted. A caller that
                 // reads only `refused_for_draft` would take a line-mismatch
                 // refusal as a success and believe it had pressed Enter.
-                "accepted": !refused && !refused_for_line,
+                "accepted": if conditional { submitted } else { !refused && !refused_for_line },
+                "submitted": submitted,
                 "refused_for_draft": refused,
                 "refused_for_line": refused_for_line,
-                "conditional_submit": submit_iff_line_equals.is_some(),
+                "conditional_submit": conditional,
                 "session_path": args[3],
                 "bytes": data.len(),
                 "message": message,
