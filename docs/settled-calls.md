@@ -663,11 +663,32 @@ These answer questions an agent asked; do NOT re-litigate them.
      trait's documented EOF contract still holds. The adoption machinery is
      Linux-gated **at the variant**, so the module compiles on every target
      rather than only the one it was written on.
-   - **Increment 2 — the `HotRestart` `sendmsg` wiring — is integrator-gated
-     and NOT built.** Two decisions are already settled and should not be
-     re-litigated when it is: the transcript payload travels BEFORE the fd,
-     and **`sendmsg` success is the commit point** — after it the fd belongs
-     to the successor, so nothing downstream may be recovered by re-sending.
+   - ✅ **Increment 2 — the `sendmsg` wiring — IS BUILT AND RUNNING.** *(This
+     clause said "integrator-gated and NOT built" until 2026-08-22. It is
+     `pty_handoff_wire.rs` (the fd), `pty_handoff.rs` (the protocol) and the
+     daemon's handoff listener; measured on the build host in one night, 135
+     adoptions and four sweeps reporting `AllMoved`. The stale line was cited
+     as evidence that a new daemon has no way to take over a PTY, which sent
+     readers looking for a mechanism that already existed.)* Both settled
+     decisions hold exactly as written and were not re-litigated: the
+     transcript payload travels BEFORE the fd, and **`sendmsg` success is the
+     commit point** — after it the fd belongs to the successor, so nothing
+     downstream may be recovered by re-sending.
+   - ⭐ **A REFUSAL IS ANSWERED BEFORE THE COMMIT POINT, NOT AFTER IT.** The
+     successor's seat check (*is a DIFFERENT live child already under this
+     key?*) used to run only once the descriptor had crossed, so a refusal
+     booked a failed handoff and the predecessor could never reach the
+     `AllMoved` that lets it retire — a daemon pinned for life holding every
+     session it owns. The metadata line already carries the whole input to
+     that decision, so the successor now answers a **verdict line** before the
+     `sendmsg`. This does not move the commit point and does not change the
+     refusal POLICY; it changes only WHEN the policy is applied.
+     ⛔ It is deliberately NOT a wire-version bump: a bump makes every older
+     successor refuse the whole handoff, and version coexistence is the
+     constitution's promise. The step is additive and asked-for — the
+     predecessor sets `precommit_verdict` in the metadata, an older successor
+     ignores an unknown field, and the successor answers only when asked, so
+     an older predecessor never sees a line where it expects its ack.
    - **Who owns the fd.** `PtySessionRuntime` in
      `crates/yggterm-server/src/terminal.rs` holds
      `master: Arc<Mutex<Box<dyn MasterPty + Send>>>`, and

@@ -97,6 +97,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ygg_host import resolve_gui_host  # noqa: E402
 from ygg_rowarg import bare_uuid, resolve_row  # noqa: E402
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_transcript  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 STATE = Path.home() / ".yggterm" / "relay"
 SUBS = STATE / "booter"
@@ -973,7 +977,11 @@ def _evidence_marker(uuid):
     re-arms the fleet forever. Same asymmetry as everywhere else in this file.
     """
     import glob
-    for p in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl")):
+    # ⛔ "Has it written anything since?" — over every declared store. Reading one
+    #    CLI's made this return None for all the others, and None is documented
+    #    just above as *not fresh evidence*: the safe direction, chosen for the
+    #    wrong reason, and never actually measuring those rows at all.
+    for p in ygg_transcript.transcript_paths(uuid):
         try:
             st = os.stat(p)
             return [st.st_size, int(st.st_mtime)]
