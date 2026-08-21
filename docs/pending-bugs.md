@@ -19851,11 +19851,34 @@ or neither does.
 after actually launching a third-party agent CLI as a work lane on 2026-08-21. It worked, but
 none of the fleet machinery reached it.
 
-**1. A third-party CLI session is invisible to the row plane.** It runs as an ordinary background
-process. It cannot be claimed, titled, seated, monitored for stalls, or messaged by any existing
-verb, and it does not appear in `server app rows`. ⇒ **Today the only way to supervise one is to
-poll files it writes.** Anything built on rows — the stall detector, the booter, succession —
-simply does not apply.
+**1. ⛔ CORRECTED 2026-08-21, SAME DAY — THE FIRST VERSION OF THIS ITEM WAS WRONG AND THE TRUE
+FINDING IS SHARPER.** It claimed a third-party CLI session "is invisible to the row plane… does not
+appear in `server app rows`". **False, and asserted without checking.** The listing carries a
+`remote-agy://` scheme with 11 rows and a `remote-muse://` scheme with 2. The plane models them.
+
+⭐ **What is actually broken is SEATING, and it splits perfectly by scheme.** Census of the live
+listing, 710 rows:
+
+| scheme | rows | seated (`outline_prefix` set) |
+|---|---:|---:|
+| `cc-runtime` | 13 | **8** |
+| `remote-cc` | 52 | 0 |
+| `remote-session` | 112 | 0 |
+| `local` | 87 | 0 |
+| `remote-agy` | 11 | **0** |
+| `remote-muse` | 2 | 0 |
+| (no scheme) | 433 | 0 |
+
+⇒ ⛔ **8 of 13 on one scheme; 0 of 697 on every other.** Seating is in practice a `cc-runtime`-only
+capability. A correctly-spawned foreign-CLI row would still take no seat, so the numbering scheme
+the fleet organises itself by **cannot address any non-native lane at all.**
+
+⚠ **And the second-order effect is what makes it deep rather than cosmetic:** an operator scanning
+the sidebar for "which lane is doing what" sees numbers only on native rows, so **foreign lanes are
+invisible to the very convention used to find work** — present in the data, absent from the map.
+
+⚠ Separately and still true: launching a foreign CLI as a bare background process creates **no row
+at all**. The scheme exists; nothing routes an ad-hoc launch into it.
 
 **2. Argument order silently changes what runs.** On the CLI tested, putting the print/non-
 interactive flag *before* the model selector caused **both** the model choice and the prompt
