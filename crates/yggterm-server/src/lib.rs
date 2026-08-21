@@ -4061,6 +4061,29 @@ mod persist_drop_trace_tests {
     }
 }
 
+impl ManagedSessionView {
+    /// Whether a DERIVED title must be refused for this row because a human
+    /// named it.
+    ///
+    /// ⭐ **The one predicate.** `set_session_title_hint` refuses on it, and
+    /// every detector that proposes a derived title must SKIP on it — a
+    /// detector that does not share the writer's rule re-detects the same
+    /// refused delta on every pass, forever. Measured 2026-08-21: 243
+    /// identical `remote_cc_title_pickup` events for ONE row in 45 minutes,
+    /// each carrying an ssh round trip, an all-sessions screen sweep under the
+    /// runtime lock and a multi-MB persist under the write lock, because the
+    /// title the detector kept "finding" could never be written. Every tick
+    /// counted as an update, so the chore's idle backoff never engaged and the
+    /// 12 s cadence was pinned for the daemon's whole life.
+    ///
+    /// ⚠ The empty-title arm is load-bearing, not defensive: a row flagged
+    /// explicit whose title is blank has nothing to protect, and refusing for
+    /// it would strand the row with no title at all.
+    pub fn title_is_owner_set(&self) -> bool {
+        self.title_is_explicit && !self.title.trim().is_empty()
+    }
+}
+
 fn working_flag_differs(session: &ManagedSessionView, working: bool) -> bool {
     session.working != Some(working)
 }
@@ -5526,21 +5549,37 @@ impl YggtermServer {
     /// ⛔ It refuses a row whose title a human set. This used to be
     /// unconditional, which is how a generated conversation title replaced the
     /// `--title` a delegate was launched with, seconds after birth.
-    pub fn set_session_title_hint(&mut self, session_path: &str, title: &str) {
+    /// Returns whether the hint actually landed.
+    ///
+    /// ⭐ The answer is load-bearing for every CHORE that proposes titles: a
+    /// caller that assumes its proposal was taken keeps re-proposing it, and a
+    /// refusal that reads as an update re-arms the chore's cadence forever
+    /// (the 12 s livelock of 2026-08-21). Refused, and no-op, both answer
+    /// false — "nothing about this row changed" is the fact a caller needs,
+    /// and it cannot be derived from the outside.
+    pub fn set_session_title_hint(&mut self, session_path: &str, title: &str) -> bool {
         if self.session_title_is_explicit(session_path) {
-            return;
+            return false;
         }
-        if let Some(session) = self.sessions.get_mut(session_path) {
+        let mut applied = false;
+        if let Some(session) = self.sessions.get_mut(session_path)
+            && session.title != title
+        {
             session.title = title.to_string();
+            applied = true;
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
                 if scanned.session_path == session_path {
-                    scanned.title_hint = title.to_string();
-                    return;
+                    if scanned.title_hint != title {
+                        scanned.title_hint = title.to_string();
+                        applied = true;
+                    }
+                    return applied;
                 }
             }
         }
+        applied
     }
 
     /// Whether this row's title was set by a human. The scanned mirror carries
@@ -5549,7 +5588,7 @@ impl YggtermServer {
     pub fn session_title_is_explicit(&self, session_path: &str) -> bool {
         self.sessions
             .get(session_path)
-            .is_some_and(|session| session.title_is_explicit && !session.title.trim().is_empty())
+            .is_some_and(ManagedSessionView::title_is_owner_set)
     }
 
     /// Set (or clear, with an empty value) the row's outline position.

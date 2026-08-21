@@ -201,7 +201,7 @@ pid runs the new image with the supervisor alive and every row intact.
 
 ## ⛔⛔ [11.9] THE HOT-RESTART GATE COMPARES VERSION STRINGS, SO A SAME-VERSION REBUILD NEVER ROLLS
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *Measured 2026-08-21 ~00:15 by the cli-practice lane.*
 
@@ -215,6 +215,129 @@ gate must compare BUILD IDENTITY (build id / exe hash), not the version string; 
 same-version different-build install is a roll, and `already_ready` must name the build id
 it verified. **Falsifier:** rebuild at an unchanged version with a one-line observable
 change, install, and the gate must roll the daemon and the change must be observable live.
+
+**LANDED 2026-08-21 (11.15).** `status_matches_expected` defaulted `expected_version` to
+the compiled-in version and treated `expected_build_id` as optional, so with no explicit
+`--expected-build-id` the build half was skipped entirely and the version string WAS the
+identity. The facts needed were already on the wire and simply not consulted: the daemon
+holds `running_build_id` (captured at process start) against `on_disk_build_id` (read now),
+and already publishes their disagreement as `hot_restart_pending` — the same signal
+`server daemons` renders as `(deleted) REPLACED ON DISK`. Now (1) a daemon whose running
+build is superseded on disk is never the expected daemon, which also governs the two
+coverage checks that pick which daemon may adopt another's sessions; (2) `already_ready`
+names what it verified, and `server_status_json` carries `running_build_id` /
+`on_disk_build_id` / `server_build_commit` / `build_superseded_on_disk` for every consumer
+— the old report showed only `server_build_id`, which is the ON-DISK file's stamp read at
+status time and therefore describes the new file while the process runs the old one; (3)
+the request forces past the daemon's own same-version refusal when the build is superseded,
+without which the fix only moves the identical wrong test one layer down. A daemon too old
+to report the fields answers false and is governed by the version check alone, so unknown
+is not confused with stale. Tests:
+`a_daemon_running_a_superseded_build_is_never_the_expected_daemon`,
+`the_status_report_names_the_running_build_not_just_the_file_on_disk`.
+
+⚠ This does NOT fix the sibling entry "A SAME-VERSION REBUILD CAN NEVER BE ADOPTED" below —
+that one is about socket NAMING (a same-version rebuild writes the same `server-<version>.sock`
+name, so no successor can advertise), and it stays open on its own terms.
+
+**The observation still owed:** the falsifier above, run on a real roll.
+
+## ⛔⛔ [11.15] A DETECTOR THAT DOES NOT SHARE THE WRITER'S REFUSAL RE-DETECTS ITS DELTA FOREVER
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Measured 2026-08-21 from daemon traces on two hosts.*
+
+The background copy chore sat at its 12s floor for a daemon's entire life. 243 identical
+`remote_cc_title_pickup` events for ONE row in ~45 minutes, the same `new_title` every time
+and `previous_title` never advancing — each one paying an ssh round trip, an all-sessions
+screen sweep under the runtime lock, and a multi-MB `persist` under the write lock (daemon
+persist p50 87ms x2,108 in one retention window). `background_copy` ticks reported
+`updates: 1-2` on 55 of 55 consecutive ticks, so the 60s idle backoff never engaged.
+
+**Root.** `remote_cc_title_poll_paths` selected every WORKING remote-cc row and the collector
+emitted an update whenever the remote JSONL title differed from the row's title — while
+`set_session_title_hint` silently refuses any row whose title a human set. The delta was real
+and permanently unsatisfiable, and because the chore's backoff keys on `update_count > 0`,
+every tick read as productive.
+
+**Fixed** by one predicate asked by both sides — `ManagedSessionView::title_is_owner_set`,
+which `session_title_is_explicit` now delegates to and the poll selector skips on, so an
+owner-titled row costs no ssh at all. Second net, because remembering this bug is not a
+mechanism: `set_session_title_hint` reports whether it landed (refusal and no-op both answer
+false), the chore counts APPLIED updates rather than proposed ones, and a tick that applied
+nothing no longer serializes the state file. The tick trace carries both numbers.
+
+**Falsifier:** with one owner-titled remote-cc row live, `background_copy` tick gaps must
+decay from 12s to the 60s idle ceiling, and `remote_cc_title_pickup` must stop repeating for
+that row.
+
+## ⛔⛔ [11.15] A GATE THAT JUDGES THE STORED ANSWER REOPENS ITSELF WHEN THE ANSWER IS BAD
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Measured 2026-08-21: title generation p50 9,335ms x2,589 (6.4h of wall clock in one
+retention window), summary p50 3,557ms x1,707 (1.9h), 271 `copy_generation_busy` incidents.*
+
+Both copy gates ask whether what is STORED is any good, and neither asks whether re-running
+could help. A title counts as missing while the stored one is a generated fallback; a summary
+needs refreshing while the stored one reads as low-signal. So a generation that failed and
+honestly recorded `untitled session` — itself a fallback — reopened its own gate, and the same
+unchanged session re-paid a ~9.3s LLM call on every eligible pass, forever. The code said so
+at the failure site and treated it as the design: "next tick will retry because untitled
+session is itself a fallback". A low-signal SUMMARY has exactly the same shape.
+
+**Fixed** with a generation-attempt ledger keyed `(session_id, kind)` holding the SOURCE STATE
+each attempt ran against, and one predicate over it. Deliberately not a retry timer: a timer
+says "try again later", the ledger says the input has not changed so the output cannot, and a
+transcript that GROWS is retried at once rather than waiting out a backoff it never earned.
+The attempt is recorded past the rate-limit and per-tick budget guards (a call that was never
+made is not an attempt, or one 429 storm freezes generation for every session at once);
+`delete_title` / `delete_summary` clear the ledger, because deleting generated copy is the
+documented repair and a ledger outliving it would make that repair silently do nothing; title
+and summary are tracked apart.
+
+⚠ Scope: this is the DAEMON chore, whose retry was per-tick and unbounded. The GUI has its own
+copy-generation path with a separate 5m-80m backoff (`background_copy_retry_key`), untouched.
+Generation is currently env-disabled on both fleet daemons, so this banks against the next
+daemon that has it on rather than showing in today's numbers.
+
+**Falsifier:** with generation enabled and a session whose transcript is not growing, a failed
+title generation must be attempted ONCE, not once per eligible pass — and must be attempted
+again the moment that transcript grows.
+
+## ⛔⛔ [11.15] THE LOCAL TREE SCAN RE-DERIVES A CORPUS THAT DID NOT CHANGE
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Measured 2026-08-21: `background/local_tree_scan` p50 4,616ms x1,378 on one host and p50
+13,932ms x700 on another; post-3.1.15 `span_busy` incidents of 52,267ms and 65,590ms per
+60,000ms window (87-109% duty). Corpora of 712 JSONL / 2.1GB and 1,291 JSONL / 6.7GB.*
+
+The walk ran every 8s from the GUI and every 12s from the daemon chore and rebuilt every row
+from scratch each time: a fresh SQLite connection per file (schema batch included), a
+multi-megabyte tail seek, and a serde parse of every line in that tail — TWICE, because the
+title fallback and the detail each asked for the tail separately.
+
+**Fixed** by memoising each row against its transcript's `(mtime_ns, len)`, and by reading the
+tail once per entry. The care is in what the memo must NOT freeze: a row is not a pure
+function of its transcript, because the title store answers into it and the generation chore
+writes that store behind the scan's back. So the store's stamp is the memo's GENERATION and a
+title write rebuilds everything — folding in every store path the row builder might resolve,
+since the scan's home and the builder's home are resolved by different code (see "THE TITLE
+STORE IS OPENED AT THREE DIFFERENT HOMES" below, still open; once that has ONE resolver this
+fold collapses to a single stat). Writers also drop the memo directly, because the titles
+sweep writes a title and immediately rescans to check its own work, and those two steps are
+closer together than a filesystem timestamp resolves. The scan span reports
+`scan_memo_hits` / `scan_memo_misses` / `scan_memo_rows`.
+
+⚠ Cadence constants were deliberately left alone. `BROWSER_TREE_REFRESH_POLL_MS` (8s) was the
+multiplier, not the root; with the scan incremental the poll is a stat sweep, and lengthening
+it would trade sidebar freshness for nothing.
+
+**Falsifier:** on a quiet corpus, `local_tree_scan` p50 must fall by an order of magnitude and
+the span must report `scan_memo_hits` approximately equal to the row count with near-zero
+misses; a session file that is appended to must still show its new content on the next scan.
 
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
@@ -918,6 +1041,11 @@ silently diverging title store. A junk-title delete aimed at the stray store del
 from the store every surface reads. Same shape as the count fix above: the home needs ONE
 resolver (`agent_store_home` now exists for the agent stores; the title store needs the
 yggterm-home equivalent), and the stray DBs need a migration-or-delete decision when fixed.
+
+⚠ A second reader now depends on this being ambiguous: the durable-scan memo's generation
+stamp (11.15) folds ALL of these candidate paths, because it cannot know which one the row
+builder will resolve. Once there is ONE resolver, that fold collapses to a single stat —
+see "THE LOCAL TREE SCAN RE-DERIVES A CORPUS THAT DID NOT CHANGE".
 
 ## ⛔⛔ [11.1] THE METADATA RAIL'S "CONVERSATION N user · M assistant" COUNTS A PREVIEW, NOT A CONVERSATION
 
