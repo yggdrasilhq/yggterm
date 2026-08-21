@@ -86,21 +86,25 @@ def ahead_behind(branch):
     return len(unlanded), behind
 
 
-def _main_lines():
-    """Every line of every text file in `origin/main`, as a set. Built once.
+def _tree_lines(rev):
+    """Every line of every text file at `rev`, COUNTED. ~0.5 s per rev here.
 
-    ~0.5 s and ~370k lines on this repo. Cheap enough to be the routine third
-    stage, which is the whole point: the two instruments above it are cheaper
-    still and both wrong.
+    ⛔ A set is not enough on the deletion side. `**Status:** FIXED IN CODE` is
+    boilerplate a dozen queue entries share, so membership says "still in main"
+    for a removal that landed perfectly. The counts are what let `_distinctive`
+    below drop those lines instead of reporting them forever.
     """
-    global _MAIN_LINES
-    if _MAIN_LINES is None:
-        r = git("grep", "-h", "-I", "-e", "", "origin/main")
-        _MAIN_LINES = set(l.strip() for l in r.stdout.splitlines())
-    return _MAIN_LINES
+    if rev not in _TREE_LINES:
+        r = git("grep", "-h", "-I", "-e", "", rev)
+        c = {}
+        for l in r.stdout.splitlines():
+            l = l.strip()
+            c[l] = c.get(l, 0) + 1
+        _TREE_LINES[rev] = c
+    return _TREE_LINES[rev]
 
 
-_MAIN_LINES = None
+_TREE_LINES = {}
 _RESIDUE = {}
 
 
@@ -155,9 +159,20 @@ def content_residue(branch):
             added.append(l[1:].strip())
         elif l.startswith("-") and not l.startswith("---"):
             deleted.append(l[1:].strip())
-    have = _main_lines()
+    have = _tree_lines("origin/main")
     add_miss = [l for l in _substantive(added) if l not in have]
-    del_left = [l for l in _substantive(deleted) if l in have]
+    del_left = []
+    del_sub = _substantive(deleted)
+    if del_sub:
+        # ⛔ ONLY DISTINCTIVE LINES CAN TESTIFY TO A REMOVAL. A line the parent
+        # tree already held more than once is boilerplate, and main having a
+        # copy says nothing about whether THIS block went away. Counting a
+        # multiple against main is also unfixable by arithmetic: main is 190
+        # commits ahead and has minted new entries carrying the same line, so
+        # no baseline subtraction converges. Test the unique lines and be
+        # quiet about the rest.
+        was = _tree_lines(mb)
+        del_left = [l for l in set(del_sub) if was.get(l, 0) == 1 and l in have]
     if not _substantive(added) and not _substantive(deleted):
         # Nothing testable — do not let an empty diff vote "landed".
         out = (1, ["(no substantive lines to test)"])
