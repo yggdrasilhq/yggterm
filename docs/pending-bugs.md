@@ -512,6 +512,42 @@ naming nodes that no longer exist — the JS applies batches inside a try/catch 
 rebuild that follows re-creates the tree, so it should be self-correcting, but "should" is
 the word doing the work.
 
+## ⛔⛔ [11.0] THE PANIC WATCHDOG'S MEMORY ARM THRESHOLDS A LEVEL, SO IT CANNOT EVER CLEAR
+
+**Status:** OPEN — the fix is a change to the `ytrace` crate, not to this repo.
+
+*Measured on the GUI host 2026-08-21, while the owner was reporting input latency.*
+
+`host_panic_memory` fired every 60 s reading *"memory pressure: 32% RAM in use, 7.5 GiB
+swapped"* on a machine with **9 GiB free**, producing roughly 200 error-severity incidents of
+pure noise in one trace generation.
+
+**Mechanism, from the source.** `diagnose_host_panic` (ytrace `diagnosis.rs`) ORs the two
+memory arms:
+
+```rust
+sample.mem_used_fraction.map(|f| f >= HOST_MEM_PANIC_FRACTION)   // 0.93 — nowhere near
+|| sample.swap_used_gib.map(|g| g >= HOST_SWAP_PANIC_GIB)        // 4.0  — permanently true
+```
+
+**Swap-used is a LEVEL, not a pressure.** After a memory crunch, GiBs stay resident in swap
+while free RAM recovers, and nothing in the system is obliged to reclaim them — that is the
+open swap-residue entry above, and it is the normal steady state on this host. So the arm is
+true forever, the sustain requirement is trivially met, and the alarm can never clear by any
+action the system can take.
+
+⚠ **This is the converse of the swap-residue diagnostic defect already recorded**, where
+machine-wide PSI *rates* were read as the absence of a per-process *level* and the verdict
+said "memory is not the cause" during an 81.8 s reveal. One instrument read a rate where a
+level was wanted; this one thresholds a level as though it were a rate. **A field naming a
+resource must say which it is, and only rates belong in an alarm predicate.**
+
+**Fix direction:** the memory arm fires on `mem_used_fraction` alone, or on a genuine
+contention rate (PSI `some`/`full` averaged over the sustain window, or major-fault rate).
+Swap residency stays in the payload as CONTEXT — it is useful for explaining a slow first
+touch — but stops being a trigger. **Falsifier:** park the host at high swap-used with ample
+free RAM and no reclaim stalls; no `host_panic_memory` incident may fire.
+
 ## ⚠ [11.0] SWAP RESIDUE MAKES EVERY FIRST TOUCH CRAWL, AND TWO INSTRUMENTS CALLED IT HEALTHY
 
 **Status:** OPEN

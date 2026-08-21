@@ -272,8 +272,37 @@ impl OurCpu {
 }
 
 /// Blocks per minute reported by the GUI's ui/block watchdog, read from the bus.
+///
+/// ⛔⛔ THE THIRD ARGUMENT IS AN ABSOLUTE EPOCH CUTOFF, NOT A DURATION, AND THIS
+/// PASSED A DURATION FOR MONTHS. `ytrace::query::summarize`'s parameter is
+/// `since_ms` and its reader filters with `record.ts_ms < since`. Handing it a
+/// window length (300_000) asks for "everything after 1970-01-01 00:05", which
+/// every record satisfies — so NOTHING was filtered and this returned the
+/// LIFETIME count of the retained trace divided by five minutes.
+///
+/// Both values are `u128`, both are honestly "milliseconds", and the call site
+/// read correctly at a glance. Nothing in the type system or the name could
+/// catch it; only the values could, and they were never checked against a
+/// second source.
+///
+/// ⇒ Measured on the desktop host 2026-08-21, while the owner was reporting
+///   input latency: this field read `1121.6`, then `97.0`, each REPEATED
+///   IDENTICALLY across consecutive 60 s heartbeats, against a 6/min alarm
+///   threshold. `ytrace health` gave a lifetime count of 487 for the same
+///   probe, and 487 / 5 = 97.4. Three tells, any one of which is conclusive:
+///   the value only ever rises, it is constant between adjacent samples (which
+///   a rate cannot be), and it sat permanently above its own threshold — so the
+///   panic incident fired every minute forever, ~200 error-severity incidents
+///   of pure noise. **An alarm that is always on carries the same information
+///   as one that is never on**, and the instrument built to make input blocks
+///   visible was incapable of reporting them while appearing to report them
+///   continuously.
+///
+/// ⚠ A rate that does not move between samples is not a rate. That check costs
+/// nothing and is the one that would have caught this on day one.
 fn ui_block_density(home: &Path, window_ms: u128) -> Option<f64> {
-    let summaries = ytrace::query::summarize(home, Some("ui"), Some(window_ms));
+    let since = now_ms().saturating_sub(window_ms);
+    let summaries = ytrace::query::summarize(home, Some("ui"), Some(since));
     let blocks = summaries.iter().find(|s| s.name == "block")?;
     Some(blocks.count as f64 / (window_ms as f64 / 60_000.0))
 }
