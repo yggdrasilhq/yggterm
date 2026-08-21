@@ -9,13 +9,29 @@
 //! ships, every un-waited child is a permanent entry in the process table for
 //! the life of the parent.
 //!
-//! **Measured on the fleet 2026-08-21**, four live daemons held **221 zombies**
-//! between them (79 / 68 / 66 / 8). In every one of them the OLDEST zombie was
-//! the same age as the daemon itself, so nothing had ever been reaped, and the
-//! arrivals were a metronome: p50 **912s** apart, min 911, max 917, across 78
-//! samples. That is `host_panic`'s fifteen-minute notify cooldown plus one
-//! monitor tick — a single `let _ = cmd.spawn()` in the owner-notification
-//! path, firing forever on a host that is genuinely under load.
+//! **Measured on one host 2026-08-21**, five live daemons held **233 zombies**
+//! between them (82 / 71 / 69 / 11 / 0). In every leaking one the OLDEST zombie
+//! was the same age as the daemon itself, so nothing had ever been reaped, and
+//! the arrivals were a metronome: p50 **903s** apart, min 901, max 906.
+//!
+//! ⭐ **The attribution is an exact correspondence, not an arithmetic
+//! coincidence.** Simulating `host_panic`'s fifteen-minute cooldown over one
+//! daemon's own traced `daemon/heartbeat/panic` events predicts **71**
+//! notifications; that daemon holds **71** zombies, first notification and
+//! first zombie share a birth second (23:57:23) and so do the last
+//! (17:30:39/40). 903s is not the cooldown plus anything — it is fifteen ticks
+//! of the 60s watcher loop, each carrying its own drift. A single
+//! `let _ = cmd.spawn()` in the owner-notification path, firing forever on a
+//! host that is genuinely under load.
+//!
+//! ⚠ **And the sixth daemon is the control the census nearly missed.** The one
+//! daemon on that host with zero zombies is the one built before the host-panic
+//! notifier existed — its binary contains none of the notifier's strings. The
+//! counterexample is the mechanism confirming itself. ⛔ It was also nearly
+//! missed for a duller reason: a census that greps for `yggterm-headless`
+//! misses a daemon launched as `yggterm server daemon`, and one such daemon was
+//! holding 69 zombies. **Enumerate daemons by their `server daemon` argument,
+//! never by the binary's name.**
 //!
 //! ⚠ **The failure is silent and it never gets worse in a way anyone notices.**
 //! A zombie costs no CPU and almost no memory, so nothing complains until the
