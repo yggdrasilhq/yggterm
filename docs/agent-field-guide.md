@@ -2641,3 +2641,60 @@ arithmetic is how a session produced three wrong readings in one afternoon.
 in one session, one of them on the person who had just written the warning. They are
 not facts to remember, they are STEPS to run — which is the argument for calling the
 helper rather than reproducing its logic at a shell prompt.
+
+## `server daemons` cannot see a daemon that lost its name (measured 2026-08-22)
+
+The census exists because `server status` answers for ONE daemon and "the whole
+daemon-lifecycle problem is about the others". It has a blind spot of exactly the same
+shape, and it is the one that matters: **it finds daemons by dialling the versioned
+socket PATHS**, so a daemon whose name has been re-pointed to a newer one is absent
+from it. Not listed as unreachable — absent.
+
+Measured on a build host: the census printed **two rows** while a **third** daemon was
+alive at 28 h, holding **83 `/dev/ptmx` descriptors**, still listening. Every versioned
+name in that home was a symlink to the newest daemon's socket, so every probe reached
+the same process and the other two were invisible to it.
+
+⇒ **The population always looks smaller and healthier than it is when this is
+happening**, which is the direction that gets believed. Cross-check with the two reads
+the census does not do:
+
+```sh
+# 1. The fast tell: names that are symlinks.
+ls -la "$YGGTERM_HOME"/server-*.sock | grep -c ' -> '
+
+# 2. The kernel still reports the path a socket was BOUND to, long after that path
+#    stopped leading there. Anything here that the census did not list is stranded.
+grep -E ' 00010000 .* 01 .*/server-.*\.sock$' /proc/net/unix
+```
+
+⚠ **The same blindness is not only cosmetic** — `reachable_versioned_daemon_statuses`
+is what the resume wrapper asks *"does any daemon already hold a runtime for this
+key?"*, and it is the same path probe. A stranded daemon's rows therefore answer "no
+such session" from every client on the host while the session itself is perfectly
+healthy, which is the attach deadlock in `pending-bugs.md` `[11.0]`.
+
+⭐ A daemon now re-binds its own name when it finds it re-pointed, so this state
+resolves itself within ~15 s on a fixed build. On a mixed-version host it can still
+happen and still needs the cross-check: the daemon that TAKES a name is the one that
+has to be fixed, and it may be the older binary.
+
+## `server attach --help` is not a help flag — it opens a row called `--help` (2026-08-22)
+
+`attach` takes a session path as its first POSITIONAL argument and does not
+special-case anything that looks like a flag. So the reflex that documents every
+other verb creates a live row named `local://--help` on whatever daemon is default,
+runs a shell in it, blocks for two minutes, and then reports the session as
+**wedged** — an error message about a session the reader has never heard of, on a
+host they were only trying to read the help for.
+
+⇒ It is worse on a SHARED host, where the stray row lands in somebody else's sidebar.
+
+- ⛔ Get the surface from `server --help`, which lists every subcommand with its
+  arguments. Do not probe a verb for its own help unless you already know the verb
+  does not take a positional.
+- ⭐ If it happens: `server app session remove <path>`, then read the row list back —
+  a row verb reports the request, never the effect.
+
+⚠ The same shape is worth checking before typing `--help` after ANY verb that takes a
+session path first (`screen`, `screenrecord`, `terminal write`).

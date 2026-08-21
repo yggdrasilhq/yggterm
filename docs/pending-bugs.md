@@ -211,10 +211,15 @@ in `crates/`, and `cargo test -p yggterm-server` is green.
 
 ## ⛔⛔⛔ [11.0] LEGENDARY — A LIVE DAEMON KEEPS ITS PTY MASTERS AND LOSES ITS NAME, SO NOTHING CAN ATTACH
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Half of it is fixed — mechanism (a) below — and the entry stays OPEN because mechanism (b), the
-one the user actually saw, is not.*
+*Both mechanisms are fixed, falsified RED-before/GREEN-after, and proved on two real daemons of
+different builds in a sandbox `YGGTERM_HOME`. What is owed is the entry's own falsifier on the
+desktop host: restart the daemon under a live agent row, attach to that row from a fresh client,
+and see the scrollback come back with the CLI's pid unchanged. That needs the fix deployed there.*
+
+*Mechanism (a) fixed 2026-08-22. Mechanism (b) — the half the user actually saw — fixed
+2026-08-22 in the same pair of changes as the seat-policy half it needs to work.*
 
 *⚠ Retitled 2026-08-22. It said "A DAEMON RESTART ORPHANS ITS PTY MASTERS": the masters are not
 orphaned and never were, which is measured below and is why the stated missing piece sent readers
@@ -335,12 +340,54 @@ own resume, and the wrapper correctly refuses to start a second one:
 second resume, which would corrupt the transcript. Waiting 24s so far.
 ```
 
-⇒ **That is the deadlock, and (a) is what supplies it with victims.** `probe_socket_occupancy`
-already exists to stop a name being taken from a daemon that merely failed to answer — but
-`refresh_legacy_server_socket_aliases` skips that probe entirely on its
-`versioned_socket_candidate_is_symlink` branch, so once a name has been taken ONCE it is
-re-pointed for ever and the daemon behind it can never get it back. **This half is not fixed here
-and needs its own lane.**
+⇒ **That is the deadlock, and (a) is what supplies it with victims.** ✅ **FIXED 2026-08-22.**
+
+`probe_socket_occupancy` guarded the branch that unlinks a REAL socket file and only that one —
+`refresh_legacy_server_socket_aliases` re-pointed a candidate that was ALREADY a symlink with no
+occupancy question asked at all. So a name only had to be taken once and every later daemon
+perpetuated the loss for free.
+
+⚠⚠ **AND THE PROBE COULD NOT HAVE ANSWERED IT EVEN IF IT HAD BEEN CALLED THERE**, which is
+the part that makes this its own defect rather than a missing call. A probe follows the path, and
+a diverted path leads to the daemon that TOOK the name — which always answers. ⇒ The question
+*"whose address is this name"* has exactly one instrument: the kernel's bind table, which goes on
+reporting the original path long after that path stopped leading there. `socket_sweep`'s census
+already reads it; the alias refresh now asks it, on BOTH branches, once per refresh, and keeps
+the name whenever the census cannot be read.
+
+⭐⭐ **AND PREVENTION RESCUES NOBODY, SO THE DAEMON TAKES ITS NAME BACK.** An unlinked socket
+inode cannot be re-linked to a path by anything, so every daemon already stranded stays stranded
+under prevention alone — the memory finding said outright that they *"cannot be rescued by
+anything"*, and that is now false. A live daemon re-binds its own versioned name, and only when
+what stands there is a symlink or nothing; a DIFFERENT real socket file at that name belongs to
+whoever bound it and is left alone. Reclaiming the name is a complete cure because everything
+that looks for a daemon looks by name — `reachable_versioned_daemon_statuses` dials the versioned
+paths, the bridge resolver asks those daemons which one owns a runtime key, and the cross-daemon
+reconcile addresses siblings the same way.
+
+### ⚠⚠ A THIRD INSTRUMENT LYING, AND IT IS THE ENUMERATION VERB ITSELF
+
+`server daemons` — the census written precisely because `server status` answers for one daemon
+and *"the whole daemon-lifecycle problem is about the others"* — **did not list the stranded
+daemon.** Measured on the build host 2026-08-22: the census printed two rows while a third daemon
+was alive with 83 pty masters. It cannot see it, and for the same reason nothing else can: it
+probes the versioned socket PATHS, and every one of them had been re-pointed to the newest
+daemon. ⇒ A daemon that has lost its name is absent from the one instrument whose job is to find
+daemons, so the population looks smaller and healthier than it is. The `/proc/net/unix` bind-name
+read is the cross-check; `ls -la $YGGTERM_HOME/server-*.sock` showing symlinks is the fast tell.
+
+### ⚠ AND THE CONTESTED KEY WAS NOT WHAT IT WAS SAID TO BE
+
+The report reaching this lane said the successor's runtime under the contested key was *"a WRAPPER
+STILL WAITING TO ATTACH"*. Checked against the trace instead of repeated: on the build host the
+key that re-failed every 60 s for 28 hours was a **plain shell** (`exec '/bin/bash' -i`), and no
+attach wrapper is involved in one at any point. The substance survives — the tenant was a
+stand-in, not work — but a fix built on the stated specifics would have keyed on a wrapper that
+is not there. ⇒ **What the tenant IS, and what the fix keys on:** a child this daemon spawned for
+itself, that nobody has ever typed into. Adopted children are the session's own travelling pty and
+are never displaced; a child somebody has typed into is never displaced. The two arms of
+`a_stand_in_yields_the_key_to_the_sessions_own_pty` and
+`a_child_somebody_has_typed_into_is_still_a_conflict` differ by exactly one byte of client input.
 
 ### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 
