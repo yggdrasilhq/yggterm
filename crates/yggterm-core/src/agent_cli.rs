@@ -1740,7 +1740,32 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
-        startup_gate_screen_phrases: &[],
+        // ⭐ MEASURED 2026-08-22 from a real codex row spawned into a directory this
+        // CLI had never opened. The gate asks `Do you trust the contents of this
+        // directory?` over `› 1. Yes, continue` / `2. No, quit`, with `Press enter
+        // to continue` beneath.
+        //
+        // ⛔⛔ THIS EMPTY LIST HAD A CAUSAL CHAIN BEHIND IT, WATCHED END TO END.
+        // Unrecognised, the gate classified as `ready` with `may_type: true`, so a
+        // delivery verb submitted into it. A picker consumes navigation keys, and
+        // one of these options is `No, quit` — so the CLI exited, the daemon
+        // relaunched it, and the fresh process came up at the same gate reporting
+        // `idle` again. A brief aimed at that row is eaten every time, and nothing
+        // anywhere reports a failure.
+        //
+        // ⚠ Two witnesses on their own rows and no `also_any`, for the same reason
+        // as Claude Code's: the gate paints each on its own visible line, so a
+        // same-line conjunction would demand an adjacency the screen does not have.
+        startup_gate_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "do you trust the contents of this directory",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "no, quit",
+                also_any: &[],
+            },
+        ],
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // `codex resume <id>` reopens the session's ORIGINAL cwd unless
@@ -2760,7 +2785,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_footer_hints: &["esc", "ctrl", "enter", "tab"],
-        composer_marker: '\u{276f}',
+        // ⭐ MEASURED 2026-08-22 from a real muse row: it draws U+27E9 `⟩`, not the
+        // U+276F `❯` that seven of the ten descriptors carry. Declared as `❯`, the
+        // readiness probe never found this CLI's composer at all, so every row of
+        // it reported `consuming_input: false` forever and the delivery verb waited
+        // out its whole timeout without ever sending — the SAME failure this field
+        // was created for when a hardcoded `›` did it to Claude Code on 2026-08-06.
+        // ⇒ The mechanism was made per-CLI; the value stayed a guess.
+        composer_marker: '\u{27e9}',
         working_footer_hints: &["esc to interrupt", "esc to cancel"],
         // MEASURED from `muse --help` §Safety: approval and the sandbox are ON
         // by default, and `--yolo` is the one flag that turns both off. Muse
@@ -4756,6 +4788,34 @@ pub fn new_row_birth_title(machine: Option<&str>, what: &str) -> String {
 /// exclusive by construction (`/.codex/sessions/` is not a substring of
 /// `/.codex-litellm/sessions/`), and
 /// [`agent_cli_store_roots_are_mutually_exclusive`] holds a new CLI to that.
+/// The kind slug a ROW REPORTS for this CLI — `icon_kind` in the row JSON, and
+/// the `data-tree-icon-kind` attribute the sidebar draws from.
+///
+/// ⛔⛔ **IT IS NOT ALWAYS [`AgentCliDescriptor::slug`], AND THAT IS THE WHOLE
+/// REASON THIS EXISTS.** The codex family reports the historical `"session"` —
+/// it predates there being a second CLI, it ships on the wire, and it may not be
+/// renamed. Every other CLI reports its slug.
+///
+/// ⚠ The fleet's Python matched a row's kind against the store table's KEYS,
+/// which are slugs, so it never narrowed for the codex family: **410 of 742 live
+/// rows on 2026-08-22**. It was right only because session ids are unique across
+/// stores, and that luck runs out the moment a caller needs to know WHETHER IT
+/// LOOKED — which the reap does, immediately before destroying a row.
+///
+/// ⇒ So the mapping is stated ONCE, here, next to the registry it derives from,
+/// and both the sidebar that produces the string and the lock that ratifies the
+/// fleet's copy of it read this rather than restating the match.
+pub fn row_icon_kind(kind: SessionKind) -> Option<&'static str> {
+    let descriptor = agent_cli_descriptor(kind)?;
+    Some(match kind {
+        // ⛔ HISTORICAL. Both codex variants wear the same mark, so this slug does
+        //    not identify which of the two a row is — a caller narrowing by it
+        //    must keep both candidates.
+        SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
+        _ => descriptor.slug,
+    })
+}
+
 pub fn agent_cli_for_store_path(path: &str) -> Option<&'static AgentCliDescriptor> {
     AGENT_CLIS
         .iter()
@@ -6744,6 +6804,93 @@ mod tests {
     /// a probe that reads the wrong file answers "nothing here", which is the same
     /// answer as the defect it was written to repair.
     #[test]
+    /// ⛔⛔ A ROW SITTING AT A STARTUP GATE MUST NEVER CLASSIFY AS TYPEABLE.
+    ///
+    /// Measured live 2026-08-22, and the chain was watched end to end: codex
+    /// declared NO gate phrases, so its trust prompt classified as `ready` with
+    /// `may_type: true`; a delivery verb submitted into it; a picker consumes
+    /// navigation keys and one option is `No, quit`; the CLI exited; the daemon
+    /// relaunched it; the fresh process came up at the same gate reporting `idle`.
+    /// Every brief aimed at that row was eaten, and nothing reported a failure.
+    ///
+    /// ⚠ The screens below are REAL captures with the directory replaced by an
+    /// invented one — the gate's wording is what is under test, and the path is
+    /// the one part of it that identifies nothing.
+    #[test]
+    fn a_startup_gate_is_recognised_for_every_cli_that_declares_one() {
+        const CODEX_GATE: &str = "\
+> You are in /home/example/work
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of
+  prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.
+› 1. Yes, continue
+  2. No, quit
+  Press enter to continue";
+        const CLAUDE_GATE: &str = "\
+ Accessing workspace:
+ /home/example/work
+ Quick safety check: Is this a project you created or one you trust?
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+ Enter to confirm · Esc to cancel";
+        // An ordinary working screen of each, which must NOT trip the gate.
+        const CODEX_IDLE: &str = "\
+› Run /review on my current changes
+  gpt-5.6-terra medium · ~/work";
+        const CLAUDE_IDLE: &str = "\
+❯ Try \"write a test for <filepath>\"
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent";
+
+        for (kind, gate, idle) in [
+            (SessionKind::Codex, CODEX_GATE, CODEX_IDLE),
+            (SessionKind::ClaudeCode, CLAUDE_GATE, CLAUDE_IDLE),
+        ] {
+            let d = agent_cli_descriptor(kind).expect("registered");
+            assert!(
+                !d.startup_gate_screen_phrases.is_empty(),
+                "{} declares no startup gate — EMPTY means UNMEASURED here, and an \
+                 unrecognised gate classifies as typeable",
+                d.slug
+            );
+            assert!(
+                d.screen_shows_startup_gate(&gate.to_lowercase()),
+                "{}'s own trust gate was not recognised from its real screen",
+                d.slug
+            );
+            assert!(
+                !d.screen_shows_startup_gate(&idle.to_lowercase()),
+                "{}'s ordinary composer screen was mistaken for a startup gate — a \
+                 gate that fires on an idle row makes every row untypeable",
+                d.slug
+            );
+        }
+    }
+
+    /// ⛔ The composer marker is a MEASUREMENT, and seven of ten descriptors carry
+    /// the same `❯`, which is how an assumed default hides among real ones. muse
+    /// draws U+27E9 and was declared U+276F, so its rows reported
+    /// `consuming_input: false` forever and delivery waited out every timeout —
+    /// the same failure a hardcoded `›` caused for Claude Code on 2026-08-06.
+    #[test]
+    fn a_composer_marker_is_the_glyph_that_cli_actually_draws() {
+        // Real composer lines, captured 2026-08-22. Paths invented.
+        for (kind, line) in [
+            (SessionKind::Muse, "\u{27e9}"),
+            (SessionKind::Codex, "\u{203a} Run /review on my current changes"),
+            (SessionKind::ClaudeCode, "\u{276f} Try \"write a test\""),
+        ] {
+            let d = agent_cli_descriptor(kind).expect("registered");
+            assert!(
+                line.starts_with(d.composer_marker),
+                "{} declares composer_marker {:?} but its real composer line starts \
+                 {:?} — the readiness probe finds no composer at all and the row \
+                 reports never-ready forever",
+                d.slug,
+                d.composer_marker,
+                line.chars().next().unwrap()
+            );
+        }
+    }
+
     fn the_fleet_transcript_table_matches_the_registry() {
         let raw = include_str!(
             "../../../.agents/skills/yggterm-agent-fleet/cli-stores.json"
@@ -6761,6 +6908,36 @@ mod tests {
                     descriptor.slug
                 )
             });
+
+            // ⛔⛔ THE SPELLING A ROW REPORTS, RATIFIED BY THE OWNER OF THAT
+            //    QUESTION. `icon_kind` is not always the slug — a codex row wears
+            //    the historical `session` — and the fleet's resolver matched a
+            //    row's kind against the table's KEYS, so it never narrowed for
+            //    codex: 410 of 742 live rows on 2026-08-22. It was right only
+            //    because ids are unique across stores, and that luck runs out the
+            //    moment a caller needs to know WHETHER IT LOOKED, which the reap
+            //    does before destroying a row.
+            let icon_kind = entry["icon_kind"].as_str().unwrap_or_else(|| {
+                panic!(
+                    "{} has no `icon_kind` in cli-stores.json - without it the fleet \
+                     cannot recognise its own rows by the kind they report",
+                    descriptor.slug
+                )
+            });
+            // ⛔ Compared against the PRODUCER, not against mere resolvability.
+            //    The first draft asked only whether `session_kind_for_row` could
+            //    map the alias back, and `"codex"` passed that - the exact wrong
+            //    guess whose absence caused the defect, because the slug arm
+            //    resolves it too. A lock that accepts the wrong answer is not one.
+            assert_eq!(
+                Some(icon_kind),
+                row_icon_kind(descriptor.kind),
+                "cli-stores.json spells {}'s row kind {icon_kind:?}, but a row of \
+                 that kind reports {:?} - the spelling a row reports has one owner \
+                 and this is not a place to restate it",
+                descriptor.slug,
+                row_icon_kind(descriptor.kind)
+            );
 
             let recorded: Vec<&str> = entry["store_globs"]
                 .as_array()

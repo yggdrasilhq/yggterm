@@ -40,10 +40,10 @@ import time
 
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_plane  # noqa: E402
 import ygg_transcript  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
 
 #: The transcript lags the submit. Measured 2026-08-21: brief accepted at
 #: 13:33:58 with submitted:true, transcript created 13:34:12.500 — 14.5 s, with
@@ -69,15 +69,9 @@ def gui_host():
     return (r.stdout or "").strip() or os.environ.get("YGG_GUI_HOST", "")
 
 
-def app(host, argstr, stdin_path=None):
-    cmd = f"{YGG} server app {argstr}"
-    if stdin_path:
-        cmd += f" < {stdin_path}"
-    r = subprocess.run(["ssh", "-n", host, cmd], capture_output=True, text=True, timeout=180)
-    try:
-        return json.loads(r.stdout)
-    except Exception:
-        return {"error": (r.stderr or r.stdout or "unparseable").strip()[:200]}
+#: ⛔ One owner for reaching the plane — see `ygg_plane`. Spelling it here is how
+#: a spawn verb became unprovable anywhere but somebody's live desktop.
+app = ygg_plane.app
 
 
 def main():
@@ -197,9 +191,10 @@ def main():
 
     # 5. SUBMIT, and read the answer. ⛔ `submitted:false` means MID-OUTPUT, never
     #    unreachable, and is NEVER retried — that is the bug that types over people.
-    remote_brief = f"/tmp/ygg-spawn-{uuid[:8]}.brief"
-    subprocess.run(["scp", "-q", a.brief, f"{host}:{remote_brief}"], timeout=120)
-    sub = (app(host, f"terminal submit '{row}' --stdin", stdin_path=remote_brief).get("data") or {})
+    # ⛔ One owner for putting a file where the plane can read it; locally that is
+    #    a no-op, and an unconditional scp is what kept this verb off a sandbox.
+    staged = ygg_plane.stage(host, a.brief)
+    sub = (app(host, f"terminal submit '{row}' --stdin", stdin_path=staged).get("data") or {})
     if not sub.get("submitted"):
         # ⛔⛔ NEVER RETRY A `submitted:false` — that is the bug that types over
         # people. But printing advice and exiting leaves a SEATED, BRIEFLESS row
