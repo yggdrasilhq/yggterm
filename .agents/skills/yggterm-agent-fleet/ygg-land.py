@@ -256,6 +256,46 @@ def touches_build(from_ref, to_ref):
     return any(not any(f.startswith(i) for i in INERT) and not f.endswith(".md") for f in out if f.strip())
 
 
+#: The roll builds from `origin/main` and refuses if main moved during its build.
+#: Landing into that window costs it a whole build and one allocated version, and
+#: its own retry budget is TWO — so a second collision in the same tick fails the
+#: roll outright and the fleet stays a version behind for an hour.
+#:
+#: ⛔ AND THE INTERLOCK MUST NOT WAIT FOR ITSELF. The roll invokes this very verb
+#: from inside its own service, so "wait while the roll is active" would deadlock
+#: on the one caller that must never wait. Membership is read from the cgroup
+#: rather than from an environment variable the roll would have to remember to
+#: set: a process started by the unit is IN the unit's cgroup, and nothing else is.
+ROLL_UNIT = "ygg-roll-watch.service"
+
+
+def _inside_the_roll():
+    try:
+        return ROLL_UNIT in open("/proc/self/cgroup").read()
+    except OSError:
+        return False
+
+
+def _roll_is_building():
+    r = subprocess.run(["systemctl", "--user", "is-active", ROLL_UNIT],
+                       capture_output=True, text=True, timeout=30)
+    return r.stdout.strip() in ("active", "activating", "reloading")
+
+
+def wait_out_the_roll(ceiling_s=600):
+    """Hold off while the roll owns main. Returns having waited, never refusing:
+    a branch that does not land is worse than a branch that lands late."""
+    if _inside_the_roll() or not _roll_is_building():
+        return
+    log(f"  ⏸ the roll is building from main — holding up to {ceiling_s // 60}m so the")
+    log("     push does not cost it a version and a build (its retry budget is 2)")
+    waited = 0
+    while waited < ceiling_s and _roll_is_building():
+        time.sleep(15)
+        waited += 15
+    log(f"  ▶ proceeding after {waited}s" + ("" if waited < ceiling_s else " — ceiling reached, landing anyway"))
+
+
 def land_one(branch, apply_it, attempts=5):
     """⛔ A PUSH REJECTION IS THE NORMAL OUTCOME HERE, NOT AN ERROR.
 
@@ -276,6 +316,8 @@ def land_one(branch, apply_it, attempts=5):
     #   from main, which is true by construction on every attempt, so the skip
     #   never fired and every retry paid full price.
     needs_check = True
+    if apply_it:
+        wait_out_the_roll()
     for attempt in range(1, attempts + 1):
         result = _land_once(branch, apply_it, attempt, attempts, needs_check)
         if isinstance(result, tuple):
