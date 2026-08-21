@@ -21553,6 +21553,137 @@ mod tests {
         .collect()
     }
 
+    /// ⛔ A HEAD THAT DIES DAEMON-SIDE MUST NOT LEAVE ITS ARRANGEMENT BEHIND —
+    /// AND AN ABSENCE MUST BE CONFIRMED BEFORE IT COUNTS.
+    ///
+    /// `RowArrangement::retain_live` existed, correct and tested, with no
+    /// production caller: the GUI's close and remove paths handle the row being
+    /// closed, and a head that dies daemon-side or remotely left an entry stored
+    /// forever. The obvious wiring — prune every frame against the live set — is
+    /// worse than the leak, because the live set FLICKERS during a daemon
+    /// handover and the user's whole arrangement would go with it. So this
+    /// asserts the confirmation as hard as it asserts the prune: two sightings
+    /// change nothing, and an EMPTY live set changes nothing at any count.
+    #[test]
+    fn a_departed_head_is_forgotten_only_after_its_absence_is_confirmed() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://head");
+        let mut shell = ShellState::new(bootstrap);
+        let head = "local://head".to_string();
+        let member = "local://member".to_string();
+        shell
+            .row_arrangement
+            .attach(&head, &member, None)
+            .expect("a hand-built set");
+
+        let survivor =
+            yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&member));
+        let snapshot_without_the_head = |sessions: Vec<yggterm_server::SnapshotSessionView>| ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: sessions,
+            apps: Vec::new(),
+        };
+
+        // ⛔ NOTHING LIVE AT ALL — a handover, not a departure. Any number of
+        // these must decide nothing, or three quiet snapshots would wipe an
+        // arrangement built over weeks.
+        shell.server.apply_snapshot(snapshot_without_the_head(Vec::new()));
+        for _ in 0..6 {
+            shell.prune_departed_row_arrangement();
+        }
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            Some(head.as_str()),
+            "an empty live set is 'I have not been told yet', never 'everyone left'"
+        );
+
+        // The member is live; the head is gone. Two sightings are not enough.
+        shell
+            .server
+            .apply_snapshot(snapshot_without_the_head(vec![survivor.clone()]));
+        shell.prune_departed_row_arrangement();
+        shell.prune_departed_row_arrangement();
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            Some(head.as_str()),
+            "an unconfirmed absence must leave the arrangement untouched"
+        );
+
+        // The third confirms it.
+        shell.prune_departed_row_arrangement();
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            None,
+            "a confirmed departure re-parents the member per retain_live's own \
+             contract"
+        );
+        assert!(
+            !shell.row_arrangement.sets.is_head(&head),
+            "and the dead head's entry is gone from the arrangement"
+        );
+        assert_eq!(
+            shell.settings.row_arrangement, shell.row_arrangement,
+            "the prune persists: an entry cleared in memory and left in settings \
+             comes straight back at the next start"
+        );
+    }
+
+    /// A row that comes BACK before the count runs out keeps its arrangement —
+    /// the counter must reset on sight, not merely stop rising, or a row that
+    /// flickers once per handover would be pruned on its third handover rather
+    /// than on its third absence.
+    #[test]
+    fn a_row_that_reappears_keeps_the_arrangement_it_had() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://head");
+        let mut shell = ShellState::new(bootstrap);
+        let head = "local://head".to_string();
+        let member = "local://member".to_string();
+        shell
+            .row_arrangement
+            .attach(&head, &member, None)
+            .expect("a hand-built set");
+        let snapshot = |sessions: Vec<yggterm_server::SnapshotSessionView>| ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: sessions,
+            apps: Vec::new(),
+        };
+        let head_row =
+            yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&head));
+        let member_row =
+            yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&member));
+
+        for _ in 0..2 {
+            shell
+                .server
+                .apply_snapshot(snapshot(vec![member_row.clone()]));
+            shell.prune_departed_row_arrangement();
+        }
+        // Back on the next snapshot.
+        shell
+            .server
+            .apply_snapshot(snapshot(vec![head_row.clone(), member_row.clone()]));
+        shell.prune_departed_row_arrangement();
+        // Two more absences: with the counter reset, that is still not three.
+        for _ in 0..2 {
+            shell
+                .server
+                .apply_snapshot(snapshot(vec![member_row.clone()]));
+            shell.prune_departed_row_arrangement();
+        }
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            Some(head.as_str()),
+            "a sighting resets the count; only three CONSECUTIVE absences act"
+        );
+    }
+
     /// ⛔⛔ THE SIDEBAR DRAWS OUTLINE ORDER CONTINUOUSLY — NO VERB RUN AT ALL.
     ///
     /// Owner-reported twice on 2026-08-21 as rows not being in ascending order.
