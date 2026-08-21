@@ -2088,3 +2088,32 @@ happened most recently before the block, so the most FREQUENT event wins by acci
 Across a sample it was `None` for half the blocks, with four different named
 activities splitting the rest — one payload read alone would have named a culprit that
 is not one.
+
+## Measuring ytrace: use `notebooks/ytrace_helpers.py`, not the raw CLI (2026-08-21)
+
+The raw `ytrace` CLI has two traps that produce confident wrong numbers, and the
+helper module already solves both. Reaching for the CLI and hand-rolling the
+arithmetic is how a session produced three wrong readings in one afternoon.
+
+- ⛔ **`ytrace tail` applies `--lines` with a DEFAULT OF 20 even when `--since` is
+  given.** So `--since 1h` returns the last twenty records while claiming an hour.
+  It distorts BOTH ways: a rate comes out too HIGH (fixed count over the short span
+  those records cover — 67/min for a true ~2/min), and a TOTAL comes out too LOW
+  (a truncated sum — "5.2% of a core" for a render cost that was 11.3%). The second
+  is the dangerous one, because a small number reads as good news.
+  ⇒ `ytrace_helpers.tail()` passes `TAIL_LINES_DEFAULT = 100_000`.
+- ⛔ **Cores burned is not `duration_ms / window`.** A cpu-clock span carries its own
+  `interval_ms`; dividing by the window you asked for is an approximation that drifts
+  whenever sampling is irregular. ⇒ `ytrace_helpers.core_fraction()`.
+- ⛔ **Never rank a `render` row against a latency row.** One is CPU-ms over an
+  interval, the other wall-clock; sorting both by `total_ms` calls the largest of two
+  different quantities the hottest. ⇒ `ytrace_helpers.split_by_clock()`.
+- ⛔ **Group by emitter version BEFORE comparing anything to a bar**, because a fleet
+  mid-roll writes several builds into one stream and a window that spans a roll
+  describes the roll. ⇒ `ytrace_helpers.split_by_version()` and `version_spans()`,
+  which divides each version's rate by that version's OWN first-to-last span.
+
+⚠ **Knowing these did not prevent them.** All four are written down; three still fired
+in one session, one of them on the person who had just written the warning. They are
+not facts to remember, they are STEPS to run — which is the argument for calling the
+helper rather than reproducing its logic at a shell prompt.
