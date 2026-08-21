@@ -10455,7 +10455,7 @@ console.log('ok');
     #[test]
     fn the_cli_install_modal_owns_the_keys_when_it_is_the_only_one_up() {
         assert_eq!(
-            top_modal_of(false, false, false, true, false, false, false, false, false, false, false),
+            top_modal_of(false, false, false, true, false, false, false, false, false, false, false, false),
             Some(TopModal::CliInstall)
         );
         assert_eq!(TopModal::CliInstall.kind(), "cli-install");
@@ -10468,7 +10468,7 @@ console.log('ok');
     #[test]
     fn launch_flags_outranks_cli_install_when_both_are_flagged() {
         assert_eq!(
-            top_modal_of(false, false, true, true, false, false, false, false, false, false, false),
+            top_modal_of(false, false, true, true, false, false, false, false, false, false, false, false),
             Some(TopModal::LaunchFlags),
             "the deeper modal keeps the keys until it is dismissed"
         );
@@ -10504,46 +10504,46 @@ console.log('ok');
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, false, false),
+            top_modal_of(false, false, false, false, false, false, false, false, false, false, false, false),
             None
         );
         // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false, false, false, false, false, false, false),
+            top_modal_of(true, false, false, false, false, false, false, false, false, false, false, false),
             Some(TopModal::KeymapEditor)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false, false, false, false, false, false, false),
+            top_modal_of(false, true, false, false, false, false, false, false, false, false, false, false),
             Some(TopModal::ThemeEditor)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, false, false, false, false, false),
+            top_modal_of(false, false, false, false, false, true, false, false, false, false, false, false),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, false, false, false, false, false),
+            top_modal_of(false, false, false, false, false, false, true, false, false, false, false, false),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, false, false, false, false),
+            top_modal_of(false, false, false, false, false, false, false, true, false, false, false, false),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true, false, false, false),
+            top_modal_of(false, false, false, false, false, false, false, false, true, false, false, false),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true, false, false),
+            top_modal_of(false, false, false, false, false, false, false, false, false, true, false, false),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, false, true),
+            top_modal_of(false, false, false, false, false, false, false, false, false, false, false, true),
             Some(TopModal::StripDropdown)
         );
         // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
         // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, false, true, true, true, true, true, false, true),
+            top_modal_of(true, true, true, false, false, true, true, true, true, true, false, true),
             Some(TopModal::KeymapEditor)
         );
         // ⛔ A capture prompt outranks every dialog below the two editors. Both
@@ -10552,21 +10552,21 @@ console.log('ok');
         // keyboard reaches, or Escape would dismiss the wrong dialog and leave
         // the engine blocked on this one.
         assert_eq!(
-            top_modal_of(false, false, false, false, true, true, true, true, true, false, true),
+            top_modal_of(false, false, false, false, false, true, true, true, true, true, false, true),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, true, true, true, false, true),
+            top_modal_of(false, false, false, false, false, false, true, true, true, true, false, true),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, true, true, false, true),
+            top_modal_of(false, false, false, false, false, false, false, true, true, true, false, true),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true, false, true),
+            top_modal_of(false, false, false, false, false, false, false, false, false, true, false, true),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -17138,6 +17138,235 @@ console.log('ok');
         assert_eq!(shell.app_pane_values["query"], "gh");
         let posted = shell.app_pane_values_json().to_string();
         assert!(!posted.contains("hunter2"), "secret leaked into an action POST");
+    }
+
+    /// An app-raised modal is a first-class member of the ONE precedence list.
+    ///
+    /// ⛔ It sits with the other RAIL-RAISED editors, ABOVE the dialogs a page
+    /// can raise, and that is not an oversight: precedence follows PAINT order
+    /// here, it is drawn at their z-index, and a prompt painted underneath it
+    /// must not be the thing Escape answers. The first cut of this test asserted
+    /// the opposite from a comment that contradicted the code — the code was
+    /// right and the comment was the bug.
+    #[test]
+    fn an_app_raised_modal_sits_with_the_rail_raised_editors() {
+        assert_eq!(
+            top_modal_of(false, false, false, false, true, false, false, false, false, false, false, false),
+            Some(TopModal::AppPaneModal)
+        );
+        assert_eq!(TopModal::AppPaneModal.kind(), "app-pane-modal");
+        assert_eq!(TopModal::AppPaneModal.scope_label(), "Options");
+        // It is drawn ABOVE a page-raised prompt, so it keeps the keys over one.
+        assert_eq!(
+            top_modal_of(false, false, false, false, true, true, false, false, false, false, false, false),
+            Some(TopModal::AppPaneModal),
+            "a prompt painted under the dialog must not be what Escape answers"
+        );
+        assert_eq!(
+            top_modal_of(false, false, false, false, true, false, true, false, false, false, false, false),
+            Some(TopModal::AppPaneModal)
+        );
+        // …and the two editors it shares a z-index with still outrank it.
+        assert_eq!(
+            top_modal_of(false, false, false, true, true, false, false, false, false, false, false, false),
+            Some(TopModal::CliInstall)
+        );
+        assert_eq!(
+            top_modal_of(false, false, true, false, true, false, false, false, false, false, false, false),
+            Some(TopModal::LaunchFlags)
+        );
+    }
+
+    /// ⛔ THE TRAP THIS TEST EXISTS FOR: a native child webview draws above ALL
+    /// DOM, so a dialog raised over a browsing session renders BEHIND the page
+    /// unless the reconciler stashes the surface first. The user's report is
+    /// "the button does nothing". ychrome raises this dialog from its settings
+    /// pane, which is always over a web surface, so this membership is the whole
+    /// difference between a working modal and an invisible one.
+    #[test]
+    fn an_app_raised_modal_joins_the_over_viewport_list_so_the_surface_is_stashed() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        assert!(!chrome_transient_over_viewport(&shell.snapshot()));
+        shell.open_app_pane_modal(
+            "settings",
+            serde_json::from_value(json!({
+                "title": "Options",
+                "widgets": [{"kind": "label", "text": "hello"}],
+            }))
+            .expect("modal spec parses"),
+        );
+        assert!(
+            chrome_transient_over_viewport(&shell.snapshot()),
+            "an app modal that does not stash the surface is painted behind the page"
+        );
+        assert!(shell.close_app_pane_modal());
+        assert!(!chrome_transient_over_viewport(&shell.snapshot()));
+        assert!(
+            !shell.close_app_pane_modal(),
+            "closing nothing must not report itself as a dismissal"
+        );
+    }
+
+    /// A modal's drafts live in the MODAL's map, not the rail's. The rail keeps
+    /// refreshing underneath a dialog (a heartbeat, another action's reply), and
+    /// applying a rail schema replaces that map wholesale — sharing one map
+    /// would let a background refresh empty the form the user is typing in.
+    #[test]
+    fn a_modal_draft_is_not_stored_in_the_rails_own_values() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(
+            seq,
+            "settings",
+            serde_json::from_value(json!({
+                "widgets": [{"kind": "search-box", "id": "query", "value": "rail"}],
+            }))
+            .expect("schema parses"),
+        );
+        shell.open_app_pane_modal(
+            "settings",
+            serde_json::from_value(json!({
+                "title": "Options",
+                "widgets": [{"kind": "text-input", "id": "site"}],
+            }))
+            .expect("modal spec parses"),
+        );
+        shell.set_app_pane_value("site", "example.com".to_string());
+        assert!(
+            !shell.app_pane_values.contains_key("site"),
+            "a modal draft landed in the rail's map, where a refresh can drop it"
+        );
+        assert_eq!(
+            shell.app_pane_modal.as_ref().expect("modal is up").values["site"],
+            "example.com"
+        );
+
+        // The rail refreshing underneath must not disturb the dialog's draft.
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(
+            seq,
+            "settings",
+            serde_json::from_value(json!({
+                "widgets": [{"kind": "search-box", "id": "query", "value": "rail"}],
+            }))
+            .expect("schema parses"),
+        );
+        assert_eq!(
+            shell.app_pane_modal.as_ref().expect("modal is up").values["site"],
+            "example.com",
+            "a rail refresh emptied the form the user was typing in"
+        );
+
+        // …and the POST an action makes carries both, the modal's winning.
+        let posted = shell.app_pane_action_values_json();
+        assert_eq!(posted["site"], "example.com");
+        assert_eq!(posted["query"], "rail");
+    }
+
+    /// The drafts die with the dialog, for the same reason a pane switch drops
+    /// the rail's: a value the app has stopped declaring must never ride along
+    /// on some later, unrelated action.
+    #[test]
+    fn closing_a_modal_drops_its_drafts_and_a_pane_switch_retires_it() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        shell.open_app_pane_modal(
+            "settings",
+            serde_json::from_value(json!({
+                "widgets": [{"kind": "text-input", "id": "token", "secret": true}],
+            }))
+            .expect("modal spec parses"),
+        );
+        shell.set_app_pane_value("token", "hunter2".to_string());
+        assert!(shell.app_pane_action_values_json().to_string().contains("hunter2"));
+        shell.close_app_pane_modal();
+        assert!(
+            !shell.app_pane_action_values_json().to_string().contains("hunter2"),
+            "a dismissed dialog's secret survived into the next action's POST"
+        );
+
+        // A pane switch retires the dialog with it — otherwise its actions would
+        // POST at a pane the app is no longer drawing.
+        shell.open_app_pane_modal(
+            "settings",
+            serde_json::from_value(json!({"widgets": []})).expect("modal spec parses"),
+        );
+        shell.clear_app_pane_draft();
+        assert!(shell.app_pane_modal.is_none());
+    }
+
+    /// A modal refreshing itself must not steal the caret. Same rule the rail
+    /// follows, and it is the same code — [`app_pane_adopt_values`] — so the two
+    /// cannot drift apart.
+    #[test]
+    fn refreshing_a_modal_bumps_an_epoch_only_for_a_value_the_field_is_not_showing() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        let spec = json!({
+            "widgets": [
+                {"kind": "search-box", "id": "query", "value": "you"},
+                {"kind": "text-input", "id": "note", "value": "one"},
+            ],
+        });
+        shell.open_app_pane_modal("settings", serde_json::from_value(spec.clone()).expect("parses"));
+        let first = shell.app_pane_modal.as_ref().expect("up").pane.value_epochs.clone();
+
+        // Re-declare the SAME values: an echo, which must leave both alone.
+        shell.open_app_pane_modal("settings", serde_json::from_value(spec).expect("parses"));
+        let echoed = shell.app_pane_modal.as_ref().expect("up").pane.value_epochs.clone();
+        assert_eq!(echoed["query"], first["query"]);
+        assert_eq!(echoed["note"], first["note"]);
+
+        // Push a value the field is NOT showing: only that one remounts.
+        shell.open_app_pane_modal(
+            "settings",
+            serde_json::from_value(json!({
+                "widgets": [
+                    {"kind": "search-box", "id": "query", "value": "you"},
+                    {"kind": "text-input", "id": "note", "value": "two"},
+                ],
+            }))
+            .expect("parses"),
+        );
+        let pushed = shell.app_pane_modal.as_ref().expect("up").pane.value_epochs.clone();
+        assert_eq!(pushed["query"], first["query"], "an untouched field remounted");
+        assert_eq!(pushed["note"], first["note"] + 1);
+    }
+
+    /// The capability marker. An app that draws an "Options…" button on a shell
+    /// too old to answer it has drawn a DEAD CONTROL, so it has to be able to ask
+    /// before it declares one — on the schema GET and on an action POST alike,
+    /// because an action handler decides what to RETURN and must not have to
+    /// remember what the last GET said.
+    #[test]
+    fn both_directions_tell_the_app_whether_this_shell_can_raise_a_modal() {
+        let fetch = shell_fn_body("async fn app_pane_fetch_schema");
+        assert!(
+            fetch.contains(r#"query.push(format!("app_modals={APP_MODALS_SUPPORTED}"));"#),
+            "the schema GET stopped advertising the modal capability"
+        );
+        let action = shell_fn_body("async fn app_pane_run_action_with_order");
+        assert!(
+            action.contains(r#""app_modals".to_string(),"#)
+                && action.contains("APP_MODALS_SUPPORTED"),
+            "the action POST stopped advertising the modal capability"
+        );
+    }
+
+    /// ONE renderer draws a rail pane and a modal. A second copy of the widget
+    /// vocabulary for dialogs would be a second thing to grow, and the two would
+    /// diverge on the first widget somebody added to only one of them.
+    #[test]
+    fn the_modal_draws_through_the_rails_own_widget_renderer() {
+        let source = include_str!("overlays.rs");
+        let overlay = source
+            .find("fn AppPaneModalOverlay(")
+            .expect("the modal overlay is mounted");
+        let body = &source[overlay..];
+        let end = body.find("\n}\n").expect("the overlay has a column-0 close");
+        let body = &body[..end];
+        assert!(
+            body.contains("AppPaneRailBody {") && body.contains("modal: true,"),
+            "the modal grew its own widget renderer beside the rail's"
+        );
     }
 
     fn declare_pane(shell: &mut ShellState, session: &str, pane_id: &str, now_ms: u64) {
@@ -43060,6 +43289,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -44223,6 +44453,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -44430,6 +44661,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -44637,6 +44869,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -44847,6 +45080,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -45061,6 +45295,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -45267,6 +45502,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -45473,6 +45709,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -45720,6 +45957,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -45929,6 +46167,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -46177,6 +46416,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
@@ -46702,6 +46942,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_modal: None,
             app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
