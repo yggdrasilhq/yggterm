@@ -19812,3 +19812,74 @@ form is a destructive write, and it reports success.
 confirmation on the erasing form. Wanted: the no-argument form should RETURN the current
 value (or refuse), and clearing should be an explicit flag (`--clear`). Until then the only
 safe read-back is a listing instrument, not the verb itself.
+
+## [19.1] `server app session outline` REPORTS `error: null` WHILE `applied: false`, SO A SEAT SILENTLY DOES NOT LAND
+
+**Status:** OPEN — observed 2026-08-21 against the current build.
+
+A CLI-runtime session renamed its own row successfully and then set its seat number in the
+same claim. **The rename landed; the seat did not.** The read-back showed an empty prefix,
+which the claim script reported as `claim never verified (row reads: |<title>)`.
+
+Calling the verb directly returns the reason, and the reason is only in `data`:
+
+```json
+{ "data": { "applied": false,
+            "daemon_message": "no live session for cc-runtime://<uuid>",
+            "outline_prefix": null, "requested": "19.1" },
+  "error": null }
+```
+
+⛔ **`error` is `null` for a request that did nothing.** Any caller that checks the documented
+error channel concludes success. The claim script only caught it because it independently
+re-reads row state — a caller written to the obvious contract would not.
+
+⚠ **And the two verbs disagree about what a row is.** `rename` accepted the same row path in the
+same second that `outline` called it "no live session". So a row can be renameable and
+unseatable at once, which is not a state any caller is written to expect.
+
+**What would falsify this:** a run where `outline` on a row absent from the daemon's live-session
+table returns a non-null `error`, or where `rename` refuses the same path for the same reason.
+
+**Suggested shape of a fix:** `applied: false` should always be accompanied by a non-null `error`,
+and the two verbs should agree on the liveness precondition — either both require a live session
+or neither does.
+
+## [19.2] REPORT — CROSS-CLI ORCHESTRATION: WHAT BLOCKS DRIVING A NON-CLAUDE AGENT CLI AS A FLEET LANE
+
+**Status:** AWAITING A DECISION (orchestration owner). Not a defect report — a survey, written
+after actually launching a third-party agent CLI as a work lane on 2026-08-21. It worked, but
+none of the fleet machinery reached it.
+
+**1. A third-party CLI session is invisible to the row plane.** It runs as an ordinary background
+process. It cannot be claimed, titled, seated, monitored for stalls, or messaged by any existing
+verb, and it does not appear in `server app rows`. ⇒ **Today the only way to supervise one is to
+poll files it writes.** Anything built on rows — the stall detector, the booter, succession —
+simply does not apply.
+
+**2. Argument order silently changes what runs.** On the CLI tested, putting the print/non-
+interactive flag *before* the model selector caused **both** the model choice and the prompt
+itself to be dropped: the agent ran on the default model and answered a question nobody asked,
+with exit status 0. ⇒ ⛔ **A wrapper must pin flag order and then VERIFY the model actually used**,
+because the failure is silent and looks like a bad answer rather than a bad invocation.
+
+**3. Non-interactive mode buffers all output to completion.** A multi-hour run produces a
+zero-byte log and is indistinguishable from a hung process. ⇒ **Any long third-party run must be
+instructed to write incremental artefacts and a progress log**, or it cannot be observed at all.
+That instruction has to be in the prompt; there is no flag for it.
+
+**4. Capability cannot be assumed and must be positively controlled.** Before committing a long
+batch, one input was processed and the result compared against a reading taken independently. It
+matched. ⇒ **Cheap, and the only thing separating "the tool can do this" from "the tool produced
+confident text".** Recommend this become standard practice for any new engine.
+
+**5. Blast radius has to be pre-shrunk, because a third-party lane cannot be trusted with shared
+registries.** The approach that worked: **reserve the identifier range up front** so the lane never
+negotiates for one, forbid it from editing any shared index, and have it write only additive
+artefacts that a first-party lane later promotes. ⇒ **Generalisable rule: give a foreign lane a
+sandbox and a promotion step, never a seat at a shared table.**
+
+**The decision owed:** whether the row plane should model non-Claude sessions at all — a thin
+"external lane" row carrying pid, log path and progress file would make items 1 and 3 tractable —
+or whether foreign CLIs stay file-supervised by design. **Both are defensible; the current state
+is neither, and it is undocumented.**
