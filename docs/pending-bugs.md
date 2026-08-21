@@ -153,6 +153,65 @@ caller makes its callees newly dead, so the count falls further than the first s
 **Falsifier:** `cargo check --workspace` after touching every crate root reports zero `dead_code`
 in `crates/`, and `cargo test -p yggterm-server` is green.
 
+## ⛔⛔⛔ [11.0] LEGENDARY — A RESTART PUT A LIVE AGENT ON THE WEB VIEW AND LEFT ITS TERMINAL BLANK, FROM ONE HARDCODED SCHEME
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Reported from the seat 2026-08-21: "Restart hit webview. I switched to this session terminal
+view and it was blank. I think the blank terminal view is switching the webview in restart as a
+mechanism in code."* ⭐ **Two symptoms, one root, and the owner's causal reading was right in
+shape** — both come from the restore concluding the active row has no terminal.
+
+**The root is a key mismatch, and it is one function.** `remote_scanned_session_path()` builds
+`remote-session://…` — the CODEX scheme, hardcoded, because a scanned row has no kind to
+consult. The restore path used it to normalise the persisted active path, so **every
+`remote-cc://` row was silently rewritten into a `remote-session://` key**, while
+`restore_live_session` inserted that same row under `remote_agent_session_path(ClaudeCode, …)`
+= `remote-cc://…`.
+
+⇒ `self.sessions.contains_key(&active_path)` is therefore **false for every Claude Code row**,
+and everything downstream follows:
+
+| consequence | what the person sees |
+|---|---|
+| the surface derive is skipped, and the trailing `normalize_active_view_mode` finds a path with no session | `Terminal` demoted to `Rendered` — **the restart lands on the web view** |
+| the terminal launch is skipped for the same reason | switching back by hand finds **a blank surface with nothing attached** |
+
+⚠ **The warning was already written, one function away.** The doc on
+`remote_scanned_session_path`'s neighbour says: *"Takes the SCANNER'S OWN answer rather than
+rebuilding one. The scanner already knows which agent CLI wrote the file and stamps the scheme
+accordingly; re-deriving it here means guessing."* The restore made exactly that guess, in the
+one path where being wrong loses the row.
+
+**A second, independent defect found on the way, and fixed with it.** The restore's launch gate
+also required `remote_scanned_session_path_is_live()`, which reads the `live_runtime` flag on
+the SCAN — and `clear_remote_machine_live_runtime_flags` strips that flag at persist time,
+because a runtime cannot be asserted alive across a process restart. Measured on the GUI host:
+**0 of 1,483** persisted remote sessions carried `live_runtime`, so that conjunct was false on
+every restart regardless of the key bug. ⇒ **Blind is not dead.** The liveness statement that
+survives is the row's presence in `live_sessions`, and the gate asks that now.
+
+⚠ Measured the same evening and worth keeping: the owner's active row was in `live_sessions`
+with `keep_alive: true` and **not in `remote_machines` at all** — so a restore that rebuilds
+remote rows from the scan loses every row the scan has since dropped. The fallback path for
+that exists and is correct; it was the key it filed the row under that was wrong.
+
+**Regression lock:** `a_restarted_remote_agent_row_still_gets_its_terminal_launched`, built
+from the persisted shape actually measured on the host — a `remote-cc://` row in
+`live_sessions`, `remote_machines` empty. It carries its own control asserting the scan's
+liveness reads FALSE, so it cannot pass by that instrument starting to work. **Verified red
+before the fix (`left: Rendered, right: Terminal`) and green after.**
+
+**The instrument that did not exist.** No probe recorded the decision that picks the user's
+surface — the restore's perf span counts sessions and machines and says nothing about the one
+field that decides what is on screen, which is why every report of this has been a guess about
+which of four writers fired. `session/restore_view_mode` now records the persisted mode, the
+row's own default, whether it supports a terminal, and BOTH liveness readings side by side.
+
+**Falsifier — the observation still owed:** restart the GUI with an active remote agent row and
+watch `session/restore_view_mode` — `persisted`, `row_default` and `decided` must all read
+`Terminal`, and the terminal must paint without a manual switch.
+
 ## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
 
 **Status:** OPEN
