@@ -30,6 +30,13 @@ copies.
 
 ## Decisions only he makes
 
+- **May the all-CLI greeting run spend N agent sessions, and must it open rows on the live client?**
+  **Recommendation: take it in a sandbox home against a headless daemon, scoped to the CLIs with a
+  working backend** — nothing needs his screen unless a stage turns out to. **Done meanwhile:** four
+  of its five stages are now answered by registry locks instead of by spawning, and the CLI-plane
+  trace grammar makes the run readable when it is taken, so what is left to buy is much smaller than
+  the original shape. Detail: `docs/pending-bugs.md` §"THE ALL-CLI GREETING RUN HAS NOT BEEN TAKEN".
+
 - **Do we read the embedded controller to get a true fan RPM?** Every ACPI fan interface on the
   reference client was enumerated and sampled and all of them are stubs — there is no tachometer to
   read, which confirms rather than contradicts the "fan speed has to be interpolated" reading. The

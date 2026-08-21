@@ -1028,6 +1028,19 @@ pub enum RemoteStoreLocators {
     /// relocating a CLI's store moves its index with it and nothing here has to
     /// be edited.
     CliHomeFiles(&'static [&'static str]),
+    /// Both of the above, store globs first — for a CLI whose title lives in a
+    /// shared index for OLD sessions and only in the session's own file for
+    /// new ones.
+    ///
+    /// ⛔ **Neither half alone is enough, and the half that reads like the
+    /// obvious one is the half that is empty when it matters.** Measured on a
+    /// live Antigravity store: of the eight most recently touched
+    /// conversations, ZERO had a row in the summaries index and six had no
+    /// entry in the history file — while all eight carried a usable prompt in
+    /// their own transcript. A probe wired to the index alone therefore
+    /// answers "no title in store" for exactly the rows a person is looking
+    /// at, which is the same reading as the defect it was written to repair.
+    StoreGlobsAndCliHomeFiles(&'static [&'static str]),
 }
 
 /// How a live session of a CLI is recognised from a path its process holds open.
@@ -1435,16 +1448,26 @@ impl AgentCliDescriptor {
                 .iter()
                 .map(|glob| (*glob).to_string())
                 .collect(),
-            RemoteStoreLocators::CliHomeFiles(names) => {
-                let Some(home) = self.cli_home_relative() else {
-                    return Vec::new();
-                };
-                names
-                    .iter()
-                    .map(|name| format!("{home}/{name}"))
-                    .collect()
-            }
+            RemoteStoreLocators::CliHomeFiles(names) => self.cli_home_file_locators(names),
+            RemoteStoreLocators::StoreGlobsAndCliHomeFiles(names) => self
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .chain(self.cli_home_file_locators(names))
+                .collect(),
         }
+    }
+
+    /// Named files resolved under [`Self::cli_home_relative`]. Empty when this
+    /// CLI declares no store, since then there is no home to resolve against.
+    fn cli_home_file_locators(&self, names: &[&'static str]) -> Vec<String> {
+        let Some(home) = self.cli_home_relative() else {
+            return Vec::new();
+        };
+        names
+            .iter()
+            .map(|name| format!("{home}/{name}"))
+            .collect()
     }
 
     /// The path fragments a containment test keys on, e.g. `/.codex/sessions/`.
@@ -2526,8 +2549,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_qwen_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        read_live_store_title: Some(read_qwen_live_store_title),
+        remote_live_store_title: Some(QWEN_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
@@ -2544,7 +2567,31 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         menu_hint: 'k',
         // `state.json` carries `custom_title` with a `title_generated` flag and
         // a 3-attempt cap — the CLI owns it.
-        title_authority: TitleAuthority::Store,
+        // ⛔ WAS `Store`, OVER A STORE THAT HOLDS NO TITLE — and the two halves of
+        // yggterm already disagreed about that.
+        //
+        // `TitleAuthority::Store` makes `session_accepts_generated_copy` refuse
+        // this kind a generated title, on the reasoning that inventing one would
+        // disagree forever with the title the CLI wrote. That reasoning needs
+        // the CLI to have written one.
+        //
+        // ⭐ It does not. `startpage::scan_kimi_sessions` — which locates this
+        // store perfectly well, reversing its hashed bucket via the CLI's own
+        // config — says so in its own comment and falls back to a generated or
+        // heuristic title. Measured independently 2026-08-21 on a machine where
+        // this CLI has been launched: no key anywhere in a session's files is a
+        // title, a cwd or a session id.
+        //
+        // ⇒ So the SCAN path already treated this CLI as generating, while the
+        // LIVE path honoured the declaration and refused to generate. One CLI,
+        // two answers to "who names this row", and the live half's answer was
+        // "nobody" — the row wore its birth title for the life of the session.
+        //
+        // ⚠ Its store being empty of titles is why `read_live_store_title` is
+        // `None` here and why that is NOT the hole the store-authority lock
+        // hunts: there is nothing to read. This flips back only if the CLI
+        // starts writing a title, in the same commit as the reader for it.
+        title_authority: TitleAuthority::Generated,
         // `kimi -r <unknown-id>` CREATES that session rather than failing, so a
         // caller-supplied id at birth is honoured. Its id is a directory name
         // verbatim, with no format validation.
@@ -3418,6 +3465,70 @@ fn read_qwen_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     })
 }
 
+/// The LIVE half of Qwen's title: find this session's own chat file under the
+/// agent store home, then read the title out of it with the same tail parser
+/// the identity scan uses.
+///
+/// ⛔ **This existed as a hole, not as an absence.** `read_live_store_title:
+/// None` is documented to mean UNMEASURED — this CLI's store layout has never
+/// been read off a real machine, so nothing is guessed at. But Qwen's layout
+/// HAS been read: `read_qwen_store_entry` parses its `sessionId` and `cwd`, and
+/// `read_qwen_custom_title_tail` knows the title is a `custom_title` record
+/// re-appended near EOF. So `None` was claiming unmeasured about a store two
+/// functions above it already decode, while the descriptor ALSO declared
+/// `TitleAuthority::Store` — which makes yggterm refuse to generate a title.
+/// A live Qwen row was therefore refused a generated title and offered no
+/// stored one: titled by nothing, for the life of the session.
+///
+/// ⚖ Only the LOOKUP is new here. The format is the existing parsers', and it
+/// is not re-derived — the fixture test exercises finding the right file for an
+/// id, which is the only part this function decides.
+fn read_qwen_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let descriptor = agent_cli_descriptor(SessionKind::QwenCode)?;
+    for root in descriptor.store_roots_absolute(home) {
+        // `<root>/<project>/chats/<file>.jsonl`. The project directory encodes a
+        // cwd, so it cannot be derived from the id and every project is walked.
+        let Ok(projects) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for project in projects.flatten() {
+            let chats = project.path().join("chats");
+            let Ok(files) = std::fs::read_dir(&chats) else {
+                continue;
+            };
+            // ⭐ Cheapest discriminator first: a file NAMED for the session.
+            // Falling through to parsing is not an optimisation detail — it is
+            // the correctness half, because unlike Claude Code's store the
+            // filename here is not contractually the id, and a lookup that
+            // assumed it were would answer nothing for a store that names its
+            // files any other way.
+            let mut fallback = Vec::new();
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if path.file_stem().and_then(|value| value.to_str()) == Some(session_id) {
+                    return read_qwen_custom_title_tail(&path);
+                }
+                fallback.push(path);
+            }
+            for path in fallback {
+                let Some(first) = read_first_jsonl_object(&path) else {
+                    continue;
+                };
+                if first.get("sessionId").and_then(|value| value.as_str()) == Some(session_id) {
+                    return read_qwen_custom_title_tail(&path);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn read_qwen_custom_title_tail(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let file = std::fs::File::open(path).ok()?;
@@ -3513,6 +3624,18 @@ fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     })
 }
 
+/// The first `limit` CHARACTERS of `text`, trimmed.
+///
+/// ⚖ Characters, not bytes: a title is displayed, so its length is what a
+/// reader counts, and a byte slice through the middle of a character is a
+/// panic rather than a short title.
+fn first_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((at, _)) => text[..at].trim().to_string(),
+        None => text.trim().to_string(),
+    }
+}
+
 pub fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
     let mut text = raw.trim();
     if let Some(idx) = text.find("<USER_REQUEST>") {
@@ -3534,12 +3657,14 @@ pub fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
             continue;
         }
         if !crate::looks_like_generated_fallback_title(l) {
-            let res = if l.len() > 120 {
-                l[..120].trim().to_string()
-            } else {
-                l.to_string()
-            };
-            return Some(res);
+            // ⛔ `l[..120]` PANICS when byte 120 lands inside a character, and
+            // this line is a person's own prompt — the one string in the title
+            // path most likely to carry an accent, a dash or an emoji. It
+            // survived only because the sources reaching here were short,
+            // curated index entries; the remote probe now also carries raw
+            // transcript prompts, which are long free-form text, so the latent
+            // case became a reachable one. Count CHARACTERS.
+            return Some(first_chars(l, 120));
         }
     }
     None
@@ -3663,9 +3788,116 @@ for session_id in ids:
 /// answer for every conversation that has had a turn. A remote row that only
 /// the transcript could name reports `no_title_in_store`, which is true and
 /// cheap; guessing it would have cost a store walk per tick.
+const QWEN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: QWEN_REMOTE_TITLE_SCRIPT,
+    // The title lives in the session's OWN chat file; Qwen keeps no shared index
+    // beside it, so there is nothing to union in.
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
+
+const QWEN_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+TAIL_BYTES = 64 * 1024
+
+# argv: <home-relative glob>... -- <session id>...
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+globs = [value for value in argv[:split] if value.strip()]
+ids = [value for value in argv[split + 1:] if value.strip()]
+if not globs or not ids:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+
+def title_from_tail(path):
+    # The title is a `custom_title` record that this CLI re-appends near EOF, so
+    # the LAST one wins and only the tail has to be read.
+    try:
+        size = path.stat().st_size
+        with open(path, 'rb') as handle:
+            handle.seek(max(0, size - TAIL_BYTES))
+            raw = handle.read().decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+    lines = raw.splitlines()
+    if size > TAIL_BYTES and lines:
+        # First chunk is likely a partial line; drop it.
+        lines = lines[1:]
+    found = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if record.get('type') != 'custom_title':
+            continue
+        for key in ('title', 'customTitle'):
+            value = record.get(key)
+            if value and str(value).strip():
+                found = str(value).strip()
+    return found
+
+def session_id_of(path):
+    # Cheapest first: a file NAMED for the session. The name is not
+    # contractually the id here, so a miss falls through to the first record
+    # rather than being reported as "no such session".
+    if path.stem in wanted:
+        return path.stem
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    return None
+                value = record.get('sessionId')
+                return value if value in wanted else None
+    except Exception:
+        return None
+    return None
+
+candidates = {session_id: [] for session_id in ids}
+for glob in globs:
+    try:
+        matches = sorted(home.glob(glob))
+    except Exception:
+        continue
+    for match in matches:
+        session_id = session_id_of(match)
+        if session_id is None:
+            continue
+        title = title_from_tail(match)
+        if title:
+            candidates[session_id].append(title)
+
+for session_id in ids:
+    found = candidates.get(session_id) or []
+    if found:
+        print(json.dumps({'session_id': session_id, 'candidates': found}, ensure_ascii=False))
+"#;
+
 const ANTIGRAVITY_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     script: ANTIGRAVITY_REMOTE_TITLE_SCRIPT,
-    locators: RemoteStoreLocators::CliHomeFiles(&["conversation_summaries.db", "history.jsonl"]),
+    // ⛔ The store globs LEAD, because they are the only source a new
+    // conversation has: `conversation_summaries.db` is written late (and by the
+    // measurement above, often not at all for the rows on screen), while the
+    // transcript exists from the first turn. Ranking inside the script keeps
+    // the CHOSEN order the local reader's — index title, index preview,
+    // history, then transcript — so the two halves cannot answer differently.
+    locators: RemoteStoreLocators::StoreGlobsAndCliHomeFiles(&[
+        "conversation_summaries.db",
+        "history.jsonl",
+    ]),
     choose: first_agy_prompt_line_candidate,
 };
 
@@ -3674,6 +3906,9 @@ import json, os, sqlite3, sys
 from pathlib import Path
 
 # argv: <home-relative locator>... -- <session id>...
+# A locator is either a literal file (the shared index) or a glob naming the
+# per-conversation stores. Both are needed: see the registry's note on why the
+# index alone answers for nothing on a fresh conversation.
 argv = sys.argv[1:]
 if '--' not in argv:
     sys.exit(0)
@@ -3683,7 +3918,16 @@ ids = [value for value in argv[split + 1:] if value.strip()]
 if not locators or not ids:
     sys.exit(0)
 home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+# rank -> the local reader's own precedence: index title, index preview,
+# history display, transcript prompt. Ranking here rather than relying on
+# locator order keeps the remote answer identical to the local one.
+RANK_TITLE, RANK_PREVIEW, RANK_HISTORY, RANK_TRANSCRIPT = 0, 1, 2, 3
 candidates = {session_id: [] for session_id in ids}
+
+def offer(session_id, rank, value):
+    if session_id in candidates and value and str(value).strip():
+        candidates[session_id].append((rank, str(value)))
 
 def open_read_only(path):
     # Never take a write lock on a store yggterm does not own. `mode=ro` still
@@ -3697,33 +3941,27 @@ def open_read_only(path):
             continue
     return None
 
-for locator in locators:
-    path = home / locator
-    if not path.exists():
-        continue
-    if path.suffix == '.db':
-        conn = open_read_only(path)
-        if conn is None:
-            continue
+def read_summaries(path):
+    conn = open_read_only(path)
+    if conn is None:
+        return
+    try:
+        placeholders = ','.join('?' * len(ids))
+        rows = conn.execute(
+            'SELECT conversation_id, title, preview FROM conversation_summaries '
+            'WHERE conversation_id IN (%s);' % placeholders, ids).fetchall()
+        for conversation_id, title, preview in rows:
+            offer(conversation_id, RANK_TITLE, title)
+            offer(conversation_id, RANK_PREVIEW, preview)
+    except Exception:
+        pass
+    finally:
         try:
-            placeholders = ','.join('?' * len(ids))
-            rows = conn.execute(
-                'SELECT conversation_id, title, preview FROM conversation_summaries '
-                'WHERE conversation_id IN (%s);' % placeholders, ids).fetchall()
-            for conversation_id, title, preview in rows:
-                if conversation_id not in candidates:
-                    continue
-                for value in (title, preview):
-                    if value and str(value).strip():
-                        candidates[conversation_id].append(str(value))
+            conn.close()
         except Exception:
             pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        continue
+
+def read_history(path):
     try:
         with open(path, encoding='utf-8', errors='ignore') as handle:
             for line in handle:
@@ -3734,17 +3972,74 @@ for locator in locators:
                     record = json.loads(line)
                 except Exception:
                     continue
-                conversation_id = record.get('conversationId')
-                if conversation_id not in candidates:
-                    continue
-                display = record.get('display')
-                if display and str(display).strip():
-                    candidates[conversation_id].append(str(display))
+                offer(record.get('conversationId'), RANK_HISTORY, record.get('display'))
     except Exception:
+        return
+
+def transcript_id(path):
+    # The conversation id is a DIRECTORY segment of the transcript path, not
+    # its stem — the stem is the same word for every conversation. Matching on
+    # the parts is exact and needs no knowledge of the store's depth.
+    for part in path.parts:
+        if part in wanted:
+            return part
+    return None
+
+def read_transcript(path):
+    session_id = transcript_id(path)
+    if session_id is None:
+        return
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as handle:
+            for index, line in enumerate(handle):
+                if index > 20:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if record.get('type') != 'USER_INPUT':
+                    continue
+                content = record.get('content')
+                if content and str(content).strip():
+                    offer(session_id, RANK_TRANSCRIPT, content)
+                    return
+    except Exception:
+        return
+
+for locator in locators:
+    if any(character in locator for character in '*?['):
+        try:
+            matches = sorted(home.glob(locator))
+        except Exception:
+            continue
+        for match in matches:
+            # ⛔ A DELIBERATE, NAMED SKIP, not an oversight. A glob may also name
+            # this CLI's per-conversation `.db` and its legacy `.json` layout.
+            # Their schemas have not been measured, and a decoder written
+            # against a guessed schema returns EMPTY rather than an error — it
+            # would read as "this conversation has no title" forever. The
+            # transcript is the source that has been measured, so it is the one
+            # decoded; the others are listed so a future measurement has a
+            # place to land.
+            if match.suffix != '.jsonl':
+                continue
+            read_transcript(match)
         continue
+    path = home / locator
+    if not path.exists():
+        continue
+    if path.suffix == '.db':
+        read_summaries(path)
+    else:
+        read_history(path)
 
 for session_id in ids:
-    found = candidates.get(session_id) or []
+    found = [value for _, value in sorted(candidates.get(session_id) or [],
+                                          key=lambda pair: pair[0])]
     if found:
         print(json.dumps({'session_id': session_id, 'candidates': found}, ensure_ascii=False))
 "#;
@@ -5287,6 +5582,162 @@ mod tests {
         }
     }
 
+    /// ⛔ A LONG PROMPT WITH A MULTI-BYTE CHARACTER ON THE CUT USED TO PANIC.
+    ///
+    /// The cleaner truncated with `l[..120]`, which is a BYTE index, and the
+    /// string it truncates is a person's own prompt — the likeliest string in
+    /// the whole title path to carry an accent or an emoji. Nothing had hit it
+    /// because the sources reaching the cleaner were short curated index
+    /// entries; widening the remote probe to raw transcript prompts made the
+    /// latent case reachable.
+    #[test]
+    fn a_long_prompt_is_truncated_on_a_character_and_never_panics() {
+        // The cut falls inside the two-byte character, which is the panicking
+        // case, and again inside a four-byte one.
+        for filler in ['e', 'x'] {
+            for tail in ["é", "🙂"] {
+                let prompt = format!("{}{tail} and the prompt continues", String::from(filler).repeat(119));
+                let cleaned =
+                    clean_agy_prompt_first_line(&prompt).expect("a plain prompt is a title");
+                assert!(
+                    cleaned.chars().count() <= 120,
+                    "truncation must count characters: {} chars",
+                    cleaned.chars().count()
+                );
+                assert!(
+                    prompt.starts_with(&cleaned),
+                    "the title must be a prefix of the prompt it came from"
+                );
+            }
+        }
+    }
+
+    /// Write a Qwen chat store. `file_stem` is deliberately a parameter: the
+    /// file name is NOT contractually the session id for this CLI, and a lookup
+    /// that assumed it were would answer nothing for a store that names its
+    /// files any other way.
+    fn write_qwen_fixture(home: &std::path::Path, file_stem: &str, session_id: &str, title: &str) {
+        let chats = home.join(".qwen/projects/-home-user-project/chats");
+        std::fs::create_dir_all(&chats).expect("fixture chats directory");
+        let first = serde_json::json!({ "sessionId": session_id, "cwd": "/home/user/project" });
+        // The title is re-appended near EOF by this CLI, and an earlier one is
+        // superseded — so the fixture carries both and the LAST must win.
+        let stale = serde_json::json!({ "type": "custom_title", "title": "an older name" });
+        let current = serde_json::json!({ "type": "custom_title", "title": title });
+        let body = format!("{first}\n{stale}\n{{\"type\":\"message\"}}\n{current}\n");
+        std::fs::write(chats.join(format!("{file_stem}.jsonl")), body).expect("fixture chat");
+    }
+
+    /// ⛔ THE LOOKUP IS THE ONLY PART THIS FUNCTION DECIDES, SO IT IS THE PART
+    /// UNDER TEST. The record format comes from the two parsers that already
+    /// decode this store; what is new is finding the right file for an id.
+    #[test]
+    fn a_live_qwen_row_is_titled_from_its_own_chat_file() {
+        let home = std::env::temp_dir().join(format!("yggterm-qwen-live-{}", uuid::Uuid::new_v4()));
+        let session_id = "b3d17e02-5c48-4a91-8f60-2d7c1a9e4b35";
+        // Named for something OTHER than the id, so the fallback that parses the
+        // first record is what has to find it.
+        write_qwen_fixture(&home, "chat-0007", session_id, "Port the CSV importer");
+        let found = read_qwen_live_store_title(&home, session_id);
+        let named_for_the_id = {
+            let other = std::env::temp_dir().join(format!("yggterm-qwen-live-{}", uuid::Uuid::new_v4()));
+            write_qwen_fixture(&other, session_id, session_id, "Port the CSV importer");
+            let hit = read_qwen_live_store_title(&other, session_id);
+            let _ = std::fs::remove_dir_all(&other);
+            hit
+        };
+        // ⚠ A plainly invented id that no fixture writes. Not an all-zero uuid:
+        // its twelve-zero run trips the privacy guard's identity-number pattern.
+        let miss = read_qwen_live_store_title(&home, "5e2a9c71-0b34-4d8f-9a16-c703e85b2d49");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            found,
+            Some("Port the CSV importer".to_string()),
+            "a chat file not named for its session was not found, so a store that \
+             names its files anything else is titled by nothing"
+        );
+        assert_eq!(named_for_the_id, Some("Port the CSV importer".to_string()));
+        assert_eq!(miss, None, "an id with no chat file must miss, not borrow another row's title");
+    }
+
+    /// The ssh half of the same store, run the way the daemon runs it.
+    #[test]
+    fn a_remote_qwen_row_is_titled_by_its_probe_script() {
+        let home = std::env::temp_dir().join(format!("yggterm-qwen-probe-{}", uuid::Uuid::new_v4()));
+        let session_id = "b3d17e02-5c48-4a91-8f60-2d7c1a9e4b35";
+        write_qwen_fixture(&home, "chat-0007", session_id, "Port the CSV importer");
+
+        let descriptor = agent_cli_descriptor(SessionKind::QwenCode).expect("Qwen is registered");
+        let probe = descriptor
+            .remote_live_store_title
+            .expect("Qwen declares a remote probe");
+        let mut args: Vec<String> = descriptor.remote_store_title_locators();
+        args.push("--".to_string());
+        args.push(session_id.to_string());
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(probe.script)
+            .args(&args)
+            .env("HOME", &home)
+            .output()
+            .expect("python3 is needed to exercise a remote store probe");
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            output.status.success(),
+            "the probe script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_else(|| panic!("the probe answered for nothing: {stdout:?}"));
+        let value: serde_json::Value = serde_json::from_str(line).expect("JSON lines");
+        assert_eq!(value["session_id"], session_id);
+        let candidates: Vec<String> = value["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .map(|candidate| candidate.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            (probe.choose)(&candidates),
+            Some("Port the CSV importer".to_string()),
+            "the re-appended title must supersede the earlier one: {candidates:?}"
+        );
+    }
+
+    /// ⛔⛔ A REMOTE PROBE MUST BE ABLE TO OPEN THE SESSION'S OWN FILE.
+    ///
+    /// A shared index is written when the CLI gets round to it; the session's
+    /// own store exists from its first turn. So a probe wired to indexes alone
+    /// is blind for precisely as long as a row is new — which is the whole of
+    /// the window in which a person notices an untitled row and reports it.
+    /// Measured on a live Antigravity store: eight of the eight most recently
+    /// touched conversations were absent from the index and present in their
+    /// own transcript.
+    ///
+    /// ⇒ Whatever else a probe reads, it reads the store globs too.
+    #[test]
+    fn every_remote_title_probe_can_reach_the_sessions_own_store() {
+        for descriptor in AGENT_CLIS {
+            if descriptor.remote_live_store_title.is_none() {
+                continue;
+            }
+            let locators = descriptor.remote_store_title_locators();
+            for glob in descriptor.session_store_globs {
+                assert!(
+                    locators.iter().any(|locator| locator == glob),
+                    "{}: its remote probe never opens {glob:?}, so a conversation the \
+                     shared index has not caught up with is answered for by nothing — \
+                     which reads exactly like a store with no title in it",
+                    descriptor.display_name
+                );
+            }
+        }
+    }
+
     /// ⭐ The index-beside-the-store shape, derived rather than transcribed: the
     /// directory comes from the CLI's own store globs, so relocating its store
     /// moves its index with it and no second table has to agree.
@@ -5298,7 +5749,16 @@ mod tests {
             .cli_home_relative()
             .expect("its store root has a parent");
         let locators = descriptor.remote_store_title_locators();
-        for locator in &locators {
+        // ⚠ Only the HOME-FILE half is anchored here. The union also carries
+        // this CLI's store globs, and one of those is a legacy layout under a
+        // different directory entirely — asserting over every locator would
+        // make this lock a test of the store list rather than of the
+        // index-beside-the-store derivation it is named for.
+        let store_globs: Vec<&str> = descriptor.session_store_globs.to_vec();
+        for locator in locators
+            .iter()
+            .filter(|locator| !store_globs.contains(&locator.as_str()))
+        {
             assert!(
                 locator.starts_with(&format!("{home}/")),
                 "{locator:?} is not under the CLI home {home:?} the registry derives"
@@ -5308,7 +5768,11 @@ mod tests {
             locators
                 .iter()
                 .any(|locator| locator.ends_with("conversation_summaries.db")),
-            "the summaries index is the first place its title lives: {locators:?}"
+            // ⚠ Corrected once measured: the index is where an OLD title lives,
+            // and it is empty for a conversation created minutes ago. It is
+            // still required — it is the only place an owner's rename lands —
+            // but it is the last word, not the first.
+            "the summaries index carries the renamed title and must be asked: {locators:?}"
         );
     }
 
@@ -5335,6 +5799,186 @@ mod tests {
         assert_eq!(
             (agy.choose)(&["<USER_REQUEST>\nRefactor the CSV import\n</USER_REQUEST>".to_string()]),
             Some("Refactor the CSV import".to_string())
+        );
+    }
+
+    /// Build a fixture Antigravity home and run one CLI's remote probe against
+    /// it, exactly as the daemon does: locators, `--`, then ids.
+    ///
+    /// ⛔ **The script is the half no other test could reach.** Every lock
+    /// above reads the registry — which locators resolve, that the argv
+    /// separator is honoured — and every one of them was GREEN while the
+    /// script read two stores that are empty for a live row. A probe is only
+    /// wired when something has run it against a store shaped like the real
+    /// one.
+    fn run_agy_probe(fixture_home: &std::path::Path, ids: &[&str]) -> Vec<String> {
+        let descriptor =
+            agent_cli_descriptor(SessionKind::Antigravity).expect("Antigravity is registered");
+        let probe = descriptor
+            .remote_live_store_title
+            .expect("Antigravity declares a remote probe");
+        let mut args: Vec<String> = descriptor.remote_store_title_locators();
+        args.push("--".to_string());
+        args.extend(ids.iter().map(|id| (*id).to_string()));
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(probe.script)
+            .args(&args)
+            .env("HOME", fixture_home)
+            .output()
+            // ⛔ Loud, never skipped. A gate that passes on a machine which
+            // cannot run it reports the same thing as a gate that passed.
+            .expect("python3 is needed to exercise a remote store probe");
+        assert!(
+            output.status.success(),
+            "the probe script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.to_string())
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    }
+
+    /// Write the three Antigravity stores. `index` and `history` are optional
+    /// so a test can reproduce the shape a fresh conversation actually has.
+    fn write_agy_fixture(
+        home: &std::path::Path,
+        conversation_id: &str,
+        transcript_prompt: &str,
+        index: Option<(&str, &str)>,
+        history: Option<&str>,
+    ) {
+        let cli_home = home.join(".gemini/antigravity-cli");
+        let logs = cli_home
+            .join("brain")
+            .join(conversation_id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("fixture transcript directory");
+        let record = serde_json::json!({
+            "type": "USER_INPUT",
+            "content": transcript_prompt,
+        });
+        std::fs::write(logs.join("transcript_full.jsonl"), format!("{record}\n"))
+            .expect("fixture transcript");
+
+        let db = cli_home.join("conversation_summaries.db");
+        let connection = rusqlite::Connection::open(&db).expect("fixture index");
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS conversation_summaries \
+                 (conversation_id TEXT, title TEXT, preview TEXT, workspace_uris TEXT);",
+                [],
+            )
+            .expect("fixture index schema");
+        if let Some((title, preview)) = index {
+            connection
+                .execute(
+                    "INSERT INTO conversation_summaries \
+                     (conversation_id, title, preview, workspace_uris) VALUES (?1, ?2, ?3, '');",
+                    rusqlite::params![conversation_id, title, preview],
+                )
+                .expect("fixture index row");
+        }
+        drop(connection);
+
+        let history_line = history
+            .map(|display| {
+                serde_json::json!({ "conversationId": conversation_id, "display": display })
+                    .to_string()
+            })
+            .unwrap_or_else(|| {
+                serde_json::json!({ "conversationId": "another-conversation", "display": "x" })
+                    .to_string()
+            });
+        std::fs::write(cli_home.join("history.jsonl"), format!("{history_line}\n"))
+            .expect("fixture history");
+    }
+
+    /// ⛔⛔ THE MEASUREMENT THAT MOVED THIS PROBE. On a live Antigravity store,
+    /// of the eight most recently touched conversations **zero** had a row in
+    /// `conversation_summaries.db` and six had no `history.jsonl` entry — while
+    /// all eight carried a usable prompt in their own transcript.
+    ///
+    /// A probe reading only the two shared files therefore answers
+    /// `no_title_in_store` for exactly the rows a person is looking at, which
+    /// is indistinguishable from the defect it was written to repair. This is
+    /// that row, and it must come back titled.
+    #[test]
+    fn a_fresh_remote_agy_conversation_is_titled_from_its_own_transcript() {
+        let home = std::env::temp_dir().join(format!("yggterm-agy-probe-{}", uuid::Uuid::new_v4()));
+        let conversation_id = "4f0d5a2b-1c73-4c8e-9f21-6b0a7d3e5c14";
+        write_agy_fixture(
+            &home,
+            conversation_id,
+            "<USER_REQUEST>\nRewrite the invoice exporter\n</USER_REQUEST>",
+            None,
+            None,
+        );
+        let lines = run_agy_probe(&home, &[conversation_id]);
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "the conversation exists only as a transcript and was answered for by nothing: \
+             {lines:?}"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&lines[0]).expect("the probe answers in JSON lines");
+        assert_eq!(value["session_id"], conversation_id);
+        let candidates: Vec<String> = value["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .map(|candidate| candidate.as_str().unwrap_or_default().to_string())
+            .collect();
+        let probe = agent_cli_descriptor(SessionKind::Antigravity)
+            .and_then(|descriptor| descriptor.remote_live_store_title)
+            .expect("Antigravity declares a remote probe");
+        assert_eq!(
+            (probe.choose)(&candidates),
+            Some("Rewrite the invoice exporter".to_string()),
+            "the transcript prompt did not survive the same cleaner the local reader uses"
+        );
+    }
+
+    /// The precedence half: where the shared index HAS answered, it still wins.
+    /// The transcript is the fallback that was missing, not a new authority —
+    /// promoting it would make a remote row's title differ from the same row's
+    /// title read locally, which is the drift the two halves exist to avoid.
+    #[test]
+    fn an_indexed_agy_conversation_still_prefers_the_index_title() {
+        let home = std::env::temp_dir().join(format!("yggterm-agy-probe-{}", uuid::Uuid::new_v4()));
+        let conversation_id = "8c1e7f40-92ab-4d55-bb03-1e6f2a9c4d77";
+        write_agy_fixture(
+            &home,
+            conversation_id,
+            "<USER_REQUEST>\nthe transcript prompt\n</USER_REQUEST>",
+            Some(("Renamed by the owner", "an auto summary")),
+            Some("a history display"),
+        );
+        let lines = run_agy_probe(&home, &[conversation_id]);
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).expect("JSON lines");
+        let candidates: Vec<String> = value["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .map(|candidate| candidate.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("Renamed by the owner"),
+            "the local reader's precedence is index title, index preview, history, \
+             transcript — the remote answer must be ordered the same way: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate.contains("the transcript prompt")),
+            "the transcript must still be offered as the last fallback: {candidates:?}"
         );
     }
 
@@ -5665,9 +6309,20 @@ mod tests {
     /// declares no `read_live_store_title` can never be named at all, and its
     /// rows wear their birth title for the life of the session.
     ///
-    /// This is a REPORT, not a prohibition: leaving the hook `None` is the
-    /// honest answer for a store nobody has measured. It exists so the hole is
-    /// named in one place, with the measurement each CLI still owes.
+    /// ⭐ **It was a REPORT and is now a PROHIBITION, because both holes it
+    /// named have been closed** (2026-08-21) and they closed in opposite
+    /// directions, which is the point:
+    ///
+    /// * one CLI's store WAS measured — two functions in this file already
+    ///   decoded its layout — so `None` was claiming unmeasured about a store
+    ///   the registry could read. It got a reader.
+    /// * the other declared `Store` over a store the registry cannot locate at
+    ///   all (`session_store_globs` empty). It was not owed a reader; it was
+    ///   owed an honest authority, and now generates.
+    ///
+    /// ⇒ Leaving the hook `None` is still the honest answer for an unmeasured
+    /// store — but then the CLI must not ALSO claim its store is authoritative,
+    /// because the two together are what make a row unnameable.
     #[test]
     fn a_store_titled_cli_without_a_live_reader_can_never_be_titled() {
         let unreachable = AGENT_CLIS
@@ -5678,15 +6333,11 @@ mod tests {
             })
             .map(|descriptor| descriptor.slug)
             .collect::<Vec<_>>();
-        assert_eq!(
-            unreachable,
-            // Both owe a MEASURED store layout on a real machine: neither had a
-            // session on the host this was written from, and Kimi's
-            // `session_store_globs` are empty — its store is not wired at all.
-            vec!["qwen-code", "kimi"],
-            "the set of CLIs that can never be titled has changed; either a \
-             measurement landed (drop it from this list) or a CLI was made \
-             store-authoritative without a reader (measure its store first)",
+        assert!(
+            unreachable.is_empty(),
+            "a CLI is store-authoritative with no reader, so its rows can never \
+             be titled at all: {unreachable:?} — either measure its store and \
+             wire a reader, or stop claiming its store is authoritative",
         );
     }
 

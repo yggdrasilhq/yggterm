@@ -766,6 +766,34 @@ enum TranscriptActivity {
 ///
 /// ⚠ `comm` is TRUNCATED TO 15 BYTES by the kernel, so a long binary name is
 /// compared on its truncated prefix.
+/// How many BYTES of a process name survive in `/proc/<pid>/comm`.
+///
+/// The kernel's `TASK_COMM_LEN` is 16 including the terminator, so a longer
+/// name reaches us cut at 15 bytes — not 15 characters. The comparison below
+/// is deliberately in bytes for that reason.
+#[cfg(unix)]
+const PROC_COMM_BYTES: usize = 15;
+
+/// Does a `/proc/<pid>/comm` value name this binary, allowing for the kernel's
+/// truncation?
+///
+/// ⚠ Byte-compared, matching what the kernel actually did. Slicing `&str` here
+/// would be the wrong unit AND a panic: `&name[..15]` aborts when byte 15 falls
+/// inside a character, which is the same defect the response-snippet quoting
+/// carried. Nothing in the registry can trip it today — every binary name is
+/// ASCII — but that made it a latent panic guarded by a table other people
+/// edit, rather than by the code that depends on it.
+#[cfg(unix)]
+fn comm_names_binary(comm: &str, binary_name: &str) -> bool {
+    if comm == binary_name {
+        return true;
+    }
+    match binary_name.as_bytes().get(..PROC_COMM_BYTES) {
+        Some(truncated) => comm.as_bytes() == truncated,
+        None => false,
+    }
+}
+
 #[cfg(unix)]
 fn process_tree_runs_agent_cli(pid: u32) -> bool {
     fn comm_is_agent(pid: u32) -> bool {
@@ -773,10 +801,9 @@ fn process_tree_runs_agent_cli(pid: u32) -> bool {
             return false;
         };
         let comm = comm.trim();
-        yggterm_core::AGENT_CLIS.iter().any(|cli| {
-            let name = cli.binary_name;
-            comm == name || (name.len() > 15 && comm == &name[..15])
-        })
+        yggterm_core::AGENT_CLIS
+            .iter()
+            .any(|cli| comm_names_binary(comm, cli.binary_name))
     }
     // The wrapper itself, then one sweep of everything that claims it as parent.
     // A single level is enough: `bash -c "… && claude"` puts the agent directly
@@ -22671,6 +22698,35 @@ fn read_response_line_before(
     }
 }
 
+/// How many CHARACTERS of an unparseable daemon response get quoted back.
+const DAEMON_RESPONSE_SNIPPET_CHARS: usize = 240;
+
+/// Quote the head of a response line that failed to parse.
+///
+/// ⛔ CHARACTERS, NOT BYTES, AND THE SAME UNIT ON BOTH SIDES OF THE DECISION.
+/// This ran as `&trimmed[..240]` — a byte index into a string that just came off
+/// a socket — so a response carrying a multi-byte character across that boundary
+/// panicked INSIDE the error handler, and the message that would have explained
+/// an unparseable response was what killed the process instead.
+///
+/// ⚠ The case most likely to reach here is also the likeliest to have panicked:
+/// the caller builds this string with `from_utf8_lossy`, so every invalid byte
+/// off the socket becomes a 3-byte U+FFFD. Binary noise — the exact thing that
+/// fails to parse — arrives as a dense run of multi-byte characters, and a cut
+/// at a fixed offset lands inside one of them about two times in three.
+///
+/// The length test is in characters too: `len() > 240` asked bytes while the cut
+/// took characters, so a 300-byte / 150-character line was quoted whole and then
+/// given an ellipsis it had not earned. An ellipsis here means "there was more",
+/// and it must not be able to lie.
+fn daemon_response_snippet(trimmed: &str) -> String {
+    let mut head: String = trimmed.chars().take(DAEMON_RESPONSE_SNIPPET_CHARS).collect();
+    if trimmed.chars().nth(DAEMON_RESPONSE_SNIPPET_CHARS).is_some() {
+        head.push_str("...");
+    }
+    head
+}
+
 /// Send a request declaring this client's slice-4.0 identity/role.
 fn send_request_as(
     endpoint: &ServerEndpoint,
@@ -22707,12 +22763,7 @@ fn send_request_as(
                 .context("reading daemon response")?;
             let line = String::from_utf8_lossy(&raw).into_owned();
             serde_json::from_str(line.trim_end()).with_context(|| {
-                let trimmed = line.trim_end();
-                let snippet = if trimmed.len() > 240 {
-                    format!("{}...", &trimmed[..240])
-                } else {
-                    trimmed.to_string()
-                };
+                let snippet = daemon_response_snippet(line.trim_end());
                 format!("parsing daemon response: {:?}", snippet)
             })
         }
@@ -22757,12 +22808,7 @@ fn send_request_as(
                 .context("reading daemon response")?;
             let line = String::from_utf8_lossy(&raw).into_owned();
             serde_json::from_str(line.trim_end()).with_context(|| {
-                let trimmed = line.trim_end();
-                let snippet = if trimmed.len() > 240 {
-                    format!("{}...", &trimmed[..240])
-                } else {
-                    trimmed.to_string()
-                };
+                let snippet = daemon_response_snippet(line.trim_end());
                 format!("parsing daemon response: {:?}", snippet)
             })
         }
@@ -33414,5 +33460,150 @@ mod daemon_request_deadline_locks {
             "a total deadline at or below the per-syscall budget would fail reads \
              that are merely large, which is a regression rather than a fix"
         );
+    }
+}
+
+#[cfg(test)]
+mod daemon_response_snippet_locks {
+    use super::{DAEMON_RESPONSE_SNIPPET_CHARS, daemon_response_snippet};
+
+    /// ⛔ THE FALSIFIER. This ran as `&trimmed[..240]`, and every case below
+    /// panicked under it — inside the error handler, so the report about an
+    /// unparseable response was what killed the process.
+    ///
+    /// The sweep slides one two-byte character across the cut rather than
+    /// placing it at a single offset, because the defect is not "the boundary is
+    /// wrong by one" — it is that a byte offset has no relationship to where
+    /// characters end, so any one probe can miss by landing on a boundary.
+    #[test]
+    fn a_multibyte_character_may_sit_at_any_offset_across_the_cut() {
+        for pad in (DAEMON_RESPONSE_SNIPPET_CHARS - 12)..(DAEMON_RESPONSE_SNIPPET_CHARS + 12) {
+            let line = format!("{}é{}", "a".repeat(pad), "b".repeat(80));
+            let snippet = daemon_response_snippet(&line);
+            let kept = snippet.trim_end_matches('.');
+            assert!(
+                line.starts_with(kept),
+                "pad {pad}: the snippet must be a genuine prefix of the line it quotes",
+            );
+            assert!(
+                kept.chars().count() <= DAEMON_RESPONSE_SNIPPET_CHARS,
+                "pad {pad}: quoted {} characters against a {DAEMON_RESPONSE_SNIPPET_CHARS} budget",
+                kept.chars().count(),
+            );
+        }
+    }
+
+    /// ⚠ The case that reaches this path most often is the one that was most
+    /// likely to panic. The caller builds the line with `from_utf8_lossy`, so
+    /// binary noise off the socket — precisely what fails to parse — arrives as
+    /// a dense run of three-byte U+FFFD, and a fixed byte offset lands inside
+    /// one of them about two times in three.
+    #[test]
+    fn binary_noise_off_the_socket_is_quoted_rather_than_fatal() {
+        let mut raw = b"{\"".to_vec();
+        raw.extend(std::iter::repeat(0xFF).take(400));
+        let line = String::from_utf8_lossy(&raw).into_owned();
+        assert!(
+            !line.is_char_boundary(240),
+            "this lock is only meaningful while byte 240 of the lossy line is \
+             inside a character — the old code sliced exactly there",
+        );
+        let snippet = daemon_response_snippet(&line);
+        assert!(snippet.ends_with("..."), "a 402-character line was dropped from");
+        assert_eq!(
+            snippet.trim_end_matches('.').chars().count(),
+            DAEMON_RESPONSE_SNIPPET_CHARS,
+        );
+    }
+
+    /// The length test and the cut must ask the same question. The old guard
+    /// asked bytes (`len() > 240`) while the cut took bytes too — consistent,
+    /// but in the unit nobody reads. A line well inside the budget in the unit
+    /// that is actually quoted must come back whole.
+    #[test]
+    fn the_length_test_and_the_cut_use_the_same_unit() {
+        let line = "é".repeat(150);
+        assert!(line.len() > DAEMON_RESPONSE_SNIPPET_CHARS, "300 bytes");
+        assert!(line.chars().count() < DAEMON_RESPONSE_SNIPPET_CHARS, "150 characters");
+        assert_eq!(
+            daemon_response_snippet(&line),
+            line,
+            "a line that fits the character budget must be quoted whole",
+        );
+    }
+
+    /// ⛔ The ellipsis is a claim that there was more. It must not be able to
+    /// lie in either direction, or a truncated diagnostic reads as a complete
+    /// one and the reader stops looking.
+    #[test]
+    fn the_ellipsis_appears_exactly_when_something_was_dropped() {
+        let exact = "a".repeat(DAEMON_RESPONSE_SNIPPET_CHARS);
+        assert_eq!(daemon_response_snippet(&exact), exact, "nothing was dropped");
+        let over = "a".repeat(DAEMON_RESPONSE_SNIPPET_CHARS + 1);
+        assert!(daemon_response_snippet(&over).ends_with("..."), "one character was dropped");
+        assert_eq!(daemon_response_snippet(""), "");
+    }
+
+    /// ⚠ Do not "fix" the panic by removing the snippet: the snippet is what
+    /// makes an unparseable response diagnosable at all. This pins that the
+    /// quote survives, so a later reader cannot silence the report and call it
+    /// a repair.
+    #[test]
+    fn the_report_still_carries_the_offending_text() {
+        let snippet = daemon_response_snippet("{\"kind\":\"nonsense\"");
+        assert!(snippet.contains("nonsense"), "got {snippet:?}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod comm_truncation_locks {
+    use super::{PROC_COMM_BYTES, comm_names_binary};
+
+    #[test]
+    fn a_short_name_is_matched_whole_and_a_long_one_on_its_truncation() {
+        assert!(comm_names_binary("claude", "claude"));
+        assert!(!comm_names_binary("claud", "claude"));
+        let long = "codex-with-a-very-long-name";
+        assert!(comm_names_binary(&long[..PROC_COMM_BYTES], long));
+        assert!(!comm_names_binary(&long[..PROC_COMM_BYTES - 1], long));
+    }
+
+    /// ⛔ THE FALSIFIER. This ran as `comm == &name[..15]` — a byte index into a
+    /// name from a table, safe only for as long as every entry stays ASCII. The
+    /// panic was guarded by a registry other people edit rather than by the code
+    /// that depends on it, which is why it is worth a lock and not a comment.
+    #[test]
+    fn a_binary_name_whose_fifteenth_byte_is_inside_a_character_returns_a_verdict() {
+        let name = "aaaaaaaaaaaaaaé-agent";
+        assert!(
+            !name.is_char_boundary(PROC_COMM_BYTES),
+            "this lock is only meaningful while byte 15 sits inside a character",
+        );
+        // A comm is read as `&str`, so its bytes are always valid UTF-8, while a
+        // cut through a character never is. The truncated arm therefore cannot
+        // match anything at all — which is the right answer, and reachable only
+        // because asking the question no longer aborts.
+        assert!(!comm_names_binary("something-else", name));
+        assert!(!comm_names_binary(&name[..PROC_COMM_BYTES - 1], name));
+        assert!(comm_names_binary(name, name), "the untruncated arm still works");
+    }
+
+    /// ⚖ The unit is the kernel's, not ours: `/proc/<pid>/comm` is cut at 15
+    /// BYTES, so matching by characters would disagree with the value we are
+    /// handed the moment a name stops being ASCII.
+    #[test]
+    fn no_registry_binary_name_can_panic_the_matcher() {
+        for cli in yggterm_core::AGENT_CLIS.iter() {
+            assert!(
+                !comm_names_binary("", cli.binary_name),
+                "an empty comm names nothing, including {:?}",
+                cli.binary_name,
+            );
+            assert!(
+                comm_names_binary(cli.binary_name, cli.binary_name),
+                "{:?} must name itself",
+                cli.binary_name,
+            );
+        }
     }
 }
