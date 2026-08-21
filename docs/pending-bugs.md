@@ -3553,7 +3553,9 @@ on a host whose store has no such transcripts, so the resume could never succeed
 exists for either row on either host**, the launch is long dead, and the rows have already
 survived one daemon restart in that state — nothing times a RemoteBootstrap out, fails it
 loudly, or marks it dead. They are also the pair whose arrangement dead-head made them
-invisible on the sidebar (the [11.10] row-set entry), so the two defects compounded: a husk
+invisible on the sidebar (that arrangement entry is closed — `visible_rows` draws an
+orphaned member at top level, and a departed head's entry is now swept once its absence is
+confirmed), so the two defects compounded at the time: a husk
 nobody could see. The husks are left in place as specimens; the wake relay that spawned them
 (a parked-row wake addressed at a session that does not exist on the target) is its own
 defect for the plane that owns the booter's send path.
