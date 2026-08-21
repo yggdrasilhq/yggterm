@@ -71,12 +71,25 @@ fi
 
 # ── 1. The seed re-asks instead of leaving a black canvas ────────────────────
 say "1. blank viewport: the seed re-asks, and refuses in words if it cannot"
-# ⭐ THIS ARM NEEDS NO STAGING WHEN IT FOLLOWS A ROLL. A fleet deploy restarts
-# the GUI while daemons adopt — which IS the condition that produced the
-# 13-minute blank. So after a roll, do not stage anything: just read the trace
-# for the window the storm already created.
-todo "after a ROLL this is already staged — the deploy's own adoption is the repro."
-echo "      (otherwise: restart the GUI DURING a daemon adoption, then open a retained remote row)"
+# ⛔ THE "A ROLL ALREADY STAGES THIS" ADVICE WAS WRONG AND IS WITHDRAWN (measured
+# 2026-08-21, 11.14). The 3.1.16 roll produced ZERO retained_rehydrate events of
+# any kind, and so did a deliberate GUI restart afterwards. Two reasons, both
+# measured:
+#   1. THE ROW MUST BE A REMOTE **RESUME**, NOT MERELY A REMOTE ROW. The gate is
+#      `is_remote_resume_agent_session`; `terminal_live_host_connected` is seeded
+#      `!is_remote_resume_session`, so a freshly CREATED remote row (start-cc)
+#      starts "connected" and the seed never arms. A revealed resume row armed it
+#      on the first try.
+#   2. THE HEALTHY ATTACH IS ~300 ms (`request_to_ready_ms`), so there is no
+#      window to race by hand.
+# ⇒ STAGE IT AS: reveal a retained remote RESUME row (`remote-cc://<host>/<uuid>`
+#   whose Remote Launch Action is a resume). That reliably produces
+#   begin → daemon_ready_wait → end. It does NOT produce `empty`: an empty answer
+#   needs the daemon to hold no paintable screen, which a healthy fleet will not
+#   do on demand.
+todo "reveal a retained remote RESUME row (NOT a freshly created one — see the note above)."
+echo "      ⚠ a converged run (begin → end) proves the path RUNS; it does NOT prove the retry"
+echo "        ladder, which needs a real empty answer and cannot be manufactured on a healthy fleet."
 echo "      the shapes, in order, on the row that came up blank:"
 echo "        ytrace ... terminal_mount/retained_rehydrate_empty       (the answer that used to end it)"
 echo "        ytrace ... terminal_mount/retained_rehydrate_retry_scheduled  (delay_ms 2500 → 60000)"
@@ -91,13 +104,24 @@ echo "      (this window already holds $seed_probe retry/refuse events)"
 
 # ── 2. A question picker is its own state ────────────────────────────────────
 say "2. picker: neither working nor idle, and the GUI names the mode"
+# ⭐ MEASURED 2026-08-21 (11.14): stage this on a THROWAWAY row you spawn with
+# `terminal new --no-activate --ephemeral`, never on an owner row — the readers
+# below are all daemon-side or GUI-state, so nothing needs the owner's viewport.
+# ⚠ Two of the six readers cannot be read back by an agent at all: the right-rail
+# Status string is exposed by no app-control verb, and a row's title cannot be
+# blanked, so the empty-title card branch stays code-only.
+# ⚠ Allow ~40-50 s: the dot and the card lag the daemon flag on a GUI reporting
+# `background_refresh_suspended: true`.
 todo "raise an owner question on any Claude Code row, then read all three:"
 echo "        server gate-screen <row> --tail 60   → screen_shows_question_picker: true"
 echo "        server snapshot                      → that row's awaiting_user_choice: true"
 echo "        the row's dot stays lit, and the metadata Status reads 'asking you a question'"
 echo "      and a card must appear naming the keys that answer it."
-echo "      ⛔ 'working: true' beside it is CORRECT — the CLI really is mid-turn. That is"
-echo "         the whole reason the fourth state had to exist."
+echo "      ⛔ MEASURED 2026-08-21: the two working readers DISAGREE and that is expected."
+echo "         server snapshot  → working: FALSE (this CLI's descriptor; the phrase left the screen)"
+echo "         server gate-screen → screen_text_shows_agent_working: TRUE (kind-agnostic union)"
+echo "         Trust the snapshot for a known CLI. And note the misread the fourth state"
+echo "         prevents is 'this row looks IDLE/DONE', not 'this row looks busy'."
 
 # ── 3. The webview ack ladder ────────────────────────────────────────────────
 say "3. webview edit plane: read acks_late FIRST or the numbers mislead"

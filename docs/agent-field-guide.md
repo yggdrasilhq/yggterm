@@ -1921,3 +1921,30 @@ print([c["pid"] for c in json.load(sys.stdin)["clients"] if c["client_role"]=="a
 ⭐ The same caution covers the opposite error: a probe that looks *absent* may
 simply belong to a pid whose records rotated out. Check `event-trace.g*.jsonl`
 generations before concluding a probe never fired.
+
+## Two readers named `working` disagree on the same row at the same instant (measured 2026-08-21)
+
+`server snapshot` → a session's **`working`**, and `server gate-screen` →
+**`screen_text_shows_agent_working`**, sound like the same question. They are
+not, and on a Claude Code row holding an owner question they answer **opposite**:
+ten consecutive simultaneous sample pairs read `working: false` beside
+`screen_text_shows_agent_working: true`, with `awaiting_user_choice: true` and
+the picker confirmed on screen in every one.
+
+**Why, and which to trust.** The daemon sets `session.working` from **THIS CLI's**
+descriptor, deliberately — the daemon's own comment says the kind-agnostic matcher
+"can mistake one CLI's completion trace for another's work signal". `gate-screen`'s
+field is that agnostic union. ⇒ **For a row whose CLI you know, the snapshot's
+`working` is the answer; `gate-screen`'s is a union and reads broader.**
+
+⚠ **The trap is which one you meet first.** `gate-screen` prints its field in the
+output you are already reading, so it is the one a verifier quotes — and it is the
+less specific of the two.
+
+⛔ **A corollary that inverts a widely-repeated premise.** The comments around the
+picker state say a row holding a question is mid-turn, *so `working` reads true and
+the misread is "busy working"*. Measured, `working` reads **false**: the CLI's
+working phrase leaves the screen when the picker takes it. So the misread the
+`awaiting_user_choice` state actually prevents is **"this row is IDLE / finished"**
+on a row that is stopped and eating typed sentences — the more dangerous reading,
+not the milder one.
