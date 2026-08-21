@@ -208,9 +208,31 @@ field that decides what is on screen, which is why every report of this has been
 which of four writers fired. `session/restore_view_mode` now records the persisted mode, the
 row's own default, whether it supports a terminal, and BOTH liveness readings side by side.
 
-**Falsifier — the observation still owed:** restart the GUI with an active remote agent row and
-watch `session/restore_view_mode` — `persisted`, `row_default` and `decided` must all read
-`Terminal`, and the terminal must paint without a manual switch.
+### LIVE, 2026-08-21 23:34 on 3.1.35 — HALF PROVEN, AND THE HALF MATTERS
+
+The roll restarted the GUI and the new probe answered:
+
+```
+persisted: Terminal · before_normalize: Terminal · row_default: Terminal · decided: Terminal
+supports_terminal: true
+was_a_restored_live_session: true      <- the liveness that survives a restart
+scan_says_live: false                  <- the erased flag the old gate read
+```
+
+⭐ **The two liveness readings disagree on the live machine, exactly as predicted.** That is
+the second defect caught in the act rather than argued from source: the old gate would have
+taken the `false` and skipped the launch on a row that was demonstrably a restored live
+session. No demotion occurred — `decided: Terminal`.
+
+⛔ **BUT THE ACTIVE ROW AT THIS RESTART WAS `local://…`, NOT `remote-cc://`.** A local path
+never enters the remote key builder, so **this restart did not exercise the scheme mismatch at
+all**. That half is proven only by its unit lock (red before, green after), and claiming the
+live run covered it would be reading the reading one wants.
+
+**Falsifier still owed, and now cheap to collect:** the next restart whose ACTIVE row is a
+`remote-cc://` one. `session/restore_view_mode` will name it in `active_session_path`, and
+`decided` must read `Terminal`. ⇒ Until a trace line shows a `remote-cc://` active path, the
+live half of this entry is unfinished.
 
 ## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
 
