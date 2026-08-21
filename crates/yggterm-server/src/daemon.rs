@@ -4671,6 +4671,7 @@ impl DaemonRuntime {
         }
 
         let mut owners: Vec<ServerEndpoint> = Vec::new();
+        let own_endpoint = default_endpoint(self.store.home_dir());
         for path in &unanswered {
             let runtime_key = self.terminal_runtime_key_for_path(path);
             // The registry first: it is authoritative and free. Then what
@@ -4684,6 +4685,35 @@ impl DaemonRuntime {
             let Some(owner) = owner else {
                 continue;
             };
+            // ⛔⛔ SOCKET ADOPTION CREATES ALIASES OF SELF, AFTER DISCOVERY —
+            // and a stale claim naming one is a request into our OWN accept
+            // queue while we hold the very lock its handler needs. Measured on
+            // the live host 2026-08-21: `server-3-1-22.sock` had become a
+            // SYMLINK to the current daemon's own socket, the discovery map
+            // still named it as a peer, and every probe of it self-deadlocked
+            // for the full 10 s client timeout — one guaranteed typing freeze
+            // per backoff expiry (six in 27 minutes, on schedule, forever).
+            // The census's own-address drop cannot catch this: it filters at
+            // DISCOVERY time, and the alias is created at ADOPTION time. The
+            // identity check must therefore run at USE time, canonicalized
+            // (`server_endpoints_same_target` resolves symlinks). A claim that
+            // resolves to self is not merely skipped — it is PURGED, because
+            // post-adoption it is factually wrong: these rows are ours now.
+            if server_endpoints_same_target(&owner, &own_endpoint) {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "perf",
+                    "proxied_owner_is_self_alias_purged",
+                    serde_json::json!({
+                        "owner": owner_endpoint_label(&owner),
+                        "runtime_key": runtime_key,
+                    }),
+                );
+                self.remove_preserved_owner(&runtime_key, "owner_is_self_alias");
+                self.discovered_working_flag_owners.remove(path.as_str());
+                continue;
+            }
             let label = owner_endpoint_label(&owner);
             if !owners
                 .iter()
@@ -23075,6 +23105,54 @@ mod tests {
             siblings,
             sibling_endpoints_from_census(&listening, &own),
             "the selection must be stable across passes"
+        );
+    }
+
+    /// A symlink to the daemon's own socket must read as SELF, not as a peer.
+    /// Socket adoption creates exactly this alias (`server-<old>.sock` →
+    /// `server-<new>.sock`) AFTER discovery has recorded the old path as an
+    /// owner; probing it is a request into our own accept queue while we hold
+    /// the lock its handler needs — a guaranteed 10 s self-deadlock, measured
+    /// live 2026-08-21 recurring once per backoff expiry. The identity
+    /// therefore has to be judged canonicalized, at USE time.
+    #[test]
+    fn a_symlink_to_our_own_socket_is_self_not_a_peer() {
+        let dir = std::env::temp_dir().join(format!("ygg-selfalias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let own_path = dir.join("server-3-1-23.sock");
+        std::fs::write(&own_path, b"").expect("create own socket stand-in");
+        let alias_path = dir.join("server-3-1-22.sock");
+        let _ = std::fs::remove_file(&alias_path);
+        std::os::unix::fs::symlink(&own_path, &alias_path).expect("create adoption alias");
+
+        let own = ServerEndpoint::UnixSocket(own_path);
+        let alias = ServerEndpoint::UnixSocket(alias_path.clone());
+        assert!(
+            super::server_endpoints_same_target(&alias, &own),
+            "the adoption alias must canonicalize onto its target — a \
+             path-label comparison here is the measured self-deadlock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // And the use-time guard exists where the stale claim is consumed:
+        // the working-flags owner resolution must check the resolved owner
+        // against self and PURGE a self-alias, because the census's
+        // discovery-time drop cannot see an alias created at adoption time.
+        let source = include_str!("daemon.rs");
+        let resolve_at = source
+            .find("// The registry first: it is authoritative and free.")
+            .expect("the owner-resolution loop must still exist");
+        let resolve_scope = &source[resolve_at..resolve_at + 3_000];
+        assert!(
+            resolve_scope.contains("server_endpoints_same_target(&owner, &own_endpoint)"),
+            "the owner-resolution loop lost its use-time self-alias check — \
+             a stale claim naming an adopted socket self-deadlocks the daemon \
+             for the full client timeout, once per backoff expiry, forever"
+        );
+        assert!(
+            resolve_scope.contains("owner_is_self_alias"),
+            "a self-alias claim must be PURGED, not merely skipped — \
+             post-adoption these rows are owned locally and the claim is false"
         );
     }
 
