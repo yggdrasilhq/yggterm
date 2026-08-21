@@ -519,6 +519,51 @@ fail once and stay failed.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔⛔ [11.0] A GUI RESTART STARTS A SECOND `--resume` ON A SESSION WHOSE PROCESS IS STILL ALIVE
+
+**Status:** OPEN
+
+*Measured 2026-08-21 on the live fleet, by finding two processes on one session id.*
+
+```
+pid 1782028  started 19:37:41  claude --model … --session-id <id>     ← the original
+pid 2411165  started 20:17:25  claude … --resume <id>                 ← a SECOND attach
+```
+
+Forty minutes apart, on one session, both writing the same transcript. The second
+appeared within a minute of the client restarting onto a new build.
+
+⛔ **This is the exact corruption the attach path already knows how to prevent.**
+Opening a row whose session is running prints, correctly:
+
+```
+Claude Code session <id> is already running under yggterm (pid <n>);
+waiting to attach instead of starting a second resume, which would
+corrupt the transcript. Nothing to close.
+```
+
+⇒ **So the guard exists and the restart path does not consult it.** One route waits
+for the live process; the other spawns beside it. A transcript written by two
+processes has interleaved turns and neither process knows.
+
+⚠ **Why it is invisible.** Both processes are healthy, the row looks normal, and
+the only tell is `pgrep` returning two pids for one id — which nothing checks.
+`server app rows` shows one row; the census counts one session; the transcript
+grows faster than one agent could write and nothing reads its rate.
+
+**Two things to fix, and the first is not enough alone:**
+
+1. The restart/re-resume path must take the same "already running, wait to attach"
+   branch the manual open takes. One owner for the question *is this session
+   already live*.
+2. ⚠ **The attach-wait itself needs a bound and a voice.** It prints
+   `Waiting 12s so far` and then goes silent — no progress, no timeout, no
+   failure. A correct protection that is indistinguishable from a hang is why a
+   person reaches for the path that does not wait.
+
+**Falsifier:** restart the client while an agent row is running, then
+`pgrep -af <session-id>` — exactly one process, and the row still paints.
+
 ## ⛔⛔ [11.0] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
 
 **Status:** OPEN
