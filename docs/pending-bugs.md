@@ -358,6 +358,60 @@ fail once and stay failed.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔ [11.23] A RESTART LANDS ON A WEB SURFACE OVER A LIVE TERMINAL ROW — STALE FIRST, THEN BLANK
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-21, with a frame. He restarted the GUI and the viewport
+came up on an **old, cold webview** — content from a previous surface — which then
+changed to a **blank** one: a chat panel with a search box, `WORK · 2`,
+`Show 2 more`, nothing else.*
+
+⛔ **The row it was drawing is a TERMINAL session.** The metadata rail beside that
+blank page read `Type: Claude Code · running · idle · PTY size 173 × 65`. A live
+agent terminal was on screen as an empty web page.
+
+**Two cited paths, and neither is the web surface misbehaving — they are the
+workspace choosing it.**
+
+**1. The server is CONSTRUCTED in the web surface.** `lib.rs:4210` builds with
+`active_view_mode: WorkspaceViewMode::Rendered`. The enum has two variants
+(`lib.rs:274`), so a fresh server starts in `Rendered` and the terminal must be
+asked for.
+
+**2. The normaliser can only push TOWARD `Rendered`; there is no path back.**
+`normalize_active_view_mode` (`lib.rs:4234`) returns early if the mode is not
+`Terminal`, sets `Rendered` when there is no active session, and sets `Rendered`
+when the session cannot host a terminal. **Every arm ends in `Rendered`.** Nothing
+anywhere says *"the active row IS a terminal session, therefore show the
+terminal"*.
+
+⇒ For a product whose thesis is that the terminal handoff IS the product, the
+default is inverted. ⚠ Not a one-line flip: `show_start_page` (`lib.rs:4253`) sets
+`Rendered` deliberately and the start page depends on it. The question is what the
+mode must be **when a terminal-capable session is active**.
+
+**3. And an unrelated action flips the user into it as a side effect.**
+`remove_live_session` (`lib.rs:5271`) sets `active_view_mode = Rendered` when the
+row being removed is the active one — so tidying a corpse can move the person's
+viewport onto a web page.
+
+### ⭐ THE DEAD CODE IS ALREADY NAMED BY THE COMPILER
+
+`cargo check` reports, among others: `remote_preview_payload_terminal_prefill`,
+**`remote_preview_payload_terminal_prefill_before_2_1_103`** — a pre-2.1.103
+variant kept alongside its own successor — `declared_web_surface_open_from_payload`,
+`web_surface_socks_egress_donor`, `preview_blocks_effectively_empty`,
+`rendered_sections_effectively_empty`; and `viewport.rs:14170` still carries a
+comment about "the legacy native child webview".
+
+⛔ **`never used` is not `unreachable`.** Check `#[cfg]`, feature gates and dynamic
+dispatch before deleting any of them, and record what was checked.
+
+⚠ **A blank surface and a missing surface look identical**, which is the fault this
+campaign keeps paying for. If the webview is made to refuse stale content, it must
+SAY so rather than render empty.
+
 ## ⛔⛔⛔ [11.0] REMOVING ONE OF TWO ROWS THAT SHARE A SESSION ID KILLS THE OTHER'S RUNTIME, AND REPORTS THAT IT REAPED NOTHING
 
 **Status:** OPEN
