@@ -707,6 +707,23 @@ not the population); an isolation harness (per-test temp home, serialized group)
 retry culture. **Falsifier:** two full workspace suites running concurrently on one machine
 both pass.
 
+## ⚠ [11.10] A STANDING BOOT REFUSAL IS INVISIBLE IN EVERY STATE FILE — ONLY THE LOG KNOWS
+
+**Status:** OPEN
+
+*Filed 2026-08-21 from a cross-lane report that proved out: four rows across four campaigns
+sat permanently unbootable for days while every instrument read healthy.* A refused boot is
+deliberately REFUNDED (`boots` stays 0 — correct, the row was never asked anything), so a
+row refused every tick forever is indistinguishable in the subscription state from one that
+never needed a boot: no counter rises, nothing escalates, and only a log line per tick
+records the standing condition. The immediate cause of those four (the read-buffer JSON
+envelope consumed raw, defeating the residue cleaner and half-blinding the choice-prompt
+guard) is fixed with a falsifying fixture test; THIS entry is the structural residue: a
+refusal that repeats N ticks for the SAME reason should surface — a `standing_refusal`
+field on the subscription and one escalation, not a per-tick log line nobody tails.
+**Falsifier:** wedge a row so a boot refuses repeatedly; within N ticks the subscription
+state names the standing refusal and exactly one escalation fires.
+
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
 **Status:** OPEN
