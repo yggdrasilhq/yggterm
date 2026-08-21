@@ -76,3 +76,49 @@ def resolve_row(args, *, env_fallback=""):
     value = positional or flag or bare_uuid(env_fallback)
     setattr(args, dest, value)
     return value
+
+
+def row_session_id(row):
+    """The id of a row **we are holding the JSON for** — its own answer, not ours.
+
+    ⛔⛔ **THE DEFECT THIS EXISTS TO END: the fleet re-derived a row's identity by
+    slicing its path, and that is correct only when the path happens to END in the
+    id.** Measured 2026-08-22 against the live row plane: of **281 session rows,
+    246 (87.5%) derived an id that is not the session's id**, and five rows of one
+    CLI collapsed onto a single value because their store spells identity as a
+    directory and names every file the same thing:
+
+        full_path  …/brain/<a>/.system_generated/logs/transcript_full.jsonl
+        full_path  …/brain/<b>/.system_generated/logs/transcript_full.jsonl
+        derived    'transcript_full.jsonl'   ← for BOTH, and for three more
+
+    Only a row addressed by a `scheme://host/<uuid>` path derived correctly, which
+    is why this survived: the rows a lane touches most are live ones, and live rows
+    wear the scheme. Every row at REST is path-shaped, and so is every row of a CLI
+    whose sessions are files rather than sockets.
+
+    ⇒ **What made it invisible is that `full_path` is not one format.** It is a row
+    ADDRESS, and its shape is a property of the CLI and of whether the session is
+    live — so a slice that is right in front of you is wrong four times out of five
+    a little further down the tree.
+
+    ⚖ **The id was never missing.** yggterm resolves it through the CLI registry,
+    which knows that one store names the session's DIRECTORY and another its FILE
+    STEM, and it publishes the answer on every row as `session_id` — populated on
+    **281 of 281** rows measured. So this is not a gap to fill, it is a second
+    encoding to delete: the registry already decided, and the fleet disagreed with
+    it in nine files.
+
+    ⛔ Use this whenever a row's JSON is in hand. `bare_uuid` is for the OTHER
+    question — what a human typed on a command line — where there is no row to ask
+    and the last segment is the best available guess.
+    """
+    if not isinstance(row, dict):
+        raise TypeError(f"row_session_id needs a row's JSON, got {type(row).__name__}")
+    published = (row.get("session_id") or "").strip()
+    if published:
+        return published
+    # ⚠ Only for a row that carries no id at all — a folder, a group, a machine.
+    # Falling back is right here (the caller wants SOME stable key) and wrong for
+    # a session, which is why the emptiness is what selects it rather than a flag.
+    return bare_uuid(row.get("full_path") or row.get("path") or "")

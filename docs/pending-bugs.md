@@ -18,6 +18,62 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+
+**Status:** OPEN
+
+*Found 2026-08-22 while exercising the orchestration plane ACROSS CLIs. The row-identity
+half of this is fixed and gated; this is the other half, and it is a different fix.*
+
+**The measurement.** Eleven callsites across seven fleet verbs answer *"has this row ever
+written a word?"* with one hardcoded glob — the reference CLI's transcript store:
+
+```
+ygg-spawn.py    proves the brief arrived        ygg-fold.py     harvest before retiring
+ygg-deliver.py  proves delivery, and REAPS      ygg-monitor.py  last prose, stall evidence (x3)
+ygg-babysit.py  liveness over ssh (x2)          ygg-booter.py   evidence marker
+```
+
+The registry declares a store for **every** registered CLI, and they do not share a
+layout: one keeps a SQLite database, another a per-session directory, another rollout
+files whose names decorate the id. A row of any of them has no file where these verbs
+look, so the glob returns empty — and **empty is not an error, it is an answer**, the
+same answer a row that has genuinely never done anything would give.
+
+**Why that is worse than a false negative.** `ygg-deliver`'s reap test is *"has it ever
+written a word"*, and its own comment explains the asymmetry it is guarding: *"losing a
+working lane to a delivery timeout would be far worse than the debris this cleans up."*
+For a row outside the reference store that test can only ever answer no. ⇒ A working
+lane of any other CLI that is merely busy past the deadline is classified as never
+briefed and force-folded. The interlock is correctly reasoned and reads the wrong shelf.
+
+⚠ **`ygg-booter` reasoned about exactly this and still missed it.** Its marker documents
+that an unreadable result must never be treated as fresh evidence, and picks the safe
+direction deliberately — but "unreadable" was imagined as a permissions or timing
+failure, never as *"this row belongs to a CLI that keeps its transcripts somewhere
+else."* The care was real and aimed one category short.
+
+**⛔ The law that should have caught it already exists, and cannot see these files.**
+`no_store_path_literal_outside_the_agent_cli_registry` refuses exactly this hardcoding
+and is enforced in two Rust files by scanning their own source. The orchestration layer
+is Python and sits outside the fence, so the same literal that fails the build in one
+language is unreviewed in the other.
+
+**The fix, and why it is not a one-liner.** Ask the registry, which already knows each
+store's layout and how a session is recognised inside it — do not re-encode ten layouts
+in Python. Two supply lines are possible and the choice is the real work: a headless
+verb that resolves a row's transcript (one owner, needs a rolled binary before any host
+can use it), or a table generated from the registry and checked in beside the verbs with
+a Rust lock asserting it still matches (no deploy, one more artefact to keep honest).
+**Recommendation: the generated table**, because these verbs run on timers and on hosts
+mid-roll, and a resolver that needs the newest daemon to answer is unavailable exactly
+when a stalled fleet needs reading. ⚠ And a resolved path is not yet a readable
+transcript — one store is a SQLite database, so the ack-grep that proves delivery needs
+a per-store reader, not just a per-store path.
+
+**What would falsify it being fixed:** `ygg-deliver.py` proving delivery into a row of a
+non-reference CLI, and `ygg-monitor` reporting that row's last prose instead of silence.
+
 ## ⛔⛔⛔ [11.20] A ROLL TAKES A LIVE DAEMON'S SOCKET NAME AWAY, AND NOTHING CAN REACH IT AGAIN
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
