@@ -582,11 +582,23 @@ the codebase at once by turning them into `ECHILD`.
 
 ### The locks, and what each one can and cannot see
 
-⭐ **The daemon call site is a proven lock, not an assumed one.**
-`notify_owner_reaps_the_notification_child` drives the real production function
-against a stub binary in a fake home and counts zombie children of the test process.
-It was falsified by reverting `notify_owner` to `let _ = cmd.spawn()`, and it failed
-with *"left a zombie behind: 1 zombie children against a baseline of 0"*.
+⭐ **The daemon call site is a proven lock — but its first version was flaky in the
+one place that matters, and the reason is a law.** It drove the real production
+function against a stub binary in a fake home, then **counted zombie children of the
+whole test process against a baseline snapshot**. That passes when the test is run
+alone, which is how it was verified, and FAILS in the suite: *"left a zombie behind: 3
+zombie children against a baseline of 0"* — while `notify_owner` spawns exactly ONE
+child. The other two belonged to sibling tests, because 1,200 tests in one binary
+spawn and reap children of that same process throughout the fifteen-second window.
+
+⛔ **A lock that goes red on its neighbours' work is worse than no lock; it teaches
+people to re-run.** The cure is the campaign's own rule — **identify, do not count.**
+`notify_owner` now returns the pid it launched (useful in its own right: the function
+previously swallowed what it started), and the lock watches THAT pid until it is gone
+or fails it if it sits in `Z`. It asserts the pid was reported at all before it starts,
+so it cannot pass by nothing having been launched. Falsified by restoring the dropped
+`Child` while still reporting a pid: *"left pid 3725640 as a zombie child for 15s"*.
+Green in the full 1,223-test suite afterwards.
 
 ⭐ **The GUI call sites are locked structurally, because behaviourally they cannot
 be.** They shell out to `notify-send` and `ghostty` by name, so exercising them means
