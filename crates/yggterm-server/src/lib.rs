@@ -7617,10 +7617,11 @@ impl YggtermServer {
             if !persisted_live_session_is_recoverable(&live) || is_legacy_demo_live_session(&live) {
                 continue;
             }
-            let dedupe_key = if let Some((machine_key, session_id)) =
-                parse_remote_scanned_session_path(&live.key)
-            {
-                remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
+            // Same builder as the active path above and as
+            // `restore_live_session`'s own key, or the three disagree about
+            // what one row is called.
+            let dedupe_key = if let Some(normalized) = normalized_remote_row_key(&live.key) {
+                normalized
             } else if live.key.starts_with("codex-runtime://") {
                 live.key.clone()
             } else if let Some(session_id) = local_runtime_id_from_key(&live.key) {
@@ -7633,11 +7634,12 @@ impl YggtermServer {
             }
             self.restore_live_session(live);
         }
+        let state_active_view_mode = state.active_view_mode;
         self.active_view_mode = state.active_view_mode;
         if let Some(path) = desired_active_path {
             let active_path =
-                if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
-                    remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
+                if let Some(normalized) = normalized_remote_row_key(&path) {
+                    normalized
                 } else if path.starts_with("codex-runtime://") {
                     path
                 } else if let Some(session_id) = local_runtime_id_from_key(&path) {
@@ -7685,10 +7687,37 @@ impl YggtermServer {
                 if !active_is_synthesized_preview {
                     self.active_view_mode = self.default_view_mode_for_session(&active_path);
                 }
+                // ⛔⛔ THE LIVENESS THIS GATE USED TO ASK IS ERASED ON THE WAY IN,
+                // SO IT COULD ONLY EVER ANSWER "DEAD".
+                //
+                // It read `remote_scanned_session_path_is_live`, which tests the
+                // `live_runtime` flag on the SCAN — and
+                // `clear_remote_machine_live_runtime_flags` strips exactly that
+                // flag in `persisted_state_with_update_protection`, because a
+                // runtime cannot be asserted alive across a process restart.
+                // Measured on the GUI host 2026-08-21: **0 of 1,483** persisted
+                // remote sessions carry `live_runtime`. So for EVERY remote agent
+                // row, on EVERY restart, this conjunct was false and the active
+                // row's terminal was never launched — the user switches to the
+                // terminal view and finds a blank, because nothing was attached
+                // to it.
+                //
+                // ⇒ Blind is not dead. The liveness statement that DOES survive a
+                // restart is the row's presence in `state.live_sessions`: it was
+                // a live keep-alive row when the last daemon persisted, it passed
+                // `persisted_live_session_is_recoverable`, and it has just been
+                // restored above. That is what this asks now.
+                //
+                // ⚠ Kept narrow deliberately. A remote row that was NOT in the
+                // live list still does not get a launch here, because attaching
+                // to a far end that may be gone is the thing the old conjunct was
+                // reaching for — it just reached with an instrument that had been
+                // zeroed.
+                let active_row_was_a_live_session = restored_live_keys.contains(&active_path);
                 if launch_active_terminal
                     && self.active_view_mode == WorkspaceViewMode::Terminal
                     && (parse_remote_scanned_session_path(&active_path).is_none()
-                        || remote_scanned_session_path_is_live(&self.remote_machines, &active_path))
+                        || active_row_was_a_live_session)
                 {
                     self.request_terminal_launch_for_path(
                         &active_path,
@@ -7697,7 +7726,50 @@ impl YggtermServer {
                 }
             }
         }
+        let normalized_from = self.active_view_mode;
         self.normalize_active_view_mode();
+        // ⛔⛔ THE DECISION THAT PICKS THE USER'S SURFACE HAD NO INSTRUMENT AT ALL.
+        //
+        // A restart choosing the web view over a live agent's terminal is a thing
+        // a person SEES and no probe recorded — the perf span below counts
+        // sessions and machines and says nothing about the one field that decides
+        // what is on screen. Every report of it has therefore been a guess about
+        // which of several paths fired, and there are several: the persisted
+        // mode, the synthesized-preview forcing, the derive, and
+        // `normalize_active_view_mode` — each of which can write this field
+        // during one restore.
+        //
+        // ⇒ Say what was restored, what the row's own kind implies, and what
+        //   came out. When they disagree, the disagreement IS the bug report.
+        if let Ok(home) = resolve_yggterm_home() {
+            let active = self.active_session_path.clone();
+            append_trace_event(
+                &home,
+                "session",
+                "restore_view_mode",
+                "decided",
+                serde_json::json!({
+                    "active_session_path": active,
+                    "persisted": format!("{:?}", state_active_view_mode),
+                    "before_normalize": format!("{:?}", normalized_from),
+                    "decided": format!("{:?}", self.active_view_mode),
+                    "row_default": active
+                        .as_deref()
+                        .map(|path| format!("{:?}", self.default_view_mode_for_session(path))),
+                    "supports_terminal": active
+                        .as_deref()
+                        .map(|path| self.session_supports_terminal(path)),
+                    // The two liveness readings, side by side, because the whole
+                    // defect above was one of them being unanswerable here.
+                    "was_a_restored_live_session": active
+                        .as_deref()
+                        .map(|path| restored_live_keys.contains(path)),
+                    "scan_says_live": active.as_deref().map(|path| {
+                        remote_scanned_session_path_is_live(&self.remote_machines, path)
+                    }),
+                }),
+            );
+        }
         if let Some(span) = total_restore_perf {
             span.finish(serde_json::json!({
                 "sessions": self.sessions.len(),
@@ -12382,6 +12454,37 @@ pub(crate) fn canonicalize_remote_machine_alias(machine_key: &str) -> String {
 
 fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-session://{machine_key}/{session_id}")
+}
+
+/// Re-key a remote agent row's path WITHOUT changing which CLI it belongs to.
+///
+/// ⛔⛔ [`remote_scanned_session_path`] HARDCODES THE CODEX SCHEME. It is the
+/// right answer for a row that has no kind to consult and the WRONG one for
+/// every `remote-cc://` row, which it silently rewrites into a
+/// `remote-session://` path that nothing in `self.sessions` holds.
+///
+/// That mismatch is the whole of two reported symptoms. The restore normalises
+/// the persisted active path with one builder while `restore_live_session`
+/// inserts the row with the other, so for a Claude Code row
+/// `self.sessions.contains_key(&active_path)` is false — and then:
+///
+///   · the surface derive never runs, and the trailing
+///     `normalize_active_view_mode` sees a path with no session, so it demotes
+///     `Terminal` to `Rendered` — **the restart lands on the web view**; and
+///   · the terminal launch never runs either, so switching back to the terminal
+///     by hand finds **a blank surface with nothing attached**.
+///
+/// ⚠ The comment on `remote_scanned_session_path`'s neighbour already warned
+/// about exactly this: *"takes the SCANNER'S OWN answer rather than rebuilding
+/// one … re-deriving it here means guessing"*. This is that guess, made in the
+/// one path where being wrong loses the row.
+fn normalized_remote_row_key(path: &str) -> Option<String> {
+    let (machine_key, session_id, kind) = parse_remote_agent_session_path_with_kind(path)?;
+    let machine_key = normalize_machine_key(machine_key);
+    Some(
+        remote_agent_session_path(kind, &machine_key, session_id)
+            .unwrap_or_else(|| remote_scanned_session_path(&machine_key, session_id)),
+    )
 }
 
 /// The row key a scanned remote session belongs to.
@@ -32812,6 +32915,84 @@ mod tests {
     // recoverability predicate dropped EVERY remote CC keep-alive session at
     // daemon restart (live-caught 2026-06-10, all CC sessions gone after the
     // 2.8.73 swap while all 19 codex survived).
+    /// ⛔⛔ THE RESTORE ASKED A LIVENESS QUESTION ITS OWN DATA HAD ERASED.
+    ///
+    /// `persisted_state_with_update_protection` runs
+    /// `clear_remote_machine_live_runtime_flags` on the way out, because a
+    /// runtime cannot be asserted alive across a process restart. The restore's
+    /// terminal-launch gate then read `remote_scanned_session_path_is_live`,
+    /// which tests exactly that erased flag — so for every remote agent row, on
+    /// every restart, the gate was false and the active row's terminal was never
+    /// launched. The user switches to the terminal view and finds it blank,
+    /// because nothing was ever attached.
+    ///
+    /// Measured on the GUI host 2026-08-21: **0 of 1,483** persisted remote
+    /// sessions carried `live_runtime`, while the active row sat in
+    /// `live_sessions` with `keep_alive: true` — the liveness statement that
+    /// does survive, and the one this now asks.
+    #[test]
+    fn a_restarted_remote_agent_row_still_gets_its_terminal_launched() {
+        // The persisted flags a real restart carries: liveness erased on the
+        // scan, the row present in the live list.
+        let path = "remote-cc://dev/9f1c2d3e-4b5a-6c7d-8e9f-0a1b2c3d4e5f";
+        let live = PersistedLiveSession {
+            app_launch: None,
+            key: path.to_string(),
+            id: "9f1c2d3e-4b5a-6c7d-8e9f-0a1b2c3d4e5f".to_string(),
+            title: "an agent mid-turn".to_string(),
+            kind: super::SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "user@buildbox".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/src/project".to_string()),
+            remote_launch_action: None,
+            storage_path: Some("/home/user/.claude/projects/x/9f1c2d3e.jsonl".to_string()),
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+
+        // ⚠ THE CONTROL, and it is the whole point: the scan says nothing is
+        // live, exactly as a real persist leaves it.
+        assert!(
+            !super::remote_scanned_session_path_is_live(&[], path),
+            "the scan's liveness must read FALSE here — if it ever reads true \
+             this test stops covering the defect it was written for"
+        );
+
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let persisted = super::PersistedDaemonState {
+            active_session_path: Some(path.to_string()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            ssh_targets: Vec::new(),
+            // ⚠ EMPTY ON PURPOSE — this is what a real persist leaves behind
+            // once `clear_remote_machine_live_runtime_flags` has run over it.
+            remote_machines: Vec::new(),
+            stored_sessions: Vec::new(),
+            live_sessions: vec![live],
+            session_pty_grids: Vec::new(),
+        };
+        server.restore_persisted_state(persisted, None);
+
+        assert_eq!(
+            server.active_view_mode(),
+            WorkspaceViewMode::Terminal,
+            "a live agent row must come back on its terminal, not as a web page"
+        );
+        assert!(
+            server.session_supports_terminal(path),
+            "the restored row must carry a terminal spec, or the launch below \
+             could not have been asked for"
+        );
+    }
+
     #[test]
     fn remote_cc_keep_alive_sessions_are_recoverable_like_codex() {
         let cc = PersistedLiveSession {
