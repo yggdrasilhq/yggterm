@@ -2014,3 +2014,49 @@ working phrase leaves the screen when the picker takes it. So the misread the
 `awaiting_user_choice` state actually prevents is **"this row is IDLE / finished"**
 on a row that is stopped and eating typed sentences — the more dangerous reading,
 not the milder one.
+
+## Prove a daemon gate in a sandbox home, never on a live daemon (measured 2026-08-21)
+
+A gate that decides whether to roll a daemon can only be trusted once it has been
+watched refusing AND accepting. Both halves need a real daemon, and neither is worth
+spending someone's live sessions on.
+
+`YGGTERM_HOME` gives a complete, isolated plane: its own socket directory, its own
+bind lock, its own state. A daemon started under it cannot see or disturb the real one
+— and if the variable is not exported before the daemon starts, the daemon resolves
+the REAL home, finds the real bind lock and refuses. That refusal is the guard
+working; it is not a reason to force anything.
+
+```sh
+SB=$(mktemp -d); mkdir -p "$SB/bin"
+cp ~/.local/bin/yggterm-headless "$SB/bin/"
+export YGGTERM_HOME="$SB"                 # ⛔ BEFORE the daemon starts, not after
+"$SB/bin/yggterm-headless" server daemon & sleep 6
+
+# The SAME-VERSION rebuild, without building anything: the build id is the binary's
+# mtime, so `touch` reproduces a deploy's only observable while md5 proves the
+# content — and therefore the version — did not change.
+md5sum "$SB/bin/yggterm-headless"; sleep 2
+touch "$SB/bin/yggterm-headless"
+md5sum "$SB/bin/yggterm-headless"         # identical ⇒ provably the same version
+"$SB/bin/yggterm-headless" server status | grep -E 'build_id|hot_restart_pending'
+"$SB/bin/yggterm-headless" server monitor --scenario hot-restart
+```
+
+⛔ **RUN THE CONTROL FIRST.** A gate that refuses everything passes the falsifier and
+is still broken. Query it BEFORE re-stamping the binary: a daemon whose running build
+is the one on disk must still answer `already_ready`.
+
+⚠ **AND WATCH WHICH BINARY YOU COPY.** The first run of this recipe silently tested a
+VERSION BUMP instead of a same-version rebuild, because the fleet binary sync had
+updated the installed binary between the two copies — the successor bound a
+`server-3-1-20.sock` while the test believed it was still on 3.1.19. Copy ONCE into
+the sandbox and re-stamp THAT file; never re-copy from the install mid-test.
+
+⚠ The monitor streams several JSON objects and the last one is not newline-delimited
+from the rest. Decode with `json.JSONDecoder().raw_decode` in a loop; `json.load` on
+the whole stream throws, and reading only the first line gets `accepted`, never the
+result.
+
+Cleanup: kill by EXE, not by pattern — `pgrep -f <path>` matches the shell that holds
+the path in its own command line, so it reports a stray that is your own probe.
