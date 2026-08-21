@@ -270,36 +270,6 @@ restart_gui() {  # host expected_md5
   fi
 }
 
-# ⛔⛔ RE-EXEC WHEN THIS FILE CHANGES, AND FOR BASH IT IS NOT MERELY A FRESHNESS
-# QUESTION — IT IS A CORRECTNESS ONE. Bash reads a script lazily, by byte offset,
-# so editing the file under a running instance does not leave it uniformly old:
-# it resumes at an offset that now points into different text, which is how a
-# long-lived shell loop starts executing fragments of two versions. This watcher
-# lives in a checkout that other lanes land into every few minutes.
-#
-# ⇒ It is also the fourth instance of one class in a single day — a stale daemon,
-#   a stale GUI, a stale monitor watchdog, and this. Every one of them a
-#   long-lived process reading code from a checkout that moved under it, and
-#   nothing anywhere saying how far behind it was. The monitor's cure (re-exec on
-#   its own mtime) is the right shape and this is the same cure in shell.
-#
-# ⚠ Checked AFTER the sleep and never mid-tick: a tick holds a build and a deploy,
-#   and re-execing through those would abandon a half-deployed fleet.
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-self_mtime() { stat -c %Y "$SELF" 2>/dev/null || echo 0; }
-OWN_MTIME="$(self_mtime)"
-
-say "roll-watch up (interval ${INTERVAL}s, dry=$DRY, source $(date -d "@$OWN_MTIME" +%H:%M:%S 2>/dev/null))"
-while :; do
-  tick
-  [ "$ONCE" = 1 ] && break
-  sleep "$INTERVAL"
-  NOW_MTIME="$(self_mtime)"
-  if [ "$NOW_MTIME" != "$OWN_MTIME" ]; then
-    say "⭐ source changed on disk — re-execing so this loop runs one version of itself"
-    exec bash "$SELF" "${ORIG_ARGS[@]}"
-  fi
-done
 
 #: ⛔⛔ A CLIENT RESTART RE-MOUNTS EVERY ROW, AND SOME COME UP BLANK.
 #:
@@ -363,3 +333,69 @@ except Exception: print(0)" 2>/dev/null)"
     say "repaint sweep: every seated row painted after the restart"
   fi
 }
+
+# ⛔⛔ THE MAIN LOOP IS LAST IN THIS FILE AND THAT POSITION IS LOAD-BEARING.
+# A shell function must have been DEFINED — that is, its definition must already
+# have executed — before anything calls it, and this loop never returns. Written
+# above `repaint_sweep`, it meant the definition below was never reached, so the
+# repaint sweep that `restart_gui` calls after every restart died every time with
+# `repaint_sweep: command not found` and had never once run.
+#
+# ⚠ That is the worst possible thing for it to be, because it is the mitigation
+# for the defect the owner reports as the product deleting its own interface: it
+# was written, reviewed, committed, described in the queue as shipped, and was
+# dead code on every path. Nothing failed loudly — the message went to the log
+# under a line that had just said the restart succeeded.
+#
+# ⇒ Proved live: immediately after a restart taken by this watcher, ALL 35 seated
+#   rows read `nonblank_line_count: 0`; running the sweep by hand repainted 21 of
+#   them. This repo has recorded the same trap once before, about a `log()` helper
+#   defined below the code that called it, which also exited 0 while saying
+#   nothing. ⛔ Do not "tidy" this loop back up beside the other top-level code.
+# ⛔⛔ RE-EXEC WHEN THIS FILE CHANGES, AND FOR BASH IT IS NOT MERELY A FRESHNESS
+# QUESTION — IT IS A CORRECTNESS ONE. Bash reads a script lazily, by byte offset,
+# so editing the file under a running instance does not leave it uniformly old:
+# it resumes at an offset that now points into different text, which is how a
+# long-lived shell loop starts executing fragments of two versions. This watcher
+# lives in a checkout that other lanes land into every few minutes.
+#
+# ⇒ It is also the fourth instance of one class in a single day — a stale daemon,
+#   a stale GUI, a stale monitor watchdog, and this. Every one of them a
+#   long-lived process reading code from a checkout that moved under it, and
+#   nothing anywhere saying how far behind it was. The monitor's cure (re-exec on
+#   its own mtime) is the right shape and this is the same cure in shell.
+#
+# ⚠ Checked AFTER the sleep and never mid-tick: a tick holds a build and a deploy,
+#   and re-execing through those would abandon a half-deployed fleet.
+# ⭐ AND SAY SO AT STARTUP RATHER THAN AT THE MOMENT OF USE. A missing function is
+# discovered when it is called, which for `repaint_sweep` is after a restart has
+# already happened on the owner's machine — the latest possible moment and the one
+# where nobody is reading the log. `declare -F` costs nothing and turns a silent
+# hole into a refusal to start.
+for _fn in tick reconcile_client restart_gui repaint_sweep say; do
+  declare -F "$_fn" >/dev/null || {
+    printf 'ygg-roll-watch: ⛔ %s is not defined at the point the loop starts — a
+' "$_fn" >&2
+    printf '  function defined BELOW the main loop is never reached, because the loop
+' >&2
+    printf '  does not return. Move the definition above it.
+' >&2
+    exit 70; }
+done
+unset _fn
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+self_mtime() { stat -c %Y "$SELF" 2>/dev/null || echo 0; }
+OWN_MTIME="$(self_mtime)"
+
+say "roll-watch up (interval ${INTERVAL}s, dry=$DRY, source $(date -d "@$OWN_MTIME" +%H:%M:%S 2>/dev/null))"
+while :; do
+  tick
+  [ "$ONCE" = 1 ] && break
+  sleep "$INTERVAL"
+  NOW_MTIME="$(self_mtime)"
+  if [ "$NOW_MTIME" != "$OWN_MTIME" ]; then
+    say "⭐ source changed on disk — re-execing so this loop runs one version of itself"
+    exec bash "$SELF" "${ORIG_ARGS[@]}"
+  fi
+done
