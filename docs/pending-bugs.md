@@ -114,54 +114,159 @@ this entry wants, because without it nobody can ever tell these two apart.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
-## ⛔⛔⛔ [11.0] `composer_held_draft` FIRES ON AN EMPTY COMPOSER, AND IT HAS JAMMED THE WAKE PLANE
+## ⛔⛔ [11.20] THE DRAFT FLAG IS RESET BY EVERY DAEMON HANDOVER, AND IT FAILS OPEN
 
 **Status:** OPEN
 
-*Measured 2026-08-21. This is not a cosmetic misread: it is why briefs cannot be delivered to
-several lanes, and why the booter has stopped being able to wake anything.*
+*Found 2026-08-21 while confirming the composer-draft entry below. It is the reason
+that entry's replacement is a UNION of two readings rather than one clean owner.*
 
-**Symptom.** `server app terminal input-check <row>` answers `composer_held_draft: true` for a
-row whose composer is **empty**. Read in the same minute, that row's rendered screen ends:
+`pending_input_draft` — the keystroke-derived answer to "is somebody mid-sentence in
+there" — is reconstructed from the bytes forwarded through **one daemon's** `write`.
+It has exactly one construction site and it is always `AtomicBool::new(false)` with an
+empty `pending_input_line` beside it. A session ADOPTED by a newer daemon therefore
+starts reading **clean** while the person's sentence is still standing in the composer,
+because the text lives in the CLI's own process, not in the counter.
 
-```
-                                                              new tas…
-──────────────────────────────────────────────────────────────────────
-❯
-──────────────────────────────────────────────────────────────────────
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent
-```
+**Measured.** One row on the fleet visibly held an unsent line on its rendered grid.
+`server rows drafts`, asked in the same minute, reported it as holding no draft; the
+daemon owning it had started 2h earlier, after the line was typed.
 
-Nothing after the `❯`. The row is idle at an ordinary prompt with a background agent running.
+**Why it is worse than a missing reading.** Handovers are routine — the roll takes one
+every hour — so this is a guard that goes quiet on a schedule, and the direction it
+fails in is the expensive one: `--refuse-if-draft` waves the write through and the
+readiness probe's `Ctrl+U` is licensed over whatever is there. `session_is_migratable`
+consults the same flag, so the release that destroys a draft is also cleared by it.
 
-**Why it is expensive rather than annoying.** The booter refuses to wake a row that holds a
-draft — correctly, because typing into somebody's half-written line is the defect this whole
-campaign exists to prevent. So a false positive makes the row **permanently unwakeable**: the
-booter captures the "draft", sends one clear, sees the same screen, and logs `residue survived
-the clear — refusing rather than typing more` followed by `SKIP:draft-race`, every cycle,
-forever. ⇒ **A loop whose exit depends on a condition it cannot change**, which this repo has
-already recorded as a bug class — except here the condition is not a draft at all, so no amount
-of clearing could ever satisfy it. Two lanes were unreachable when this was found, and a
-LEGENDARY brief could not be delivered.
+**Falsifier:** type into a row, confirm `server rows drafts` names it, roll the daemon,
+and ask again without touching the row. It must still name it.
 
-**Likely mechanism, NOT yet confirmed in code.** `terminal_composer_row_holds_draft`
-(`crates/yggterm-shell/src/terminal_observe.rs`) is a **line-shaped rule**: it takes the last
-line beginning with the CLI's composer marker and asks whether the first printable glyph after
-that marker was drawn faint. Correct on a grid. It is fed `terminal_snapshot_async`, and if that
-is the raw stream rather than the rendered rows, then a positioned-draw screen — which arrives
-as a few very long lines rather than as display rows — puts the *next* row's chrome after the
-marker on the same line, and that chrome is not faint. ⇒ **This is exactly the class 11.17
-fixed for the gate classifiers ("a screen does not contain the words on it; classify from the
-rendered grid"), still live in the draft detector.** The daemon now exposes
-`session_screen_plain_rows` for precisely this.
+**Not fixed here.** The seeding this wants — reconstruct the line from the rendered
+composer row at adoption, then let keystrokes maintain it as they already do — is a
+change to the adopt path, and this lane could not prove it without a daemon bump it was
+told not to take. What shipped instead is the union in
+`TerminalManager::session_composer_holds_draft`, where the rendered grid covers exactly
+the window the counter is blind in.
 
-⚠ **Confirm before fixing.** The alternative is that the faint-tracking walk is right and the
-`← 1 agent` background-agent chrome reaches it by another route; the CHANGELOG records the write
-guard being taught this distinction already, and the two may simply have diverged.
+## ⛔ [11.20] `server rows drafts` REPORTS FULL COVERAGE WHILE SEEING ONE DAEMON IN FOUR
 
-**Falsifier:** take a row with a demonstrably empty composer and a running background agent, and
-read `composer_held_draft`. It must be false. Then type one character into it and read again: it
-must be true. Both halves, or the fix is a way of never seeing a draft.
+**Status:** OPEN
+
+Measured 2026-08-21 on the build host: four `yggterm-headless server daemon` processes
+were running, and `server rows drafts` answered `daemons_seen: 1` with
+`daemons_or_rows_unable_to_answer: 0` — i.e. it declared it had asked everybody.
+
+The verb's own contract is right and is quoted in its docstring: *a daemon that cannot
+answer is counted apart, never as clean; blind is not clear*. That protects a daemon
+that ANSWERS "I am too old to say". It does nothing for a daemon that is never
+enumerated, because there is then nobody to be blind — and the fan-out enumerates by
+socket, while a version bump replaces older sockets with symlinks to the newest one.
+
+⇒ **A coverage count is not coverage.** The verb should compare the daemons it reached
+against the daemon PROCESSES on the host and report the difference, or its `verdict:
+"clear"` means "clear among the ones I happened to find".
+
+## ⛔⛔⛔ [11.20] `composer_held_draft` HAD NO DISCRIMINATOR LEFT — CONFIRMED, AND FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*The entry asked for confirmation before any change, and named the alternative: that the
+faint walk was right and the background-agent chrome reached it another way. **The walk
+is not right.** Three of its premises were tested against live rows on 2026-08-21 and
+all three are false.*
+
+**1. The SGR discriminator is dead.** The guard separated the CLI's chrome from a
+person's typing by whether the first glyph after the composer marker was drawn FAINT.
+That was measured true on 2026-08-07. On a live row holding a person's visible unsent
+sentence, the composer's raw line now reads `ESC[m<marker>NBSP ESC[2m` and then their
+words — **the CLI dims the composer's content whatever wrote it.** So the one bit the
+guard turned on stopped carrying the distinction, and it stopped in the direction that
+types over a sentence: the same row read `composer_held_draft: false` over a real draft,
+twice, in the same minute the queue said it was firing on empty ones.
+
+**2. The marker is not unique to the composer.** The CLI prefixes every DELIVERED
+message in its transcript with the same glyph, drawn in an ordinary colour rather than
+faint. Any reading that lands on one of those answers "a person has typed here" about a
+message the row already received and replied to.
+
+**3. It was fed the escape stream, which is not row-shaped.** Across 26 live rows the
+median was ~2.2 rendered rows per newline-delimited line and the worst was 16.25 — one
+65-row viewport arrived as FOUR lines. "The last line beginning with the marker" is
+therefore not a window over anything a person can see. This is the class 11.17 fixed for
+the gate classifiers, still live here.
+
+⇒ **A discriminator that has died is not repaired by reading it more carefully.** The
+predicate is deleted rather than mended, along with the test corpus that made it look
+healthy — every fixture in that test put the composer alone on its own line, which is
+the one shape the live stream never produces. *A contract test that builds its own input
+tests the constructor.*
+
+**What replaced it.** The daemon answers, on the snapshot the probe already fetches
+(`ServerResponse::TerminalSnapshot::composer_holds_draft`, `serde(default)` so an older
+daemon deserializes to `None` = nobody could say, which is not permission). Its answer
+is the union of the keystroke-derived line buffer and
+`yggterm_core::composer_row_holds_text`, which reads the RENDERED GRID and takes the
+composer to be the bottom-most marker row with only the CLI's own border and footer
+under it. The two are unioned because each is blind where the other sees: see the
+handover entry above.
+
+**Live proof owed, and it is the entry's own falsifier, both halves:** a row with a
+demonstrably empty composer and a running background agent must read
+`composer_held_draft: false`; type one character into it and it must read `true`. The
+grid arm is already proven against the live jam — on the row that had refused 84
+consecutive wakes, the new reader answers "composer empty", which is what the screen
+plainly shows — but the daemon carrying the field is not deployed, so the `input-check`
+half is owed after the next roll.
+
+## ⛔⛔⛔ [11.20] THE BOOTER READ ITS OWN DELIVERED MESSAGES AS COMPOSER RESIDUE — FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*This is the second half of the wake-plane jam and it is the expensive one. 19 rows,
+434 consecutive `SKIP:draft-race` refusals, and two rows found holding about a dozen
+copies of the same unsent wake message, cleared by hand.*
+
+**The root, and it is one sentence.** The residue check flattened the WHOLE SCREEN to a
+single line and asked whether the boot text stood after a `❯`. The CLI draws that same
+glyph in front of every DELIVERED message, so **a wake that WORKED read back as composer
+residue for as long as it stayed on screen** — and nothing clears a transcript. Every
+later wake to that row was then refused by the ones that had succeeded. On the worst row
+the cleaner fired a `Ctrl+C` into a live campaign session every five and a half minutes
+for three hours, re-captured the same 1,978 characters each time, and grew a draft file
+to 172 KB.
+
+**And the storm that fed it.** Earlier in the same log the writer typed its text, could
+not confirm it on screen, refused to press Enter — *"residue self-heals next tick"* —
+and then typed ANOTHER copy next tick. Both decisions read the SAME failing detector,
+so "I cannot see it" licensed *do not submit* and *type again* at once. That is the
+shape: **a writer that cannot confirm its own submit must not write again.**
+
+**Fixed in `ygg-booter.py`:**
+
+* the composer is read as a ROW off the daemon's rendered grid, and a marker row with
+  prose under it is a transcript entry, not a composer. Four states, not two — could
+  not look · no composer drawn · present and empty · holds text — and only the third
+  may be typed into;
+* the Enter is the atomic `--submit-iff-line-equals`, which presses it only if the input
+  line still reads exactly what we wrote, compared and enqueued under one lock in the
+  daemon that owns the PTY. ⛔ **That verb had existed for versions.** The file's own
+  docstring said it "is requested in pending-bugs", and that stale claim is why the
+  two-write gap stayed open — *an inherited "not available" is a claim, not a fact*;
+* a write LEDGER on disk, written before the bytes go out. A write that could not be
+  confirmed is COMPLETED next tick or refused; there is no path that types twice.
+
+**Two beside it, in the product:**
+
+* a conditional submit carries no data, so a daemon that never evaluated the condition
+  answered a plain write of zero bytes — nothing refused, nothing pressed — and the CLI
+  scored that `accepted: true`. `submitted` is now reported from the daemon's own word
+  and `accepted` follows it for the conditional form;
+* the conditional submit was **dropped** when a write was proxied to a preserved owner,
+  so the guard was silently a no-op for exactly the rows a version-coexisting fleet
+  keeps alive longest. It now travels.
+
+**Live proof owed:** one unattended hour in which a subscribed row is woken and the
+booter log shows no `SKIP:draft-race` on a row whose composer is empty.
 
 ## ⛔⛔ [11.0] A FINISHED LANE HAD NO WAY TO BE RETIRED, SO NOBODY EVER RETIRED ONE
 

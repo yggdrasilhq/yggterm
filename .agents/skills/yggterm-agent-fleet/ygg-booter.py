@@ -2197,13 +2197,16 @@ def boot(host, row, dry):
       decoration. [[finding-a-deadline-shorter-than-its-release-condition]]
       One line only — a multi-line send is one Enter per line and the rest queue.
 
-    ⚠ **THE APPEND HAZARD PAID OUT 2026-08-20 AND IS NOW GUARDED TWICE** — the
-      owner's half-typed sentence was submitted with the boot text spliced in.
-      The text write asks the daemon (`--refuse-if-draft`), and the Enter is
-      gated by a screen read-back that requires the composer to hold the boot
-      text alone (see `_pty_type_and_enter`). Residual window: one write
-      round-trip; the atomic close ("submit iff line equals X", a daemon verb)
-      is requested in pending-bugs."""
+    ⚠ **THE APPEND HAZARD PAID OUT 2026-08-20 AND THE WINDOW IS NOW CLOSED** —
+      the owner's half-typed sentence was submitted with the boot text spliced
+      in. The text write asks the daemon (`--refuse-if-draft`), and the Enter is
+      no longer a second unguarded write: `--submit-iff-line-equals` presses it
+      only if the input line still reads exactly what we wrote, compared and
+      enqueued under one lock in the daemon that owns the PTY.
+      ⛔ THAT VERB HAS EXISTED SINCE 3.1.x. This docstring said it "is requested
+      in pending-bugs" for as long as the gap it describes stayed open, and a
+      stale claim about a missing tool is indistinguishable from the tool being
+      missing. Re-test an inherited "not available" before building around it."""
     if dry:
         log(f"DRY-RUN would boot {row}")
         return "dry-run"
@@ -2479,172 +2482,278 @@ def _screen_text(host, row):
     return body if body.strip() else None
 
 
+# ⛔⛔ THE COMPOSER IS A ROW, AND THE BOOT TEXT LIVES IN THE TRANSCRIPT TOO.
+# Measured 2026-08-21 across 19 rows and 434 consecutive refusals. The residue
+# check flattened the WHOLE SCREEN to one line and asked whether the boot text
+# stood after a `❯`. The agent CLI prefixes every DELIVERED message with the
+# same glyph, so a boot that WORKED read back as composer residue for as long
+# as it stayed on screen — and nothing clears a transcript, so the row refused
+# every later boot forever. One row was made unbootable by each boot it had
+# already accepted.
+# ⇒ Read the composer ROW off the daemon's RENDERED GRID. A `❯` with prose
+#   under it is a transcript entry; the composer is the bottom-most one, with
+#   only the CLI's own border and footer below it.
+COMPOSER_MARKERS = ("❯", "›")
+
+# How far above the last chrome row the composer's marker may be. A composer
+# wraps over a few rows when the line is long; anything deeper is transcript.
+COMPOSER_WRAP_ROWS = 14
+
+
+def _is_composer_chrome(row_text):
+    """Rows that may sit BELOW the composer without making it a transcript entry."""
+    t = row_text.strip()
+    if not t:
+        return True
+    if not t.strip("─━│╭╮╰╯╱-=_ "):
+        return True                      # a pure border run, drawn or ASCII
+    low = t.lower()
+    return any(h in low for h in (
+        "bypass permissions", "shift+tab", "for shortcuts", "⏵⏵",
+        "esc to interrupt", "auto-accept", "plan mode", "accept edits",
+        "context left", "/clear to save", "new task?",
+    ))
+
+
+def _composer_row_content(host, row):
+    """What the COMPOSER ROW holds. FOUR states, and they license opposite acts:
+
+        (False, None)  could not look          -> refuse; blind is not clear
+        (True,  None)  no composer on screen   -> refuse; mid-output or a modal
+        (True,  "")    composer present, empty -> the only state that may be typed into
+        (True,  "...") composer holds text     -> refuse; capture it, type nothing
+
+    ⛔ THE GRID, NEVER THE STREAM. `screen_plain_rows` is the daemon's vt100
+    viewport, one entry per VISIBLE row. The escape stream that paints it is not
+    row-shaped: measured on this fleet, a 65-row screen arrived as FOUR
+    newline-delimited lines, so "the last line beginning with the marker" is not
+    a window over anything a person can see."""
+    uuid = row.rsplit("/", 1)[-1]
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "screen", f"cc-runtime://{uuid}", "--json"], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    try:
+        entries = json.loads((r.stdout or "").strip() or "[]")
+    except Exception:
+        return (False, None)
+    if not isinstance(entries, list):
+        return (False, None)
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("session_key") or "").rsplit("/", 1)[-1] != uuid:
+            continue
+        rows = e.get("screen_plain_rows")
+        if not isinstance(rows, list) or not rows:
+            return (False, None)         # it said plainly that it could not look
+        return (True, _composer_from_grid(rows))
+    return (False, None)
+
+
+def _composer_from_grid(rows):
+    """The composer row's content on a rendered grid, or None if none is drawn.
+
+    Walks up from the bottom past the CLI's own chrome, then up through the
+    composer's wrapped continuation rows to the marker. Stops at the first
+    marker: a `❯` with prose still below it is a delivered message, not a
+    composer, and returning None there refuses the boot rather than typing
+    into a screen nobody can vouch for."""
+    end = len(rows) - 1
+    while end >= 0 and _is_composer_chrome(rows[end]):
+        end -= 1
+    if end < 0:
+        return None                      # nothing but chrome: no composer drawn
+    collected = []
+    for idx in range(end, max(-1, end - COMPOSER_WRAP_ROWS), -1):
+        text = rows[idx].strip().lstrip("│ ")
+        for marker in COMPOSER_MARKERS:
+            if text.startswith(marker):
+                collected.append(text[len(marker):])
+                collected.reverse()
+                return re.sub(r"\s+", " ", " ".join(collected)).strip()
+        collected.append(text)
+    return None                          # no marker within reach: transcript
+
+
+# ⭐ THE WRITE LEDGER — one file per row, written BEFORE the bytes go out.
+#
+# ⛔⛔ THE STORM THIS ENDS, measured 2026-08-21: the booter typed its wake text,
+# could not confirm it on screen, refused to press Enter ("residue self-heals
+# next tick"), and then TYPED ANOTHER COPY next tick — because both decisions
+# read the same failing detector, and "I cannot see it" licensed *do not
+# submit* and *type again* at once. Two rows were found holding a dozen
+# unsent copies filling the viewport, cleared by hand.
+# ⇒ A WRITER THAT CANNOT CONFIRM ITS OWN SUBMIT MUST NOT WRITE AGAIN. The
+#   ledger survives the tick, so the next pass COMPLETES the pending write
+#   with an atomic submit or refuses; it never re-types.
+def _pending_write_path(row):
+    d = os.path.join(STATE, "booter", "pending-write")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{row.rsplit('/', 1)[-1]}.json")
+
+
+def _pending_write(row):
+    try:
+        with open(_pending_write_path(row)) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) and rec.get("text") else None
+    except Exception:
+        return None
+
+
+def _record_pending_write(row, text):
+    try:
+        with open(_pending_write_path(row), "w") as f:
+            json.dump({"text": text, "at": time.time(),
+                       "row": row, "attempts": 1}, f)
+    except Exception as e:
+        # ⛔ A ledger that cannot be written must STOP the write, not accompany
+        # it. Typing without the record is exactly the storm shape again.
+        log(f"  ⛔ could not record the pending write for {row}: {e}")
+        return False
+    return True
+
+
+def _clear_pending_write(row):
+    try:
+        os.unlink(_pending_write_path(row))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"  ⚠ could not clear the pending write for {row}: {e}")
+
+
+def _atomic_submit(host, row, text):
+    """Press Enter IFF the composer's line is exactly `text`. TRI-STATE.
+
+    ⭐ `--submit-iff-line-equals` is a DAEMON verb and has shipped since 3.1.x.
+    This file carried a comment saying the atomic form "needs a daemon-side
+    verb — requested via pending-bugs" long after it existed, and that stale
+    claim is why the two-write submit kept its unguarded gap. The daemon holds
+    the input line under the same lock it enqueues the Enter with, so a
+    keystroke can never land between the comparison and the submit.
+
+    ⛔ `accepted:true` IS NOT PROOF HERE. A daemon that does not own the row
+    never evaluates the condition, and the envelope's `accepted` is then true
+    for a submit that never happened. The daemon's own message is the answer."""
+    uuid = row.rsplit("/", 1)[-1]
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "terminal", "write", f"cc-runtime://{uuid}",
+                     "--submit-iff-line-equals", text], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    out = r.stdout or ""
+    if _field(out, "submitted") is True:
+        return True
+    if _field(out, "refused_for_line") is True:
+        return False
+    message = _field(out, "message") or ""
+    if isinstance(message, str) and message.startswith("submitted:"):
+        return True
+    if isinstance(message, str) and "line" in message and "expected" in message:
+        return False
+    return None                          # the daemon could not say
+
+
 def _pty_type_and_enter(host, row, text=None):
-    """Type `text` (default: the boot text), pause, then press Enter — TWO writes.
+    """Deliver `text` to a row's composer and submit it — AT MOST ONCE.
 
     ⭐ `text` IS A PARAMETER BECAUSE THIS IS THE FLEET'S ONLY GUARDED WRITER, AND
     THE OTHER WATCHDOG HAD NONE. The monitor's `wake()` typed with a bare
     `terminal send` plus a lone `\\r`: no screen read, no choice-prompt refusal,
-    no `--refuse-if-draft`, no verify-before-Enter. So the two watchdogs typed
-    into the SAME rows with opposite levels of care, and the careless one is the
-    one aimed at orchestrators. Owner-reported 2026-08-21: a monitor wake landed
-    in the middle of his orchestrator's turn.
-    ⇒ One guarded path, parameterised, rather than a second copy of five guards
-      that would drift. Every guard below is text-agnostic — they are about the
-      COMPOSER's state, not about what we intend to say.
+    no draft guard, no verify-before-Enter. So the two watchdogs typed into the
+    SAME rows with opposite levels of care, and the careless one was aimed at
+    orchestrators. One guarded path, parameterised, rather than a second copy of
+    five guards that would drift.
 
-    The 80 ms mirrors `shell.rs`'s own submit path exactly; see `boot`'s §3 for
-    why a concatenated Enter reads as pasted content rather than a submit.
+    THE SEQUENCE, and every step refuses rather than guesses:
 
-    ⛔ `--refuse-if-draft` is not optional politeness. A PTY write APPENDS, so if
-    the owner half-typed a sentence into this row and walked away — which is
-    precisely the shape of a row a watchdog calls idle — an unguarded boot glues
-    `continue, the booter booted` onto the end of HIS sentence and submits the
-    pair. The guard is evaluated by the daemon that OWNS the PTY (the only one
-    that can see a draft) and is therefore TOCTOU-free.
-    ⚠ A pre-3.0.83 owner ignores the flag, so acceptance is not proof the guard
-    ran. That is the honest limit and it is why the return distinguishes a
-    refusal rather than folding it into failure."""
+    1. the row's STATE, from the daemon — a modal reads single keys and a bare
+       Enter SELECTS, so a watcher must not type into one;
+    2. the COMPOSER ROW, from the rendered grid — the only state that may be
+       typed into is a composer that is present and EMPTY;
+    3. a PENDING WRITE from an earlier tick is COMPLETED, never repeated;
+    4. the write, recorded before it is sent;
+    5. the ATOMIC submit, which presses Enter only if the line is still exactly
+       what we wrote — so a sentence that raced us cannot be submitted as ours.
+
+    ⛔ There is no path here that types twice. The bytes we could not confirm
+    are the bytes we must not send again."""
     text = BOOT_TEXT if text is None else text
-    # ⛔⛔ SCREEN FIRST. The Enter below SELECTS a highlighted option, so a row
+    short = row.rsplit("/", 1)[-1][:8]
+    # ⛔⛔ STATE FIRST. The Enter below SELECTS a highlighted option, so a row
     # parked on a choice prompt must never be typed into. Refuse on doubt.
     choice = _screen_shows_a_choice(host, row)
     if choice is True:
-        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — its SCREEN is showing a "
-            f"prompt awaiting a choice (plan limit / billing). A bare Enter here "
-            f"SELECTS an option; that decision is the owner's, not a timer's.")
+        log(f"⛔ NOT BOOTING {short} — its SCREEN is showing a prompt awaiting a "
+            f"choice (plan limit / billing). A bare Enter here SELECTS an option; "
+            f"that decision is the owner's, not a timer's.")
         return "refused-choice-prompt"
     if choice is None:
-        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — could not read its screen, "
-            f"so it cannot be ruled out that a prompt is waiting. Blind is not clear.")
+        log(f"⛔ NOT BOOTING {short} — could not read its screen, so it cannot be "
+            f"ruled out that a prompt is waiting. Blind is not clear.")
         return "refused-screen-unreadable"
-    # ⭐ RESIDUE SELF-HEAL, BEFORE ANY WRITE — measured 2026-08-20 12:12–12:23:
-    # an abort leaves the typed boot text unsent, the next tick typed a SECOND
-    # copy, and the copy's own prefix then read as "a foreign draft". The
-    # machinery was compounding its own residue on a row the owner was viewing.
-    # ⇒ If the composer ALREADY shows the boot head: never type again. Complete
-    # with a lone Enter when the residue is the boot text alone; otherwise
-    # capture whatever else is there to the durable draft store and refuse.
-    head = text[:27]            # default: "continue, the booter booted"
-    pre = _plain_screen(_screen_text(host, row) or "")
-    pidx = pre.rfind(head)
-    if pidx >= 0:
-        pprefix = pre[max(0, pidx - 60):pidx].rstrip()
-        if pprefix.endswith(("❯", ">")):
-            log(f"⭐ RESIDUE SELF-HEAL {row.rsplit('/', 1)[-1][:8]} — an earlier "
-                f"abort left the boot text typed and unsent; completing it with "
-                f"a lone Enter instead of typing a second copy.")
-            enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
-            return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
-        _capture_draft(row, pre, head, text)
-        # ⭐ MULTI-COPY RESIDUE CLEANER — measured 2026-08-20 12:28: three aborted
-        # boots left three (glyph-mangled) copies, the LAST copy's prefix is the
-        # END of the previous one, so this branch refused forever and the row was
-        # stuck unbootable. When the composer content is provably BOOT-MATERIAL
-        # ONLY (and it is already captured durably above, so nothing can be
-        # lost), clear it with ONE Ctrl+C and boot clean. A real owner draft —
-        # text before the first copy, or a substantial tail after the last —
-        # still refuses untouched.
-        if _composer_is_boot_residue_only(pre, head, text):
-            log(f"⭐ RESIDUE CLEANER {row.rsplit('/', 1)[-1][:8]} — composer is "
-                f"boot-material only (captured first); clearing with one Ctrl+C "
-                f"and booting clean.")
-            _run(host, ["server", "terminal", "write", row, "--stdin"], "\x03")
-            time.sleep(1.2)
-            post = _plain_screen(_screen_text(host, row) or "")
-            if post.rfind(head) >= 0:
-                log(f"  ⚠ residue survived the clear — refusing rather than typing more.")
-                return "refused-draft-race"
-            # fall through to a normal typed boot below
+    readable, composer = _composer_row_content(host, row)
+    if not readable:
+        log(f"⛔ NOT BOOTING {short} — could not read its composer row. "
+            f"Blind is not clear.")
+        return "refused-screen-unreadable"
+    if composer is None:
+        log(f"⛔ NOT BOOTING {short} — no composer is drawn on its screen "
+            f"(mid-output, or a modal). Nothing here may be typed into.")
+        return "refused-no-composer"
+    pending = _pending_write(row)
+    if pending:
+        # ⛔ COMPLETE IT OR REFUSE IT. Never a second copy.
+        done = _atomic_submit(host, row, pending["text"])
+        if done is True:
+            _clear_pending_write(row)
+            log(f"⭐ COMPLETED the pending write to {short} with an atomic submit "
+                f"— the line still held exactly what we wrote.")
+            return "pty-write"
+        if not composer:
+            # The composer is empty, so our bytes are not standing in it: the
+            # write evaporated (a restart, a CLI clear). The ledger is stale and
+            # a fresh attempt is honest — but it starts from zero copies.
+            _clear_pending_write(row)
+            log(f"⚠ the pending write to {short} is no longer in its composer; "
+                f"the ledger is cleared and this tick starts a fresh single write.")
         else:
-            log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — composer holds boot-text "
-                f"residue PLUS other content; captured to the draft store, typing nothing.")
-            return "refused-draft-race"
+            _capture_draft(row, composer, text[:27], text)
+            log(f"⛔ NOT BOOTING {short} — a write from an earlier tick could not "
+                f"be confirmed and the composer no longer holds exactly it. "
+                f"Captured to the draft store; typing nothing. "
+                f"[[a writer that cannot confirm its own submit must not write again]]")
+            return "refused-unconfirmed-write"
+        pending = None
+    if composer:
+        # Somebody else's words, or our own unconfirmed ones. Either way this
+        # writer does not get to add to them.
+        _capture_draft(row, composer, text[:27], text)
+        log(f"⛔ NOT BOOTING {short} — its composer already holds text "
+            f"({len(composer)} chars). Captured to the draft store; typing nothing.")
+        return "refused-draft"
+    if not _record_pending_write(row, text):
+        return "refused-no-ledger"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
                         "--refuse-if-draft"], text)
     if _field(typed.stdout or "", "refused_for_draft") is True:
-        _capture_draft(row, pre, head, text)
+        _clear_pending_write(row)
+        _capture_draft(row, composer, text[:27], text)
         return "refused-draft"
     if _field(typed.stdout or "", "accepted") is not True:
+        _clear_pending_write(row)
         return ""
-    # ⛔⛔ VERIFY BEFORE ENTER — the Enter used to be UNGUARDED, and the owner
-    # paid for it 2026-08-20: his half-typed sentence raced into the gap
-    # between the two writes, and the lone `\r` submitted HIS SENTENCE with
-    # the boot text spliced into the middle. `--refuse-if-draft` cannot guard
-    # the Enter — by now the boot text itself IS the draft. Press Enter ONLY
-    # if the composer holds the boot text alone.
-    # ⭐ WITH PATIENCE: three of four live aborts were "not visible on screen"
-    # — the verify read racing a LAGGING ECHO (the ui/block disease itself), on
-    # a screen that would have shown the text a second later. Poll up to ~6 s
-    # before concluding; only a FOREIGN PREFIX aborts immediately.
-    # ⚠ The residual race window is one write round-trip. The atomic form
-    # ("submit iff the input line equals X") needs a daemon-side verb —
-    # requested via pending-bugs; this check is the best a caller can do.
-    verdict = None                              # "clean" | "foreign" | None=not seen
-    for attempt in range(4):
-        time.sleep(0.4 if attempt == 0 else 1.8)
-        plain = _plain_screen(_screen_text(host, row) or "")
-        idx = plain.rfind(head)
-        if idx >= 0:
-            prefix = plain[max(0, idx - 60):idx].rstrip()
-            verdict = "clean" if prefix.endswith(("❯", ">")) else "foreign"
-            if verdict == "foreign":
-                break
-            # clean on a late read is trustworthy; no need to re-poll
-            break
-    if verdict != "clean":
-        why = ("a foreign draft precedes it" if verdict == "foreign"
-               else "boot text never appeared on screen after 6 s")
-        if verdict == "foreign":
-            _capture_draft(row, plain, head, text)
-        log(f"⛔ ABORTING BOOT of {row.rsplit('/', 1)[-1][:8]} between write and "
-            f"Enter — {why}. Enter NOT sent; residue self-heals next tick.")
-        target = resolve(host, row)
-        nargs = ["server", "app", "notify", "booter: aborted mid-boot",
-                 "a draft raced the booter; your typed text is captured in "
-                 "~/.yggterm/relay/drafts/ and nothing was submitted", "--tone", "warning"]
-        if target:
-            nargs += ["--session", target]
-        ygg(host, *nargs)
-        return "refused-draft-race"
-    enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
-    return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
-
-
-def _composer_is_boot_residue_only(plain_screen, boot_head, full_text=None):
-    """True iff the composer segment is boot-text copies (possibly glyph-mangled
-    by the render defect) and nothing of the owner's. Conservative both ways:
-    - owner text BEFORE the first copy (the original splice shape) ⇒ False;
-    - a chunk much longer than one boot copy (an appended owner tail) ⇒ False —
-      glyph drops only SHORTEN a copy, so length is a safe one-sided test.
-    The caller has ALREADY captured the full content durably, so a wrong True
-    loses nothing that cannot be re-delivered."""
-    # ⛔ THE TOKEN SET BELOW IS SPECIFIC TO THE BOOT TEXT. When this writer is
-    # driving some OTHER message (a monitor steer), we cannot recognise its
-    # copies, and a wrong True would CLEAR A COMPOSER we did not understand.
-    # ⇒ Refuse. The caller then captures the content durably and types nothing,
-    #   which is the correct outcome for every text except the one we can parse.
-    if full_text is not None and full_text != BOOT_TEXT:
-        return False
-    m = plain_screen.rfind("❯")
-    if m < 0:
-        return False
-    seg = plain_screen[m + 1:].strip()
-    # Token density, not head-splitting: the render defect drops glyphs, so even
-    # the HEAD arrives mangled ("boot▮d") and a split-by-head fuses copies. Six
-    # distinctive tokens per copy survive scattered drops; every estimate errs
-    # toward False (refuse), never toward clearing an owner's text.
-    tokens = ("booter boot", "RELAY session", "ygg-booter.py unsubscribe",
-              "MONITOR is never", "handover yourself", "DECIDE and ACT")
-    hits = {t: seg.count(t) for t in tokens}
-    if sum(1 for c in hits.values() if c) < 3:
-        return False                      # not recognisably boot material
-    copies = max(hits.values())
-    first = min((seg.find(t) for t in tokens if t in seg), default=-1)
-    if first < 0 or len(seg[:first].strip()) > 24:
-        return False                      # owner text before the copies
-    limit = copies * int(len(_plain_screen(BOOT_TEXT)) * 1.25) + 220  # footer slack
-    return len(seg) <= limit
+    done = _atomic_submit(host, row, text)
+    if done is True:
+        _clear_pending_write(row)
+        return "pty-write"
+    # ⛔ THE LEDGER STAYS. Whatever happened, the next tick COMPLETES this write
+    # or refuses it; it does not type a second copy.
+    why = ("the line no longer reads exactly what we wrote"
+           if done is False else "the daemon could not answer")
+    log(f"⛔ ENTER NOT SENT to {short} — {why}. The write is recorded as pending; "
+        f"the next tick completes it or refuses. Nothing will be typed twice.")
+    return "refused-submit-unconfirmed"
 
 
 def _capture_draft(row, plain_screen, boot_head, full_text=None):

@@ -2392,6 +2392,35 @@ stalled rows above refused `submit` twice and took a PTY write immediately. And
 **the Enter is a separate write of `\r`** after a short pause; concatenated, an
 agent CLI reads it as pasted composer content rather than a submit.
 
+⛔⛔ **AND THE SECOND WRITE HAS AN ATOMIC FORM — USE IT.**
+`server terminal write <row> --submit-iff-line-equals <text>` presses Enter only
+if the input line still reads exactly what you wrote, compared and enqueued under
+one lock in the daemon that owns the PTY. A plain `\r` after a plain write leaves
+a gap a person's keystroke can land in, and it has: a half-typed sentence was
+submitted with a watchdog's text spliced into it.
+⚠ `accepted:true` is NOT proof for this form. A conditional submit carries no
+data, so a daemon that never evaluated the condition answers a plain write of
+zero bytes — nothing refused, nothing pressed. **Read `submitted`.**
+
+⛔⛔ **AND A WRITER THAT CANNOT CONFIRM ITS OWN SUBMIT MUST NOT WRITE AGAIN.**
+Measured across 19 rows and 434 refusals: a watcher typed, could not see its text,
+correctly refused the Enter, and then typed another copy on the next tick —
+because both decisions read the same failing detector, so "I cannot see it"
+licensed *do not submit* and *type again* at once. Rows were found holding a dozen
+unsent copies. Record the write before the bytes go out, and COMPLETE it next tick
+or refuse it. **Two decisions that disagree must not share one reading.**
+
+⛔⛔ **THE COMPOSER IS A ROW, AND THE MARKER IS NOT UNIQUE TO IT.** An agent CLI
+prefixes every DELIVERED message in its transcript with the same glyph the
+composer uses, so a search of the SCREEN for "the marker then your text" finds
+messages the row already received — and nothing clears a transcript, so a wake
+that WORKED can make the row refuse every later one, permanently. Read the
+composer off the daemon's rendered grid (`server screen <row> --json` →
+`screen_plain_rows`), take the bottom-most marker row with only the CLI's own
+border and footer beneath it, and treat *could not look* · *no composer drawn* ·
+*present and empty* · *holds text* as four states. Only the third may be typed
+into.
+
 ### ⭐⭐ ANY SESSION CAN ATTACH TO A RUNNING ORCHESTRATOR
 
 This is not only for rows an orchestrator spawned. **Any session, started for any

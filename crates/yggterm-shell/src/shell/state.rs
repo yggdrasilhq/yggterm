@@ -43,7 +43,7 @@ use crate::terminal_observe::{
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
     AgentRowActivity, terminal_chunk_agent_activity,
     terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_agent_composer_row,
-    terminal_chunk_has_current_codex_input_row, terminal_composer_row_holds_draft,
+    terminal_chunk_has_current_codex_input_row,
     terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
@@ -43742,7 +43742,7 @@ fn live_terminal_generation_context(
     endpoint: &ServerEndpoint,
     session_path: &str,
 ) -> Option<String> {
-    let (snapshot, _running, _runtime_output_seen, _post_resize_output_seen, _last_resize_seq, _runtime_spawn_id) =
+    let (snapshot, _running, _runtime_output_seen, _post_resize_output_seen, _last_resize_seq, _runtime_spawn_id, ..) =
         terminal_snapshot(endpoint, session_path).ok()?;
     let stripped = strip_terminal_control_sequences(&snapshot)
         .replace("\r\n", "\n")
@@ -77636,7 +77636,7 @@ async fn reconcile_terminal_from_daemon_for(
     trace_home: &Path,
 ) -> Value {
     let snapshot = terminal_snapshot_async(endpoint, session_path.to_string(), trace_home).await;
-    let (screen, running, _runtime_output_seen, _post_resize, _seq, _runtime_spawn_id) = match snapshot {
+    let (screen, running, _runtime_output_seen, _post_resize, _seq, _runtime_spawn_id, ..) = match snapshot {
         Ok(value) => value,
         Err(error) => {
             return json!({

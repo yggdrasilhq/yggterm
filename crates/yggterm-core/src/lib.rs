@@ -1513,6 +1513,93 @@ pub fn screen_text_shows_agent_background_hint(sample: &str) -> bool {
         .any(|descriptor| descriptor.screen_shows_background_agent_hint(sample))
 }
 
+/// Does the COMPOSER ROW of this rendered grid hold text?
+///
+/// `None` = no composer is drawn (mid-output, or a modal) · `Some(false)` = a
+/// composer is drawn and empty · `Some(true)` = it holds something.
+///
+/// ⛔⛔ THE COMPOSER IS A ROW, AND THE MARKER IS NOT UNIQUE TO IT. An agent CLI
+/// draws the same glyph in front of every DELIVERED message in its transcript,
+/// so "the last thing on this screen after the marker" answers about a message
+/// the row already received. Measured 2026-08-21: a watchdog reading it that
+/// way found its own successfully delivered wake text and called it composer
+/// residue — and no clear can empty a transcript, so every later wake to that
+/// row was refused, permanently, by the ones that had worked.
+///
+/// ⛔ FEED THIS A RENDERED GRID. On the escape stream that paints the screen
+/// there are no rows: a 65-row viewport was measured arriving as FOUR
+/// newline-delimited lines on this fleet, so a line-shaped rule there is not a
+/// window over anything a person can see.
+///
+/// ⚠ WHAT THIS DELIBERATELY DOES NOT DO IS READ THE SGR. The guard it replaces
+/// separated the CLI's chrome from a person's typing by whether the first glyph
+/// after the marker was drawn FAINT. That was measured true on 2026-08-07 and
+/// measured FALSE on 2026-08-21, on a live row holding a person's unsent
+/// sentence: `ESC[m<marker>NBSP ESC[2m` then their words. The CLI now dims the
+/// composer's content whatever wrote it, so the one bit the guard turned on
+/// stopped carrying the distinction — in the direction that types over a
+/// sentence. A discriminator that has died is not repaired by reading it more
+/// carefully.
+pub fn composer_row_holds_text(rows: &[String]) -> Option<bool> {
+    // How far above the CLI's own chrome the marker may sit. A long line wraps
+    // over a few rows; anything deeper is transcript, not composer.
+    const COMPOSER_WRAP_ROWS: usize = 14;
+    let mut end = rows.len();
+    while end > 0 && composer_row_is_chrome(&rows[end - 1]) {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let floor = end.saturating_sub(COMPOSER_WRAP_ROWS);
+    let mut content = String::new();
+    for index in (floor..end).rev() {
+        let text = rows[index]
+            .trim()
+            .trim_start_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
+        if let Some(marker) = agent_cli::AGENT_CLIS
+            .iter()
+            .map(|descriptor| descriptor.composer_marker)
+            .find(|marker| text.starts_with(*marker))
+        {
+            let head = text[marker.len_utf8()..].trim();
+            return Some(!head.is_empty() || !content.trim().is_empty());
+        }
+        content.push_str(text);
+    }
+    // A marker further up than a composer can reach: what is at the bottom of
+    // this screen is transcript, and nothing here may be typed into.
+    None
+}
+
+/// Rows that may sit BELOW the composer without making it a transcript entry:
+/// the CLI's own border, its footer, and the blank line between them.
+fn composer_row_is_chrome(row: &str) -> bool {
+    let text = row.trim();
+    if text.is_empty() {
+        return true;
+    }
+    if text
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '\u{2500}' | '\u{2501}' | '\u{2502}' | '\u{256d}' | '\u{256e}' | '\u{2570}'
+                    | '\u{256f}' | '-' | '=' | '_' | ' '
+            )
+        })
+        .is_empty()
+    {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    agent_cli::AGENT_CLIS.iter().any(|descriptor| {
+        descriptor
+            .composer_footer_hints
+            .iter()
+            .any(|hint| lower.contains(hint))
+    })
+}
+
 /// Kind-agnostic union of every CLI's STARTUP-GATE phrases.
 ///
 /// ⛔ FEED THIS A RENDERED GRID, not the raw pty stream. A gate is drawn with
@@ -3369,6 +3456,70 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// ⛔⛔ THE JAM THIS LOCKS OUT, measured 2026-08-21 across 19 rows and 434
+    /// consecutive refusals: the agent CLI prefixes every DELIVERED message in
+    /// its transcript with the SAME glyph the composer uses. Every reader that
+    /// searched a screen for "the marker, then text" therefore found messages
+    /// the row had already received and reported them as unsent composer
+    /// content — and nothing clears a transcript, so a row was made permanently
+    /// unwakeable by each wake it had successfully accepted.
+    ///
+    /// ⚠ Every fixture is INVENTED. What is taken from life is the SHAPE: a
+    /// delivered message with a reply under it, then the border, the composer,
+    /// the border, the footer.
+    #[test]
+    fn the_composer_is_a_row_and_a_delivered_message_is_not_one() {
+        let rows = |lines: &[&str]| {
+            lines.iter().map(|line| (*line).to_string()).collect::<Vec<_>>()
+        };
+        let border = "\u{2500}".repeat(48);
+        let footer = "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} 1 agent";
+
+        // A delivered message still on screen, and an EMPTY composer under it.
+        let delivered = rows(&[
+            "  some earlier output",
+            "\u{276f} continue, the watcher woke you \u{2014} keep going",
+            "",
+            "  and the reply the row already gave to it",
+            &border,
+            "\u{276f}",
+            &border,
+            &footer,
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(&delivered),
+            Some(false),
+            "a delivered message in the transcript is not composer content"
+        );
+
+        // The composer's own content, including when the line wraps.
+        let wrapped = rows(&[
+            "  some earlier output",
+            &border,
+            "\u{276f} please hold this thought about the",
+            "  ledger until tomorrow",
+            &border,
+            &footer,
+        ]);
+        assert_eq!(super::composer_row_holds_text(&wrapped), Some(true));
+
+        // ⛔ NO COMPOSER IS NOT AN EMPTY COMPOSER. One may be typed into and the
+        // other may not, and answering `false` for both is how a watchdog types
+        // into a modal.
+        let mid_output = rows(&[
+            "  running the sweep",
+            "  Ran 1 shell command",
+            "  ...still going",
+        ]);
+        assert_eq!(super::composer_row_holds_text(&mid_output), None);
+        assert_eq!(super::composer_row_holds_text(&[]), None);
+
+        // Codex draws a different glyph, and the reader must not be tuned to one
+        // CLI's marker.
+        let codex = rows(&["  earlier output", "\u{203a} write the brief", "", "  gpt-5.5 xhigh"]);
+        assert_eq!(super::composer_row_holds_text(&codex), Some(true));
+    }
+
     use super::*;
 
     #[test]
