@@ -19308,7 +19308,12 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     "notify_spawned",
                     serde_json::json!({
                         "incident_id": incident.id,
+                        // ⚠ `pid` is null when the spawn FAILED, and this event
+                        // is still written — so a reader counting these events
+                        // would count attempts, not launches. `spawned` is the
+                        // one a count may filter on.
                         "pid": pid,
+                        "spawned": pid.is_some(),
                     }),
                 );
             }),
