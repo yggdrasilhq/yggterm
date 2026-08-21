@@ -393,7 +393,7 @@ that makes the booter's phrase tests work is the same step that destroys its abi
 hint from typed text. **A reader that has thrown the discriminator away must ASK, not
 re-derive:** `server gate-screen --json` now answers `shows_background_agent_hint`, and the
 write path already answers through `--refuse-if-draft`. Routed to the booter's owner; this
-lane did not edit the machinery that types into live rows at 03:2x with no way to live-test it.
+lane did not edit the machinery that types into live rows with no way to live-test it.
 
 ## ⚠ [11.0] A DEAD SESSION'S SURFACE ECHOES MOUSE-TRACKING AS TEXT
 
