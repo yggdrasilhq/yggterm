@@ -61445,10 +61445,18 @@ mod terminal_loop_input_starvation_locks {
         let writer_at = source
             .find("terminal_write_queue_rx.recv()")
             .expect("the ordered writer task must drain the write queue");
-        let writer_scope = &source[writer_at.saturating_sub(600)..writer_at + 900];
+        let writer_scope = &source[writer_at.saturating_sub(600)..writer_at + 2_400];
         assert!(
             writer_scope.contains("terminal_write_async("),
             "the writer task no longer performs the daemon write"
+        );
+        // The writer leg's split census: queue wait and RPC servicing are the
+        // two halves of the measured keystroke→pty tail, and the windowed
+        // rollup is the only probe with eyes below the loop_block floor.
+        assert!(
+            writer_scope.contains("writer:queue_wait") && writer_scope.contains("writer:rpc"),
+            "the writer task lost its queue-wait/rpc share split — the \
+             keystroke→pty p95 band is unattributable again"
         );
 
         // The failure path survives, on its own branch, with the same
