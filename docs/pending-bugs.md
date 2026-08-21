@@ -93,6 +93,41 @@ of them is broken.
 machine" and a header that means "resumable work everywhere" can sit on one screen without
 contradiction the moment either admits which it is.
 
+---
+
+## ⛔ [11.26] `web <verb> --session` ADDRESSES A ROW AND SILENTLY ANSWERS ABOUT WHICHEVER TAB IS ACTIVE
+
+**Status:** OPEN
+
+Every `server app web` verb takes `--session <path>` and none takes a tab. Both
+resolvers (`resolve_live_web_surface`, `resolve_live_web_surface_handle`) read
+`surface.active_tab`, so a verb aimed at a session answers about whatever tab
+happens to be in front at the instant it runs.
+
+**Why this is a correctness bug and not a missing convenience.** It fails in the
+reassuring direction: there is no error, no warning, and a perfectly well-formed
+answer — about a different page than the caller meant. Measured while
+investigating a media defect: a probe sequence aimed at one tab followed the user
+onto another mid-investigation, and the only tell was that a later evaluation
+happened to throw `null is not an object` because the new page had no `<video>`.
+Had the new page also had one, the numbers would have been silently blended
+across two documents.
+
+A background tab is NOT out of reach — the surface table shows tabs in state
+`stashed` with `webview: true` and a live `native_id` — so inspecting one
+without bringing it to the front is possible today and simply has no verb.
+
+⛔ **The fix must echo, not just accept.** `#[serde(default)]` means an older GUI
+drops an unknown `tab` field without complaint and answers about the active tab
+— the same silent-wrong-answer this entry is about, reintroduced by the fix.
+`require_frame_echo` in `yggterm-server::lib` is the worked precedent: the
+response must echo `tab_resolved` and the CLI must hard-fail on its absence.
+
+Owner: whoever next touches the web verb surface. The record side of this is
+already solved — media probe records carry a host-stamped `(row, tab)` — so this
+is specifically about the imperative verbs.
+
+## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
 ## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
 
 **Status:** OPEN
@@ -2402,6 +2437,41 @@ sits in plain sight and reads as two unrelated lines.
 ## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
 
 **Status:** OPEN
+
+### ⛔⛔ MEASURED 2026-08-22 — FIVE CHECKOUTS RUN A CLAIM SCRIPT THAT MINTS ABSURD SEATS, AND ONE OF THEM IS THE MAIN CHECKOUT
+
+The theory above has a live instance with a visible cost. `ygg-claim.sh` was fixed twice for a
+seat-poisoning bug — a cwd-tree row whose label is a digit string parsed as a major, so each claim
+handed out the previous absurd number plus one and the seat grew by one per claim for ever. The
+cure is two guards: only an ADDRESSABLE row (one with a `://` scheme) may join the pool, and a
+derived major past a sanity bound is refused rather than handed out.
+
+Census across every worktree, asking whether its copy carries both guards:
+
+| carries the fix | does NOT |
+|---|---|
+| 12 lane worktrees, including this one | **the main checkout**, plus 4 lane worktrees |
+
+⛔ **The main checkout is the worst of the five**, because it is where anyone lands who did not
+deliberately pick a worktree — and it is not even on `main`, it is parked on a lane branch from a
+different campaign.
+
+⇒ **Confirmed live the same night from a different seat**: one row announced its own seat as
+`6914978.0` in its first turn, while `rows` listed the same session under three different prefixes
+at once, depending on which scheme the listing used. A lane cannot be trusted to report its own
+seat, and this is one of the reasons why.
+
+⚠ ⛔ **DO NOT FIX THIS BY COPYING THE FILE INTO THE STALE CHECKOUTS.** They are live trees holding
+other lanes' uncommitted work; writing into one is how a session's work is destroyed by helping.
+The repair is a rebase, taken by whoever stands in that tree — and the main checkout needs
+returning to `main` by someone who first establishes that nobody is standing in it.
+
+⭐ **And the instrument gap is the general half.** The session-start audit reports staleness for
+exactly one script — the booter, and only the copy the live watcher is executing. Every other
+fleet script is unaudited, and a lane always runs the copy in its own worktree, so a fixed
+instrument reaches a lane only when somebody rebases that lane. **A stale instrument reports
+success in its own terms either way**, which is why this was found by a lane noticing an absurd
+seat rather than by anything designed to notice.
 
 ⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
 mentions it — collateral loss in a file rewrite, not a fix. This file's own rule is that an
@@ -20132,6 +20202,8 @@ fixing it.
 verb exists.
 
 ## ★★ WHO OWNS "IS THIS ROW WORKING?" — three tools, three answers
+
+**Status:** OPEN
 
 ### ⛔ 2026-08-07 — I BECAME THE FOURTH TOOL, ON THE OWNER'S OWN ROW
 
