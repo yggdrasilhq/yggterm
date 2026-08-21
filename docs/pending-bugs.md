@@ -527,6 +527,48 @@ completions) instead of rendering per wake. `MainSurface` still renders on every
 (direct `state` subscription), though its own body is cheap (~0.4 ms mean); the `app` root
 pass carries the cost (~26 ms mean).
 
+**TWO MORE 1 Hz SOURCES REMOVED 2026-08-21 (11.14), both on the input-gate deadline tick,
+live proof owed.** Neither is a chore: both are predicates that answered a BROADER question
+than the work behind them, so the tick took its `with_mut` — one full app-root re-render —
+every second while having nothing to do.
+
+1. **The gate half asked "is any clock running anywhere", but the tick can only ever touch
+   the CANDIDATE.** The open-gate arm removes the candidate's entry and nothing else, so a
+   single entry left behind by a row the owner had since switched away from answered "not
+   inert" on every tick, forever. ⚠ **It self-heals in exactly the wrong direction, which is
+   why an idle machine never shows it:** the clear-all arm needs `candidate == None` — the
+   terminal view left, a non-agent row selected, or the **window unfocused** — so the 1 Hz
+   render persisted precisely while the owner was using the app and evaporated the moment he
+   looked away. The predicate's own doc comment already described the per-path behaviour; the
+   code had implemented the global one.
+2. **The card half asked "is a card up", not "would the card change".** Every long-lived
+   restore card therefore pinned a render per second for its whole life. Only the stage-driven
+   card (`Restoring Remote Terminal`) re-words itself and carries an elapsed-seconds string
+   that really does move each tick — its bar is unchanged. Every other card keeps its own
+   wording and a stage-derived fraction, so it now costs renders only when a stage advances.
+   The writer and the predicate were factored onto ONE computation
+   (`terminal_restore_card_update`) rather than a predicate that re-derives the writer's
+   decision beside it, which is the second encoding the SSOT law forbids and whose failure is
+   silent (the card either freezes or never stops re-rendering).
+
+⚠ **This one is self-inflicted and was caught by the lane that caused it:** the seed-refusal
+card added the same day (see the adoption-chain entry below) is exactly a long-lived
+non-stage card, raised on a row whose surface is already broken — the worst moment to be
+spending a render per second.
+
+⛔ **AND ONE FILED ROOT IS FALSIFIED — do not spend on it again.** The evidence dossier's
+keystroke-path root claimed `terminal_input_schedule_live_snapshot_refresh` "inserts an
+8.7-15.5 ms vdom pass + webview edit batch between the user's Enter and its echo". It does
+not: at the call site the bytes are handed to the dedicated writer task
+(`terminal_write_tx.send(data)`) BEFORE the reactive update is scheduled, so the write is
+already on its way and the render cannot sit between Enter and the PTY. What it can do is
+delay the same task's next loop iteration, i.e. the echo READ — real, second-order, and not
+what was filed. The proposed busy-hint hysteresis was therefore NOT taken: `show_busy_hint`
+fires only on submit (measured ~1.6/min), a submit normally arrives after the previous hint
+has expired so the hysteresis would rarely skip anything, and shortening the optimistic hint
+risks the dot flickering off before the daemon's own `working` flag takes over. **A change
+bought at that price for a harm that is not there is a regression with good intentions.**
+
 ## ⛔⛔⛔ [11.0→6.1] AN ADOPTION CHAIN LOSES THE PRESERVED-OWNER TABLE, AND EVERY OLD-GENERATION ROW MOUNTS AS A GHOST
 
 **Status:** OPEN
