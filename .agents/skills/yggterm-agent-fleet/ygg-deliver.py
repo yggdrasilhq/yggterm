@@ -28,13 +28,13 @@ timeout here is a prompt to re-check the content, not just to retry.
 using, and its meaning is stronger than "do not wake": typing into one splices
 into what they have half-written and submits the fusion as their turn.
 """
-import argparse, glob, json, os, subprocess, sys, tempfile, time
+import argparse, glob, json, os, socket, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from ygg_rowarg import row_host, row_session_id  # noqa: E402
 import ygg_transcript  # noqa: E402
-YGG = "~/.local/bin/yggterm-headless"
+import ygg_plane  # noqa: E402
 POLL_S = 20
 
 
@@ -48,15 +48,10 @@ def gui_host():
     return (r.stdout or "").strip() or os.environ.get("YGG_GUI_HOST", "")
 
 
-def app(host, argstr, stdin_path=None):
-    cmd = f"{YGG} server app {argstr}"
-    if stdin_path:
-        cmd += f" < {stdin_path}"
-    r = subprocess.run(["ssh", "-n", host, cmd], capture_output=True, text=True, timeout=180)
-    try:
-        return json.loads(r.stdout)
-    except Exception:
-        return {"error": (r.stderr or r.stdout or "unparseable").strip()[:200]}
+#: ⛔ Reaching the plane has ONE owner. This verb spelled the binary itself and
+#: could only ever be aimed at the live desktop, so the interlock below — which
+#: DESTROYS a row — had never been run anywhere harmless. See `ygg_plane`.
+app = ygg_plane.app
 
 
 def never_armed(uuid):
@@ -172,9 +167,17 @@ def main():
     a = ap.parse_args()
 
     host = a.host or gui_host()
+    if not host and ygg_plane.sandbox_home():
+        # ⛔ A sandbox plane is on THIS machine by construction, so demanding a GUI
+        #    host before it would run is a refusal with nothing behind it — and it
+        #    is the last thing keeping this verb off a rig where its destructive
+        #    branch can be exercised harmlessly.
+        host = socket.gethostname()
     if not host:
         log("⛔ no GUI host")
         return 2
+    # ⭐ Every instrument states its subject: which plane this run will drive.
+    log(ygg_plane.describe())
     if a.text is not None:
         body = a.text
     else:
@@ -240,20 +243,24 @@ def main():
         log(f"{why} — waiting {POLL_S}s")
         time.sleep(POLL_S)
 
-    # ⛔ ONE ENCODING OF "THE MESSAGE". This used to scp `a.message` — the PATH —
+    # ⛔ ONE ENCODING OF "THE MESSAGE". This used to send `a.message` — the PATH —
     # which silently made the file the source of truth and the loaded `body` a
     # decorative copy. With `--text` there is no path at all, and any future edit
     # applied to `body` would have been shipped as the untouched original. The
     # bytes that were read are the bytes that are sent.
+    #
+    # ⛔ And the transfer goes through the plane, which is a no-op when the plane
+    #    is LOCAL — an unconditional scp is what made this verb undrivable against
+    #    a sandbox, and therefore never exercised anywhere its reap could not do
+    #    harm. The two fixes compose: `body` is still the only source of truth.
     local = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
     local.write(body)
     local.close()
-    remote = f"/tmp/ygg-deliver-{uuid[:8]}.txt"
     try:
-        subprocess.run(["scp", "-q", local.name, f"{host}:{remote}"], timeout=120)
+        staged = ygg_plane.stage(host, local.name)
+        reply = app(host, f"terminal submit '{uri}' --stdin", stdin_path=staged)
     finally:
         os.unlink(local.name)
-    reply = app(host, f"terminal submit '{uri}' --stdin", stdin_path=remote)
     data = reply.get("data") or {}
     if not data.get("submitted"):
         # ⛔ NEVER RETRY. `submitted:false` means the row was mid-output, not that
