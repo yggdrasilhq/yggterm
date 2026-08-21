@@ -408,6 +408,42 @@ are confounded. A reversed-order run on a fresh GUI did not reproduce at all, so
 nothing. **Do not quote the top/middle/bottom labels as a finding** — what IS established is
 live-band-correct / static-region-broken, which holds whichever band was live.
 
+### ⛔⛔ EVERY TERMINAL SHARES ONE GLYPH ATLAS — measured, and NOT the cause
+
+**Measured live, 2026-08-22:** three terminal hosts returned **three atlas objects and ONE distinct
+atlas**, which grew to **7 pages under all three at once**. The WebGL addon keeps a module-level
+cache (`acquireTextureAtlas`) and hands every terminal whose font, theme and DPR match the **same
+`TextureAtlas`**, tracking them in an `ownedBy` list. Every yggterm row matches, so **every row
+shares one atlas.**
+
+⇒ **An atlas operation is therefore never per-terminal, and the addon's own clear says so:**
+
+```js
+clearTextureAtlas(){ this._charAtlas?.clearTexture(); this._clearModel(!0); this._requestRedrawViewport(); }
+```
+
+It wipes the **shared** texture, then clears only **this** renderer's glyph model and redraws only
+**this** viewport. Every other owner keeps a model pointing into a texture that was just wiped. We
+call this per-host on the forced-refresh funnel — i.e. on every switch-in, foreground and reveal.
+
+⛔⛔ **AND IT IS NOT THE PROVEN CAUSE OF THE GARBLE. Two direct tests refuted it — do not
+re-derive them, and do not quote the sharing as the root cause:**
+
+| experiment | result |
+|---|---|
+| clear the shared atlas via another host, then full-refresh the measured host | **100% of cells painted** — clean |
+| flood the atlas to 7 pages from another host, then full-refresh the measured host | **100% of cells painted** — clean |
+
+The refreshing terminal re-rasterises glyphs on demand, so a cleared or grown atlas is handled
+correctly for whoever repaints. The coupling is real and any future explanation has to sit beside
+it, but it is a **candidate, not an answer**.
+
+⚠ **What would justify acting on it:** a frame in which `renderer.atlas_shared` is true, a host
+other than the active one has a `last_atlas_clear_at_ms` close to the capture, and the active host
+shows `PARTIAL`. The frame now records all three (`docs/observability.md` §2.3b), so the next
+firing either shows that pattern or rules it out. **Do not "fix" the sharing defensively before
+then** — it is a behaviour change to the paint path with no measured benefit.
+
 ### ⛔ THE CODE FINDING: EVERY REPAIR TRIGGER IS EVENT-DRIVEN, NOTHING DETECTS A DIVERGENCE
 
 `requestVisiblePaint(true)` — the only thing that repairs a partial paint — is raised from settled
