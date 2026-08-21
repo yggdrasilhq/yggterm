@@ -1838,6 +1838,189 @@ row gets prompted for being recently idle.
 
 ## 10. ⭐⭐ THE N.x ORCHESTRATOR — cluster the remaining work, then run the clusters in parallel
 
+### ⛔⛔⛔ SEVEN WAYS AN ORCHESTRATOR DESTROYS VALUE, EACH ONE MEASURED — read before your first sweep
+
+*These are not hypotheticals and they are not tidy. Every one was done by an
+orchestrator seat that believed it was being careful, and each is written with the
+complexity that makes the steer correct — because the short version of every story
+below is a rule that sounds obvious and was still broken.*
+
+---
+
+#### 1. ⛔ A LANE'S "PUSHED, 0/0, CLOSED" SAYS NOTHING ABOUT WHETHER IT SHIPPED
+
+**What happened.** Five owner mandates — an entire UX programme — were reported
+CLOSED and *live-proven*, with commit hashes, screenshots and green suites. Every
+successor brief copied that table forward. Forty commits across two repos sat on
+lane branches. **None of it was in `main`.** The owner had been looking at a
+product without them for a day, while four live lanes wrote documentation about a
+queue whose fixes were already written and stranded.
+
+**Why it survived, and this is the part that matters.** Each lane was telling the
+truth as it measured it: `0/0` means *my branch and its remote agree*. It is a
+statement about a push, and it reads exactly like a statement about shipping. The
+roll builds from `origin/main`, so the branch shipped nothing while its author,
+its successor and its orchestrator all believed otherwise. **Nobody was lying and
+nobody was lazy; the number answered a different question than the one everyone
+was asking.**
+
+⇒ **A lane is done when its patches are in `main`, and the only instrument that
+knows is `git cherry origin/main <branch>`.** A commit count compares refs, so a
+rebased or cherry-picked branch reads as ahead forever.
+
+⭐ **THE STEER:** run `ygg-land.py status` at the START of a wave, not the end.
+Read it as *"how much delivered work is not in the product"*, and treat any lane
+branch older than a wave as an emergency rather than housekeeping. When a lane
+reports an item closed, **ask for the main SHA**, not the branch SHA.
+
+---
+
+#### 2. ⛔ A ROW'S VALUE IS NOT ALWAYS ITS PROCESS — AND THE TIDY-UP CANNOT TELL
+
+**What happened.** A sweep folded a row that had no process, no transcript and a
+cwd that no longer resolved. By every test the tool had, it was debris. It was the
+HEAD of a hand-built row group the owner kept as a reading list: the sessions had
+been deleted long ago and **the title was the whole artefact** — enough to remember
+what to read. It cannot be restored; the session, its transcript and its cwd are
+all gone, and the restore verb answers `not_found`.
+
+**The complexity.** The sweep was right about every fact and wrong about the model.
+It assumed a row exists to hold a PROCESS. A bookmark exists to hold a NAME, and
+the emptier it looks the more certain the tool becomes. ⇒ The signals that scream
+"debris" — no process, no transcript, dead cwd — are exactly the signals a
+long-kept bookmark produces.
+
+⭐ **THE STEER:** a hand-typed title is a person's mark and outranks every liveness
+signal. `session_titles.source='manual'` already records it. Nothing folds such a
+row without an explicit override, the check fails CLOSED, and anything a person
+curates by hand belongs in a file OUTSIDE daemon memory — a row group that lives
+only in a running process is one sweep from gone.
+
+---
+
+#### 3. ⛔ THE SAFE PROCEDURE CAN BE CORRECT AND STILL AIMED AT THE WRONG LAYER
+
+**What happened.** Two rows shared one session id under different schemes. The
+lane that root-caused it **refused to remove the bad one**, wrote the danger down —
+*"a remove resolving by id rather than path would reap the wrong one"* — and
+recommended the mitigation: remove by full path, then read back that the other
+survives. That is exactly what was done, after reading the code and confirming the
+resolver matches the exact key before any id fallback. **It killed the live
+session anyway**, because the close request DOWNSTREAM of that resolution discards
+the key and dispatches the id. The verb replied `accepted: true`,
+`reaped_processes: []` — the kill was asynchronous and had not happened yet.
+
+**The complexity.** The danger was identified, the mitigation was right, the code
+was read, and the read was accurate about the layer it examined. ⇒ **Verifying one
+layer of a call chain proves nothing about the layer that acts.**
+
+⭐ **THE STEER:** for any destructive verb, verify the EFFECT, not the acceptance,
+and verify it AFTER the delay the verb itself declares. When two rows share an id,
+assume every verb keyed on that id will hit both until proven otherwise. And when
+a lane writes down a danger it declined to test, that is a red flag, not a
+clearance.
+
+---
+
+#### 4. ⛔ A FAILED SPAWN THAT LEAVES ITS ROW BEHIND IS WORSE THAN ONE THAT FAILS LOUDLY
+
+**What happened.** The readiness wait before submitting a brief was thirty seconds.
+A cold agent CLI on a loaded machine takes longer. So the submit was refused, the
+verb exited — and left the row it had created: seated, holding a seat its own
+predecessor still held, and briefed by nobody. Three of these accumulated, one
+alive for over two hours, all classified WORKING by a sweep whose "no transcript
+to judge by" fallback is the busiest verdict it has.
+
+**The complexity, and why it hid for so long.** A hand-run spawn is watched by
+someone who simply re-runs it. **The ceiling only ever bit the unattended path**,
+which is the path nobody watches by definition. Wiring the automatic replacement
+without fixing this would have changed nothing, because the verb it calls could
+not finish.
+
+⭐ **THE STEER:** every timeout in an unattended path must be sized for the WORST
+machine, not the developer's. A verb that cannot complete its job must clean up
+what it created or hand it to something that will. And a classifier's fallback
+verdict must be the SAFEST one, not the most flattering: a live process with no
+transcript at all has never been briefed, and saying so is the whole point.
+
+---
+
+#### 5. ⛔ A DETECTOR THAT NEEDS AN OPERATOR IS NOT AN ORCHESTRATION LAYER
+
+**What happened.** The hourly loop classified cold rows correctly, wrote a
+successor brief for each, and **spawned nothing** — the flag that replaces a cold
+row was never passed. It detected the same three rows every hour, rewrote the same
+three briefs, and left them idle for the better part of an hour each while
+reporting healthily.
+
+**The complexity.** Every individual piece was correct and tested. The wake flag it
+DID pass is right for a stalled row and by law must never touch a cold one, so the
+loop looked complete and covered the wrong case. ⇒ **A loop made of correct parts
+can still close over nothing.**
+
+⭐ **THE STEER:** the bar is that the layer keeps rows healthy **with nobody
+watching it** — so test it by leaving it alone and counting what it fixed, never by
+reading its output. Anything it can DETECT it must be able to ACT on, or the
+detection is a log line. Cap the action, because unattended means one bad hour must
+not spawn a lane per row.
+
+---
+
+#### 6. ⛔ A SEAT-SCOPED CENSUS IS BLIND TO EXACTLY THE ROWS THAT NEED IT
+
+**What happened.** Four live agents ran for hours with no seat number. Every census
+is seat-scoped, so nothing counted them, nothing escalated them, and nobody read
+their output — while they filed documentation instead of fixes. Separately, the
+hourly sweep covered ONE campaign number, so campaigns without an orchestrator of
+their own were watched by nothing at all: a dead row sat seated for hours and three
+of its neighbours went cold unnoticed.
+
+**The complexity.** The scoping rule is CORRECT and was written for a good reason:
+whether a quiet lane is finished is its own campaign's judgement, and an unscoped
+sweep once reaped somebody else's finished row. ⇒ The fix is not to widen the
+scope; it is to notice that **the rule protects a JUDGEMENT, and not every action
+is a judgement.** A row with no process is a fact.
+
+⭐ **THE STEER:** seat every row you spawn, and sweep for UNSEATED rows separately —
+they are invisible to your instruments by construction, which makes them the most
+likely place for rot. Keep judgement scoped; let facts run unscoped.
+
+---
+
+#### 7. ⛔ A GUARD THAT FAILS CLOSED IN THE ONE ENVIRONMENT IT WAS WRITTEN FOR
+
+**What happened.** A lease was added so two agents could not deploy at once — a
+real fault, correctly diagnosed. Its holder line read `${SESSION_ID##*/}` with a
+fallback on the next line for when the variable is empty. Under `set -u`, that
+expansion on an UNSET variable is an error, not an empty string, so the fallback
+was unreachable. The hourly roll carries no session id. **Every roll from that
+moment refused the deploy**, and nothing reached any host for four hours while
+`main` advanced — including a fix the owner was actively waiting for. The fleet
+read as "up to date" at the last version that actually shipped.
+
+**The complexity.** The guard was needed, the diagnosis was right, and it was
+tested — by an agent, in a session, where the variable is always set. ⇒ **The one
+caller that could not satisfy it was the unattended one.**
+
+⭐ **THE STEER:** test every guard in the environment that will actually run it,
+which for a fleet is a bare shell with no session, no tty and no agent variables.
+Default first, then transform. And when a deploy stops reaching hosts, look at the
+LAST THING ADDED TO THE DEPLOY PATH before looking anywhere else.
+
+---
+
+### ⭐ THE COMMON SHAPE, AND THE ONE HABIT THAT CATCHES ALL SEVEN
+
+Six of the seven are the same failure wearing different clothes: **an instrument
+answered a question adjacent to the one being asked, and the answer was true.**
+`0/0` was true. `accepted: true` was true. `WORKING` was true. "No process, no
+transcript, dead cwd" was true. The census was true about the rows it could see.
+
+⇒ **Before acting on any reading, say out loud what question it answers and what
+question you are asking.** If they are not the same sentence, go and get the second
+one. That is the whole discipline, and it is cheap compared to any single story
+above.
+
 ### ⛔⛔ FIRST: THE HYGIENE IS THE ORCHESTRATOR'S JOB. RUN ALL FOUR EVERY WAVE.
 
 Owner-directed 2026-08-21, and written here so no successor has to be told again:
