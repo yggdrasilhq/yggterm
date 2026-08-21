@@ -263,6 +263,24 @@ def main() -> int:
     print(f"backend      {record.get('capture_backend')}")
     print(f"session      {buf.get('session_path')}")
     print(f"grid         {rows}x{cols}  cell {cell_w:.2f}x{cell_h:.2f} css  base_y={buf.get('base_y')} viewport_y={buf.get('viewport_y')}")
+    renderer = record.get("renderer") or {}
+    if renderer:
+        hosts = renderer.get("hosts") or []
+        shared = renderer.get("atlas_shared")
+        print(f"renderer     {renderer.get('host_count')} hosts, "
+              f"{renderer.get('distinct_atlases')} distinct atlas"
+              f"{'es' if (renderer.get('distinct_atlases') or 0) != 1 else ''}"
+              f"{'  <- SHARED across hosts' if shared else ''}")
+        for h in hosts:
+            mark = "*" if h.get("is_active") else " "
+            suppressed = (h.get("recent_frame_like_write_until_ms") or 0) > (renderer.get("now_ms") or 0)
+            print(f"  {mark} atlas#{h.get('atlas_index')} pages={h.get('atlas_pages')} "
+                  f"forced_refresh={h.get('forced_refresh_count')} "
+                  f"atlas_clears={h.get('forced_atlas_clear_count')} "
+                  f"repair={h.get('retained_write_paint_repair_count')} "
+                  f"refresh_SKIPPED={h.get('forced_refresh_skipped_count')}"
+                  f"{' ' + repr(h.get('forced_refresh_skipped_reasons')) if h.get('forced_refresh_skipped_reasons') else ''} "
+                  f"{'REFRESH-SUPPRESSED' if suppressed else ''}")
     cur_char = buf.get("cursor_char") or ""
     print(f"cursor       row {cursor_y} col {cursor_x}  style={buf.get('cursor_style')!r}  cell holds {cur_char!r}")
     if cur_char.strip() and cursor_y >= 0 and 0 <= cursor_x < cols:
