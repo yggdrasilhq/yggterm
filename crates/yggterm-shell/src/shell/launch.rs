@@ -1714,7 +1714,12 @@ fn app() -> Element {
                 "row_kind": format!("{:?}", row.kind),
             }),
         );
-        spawn_open_session_row_with_mode(state, row.clone(), true);
+        spawn_open_session_row_with_mode(
+            state,
+            row.clone(),
+            true,
+            ActivationOrigin::restore("startup_terminal_restore_open"),
+        );
     });
     let trace_home_for_startup_terminal_recovery = trace_home.clone();
     use_effect(move || {
@@ -1750,7 +1755,12 @@ fn app() -> Element {
                 "row_kind": format!("{:?}", row.kind),
             }),
         );
-        spawn_focus_live_session_row(state, row, WorkspaceViewMode::Terminal);
+        spawn_focus_live_session_row(
+            state,
+            row,
+            WorkspaceViewMode::Terminal,
+            ActivationOrigin::restore("startup_terminal_restore_recover"),
+        );
     });
     let schedule_ui_update_for_tree = schedule_ui_update.clone();
     use_effect(move || {
@@ -2513,12 +2523,20 @@ fn app() -> Element {
     // boundary can do its job; the closure BODIES are unchanged, merely moved.
     let sidebar_on_prev_search_row = use_callback(move |_: ()| {
         if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(-1)) {
-            spawn_open_session_row(state, row);
+            spawn_open_session_row(
+                state,
+                row,
+                ActivationOrigin::user_gesture("sidebar_prev_search_row"),
+            );
         }
     });
     let sidebar_on_next_search_row = use_callback(move |_: ()| {
         if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(1)) {
-            spawn_open_session_row(state, row);
+            spawn_open_session_row(
+                state,
+                row,
+                ActivationOrigin::user_gesture("sidebar_next_search_row"),
+            );
         }
     });
     let sidebar_on_select_all_rows =
@@ -2588,7 +2606,14 @@ fn app() -> Element {
                     state.with_mut_counted(|shell| shell.select_row(&row))
                 }
                 BrowserRowKind::Session | BrowserRowKind::Document => {
-                    spawn_open_session_row(state, row.clone());
+                    // ⭐ THE CLICK. Everything this instrument exists to tell
+                    // apart from an app-driven switch is on the other side of
+                    // this one line.
+                    spawn_open_session_row(
+                        state,
+                        row.clone(),
+                        ActivationOrigin::user_gesture("sidebar_row_select"),
+                    );
                     if terminal_activation {
                         schedule_terminal_focus_after_activation(state, row.full_path.clone());
                     }
@@ -3168,7 +3193,11 @@ fn app() -> Element {
                             1
                         };
                         if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(step)) {
-                            spawn_open_session_row(state, row);
+                            spawn_open_session_row(
+                                state,
+                                row,
+                                ActivationOrigin::user_gesture("search_step_key"),
+                            );
                         }
                         return;
                     }

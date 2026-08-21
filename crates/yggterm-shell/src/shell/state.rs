@@ -190,6 +190,7 @@ use yggterm_platform::{DockRect, configure_background_service_command, send_user
 #[cfg(unix)]
 use yggterm_server::local_daemon_socket_should_be_removed_for_spawn;
 use yggterm_server::{
+    ActivationOrigin,
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlGridCommand,
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
@@ -29782,7 +29783,8 @@ impl ShellState {
             // first live session back to active, which is now the row the
             // create was told not to activate.
             PreservedViewport::StartPage => {
-                self.server.show_start_page();
+                self.server
+                    .show_start_page(ActivationOrigin::history("viewport_history_start_page"));
                 self.show_start_page_when_no_live_sessions = false;
                 self.active_terminal_host_id = None;
                 self.clear_terminal_resume_notifications_except(None);
@@ -30083,7 +30085,8 @@ impl ShellState {
     ) {
         match target {
             ViewportHistoryEntry::StartPage { selected_path } => {
-                self.server.show_start_page();
+                self.server
+                    .show_start_page(ActivationOrigin::history("viewport_history_start_page"));
                 self.show_start_page_when_no_live_sessions = false;
                 self.active_terminal_host_id = None;
                 self.clear_terminal_resume_notifications_except(None);
@@ -30116,7 +30119,10 @@ impl ShellState {
                     self.browser.select_path(row.full_path.clone());
                 }
                 if session_is_hot_terminal_row(self, row) || is_live_sidebar_row(row) {
-                    self.server.focus_live_session(&row.full_path);
+                    self.server.focus_live_session(
+                        &row.full_path,
+                        ActivationOrigin::history("viewport_history_focus_live"),
+                    );
                 } else {
                     self.server.open_or_focus_session(
                         session_kind_for_row(row),
@@ -30125,6 +30131,7 @@ impl ShellState {
                         row.session_cwd.as_deref(),
                         Some(row.label.as_str()),
                         None,
+                        ActivationOrigin::history("viewport_history_open_session"),
                     );
                 }
                 self.server.set_view_mode(*mode);
@@ -30322,7 +30329,8 @@ impl ShellState {
             self.search_content_match_index = None;
             self.search_focused = false;
         }
-        self.server.show_start_page();
+        self.server
+            .show_start_page(ActivationOrigin::user_gesture("sidebar_scope_start_page"));
         self.show_start_page_when_no_live_sessions = false;
         self.active_terminal_host_id = None;
         self.context_menu_row = None;
@@ -35090,7 +35098,11 @@ async fn ping_and_apply_contribution(
                 && let Some(row) = state.with(|shell| resolve_app_control_row(shell, &tab.session_path))
             {
                 state.with_mut_counted(|shell| shell.prepare_app_control_foreground_open());
-                spawn_open_session_row(state, row);
+                spawn_open_session_row(
+                    state,
+                    row,
+                    ActivationOrigin::app_control("app_control_tab_raise"),
+                );
             }
         }
         if drain.delivered > 0 || drain.dropped > 0 {
@@ -36516,7 +36528,11 @@ fn focus_split_pane(mut state: Signal<ShellState>, member: &str) {
         resolve_app_control_row(shell, member)
     });
     if let Some(row) = row {
-        spawn_open_session_row(state, row);
+        spawn_open_session_row(
+            state,
+            row,
+            ActivationOrigin::user_gesture("focus_split_pane"),
+        );
     }
 }
 
@@ -36558,7 +36574,11 @@ fn focus_split_pane_by_index(mut state: Signal<ShellState>, group_id: &str, inde
         resolve_app_control_row(shell, &member_session)
     });
     if let Some(row) = row {
-        spawn_open_session_row(state, row);
+        spawn_open_session_row(
+            state,
+            row,
+            ActivationOrigin::user_gesture("focus_split_pane_by_index"),
+        );
     }
 }
 
@@ -40574,10 +40594,21 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
         }
     }
 }
-fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
+/// ⛔⛔ `origin` IS THE POINT OF THIS PARAMETER, and it is not optional.
+/// This function is the ONE door the sidebar, the start page, a notification
+/// card and the app-control `open` verb all go through — which is precisely
+/// why the trace could not tell a person clicking from an agent opening a row,
+/// and why the mount-churn entry has been unable to say whether the active row
+/// changes by itself. The door stays shared; the caller now has to say who
+/// knocked.
+fn spawn_open_session_row(
+    state: Signal<ShellState>,
+    row: BrowserRow,
+    origin: ActivationOrigin,
+) {
     let prefer_terminal =
         state.with(|shell| preferred_open_mode_for_row(shell, &row) == WorkspaceViewMode::Terminal);
-    spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2);
+    spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2, origin);
 }
 
 fn preferred_open_mode_for_row(shell: &ShellState, row: &BrowserRow) -> WorkspaceViewMode {
@@ -40646,14 +40677,16 @@ fn spawn_focus_live_session_row(
     state: Signal<ShellState>,
     row: BrowserRow,
     mode: WorkspaceViewMode,
+    origin: ActivationOrigin,
 ) {
-    spawn_focus_live_session_row_retry(state, row, mode, 2);
+    spawn_focus_live_session_row_retry(state, row, mode, 2, origin);
 }
 fn spawn_focus_live_session_row_retry(
     mut state: Signal<ShellState>,
     row: BrowserRow,
     mode: WorkspaceViewMode,
     retry_budget: u8,
+    origin: ActivationOrigin,
 ) {
     let mut open_request_id = 0_u64;
     let mut retained_live_terminal = false;
@@ -40778,6 +40811,7 @@ fn spawn_focus_live_session_row_retry(
                                 mode == WorkspaceViewMode::Terminal,
                                 retry_budget.saturating_sub(1),
                                 false,
+                                origin,
                             );
                         });
                         return;
@@ -40803,6 +40837,7 @@ fn spawn_focus_live_session_row_retry(
                                 row,
                                 mode,
                                 retry_budget.saturating_sub(1),
+                                origin,
                             );
                         });
                         return;
@@ -40836,16 +40871,25 @@ fn spawn_open_session_row_with_mode(
     state: Signal<ShellState>,
     row: BrowserRow,
     prefer_terminal: bool,
+    origin: ActivationOrigin,
 ) {
-    spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2);
+    spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2, origin);
 }
 fn spawn_open_session_row_with_mode_retry(
     state: Signal<ShellState>,
     row: BrowserRow,
     prefer_terminal: bool,
     retry_budget: u8,
+    origin: ActivationOrigin,
 ) {
-    spawn_open_session_row_with_mode_retry_inner(state, row, prefer_terminal, retry_budget, true);
+    spawn_open_session_row_with_mode_retry_inner(
+        state,
+        row,
+        prefer_terminal,
+        retry_budget,
+        true,
+        origin,
+    );
 }
 fn spawn_open_session_row_with_mode_retry_inner(
     mut state: Signal<ShellState>,
@@ -40853,6 +40897,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
     prefer_terminal: bool,
     retry_budget: u8,
     allow_live_focus: bool,
+    origin: ActivationOrigin,
 ) {
     let requested_terminal = prefer_terminal;
     let prefer_terminal = prefer_terminal && state.with(|shell| row_supports_terminal(shell, &row));
@@ -40888,7 +40933,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
                 shell.rearm_unready_remote_terminal_bootstrap_for_open(&row.full_path);
                 shell
                     .server
-                    .request_terminal_launch_for_path(&row.full_path);
+                    .request_terminal_launch_for_path(&row.full_path, origin);
                 if !shell.terminal_session_is_retained_live(&row.full_path) {
                     shell.terminal_resume_ready_paths.remove(&row.full_path);
                     let request_id =
@@ -40915,7 +40960,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
         } else {
             WorkspaceViewMode::Rendered
         };
-        spawn_focus_live_session_row(state, row, mode);
+        spawn_focus_live_session_row(state, row, mode, origin);
         return;
     }
     let mut open_request_id = 0_u64;
@@ -41141,6 +41186,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
                                 row,
                                 prefer_terminal,
                                 retry_budget.saturating_sub(1),
+                                origin,
                             );
                         });
                         return;
@@ -41229,7 +41275,11 @@ fn spawn_open_session_from_notification(state: Signal<ShellState>, session_path:
     })
     .flatten();
     if let Some(row) = row {
-        spawn_open_session_row(state, row);
+        spawn_open_session_row(
+            state,
+            row,
+            ActivationOrigin::user_gesture("notification_card_click"),
+        );
     }
 }
 fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
@@ -42916,7 +42966,11 @@ fn spawn_switch_live_session(state: Signal<ShellState>, forward: bool) {
         synthesize_app_control_row(shell, &target)
     });
     if let Some(row) = target_row {
-        spawn_open_session_row(state, row);
+        spawn_open_session_row(
+            state,
+            row,
+            ActivationOrigin::user_gesture("switch_live_session_key"),
+        );
     }
 }
 
@@ -48867,7 +48921,11 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
                     path.and_then(|path| synthesize_app_control_row(shell, &path))
                 });
                 if let Some(row) = target {
-                    spawn_open_session_row(state, row);
+                    spawn_open_session_row(
+                        state,
+                        row,
+                        ActivationOrigin::user_gesture("keytip_open_row"),
+                    );
                 }
                 return;
             }
@@ -80023,7 +80081,9 @@ async fn process_pending_app_control_requests(
         AppControlCommand::ShowStartPage => {
             let selected_paths = state.with_mut_counted(|shell| {
                 shell.remember_current_viewport_for_history();
-                shell.server.show_start_page();
+                shell
+                    .server
+                    .show_start_page(ActivationOrigin::app_control("app_control_show_start_page"));
                 shell.show_start_page_when_no_live_sessions = false;
                 shell.clear_alt_overlay();
                 shell.close_titlebar_new_menu();
@@ -82804,6 +82864,7 @@ async fn process_pending_app_control_requests(
                             state,
                             row.clone(),
                             mode == WorkspaceViewMode::Terminal,
+                            ActivationOrigin::app_control("app_control_open_with_mode"),
                         );
                         if mode == WorkspaceViewMode::Terminal {
                             terminal_open_attempt = state.with(|shell| {
@@ -82814,7 +82875,11 @@ async fn process_pending_app_control_requests(
                         state.with_mut_counted(|shell| {
                             shell.prepare_app_control_foreground_open();
                         });
-                        spawn_open_session_row(state, row.clone());
+                        spawn_open_session_row(
+                            state,
+                            row.clone(),
+                            ActivationOrigin::app_control("app_control_open"),
+                        );
                         terminal_open_attempt = state.with(|shell| {
                             shell.latest_terminal_open_attempt_snapshot_for_path(&session_path)
                         });
