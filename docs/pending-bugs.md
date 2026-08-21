@@ -18569,6 +18569,21 @@ quick one.
 **Falsifier:** `ls -l --time-style=full-iso ~/.yggterm/event-trace.*.jsonl`
 before and after `cargo test -p yggterm-shell`; if no mtime moves, this is wrong.
 
+⚠ **UPDATE 2026-08-21 — the anticipated failure has now been SEEN, once.**
+`local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id` went red in a
+full `-p yggterm-server --lib` run and passed on its own and in the two full runs
+after it. It asserts that a second `refresh_local_cc_relaunch_launch_command` is
+a no-op, which only holds while "derived truth" does not move between the two
+calls — and derived truth is read from the machine's live agent store, which on
+a developer box is being written continuously by the agent sessions running on
+it. So this is no longer "corrupts no test": it is a test whose result depends on
+who else is typing.
+
+⇒ It raises the priority of the isolated `YGGTERM_HOME` rather than changing the
+fix. ⛔ **Do not "fix" the symptom by relaxing the no-op assertion** — that
+assertion is load-bearing (it is what catches a rebuild that never converges),
+and weakening it would trade a real gate for a quiet suite.
+
 ## ★★★ FIVE VERBS REPORT THE REQUEST, NOT THE EFFECT — one rule, not five patches
 
 **Status:** OPEN
