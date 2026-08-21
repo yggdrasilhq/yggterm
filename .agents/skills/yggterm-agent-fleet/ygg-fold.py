@@ -672,7 +672,17 @@ def sweep_worktrees(repo, apply_it):
         # its own output, and the reader believes the summary.
         removed += 1
         if apply_it:
-            r = run(["git", "-C", repo, "worktree", "remove", path])
+            # ⛔ THE COST OF THIS REMOVAL IS THE BUILD DIRECTORY, NOT THE CHECKOUT.
+            # A lane worktree that has been built in carries a multi-gigabyte
+            # `target/`, and deleting it took longer than the shared 120 s timeout
+            # every time — so the sweep failed on exactly the worktrees it most
+            # wants to reclaim, and reported the failure as a refusal. Measured
+            # 2026-08-21: 2.9 GB in one tree. Say the size, then wait for it.
+            size = subprocess.run(["du", "-sh", path], capture_output=True,
+                                  text=True, timeout=300).stdout.split("\t")[0] or "?"
+            log(f"  removing {size} — a built worktree is mostly `target/`")
+            r = subprocess.run(["git", "-C", repo, "worktree", "remove", path],
+                               capture_output=True, text=True, timeout=1800)
             if r.returncode != 0:
                 log(f"  ⛔ refused: {(r.stderr or '').strip()[:160]}")
                 removed -= 1
