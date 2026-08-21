@@ -20736,9 +20736,9 @@ fn reap_spawned_child_in_background(
 ) {
     let child_pid = child.id();
     // ONE encoding of "wait on a background thread" — see
-    // `yggterm_core::child_reaper`. What is local to this caller is the
+    // `yggterm_platform::child_reaper`. What is local to this caller is the
     // TRACING of the outcome, not the reaping mechanism.
-    yggterm_core::child_reaper::reap_child_in_background(child, move |result| match result {
+    yggterm_platform::child_reaper::reap_child_in_background(child, move |result| match result {
         Ok(status) => trace_local_daemon_child_event(
             &endpoint,
             "spawned_daemon_exit",
