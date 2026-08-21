@@ -554,12 +554,40 @@ the daemon (owner ruling: a backdated client against a new daemon is the skew a 
 never face). That ruling is right, and it means **this defect moved from rare to routine** —
 every roll now re-mounts every row, and the seed races the mount each time.
 
-**Mitigation shipped, not a fix.** `scripts/ygg-roll-watch.sh` runs a repaint sweep after
-every restart it performs: any row whose surface is empty OR unreadable is re-attached with
-`server app sessions restore`, which is proven to make the screen paint on the next read and
-which TYPES NOTHING, so it is safe to run unconditionally. First run repaired 16 of 31.
+**⛔⛔ THE MITIGATION IS WITHDRAWN FROM THE AUTOMATIC PATH. DO NOT PUT IT BACK.** It swept
+every blank row with `server app sessions restore` on the reasoning that the verb TYPES
+NOTHING and is therefore safe to run unconditionally. The typing half is true; the conclusion
+is not. `sessions restore` is the RECOVERY verb and it OPENS a session, "through the same path
+a manual drag takes" — so a 34-row sweep opens 34 sessions in a row. Reported live 2026-08-21,
+during a sweep this campaign ran: the window blinking, changing session and beeping every
+three to five seconds, for minutes, until it could be typed into at all.
 
-⭐ **THE OTHER 15 ARE NOW EXPLAINED, AND THEY ARE NOT THIS DEFECT** (measured 2026-08-21 on
+⇒ **NOT TYPING IS ONE SAFETY PROPERTY; NOT DRIVING THE VIEW IS ANOTHER.** A remedy that takes
+the active session away is an interruption whether or not it writes a byte, and an automation
+is the worst possible chooser of when to take somebody's screen. It is now behind
+`ygg-roll-watch.sh --sweep`, for an operator who is watching and has decided to spend it.
+
+⛔⛔ **AND THE MEASUREMENT UNDERNEATH THIS WHOLE ENTRY IS IN DOUBT — SETTLE IT BEFORE ANY
+FURTHER WORK HERE.** `server app terminal read-buffer <row>` reports the CLIENT's surface for
+a row. A row the client has not mounted yet may hold an empty surface **because nothing has
+been mounted, not because a mount failed** — and a restart legitimately starts with every row
+unmounted. Every number in this entry is consistent with that reading:
+
+* before a restart, 21 of 36 rows read non-empty — the ones that had been visited;
+* immediately after one, **all 35 read 0**, which is what "nothing visited yet" looks like;
+* the sweep then OPENED each blank row, and 21 became non-empty — the same 21.
+
+If that is what is happening, the sweep is a device for visiting rows that calls the visit a
+cure, and "31 rows blank after a restart" is not a defect report at all. ⚠ The owner's actual
+symptom is about a row he CLICKS showing nothing, so the only measurement that can settle this
+is: select a row, then read its surface. Nobody has done that — every reading so far was taken
+against unselected rows.
+
+**Falsifier for the doubt:** select one row that reads 0, wait, and read it again without any
+restore. If it paints, the metric was measuring mountedness and this entry needs rewriting
+from the symptom up.
+
+⭐ **THE ROWS A SWEEP CANNOT REPAINT ARE THE ONES WITH NO AGENT, AND THEY ARE NOT THIS DEFECT** (measured 2026-08-21 on
 the GUI host, 36 seated rows). Every one of the 15 rows the sweep could not repaint has **no
 agent process at all** — 15 of 15, against 17 of the 18 painting rows having one. Their
 sessions ended; there is no CLI producing output, so a re-attach has nothing to attach to and
