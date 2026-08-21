@@ -2337,6 +2337,26 @@ is the fix. If the condition has lapsed, you have measured the weather.
 armed — with zero incidents from the fixed version across ten minutes, against a prior
 0.82/min. That is a falsifier answered; "no incidents lately" would not have been.
 
+**3. COUNT THE ARM, NOT THE ALARM FAMILY.** ⛔ The event `name` is the family; the arm you
+fixed is an `incident_id` inside it. Re-checking this same alarm two hours later, `name ==
+"panic"` returned **15 incidents, 9 of them from the fixed build** — which reads exactly like
+a regression and is not one. The breakdown:
+
+```
+9  heartbeat/panic  host_warm             3.1.31   "working hard but BELOW the panic thresholds"
+3  heartbeat/panic  host_panic_ui_thrash  3.1.29
+3  heartbeat/panic  host_panic_ui_thrash  3.1.30
+0  heartbeat/panic  host_panic_memory     (any version)
+```
+
+Zero for the arm under test, while its old predicate was armed (7.71 GiB swap against the
+4.0 GiB trigger it used to fire on). Group by `payload.incident_id` **and** `app_version`
+together; a family count answers a question nobody asked and answers it alarmingly.
+
+⚠ And note what the same table shows about a sibling: `host_warm` files itself as
+`incident: true` every 60 s while its own diagnosis says the host is *below* every threshold.
+An incident that reports the absence of a problem is the shape this whole entry is about.
+
 ## `ytrace tail` cannot compute a RATE in either direction (measured 2026-08-21)
 
 The cap (~20 records) is already noted above as inflating frequency. It distorts the
