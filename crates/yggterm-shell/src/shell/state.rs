@@ -78755,6 +78755,12 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             // counters sidesteps the throttle entirely -- a count
                             // cannot be rate-limited away.
                             forced_refresh_skipped_count: Number(e.forcedRefreshSkippedCount || 0),
+                            // WHICH gate refused, not just how often. `frame_like`
+                            // is the one that never lapses on an agent row.
+                            forced_refresh_skipped_reasons:
+                                e.forcedRefreshSkippedReasons || null,
+                            last_forced_refresh_skip_reason:
+                                String(e.lastForcedRefreshSkipReason || ''),
                             skipped_perf_event_count: Number(e.skippedPerfEventCount || 0),
                             last_skipped_perf_event_name: String(e.lastSkippedPerfEventName || ''),
                             forced_atlas_clear_count: Number(e.forcedAtlasClearCount || 0),
