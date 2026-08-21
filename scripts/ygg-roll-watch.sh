@@ -230,6 +230,7 @@ tick() {
 #: else's work; the cost of waiting another hour is a row in a list.
 fold_sweep() {
   local fold="$REPO/.agents/skills/yggterm-agent-fleet/ygg-fold.py"
+  local fold_repo_land="$REPO/.agents/skills/yggterm-agent-fleet/ygg-land.py"
   [ -x "$fold" ] || return 0
 
   # ⛔⛔ TWO REFUSALS, AND BOTH WERE LEARNED BY BREAKING THEM ON THE FIRST RUN.
@@ -278,6 +279,17 @@ fold_sweep() {
       --finished-idle-min 45 --stall-idle-min 10 2>&1 \
       | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|[⛔✔🔒⚠❄])' || true
   done
+  # ⛔⛔ AND REPORT THE DIVERGENCE EVERY HOUR, UNASKED. Forty commits of delivered
+  #    work — five owner mandates, an entire UX programme — sat on lane branches
+  #    while every brief reported them CLOSED and live-proven, because a lane's
+  #    "0/0" means its branch agrees with its own remote and says nothing about
+  #    main. The roll builds from origin/main, so it shipped nothing while
+  #    everyone believed otherwise. Nobody was lying: the number answered an
+  #    adjacent question. ⇒ The loop that BUILDS from main is the right place to
+  #    say what is not in it, because it is the one thing that runs unasked.
+  python3 "$fold_repo_land" status 2>&1 \
+    | sed 's/^/  /' | tee -a "$LOG" | grep -E 'READY|carrying unlanded|look ahead' || true
+
   # ⛔ AND ONE UNSCOPED PASS THAT ACTS ONLY ON THE DEAD. The scoping rule above
   #    protects a JUDGEMENT — whether a quiet lane is finished — and another
   #    campaign's row is that campaign's to judge. A row whose PROCESS IS GONE is
