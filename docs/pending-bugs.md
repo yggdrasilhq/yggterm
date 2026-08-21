@@ -526,9 +526,16 @@ the codebase at once by turning them into `ECHILD`.
 **Falsifier:** on a daemon built from this commit and up for more than three notify
 cooldowns (>46 min), `ps -eo ppid,stat | awk '$1==<pid> && $2 ~ /Z/' | wc -l` must
 read 0, where the same probe against an older daemon on the same host still counts
-its accumulated zombies. Unit side is already locked: the test asserts the CONTROL
-first (an un-waited exited child really does show as `Z`), so it cannot pass by
-being blind.
+its accumulated zombies.
+
+⭐ **The unit side is already a PROVEN lock, not an assumed one.**
+`notify_owner_reaps_the_notification_child` drives the real production function
+against a stub binary in a fake home and counts zombie children of the test process.
+It was falsified by reverting `notify_owner` to `let _ = cmd.spawn()`, and it failed
+with *"left a zombie behind: 1 zombie children against a baseline of 0"* — so it goes
+red on exactly this defect and not on something adjacent. The primitive's own test
+asserts its CONTROL first (an un-waited exited child really does show as `Z`), so
+neither test can pass by being blind to the state it checks.
 
 **What remains open:** nothing in the watch plane counts zombies, which is why this
 ran unremarked for the daemons' entire uptime. A resource-watch probe that reports a

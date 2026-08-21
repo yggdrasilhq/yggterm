@@ -507,6 +507,8 @@ fn installed_binary(home: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn memory_pressure_uses_available_not_free() {
@@ -526,6 +528,89 @@ mod tests {
         if let Some(gib) = swap {
             assert!(gib >= 0.0);
         }
+    }
+
+    /// ⛔ THE LOCK ON THE REAL CALL SITE, NOT JUST THE PRIMITIVE.
+    ///
+    /// `notify_owner` used to end in `let _ = cmd.spawn()`, and a dropped
+    /// `Child` is never waited on — so every fifteen-minute owner notification
+    /// left a zombie in the daemon's table for the daemon's whole life
+    /// (measured 2026-08-21: 79 of them under one 19.9-hour daemon). The
+    /// primitive is unit-tested in `yggterm_core::child_reaper`; this asserts
+    /// that THIS function actually routes through it.
+    ///
+    /// ⚠ The fake home is load-bearing for SAFETY, not just isolation:
+    /// `installed_binary` falls back to `yggterm-headless` on PATH, and on a
+    /// developer host that would fire a REAL notification at the owner. Placing
+    /// an executable at `<home>/bin/yggterm-headless` takes the first branch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn notify_owner_reaps_the_notification_child() {
+        fn own_zombie_children() -> usize {
+            let me = std::process::id();
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .filter(|entry| {
+                    let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                        return false;
+                    };
+                    // `pid (comm) state ppid ...`, and comm may contain spaces
+                    // and parentheses, so split after the LAST ')'.
+                    let Some((_, rest)) = stat.rsplit_once(')') else {
+                        return false;
+                    };
+                    let mut fields = rest.split_whitespace();
+                    let state = fields.next().unwrap_or("");
+                    let ppid = fields.next().unwrap_or("");
+                    state == "Z" && ppid.parse::<u32>().ok() == Some(me)
+                })
+                .count()
+        }
+
+        let home = std::env::temp_dir().join(format!("ygg-reaplock-{}", std::process::id()));
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).expect("create the bin dir");
+        let stub = bin.join("yggterm-headless");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        // Other tests in this binary may hold transient children of their own,
+        // so the claim is "this call adds no PERMANENT zombie", measured
+        // against a baseline rather than against zero.
+        let baseline = own_zombie_children();
+        let incident = ytrace::diagnosis::Incident {
+            id: "host_panic_memory".to_string(),
+            kind: ytrace::diagnosis::IncidentKind::Resource,
+            severity: ytrace::diagnosis::Severity::Warn,
+            diagnosis: "a synthetic incident for the reaping lock".to_string(),
+            remedy: "none — this incident is not real".to_string(),
+            observed: serde_json::json!(0),
+            threshold: serde_json::json!(0),
+            subject: None,
+            suggested_queries: Vec::new(),
+        };
+        notify_owner(&home, &incident);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut settled = false;
+        while std::time::Instant::now() < deadline {
+            if own_zombie_children() <= baseline {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let leaked = own_zombie_children();
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            settled,
+            "notify_owner left a zombie behind: {leaked} zombie children against a \
+             baseline of {baseline}"
+        );
     }
 
     #[test]
