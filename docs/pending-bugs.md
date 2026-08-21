@@ -535,6 +535,27 @@ server screen 'remote-cc://<host>/<uuid>' --state-only   -> unreadable
 server app terminal read-buffer <row> --mode screen      -> 0 characters
 ```
 
+⛔⛔ **CORRECTED SAME DAY — "every reader agrees" WAS AN ARTEFACT OF ASKING A
+BLIND VERB.** `server screen --state-only` answers `unreadable` for EVERY row
+path — measured across six live rows including one that was painting 4847
+characters at that moment. All three forms fail (`cc-runtime://<uuid>`,
+`remote-cc://<host>/<uuid>`, bare uuid) and the verb itself is fine: with no
+argument it dumps every local row's screen. What fails is resolving a ROW PATH,
+and **its failure is spelled exactly like a blank screen**.
+
+⇒ So there were THREE things wearing one word. The booter's envelope parse
+(fixed), this verb's path resolution (still open), and a genuine loss of the
+grid. `terminal read-buffer` resolves the same rows and answers in full; it is
+the instrument, and asking it separates the three: **three of six live rows
+returned zero characters through the verb that works, and the other three
+returned full screens.** The three empty ones are exactly the rows the booter had
+been refusing to wake.
+
+⚠ **A verdict fed by the blind verb was worthless in both directions**, which is
+why this took three attempts to state correctly. Everything that read
+`screen_state` — the census, the wake path's waiting-prompt guard — has been
+blind on every row since it was written.
+
 ⇒ **Everything that decides by looking at a screen is blind on such a row**, and
 each blindness is reported as a fact about the ROW rather than about the reader:
 
@@ -549,7 +570,10 @@ universal. Fixing the parse — proved on a row where the correct level held 283
 characters and the wrong one held zero — does not make this one readable.
 
 **What is not established:** whether the grid is lost at a client restart, never
-mounted for that row, or dropped when the daemon changed hands. All three fit.
+mounted for that row, or dropped when the daemon changed hands. ⚠ Process start
+time does NOT predict it — the affected rows started at 17:30, 17:44 and 19:25,
+and rows started at 19:38 and 21:02 read fine, so it is not simply "everything
+before the last restart".
 
 **Falsifier:** find a row reading `unreadable` after the parse fix, and ask the
 daemon whether it holds a PTY and a grid for that session. If it does, the loss is

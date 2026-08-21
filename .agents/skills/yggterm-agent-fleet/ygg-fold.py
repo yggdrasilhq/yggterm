@@ -254,9 +254,39 @@ def screen_state(uuid, host):
     using the documented form concludes the row is broken when the verb simply
     did not resolve the path. Filed; pinned here so this tool cannot inherit it.
     """
-    cmd = f"{YGG} server screen 'cc-runtime://{uuid}' --state-only"
+    # ⛔⛔ `server screen --state-only` ANSWERS `unreadable` FOR EVERY ROW PATH,
+    # AND THE COMMENT ABOVE PINNED THE WRONG FORM AS THE CURE. Measured
+    # 2026-08-21 across six live rows including this tool's own, which was
+    # painting 4847 characters at the time: `cc-runtime://<uuid>`,
+    # `remote-cc://<host>/<uuid>` and a bare uuid all return `unreadable`. The
+    # verb works — with no argument it dumps every local row's screen — so what
+    # fails is resolving a ROW PATH, and its failure is spelled exactly like a
+    # blank screen.
+    #
+    # ⇒ Every verdict this function fed was therefore blind: the census reported
+    #   "screen says unreadable" for rows that were working, and the wake path
+    #   could never tell a waiting prompt from a busy row.
+    #
+    # `terminal read-buffer` resolves the same rows and answers in full. It is
+    # the instrument; this is now a thin classifier over it.
+    cmd = (f"{YGG} server app terminal read-buffer 'remote-cc://{host or 'dev'}/{uuid}' "
+           f"--mode screen")
     r = run(["ssh", "-n", host, cmd]) if host else run(["bash", "-c", cmd])
-    return (r.stdout or "").strip().splitlines()[0].strip() if r.stdout.strip() else "unknown"
+    text = ""
+    try:
+        text = ((json.loads(r.stdout or "{}").get("data") or {}).get("text") or "")
+    except ValueError:
+        text = r.stdout or ""
+    if not text.strip():
+        # ⚠ STILL A REAL STATE, and not the same as the verb being blind: a row
+        # can be alive and working with no rendered grid at all. Reported as
+        # `unreadable` so callers keep refusing to type into it.
+        return "unreadable"
+    tail = [ln for ln in text.splitlines() if ln.strip()][-6:]
+    joined = " ".join(tail).lower()
+    if any(k in joined for k in ("esc to interrupt", "tokens)", "· ↓")):
+        return "working"
+    return "ready"
 
 
 def composer_is_empty(uuid, host):
