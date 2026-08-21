@@ -2675,9 +2675,11 @@ such session" from every client on the host while the session itself is perfectl
 healthy, which is the attach deadlock in `pending-bugs.md` `[11.0]`.
 
 ⭐ A daemon now re-binds its own name when it finds it re-pointed, so this state
-resolves itself within ~15 s on a fixed build. On a mixed-version host it can still
-happen and still needs the cross-check: the daemon that TAKES a name is the one that
-has to be fixed, and it may be the older binary.
+resolves itself within ~15 s — ⚠ **but only for a daemon that is itself running that
+build.** The reclaim thread lives in the victim, not in the taker, so a daemon stranded
+before the fix shipped stays stranded and stays invisible to the census; its rows have to
+be moved or they die with it. On a mixed-version host the cross-check above is still the
+only way to see it.
 
 ## `server attach --help` is not a help flag — it opens a row called `--help` (2026-08-22)
 
