@@ -160,7 +160,31 @@ pub fn sidebar_row_sets<'a, I>(
 where
     I: IntoIterator<Item = (&'a str, Option<&'a str>)>,
 {
-    let mut sets = outline_row_sets_with(rows, arrangement);
+    let rows: Vec<(&'a str, Option<&'a str>)> = rows.into_iter().collect();
+    // ⛔⛔ A SET'S MEMBERS DRAW IN SEAT ORDER TOO, AND THIS IS THE HALF THAT WAS
+    // MISSING. Sorting the flat list the sidebar walks fixes the TOP level and
+    // nothing else, because `visible_rows` emits a set's children from the
+    // membership vector rather than from that list. So the one verb that exists
+    // to fix the order reported `changed: true` about a list it really had
+    // rewritten while the tree on screen did not move — owner-reported twice on
+    // 2026-08-21, and the reason it survived being run.
+    //
+    // ⚖ SEATS WIN OVER INSERTION ORDER, DELIBERATELY. A drag says WHICH set a row
+    // belongs to; the index it happens to land on is a by-product of where the
+    // pointer was released, not a statement about how `11.9` should sit against
+    // `11.10`. Un-numbered members tie and therefore keep the place the hand gave
+    // them, so a set of un-numbered rows is untouched by this.
+    let seat_of: HashMap<&str, OutlineKey> = rows
+        .iter()
+        .map(|(path, prefix)| (*path, parse_outline_key(*prefix)))
+        .collect();
+    let mut sets = outline_row_sets_with(rows.iter().copied(), arrangement);
+    sets.sort_members_by_key(|member| {
+        seat_of
+            .get(member)
+            .cloned()
+            .unwrap_or(OutlineKey::Unnumbered)
+    });
     for head in collapsed_heads {
         // A flag on a row that heads nothing is kept OUT of the model rather
         // than carried in it: `is_collapsed` would then answer true for a row
@@ -269,6 +293,118 @@ mod tests {
 
     fn visible(sets: &RowSets, order: &[&str]) -> Vec<(String, usize)> {
         sets.visible_rows(order.iter().copied())
+    }
+
+    /// ⛔⛔ THE OWNER'S FALSIFIER, VERBATIM: nest three seated rows into one set
+    /// in REVERSE order and read the tree. They must draw in seat order with no
+    /// verb run at all.
+    ///
+    /// This is the half a flat sort cannot reach. `visible_rows` emits a set's
+    /// children from the membership vector, so ordering the list the sidebar
+    /// walks moves the TOP level and leaves every nested row exactly where it
+    /// was — which is why `sessions sort` could answer `changed: true`, truthfully
+    /// about the list it rewrote, while the tree on screen did not move.
+    ///
+    /// ⚠ `11.9` before `11.10` is also the ten-before-two trap, so a lexicographic
+    /// regression fails here too rather than only in the comparator's own suite.
+    #[test]
+    fn a_set_draws_its_members_in_seat_order_however_they_were_nested() {
+        let mut arrangement = RowArrangement::default();
+        // Nested by hand, worst case first: the drop order is the reverse of the
+        // seat order, and `11.20` is placed where a string sort would keep it.
+        for member in ["twenty", "ten", "nine"] {
+            arrangement
+                .attach("orch", member, None)
+                .expect("a hand-built set");
+        }
+        let sets = sidebar_row_sets(
+            rows(&[
+                ("orch", "11.0"),
+                ("twenty", "11.20"),
+                ("ten", "11.10"),
+                ("nine", "11.9"),
+            ]),
+            &arrangement,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            visible(&sets, &["orch", "twenty", "ten", "nine"]),
+            vec![
+                ("orch".into(), 0),
+                ("nine".into(), 1),
+                ("ten".into(), 1),
+                ("twenty".into(), 1),
+            ],
+            "a set's members draw in seat order, not in the order a drag \
+             happened to drop them"
+        );
+    }
+
+    /// ⚖ AND THE LIMIT OF THAT RULE. Un-numbered members tie, so a stable sort
+    /// leaves the arrangement a hand built completely untouched — grouping rows
+    /// that hold no seat is the case `DESIGN.md` calls ordinary, and it must not
+    /// become a case this reshuffles.
+    #[test]
+    fn un_numbered_members_keep_the_place_the_hand_gave_them() {
+        let mut arrangement = RowArrangement::default();
+        for member in ["notes", "logs", "scratch"] {
+            arrangement
+                .attach("orch", member, None)
+                .expect("a hand-built set");
+        }
+        let sets = sidebar_row_sets(
+            rows(&[
+                ("orch", "11.0"),
+                ("notes", ""),
+                ("logs", ""),
+                ("scratch", ""),
+            ]),
+            &arrangement,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            visible(&sets, &["orch", "notes", "logs", "scratch"]),
+            vec![
+                ("orch".into(), 0),
+                ("notes".into(), 1),
+                ("logs".into(), 1),
+                ("scratch".into(), 1),
+            ]
+        );
+    }
+
+    /// A seated member and an un-numbered one in the same set: the seated rows
+    /// fall into outline order and the un-numbered one holds its relative place
+    /// rather than being swept to either end.
+    #[test]
+    fn a_mixed_set_orders_the_seated_rows_around_the_rest() {
+        let mut arrangement = RowArrangement::default();
+        for member in ["two", "loose", "one"] {
+            arrangement
+                .attach("orch", member, None)
+                .expect("a hand-built set");
+        }
+        let sets = sidebar_row_sets(
+            rows(&[
+                ("orch", "11.0"),
+                ("two", "11.2"),
+                ("loose", ""),
+                ("one", "11.1"),
+            ]),
+            &arrangement,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            visible(&sets, &["orch", "two", "loose", "one"]),
+            vec![
+                ("orch".into(), 0),
+                ("one".into(), 1),
+                ("two".into(), 1),
+                ("loose".into(), 1),
+            ],
+            "numbered rows sort ahead of un-numbered ones, which is the key's \
+             own contract"
+        );
     }
 
     /// The owner's ask, verbatim: `N.x` under `N.0`, drawn as one outline.

@@ -16122,6 +16122,15 @@ struct ShellState {
     /// the hand half of an arrangement; the seats supply the rest, derived, and
     /// this outranks them per row. Persisted beside the split groups.
     row_arrangement: yggterm_core::row_set_outline::RowArrangement,
+    /// How many CONSECUTIVE snapshots each arranged path has been absent from
+    /// the live set.
+    ///
+    /// ⛔ IN MEMORY, NEVER PERSISTED, AND THAT IS THE POINT. The arrangement
+    /// outlives daemons; this counter must not. A restart is exactly the moment
+    /// every row is briefly absent, so a count that survived one would prune the
+    /// user's whole arrangement on the first snapshot after a handover — which is
+    /// presumably why nothing was ever wired to `retain_live` at all.
+    row_arrangement_absent_sightings: HashMap<String, u8>,
     /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
     /// source of truth for splits: the compound sidebar row, the viewport pane
     /// layout, keep-alive, and persistence all derive from this list. No
@@ -18661,6 +18670,7 @@ impl ShellState {
             // Restored so a group the user built by dragging is still there
             // after a restart — the same promise the split groups make.
             row_arrangement: restored_row_arrangement,
+            row_arrangement_absent_sightings: HashMap::new(),
             // Restored from settings so a built split-view workspace reopens as
             // the intentional artifact the user shaped ([[campaign-split-view-groups]]).
             // Normalized on parse; a group whose members no longer exist is
@@ -27212,6 +27222,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.needs_initial_server_sync = false;
                 self.request_background_copy_scan_if_unscheduled();
@@ -27306,6 +27317,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -27376,6 +27388,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -29524,6 +29537,100 @@ impl ShellState {
         promoted.sort();
         promoted.dedup();
         promoted
+    }
+
+    /// How many consecutive snapshots a row must be absent from before its
+    /// arrangement entry is forgotten.
+    ///
+    /// Three, for the same reason the boot watchdog confirms an absence three
+    /// times before acting on it: one missing sighting is a snapshot arriving
+    /// mid-handover, and the cost of being wrong is asymmetric — pruning early
+    /// destroys work the user did by hand, while pruning late leaves a dead
+    /// entry nobody can see.
+    const ROW_ARRANGEMENT_GONE_SIGHTINGS: u8 = 3;
+
+    /// Forget the arrangement of rows that have CONFIRMABLY departed.
+    ///
+    /// ⛔ **THE DEPARTURE POINT IS WHY THIS TOOK SO LONG TO WIRE.**
+    /// `RowArrangement::retain_live` has existed, correct and tested, with no
+    /// production caller at all: the GUI's own close and remove paths dissolve
+    /// and detach the row being closed, but a head that dies daemon-side or
+    /// remotely leaves its entry behind forever, and the stored arrangement
+    /// accumulates rows that exist nowhere. The obvious fix — prune every frame
+    /// against the live set — is worse than the leak, because the live set
+    /// FLICKERS: it is briefly empty or partial during a daemon handover, and a
+    /// naive prune would delete the user's whole arrangement at every restart.
+    ///
+    /// ⇒ So absence is CONFIRMED before it is acted on, and the confirmation
+    /// lives in memory so a restart starts the count over rather than inheriting
+    /// one taken across the very gap it must not trust.
+    ///
+    /// ⛔ **AN EMPTY LIVE SET DECIDES NOTHING.** "No rows" and "I have not been
+    /// told about the rows yet" are indistinguishable here and only one of them
+    /// means everyone departed. Counting on it would let three quiet snapshots
+    /// during a handover wipe an arrangement built over weeks.
+    fn prune_departed_row_arrangement(&mut self) {
+        let live: HashSet<String> = self
+            .server
+            .live_sessions()
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .map(live_session_row_path)
+            .collect();
+        if live.is_empty() {
+            self.row_arrangement_absent_sightings.clear();
+            return;
+        }
+        let arranged: HashSet<String> = self
+            .row_arrangement
+            .sets
+            .heads()
+            .map(ToOwned::to_owned)
+            .chain(
+                self.row_arrangement
+                    .sets
+                    .heads()
+                    .flat_map(|head| self.row_arrangement.sets.members_of(head))
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .chain(self.row_arrangement.detached.iter().cloned())
+            .collect();
+        self.row_arrangement_absent_sightings
+            .retain(|path, _| arranged.contains(path));
+        let mut confirmed_gone: HashSet<String> = HashSet::new();
+        for path in &arranged {
+            if live.contains(path) {
+                self.row_arrangement_absent_sightings.remove(path);
+                continue;
+            }
+            let seen = self
+                .row_arrangement_absent_sightings
+                .entry(path.clone())
+                .or_insert(0);
+            *seen = seen.saturating_add(1);
+            if *seen >= Self::ROW_ARRANGEMENT_GONE_SIGHTINGS {
+                confirmed_gone.insert(path.clone());
+            }
+        }
+        if confirmed_gone.is_empty() {
+            return;
+        }
+        // `retain_live` keeps what it is GIVEN, so the set handed to it is every
+        // arranged path that is not confirmed gone — not the live set. An
+        // unconfirmed absence must survive untouched, and a live row obviously
+        // must too.
+        let keep: HashSet<String> = arranged
+            .iter()
+            .filter(|path| !confirmed_gone.contains(*path))
+            .cloned()
+            .collect();
+        if self.row_arrangement.retain_live(&keep) {
+            for path in &confirmed_gone {
+                self.row_arrangement_absent_sightings.remove(path);
+            }
+            self.sync_browser_settings();
+        }
     }
 
     /// The arrangement the sidebar is drawing right now.
@@ -51875,6 +51982,31 @@ fn push_live_session_rows(
     if !expanded {
         return;
     }
+    // ⭐⭐ OUTLINE ORDER IS A PROPERTY OF THE SEATS, NOT OF ARRIVAL — AND THE
+    // SIDEBAR DRAWS IT CONTINUOUSLY. `sort_by_outline` documents itself as "the
+    // one sort … both the rendered sidebar and any verb that reports an order
+    // call this", and the rendered sidebar was the half that never did: the only
+    // caller was `AppControlCommand::SortSessions`, so correct order was a manual
+    // repair somebody had to remember and every spawn, fold and re-group undid
+    // it. Owner-reported twice on 2026-08-21 as rows not being in ascending
+    // order.
+    //
+    // ⚠ THE COMPARATOR WAS NEVER THE BUG. It parses a seat into `Vec<u64>` and
+    // has a test named for the ten-before-two trap. What was missing is that
+    // nothing on the render path asked it.
+    //
+    // ⚖ A SEATED ROW CAN NO LONGER BE HAND-ORDERED OUT OF SEAT ORDER HERE, and
+    // that is the intended model rather than a casualty: the seat IS the order.
+    // The sort is stable, so un-numbered rows keep the arrangement a drag gave
+    // them and only fall in around the numbered ones.
+    let sessions: Vec<&ManagedSessionView> = {
+        let mut ordered = sessions.to_vec();
+        yggterm_core::session_outline::sort_by_outline(&mut ordered, |session| {
+            session.outline_prefix.clone()
+        });
+        ordered
+    };
+    let sessions = sessions.as_slice();
     let short_ids = unique_session_short_ids_for_pairs(
         &sessions
             .iter()
@@ -57550,28 +57682,57 @@ fn app_control_created_launch_report(
     created_path: Option<&str>,
     requested: &AgentLaunchOptions,
 ) -> Value {
-    let launch_command = created_path.and_then(|path| {
+    let created = created_path.and_then(|path| {
         snapshot
             .live_sessions
             .iter()
             .chain(snapshot.active_session.iter())
             .find(|session| session.session_path == path)
-            .map(|session| session.launch_command.clone())
     });
-    let expected = created_path
-        .and_then(|path| {
-            snapshot
-                .live_sessions
-                .iter()
-                .chain(snapshot.active_session.iter())
-                .find(|session| session.session_path == path)
-        })
-        .map(|session| requested.launch_tokens(session.kind).unwrap_or_default())
-        .unwrap_or_default();
-    // Every requested token must be present in the command the row carries.
+    let launch_command = created.map(|session| session.launch_command.clone());
+    // ⛔ THE VERDICT COMES FROM WHAT THE ROW STORES, NEVER FROM THE COMMAND
+    // STRING — because the command string is re-derived and the stored options
+    // are what every re-derivation consults.
+    //
+    // This field used to be a substring test against `launch_command`, and that
+    // is a question about an artifact rather than about the row: the snapshot
+    // post-processor rebuilds a remote row's command (the identity refresh
+    // fires between a remote row's birth and its first spawn), so `applied`
+    // could read `false` for a spawn whose flag DID reach the process, and
+    // could read `true` for a create that composed the token into a string
+    // while failing to store it on the row — which is the shape the remote
+    // `--model` drop hid behind for a day. A row that stores the option
+    // re-applies it at every rebuild, relaunch and restore; a row that merely
+    // had it spelled into one command loses it at the first refresh. So the
+    // stored options are the only durable answer, and the string test is
+    // demoted to what it always was: an observation about the command as it
+    // reads right now, reported beside the verdict rather than as it.
+    let stored = created.map(|session| session.agent_launch_options.clone());
+    let applied = created.map(|session| {
+        // A kind that cannot express the request is NOT "applied". The token
+        // builder refuses rather than ignores, and swallowing that refusal into
+        // an empty expectation is how a `--model` on a shell row would report
+        // success while going nowhere.
+        if requested.launch_tokens(session.kind).is_err() {
+            return false;
+        }
+        let stored = &session.agent_launch_options;
+        requested
+            .model
+            .as_ref()
+            .is_none_or(|model| stored.model.as_deref() == Some(model.as_str()))
+            && requested
+                .permission_mode
+                .is_none_or(|mode| stored.permission_mode == Some(mode))
+    });
+    // Every requested token present in the command the row carries RIGHT NOW.
     // Quoting is the launch builder's business, so compare on the unquoted
-    // token — `--model` and `'--model'` are the same statement.
-    let applied = launch_command.as_ref().map(|command| {
+    // token — `--model` and `'--model'` are the same statement. Informational:
+    // it can differ from `applied` in both directions, and when it does, the
+    // difference is a re-derivation artifact and not a verdict.
+    let command_carries_tokens = created.map(|session| {
+        let expected = requested.launch_tokens(session.kind).unwrap_or_default();
+        let command = &session.launch_command;
         expected
             .iter()
             .all(|token| command.contains(token.as_str()))
@@ -57580,10 +57741,15 @@ fn app_control_created_launch_report(
         "model": requested.model,
         "permission_mode": requested.permission_mode.map(|mode| mode.name()),
         "applied": applied,
+        "stored_model": stored.as_ref().and_then(|stored| stored.model.clone()),
+        "stored_permission_mode": stored
+            .as_ref()
+            .and_then(|stored| stored.permission_mode)
+            .map(|mode| mode.name()),
+        "command_carries_tokens": command_carries_tokens,
         "launch_command": launch_command,
     })
 }
-
 fn app_control_created_session_path(
     snapshot: &ServerUiSnapshot,
     message: Option<&str>,

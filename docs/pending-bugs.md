@@ -348,42 +348,50 @@ remedy is the same either way — do not put it first — but the distinction de
 **Falsifier:** spawn two lanes with identical briefs, one told to claim first and one seated
 by the orchestrator and told to start on the work. Count turns before the first stall.
 
-## ⛔⛔ [11.10] `sessions sort` REPORTS `changed: true` AND THE TREE DOES NOT MOVE — IT IS BLIND TO ROW SETS
+## ⛔ [11.10] THE SIDEBAR NOW DRAWS SEAT ORDER — HIS GUI IS STILL ON THE PRE-FIX IMAGE
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Owner-reported 2026-08-21, twice, as rows not being in ascending order — and it is not the
-comparator, which is correct and has a test for exactly this.*
+*Owner-reported 2026-08-21, twice, as rows not being in ascending order.* The comparator
+was never it. Two things around it were, and both are fixed:
 
-**The comparator is right.** `sort_by_outline` in `yggterm-core::session_outline` parses a seat
-into `Vec<u64>` and sorts numerically; its test suite already pins the trap
-(`a_tenth_lobe_does_not_sort_before_the_second`). Nothing about `11.9` vs `11.10` is wrong there.
+1. **The sort only ran when a verb asked for it.** `sort_by_outline` calls itself "the one
+   sort — both the rendered sidebar and any verb that reports an order call this", and the
+   rendered sidebar was the half that never did: its only caller was
+   `AppControlCommand::SortSessions`. Rendered order was arrival order and correct order was
+   a manual repair that every spawn, fold and re-group undid. The Live Sessions render path
+   now sorts before it derives anything.
+2. **And that alone still would not move a nested row.** `visible_rows` emits a set's
+   children from the membership vector, not from the list the sidebar walks. Members are now
+   ordered by seat as well, in `row_set_outline` — the one module allowed to know both what a
+   set is and what a seat is; `row_set` takes the key from its caller and still refuses to
+   know. Seats beat insertion order deliberately: a drag says WHICH set a row joins, and the
+   index it lands on is a by-product of the drop point. Un-numbered rows tie under a stable
+   sort, so a hand-built set of un-numbered rows is untouched.
 
-**Two things are wrong around it.**
+**⭐ THE MECHANISM WAS NARROWER THAN FILED, MEASURED IN PIXELS.** For a SEAT-DERIVED set the
+verb does reach the members — membership is rebuilt by iterating the flat list, so sorting
+that list reorders the children too, and the sandbox showed the tree moving. The case that
+cannot be fixed by the verb is the HAND-ARRANGED set, whose membership vector is stored. And
+there the instrument lies in the opposite direction from the one filed: with the flat list
+already sorted, `sessions sort` answers **`changed: false`** — "already sorted, nothing to
+do" — over a tree drawn in full reverse. Both readings are the same defect: the verb answers
+about the flat list, and `changed` in either polarity is a statement about something the
+person is not looking at.
 
-1. **The sort only runs when a verb asks for it.** `sort_by_outline` is called from exactly two
-   places, and the sidebar's continuous rendering is neither of them — the shell calls it only
-   inside `AppControlCommand::SortSessions`. So the rendered order is whatever order rows
-   happened to arrive in, and correct order is a manual repair somebody has to remember. Every
-   spawn, fold and re-group therefore leaves the sidebar wrong until a human notices.
+**Pixel proof, one sandbox home, one hand-arranged set nested in reverse, only the binary
+differing** (`scripts/underglass-sandbox.sh`, Wayland-native, no XWayland):
+- pre-fix `139c6a39`: `11.0 · 11.20 · 11.13 · 11.10 · 11.9`, and the verb said `changed: false`;
+- fixed `10711945`: `11.0 · 11.9 · 11.10 · 11.13 · 11.20`, **with no verb run at all**.
 
-2. **⛔ And running the verb does not fix a nested row.** `sessions sort` orders the flat
-   `live_sessions` list. The sidebar draws ROW SETS, and a set's children render in membership
-   order, so a sorted flat list changes nothing a reader can see. Measured: after the verb
-   returned `changed: true` with an applied order placing `11.9` immediately after `11.0`, the
-   tree still rendered `11.20, 11.21, 11.10, 11.13, 11.15, 11.9, 11.16, 11.19`.
+⚠ `11.9` before `11.10` means the ten-before-two trap is now pinned on the render path in
+pixels, not only in the comparator's own suite.
 
-⚠ **`changed: true` is the instrument lying.** It describes the flat list it rewrote, not the
-tree the person is looking at — so the one verb that exists to fix this reports success while
-the symptom stays on screen, which is why it survived being run.
-
-**What is wanted.** Outline order is a property of the seats, not of arrival: the tree should
-render it continuously, including inside a row set, and `sessions sort` should either reach set
-members or say plainly that it cannot. ⇒ Until then an orchestrator must re-sort after every
-row-set change, and that is a workaround, not the fix.
-
-**Falsifier:** nest three rows seated `11.9`, `11.10` and `11.20` into one set in that reverse
-order, then read the rendered tree. They must draw `11.9, 11.10, 11.20` with no verb run at all.
+**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image, so his
+sidebar draws the old order until it restarts — and that restart is deliberately not taken
+here (he is using the machine, and `ygg-roll-watch.sh` will not restart a GUI on a timer by
+design). **Falsifier:** after his GUI comes up on an image containing `10711945`, one
+screenshot of the live sidebar shows `11.0`'s members in ascending order with no verb run.
 
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
@@ -1795,21 +1803,31 @@ decomposed into four distinct defects, each proven from the trace or `/proc`:
    deploy that relied on it left daemons unconverged — plausibly the parent of today's
    generation pile-up.
 
-## ⚠ [11.0→11.10] `launch.applied` IS STILL COMPUTED AGAINST A RE-DERIVED COMMAND
+## ⚠ [11.0→11.10] `launch.applied` — THE VERDICT IS FIXED, THE LIVE PROOF IS OWED
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*The narrowed residue of the remote `--model` drop, closed 2026-08-20 on live proof against
-the 3.1.14 dev daemon: a remote CC spawn with a non-default model reached its process with
-the flag on the cmdline, an explicit `sync_terminal_identity` refreshed the launch command
-("refreshed 1") and the model SURVIVED, and the row's `agent_launch_options` carried the
-stored model.* What remains is the reporting mask the original entry named: the snapshot
-post-processor re-derives a remote row's `launch_command`, and `launch.applied` is computed
-against that re-derivation rather than against the command the create composed — so it can
-read `false` for an unverifiable reason (observed on the 3.1.12 probe) and its verdict
-cannot be told from a re-derivation artifact. **Falsifier:** `launch.applied` reflects the
-command the create actually composed, and a spawn whose flag reached the process never
-answers `applied: false`.
+*The narrowed residue of the remote `--model` drop.* The verdict was computed by
+substring-testing the row's `launch_command`, which the snapshot post-processor
+re-derives, so it answered a question about a rebuildable artifact rather than about
+the row: `false` for a spawn whose flag reached the process, and — the expensive
+direction — `true` for a create that spelled the token into one command without
+storing it, which loses the option at the very next identity refresh.
+
+**Changed:** `applied` now reads the row's stored `agent_launch_options`, which is what
+every rebuild, relaunch and restore consults. The string test survives as a separate
+`command_carries_tokens` field reported beside the verdict, and the stored values are
+reported too, so the answer is auditable. A kind with no CLI to pass the flag to reads
+`false` rather than inheriting the empty expectation a swallowed refusal produced. Both
+directions fail on the pre-fix tree
+(`launch_applied_reads_the_stored_options_not_the_re_derived_command`).
+
+**⛔ WHAT KEEPS THIS OPEN.** A unit test builds its own snapshot; it cannot show that a
+real create stores what it composed. **Falsifier:** spawn a remote CC row with a
+non-default model, read `launch.applied` from the create's own reply, and confirm the
+flag on the target process's cmdline — `applied: true` and the flag present, in one
+sample. Not taken here: the GUI host is the owner's machine and in use, and a spawn
+opens a row.
 
 ## ⛔⛔ [11.5] SESSION SWITCHES PAINT GHOST FRAMES AND FULL-CANVAS GLYPH SOUP — EVIDENCE FILED, MECHANISM UNPROVEN
 
@@ -1920,24 +1938,6 @@ what happens after a boot decision.
 silence; a live stalled row is booted with exactly one typed copy and one Enter; `ps` shows
 exactly one watcher after two racing starts.
 
-## ⚠ [11.10] `RowArrangement::retain_live` STILL HAS NO PRODUCTION CALLER, SO DEAD-HEAD GARBAGE ACCUMULATES IN SETTINGS
-
-**Status:** OPEN
-
-*The narrowed residue of the dead-head visibility entry, closed 2026-08-20 on live proof:
-with the dead-head arrangement entry still stored, one simultaneous window answered start
-page 825 == `startpage ls` 825 == `cwdtree ls` 825, and both formerly-hidden live rows
-render in the rail at top level.* Visibility no longer depends on pruning — `visible_rows`
-draws an orphaned member at top level — but the STORED arrangement still keeps entries for
-rows that no longer exist anywhere, forever: `retain_live` (which dissolves a departed head
-and detaches departed members) is called only by its own unit tests. The wiring needs a
-NON-TRANSIENT departure point — a naive per-frame prune against a flickering universe would
-destroy user arrangement during every daemon restart, which is presumably why it was never
-wired. The GUI close/remove paths already call `dissolve`/`detach` for the row being closed;
-the gap is heads that die daemon-side or remotely. **Falsifier:** close a head row through a
-daemon-side removal, and the arrangement entry for it is gone from settings within the
-session, with members re-parented per `retain_live`'s own contract.
-
 ## ⚠ [11.10] THE SERVER AND SHELL TEST SUITES FLAKE UNDER CONCURRENT RUNS — A DIFFERENT TEST EACH TIME, EVERY ONE GREEN IN ISOLATION
 
 **Status:** OPEN
@@ -1991,23 +1991,6 @@ this one is small and worth taking first:** the env-mutating test wants an env m
 and `collect_live_store_title_syncs_in` are), so it stops reaching into a variable other
 threads are reading. Any test that calls `std::env::set_var` in this workspace is a candidate —
 grep for it before assuming this is the only one.
-
-## ⚠ [11.10] A STANDING BOOT REFUSAL IS INVISIBLE IN EVERY STATE FILE — ONLY THE LOG KNOWS
-
-**Status:** OPEN
-
-*Filed 2026-08-21 from a cross-lane report that proved out: four rows across four campaigns
-sat permanently unbootable for days while every instrument read healthy.* A refused boot is
-deliberately REFUNDED (`boots` stays 0 — correct, the row was never asked anything), so a
-row refused every tick forever is indistinguishable in the subscription state from one that
-never needed a boot: no counter rises, nothing escalates, and only a log line per tick
-records the standing condition. The immediate cause of those four (the read-buffer JSON
-envelope consumed raw, defeating the residue cleaner and half-blinding the choice-prompt
-guard) is fixed with a falsifying fixture test; THIS entry is the structural residue: a
-refusal that repeats N ticks for the SAME reason should surface — a `standing_refusal`
-field on the subscription and one escalation, not a per-tick log line nobody tails.
-**Falsifier:** wedge a row so a boot refuses repeatedly; within N ticks the subscription
-state names the standing refusal and exactly one escalation fires.
 
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
