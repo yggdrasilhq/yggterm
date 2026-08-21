@@ -1516,10 +1516,30 @@ under a second in state `S`, and disappeared — never once observed in `Z`, whe
 old code would have parked it forever. Against that, the four pre-fix daemons on the
 same host went on accumulating throughout.
 
-⇒ **Still owed:** the same probe against a ROLLED fleet daemon. The fix is on `main`;
-the installed binary predates it, and forcing a fleet roll to satisfy a falsifier is
-not a trade this lane gets to make while the machine is in use. The recipe is above and
-takes about thirty minutes of daemon uptime.
+### The rolled fleet daemon — run, and ONE notification short of this entry's own bar
+
+*The fleet rolled to 3.1.29 at 19:18 on its own, so the probe this entry was waiting for
+became available without anyone forcing a deploy. Measured against the INSTALLED daemon.*
+
+| | |
+|---|---|
+| rolled daemon uptime | **63.8 min** |
+| notifications it really spawned | **2** (19:49:09, 20:04:19) |
+| zombies held, across 82 samples | **0** |
+| the two pre-fix daemons beside it, same window | **91 → 92** and **80 → 81** |
+
+⚠ **This entry asked for three notifications and got two, and the reason is worth more
+than the missing one.** The notifier only fires while the host is genuinely under load.
+The host cooled at 20:09 — partly because this lane's own sandbox daemons stopped
+consuming tmpfs — and the third cooldown expiry had nothing to report. ⇒ **This
+falsifier cannot be run on demand: it needs the machine to be unhealthy, and tidying up
+removes the condition it depends on.** Expect to wait for weather, not for uptime.
+
+⇒ **Still owed: the third notification, and nothing else.** A monitor is armed against
+the rolled daemon and will record it whenever the host next heats up. Its tally
+accumulates to a file rather than recounting from the trace, because the trace is a byte
+budget and a count re-derived from it can go DOWN — evidence that can evaporate is not
+evidence.
 
 **What remains open — and it is sharper than "nobody looked":** the codebase's only
 zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
