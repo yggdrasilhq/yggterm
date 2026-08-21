@@ -10386,6 +10386,19 @@ impl YggtermServer {
         if !keep_alive && !temporary_update_restore && !store_recoverable {
             return;
         }
+        // ⭐ THE RE-RESOLUTION, ON THE PLANE. Emitted here and not beside
+        // `restored_live_row_key` above, because that function is deliberately
+        // pure and is also asked speculatively about rows that never land —
+        // tracing from inside it would report restores that did not happen.
+        // This is the first line past every early return, so an event here
+        // means the row IS being restored, and `rekeyed` says whether it kept
+        // the key it was persisted under.
+        yggterm_core::cli_plane::emit_restore(
+            "daemon",
+            &key,
+            restored_row_key.as_deref().unwrap_or(key.as_str()),
+            kind,
+        );
         let remote_scanned_key =
             parse_remote_agent_session_path_with_kind(&key).map(|(raw_machine_key, session_id, agent_kind)| {
                 let machine_key = normalize_machine_key(raw_machine_key);
@@ -35953,6 +35966,37 @@ mod tests {
             Some("not_in_protected_runtime_keys"),
             "WHICH gate took it: the three drop reasons mean different things, \
              and without this the reader is sent back to a rotating trace file"
+        );
+    }
+
+    /// ⛔ THE RESTORE EVENT MUST SIT PAST EVERY EARLY RETURN.
+    ///
+    /// `restore_live_session` drops a row that is neither kept, nor a temporary
+    /// update restore, nor store-recoverable. An emit placed above that gate
+    /// would report restores that never happened — and a plane whose counts are
+    /// inflated by rows that were discarded is worse than one with no counts,
+    /// because it reads as evidence. Locked by position, since the mistake is
+    /// invisible in review: both orderings compile and both emit.
+    #[test]
+    fn the_cli_restore_event_is_emitted_only_for_a_row_that_actually_restores() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("pub fn restore_live_session(")
+            .nth(1)
+            .expect("restore_live_session")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of restore_live_session");
+        let skip_gate = body
+            .find("if !keep_alive && !temporary_update_restore && !store_recoverable {")
+            .expect("the gate that drops an unrecoverable husk");
+        let emit = body
+            .find("cli_plane::emit_restore(")
+            .expect("restore must report the row's re-resolution to the CLI plane");
+        assert!(
+            skip_gate < emit,
+            "the restore event is emitted before the row has survived the drop gate, \
+             so the plane would count rows that were thrown away"
         );
     }
 
