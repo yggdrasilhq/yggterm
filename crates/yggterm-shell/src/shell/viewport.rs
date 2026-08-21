@@ -6209,6 +6209,46 @@ fn TerminalCanvas(
                     "phase": "before_ensure",
                 }),
             );
+            // ⛔⛔ A ROW THAT ALREADY FAILED THIS EXACT LAUNCH IS NOT ASKED AGAIN.
+            //
+            // The retry is not merely wasted: `terminal_ensure_with_retry_async`
+            // is a full mount against a remote host, and every one of them
+            // repaints the surface — which is what the owner sees as blinking and
+            // broken TUI paint. Measured 2026-08-21: one row creation produced
+            // five of these, all against the same unmountable row.
+            //
+            // ⚠ The EXPLANATION is re-shown rather than swallowed. A suppressed
+            // retry that also went silent would leave a dead row looking merely
+            // slow, which is worse than the churn — so the recorded error goes
+            // back on the overlay and the row stays visibly failed.
+            let already_failed = {
+                let shell = state.read();
+                shell
+                    .terminal_ensure_already_failed(&session_path)
+                    .map(|failure| failure.error.clone())
+            };
+            if let Some(previous_error) = already_failed {
+                set_signal_if_changed(terminal_resume_overlay_excerpt, Some(previous_error.clone()));
+                set_signal_if_changed(resume_overlay_failed, true);
+                set_signal_if_changed(resume_overlay_timed_out, false);
+                release_bootstrap_lease(state, "terminal_bootstrap_release_after_known_failure");
+                let _ = safe_shell_mut(state, "terminal_attach_known_failure", |shell| {
+                    shell.terminal_attach_in_flight.remove(&session_path);
+                    shell.terminal_resume_ready_paths.remove(&session_path);
+                    shell.maybe_finish_terminal_surface_request_for_session(&session_path);
+                });
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "ensure_skipped_after_failure",
+                    json!({
+                        "session_path": session_path.clone(),
+                        "error": previous_error,
+                    }),
+                );
+                return;
+            }
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -6256,6 +6296,7 @@ fn TerminalCanvas(
                         session_host_label, error
                     ),
                 );
+                let ensure_error_text = error.to_string();
                 let _ = safe_shell_mut(state, "terminal_attach_ensure_error", |shell| {
                     release_terminal_bootstrap_lease_if_current(
                         shell,
@@ -6264,6 +6305,14 @@ fn TerminalCanvas(
                     );
                     shell.terminal_attach_in_flight.remove(&session_path);
                     shell.terminal_resume_ready_paths.remove(&session_path);
+                    // ⛔ FAIL ONCE, STAY FAILED. Without this the next thing that
+                    // touches the tree remounts this row and asks the identical
+                    // question again — measured at five mounts and four bootstrap
+                    // resets from ONE row creation, all aimed here, all ending
+                    // back in this branch with the mount epoch climbing. The
+                    // record is keyed on the launch command, so a repaired row
+                    // retries by itself and this never becomes a latch.
+                    shell.note_terminal_ensure_failed(&session_path, &ensure_error_text);
                     shell.maybe_finish_terminal_surface_request_for_session(&session_path);
                 });
                 maybe_spawn_missing_remote_machine_refreshes(state);

@@ -21938,6 +21938,122 @@ console.log('ok');
         );
     }
 
+    /// ⛔⛔ AN UNRESTORABLE ROW FAILS ONCE, NOT ONCE PER TREE CHANGE.
+    ///
+    /// Measured on the GUI host 2026-08-21 with an isolation test — one create
+    /// alone, quiet controls either side: a SINGLE row creation drove five full
+    /// terminal mounts and four bootstrap resets, every one aimed at the same
+    /// unmountable active row, every one ending in `ensure_error` and re-arming
+    /// with the mount epoch climbing. A remove cost nothing. Each of those is a
+    /// full remote mount that repaints the surface, which is what the owner sees
+    /// as blinking and broken TUI paint.
+    ///
+    /// ⚖ The record is keyed on the LAUNCH COMMAND, not on the mount identity.
+    /// The mount identity carries the epoch and the epoch climbs on every retry,
+    /// so keying on it would suppress nothing. The launch command is what cannot
+    /// change between two attempts that will get the same answer — and when it
+    /// DOES change, the row must retry with no one clearing anything, which is
+    /// the property that keeps this from being a latch. Both halves asserted.
+    #[test]
+    fn a_failed_ensure_is_remembered_until_the_launch_it_failed_on_changes() {
+        let path = "remote-cc://testhost/4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        let bootstrap = test_shell_bootstrap_with_active_session(path);
+        let mut shell = ShellState::new(bootstrap);
+
+        let with_launch = |command: &str| {
+            let mut session =
+                yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(path));
+            session.kind = SessionKind::ClaudeCode;
+            session.launch_command = command.to_string();
+            ServerUiSnapshot {
+                active_session_path: Some(path.to_string()),
+                active_session: Some(session.clone()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![session],
+                apps: Vec::new(),
+            }
+        };
+
+        // Nothing recorded ⇒ nothing suppressed.
+        shell
+            .server
+            .apply_snapshot(with_launch("ssh dev -- resume-cc --require-existing"));
+        assert!(
+            shell.terminal_ensure_already_failed(path).is_none(),
+            "a row that has not failed must never be suppressed"
+        );
+
+        // It fails once.
+        shell.note_terminal_ensure_failed(path, "saved session is no longer available");
+        let remembered = shell
+            .terminal_ensure_already_failed(path)
+            .expect("the failure is remembered for the launch it failed on");
+        assert_eq!(
+            remembered.error, "saved session is no longer available",
+            "the explanation is kept — a suppressed retry that also went silent \
+             would leave a dead row looking merely slow"
+        );
+
+        // Anything that re-mounts the tree asks again, and is refused, as long
+        // as the launch is the same question.
+        shell
+            .server
+            .apply_snapshot(with_launch("ssh dev -- resume-cc --require-existing"));
+        assert!(
+            shell.terminal_ensure_already_failed(path).is_some(),
+            "the same launch must stay suppressed across remounts — that is the \
+             churn this exists to stop"
+        );
+
+        // ⭐ THE WAY OUT, and it needs no one to remember it: the launch changed,
+        // so the question changed, so the row retries.
+        shell
+            .server
+            .apply_snapshot(with_launch("ssh dev -- resume-cc"));
+        assert!(
+            shell.terminal_ensure_already_failed(path).is_none(),
+            "a repaired launch must retry by itself; a suppression nothing can \
+             clear is a latch, not a fix"
+        );
+    }
+
+    /// The state above is only worth having if the mount path CONSULTS it, and a
+    /// unit test cannot reach inside the component's async task to prove that.
+    /// So the guard is pinned where it lives: in front of the ensure, not after
+    /// it. Scanned over the product half so this test's own text cannot satisfy
+    /// it.
+    #[test]
+    fn the_mount_path_checks_for_a_known_failure_before_it_ensures() {
+        let source = yggterm_core::agent_cli::product_lines(include_str!("viewport.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let guard = source
+            .find("terminal_ensure_already_failed")
+            .expect("the mount path consults the recorded failure");
+        // ⛔ THE CALL SITE, NOT THE NAME. A bare `find` on the function name
+        // matches its DEFINITION, which sits above everything that calls it — so
+        // the first version of this test failed against correct code and would
+        // have passed against code with no guard at all, as long as the
+        // definition moved. A scan comparing positions has to anchor on the
+        // syntax of the thing it means.
+        let ensure = source
+            .find("if let Err(error) = terminal_ensure_with_retry_async(")
+            .expect("the mount path still ensures");
+        assert!(
+            guard < ensure,
+            "the guard must sit BEFORE the ensure — after it, every retry has \
+             already paid for the full remote mount it was supposed to avoid"
+        );
+        assert!(
+            source.contains("note_terminal_ensure_failed"),
+            "and the failure branch must record, or the guard has nothing to read"
+        );
+    }
+
     /// ⛔⛔ THE SIDEBAR DRAWS OUTLINE ORDER CONTINUOUSLY — NO VERB RUN AT ALL.
     ///
     /// Owner-reported twice on 2026-08-21 as rows not being in ascending order.
