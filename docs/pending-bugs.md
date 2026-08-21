@@ -1589,6 +1589,23 @@ steady-state minutes, not the two GUI restarts the window contains — worst **3
    loudly rather than parked on the confound. The clean next falsifier needs the swap residue
    drained first (routed to 6.7, who owns MEMORY).
 
+**THE pre_select FIX IS LIVE ON THE LAPTOP (2026-08-21 12:02, commit `4507abe70be9`,
+GUI-only same-version deploy, verified by `server app clients` build_commit + faithful
+screenshot).** The reconcile's daemon snapshot fetch now spawns off the select loop behind an
+in-flight latch (`spawn_screen_reconcile_fetch`); the apply decision runs unchanged on the
+result channel's own branch; a failed fetch traces `screen_reconcile_fetch_failed` instead of
+vanishing. Locked by `the_reconcile_fetch_is_dispatched_off_the_select_loop`. What forced the
+timing: through the owner's live complaint window (11:42–12:00) the inline fetch was hitting
+what looks like the daemon's 10 s io timeout ON THE LOOP — `pre_select` holds of 9.1/9.3/9.8/
+9.9/10.0 s about every 90 s, across three different sessions, echo frozen for each. ⚠ The
+deploy restart raced the owner's own manual GUI relaunch (12:01:27, systemd desktop scope) by
+~60 s — from his seat his fresh GUI "self destructed"; the sequence is recorded here so the
+next report can say so plainly. ⚠ The reconcile path has not yet FIRED on the new build (cold
+mounts don't trigger it); its first natural reveal-transition will, and the
+`screen_reconcile_apply` branch guard witnesses it. The echo bar is still graded by the next
+clean typed window — the ~221 ms p95 band is per-iteration loop cost (`read_poll_apply`), a
+separate slice, and is NOT claimed fixed by this deploy.
+
 ## ⛔⛔⛔ [11.5] THE INPUT CHAIN PROVES DELIVERY TO THE PTY, NEVER CONSUMPTION BY THE PROGRAM — AND THAT IS THE GAP "I CANNOT TYPE" FALLS THROUGH
 
 **Status:** OPEN
