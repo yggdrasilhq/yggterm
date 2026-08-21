@@ -396,11 +396,28 @@ blank cells.
   twenty seconds later. The repair machinery (forced full refresh, 1500 ms deadline, 750 ms
   rate-limit) does fire — the earlier reading of the code, that a hole "latches forever", is WRONG
   and is corrected here rather than left to be inherited.
-- ⚠ **It is INTERMITTENT: 2 reproductions in ~15 attempts**, which is consistent with a race during
+- ⚠ **It is INTERMITTENT: 2 reproductions in ~23 attempts**, which is consistent with a race during
   mount churn rather than a deterministic path. Both reproductions needed a **fresh GUI** — a warm
   GUI did not reproduce under the same churn, and a second churn on an already-healed GUI never
   did. Warm mounts, cold rows on a warm GUI, streaming vs idle, and switch gaps from 0.05 s to
   0.7 s were all tried and all painted clean.
+
+⭐ **THE MOST PROMISING UNTESTED LEAD — MEMORY PRESSURE, stated as a correlation and NOT a cause.**
+Both firings happened while `$XDG_RUNTIME_DIR` — **a tmpfs, i.e. RAM** — was at **51 GB / 100%
+full** from 48 leaked sandbox homes (see the harness entry above). After 33 GB was reclaimed, **8
+further trials with a verified-working harness reproduced nothing.** A machine with tens of GB of
+RAM held by a tmpfs is exactly the condition under which a compositor evicts GPU textures, and a
+stale glyph atlas is what the captured frame looked like.
+
+⚠ **This is a before/after correlation confounded with everything else that changed, and it is
+recorded as a lead, not a finding.** The test that would settle it: fill the tmpfs to near
+capacity, then run `hunt.sh`. ⛔ **It must be run on a host with NO other live sandboxes** — the
+runtime dir is shared, three other sessions had live compositors in it during this work, and
+filling it would take their work down. That constraint is why this lane did not run the test.
+
+⇒ If it holds, this bug is a *memory-pressure* symptom and joins the resource-watch lane rather
+than being purely a renderer defect — and it would explain why the owner, on a laptop, sees
+constantly what a sandbox reproduces twice in twenty-three tries.
 
 ⚠ **One control could not be settled and must not be assumed:** in both reproductions the broken
 row was also the FIRST row captured after the churn, so "which band is live" and "captured first"
