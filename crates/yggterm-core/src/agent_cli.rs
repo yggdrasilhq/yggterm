@@ -4756,6 +4756,34 @@ pub fn new_row_birth_title(machine: Option<&str>, what: &str) -> String {
 /// exclusive by construction (`/.codex/sessions/` is not a substring of
 /// `/.codex-litellm/sessions/`), and
 /// [`agent_cli_store_roots_are_mutually_exclusive`] holds a new CLI to that.
+/// The kind slug a ROW REPORTS for this CLI — `icon_kind` in the row JSON, and
+/// the `data-tree-icon-kind` attribute the sidebar draws from.
+///
+/// ⛔⛔ **IT IS NOT ALWAYS [`AgentCliDescriptor::slug`], AND THAT IS THE WHOLE
+/// REASON THIS EXISTS.** The codex family reports the historical `"session"` —
+/// it predates there being a second CLI, it ships on the wire, and it may not be
+/// renamed. Every other CLI reports its slug.
+///
+/// ⚠ The fleet's Python matched a row's kind against the store table's KEYS,
+/// which are slugs, so it never narrowed for the codex family: **410 of 742 live
+/// rows on 2026-08-22**. It was right only because session ids are unique across
+/// stores, and that luck runs out the moment a caller needs to know WHETHER IT
+/// LOOKED — which the reap does, immediately before destroying a row.
+///
+/// ⇒ So the mapping is stated ONCE, here, next to the registry it derives from,
+/// and both the sidebar that produces the string and the lock that ratifies the
+/// fleet's copy of it read this rather than restating the match.
+pub fn row_icon_kind(kind: SessionKind) -> Option<&'static str> {
+    let descriptor = agent_cli_descriptor(kind)?;
+    Some(match kind {
+        // ⛔ HISTORICAL. Both codex variants wear the same mark, so this slug does
+        //    not identify which of the two a row is — a caller narrowing by it
+        //    must keep both candidates.
+        SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
+        _ => descriptor.slug,
+    })
+}
+
 pub fn agent_cli_for_store_path(path: &str) -> Option<&'static AgentCliDescriptor> {
     AGENT_CLIS
         .iter()
@@ -6761,6 +6789,36 @@ mod tests {
                     descriptor.slug
                 )
             });
+
+            // ⛔⛔ THE SPELLING A ROW REPORTS, RATIFIED BY THE OWNER OF THAT
+            //    QUESTION. `icon_kind` is not always the slug — a codex row wears
+            //    the historical `session` — and the fleet's resolver matched a
+            //    row's kind against the table's KEYS, so it never narrowed for
+            //    codex: 410 of 742 live rows on 2026-08-22. It was right only
+            //    because ids are unique across stores, and that luck runs out the
+            //    moment a caller needs to know WHETHER IT LOOKED, which the reap
+            //    does before destroying a row.
+            let icon_kind = entry["icon_kind"].as_str().unwrap_or_else(|| {
+                panic!(
+                    "{} has no `icon_kind` in cli-stores.json - without it the fleet \
+                     cannot recognise its own rows by the kind they report",
+                    descriptor.slug
+                )
+            });
+            // ⛔ Compared against the PRODUCER, not against mere resolvability.
+            //    The first draft asked only whether `session_kind_for_row` could
+            //    map the alias back, and `"codex"` passed that - the exact wrong
+            //    guess whose absence caused the defect, because the slug arm
+            //    resolves it too. A lock that accepts the wrong answer is not one.
+            assert_eq!(
+                Some(icon_kind),
+                row_icon_kind(descriptor.kind),
+                "cli-stores.json spells {}'s row kind {icon_kind:?}, but a row of \
+                 that kind reports {:?} - the spelling a row reports has one owner \
+                 and this is not a place to restate it",
+                descriptor.slug,
+                row_icon_kind(descriptor.kind)
+            );
 
             let recorded: Vec<&str> = entry["store_globs"]
                 .as_array()

@@ -32,7 +32,7 @@ import argparse, glob, json, os, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from ygg_rowarg import row_session_id  # noqa: E402
+from ygg_rowarg import row_host, row_session_id  # noqa: E402
 import ygg_transcript  # noqa: E402
 YGG = "~/.local/bin/yggterm-headless"
 POLL_S = 20
@@ -77,7 +77,32 @@ def find_row(host, target):
     return None
 
 
-def _reap_if_never_briefed(uuid, row_kind):
+def _carries_anywhere(uuid, token, kind, host):
+    """The ack, looked for on the machine that owns the row as well as here.
+
+    ⚠ Delivery proof had the same host blindness as the reap, with a milder
+    consequence: an ack that landed on another machine could never be found, so
+    a delivery that worked reported UNPROVEN. That is the benign half of the
+    same defect, and fixing one without the other leaves the pair disagreeing.
+    """
+    if ygg_transcript.carries(uuid, token, kind=kind):
+        return True
+    if not host:
+        return False
+    ok, paths = ygg_transcript._remote_transcript_hits(host, uuid, kind, 90)
+    if not ok or not paths:
+        return False
+    quoted = " ".join("'" + p.replace("'", "'\\''") + "'" for p in paths)
+    probe = f"grep -l -F -- '{token}' {quoted} 2>/dev/null | head -1"
+    try:
+        done = subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", host, probe],
+                              capture_output=True, text=True, timeout=90)
+    except Exception:
+        return False
+    return bool((done.stdout or "").strip())
+
+
+def _reap_if_never_briefed(uuid, row_kind, host=None):
     """⛔⛔ A ROW THAT WAS NEVER BRIEFED MUST NOT OUTLIVE THE ATTEMPT TO BRIEF IT.
 
     A spawn whose submit failed used to leave its row seated and empty — holding a
@@ -100,12 +125,23 @@ def _reap_if_never_briefed(uuid, row_kind):
     did. ⇒ Pass what the body reads and nothing else; an unused parameter is where
     a missing one hides.
     """
-    # ⛔ EVERY CLI's store, not just the reference one. This decides whether to
-    #    DESTROY the row, and the old glob could only ever answer "no" for a CLI
-    #    that keeps its transcripts anywhere else — so a working lane that was
-    #    merely busy past the deadline was force-folded as never briefed.
-    if ygg_transcript.has_transcript(uuid, kind=row_kind):
+    # ⛔ EVERY CLI's store, not just the reference one, and on the machine that
+    #    OWNS the row. The old glob could only ever answer "no" for a CLI that
+    #    keeps its transcripts anywhere else, or for a row on another host — so a
+    #    working lane that was merely busy past the deadline was force-folded as
+    #    never briefed.
+    evidence = ygg_transcript.transcript_evidence(uuid, kind=row_kind, host=host)
+    if evidence == ygg_transcript.FOUND:
         log("  the row has a transcript — it has been briefed before, so it STAYS")
+        return 6
+    if evidence != ygg_transcript.ABSENT:
+        # ⛔⛔ WE DID NOT LOOK. Two CLIs declare no transcript template, and a host
+        #    can be unreachable — both come back as "no files" from a boolean, and
+        #    the boolean is what used to be destroyed on. Refusing here is the
+        #    whole asymmetry this function already claims to respect.
+        log(f"  ⛔ transcript {evidence} for kind={row_kind or 'unknown'} on "
+            f"host={host or 'here'} — this is NOT evidence the row never worked, "
+            f"so it STAYS")
         return 6
     fold = os.path.join(HERE, "ygg-fold.py")
     if not os.path.exists(fold):
@@ -165,6 +201,10 @@ def main():
     # ⛔ Which CLI wrote this row's transcript. A narrowing, never a requirement:
     #    without it every declared store is tried, which is still correct.
     row_kind = (row.get("icon_kind") or "").strip() or None
+    # ⛔ WHICH MACHINE holds this row's work. A transcript check that asks the
+    #    local filesystem about a row on another host reads "no transcript" and
+    #    the reap destroys it — measured across 34 such rows on 2026-08-22.
+    row_machine = row_host(row, host)
 
     why = never_armed(uuid)
     if why:
@@ -196,7 +236,7 @@ def main():
             why = "not consuming input yet (still starting up?)"
         if time.time() > deadline:
             log(f"⛔ {why} after {a.wait_min:g}m — NOT delivered")
-            return _reap_if_never_briefed(uuid, row_kind)
+            return _reap_if_never_briefed(uuid, row_kind, row_machine)
         log(f"{why} — waiting {POLL_S}s")
         time.sleep(POLL_S)
 
@@ -219,7 +259,7 @@ def main():
         # ⛔ NEVER RETRY. `submitted:false` means the row was mid-output, not that
         # it is unreachable, and a retry is a second write into the same composer.
         log(f"⛔ submitted:false ({reply.get('error')}) — NOT retried, by law")
-        return _reap_if_never_briefed(uuid, row_kind)
+        return _reap_if_never_briefed(uuid, row_kind, row_machine)
     log(f"submitted {data.get('bytes')}B, proving delivery from the transcript")
 
     if not ack:
@@ -227,7 +267,7 @@ def main():
         return 0
     for _ in range(9):
         time.sleep(15)
-        if ygg_transcript.carries(uuid, ack, kind=row_kind):
+        if _carries_anywhere(uuid, ack, row_kind, row_machine):
             log(f"transcript carries {ack}: True")
             return 0
     log(f"⚠ transcript does not carry {ack} after ~2m — delivery UNPROVEN")

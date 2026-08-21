@@ -46,20 +46,51 @@ def _table():
     return _TABLE
 
 
+#: What the evidence question can honestly answer. ⛔ Three states, not two —
+#: see `transcript_evidence`.
+FOUND = "found"
+ABSENT = "absent"
+UNMEASURABLE = "unmeasurable"
+
+
+def entries_for(kind):
+    """Every table row this kind could name — a LIST, because one mark names two.
+
+    ⛔⛔ A ROW'S `icon_kind` IS NOT ALWAYS THE REGISTRY SLUG, and matching against
+    the table's keys alone silently never narrowed for the biggest CLI: a codex
+    row reports the historical `session`, so 410 of 742 live rows on 2026-08-22
+    missed their own entry and fell through to trying all ten stores. That was
+    right only by luck — ids are unique across stores — and it is wrong the moment
+    a caller needs to know WHETHER IT LOOKED, which the reap does.
+
+    ⚠ **AND `session` NAMES BOTH CODEX VARIANTS**, so narrowing on it cannot
+    return one entry. `row_icon_kind` in yggterm-core is the one owner of this
+    spelling and says so in its own comment; a resolver that returned the first
+    match would have silently stopped finding one CLI's sessions in the act of
+    fixing the other's. Caught by reading the producer, not the table.
+
+    ⚖ A SLUG still wins when a caller passes one: it is the narrower answer.
+    """
+    if not kind:
+        return []
+    table = _table()
+    if kind in table:
+        return [table[kind]]
+    return [entry for entry in table.values() if entry.get("icon_kind") == kind]
+
+
 def templates_for(kind=None):
     """The transcript templates to try, in order.
 
-    `kind` is a row's `icon_kind` — the registry's own slug for the CLI. Passing it
-    is a narrowing, never a requirement: a caller that only holds a uuid (the
-    watchdogs mostly do) gets every declared store tried, which is correct because
-    a session id is unique across them and a glob that matches nothing costs a
-    syscall.
+    `kind` is a row's `icon_kind` or a registry slug. Passing it is a narrowing,
+    never a requirement: a caller that only holds a uuid (the watchdogs mostly do)
+    gets every declared store tried, which is correct because a session id is
+    unique across them and a glob that matches nothing costs a syscall.
     """
-    table = _table()
-    if kind and kind in table:
-        entry = table[kind]
-        return [entry["transcript"]] if entry.get("transcript") else []
-    return [e["transcript"] for e in table.values() if e.get("transcript")]
+    entries = entries_for(kind)
+    if not entries:
+        entries = list(_table().values())
+    return [e["transcript"] for e in entries if e.get("transcript")]
 
 
 def transcript_paths(uuid, kind=None, home=None):
@@ -96,6 +127,68 @@ def has_transcript(uuid, kind=None, home=None):
     anything: the old answer was "no" for every CLI but one.
     """
     return bool(transcript_paths(uuid, kind, home))
+
+
+def transcript_evidence(uuid, kind=None, home=None, host=None, ssh_timeout=90):
+    """`FOUND` / `ABSENT` / `UNMEASURABLE` — the question a DESTRUCTIVE decision
+    must ask instead of `has_transcript`.
+
+    ⛔⛔ **"WE LOOKED AND FOUND NOTHING" AND "WE NEVER LOOKED" ARE DIFFERENT
+    ANSWERS, AND `has_transcript` RETURNS THE SAME `False` FOR BOTH.** Two CLIs
+    declare no transcript template — deliberately, because a template nobody has
+    resolved against a real store is a guess wearing the costume of a measurement.
+    But the reap reads that `False` as *"this row has never written a word, so it
+    was never briefed and cannot become anything"* and destroys the row.
+
+    ⚖ Measured on the live plane, 2026-08-22: **nine rows were in that class** —
+    a kimi row whose transcript is 30 KB on disk and opencode rows sharing a
+    315 KB store. Every one of them would have been force-folded by a delivery
+    that merely ran late, and each was doing exactly what it was spawned to do.
+
+    ⇒ So the two answers are separated here, and the caller that destroys is made
+    to say which one it is acting on. This does NOT guess a path for an
+    unmeasured CLI — that is the mistake the table exists to refuse. It reports
+    that it cannot see, which is the honest answer and the safe one.
+    """
+    if not uuid:
+        return UNMEASURABLE
+    if transcript_paths(uuid, kind, home):
+        return FOUND
+    entries = entries_for(kind)
+    if not entries:
+        # ⚠ No kind, or one nothing in the table claims: every declared store was
+        #   tried and none matched, but a CLI that declares none would look the
+        #   same. That is not evidence of absence.
+        return UNMEASURABLE
+    if not any(e.get("transcript") for e in entries):
+        return UNMEASURABLE
+    if not host:
+        return ABSENT
+    # ⛔ The file may simply be on another machine. Ask the host that owns the row
+    #   before calling a transcript missing — and if the question cannot be PUT,
+    #   say so rather than answering it. A failed ssh is not an empty store.
+    ok, hits = _remote_transcript_hits(host, uuid, kind, ssh_timeout)
+    if not ok:
+        return UNMEASURABLE
+    return FOUND if hits else ABSENT
+
+
+def _remote_transcript_hits(host, uuid, kind, timeout):
+    """`(reachable, paths)` — ⛔ the first element is the whole point. An ssh that
+    times out, is refused, or returns non-zero must never be folded into "no
+    files", because the caller destroys a row on that answer."""
+    import subprocess
+    try:
+        done = subprocess.run(
+            ["ssh", "-n", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={min(30, timeout)}",
+             host, remote_find_command(uuid, kind=kind)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:
+        return False, []
+    if done.returncode != 0:
+        return False, []
+    return True, [line for line in (done.stdout or "").splitlines() if line.strip()]
 
 
 def carries(uuid, token, kind=None, home=None, tail_bytes=400_000):
