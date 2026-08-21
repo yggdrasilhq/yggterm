@@ -43,7 +43,6 @@ use crate::terminal_observe::{
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
     AgentRowActivity, terminal_chunk_agent_activity,
     terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_agent_composer_row,
-    terminal_chunk_has_current_codex_input_row,
     terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
@@ -174,7 +173,7 @@ use yggterm_core::{
     SplitMemberView, TerminalTelemetryEvent,
     WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_foreign_trace_batch,
-    append_perf_event, append_trace_event, best_effort_precis_from_context, best_effort_summary_from_context,
+    append_perf_event, append_trace_event,
     best_effort_title_from_context, check_for_update, current_version, detect_install_context,
     generation_context_from_messages, install_mode_summary, install_release_update_with_progress,
     looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
@@ -201,9 +200,8 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteScannedSession,
     RowSeatRequest, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
-    SessionMetadataEntry, RemoteRuntimeAfterRemoval, SessionPreview, SessionPreviewBlock,
-    SessionRemovalEvidence, SessionRenderedSection, SessionSource, SnapshotPreview,
-    SnapshotPreviewBlock, SnapshotRenderedSection,
+    SessionMetadataEntry, RemoteRuntimeAfterRemoval, SessionPreviewBlock,
+    SessionRemovalEvidence, SessionRenderedSection, SessionSource,
     SessionTeardownProcess, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
     WebElementRef, WebFillMechanism, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs,
@@ -225,8 +223,7 @@ use yggterm_server::{
     stage_remote_clipboard_png, start_command_session_placed,
     start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance, start_local_session_placed,
-    start_remote_agent_session_placed, start_remote_agent_session_seated, start_remote_claude_session_placed,
-    start_remote_codex_session_placed, start_ssh_session_placed, status,
+    start_remote_agent_session_placed, start_remote_agent_session_seated, start_ssh_session_placed, status,
     take_next_app_control_request,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write,
@@ -273,8 +270,7 @@ use yggui::{
     drag_threshold_reached, emphasized_enter_transition, emphasized_exit_transition,
     gradient_background_repeat_css,
     gradient_background_size_css, gradient_css, join_tree_child_path, live_blur_gradient_css,
-    material_blur_radius_px, preview_surface_css,
-    reorder_row_tree, resolve_drag_drop_target as resolve_tree_drag_drop_target,
+    material_blur_radius_px, preview_surface_css, resolve_drag_drop_target as resolve_tree_drag_drop_target,
     resolve_tree_drop_placement,
     search_field_shell_style, search_input_style, shell_tint, standard_accelerate_transition,
     standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
@@ -331,7 +327,6 @@ static SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT: AtomicBool = AtomicBool::new(false);
 static INTENTIONAL_CLIENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_TRACED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_EFFECT_TRACED: AtomicBool = AtomicBool::new(false);
-static APP_ROOT_MAC_WINDOW_FORCED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_LINUX_WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_MAXIMIZED_RESTORED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
@@ -918,6 +913,20 @@ const APP_CONTROL_BACKGROUND_FOCUS_REARM_GRACE_MS: u64 = 750;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } } [style*=\"visibility:hidden\"] .yggterm-loading-dot, [style*=\"visibility: hidden\"] .yggterm-loading-dot, .yggterm-loading-dot[style*=\"visibility:hidden\"], .yggterm-loading-dot[style*=\"visibility: hidden\"] { animation: none !important; }";
 const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !important; }";
+const STATUS_DOT_BLINK_VAR: &str = "--yggterm-status-dot-blink";
+// ⛔⛔ THE BLINK'S PERIOD AND ITS OFF-CLASS ARE NOW LITERALS IN THE TWO
+// CONSTANTS BELOW — `1200` in the JS, `yggterm-blink-off` in both — and until
+// 2026-08-21 they were ALSO named constants that nothing read. The compiler
+// called those dead and they were, but not because the mechanism went away:
+// somebody inlined their values and left the originals behind, so the file held
+// two answers to "how fast" and "which class" with only one of them wired.
+// Deleting them removed a duplicate, not a feature. ⚠ If either literal is ever
+// changed, it must change in BOTH strings — they are one contract split across
+// a stylesheet and a timer, and nothing checks that they agree.
+//
+// The rest of this block is the finding that produced this design, kept because
+// it is a measurement nobody should have to make twice:
+//
 // Status-dot blink — the WORKING signal of the live-session status dot
 // (DESIGN.md "Status indicator vocabulary"). A HARD square-wave blink: full on
 // for the first half of the cycle, full OFF for the second half, with no fade
@@ -999,10 +1008,6 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 /// square wave that takes the dot fully dark reads as a strobe at ~0.9 Hz and
 /// as a heartbeat at ~0.4 Hz. The SHAPE is untouched — full off, full on, no
 /// fade — because that is a settled call (2026-06-26); only the period moved.
-const STATUS_DOT_BLINK_PERIOD_MS: u64 = 2_400;
-const STATUS_DOT_BLINK_VAR: &str = "--yggterm-status-dot-blink";
-/// The class the clock parks on `<html>` for the OFF half of each cycle.
-const STATUS_DOT_BLINK_OFF_CLASS: &str = "yggterm-blink-off";
 /// ⛔ `!important` is load-bearing, not shouting: the working arm's `opacity`
 /// is an INLINE declaration (Dioxus writes `style` attributes), and an ordinary
 /// author rule loses to inline. This is the one place in the shell where the
@@ -1768,7 +1773,6 @@ struct WebSurfaceUiState {
     /// Id (not index) of the visible tab, stable across tab closes.
     active_tab: u64,
     next_tab_id: u64,
-    opened_at_ms: u64,
     last_seen_ms: u64,
     /// In-progress address-bar edit for the ACTIVE tab; None shows the tab URL.
     /// When an inline completion is active this holds the COMPLETED text (what
@@ -5998,11 +6002,6 @@ impl WebTabRailRow {
     fn id(&self) -> String {
         web_tab_row_id(&self.row)
     }
-    fn tab_id(&self) -> u64 {
-        match self.row {
-            WebTabMenuTarget::Tab(id) => id,
-        }
-    }
 }
 
 /// The tab tree as one ordered row list. Pure over the overlay view, so the
@@ -6171,7 +6170,7 @@ fn select_web_surface_tab(
 /// throw away, and the reconciler's next tick observes where the page landed and
 /// updates the address bar, the title and the buttons.
 fn web_surface_step_history(
-    state: Signal<ShellState>,
+    _state: Signal<ShellState>,
     session_path: &str,
     tab_id: u64,
     forward: bool,
@@ -10932,7 +10931,6 @@ fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
             .or_else(|| url.strip_prefix("http://"))
             .unwrap_or(url);
         let no_www = stripped.strip_prefix("www.").unwrap_or(stripped);
-        let days = (*last_ts).saturating_sub(0) as f64;
         let days = (now_ms.saturating_sub(*last_ts) as f64) / 86_400_000.0;
         let frecency = omnibox_frecency_score(*count, days);
         for candidate in [no_www, stripped, url.as_str()] {
@@ -16884,11 +16882,6 @@ struct ShellState {
     /// tab bar is a single strip and cannot draw a tree, so the modal says what
     /// will happen before the organization disappears behind an overflow menu.
     pending_classic_tabs_switch: bool,
-    /// The omnibox is raised as the centred palette. The GATED reader
-    /// ([`ShellState::web_command_palette_open`]), never a second flag: the
-    /// render pass, the modal precedence and the transient cover all take this
-    /// one field, so they cannot come to disagree about whether it is up.
-    web_command_palette_open: bool,
     /// `(rail row id, draft name)` while a tab-tree row is being renamed —
     /// [`web_tab_row_id`], so a FOLDER and a TAB rename through one field. A
     /// second `Option<u64>` beside it for tabs would be a second answer to
@@ -19263,7 +19256,6 @@ impl ShellState {
             pending_media_capture: None,
             copy_edit_dialog: None,
             pending_classic_tabs_switch: false,
-            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             row_drag_click_suppressed_until_ms: 0,
@@ -20647,7 +20639,6 @@ impl ShellState {
                 // launched.
                 active_tab: restore_active_tab,
                 next_tab_id,
-                opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
                 address_typed_len: None,
@@ -20759,7 +20750,6 @@ impl ShellState {
                 tabs: vec![app_tab],
                 active_tab: 0,
                 next_tab_id: 1,
-                opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
                 address_typed_len: None,
@@ -23211,6 +23201,19 @@ impl ShellState {
     /// `address_draft` already answers, and the two would drift the first time
     /// something cleared the draft without clearing the flag, leaving a palette
     /// on screen with nothing in it.
+    ///
+    /// ⛔⛔ AND THE FLAG THIS WARNS ABOUT WAS REALLY THERE, until 2026-08-21.
+    /// `WebSurfaceState` carried a `web_command_palette_open: bool` whose own
+    /// doc claimed to be the gated reader — two fields, two comments, each
+    /// naming itself the single answer. The compiler settled it: the struct
+    /// field was never read by anything. The derivation below is what the
+    /// render pass, the modal precedence and the transient cover have actually
+    /// been asking all along, and the flag was 2.x-era machinery that survived
+    /// its own replacement still wearing the documentation of the winner.
+    ///
+    /// ⚠ The one `web_command_palette_open` that remains beside this is the
+    /// RENDER SNAPSHOT's field, and it is fed from here — a snapshot carrying a
+    /// derived value is not a second source of truth, it is this one, sampled.
     fn web_command_palette_open(&self) -> bool {
         self.active_web_surface()
             .is_some_and(|surface| surface.picker.is_none() && surface.address_draft.is_some())
@@ -23556,9 +23559,6 @@ impl ShellState {
         self.apply_web_tab_row_drop(&session, &drag.row_id, drop);
     }
 
-    fn clear_web_tab_row_drag(&mut self) {
-        self.row_drag = None;
-    }
 
     fn web_tab_row_is_dragging(&self, row_id: &str) -> bool {
         self.row_drag
@@ -24975,6 +24975,8 @@ impl ShellState {
         self.maybe_begin_row_drag(pointer)
     }
 
+
+    #[cfg(test)]
     /// Hover `row_id` at `placement` while a drag is live. Ignored unless the
     /// hovered row belongs to the SAME pane — a rail row cannot be dropped into
     /// another app's list, and silently accepting that would POST an order
@@ -24988,7 +24990,6 @@ impl ShellState {
     ) -> Option<String> {
         self.hover_app_pane_row_drop_group(pane_id, row_id, "", placement, false)
     }
-
     /// …and the form the render calls, which knows whether the hovered row is a
     /// SHUT group. Returns the row the shared engine wants sprung open, if any;
     /// the pane opens it by POSTing its own `expand_action`, which is the only
@@ -25551,10 +25552,6 @@ impl ShellState {
         (current == failure.launch_command).then_some(failure)
     }
 
-    /// Forget a row's recorded failure — an explicit retry, or the row going away.
-    fn clear_terminal_ensure_failure(&mut self, session_path: &str) {
-        self.terminal_ensure_failed.remove(session_path);
-    }
 
     fn maybe_finish_terminal_surface_request_for_session(&mut self, session_path: &str) {
         if self.terminal_attach_in_flight.contains(session_path) {
@@ -29542,26 +29539,6 @@ impl ShellState {
         );
         Some(session_path)
     }
-    fn active_terminal_prefers_text_input(&self) -> bool {
-        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
-            return false;
-        }
-        if (self.right_panel_mode != RightPanelMode::Hidden && !self.terminal_input_override_active)
-            || self.search_focused
-            || self.tree_rename_path.is_some()
-            || is_command_query(&self.search_query)
-        {
-            return false;
-        }
-        let Some(session_path) = self.server.active_session_path() else {
-            return false;
-        };
-        if self.terminal_attach_in_flight.contains(session_path) {
-            return false;
-        }
-        self.terminal_session_has_visual_resume_reveal(session_path)
-            || self.terminal_session_has_ready_attempt(session_path)
-    }
     fn terminal_session_has_active_terminal_request(&self, session_path: &str) -> bool {
         let Some(request) = self.active_surface_requests.get(&YggSurface::Terminal) else {
             return false;
@@ -29704,6 +29681,7 @@ impl ShellState {
         }
         true
     }
+    #[cfg(test)]
     fn retained_fault_recovery_should_rearm(&self, active_session_path: &str, now_ms: u64) -> bool {
         if self.server.active_view_mode() != WorkspaceViewMode::Terminal
             || self.server.active_session_path() != Some(active_session_path)
@@ -32226,11 +32204,6 @@ impl ShellState {
         self.begin_drag(row, pointer);
         true
     }
-    fn clear_pending_tree_drag(&mut self) {
-        if self.pending_tree_drag.take().is_some() {
-            self.refresh_tree_debug("clear_pending_tree_drag");
-        }
-    }
     fn update_tree_drag_pointer(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
         if !self.drag_paths.is_empty() {
             self.update_drag_pointer(pointer);
@@ -32645,9 +32618,6 @@ impl ShellState {
             return;
         }
         append_ui_telemetry_event(event, payload);
-    }
-    fn regenerate_title_for_row(&mut self, _row: &BrowserRow) {
-        self.context_menu_row = None;
     }
     fn persist_settings(&self) {
         yggterm_core::set_perf_profiling_enabled(self.settings.perf_profiling_enabled);
@@ -34249,11 +34219,6 @@ fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: boo
         spawn_title_generation_for_target(state, target, force, announce, false);
     }
 }
-fn spawn_deferred_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
-    spawn(async move {
-        queue_title_generation(state, row, force, force);
-    });
-}
 /// Fill a contributed row's rename field with an AI-generated name.
 ///
 /// The app declared the source text (`rename.ai_source`); yggterm owns the
@@ -34486,11 +34451,6 @@ fn queue_active_session_title_generation_silent(state: Signal<ShellState>, force
         return;
     };
     spawn_title_generation_for_target(state, target, force, false, false);
-}
-fn spawn_deferred_active_session_title_generation(state: Signal<ShellState>, force: bool) {
-    spawn(async move {
-        queue_active_session_title_generation(state, force);
-    });
 }
 fn spawn_title_generation_for_target(
     mut state: Signal<ShellState>,
@@ -44611,42 +44571,6 @@ fn humanized_title_for_copy_target(target: &CopyGenerationTarget) -> Option<Stri
     let title = format!("{} Shell", shell_title_case_words(&leaf));
     (!memoized_generated_fallback_title(&title)).then_some(title)
 }
-fn humanized_summary_for_copy_target(target: &CopyGenerationTarget) -> Option<String> {
-    let cwd = target.cwd.trim();
-    if let Some(machine) = target.remote_machine.as_ref() {
-        let label = machine.label.trim();
-        if !label.is_empty() && !cwd.is_empty() {
-            return Some(format!("Remote shell on {label} rooted at {cwd}."));
-        }
-        if !label.is_empty() {
-            return Some(format!("Remote shell on {label}."));
-        }
-    }
-    if !cwd.is_empty() {
-        return Some(format!("Local shell rooted at {cwd}."));
-    }
-    None
-}
-fn generated_copy_from_context(
-    target: &CopyGenerationTarget,
-    context: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let title =
-        best_effort_title_from_context(context).or_else(|| humanized_title_for_copy_target(target));
-    let precis = best_effort_precis_from_context(context)
-        .or_else(|| humanized_summary_for_copy_target(target));
-    let summary = best_effort_summary_from_context(context)
-        .or_else(|| precis.clone())
-        .or_else(|| humanized_summary_for_copy_target(target));
-    (title, precis, summary)
-}
-fn target_can_fetch_remote_generation_context(target: &CopyGenerationTarget) -> bool {
-    target.remote_machine.is_some()
-        && target
-            .storage_path
-            .as_deref()
-            .is_some_and(|path| !path.trim().is_empty())
-}
 fn remote_preview_storage_path_from_metadata(session: &ManagedSessionView) -> Option<String> {
     let storage_path = metadata_value(session, "Storage").trim().to_string();
     (!storage_path.is_empty()).then_some(storage_path)
@@ -44838,65 +44762,17 @@ fn remote_preview_should_auto_sync(session: &ManagedSessionView) -> bool {
     }
     true
 }
-/// Whether the rendered surface is about to paint a page with nothing to READ.
+/// ⛔⛔ `transcript_has_written_turn` IS ABOUT THE WHOLE TRANSCRIPT, AND THE
+/// PARAMETER IS A BOOL SO THAT IT CANNOT QUIETLY BECOME A WINDOW AGAIN.
 ///
-/// ⛔ **A BLANK SURFACE AND A BROKEN ONE LOOK IDENTICAL, AND THIS CAMPAIGN HAS
-/// PAID FOR THAT MORE THAN ONCE.** The frame that produced this: a live agent
-/// row drawn as a chat panel holding a single collapsed `Work · 2` group and
-/// nothing else. Every instrument said the surface was fine, because it WAS
-/// fine — it had faithfully rendered a transcript with no prose in it. What
-/// the person saw was a page that had failed.
-///
-/// Tool calls and reasoning are not reading matter: a surface whose entire
-/// content is machine work has no answer on it, and must say which of the two
-/// it is rather than leave the reader to guess. The loading and failure
-/// placeholders already own their states; this owns the third.
-///
-/// ⚠ Deliberately narrow — it is false the moment ANY prose block or ANY
-/// rendered section exists, so it can never hide a transcript that has
-/// something to say.
-fn retained_remote_surface_has_non_prompt_text(
-    host_health_cursor_line_text: &str,
-    host_health_text_tail: &str,
-) -> bool {
-    let host_surface_text =
-        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
-    let trimmed = host_surface_text.trim();
-    !trimmed.is_empty()
-        && !terminal_surface_has_prompt_ready_text(host_surface_text)
-        && !terminal_chunk_is_transport_error(host_surface_text)
-        && !terminal_chunk_is_loading_placeholder(host_surface_text)
-        && !terminal_chunk_is_transcript_browser(host_surface_text)
-        && !terminal_chunk_is_saved_transcript_prefill(host_surface_text)
-        && !terminal_chunk_is_low_signal_terminal_noise(host_surface_text)
-        && !terminal_chunk_is_codex_resume_instruction(host_surface_text)
-}
-fn remote_resume_snapshot_is_replayable_for_session(
-    snapshot: &str,
-    remote_starting_agent_session: bool,
-    codex_like_session: bool,
-) -> bool {
-    if codex_like_session && terminal_replay_snapshot_has_cursor_addressed_scrollback_risk(snapshot)
-    {
-        return false;
-    }
-    if !remote_resume_blank_host_snapshot_is_replayable(snapshot) {
-        return false;
-    }
-    let trimmed = snapshot.trim();
-    if remote_starting_agent_session {
-        return terminal_chunk_is_codex_prompt_surface(trimmed)
-            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed);
-    }
-    if codex_like_session {
-        return terminal_chunk_is_codex_prompt_surface(trimmed)
-            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
-            || terminal_chunk_has_codex_prompt_output(trimmed);
-    }
-    true
-}
+/// This took `&[PreviewRun]` and the caller passed the runs of the virtual
+/// window — the slice the reader is scrolled over. The notice then announced
+/// "this web view has no written turns" over any stretch of pure tool calls,
+/// with the transcript's own content drawn directly underneath it. Taking the
+/// answer instead of the material is what stops the next caller repeating it:
+/// there is no longer a collection here for a window to be substituted into.
 fn preview_surface_has_nothing_to_read(
-    runs: &[PreviewRun],
+    transcript_has_written_turn: bool,
     rendered_sections_empty: bool,
     loading_placeholder_visible: bool,
     failure_placeholder_visible: bool,
@@ -44907,32 +44783,32 @@ fn preview_surface_has_nothing_to_read(
     if !rendered_sections_empty {
         return false;
     }
-    !runs
-        .iter()
-        .flat_map(|run| run.entries.iter())
-        .any(|entry| !preview_block_is_activity(&entry.block))
+    !transcript_has_written_turn
 }
+/// ⚠ `transcript_is_empty`, NOT "the window is empty" — a BLOCKING placeholder
+/// replaces the page, so it may only appear when there is nothing anywhere.
 fn preview_should_show_blocking_failure_placeholder(
     preview_failure_present: bool,
-    grouped_runs_empty: bool,
+    transcript_is_empty: bool,
     rendered_sections_empty: bool,
     fallback_context_visible: bool,
 ) -> bool {
     preview_failure_present
-        && grouped_runs_empty
+        && transcript_is_empty
         && rendered_sections_empty
         && !fallback_context_visible
 }
+/// ⚠ Same reading as the failure twin: the transcript, never the window.
 fn preview_should_show_blocking_loading_placeholder(
     preview_loading: bool,
     failure_placeholder_visible: bool,
-    grouped_runs_empty: bool,
+    transcript_is_empty: bool,
     rendered_sections_empty: bool,
     fallback_context_visible: bool,
 ) -> bool {
     preview_loading
         && !failure_placeholder_visible
-        && grouped_runs_empty
+        && transcript_is_empty
         && rendered_sections_empty
         && !fallback_context_visible
 }
@@ -53432,9 +53308,6 @@ fn snapshot_session_keep_alive(session: &SnapshotSessionView) -> bool {
 fn live_session_temporary_update_restore(session: &ManagedSessionView) -> bool {
     metadata_value(session, "Runtime Restore Reason") == "update-restart"
 }
-fn live_session_restart_protected(session: &ManagedSessionView) -> bool {
-    live_session_keep_alive(session) || live_session_temporary_update_restore(session)
-}
 fn live_session_detail_label(summary: String, keep_alive: bool) -> String {
     if !keep_alive {
         return summary;
@@ -56994,19 +56867,6 @@ const CONTEXT_MENU_MIN_BAND_WIDTH_PX: f64 = 96.0;
 /// The natural minimum box, so a two-item menu is not a sliver. Border-box, like
 /// the max — see [`context_menu_surface_style`].
 const CONTEXT_MENU_MIN_BOX_PX: f64 = 200.0;
-/// How much of a menu entry's width is NOT label: the surface's own padding, the
-/// entry's horizontal padding, and the icon slot with its gap.
-///
-/// Named because a lock reads it. "Does this label fit the narrowest menu the app
-/// draws" is a question about geometry, and a lock that answered it with a magic
-/// number would go quietly wrong the day the padding changes.
-const CONTEXT_MENU_ITEM_TEXT_INSET_PX: f64 = 12.0 + 24.0 + 25.0;
-/// A rough average advance for the menu's 12px, 600-weight interface font.
-///
-/// Deliberately approximate — this is the budget for a length lock, not a
-/// layout. It only has to be close enough to catch a label that is four times
-/// too long, which is the failure the user photographed.
-const CONTEXT_MENU_LABEL_CHAR_PX: f64 = 6.6;
 /// THE width owner for a context menu.
 ///
 /// Both halves of the decision read this one number: [`context_menu_placement`]
@@ -69261,28 +69121,6 @@ fn segmented_expectation(expected: &str, boxes: usize) -> Vec<String> {
         .collect()
 }
 
-/// PURE readback rule: given what each box holds, which boxes are right?
-///
-/// This exists because the old readback was structurally incapable of reporting
-/// the failure it was written to catch. It compared the WHOLE expected string
-/// against `targets.first()` — one box, holding one character — so on a 6-box
-/// OTP it returned false (or null) for a perfectly good fill, and could never
-/// name the merge. The measured case: typing `292244` over a prior `278347`
-/// produced `278344`, and the boolean still read fine.
-///
-/// The live path runs the same rule PAGE-SIDE (only booleans cross back out —
-/// F4 redaction), sharing `segmented_expectation` so the chunking has exactly
-/// one owner; this function is the same rule expressed where it can be tested
-/// with no browser.
-fn segmented_match(expected: &str, per_box: &[Option<String>]) -> (bool, Vec<bool>) {
-    let want = segmented_expectation(expected, per_box.len());
-    let per: Vec<bool> = per_box
-        .iter()
-        .zip(want.iter())
-        .map(|(held, want)| held.as_deref() == Some(want.as_str()))
-        .collect();
-    (per.iter().all(|ok| *ok) && !per.is_empty(), per)
-}
 
 /// What one PINNED box holds, as far as emptiness is concerned. Lengths and
 /// booleans only — no page value crosses back out (F4).
@@ -81419,8 +81257,7 @@ async fn process_pending_app_control_requests(
             // poll the session's daemon screen until it shows a CURRENT codex input
             // row (idle interactive prompt), then send. If it never becomes ready
             // within the timeout, send NOTHING and report not-ready so the caller
-            // retries later or skips — never fire a prompt into a menu/busy/update
-            // surface. Readiness policy = terminal_chunk_has_agent_composer_row,
+            // retries later or skips — never fire a prompt into a menu/busy/up_started          // surface. Readiness policy = terminal_chunk_has_agent_composer_row,
             // which recognizes EVERY registered agent CLI's composer glyph (codex
             // `›`, Claude Code `❯`). With only codex's, a claude-code row was never
             // ready and its prompt was never sent (live, guihost 2026-08-06).
@@ -85019,3 +84856,130 @@ fn ghostty_dock_request(
         retry_budget: 16,
     })
 }
+
+// ── TEST AFFORDANCES ─────────────────────────────────────────────────────
+// ⛔ Nothing that SHIPS calls these; the test suite does, to assert on
+// behaviour that is still live. They were `dead_code` warnings for exactly
+// that reason, and a warning nobody can act on is how the other 60 in this
+// crate went unread. `#[cfg(test)]` is the accurate statement: not dead,
+// not shipped, and now it cannot drown a real one.
+// ⚠ If a test below is the LAST caller of one of these, the behaviour it
+// characterises may already be gone — check the product path before
+// trusting the green tick.
+#[cfg(test)]
+/// Whether the rendered surface is about to paint a page with nothing to READ.
+///
+/// ⛔ **A BLANK SURFACE AND A BROKEN ONE LOOK IDENTICAL, AND THIS CAMPAIGN HAS
+/// PAID FOR THAT MORE THAN ONCE.** The frame that produced this: a live agent
+/// row drawn as a chat panel holding a single collapsed `Work · 2` group and
+/// nothing else. Every instrument said the surface was fine, because it WAS
+/// fine — it had faithfully rendered a transcript with no prose in it. What
+/// the person saw was a page that had failed.
+///
+/// Tool calls and reasoning are not reading matter: a surface whose entire
+/// content is machine work has no answer on it, and must say which of the two
+/// it is rather than leave the reader to guess. The loading and failure
+/// placeholders already own their states; this owns the third.
+///
+/// ⚠ Deliberately narrow — it is false the moment ANY prose block or ANY
+/// rendered section exists, so it can never hide a transcript that has
+/// something to say.
+fn retained_remote_surface_has_non_prompt_text(
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+) -> bool {
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
+    let trimmed = host_surface_text.trim();
+    !trimmed.is_empty()
+        && !terminal_surface_has_prompt_ready_text(host_surface_text)
+        && !terminal_chunk_is_transport_error(host_surface_text)
+        && !terminal_chunk_is_loading_placeholder(host_surface_text)
+        && !terminal_chunk_is_transcript_browser(host_surface_text)
+        && !terminal_chunk_is_saved_transcript_prefill(host_surface_text)
+        && !terminal_chunk_is_low_signal_terminal_noise(host_surface_text)
+        && !terminal_chunk_is_codex_resume_instruction(host_surface_text)
+}
+#[cfg(test)]
+fn remote_resume_snapshot_is_replayable_for_session(
+    snapshot: &str,
+    remote_starting_agent_session: bool,
+    codex_like_session: bool,
+) -> bool {
+    if codex_like_session && terminal_replay_snapshot_has_cursor_addressed_scrollback_risk(snapshot)
+    {
+        return false;
+    }
+    if !remote_resume_blank_host_snapshot_is_replayable(snapshot) {
+        return false;
+    }
+    let trimmed = snapshot.trim();
+    if remote_starting_agent_session {
+        return terminal_chunk_is_codex_prompt_surface(trimmed)
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed);
+    }
+    if codex_like_session {
+        return terminal_chunk_is_codex_prompt_surface(trimmed)
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
+            || terminal_chunk_has_codex_prompt_output(trimmed);
+    }
+    true
+}
+#[cfg(test)]
+fn target_can_fetch_remote_generation_context(target: &CopyGenerationTarget) -> bool {
+    target.remote_machine.is_some()
+        && target
+            .storage_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+}
+#[cfg(test)]
+fn live_session_restart_protected(session: &ManagedSessionView) -> bool {
+    live_session_keep_alive(session) || live_session_temporary_update_restore(session)
+}
+#[cfg(test)]
+/// PURE readback rule: given what each box holds, which boxes are right?
+///
+/// This exists because the old readback was structurally incapable of reporting
+/// the failure it was written to catch. It compared the WHOLE expected string
+/// against `targets.first()` — one box, holding one character — so on a 6-box
+/// OTP it returned false (or null) for a perfectly good fill, and could never
+/// name the merge. The measured case: typing `292244` over a prior `278347`
+/// produced `278344`, and the boolean still read fine.
+///
+/// The live path runs the same rule PAGE-SIDE (only booleans cross back out —
+/// F4 redaction), sharing `segmented_expectation` so the chunking has exactly
+/// one owner; this function is the same rule expressed where it can be tested
+/// with no browser.
+fn segmented_match(expected: &str, per_box: &[Option<String>]) -> (bool, Vec<bool>) {
+    let want = segmented_expectation(expected, per_box.len());
+    let per: Vec<bool> = per_box
+        .iter()
+        .zip(want.iter())
+        .map(|(held, want)| held.as_deref() == Some(want.as_str()))
+        .collect();
+    (per.iter().all(|ok| *ok) && !per.is_empty(), per)
+}
+#[cfg(test)]
+/// How much of a menu entry's width is NOT label: the surface's own padding, the
+/// entry's horizontal padding, and the icon slot with its gap.
+///
+/// Named because a lock reads it. "Does this label fit the narrowest menu the app
+/// draws" is a question about geometry, and a lock that answered it with a magic
+/// number would go quietly wrong the day the padding changes.
+const CONTEXT_MENU_ITEM_TEXT_INSET_PX: f64 = 12.0 + 24.0 + 25.0;
+#[cfg(test)]
+/// A rough average advance for the menu's 12px, 600-weight interface font.
+///
+/// Deliberately approximate — this is the budget for a length lock, not a
+/// layout. It only has to be close enough to catch a label that is four times
+/// too long, which is the failure the user photographed.
+const CONTEXT_MENU_LABEL_CHAR_PX: f64 = 6.6;
+#[cfg(test)]
+/// ⚠ The narrative that used to sit here is now above `STATUS_DOT_BLINK_CSS`,
+/// beside the mechanism it describes. This value survives only because a test
+/// asserts the clock's period; the shipped timer carries the number itself.
+const STATUS_DOT_BLINK_PERIOD_MS: u64 = 2_400;
+#[cfg(test)]
+/// The class the clock parks on `<html>` for the OFF half of each cycle.
+const STATUS_DOT_BLINK_OFF_CLASS: &str = "yggterm-blink-off";

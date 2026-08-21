@@ -52,9 +52,6 @@ pub(crate) enum TerminalJsCommand {
         enabled: bool,
         focus: bool,
     },
-    Redraw {
-        reason: String,
-    },
     Refit,
     /// Daemon-handover paint suspension (user-settled call #7). While `true` the
     /// host stops its OWN render work — the render-health probe and its recovery
