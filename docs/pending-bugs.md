@@ -18,6 +18,81 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.0] THE CWD TREE'S SELECTION NEVER REACHES THE START PAGE, BECAUSE THE ACTIVE SESSION OVERWRITES IT
+
+**Status:** OPEN
+
+*Reported 2026-08-22 with a screenshot: a folder highlighted in the cwd tree, the start page
+listing work from everywhere, and the folder's own count disagreeing with the header's.* ⛔ The screenshot is staged outside any repo — a faithful frame leaks
+by BACKGROUND and must never land in `~/gh`.
+
+Three separate things are true in that one frame, and only the middle one is a plain bug.
+
+### 1. ⚖ THE START PAGE RANKS BY SCOPE, IT DOES NOT FILTER — AND THAT IS A SETTLED CALL
+
+`startpage.rs` states it where the scope is applied: *"THE SCOPE RANKS, IT DOES NOT DROP"*,
+root-caused 2026-08-08. The predicates used to filter, and one page read three times with a
+different row selected answered **188, then 40, then 4** — a row outside the selected row's
+`{machine_key, cwd}` looked exactly like a row that had never existed. **The owner hit that while
+removing a delegate and going to the start page to respawn it.**
+
+⇒ "Show only this folder's sessions" is the behaviour that was deliberately removed after it bit
+him. Restoring it is his call to make, not a defect to quietly fix — and it is worth pairing with
+whatever would have saved him the first time: a visible statement that a scope is in force, and a
+way out of it, neither of which the page has today.
+
+### 2. ⛔ THE REAL DEFECT: A LIVE SESSION OVERWRITES WHAT THE USER CLICKED
+
+Whatever the scope then DOES with the selection, it is not reading the user's selection at all.
+The render snapshot builds its `selected_path` like this:
+
+```rust
+let selected_path = if let Some(active) = self.server.active_session() {
+    if active.source == SessionSource::LiveSsh
+        || active.session_path.starts_with("remote-session://")
+        || is_local_live_session_path(&active.session_path)
+    { Some(active.session_path.clone()) }          // <- the ACTIVE SESSION WINS
+    else { self.browser.selected_path()... }
+} else { self.browser.selected_path()... }
+```
+
+`start_page_recent_scope` reads `snapshot.selected_row`, and startpage's own comment calls that
+*"(sidebar selection)"*. **It is not.** With any live agent row active — which on this fleet is
+always — the scope is derived from the ACTIVE SESSION's machine and cwd, and clicking a folder
+changes nothing about it.
+
+**Measured live, on the shipped build, in one reading:**
+
+| field | value |
+|---|---|
+| `browser.stored_selected_path` | a machine group — what the user last chose |
+| `browser.selected_path` | an unrelated live agent session |
+| `browser.selected_row` | that session's row |
+
+⇒ **Two encodings of "what is selected", disagreeing at rest.** The folder row is not the
+problem: it carries everything the scope needs (a machine key, a `session_cwd` naming the folder, and
+`kind: Group`), and `remote_folder_cwd` parses its path correctly. The selection simply never
+arrives.
+
+⚠ **Fix the SELECTION, not the scope.** Whether the scope ends up ranking or filtering, it must
+first be given the row the user actually clicked. ⛔ And the override cannot just be deleted: it
+is what makes the sidebar follow the active session as work moves. Two concepts — *what is
+selected* and *what is active* — currently share one field, and that is the SSOT violation the
+owner named.
+
+### 3. ⚠ THE TWO COUNTS WERE NEVER THE SAME QUESTION, AND NOTHING SAYS SO
+
+A machine row reading `⌄ 795` beside a header reading `857 shown`, on one screen. Measured the
+same night: the machine row's badge is its **descendant count** — the four machines listed 802,
+697, 679 and 18, the tree having grown between his frame and the reading — while the header counts
+**start-page candidates across every machine**, which is a different population entirely and includes stored sessions that are not tree
+rows. Neither number is wrong and neither is labelled, so the only available reading is that one
+of them is broken.
+
+⇒ Cheapest honest repair: say what each count counts. A badge that means "descendants on this
+machine" and a header that means "resumable work everywhere" can sit on one screen without
+contradiction the moment either admits which it is.
+
 ---
 
 ## ⛔ [11.26] `web <verb> --session` ADDRESSES A ROW AND SILENTLY ANSWERS ABOUT WHICHEVER TAB IS ACTIVE
