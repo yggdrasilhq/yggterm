@@ -78,6 +78,10 @@ def main():
     ap.add_argument("--purpose", required=True, help="one line a human can act on")
     ap.add_argument("--cwd", required=True)
     ap.add_argument("--brief", required=True, help="file holding the brief to submit")
+    ap.add_argument("--no-group", action="store_true",
+                    help="leave the row at the top level. Needed for a SUCCESSOR at a head "
+                         "seat: deriving the group from the seat would nest 11.0's successor "
+                         "under 11.0, i.e. under the row it is replacing.")
     ap.add_argument("--into", help="row this one is nested under (uri or uuid); "
                                    "default: the seat's own head, e.g. 11.0 for 11.21")
     ap.add_argument("--ack", help="token that must appear in the transcript; "
@@ -142,19 +146,21 @@ def main():
 
     # 3. INTO ITS GROUP. A lane that sits beside its orchestrator instead of
     #    under it is the hygiene complaint this verb exists to end.
-    into = a.into
-    if not into:
+    into = None if a.no_group else a.into
+    if a.no_group:
+        log("left at the top level (--no-group)")
+    elif not into:
         rows = (app(host, "rows --json").get("data") or {}).get("rows") or []
         head_seat = a.seat.split(".")[0] + ".0"
         into = next((r.get("full_path") for r in rows
                      if str(r.get("outline_prefix")) == head_seat), None)
-    if into:
+    if into and not a.no_group:
         if "://" not in into:
             rows = (app(host, "rows --json").get("data") or {}).get("rows") or []
             into = next((r["full_path"] for r in rows if into in (r.get("full_path") or "")), into)
         res = app(host, f"row-set '{row}' --into '{into}'")
         log(f"nested under {str(into)[-42:]}: accepted={(res.get('data') or {}).get('accepted')}")
-    else:
+    elif not a.no_group:
         log("⚠ no head row found for this campaign — left at the top level")
 
     # 4. WAIT FOR IT TO BE READING INPUT. A cold agent row needs SECONDS, and the
