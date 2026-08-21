@@ -205,6 +205,10 @@ fn print_server_help() {
   yggterm-headless server snapshot
   yggterm-headless server shutdown
   yggterm-headless server terminal write <session> (--data <data>|--stdin) [--refuse-if-draft]
+  yggterm-headless server terminal write <session> --submit-iff-line-equals <text>
+    press Enter ONLY if the composer's line is exactly <text>; refuses otherwise
+    and says which. The atomic half of a two-write submit — see the queue entry
+    on typing over a draft. Takes no --data.
   yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm-headless server terminal tenants [<session>]
   yggterm-headless server wpe <verb> [--key value ...]
@@ -1260,7 +1264,15 @@ fn main() -> Result<()> {
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
         let endpoint = cli_server_endpoint(store.home_dir());
-        let data = if args.iter().any(|arg| arg == "--stdin") {
+        // ⛔ THE CONDITIONAL SUBMIT TAKES NO DATA. It writes exactly one `\r`,
+        // and only if the composer's line already reads what the caller says it
+        // wrote — so requiring `--data` here would make the guard's own call
+        // look like a second text write.
+        let submit_iff_line_equals = cli_flag_value(&args, "--submit-iff-line-equals")
+            .map(ToString::to_string);
+        let data = if submit_iff_line_equals.is_some() {
+            String::new()
+        } else if args.iter().any(|arg| arg == "--stdin") {
             let mut value = String::new();
             std::io::stdin()
                 .read_to_string(&mut value)
@@ -1278,14 +1290,26 @@ fn main() -> Result<()> {
         // `accepted:true` is not a guard.
         // [[finding-a-constant-anomaly-is-a-measurement-bug]]
         let refuse_if_draft = args.iter().any(|arg| arg == "--refuse-if-draft");
-        let message =
-            yggterm_server::terminal_write_guarded(&endpoint, &args[3], &data, refuse_if_draft)?;
+        let message = yggterm_server::terminal_write_guarded_full(
+            &endpoint,
+            &args[3],
+            &data,
+            refuse_if_draft,
+            submit_iff_line_equals.clone(),
+        )?;
         let refused = yggterm_server::terminal_write_was_refused_for_draft(message.as_deref());
+        let refused_for_line =
+            yggterm_server::terminal_submit_was_refused_for_line(message.as_deref());
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
-                "accepted": !refused,
+                // ⛔ Either refusal means nothing was submitted. A caller that
+                // reads only `refused_for_draft` would take a line-mismatch
+                // refusal as a success and believe it had pressed Enter.
+                "accepted": !refused && !refused_for_line,
                 "refused_for_draft": refused,
+                "refused_for_line": refused_for_line,
+                "conditional_submit": submit_iff_line_equals.is_some(),
                 "session_path": args[3],
                 "bytes": data.len(),
                 "message": message,
