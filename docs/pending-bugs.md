@@ -627,10 +627,26 @@ silently breaks the probe.
 correctly, but it cannot tell a caller *what* the line is, and a row whose CLI has not
 yet redrawn its composer is invisible to both arms at once.
 
-**Live proof owed, and it cannot be taken without a roll:** the falsifier below reads
-the daemon's own `pending_input_drafts`, which the DAEMON builds — so it needs a daemon
-running this code, and the roll watcher has been dead since 15:51 today (its own queue
-entry). Ask for it after the next deploy.
+**LIVE-PROVEN 2026-08-21 on the deployed 3.1.30 daemon, both halves.** Four sessions it
+owns, every composer read EMPTY off the rendered grid and the sweep naming none of them;
+then ONE character typed into one of those composers and the sweep names that row. The
+negative control is not a fixture: a sibling row acquired a draft between the two reads
+on its own, so the sweep was discriminating rather than answering true to everything.
+
+⚠ **The `input-check` RELAY of the same field is still owed**, and it is not a code gap:
+the field is rendered by the GUI, and the GUI on the owner's machine predates this
+change (it only picks one up on a restart, which this lane does not take). Asked on a
+row mid-output it answered `composer_shown: false` and, correctly, **typed nothing** —
+so the refusal path holds; what is unproven is the tri-state rendering.
+
+⛔ **AND THE ATOMIC SUBMIT SHARES THE BLIND SPOT — measured, and it is why boot-text
+residue cannot clear itself.** `--submit-iff-line-equals` compares against the same
+daemon-built input line, so across a handover it compares 0 bytes against 458 and can
+never fire. On a live jammed row the rendered screen held all 458 bytes and the daemon
+answered `holds 0 bytes, expected 458`. ⇒ The ledger's "COMPLETE it next tick" path is
+guaranteed to fail on any write that predates a handover, which makes such a row
+permanently unrecoverable by the safe path. `ygg-booter.py unjam` is the floor under
+that; adopt-path seeding would remove the need for it.
 
 ## ⛔⛔⛔ [11.20] `composer_held_draft` HAD NO DISCRIMINATOR LEFT — CONFIRMED, AND FIXED
 
@@ -1500,10 +1516,30 @@ under a second in state `S`, and disappeared — never once observed in `Z`, whe
 old code would have parked it forever. Against that, the four pre-fix daemons on the
 same host went on accumulating throughout.
 
-⇒ **Still owed:** the same probe against a ROLLED fleet daemon. The fix is on `main`;
-the installed binary predates it, and forcing a fleet roll to satisfy a falsifier is
-not a trade this lane gets to make while the machine is in use. The recipe is above and
-takes about thirty minutes of daemon uptime.
+### The rolled fleet daemon — run, and ONE notification short of this entry's own bar
+
+*The fleet rolled to 3.1.29 at 19:18 on its own, so the probe this entry was waiting for
+became available without anyone forcing a deploy. Measured against the INSTALLED daemon.*
+
+| | |
+|---|---|
+| rolled daemon uptime | **63.8 min** |
+| notifications it really spawned | **2** (19:49:09, 20:04:19) |
+| zombies held, across 82 samples | **0** |
+| the two pre-fix daemons beside it, same window | **91 → 92** and **80 → 81** |
+
+⚠ **This entry asked for three notifications and got two, and the reason is worth more
+than the missing one.** The notifier only fires while the host is genuinely under load.
+The host cooled at 20:09 — partly because this lane's own sandbox daemons stopped
+consuming tmpfs — and the third cooldown expiry had nothing to report. ⇒ **This
+falsifier cannot be run on demand: it needs the machine to be unhealthy, and tidying up
+removes the condition it depends on.** Expect to wait for weather, not for uptime.
+
+⇒ **Still owed: the third notification, and nothing else.** A monitor is armed against
+the rolled daemon and will record it whenever the host next heats up. Its tally
+accumulates to a file rather than recounting from the trace, because the trace is a byte
+budget and a count re-derived from it can go DOWN — evidence that can evaporate is not
+evidence.
 
 **What remains open — and it is sharper than "nobody looked":** the codebase's only
 zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
@@ -22565,6 +22601,39 @@ render path then does no I/O and both columns answer the same question by constr
 **Falsified by:** starting the GUI from an environment whose `PATH` omits the managed CLI
 bin dir, then comparing its `This machine` count against what another host's matrix reports
 for that same machine over ssh. Equal counts falsify the divergence; unequal counts are it.
+
+## ⛔ NOTHING RUNS `ygg-land`, SO A LANE EITHER SITS UNLANDED OR BREAKS THE SPLIT ITSELF
+
+**Status:** OPEN
+
+⚠ **This is one layer ABOVE the roll gap below it, not a duplicate of it.** That entry owns
+`main` → the machine someone is using. This one owns a lane branch → `main`. Both are absent;
+either alone strands work, and they fail in the same silent direction.
+
+`ygg-land.py`'s own header states the split it enforces: *"a LANE pushes its own branch and
+says it is ready. The ORCHESTRATOR lands it and is the only thing that rolls."* The lane half
+works — branches are pushed. **The orchestrator half is nobody.** No process anywhere runs the
+verb, on any interval, and the seat the split names has been dead since the afternoon.
+
+**Measured 2026-08-21 19:56:** `ygg-land.py status` reports **9 branches carrying unlanded
+work**. One of them had been pushed, tested and green for two hours while its author believed
+the mechanism would take it, because the mechanism took two other branches in that window —
+which is the tell. A queue that empties sometimes reads as a queue that is being served.
+
+⛔ **And the lane is left with only bad options.** Wait, and the work never reaches the roll
+that builds from `main`. Or land itself, which is exactly what the split forbids, and which
+this lane then did — deliberately and recorded here, because landing without rolling touches
+neither of the two hazards the split names (divergence, which landing *removes*, and two
+agents allocating two versions, which only rolling can cause). ⚠ **That reasoning is sound for
+one branch and does not generalise:** the moment two lanes reach it at once it is the
+divergence the split exists to prevent, arrived at by the same argument.
+
+**The shape of the fix:** supervise `ygg-land.py land --all` the way the other recurring jobs
+are supervised, so its lifetime does not depend on a session; and give "when did a land last
+run" a surface, so its absence is reported rather than inferred from a branch that sat.
+
+**Falsified by:** a supervisor that runs the verb after its launching session exits, or any
+surface answering how long it has been since a land completed.
 
 ## [11.9] THE JOB THAT LANDS EVERY LANE'S WORK IS ITSELF A LOOP NOBODY RESTARTS
 
