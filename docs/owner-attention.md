@@ -368,6 +368,26 @@ answered. **To reverse:** it is a view-layer rule; no data change either way.
 
 ---
 
+## One campaign's row is out of API CREDITS, and only he can restore them
+
+A subscribed row was refused by the model provider with *"out of usage credits …
+`/model` to switch models"*, which no amount of waiting fixes: a balance is
+restored by a purchase, or the row moves to another model. **Both are his.**
+
+**Done meanwhile, so nothing is blocked on the answer.** That refusal used to
+hold the WHOLE fleet — every other campaign's rows were unwakeable behind one
+row's billing state, twice today, and the same shape ran 7.4 continuous hours on
+2026-08-14. It is now a **per-row suspension**: that one row sits out, the fleet
+stays wakeable, and it un-suspends by itself the moment the row writes again.
+A genuine timed quota window still holds everything, which is correct — that one
+does clear on its own.
+
+**Recommendation: no action unless he wants that campaign woken tonight.** It
+costs nothing to leave: the row is alive, its work is not lost, and it resumes
+the moment either remedy is applied. **To reverse:** nothing to reverse.
+
+---
+
 ## Nothing is waiting on him for these, and they are the relay's actual queue
 
 Said explicitly because the tab is easier to read when it is short: everything
