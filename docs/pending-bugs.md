@@ -266,6 +266,49 @@ question. **Status here is about which surface is chosen and whether the launch 
 `YGGTERM_HOME` on the shipped binary, with its own trace plane, in about a minute, without
 touching the desktop. Reach for it before parking a restore-path claim on "the next restart".
 
+## ⛔⛔ [11.26] THE SANDBOX HARNESS FILLS A RAM DISK AND THEN REPORTS CLEAN RESULTS IT NEVER RENDERED
+
+**Status:** OPEN
+
+⛔⛔ **THE DANGEROUS HALF IS NOT THE LEAK, IT IS THE SHAPE OF THE FAILURE.** A reproduction loop
+of eight trials ran to completion and printed a clean verdict for every one of them. **No GUI had
+started in any of them.** `underglass-sandbox.sh start` failed, `env` then found no
+`wayland-display`, every app-control call returned nothing, the diff parsed nothing, and the loop
+reported *"not caught in 8 trials"* — a sentence that reads as evidence of absence and was
+produced by a harness that rendered no pixels at all. Had that line been believed, the honest
+conclusion "this fault is rarer than we thought" would have been recorded from a run that tested
+nothing.
+
+**The mechanism, measured 2026-08-22.** `underglass-sandbox.sh stop` **preserves the sandbox home
+by design** (the header says so — "sandbox home is preserved for inspection"). Nothing ever reaps
+them. They accumulate under `$XDG_RUNTIME_DIR`, which is a **tmpfs — RAM, not disk**. Found: **48
+dead sandbox homes holding a 51 GB tmpfs at 100% full**, several at 2.4–2.9 GB each, the oldest
+weeks old and belonging to lanes long since landed. `start` then dies with
+`cat: write error: No space left on device` and returns **rc=0**.
+
+⚠ **And it is a SHARED host, so this is other people's failure too.** Three sandboxes were LIVE at
+the time, owned by other sessions (their compositors still running). A blanket cleanup would have
+killed live work; the reap has to check `sway.pid` liveness per directory and skip anything whose
+compositor answers. 48 dead homes were reaped this way and 33 GB returned, with the three live
+ones untouched.
+
+**What it wants, in order of value:**
+
+1. ⭐ **`start` must FAIL LOUDLY.** Returning rc=0 having written no display file is the whole
+   defect — every caller downstream then measures nothing and says so in the language of success.
+   A missing `wayland-display` after `start` is an error, not a state.
+2. **`stop` should reap by default**, with `--keep` for the inspection case the header describes.
+   Preserving by default is backwards: the inspection case is rare and deliberate, the leak is
+   automatic and invisible.
+3. **A liveness-checked sweeper** — skip any directory whose `sway.pid` is alive, because the host
+   is shared.
+4. ⚠ **Callers must not `eval "$(sandbox env)"` in a loop.** It exports `HOME`, so the next
+   iteration's `start` runs against the previous trial's sandbox home. The script header already
+   warns about the `HOME` export; it does not say that a LOOP is where it bites.
+
+⇒ Filed from the 11.26 lane, which lost a full reproduction run to it. It belongs to whoever owns
+the sandbox harness, not to the paint bug.
+
 ## ⛔⛔⛔ [11.26] LEGENDARY — THE TUI PAINTS WRONG WHILE THE BUFFER IS CORRECT, AND EACH CLI BREAKS IN A DIFFERENT REGION
 
 **Status:** OPEN
