@@ -842,6 +842,56 @@ falsified and was not testable there:** that host's GUI is parented to pid 1, so
 supervised pair to lose. Re-test the supervisor claim where the GUI actually runs under one
 before treating this entry as closed.
 
+## ⛔⛔ TWO BINARIES CALL THEMSELVES 3.1.26 AND SPEAK DIFFERENT WIRE SHAPES
+
+**Status:** OPEN
+
+*Found 2026-08-21 by a lane that was not looking for it: the full server suite went red
+on `daemon::tests::protocol_shape_stamp_forces_version_bump`, which fails deterministically
+and NOT only under parallel load.*
+
+`ServerRequest`/`ServerResponse` changed shape in **`a968091d`** (17:36) while the workspace
+version still read **3.1.26** — the version already built, installed and serving. The release
+to 3.1.27 followed **31 minutes later** (`89ceea38`, 18:07). The stamp constants were not
+touched, so the guard that exists to force exactly this bump has been red on `main` ever since.
+
+Verified independently of the test, by extracting both enum blocks and hashing them the way
+`fnv1a_build_id` does:
+
+| | |
+|---|---|
+| shape hash on `origin/main` | `0xb0be92515d8e30a0` |
+| shape hash on this lane | `0xb0be92515d8e30a0` (identical — not introduced here) |
+| `STAMPED_SHAPE_HASH` on both | `0x59be8a8cd2b159bf`, stamped at 3.1.16 |
+
+⛔ **And the hazard is not hypothetical, it is on the disk.** A lane worktree built at 18:06
+from a tree containing `a968091d` produces a binary that answers `--version` with **3.1.26**
+and speaks the NEW shape, while the installed `3.1.26` (built 14:57) speaks the OLD one. Both
+were on this machine at once and the newer one was running as a daemon minutes before this was
+written. That is the exact condition the stamp's own comment names as the lost-PTY latch storm
+of 2026-07-17: *the fleet's version-ordered compatibility gate looking at two builds of one
+version with different shapes.*
+
+**What is owed, in order:**
+
+1. **Rebuild every worktree binary built between 17:36 and 18:07.** They are mislabelled and no
+   amount of stamp bookkeeping changes what they answer to `--version`. Sweeping
+   `*/target/release/` by mtime found exactly **one** at the time of writing — a single lane's
+   headless, built 18:06 — so this is one rebuild, not a fleet-wide campaign. ⚠ Re-sweep before
+   acting: a lane that rebuilds from an un-rebased tree can mint another one at any time, and
+   nothing warns it.
+2. **Re-stamp**, in one commit: `STAMPED_AT_VERSION = "3.1.27"`, `STAMPED_SHAPE_HASH =
+   0xb0be92515d8e30a0`, plus the paragraph the file's convention requires — *what* changed on
+   the wire and what an older daemon does when it meets it. ⛔ **Not by whoever finds this
+   first.** Re-stamping is the one action that silences the alarm, and doing it without being
+   able to describe the change launders the question the guard was asking. It belongs to the
+   author of `a968091d` or a successor who has read it.
+
+⚠ **The way this surfaced is worth as much as the finding.** The suite genuinely flakes — two
+of five full runs failed on a single different test, both green alone — so a lone red reads as
+noise. This one is deterministic and reproduces alone. See `docs/agent-field-guide.md`
+§"A single red in the server suite is not automatically a flake".
+
 ## ⛔ [11.15] EVERY DAEMON LEAKS A ZOMBIE EVERY FIFTEEN MINUTES, AND NOTHING COUNTS THEM
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
