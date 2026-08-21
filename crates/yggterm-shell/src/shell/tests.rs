@@ -21642,6 +21642,50 @@ console.log('ok');
         assert_eq!(web_tab_activity_dot_title(true, true), Some("Loading"));
     }
 
+    /// ⛔ BOTH CONSUMERS ASK THE SAME QUESTION, and they have to.
+    ///
+    /// Two things consult "is this surface playing": the background-activity dot
+    /// and the reap veto that keeps a backgrounded surface alive. They were both
+    /// asking about AUDIO, and both were therefore blind to a muted video —
+    /// meaning a background tab playing a muted video showed no dot AND could be
+    /// destroyed out from under the playback.
+    ///
+    /// Fixing one and not the other is the obvious next mistake, so this
+    /// requires the audio-only spelling to be gone from the shell entirely.
+    #[test]
+    fn nothing_in_the_shell_still_asks_only_about_audio() {
+        let source = SHELL_SOURCE;
+        let product: Vec<&str> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("fn nothing_in_the_shell_still_asks_only_about_audio")),
+            "the scan is reading this test, so its own needle would satisfy it",
+        );
+        for spelling in ["web_surface_is_playing_audio", "is_playing_audio("] {
+            assert!(
+                !product.iter().any(|line| line.contains(spelling)),
+                "the shell still asks about AUDIO ({spelling}) — a muted video answers false"
+            );
+        }
+        // …and both consumers reach the media predicate.
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("desktop.web_surface_is_playing_media(")),
+            "the activity dot lost its probe"
+        );
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("media.is_playing_media(surface.native_id)")),
+            "the reap veto lost its probe"
+        );
+    }
+
     /// ⛔⛔ THE DEFECT THAT WOULD BLIND THE WHOLE FEATURE, AND IT FAILS SILENTLY.
     ///
     /// The reconciler's page-state poll sits behind `if entry.stashed_at_ms
@@ -21673,7 +21717,7 @@ console.log('ok');
         let probe = product
             .iter()
             .position(|line| {
-                line.contains("let media_playing = desktop.web_surface_is_playing_audio(")
+                line.contains("let media_playing = desktop.web_surface_is_playing_media(")
             })
             .expect(
                 "the reconciler no longer probes the engine for media — the tab dot \

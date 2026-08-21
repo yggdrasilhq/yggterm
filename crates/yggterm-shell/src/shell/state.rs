@@ -2246,7 +2246,7 @@ struct WebSurfaceTab {
     loading: bool,
     /// Is this tab's page PLAYING MEDIA right now, as the ENGINE reports it?
     ///
-    /// Written from `webkit_web_view_is_playing_audio` by the native-surface
+    /// Written from `is_playing_media` by the native-surface
     /// reconciler and rendered as the tab's blinking dot when the tab is in the
     /// BACKGROUND — the "which of these rows is making noise" signal.
     ///
@@ -7244,7 +7244,13 @@ fn web_surface_tab_background_hold_ms() -> Option<u64> {
 /// loop hands over the desktop context and no longer has a media flag it could
 /// get wrong.
 trait WebSurfaceMediaProbe {
-    fn is_playing_audio(&self, native_id: u64) -> bool;
+    /// ⛔ MEDIA, not audio, and the rename is the fix rather than cosmetics.
+    /// This was `is_playing_audio` all the way down to WebKit, which has no
+    /// `is-playing-video` — so a MUTED video answered `false` and neither the
+    /// reap veto nor the background-activity dot could see the one case they
+    /// exist for. The page reports the picture half itself now; the name says
+    /// what the predicate means so the next reader does not have to find out.
+    fn is_playing_media(&self, native_id: u64) -> bool;
 }
 
 /// WHY a realized surface is in this pass's reclaim set.
@@ -7492,7 +7498,7 @@ fn web_surface_background_plan(
             // Engine truth, read at the moment of the decision and for THIS
             // surface — a stale flag, or one read for a different surface, would
             // be worse than none.
-            let media_active = media.is_playing_audio(surface.native_id);
+            let media_active = media.is_playing_media(surface.native_id);
             let action = if web_surface_reap_due(
                 now_ms,
                 surface.stashed_at_ms,
@@ -7725,8 +7731,8 @@ struct LiveWebSurfaceBackgroundHost<'a> {
 }
 
 impl WebSurfaceMediaProbe for LiveWebSurfaceBackgroundHost<'_> {
-    fn is_playing_audio(&self, native_id: u64) -> bool {
-        self.desktop.web_surface_is_playing_audio(native_id)
+    fn is_playing_media(&self, native_id: u64) -> bool {
+        self.desktop.web_surface_is_playing_media(native_id)
     }
 }
 
@@ -7878,7 +7884,7 @@ mod web_surface_reclaim_locks {
     }
 
     impl WebSurfaceMediaProbe for FakeHost {
-        fn is_playing_audio(&self, native_id: u64) -> bool {
+        fn is_playing_media(&self, native_id: u64) -> bool {
             self.audio_probes.borrow_mut().push(native_id);
             self.audible.contains(&native_id)
         }
@@ -8697,8 +8703,8 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             code_lines(&product[media_impl_start + 1..media_impl_end]),
             vec![
-                "fn is_playing_audio(&self, native_id: u64) -> bool {",
-                "self.desktop.web_surface_is_playing_audio(native_id)",
+                "fn is_playing_media(&self, native_id: u64) -> bool {",
+                "self.desktop.web_surface_is_playing_media(native_id)",
                 "}",
             ],
             "the audio veto is reading something other than the engine:\n{media_impl}",
@@ -13576,7 +13582,7 @@ async fn web_surface_native_reconcile_loop(
                     // broken. `is_playing_audio` reads the engine's own media
                     // session, which a detached, unpainted webview still has —
                     // stash is a paint decision and explicitly never a mute.
-                    let media_playing = desktop.web_surface_is_playing_audio(entry.native_id);
+                    let media_playing = desktop.web_surface_is_playing_media(entry.native_id);
                     // The EDGE is written through at once so the dot appears and
                     // disappears on the beat the engine changed its answer. While
                     // the answer stays true the claim is RENEWED on a slow
