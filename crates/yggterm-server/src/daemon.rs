@@ -633,11 +633,22 @@ enum OwnSocketName {
     /// A DIFFERENT real socket file stands at our name. Somebody is bound to it
     /// for real; removing it would strand THEM.
     HeldByAnother,
-    /// Nothing is there at all. ⛔ NOT a reclaim: this is the shape of a bind
-    /// window that belongs to somebody else. Our OWN retirement unlinks this
-    /// path so a successor can bind it, and a successor's bind is `remove` then
-    /// `bind` with a gap between — reclaiming in either window would take the
-    /// name from the very process meant to have it next.
+    /// Nothing is there at all.
+    ///
+    /// ⚠⚠ **RECLAIMABLE, BUT ONLY UNDER TWO GUARDS, AND BOTH ARE LOAD-BEARING.**
+    /// This is a real end-state of the same disease: a name is re-pointed at a
+    /// newer daemon, that daemon dies, its socket file is swept, the alias is
+    /// now dangling, and the next client to dial it unlinks the dangling link
+    /// (`clear_local_daemon_socket_link_escaping_home` — correct behaviour over
+    /// garbage). The name is then absent while its owner is still bound to it,
+    /// which is the stranding again with the evidence removed.
+    ///
+    /// ⛔ It is ALSO the shape of a bind window that belongs to somebody else:
+    /// our own retirement unlinks this path so a successor can bind it, and a
+    /// successor's bind is `remove` then `bind` with a gap between. Reclaiming
+    /// in either window takes the name from the very process meant to have it
+    /// next. ⇒ Only a daemon that is NOT retiring, and that the kernel still
+    /// names as bound to this path, may take an absent name back.
     Absent,
 }
 
@@ -679,20 +690,53 @@ fn classify_own_socket_name(current: SocketNameEntry, bound: (u64, u64)) -> OwnS
     }
 }
 
+/// May this daemon bind its own name again?
+///
+/// ⛔⛔ **THE TWO GUARDS ARE THE WHOLE SAFETY OF THE RECLAIM, so they are one
+/// pure function and not three conditions scattered through a loop.** A wrong
+/// `true` here is the defect this lane exists to remove, aimed at a different
+/// victim: the daemon that is supposed to have the name next.
+///
+/// * `retiring` — we broke out of the accept loop and are unlinking this path
+///   FOR a successor. Taking it back makes that successor's bind fail on an
+///   address already in use, from the process handing over to it.
+/// * `kernel_still_names_us` — for an ABSENT name only. It separates "our name,
+///   emptied out from under us" from "somebody else's bind window": the kernel
+///   goes on reporting the path we bound, and a daemon that has not bound yet
+///   appears nowhere at all.
+#[cfg(unix)]
+fn may_reclaim_own_socket_name(
+    verdict: OwnSocketName,
+    retiring: bool,
+    kernel_still_names_us: bool,
+) -> bool {
+    if retiring {
+        return false;
+    }
+    match verdict {
+        OwnSocketName::Taken => true,
+        OwnSocketName::Absent => kernel_still_names_us,
+        OwnSocketName::StillOurs | OwnSocketName::HeldByAnother => false,
+    }
+}
+
 /// Bind a fresh listener at a name that was taken, and hand it back.
 #[cfg(unix)]
 fn rebind_taken_socket_name(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
-    // ⛔ ONLY a symlink is removed here. `Taken` is the only verdict that
-    // reaches this function, and the check is repeated rather than trusted
-    // because the thing being removed is somebody's address if it is anything
-    // else at all.
-    if socket_name_entry(path) != SocketNameEntry::Symlink {
-        return Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            "the name is no longer a symlink; it belongs to whatever bound it",
-        ));
+    // ⛔ A SYMLINK IS REMOVED; A REAL SOCKET FILE NEVER IS. The check is
+    // repeated here rather than trusted from the caller, because what would be
+    // removed is somebody's address if it is anything other than a symlink or
+    // nothing.
+    match socket_name_entry(path) {
+        SocketNameEntry::Symlink => fs::remove_file(path)?,
+        SocketNameEntry::Missing => {}
+        SocketNameEntry::RealFile(_) => {
+            return Err(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "a real socket file stands at this name; it belongs to whatever bound it",
+            ));
+        }
     }
-    fs::remove_file(path)?;
     let listener = std::os::unix::net::UnixListener::bind(path)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
@@ -726,6 +770,7 @@ fn spawn_versioned_socket_name_reclaim(
     runtime: Arc<Mutex<DaemonRuntime>>,
     last_activity_ms: Arc<AtomicU64>,
     outcomes: std::sync::mpsc::Sender<Result<DaemonRequestOutcome>>,
+    retiring: Arc<AtomicBool>,
 ) {
     let Some(mut bound) = socket_file_identity(&path) else {
         // We just bound it; if it is not a real file of ours already, something
@@ -742,7 +787,23 @@ fn spawn_versioned_socket_name_reclaim(
                 if now_ms.saturating_sub(last_check_ms) >= SOCKET_NAME_RECLAIM_CHECK_MS {
                     last_check_ms = now_ms;
                     let verdict = classify_own_socket_name(socket_name_entry(&path), bound);
-                    if verdict == OwnSocketName::Taken {
+                    // ⛔ A RETIRING DAEMON NEVER TAKES A NAME BACK. It unlinked
+                    //    that path itself, for a successor that has not bound
+                    //    yet — re-binding there would make the handover fail on
+                    //    an address already in use, from the process handing
+                    //    over.
+                    // The census read is deferred behind the cheap answers: it
+                    // is only ever needed for an ABSENT name.
+                    let kernel_still_names_us = verdict == OwnSocketName::Absent
+                        && crate::socket_sweep::socket_name_is_a_live_daemons_address(
+                            &crate::socket_sweep::LiveDaemonCensus::gather(&home_dir),
+                            &path,
+                        );
+                    if may_reclaim_own_socket_name(
+                        verdict,
+                        retiring.load(Ordering::SeqCst),
+                        kernel_still_names_us,
+                    ) {
                         match rebind_taken_socket_name(&path) {
                             Ok(listener) => {
                                 if let Some(identity) = socket_file_identity(&path) {
@@ -20458,12 +20519,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // prevention stops new victims, and this is what rescues the ones a
         // pre-fix daemon already made — including one measured alive 28 h with
         // 83 pty masters and no path leading to it.
+        // Set the moment the accept loop breaks, BEFORE this daemon unlinks its
+        // own path for a successor. See `spawn_versioned_socket_name_reclaim`.
+        let retiring = Arc::new(AtomicBool::new(false));
         spawn_versioned_socket_name_reclaim(
             path.clone(),
             home_dir.clone(),
             runtime.clone(),
             last_activity_ms.clone(),
             client_outcome_tx.clone(),
+            Arc::clone(&retiring),
         );
         let mut restart_after_exit = None::<PathBuf>;
         // Started at most once: the drain thread polls until our hands are empty
@@ -20536,6 +20601,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 Err(error) => return Err(error).context("accepting daemon client"),
             }
         }
+        // ⛔ BEFORE `drop(listener)` and before the unlink below: from here on
+        // this daemon's own name belongs to whoever binds it next, and the
+        // reclaim thread must stop competing for it.
+        retiring.store(true, Ordering::SeqCst);
         let restart_executable = restart_after_exit.take();
         append_trace_event(
             &home_dir,
@@ -27745,10 +27814,46 @@ mod tests {
         assert_eq!(
             super::classify_own_socket_name(super::SocketNameEntry::Missing, (7, 11)),
             super::OwnSocketName::Absent,
-            "⛔⛔ AND AN ABSENT NAME IS NOT A TAKEN ONE. Our own retirement unlinks this \
-             path so a successor can bind it, and the successor's bind has a gap between \
-             remove and bind — reclaiming in either window takes the name from the very \
-             process meant to have it next"
+            "⛔⛔ AND AN ABSENT NAME IS NOT A TAKEN ONE — the two need different guards"
+        );
+    }
+
+    /// ⛔⛔ THE GUARDS ON THE RECLAIM, WHICH ARE WHAT KEEP THE CURE FROM BECOMING
+    /// A SECOND VERSION OF THE DISEASE.
+    ///
+    /// A wrong `true` here takes a name from the process that is supposed to
+    /// have it next — a successor mid-bind, or the successor this very daemon is
+    /// retiring in favour of.
+    #[cfg(unix)]
+    #[test]
+    fn a_retiring_daemon_never_takes_its_name_back() {
+        use super::OwnSocketName::*;
+        use super::may_reclaim_own_socket_name as may;
+
+        // Retiring: no verdict licenses anything. This daemon unlinked the path
+        // ITSELF, for a successor that has not bound yet.
+        for verdict in [Taken, Absent, StillOurs, HeldByAnother] {
+            assert!(
+                !may(verdict, true, true),
+                "a retiring daemon must never re-bind its own name ({verdict:?})"
+            );
+        }
+        // Serving: a re-pointed name comes back, and a real socket file never
+        // does.
+        assert!(may(Taken, false, false), "a symlink is a re-point, and it comes back");
+        assert!(!may(StillOurs, false, true));
+        assert!(
+            !may(HeldByAnother, false, true),
+            "⛔ a real socket file at our name belongs to whoever bound it"
+        );
+        // An emptied name comes back only when the kernel still says the path is
+        // ours; otherwise it is somebody's bind window and must be left alone.
+        assert!(may(Absent, false, true));
+        assert!(
+            !may(Absent, false, false),
+            "⛔ an absent name nobody is bound to is a BIND WINDOW — a successor that has \
+             not bound yet appears nowhere in the kernel table, and taking the name there \
+             makes its bind fail on an address already in use"
         );
     }
 
