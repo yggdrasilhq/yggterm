@@ -2363,6 +2363,41 @@ sits in plain sight and reads as two unrelated lines.
 
 **Status:** OPEN
 
+### ⛔⛔ MEASURED 2026-08-22 — FIVE CHECKOUTS RUN A CLAIM SCRIPT THAT MINTS ABSURD SEATS, AND ONE OF THEM IS THE MAIN CHECKOUT
+
+The theory above has a live instance with a visible cost. `ygg-claim.sh` was fixed twice for a
+seat-poisoning bug — a cwd-tree row whose label is a digit string parsed as a major, so each claim
+handed out the previous absurd number plus one and the seat grew by one per claim for ever. The
+cure is two guards: only an ADDRESSABLE row (one with a `://` scheme) may join the pool, and a
+derived major past a sanity bound is refused rather than handed out.
+
+Census across every worktree, asking whether its copy carries both guards:
+
+| carries the fix | does NOT |
+|---|---|
+| 12 lane worktrees, including this one | **the main checkout**, plus 4 lane worktrees |
+
+⛔ **The main checkout is the worst of the five**, because it is where anyone lands who did not
+deliberately pick a worktree — and it is not even on `main`, it is parked on a lane branch from a
+different campaign.
+
+⇒ **Confirmed live the same night from a different seat**: one row announced its own seat as
+`6914978.0` in its first turn, while `rows` listed the same session under three different prefixes
+at once, depending on which scheme the listing used. A lane cannot be trusted to report its own
+seat, and this is one of the reasons why.
+
+⚠ ⛔ **DO NOT FIX THIS BY COPYING THE FILE INTO THE STALE CHECKOUTS.** They are live trees holding
+other lanes' uncommitted work; writing into one is how a session's work is destroyed by helping.
+The repair is a rebase, taken by whoever stands in that tree — and the main checkout needs
+returning to `main` by someone who first establishes that nobody is standing in it.
+
+⭐ **And the instrument gap is the general half.** The session-start audit reports staleness for
+exactly one script — the booter, and only the copy the live watcher is executing. Every other
+fleet script is unaudited, and a lane always runs the copy in its own worktree, so a fixed
+instrument reaches a lane only when somebody rebases that lane. **A stale instrument reports
+success in its own terms either way**, which is why this was found by a lane noticing an absurd
+seat rather than by anything designed to notice.
+
 ⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
 mentions it — collateral loss in a file rewrite, not a fix. This file's own rule is that an
 entry is deleted in the same commit as its VERIFIED FIX. Re-measured 2026-08-21 and still real.
