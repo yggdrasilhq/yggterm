@@ -28,7 +28,7 @@ timeout here is a prompt to re-check the content, not just to retry.
 using, and its meaning is stronger than "do not wake": typing into one splices
 into what they have half-written and submits the fusion as their turn.
 """
-import argparse, glob, json, os, subprocess, sys, time
+import argparse, glob, json, os, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -107,7 +107,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("target")
-    ap.add_argument("--message", required=True, help="file holding the message")
+    # ⚠ `--message` holds a PATH, which its name does not say. An orchestrator
+    # with the text already in hand passes the text, gets "no such message file"
+    # with 7 KB of brief where a filename should be, and has to go and read the
+    # source to find out which of the two the flag wanted. Both are accepted now,
+    # as SEPARATE flags rather than by sniffing the value: a heuristic would read
+    # a one-line message that happens to name a file as a file.
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--message", help="PATH to a file holding the message")
+    src.add_argument("--text", help="the message itself, inline")
     ap.add_argument("--ack", help="token to grep the transcript for; default: first word of line 1")
     ap.add_argument("--wait-min", type=float, default=30.0)
     ap.add_argument("--host")
@@ -117,10 +125,15 @@ def main():
     if not host:
         log("⛔ no GUI host")
         return 2
-    if not os.path.exists(a.message):
-        log(f"⛔ no such message file: {a.message}")
-        return 2
-    first = open(a.message).readline().strip()
+    if a.text is not None:
+        body = a.text
+    else:
+        if not os.path.exists(a.message):
+            log(f"⛔ --message takes a PATH and there is no file at: {a.message[:120]}")
+            log("   To pass the text itself, use --text.")
+            return 2
+        body = open(a.message).read()
+    first = body.splitlines()[0].strip() if body.strip() else ""
     ack = a.ack or (first.split()[0] if first else "")
 
     row = find_row(host, a.target)
@@ -170,8 +183,19 @@ def main():
         log(f"{why} — waiting {POLL_S}s")
         time.sleep(POLL_S)
 
+    # ⛔ ONE ENCODING OF "THE MESSAGE". This used to scp `a.message` — the PATH —
+    # which silently made the file the source of truth and the loaded `body` a
+    # decorative copy. With `--text` there is no path at all, and any future edit
+    # applied to `body` would have been shipped as the untouched original. The
+    # bytes that were read are the bytes that are sent.
+    local = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+    local.write(body)
+    local.close()
     remote = f"/tmp/ygg-deliver-{uuid[:8]}.txt"
-    subprocess.run(["scp", "-q", a.message, f"{host}:{remote}"], timeout=120)
+    try:
+        subprocess.run(["scp", "-q", local.name, f"{host}:{remote}"], timeout=120)
+    finally:
+        os.unlink(local.name)
     reply = app(host, f"terminal submit '{uri}' --stdin", stdin_path=remote)
     data = reply.get("data") or {}
     if not data.get("submitted"):
