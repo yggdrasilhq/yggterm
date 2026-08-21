@@ -187,6 +187,36 @@ impl LiveDaemonCensus {
     }
 }
 
+/// Does a LIVE daemon still answer to this NAME?
+///
+/// ⛔⛔ **THIS IS THE ONLY INSTRUMENT THAT SURVIVES THE NAME BEING DIVERTED,
+/// AND THAT IS THE ENTIRE POINT.** A `connect` through the path answers about
+/// whatever the path resolves to *now*; once an alias has been re-pointed, that
+/// is a different daemon, and the probe cheerfully reports "somebody is there"
+/// about the very process that took the name. The kernel, by contrast, records
+/// the path a socket was BOUND to and keeps reporting it after that path has
+/// been unlinked or replaced — so this answers "whose address is this name",
+/// which is the question a re-point actually needs to ask.
+///
+/// ⇒ Measured on the build host 2026-08-22: a daemon alive 28 h, holding 83
+/// pty masters, still listed by `/proc/net/unix` as bound to its own versioned
+/// name — while that name on disk was a symlink to a newer daemon's socket.
+/// Nothing could dial it, and every session it owned was undrivable.
+///
+/// ⚖ **An incomplete census answers YES.** "I could not look" must never
+/// license taking an address away; the fail-safe direction here is to leave the
+/// name alone, exactly as the sweep's fail-safe direction is to leave the file
+/// alone.
+pub(crate) fn socket_name_is_a_live_daemons_address(
+    census: &LiveDaemonCensus,
+    candidate: &Path,
+) -> bool {
+    if !census.is_complete() {
+        return true;
+    }
+    census.listening.contains(candidate)
+}
+
 /// Linux's `/proc/net/unix`, or `None` on any platform/read where it cannot be
 /// consulted (⇒ incomplete census ⇒ no deletions).
 #[cfg(target_os = "linux")]
