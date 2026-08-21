@@ -109,7 +109,7 @@ impl RowScreenState {
                  BACK to confirm the gate is gone"
             }
             Self::PlanLimitChoice => "escalate to the owner and leave the screen alone",
-            Self::QuestionPicker => "notify the owner that his row is asking him a question",
+            Self::QuestionPicker => "notify the owner — this row is asking a question and is waiting for an answer",
             Self::LimitWait => "wait — the CLI's own auto-continue resumes the turn",
             Self::Working => "wait, or re-read the screen later",
             Self::Ready => "write to it",
@@ -145,6 +145,23 @@ impl RowScreenState {
         }
     }
 }
+
+/// Every state this crate can name, in the precedence [`classify_screen`] uses.
+///
+/// ⭐ EXISTS TO BE PRINTED. A classifier set that only a reader of this file can
+/// enumerate is one an agent will re-derive from a screenshot at three in the
+/// morning, and the re-derivation is where the prohibitions get lost. `server
+/// screen --states` renders this, so the remedies and the things one must never
+/// do are available to whoever is about to act.
+pub const ALL_ROW_SCREEN_STATES: &[RowScreenState] = &[
+    RowScreenState::Unreadable,
+    RowScreenState::StartupGate,
+    RowScreenState::PlanLimitChoice,
+    RowScreenState::QuestionPicker,
+    RowScreenState::LimitWait,
+    RowScreenState::Working,
+    RowScreenState::Ready,
+];
 
 /// Whether a visible row carries a SELECTION MARKER sitting on a NUMBERED
 /// option — the structural signature of a modal that Enter would answer.
@@ -329,5 +346,39 @@ mod tests {
         let state = classify_screen(Some(footer));
         assert_eq!(state, RowScreenState::LimitWait);
         assert!(!state.needs_a_human());
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// ⛔ A new state that is not in the printed table is a state the fleet
+    /// cannot learn about. The count is asserted deliberately: adding a variant
+    /// should FAIL here and make the author put it in the listing, rather than
+    /// shipping a classifier nobody can discover.
+    #[test]
+    fn every_state_is_listed_with_a_remedy_and_a_prohibition() {
+        assert_eq!(
+            ALL_ROW_SCREEN_STATES.len(),
+            7,
+            "a state was added or removed — put it in ALL_ROW_SCREEN_STATES too",
+        );
+        for state in ALL_ROW_SCREEN_STATES {
+            assert!(!state.slug().is_empty());
+            assert!(!state.remedy().is_empty(), "{} has no remedy", state.slug());
+            assert!(
+                !state.prohibition().is_empty(),
+                "{} has no prohibition",
+                state.slug(),
+            );
+        }
+        // Only one state licenses a write, and it is not `working`.
+        let writable: Vec<&str> = ALL_ROW_SCREEN_STATES
+            .iter()
+            .filter(|state| state.may_type())
+            .map(|state| state.slug())
+            .collect();
+        assert_eq!(writable, vec!["ready"]);
     }
 }

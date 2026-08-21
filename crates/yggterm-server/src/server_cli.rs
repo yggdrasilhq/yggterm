@@ -278,6 +278,20 @@ pub(crate) fn run_server_reorder_apply(
 /// * `--state-only` — just the state token, for `[ "$(…)" = ready ]`.
 /// * `--json` — the whole reading, for a program that wants the flags too.
 pub fn run_server_screen_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    if args.iter().any(|arg| arg == "--states") {
+        // The registry, printed. Takes no daemon and no row on purpose: an agent
+        // deciding whether it may type wants this at the moment it is deciding,
+        // and a listing that needed a live row would be unavailable exactly when
+        // the row is the thing in doubt.
+        for state in yggterm_core::screen_state::ALL_ROW_SCREEN_STATES {
+            println!("{}", state.slug());
+            println!("  may_type:    {}", state.may_type());
+            println!("  needs human: {}", state.needs_a_human());
+            println!("  remedy:      {}", state.remedy());
+            println!("  prohibition: {}", state.prohibition());
+        }
+        return Ok(());
+    }
     let endpoint = cli_server_endpoint(store.home_dir());
     let path = args.get(2).filter(|arg| !arg.starts_with("--"));
     let sessions = crate::hot_restart_gate_screens(&endpoint, path.map(String::as_str), None)?;

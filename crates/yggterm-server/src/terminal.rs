@@ -5591,6 +5591,89 @@ PY"#;
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
+    /// ⛔ THE WHOLE CHAIN, ON A REAL PTY, THROUGH THE CALL THE DAEMON MAKES.
+    ///
+    /// The fixture test above proves bytes -> grid -> classifier. This one
+    /// proves the part a unit test on a hand-built screen cannot: that
+    /// `TerminalManager::session_screen_plain_rows` — the exact method the
+    /// gate-screen reading calls — returns the rendered grid for a session that
+    /// really exists, with a real child process painting a real terminal.
+    ///
+    /// Worth its seconds because the mapping between "the model can render" and
+    /// "the daemon serves it" is precisely where this repository has lost
+    /// working code before: a handler that existed, compiled and passed its own
+    /// tests while nothing could reach it.
+    #[test]
+    fn the_manager_serves_a_rendered_grid_for_a_live_pty() {
+        let key = "local://screen-grid-test";
+        let mut manager = TerminalManager::new();
+        // Paint with ABSOLUTE CURSOR MOVES and no newlines between the rows —
+        // the drawing grammar that makes a modal illegible on the raw stream —
+        // then hold the pty open so the screen can be read.
+        manager
+            .ensure_session(
+                key,
+                "bash -lc 'printf \"\\033[2J\\033[3;2HQuick safety check: is this a project you trust?\
+                 \\033[5;2H1. Yes, I trust this folder\\033[7;2H2. No, exit\"; sleep 30'",
+                None,
+            )
+            .expect("spawn a pty for the grid test");
+        // ⛔ WAIT FOR CONTENT, THEN FOR QUIET. `settle_pty_output` alone returns
+        // instantly here: it asks whether output STOPPED changing, and before the
+        // child has written its first byte the answer is trivially yes. A quiet
+        // screen and a not-yet-started one are indistinguishable to it.
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = manager.session_screen_plain_rows(key).unwrap_or_default();
+            if rows
+                .iter()
+                .any(|row| row.to_ascii_lowercase().contains("quick safety check"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let runtime = manager
+            .sessions
+            .get(key)
+            .expect("the manager kept the session it just spawned");
+        settle_pty_output(runtime);
+        let rows = manager
+            .session_screen_plain_rows(key)
+            .expect("a live session must have a readable grid");
+        let _ = &rows;
+        let populated: Vec<&String> = rows.iter().filter(|row| !row.trim().is_empty()).collect();
+        assert!(
+            populated.len() >= 3,
+            "the three painted rows must arrive as three rows, got {populated:?}",
+        );
+        let joined = rows.join("\n");
+        assert!(
+            joined.to_ascii_lowercase().contains("quick safety check"),
+            "the grid must carry the words a person can see: {joined:?}",
+        );
+        assert_eq!(
+            yggterm_core::screen_state::classify_screen(Some(&joined)),
+            yggterm_core::screen_state::RowScreenState::StartupGate,
+            "the daemon's own call must name the state",
+        );
+
+        // ⛔ And the raw snapshot must NOT be legible, or the grid is buying
+        // nothing and this whole change is ceremony.
+        let raw = manager
+            .session_screen_snapshot(key)
+            .expect("a live session must have a raw screen too");
+        assert!(
+            raw.lines().count() < populated.len(),
+            "the raw stream must fuse rows the grid recovers: {} raw lines vs {} \
+             populated rows",
+            raw.lines().count(),
+            populated.len(),
+        );
+
+        manager.remove_session(key, None).ok();
+    }
+
     #[test]
     fn missing_session_reports_spawn_id_zero() {
         let manager = TerminalManager::new();
