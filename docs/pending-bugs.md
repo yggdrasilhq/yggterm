@@ -201,7 +201,9 @@ pid runs the new image with the supervisor alive and every row intact.
 
 ## ⛔⛔ [11.9] THE HOT-RESTART GATE COMPARES VERSION STRINGS, SO A SAME-VERSION REBUILD NEVER ROLLS
 
-**Status:** OPEN (measured 2026-08-21 ~00:15 by the cli-practice lane)
+**Status:** OPEN
+
+*Measured 2026-08-21 ~00:15 by the cli-practice lane.*
 
 A rebuilt binary installed at the SAME version answers `already_ready:true` from the deploy
 gate while `/proc/<daemon>/exe` md5 differs from disk — the daemon keeps running the old
@@ -216,7 +218,9 @@ change, install, and the gate must roll the daemon and the change must be observ
 
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
-**Status:** OPEN (owner-reported live 2026-08-21 ~00:1x as "INPUT BLOCK ON 13.0")
+**Status:** OPEN
+
+*Owner-reported live 2026-08-21 ~00:1x as "INPUT BLOCK ON 13.0".*
 
 A seat raised an interactive question picker (the standing owner-question shape) and sat on
 it 27 minutes. Every surface misdescribed the state: `gate-screen` answered
@@ -236,7 +240,9 @@ text is refused with the mode named, and a notification fires.
 
 ## ⚠ [11.0] A WEBVIEW THAT STOPS ACKING EDIT BATCHES IS DEAD INPUT WEARING A LIVE WINDOW
 
-**Status:** OPEN (incident evidence; owner-reported as "input blocked — trauma")
+**Status:** OPEN
+
+*Incident evidence; owner-reported as "input blocked — trauma".*
 
 2026-08-20 ~23:2x-23:37: the GUI instance launched at 23:20 (via app-control, unsupervised
 after the raw-kill-loses-the-supervisor gap below) logged **13 ×** `webview never
