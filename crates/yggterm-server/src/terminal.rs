@@ -8670,9 +8670,39 @@ line-two on the real screen\r\n\
 
         assert_eq!(
             support,
+            crate::pty_handoff::PrecommitSupport::OneSilence,
+            "one silence must be REMEMBERED but must not yet conclude anything: \
+             an old build and a successor briefly behind its own runtime lock \
+             look identical here"
+        );
+        // ⭐ A SECOND silence is what settles it, and only then does the sweep
+        // stop waiting. Proving the transition needs the same peer twice,
+        // because the whole point is that one strike decides nothing.
+        // ⛔ The first listener's socket FILE outlives its listener; a bind over
+        // it is AddrInUse, not a fresh listener.
+        let _ = std::fs::remove_file(&socket);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("rebind the handoff socket");
+        let old = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let metadata = crate::pty_handoff::receive_metadata(&stream).expect("metadata");
+            let fd = crate::pty_handoff::receive_descriptor(&stream, &metadata).expect("fd");
+            drop(fd);
+            crate::pty_handoff::send_ack(&stream, &crate::pty_handoff::HandoffAck::adopted_here())
+                .expect("ack");
+        });
+        crate::pty_handoff::send_session(
+            &socket,
+            &rig.metadata("local://silent-successor-2", true),
+            rig.master_fd(),
+            &mut support,
+        )
+        .expect("still completes");
+        old.join().expect("old successor thread");
+        assert_eq!(
+            support,
             crate::pty_handoff::PrecommitSupport::Silent,
-            "the silence must be REMEMBERED, or the rest of the sweep pays the \
-             wait once per runtime"
+            "two silences settle it — from here the sweep stops paying the wait"
         );
         let _ = std::fs::remove_file(&socket);
     }
