@@ -81,7 +81,95 @@ def ahead_behind(branch):
     if c.returncode != 0:
         return refs_ahead, behind
     unlanded = [l for l in c.stdout.splitlines() if l.startswith("+")]
+    if unlanded and not content_residue(branch)[0]:
+        return 0, behind
     return len(unlanded), behind
+
+
+def _main_lines():
+    """Every line of every text file in `origin/main`, as a set. Built once.
+
+    ~0.5 s and ~370k lines on this repo. Cheap enough to be the routine third
+    stage, which is the whole point: the two instruments above it are cheaper
+    still and both wrong.
+    """
+    global _MAIN_LINES
+    if _MAIN_LINES is None:
+        r = git("grep", "-h", "-I", "-e", "", "origin/main")
+        _MAIN_LINES = set(l.strip() for l in r.stdout.splitlines())
+    return _MAIN_LINES
+
+
+_MAIN_LINES = None
+_RESIDUE = {}
+
+
+def _substantive(lines):
+    """Lines worth testing for presence. A short or punctuation-only line matches
+    somewhere in any large tree, so counting it inflates 'landed' toward yes."""
+    return [l for l in lines if len(l) >= 12 and any(ch.isalnum() for ch in l)]
+
+
+def content_residue(branch):
+    """⛔⛔ `git cherry` COMPARES PATCH-IDS, AND A PATCH-ID HASHES ITS CONTEXT.
+
+    A commit re-applied where main's surrounding lines have since drifted — or
+    whose file was renamed or split — gets a different patch-id and reads
+    unlanded FOREVER. Measured 2026-08-21: `status` called six branches ready;
+    all six were already in main. Five had every added line present verbatim,
+    and `gum-never-hangs` read unlanded only because main split the 24k-line
+    `shell.rs` it touched into `shell/{launch,state,tests}.rs`.
+
+    ⚠ That is not a cosmetic miscount. Six false alarms are how the seventh
+    branch — the one genuinely carrying work — stops being read at all.
+
+    ⇒ So ask the question the two ref-level instruments cannot: **is this
+    commit's content in main's tree today, wherever it now lives?** Both halves,
+    because a commit that only DELETES has no added lines to find:
+
+      · every substantive line the branch ADDED is somewhere in main, and
+      · every substantive line it DELETED is nowhere in main.
+
+    The second half is the one that matters for a queue: `11.15-panic-proof`
+    added a field-guide section (landed) and removed a closed bug entry (NOT
+    landed, all 47 lines still sitting in `pending-bugs.md`). An added-lines-only
+    check would have called that branch landed and left the entry rotting.
+
+    ⚠ WHAT THIS STILL CANNOT SEE: content moved into main by a DIFFERENT commit
+    that happens to share lines, and a rewrite that preserves every line while
+    changing what they mean. It answers "is this text present", not "is this
+    change's INTENT applied" — so a non-zero residue is a prompt to look, never
+    a verdict on its own. Reachability beats all three: `gum-never-hangs` kept a
+    12% residue of CLI-help text, and one live `server app media answer` call
+    proved the verb it adds is already there.
+
+    Returns (missing_count, detail) where detail names the first few lines.
+    """
+    if branch in _RESIDUE:
+        return _RESIDUE[branch]
+    mb = git("merge-base", "origin/main", branch).stdout.strip()
+    d = git("diff", "--format=", "-U0", f"{mb}..{branch}")
+    added, deleted = [], []
+    for l in d.stdout.splitlines():
+        if l.startswith("+") and not l.startswith("+++"):
+            added.append(l[1:].strip())
+        elif l.startswith("-") and not l.startswith("---"):
+            deleted.append(l[1:].strip())
+    have = _main_lines()
+    add_miss = [l for l in _substantive(added) if l not in have]
+    del_left = [l for l in _substantive(deleted) if l in have]
+    if not _substantive(added) and not _substantive(deleted):
+        # Nothing testable — do not let an empty diff vote "landed".
+        out = (1, ["(no substantive lines to test)"])
+    else:
+        detail = []
+        if add_miss:
+            detail.append(f"{len(add_miss)} added line(s) not in main, e.g. {add_miss[0][:60]!r}")
+        if del_left:
+            detail.append(f"{len(del_left)} deleted line(s) still in main, e.g. {del_left[0][:60]!r}")
+        out = (len(add_miss) + len(del_left), detail)
+    _RESIDUE[branch] = out
+    return out
 
 
 def refs_ahead(branch):
@@ -129,6 +217,9 @@ def cmd_status(_a):
             note = f"  ({raw - ahead} commit(s) already in main under other SHAs)"
             phantom += 1
         log(f"{state} {b:<40} ahead={ahead:<4} behind={behind}{note}")
+        if ahead:
+            for line in content_residue(b)[1]:
+                log(f"         · {line}")
     log(f"— {sum(1 for r in rows if r[1])} branch(es) carrying unlanded work")
     if phantom:
         log(f"  {phantom} branch(es) look ahead by SHA and are not: their patches are in main.")
