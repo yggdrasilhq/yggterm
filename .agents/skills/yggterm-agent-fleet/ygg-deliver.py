@@ -33,6 +33,7 @@ import argparse, glob, json, os, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from ygg_rowarg import row_session_id  # noqa: E402
+import ygg_transcript  # noqa: E402
 YGG = "~/.local/bin/yggterm-headless"
 POLL_S = 20
 
@@ -90,7 +91,11 @@ def _reap_if_never_briefed(uuid, uri, host, a):
     debris this cleans up. Only a row with NO transcript at all is reaped, because
     that row has, demonstrably, never been given anything to do.
     """
-    if glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl")):
+    # ⛔ EVERY CLI's store, not just the reference one. This decides whether to
+    #    DESTROY the row, and the old glob could only ever answer "no" for a CLI
+    #    that keeps its transcripts anywhere else — so a working lane that was
+    #    merely busy past the deadline was force-folded as never briefed.
+    if ygg_transcript.has_transcript(uuid, kind=row_kind):
         log("  the row has a transcript — it has been briefed before, so it STAYS")
         return 6
     fold = os.path.join(HERE, "ygg-fold.py")
@@ -135,6 +140,9 @@ def main():
     #    Everything below keys on this: the never-arm guard that stops us
     #    typing over a person, the temp file, and the reap.
     uuid = row_session_id(row)
+    # ⛔ Which CLI wrote this row's transcript. A narrowing, never a requirement:
+    #    without it every declared store is tried, which is still correct.
+    row_kind = (row.get("icon_kind") or "").strip() or None
 
     why = never_armed(uuid)
     if why:
@@ -186,8 +194,7 @@ def main():
         return 0
     for _ in range(9):
         time.sleep(15)
-        hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
-        if hits and ack in open(hits[0], errors="ignore").read()[-400000:]:
+        if ygg_transcript.carries(uuid, ack, kind=row_kind):
             log(f"transcript carries {ack}: True")
             return 0
     log(f"⚠ transcript does not carry {ack} after ~2m — delivery UNPROVEN")

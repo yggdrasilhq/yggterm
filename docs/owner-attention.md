@@ -393,6 +393,34 @@ does clear on its own.
 costs nothing to leave: the row is alive, its work is not lost, and it resumes
 the moment either remedy is applied. **To reverse:** nothing to reverse.
 
+## Credentials for the non-reference agent CLIs — a sign-in, once, per CLI
+
+**Why it needs him:** a credential, and nothing else unblocks it.
+
+Of the ten registered CLIs, four are signed in on the build host (codex,
+claude-code, muse, grok-build) and **qwen-code, opencode and antigravity are
+not**. Two consequences, one of them a correctness question rather than a
+convenience:
+
+- **`qwen-code` is store-authoritative over a store nobody has seen produce a
+  transcript.** 27 of its sessions across two hosts hold only `<id>.runtime.json`
+  sidecars — pid and cwd, no title, no conversation — and every one was an
+  unauthenticated probe that never exchanged a message. So *"this store never
+  writes a transcript"* and *"a transcript appears only once a session speaks"*
+  predict the identical disk. **One authenticated exchange separates them.**
+- The cross-CLI greeting run can only cover CLIs that can actually start.
+
+⚖ **The run is NOT blocked meanwhile, and was not held for this.** codex ↔
+claude-code exercises delivery across two genuinely different store layouts and
+both are signed in today. This decides how far the run generalises, not whether
+it happens.
+
+**Recommendation:** qwen-code first, since it is the only CLI whose registry
+declaration currently rests on an unmeasured store. **To reverse:** nothing to
+reverse — signing in changes no yggterm state.
+
+Detail: the entry in [`pending-bugs.md`](pending-bugs.md) that names this file.
+
 ---
 
 ## Nothing is waiting on him for these, and they are the relay's actual queue

@@ -18,61 +18,60 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+## ⛔ [99.0] A TRANSCRIPT IS NOW FOUND FOR EVERY CLI, BUT ONLY THE REFERENCE ONE IS READ AS PROSE
 
 **Status:** OPEN
 
-*Found 2026-08-22 while exercising the orchestration plane ACROSS CLIs. The row-identity
-half of this is fixed and gated; this is the other half, and it is a different fix.*
+*The finding-the-file half is fixed and gated (`ygg_transcript`, `cli-stores.json`,
+`the_fleet_transcript_table_matches_the_registry`). This is what is left, stated narrowly
+so it is not mistaken for the larger defect it came from.*
 
-**The measurement.** Eleven callsites across seven fleet verbs answer *"has this row ever
-written a word?"* with one hardcoded glob — the reference CLI's transcript store:
+`ygg-monitor`'s `_last_prose` now locates any CLI's transcript and then parses it as the
+reference CLI's record format. Another CLI's file is therefore found and read as **empty
+prose** — better than the old silence, because the file's size and mtime now answer the
+stall and evidence questions correctly, but still not the row's last words.
 
-```
-ygg-spawn.py    proves the brief arrived        ygg-fold.py     harvest before retiring
-ygg-deliver.py  proves delivery, and REAPS      ygg-monitor.py  last prose, stall evidence (x3)
-ygg-babysit.py  liveness over ssh (x2)          ygg-booter.py   evidence marker
-```
+⚖ **Why the split is the right shape rather than half a job.** Finding the file was one
+defect with one fix and it unblocked every caller at once, including the two that DESTROY
+things. Reading a record is a different question per CLI and each answer needs a real
+store to check against — the same measurement discipline, one CLI at a time, and no
+caller is blocked while it is done.
 
-The registry declares a store for **every** registered CLI, and they do not share a
-layout: one keeps a SQLite database, another a per-session directory, another rollout
-files whose names decorate the id. A row of any of them has no file where these verbs
-look, so the glob returns empty — and **empty is not an error, it is an answer**, the
-same answer a row that has genuinely never done anything would give.
+**Ack-grep is unaffected** and that is deliberate: proving a message arrived only needs
+the token FOUND, not parsed, so cross-CLI delivery proof works today.
 
-**Why that is worse than a false negative.** `ygg-deliver`'s reap test is *"has it ever
-written a word"*, and its own comment explains the asymmetry it is guarding: *"losing a
-working lane to a delivery timeout would be far worse than the debris this cleans up."*
-For a row outside the reference store that test can only ever answer no. ⇒ A working
-lane of any other CLI that is merely busy past the deadline is classified as never
-briefed and force-folded. The interlock is correctly reasoned and reads the wrong shelf.
+**What would falsify it being fixed:** `ygg-monitor status` showing a non-reference row's
+actual last sentence instead of a blank.
 
-⚠ **`ygg-booter` reasoned about exactly this and still missed it.** Its marker documents
-that an unreadable result must never be treated as fresh evidence, and picks the safe
-direction deliberately — but "unreadable" was imagined as a permissions or timing
-failure, never as *"this row belongs to a CLI that keeps its transcripts somewhere
-else."* The care was real and aimed one category short.
+## ⛔ [99.0] NO NON-REFERENCE CLI HAS EVER COMPLETED AN AUTHENTICATED SESSION HERE, SO THE GREETING RUN CANNOT BE VALIDATED
 
-**⛔ The law that should have caught it already exists, and cannot see these files.**
-`no_store_path_literal_outside_the_agent_cli_registry` refuses exactly this hardcoding
-and is enforced in two Rust files by scanning their own source. The orchestration layer
-is Python and sits outside the fence, so the same literal that fails the build in one
-language is unreviewed in the other.
+**Status:** AWAITING A DECISION
 
-**The fix, and why it is not a one-liner.** Ask the registry, which already knows each
-store's layout and how a session is recognised inside it — do not re-encode ten layouts
-in Python. Two supply lines are possible and the choice is the real work: a headless
-verb that resolves a row's transcript (one owner, needs a rolled binary before any host
-can use it), or a table generated from the registry and checked in beside the verbs with
-a Rust lock asserting it still matches (no deploy, one more artefact to keep honest).
-**Recommendation: the generated table**, because these verbs run on timers and on hosts
-mid-roll, and a resolver that needs the newest daemon to answer is unavailable exactly
-when a stalled fleet needs reading. ⚠ And a resolved path is not yet a readable
-transcript — one store is a SQLite database, so the ack-grep that proves delivery needs
-a per-store reader, not just a per-store path.
+**Who decides:** the owner — it needs credentials only he holds, and it is listed in
+[`owner-attention.md`](owner-attention.md).
 
-**What would falsify it being fixed:** `ygg-deliver.py` proving delivery into a row of a
-non-reference CLI, and `ygg-monitor` reporting that row's last prose instead of silence.
+**Measured 2026-08-22 across two hosts.** Of the ten registered CLIs, credentials are
+present for **codex, claude-code, muse and grok-build**; **qwen-code, opencode and
+antigravity have none**, and two others are unclear.
+
+⇒ This is what makes one registry claim untestable rather than wrong. `qwen-code` is
+store-authoritative with a live reader that requires a `.jsonl` transcript, and **27 qwen
+sessions across two hosts contain only `<id>.runtime.json` sidecars** — a pid/cwd marker
+with no title and no conversation, and zero `.jsonl` files. Every one of those sessions
+was an unauthenticated probe that never exchanged a message, so *"this store never writes
+a transcript"* and *"a transcript appears only once a session says something"* predict the
+identical disk, and nothing on these machines separates them.
+
+⛔ **Do not resolve this by reading the CLI's source and declaring it settled** — that is
+how the layout got into the registry in the first place, and a real store has already
+contradicted a documented layout once in this lane. **One authenticated exchange settles
+it**, and the same credential unblocks the greeting run for that CLI.
+
+**Recommendation:** authenticate `qwen-code` first — it is the only CLI whose registry
+declaration currently rests on an unmeasured store — then `opencode`. **Meanwhile the
+greeting run is not blocked**: codex ↔ claude-code exercises delivery across two genuinely
+different store layouts (a decorated file name against a plain one) and both are
+authenticated today.
 
 ## ⛔⛔⛔ [11.20] A ROLL TAKES A LIVE DAEMON'S SOCKET NAME AWAY, AND NOTHING CAN REACH IT AGAIN
 
