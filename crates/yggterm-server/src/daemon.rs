@@ -445,6 +445,70 @@ fn versioned_server_socket_alias_candidates(current: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+/// Is anybody listening on this socket path? THREE answers, and only one of
+/// them licenses taking the name away.
+///
+/// ⛔⛔ THIS EXISTS BECAUSE `ping(..).is_ok()` COLLAPSED "NOBODY IS THERE" AND
+/// "I COULD NOT TELL" INTO ONE FALSE, AND THE ACT ON THAT FALSE IS IRREVERSIBLE.
+/// The alias refresh unlinks the candidate and symlinks its name to the current
+/// daemon. A unix socket whose file has been unlinked is still bound and still
+/// accepting on its inode, but **no path reaches it any more** — so a daemon
+/// that merely failed to answer a probe in time loses its address permanently,
+/// along with every session it owns. Nothing can dial it, no verb can enumerate
+/// it, and its rows answer "no session here matches" from every other daemon.
+///
+/// ⇒ Measured on the build host 2026-08-21, minutes after a roll. Two live
+/// daemons had their names taken by the newest: `/proc/net/unix` showed them
+/// still bound to `server-3-1-12.sock` and `server-3-1-29.sock`, while both of
+/// those names had become symlinks to `server-3-1-30.sock` — so all three names
+/// reached one daemon and two daemons were unreachable. The rows they own were
+/// refused by the wake plane as "screen unreadable, blind is not clear" on every
+/// pass, indefinitely, and this is the mechanism behind that.
+///
+/// ⚖ A failed ping has many causes and only one of them is absence: a daemon
+/// under load that does not accept inside the deadline, a read or write timeout,
+/// a protocol error, a permission error. `ConnectionRefused` and `NotFound` are
+/// the only two that are structural — the kernel saying there is no listener on
+/// that inode, or no such file. Everything else is *could not tell*, and this
+/// project's own rule for that is that blind is not clear.
+///
+/// ⚠ A connection that is ACCEPTED but does not speak our protocol is not
+/// absence either. Something is listening; taking its name is exactly the harm
+/// being prevented, whatever it turns out to be.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketOccupancy {
+    /// A yggterm daemon answered on it.
+    Answering,
+    /// The kernel says there is no listener: refused, or no such path.
+    StructurallyAbsent,
+    /// Anything else. NOT permission to unlink it.
+    CouldNotTell,
+}
+
+#[cfg(unix)]
+fn socket_occupancy_from_connect_error(kind: std::io::ErrorKind) -> SocketOccupancy {
+    match kind {
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+            SocketOccupancy::StructurallyAbsent
+        }
+        _ => SocketOccupancy::CouldNotTell,
+    }
+}
+
+#[cfg(unix)]
+fn probe_socket_occupancy(candidate: &Path) -> SocketOccupancy {
+    if ping(&ServerEndpoint::UnixSocket(candidate.to_path_buf())).is_ok() {
+        return SocketOccupancy::Answering;
+    }
+    match std::os::unix::net::UnixStream::connect(candidate) {
+        // Somebody accepted. It did not answer our ping — too old, too busy,
+        // mid-startup, not ours — and none of those is an empty socket.
+        Ok(_) => SocketOccupancy::CouldNotTell,
+        Err(error) => socket_occupancy_from_connect_error(error.kind()),
+    }
+}
+
 #[cfg(unix)]
 fn refresh_legacy_server_socket_aliases(current: &Path) {
     let Some(current_version) = parse_versioned_server_socket_name(current) else {
@@ -465,7 +529,12 @@ fn refresh_legacy_server_socket_aliases(current: &Path) {
             let _ = std::os::unix::fs::symlink(current, &candidate);
             continue;
         }
-        if ping(&ServerEndpoint::UnixSocket(candidate.clone())).is_ok() {
+        // ⛔ ONLY A STRUCTURAL ABSENCE MAY TAKE A NAME. The two lines below
+        //    unlink a real socket file, and an unlinked unix socket is bound to
+        //    an inode no path reaches — so a daemon that merely failed to answer
+        //    in time loses its address for the rest of its life, with every
+        //    session it owns. See `probe_socket_occupancy`.
+        if probe_socket_occupancy(&candidate) != SocketOccupancy::StructurallyAbsent {
             continue;
         }
         let _ = fs::remove_file(&candidate);
@@ -2231,14 +2300,47 @@ pub fn cmdline_names_a_yggterm_daemon(args: &[String]) -> bool {
         .any(|pair| pair[0] == "server" && pair[1] == "daemon")
 }
 
-/// Every yggterm daemon PROCESS on this host, or `None` when the process table
-/// could not be read.
+/// Socket inode -> the path it was BOUND to, from `/proc/net/unix`.
+///
+/// ⚠ This is the bind-time name and it can be a lie about the present: a socket
+/// whose file was unlinked still reports the name it was bound to, while that
+/// name now reaches somebody else. That is exactly the condition
+/// `probe_socket_occupancy` exists to stop being created, and it is why this is
+/// used to decide WHICH HOME a daemon belongs to and never to dial one.
+#[cfg(target_os = "linux")]
+fn unix_socket_bind_names() -> Option<HashMap<String, PathBuf>> {
+    let raw = std::fs::read_to_string("/proc/net/unix").ok()?;
+    let mut names = HashMap::new();
+    for line in raw.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // `… <inode> <path>`, and only entries that actually carry a path.
+        if fields.len() >= 8 {
+            let path = fields[fields.len() - 1];
+            if path.starts_with('/') {
+                names.insert(fields[fields.len() - 2].to_string(), PathBuf::from(path));
+            }
+        }
+    }
+    Some(names)
+}
+
+/// Every yggterm daemon PROCESS serving THIS home, or `None` when the process
+/// table could not be read.
 ///
 /// ⛔⛔ `None` IS "COULD NOT ASK", NEVER "THERE ARE NONE". This exists to
 /// falsify a coverage claim, so a failure to read must never look like a
 /// confirmation.
+///
+/// ⛔⛔ AND IT IS SCOPED BY HOME, WHICH THE FIRST VERSION WAS NOT. A build host
+/// runs sandbox daemons under private `YGGTERM_HOME`s — six processes on this
+/// one, three of them sandboxes — and a sweep of the real home neither reaches
+/// nor should reach them. Counting them made the coverage verdict read `blind`
+/// permanently and named pids that were never in scope, which is the false
+/// shortfall that teaches people to ignore a field. A daemon's home is taken
+/// from the socket it is bound to, because that is what the sweep dials.
 #[cfg(target_os = "linux")]
-pub fn daemon_process_pids() -> Option<Vec<u32>> {
+pub fn daemon_process_pids(home_dir: &Path) -> Option<Vec<u32>> {
+    let bind_names = unix_socket_bind_names()?;
     let dir = std::fs::read_dir("/proc").ok()?;
     let mut pids = Vec::new();
     for entry in dir.flatten() {
@@ -2259,15 +2361,53 @@ pub fn daemon_process_pids() -> Option<Vec<u32>> {
             .filter(|part| !part.is_empty())
             .map(|part| String::from_utf8_lossy(part).to_string())
             .collect();
-        if cmdline_names_a_yggterm_daemon(&args) {
+        if !cmdline_names_a_yggterm_daemon(&args) {
+            continue;
+        }
+        if daemon_pid_serves_home(pid, &bind_names, home_dir) {
             pids.push(pid);
         }
     }
     Some(pids)
 }
 
+/// Does this daemon process listen on a socket inside `home_dir`?
+#[cfg(target_os = "linux")]
+fn daemon_pid_serves_home(
+    pid: u32,
+    bind_names: &HashMap<String, PathBuf>,
+    home_dir: &Path,
+) -> bool {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        // Its descriptors are unreadable, so its home is unknown. Counting it
+        // would invent a shortfall; the sweep's own `unable` count is where an
+        // unanswerable daemon belongs, not here.
+        return false;
+    };
+    for fd in fds.flatten() {
+        let Ok(target) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        let Some(inode) = target
+            .to_str()
+            .and_then(|text| text.strip_prefix("socket:["))
+            .and_then(|text| text.strip_suffix(']'))
+        else {
+            continue;
+        };
+        if bind_names
+            .get(inode)
+            .and_then(|path| path.parent())
+            .is_some_and(|parent| parent == home_dir)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(not(target_os = "linux"))]
-pub fn daemon_process_pids() -> Option<Vec<u32>> {
+pub fn daemon_process_pids(_home_dir: &Path) -> Option<Vec<u32>> {
     None
 }
 
@@ -25250,6 +25390,100 @@ mod tests {
         // mid-sentence" that permits the bump.
         assert_eq!(draft_sweep_verdict(1, 0), DRAFT_SWEEP_DRAFTS_PRESENT);
         assert_eq!(draft_sweep_verdict(1, 9), DRAFT_SWEEP_DRAFTS_PRESENT);
+    }
+
+    /// ⛔⛔ TAKING A LIVE DAEMON'S NAME IS IRREVERSIBLE, SO ONLY A STRUCTURAL
+    /// ABSENCE MAY LICENSE IT.
+    ///
+    /// The alias refresh unlinks an older versioned socket and symlinks its name
+    /// to the current daemon. A unix socket whose file has been unlinked is
+    /// still bound and still accepting on its inode, but **no path reaches it**
+    /// — so the guard in front of that `remove_file` is the only thing standing
+    /// between a slow daemon and permanent unreachability, for it and for every
+    /// session it owns. It used to be `ping(..).is_ok()`, which reads a timeout,
+    /// a busy accept queue and a protocol error identically to "nobody is home".
+    ///
+    /// Measured on the build host after a roll: two live daemons still bound to
+    /// `server-3-1-12.sock` and `server-3-1-29.sock` per `/proc/net/unix`, both
+    /// of those names symlinked to `server-3-1-30.sock`, all three names
+    /// reaching one daemon. The wake plane then refused their rows as "screen
+    /// unreadable" on every pass, indefinitely.
+    ///
+    /// ⭐ Driven against REAL unix sockets rather than a mocked error, because
+    /// the distinction being tested is one the kernel makes and not one this
+    /// code invents.
+    #[test]
+    fn only_a_structurally_absent_socket_may_have_its_name_taken() {
+        use super::{SocketOccupancy, probe_socket_occupancy, socket_occupancy_from_connect_error};
+        use std::io::ErrorKind;
+
+        let dir = std::env::temp_dir().join(format!("ygg-occupancy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // 1. Nothing there at all.
+        assert_eq!(
+            probe_socket_occupancy(&dir.join("never-existed.sock")),
+            SocketOccupancy::StructurallyAbsent,
+            "a path with no socket is the case the alias refresh exists for"
+        );
+
+        // 2. A socket FILE whose daemon has gone: the kernel refuses. This is
+        //    the stale-socket case and it must stay takeable, or old names
+        //    accumulate forever and no client pinned to one is ever rescued.
+        let stale = dir.join("stale.sock");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&stale).expect("bind");
+            drop(listener);
+        }
+
+        // Re-create the file without a listener behind it.
+        std::fs::write(&stale, b"").ok();
+        assert_ne!(
+            probe_socket_occupancy(&stale),
+            SocketOccupancy::Answering,
+            "a stale socket must never read as a live daemon"
+        );
+
+        // 3. ⛔ THE ONE THAT MATTERS. Something is listening and does not speak
+        //    our protocol — a daemon mid-startup, one too busy to answer, one
+        //    too old. It must NOT be takeable.
+        let live = dir.join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&live).expect("bind live");
+        assert_eq!(
+            probe_socket_occupancy(&live),
+            SocketOccupancy::CouldNotTell,
+            "a socket somebody is listening on must never be classified absent: \
+             the act licensed by that answer unlinks it, and an unlinked unix \
+             socket is bound to an inode no path can reach again"
+        );
+        drop(listener);
+
+        // The error mapping itself, stated once so the two structural kinds
+        // cannot quietly grow a third sibling.
+        assert_eq!(
+            socket_occupancy_from_connect_error(ErrorKind::ConnectionRefused),
+            SocketOccupancy::StructurallyAbsent
+        );
+        assert_eq!(
+            socket_occupancy_from_connect_error(ErrorKind::NotFound),
+            SocketOccupancy::StructurallyAbsent
+        );
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionAborted,
+        ] {
+            assert_eq!(
+                socket_occupancy_from_connect_error(kind),
+                SocketOccupancy::CouldNotTell,
+                "{kind:?} is a failure to ask, not an answer — and the act it \
+                 would license cannot be undone"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ⛔⛔ THE DRAFT GUARDS THAT DO NOT WRITE FIRST MUST READ THE UNION.

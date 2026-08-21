@@ -23614,7 +23614,7 @@ pub fn run_row_drafts() -> anyhow::Result<()> {
     // ⚠ And when the process table itself cannot be read, that is reported as
     // `null` rather than as zero: an unverifiable coverage claim must not read
     // like a confirmed one.
-    let daemon_pids = daemon::daemon_process_pids();
+    let daemon_pids = daemon::daemon_process_pids(&home);
     let unreached: Vec<u32> = daemon_pids
         .as_ref()
         .map(|pids| {

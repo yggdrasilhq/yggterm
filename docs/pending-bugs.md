@@ -18,6 +18,64 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔⛔ [11.20] A ROLL TAKES A LIVE DAEMON'S SOCKET NAME AWAY, AND NOTHING CAN REACH IT AGAIN
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Measured on the build host 2026-08-21, minutes after the roll to 3.1.30. This is the
+mechanism behind the wake plane going blind after every deploy, and it is a direct
+breach of the constitution's guarantee that a session owned by an OLDER daemon is still
+a first-class row.*
+
+**What was measured.** `/proc/net/unix` showed three daemons in this home, each still
+bound and accepting:
+
+```
+pid  777830  bound to server-3-1-12.sock   that name now resolves to server-3-1-30.sock  -> A DIFFERENT DAEMON
+pid 1549920  bound to server-3-1-29.sock   that name now resolves to server-3-1-30.sock  -> A DIFFERENT DAEMON
+pid 2410451  bound to server-3-1-30.sock   that name now resolves to server-3-1-30.sock  -> itself
+```
+
+Both older names had become symlinks to the newest daemon's socket, timestamped at the
+roll. **A unix socket whose file has been unlinked is still bound and still accepting on
+its inode, but no path reaches it.** So those two daemons are unreachable by anything,
+for the rest of their lives, along with every session they own.
+
+**What it costs, live.** Three subscribed rows were refused by the booter on every pass
+as `SKIP:blind` / *"could not read its screen, so it cannot be ruled out that a prompt
+is waiting"* — correct behaviour over an instrument that has gone blind. `server screen`
+and `gate-screen` answer `[]` for those rows; `server rows drafts` reaches one daemon in
+three. Every enumerating verb is affected, because they all dial by name.
+
+**The mechanism, and it is one `is_ok()`.** `refresh_legacy_server_socket_aliases` walks
+older versioned socket names so a client pinned to an old version still finds the current
+daemon. It guards the destructive branch by pinging the candidate first — correct in
+shape. But `ping(..).is_ok()` collapses *"nobody is listening"* into the same `false` as
+a read timeout, a write timeout, a busy accept queue, a protocol error and a permission
+error. Only the first is absence. The act licensed by that `false` unlinks a live
+socket and **cannot be undone**.
+
+⇒ **Blind is not clear, applied where being wrong is permanent.** The probe is tri-state
+now: `Answering` · `StructurallyAbsent` (the kernel refused the connection, or there is
+no such path) · `CouldNotTell` (everything else, **including a connection that is
+ACCEPTED but does not speak our protocol** — a daemon mid-startup, one too busy, one too
+old). Only `StructurallyAbsent` may take a name. The stale-socket case still works, so
+old names are still rescued.
+
+**Live proof owed:** the next roll must leave a live older daemon's socket name alone —
+`/proc/net/unix` bind-name and `realpath` of that name must still be the same inode
+afterwards. It needs a deploy of this code plus a roll on top of it.
+
+⚠ **Not fixed here, and it is the other half.** These daemons are superseded and are
+*trying* to retire; they linger because the drain never converges under load, which is
+the constitution's own documented gap. The alias is written by the newest daemon on
+startup, not by the retiring one — `alias_own_socket_to_successor` is correct and fires
+250 ms before `exit(0)`. So this fix stops the name being stolen; it does not make the
+lingering daemons retire, and while they linger their sessions stay split across owners.
+
+⛔ **And the daemons whose names were already taken cannot be rescued by this fix or any
+other.** Their sockets are unlinked; there is no path to them. They end when they end.
+
 ## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
 
 **Status:** OPEN
