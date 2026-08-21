@@ -2145,7 +2145,6 @@ fn SidebarRow(
 ) -> Element {
     // Indent math from the SHARED row engine — the cwdtree is the vocabulary's
     // reference consumer, so its numbers and the engine's are one definition.
-    let sidebar_row_metrics = session_row_metrics(SessionRowDensity::Sidebar);
     let (indent, label_indent) = sidebar_row_indents(row.depth, show_live_close);
     let draggable = is_tree_drag_source_row(&row);
     let row_kind_label = format!("{:?}", row.kind);

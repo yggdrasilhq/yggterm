@@ -39,122 +39,12 @@ pub(crate) fn retained_rehydrate_allow_screen_fallback(
 ) -> bool {
     agent_cli_session || matches!(mode, RetainedRehydrateMode::CollapsedScrollbackRecovery)
 }
-/// The minimum scrollback depth (baseY) for a client buffer to count as a "rich"
-/// transcript worth protecting from a collapse-reseed.
-pub(crate) const RICH_CLIENT_MIN_NONBLANK: u32 = 6;
 
-/// Cold-re-resume vacuum guard (sum-total run #3 redesign of the reverted 2.8.64
-/// guard): refuse a daemon-frame reseed that would VACUUM a substantially richer
-/// client buffer — but ONLY when the frame was read from a DIFFERENT runtime
-/// spawn than the one the client buffer was seeded from (`incoming_from_new_runtime`).
-///
-/// The scenario: a codex runtime exits (e.g. a system update drops the SSH
-/// transport) → the daemon cold-re-resumes it on a FRESH PTY whose vt100 screen is
-/// ~8 lines (codex repaints in place, so the conversation was NEVER in the daemon
-/// scrollback — it lives ONLY in the client xterm buffer) → reseeding the client
-/// from that sparse frame collapses the whole transcript (live-caught: base_y
-/// 1801 → 32).
-///
-/// WHY the runtime-spawn AND is load-bearing (the 2.8.64 lesson): codex daemon
-/// frames are ALWAYS small relative to an accumulated client baseY, so a blanket
-/// magnitude ratio fires on every normal codex reveal and gates the
-/// reveal-reconcile into a persistent shadow + gate notification (sum-test obs
-/// #2/#4/#5 — reverted in 2.8.65). With the spawn-id signal, a same-runtime
-/// reveal can NEVER guard; only a genuinely replaced runtime arms the ratio.
-/// Unknown spawn ids (0, e.g. older daemon or the user/agent reconcile that owns
-/// the churn decision) keep `incoming_from_new_runtime` false → fails open.
-///
-/// Failure mode is benign by construction: at worst it keeps slightly-stale rich
-/// content that the fresh runtime's next comparably-rich frame replaces normally
-/// — never a vacuum.
-pub(crate) fn retained_replay_would_vacuum_richer_client(
-    client_richness: u32,
-    incoming_richness: u32,
-    incoming_from_new_runtime: bool,
-) -> bool {
-    incoming_from_new_runtime
-        && client_richness >= RICH_CLIENT_MIN_NONBLANK
-        && incoming_richness.saturating_mul(3) < client_richness
-}
 
-/// Boring retained reveal (spec-boring-session-loads, lane 1): how the
-/// bootstrap read loop should (re)enter the daemon chunk stream for a host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetainedRevealReadPlan {
-    /// The host's xterm entry survived backgrounding with this stream's
-    /// content already painted: resume reads at the saved cursor and APPEND
-    /// only the missed delta — no reset, no full replay. The harness locks
-    /// the safety property (stream-split invariance: split feeds equal the
-    /// un-split feed; tools/xterm-harness/boring_reveal_resume.test.js), so
-    /// the revealed buffer ends exactly as if the session never detached.
-    ResumeAppend { cursor: u64 },
-    /// Fresh mount (or no healthy saved cursor): read from 0, full replay.
-    FullReplay,
-}
 
-/// The saved cursor is keyed by (session_path, host_id): the host id is only
-/// reused when the GUI retained the SAME terminal host element (and thus the
-/// same painted xterm entry) across the background/reveal cycle, so presence
-/// of a positive saved cursor IS the "retained and already painted" signal —
-/// a scenario signal, never a magnitude ratio (the 2.8.64 lesson). The store
-/// must only be written by a healthy read loop and cleared on every reset /
-/// cursor-rewind / fault-recovery path, so a stale or churned host never
-/// resumes.
-pub(crate) fn retained_reveal_read_plan(saved_cursor: Option<u64>) -> RetainedRevealReadPlan {
-    match saved_cursor {
-        Some(cursor) if cursor > 0 => RetainedRevealReadPlan::ResumeAppend { cursor },
-        _ => RetainedRevealReadPlan::FullReplay,
-    }
-}
 
-/// When resuming (ResumeAppend), the InitialRead retained-rehydrate task is
-/// pure churn: it re-reads the stream from 0 and reset+replays it into the
-/// already-painted buffer — that reset IS the blink-blink shadow the spec
-/// rejects. Suppress it. A CollapsedScrollbackRecovery rehydrate is a FAULT
-/// path (the surface is already known broken) and must stay armed.
-pub(crate) fn retained_reveal_resume_suppresses_rehydrate(
-    plan: RetainedRevealReadPlan,
-    mode: RetainedRehydrateMode,
-) -> bool {
-    matches!(plan, RetainedRevealReadPlan::ResumeAppend { .. })
-        && matches!(mode, RetainedRehydrateMode::InitialRead)
-}
 
-/// Outcome of the FIRST read after a ResumeAppend, decided from the daemon's
-/// own stream signals (deterministic, no heuristics):
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResumedReadOutcome {
-    /// Contiguous tail: append the chunks. The boring reveal.
-    AppendChunks,
-    /// The live ring trimmed below our cursor (`resync_required`): the
-    /// returned tail skips a contiguous middle, so appending it would corrupt
-    /// the buffer (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
-    /// Skip the chunks, advance the cursor past the gap, and arm the
-    /// scrollback-preserving visible-screen reconcile (the shipped 2.8.69
-    /// daemon vt100 write) to repaint the authoritative bottom. The client
-    /// keeps its scrollback; only the unrecoverable gap middle is absent —
-    /// strictly more than the old reset+replay preserved. NEVER replay
-    /// history into the buffer here (the gap-fix cascade trap: history
-    /// written into an alternate-screen TUI corrupted codex on switch-back).
-    SkipGapReconcileScreen,
-    /// The daemon's cursor rewound below ours: the runtime was re-created
-    /// (cold re-resume). The existing rewind path owns this — full reset +
-    /// replay of the fresh stream.
-    FullResetReplay,
-}
 
-pub(crate) fn resumed_read_outcome(
-    resync_required: bool,
-    cursor_rewound: bool,
-) -> ResumedReadOutcome {
-    if cursor_rewound {
-        ResumedReadOutcome::FullResetReplay
-    } else if resync_required {
-        ResumedReadOutcome::SkipGapReconcileScreen
-    } else {
-        ResumedReadOutcome::AppendChunks
-    }
-}
 
 pub(crate) fn retained_ready_remote_host_should_reuse_bootstrap(
     is_remote_resume_session: bool,
@@ -921,5 +811,132 @@ mod tests {
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery),
         );
         assert_ne!(initial, recovery);
+    }
+}
+
+// ── TEST AFFORDANCES ─────────────────────────────────────────────────────
+// ⛔ Nothing that SHIPS calls these; the test suite does, to assert on
+// behaviour that is still live. They were `dead_code` warnings for exactly
+// that reason, and a warning nobody can act on is how the other 60 in this
+// crate went unread. `#[cfg(test)]` is the accurate statement: not dead,
+// not shipped, and now it cannot drown a real one.
+// ⚠ If a test below is the LAST caller of one of these, the behaviour it
+// characterises may already be gone — check the product path before
+// trusting the green tick.
+#[cfg(test)]
+/// The minimum scrollback depth (baseY) for a client buffer to count as a "rich"
+/// transcript worth protecting from a collapse-reseed.
+pub(crate) const RICH_CLIENT_MIN_NONBLANK: u32 = 6;
+#[cfg(test)]
+/// Cold-re-resume vacuum guard (sum-total run #3 redesign of the reverted 2.8.64
+/// guard): refuse a daemon-frame reseed that would VACUUM a substantially richer
+/// client buffer — but ONLY when the frame was read from a DIFFERENT runtime
+/// spawn than the one the client buffer was seeded from (`incoming_from_new_runtime`).
+///
+/// The scenario: a codex runtime exits (e.g. a system update drops the SSH
+/// transport) → the daemon cold-re-resumes it on a FRESH PTY whose vt100 screen is
+/// ~8 lines (codex repaints in place, so the conversation was NEVER in the daemon
+/// scrollback — it lives ONLY in the client xterm buffer) → reseeding the client
+/// from that sparse frame collapses the whole transcript (live-caught: base_y
+/// 1801 → 32).
+///
+/// WHY the runtime-spawn AND is load-bearing (the 2.8.64 lesson): codex daemon
+/// frames are ALWAYS small relative to an accumulated client baseY, so a blanket
+/// magnitude ratio fires on every normal codex reveal and gates the
+/// reveal-reconcile into a persistent shadow + gate notification (sum-test obs
+/// #2/#4/#5 — reverted in 2.8.65). With the spawn-id signal, a same-runtime
+/// reveal can NEVER guard; only a genuinely replaced runtime arms the ratio.
+/// Unknown spawn ids (0, e.g. older daemon or the user/agent reconcile that owns
+/// the churn decision) keep `incoming_from_new_runtime` false → fails open.
+///
+/// Failure mode is benign by construction: at worst it keeps slightly-stale rich
+/// content that the fresh runtime's next comparably-rich frame replaces normally
+/// — never a vacuum.
+pub(crate) fn retained_replay_would_vacuum_richer_client(
+    client_richness: u32,
+    incoming_richness: u32,
+    incoming_from_new_runtime: bool,
+) -> bool {
+    incoming_from_new_runtime
+        && client_richness >= RICH_CLIENT_MIN_NONBLANK
+        && incoming_richness.saturating_mul(3) < client_richness
+}
+#[cfg(test)]
+/// Boring retained reveal (spec-boring-session-loads, lane 1): how the
+/// bootstrap read loop should (re)enter the daemon chunk stream for a host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedRevealReadPlan {
+    /// The host's xterm entry survived backgrounding with this stream's
+    /// content already painted: resume reads at the saved cursor and APPEND
+    /// only the missed delta — no reset, no full replay. The harness locks
+    /// the safety property (stream-split invariance: split feeds equal the
+    /// un-split feed; tools/xterm-harness/boring_reveal_resume.test.js), so
+    /// the revealed buffer ends exactly as if the session never detached.
+    ResumeAppend { cursor: u64 },
+    /// Fresh mount (or no healthy saved cursor): read from 0, full replay.
+    FullReplay,
+}
+#[cfg(test)]
+/// The saved cursor is keyed by (session_path, host_id): the host id is only
+/// reused when the GUI retained the SAME terminal host element (and thus the
+/// same painted xterm entry) across the background/reveal cycle, so presence
+/// of a positive saved cursor IS the "retained and already painted" signal —
+/// a scenario signal, never a magnitude ratio (the 2.8.64 lesson). The store
+/// must only be written by a healthy read loop and cleared on every reset /
+/// cursor-rewind / fault-recovery path, so a stale or churned host never
+/// resumes.
+pub(crate) fn retained_reveal_read_plan(saved_cursor: Option<u64>) -> RetainedRevealReadPlan {
+    match saved_cursor {
+        Some(cursor) if cursor > 0 => RetainedRevealReadPlan::ResumeAppend { cursor },
+        _ => RetainedRevealReadPlan::FullReplay,
+    }
+}
+#[cfg(test)]
+/// When resuming (ResumeAppend), the InitialRead retained-rehydrate task is
+/// pure churn: it re-reads the stream from 0 and reset+replays it into the
+/// already-painted buffer — that reset IS the blink-blink shadow the spec
+/// rejects. Suppress it. A CollapsedScrollbackRecovery rehydrate is a FAULT
+/// path (the surface is already known broken) and must stay armed.
+pub(crate) fn retained_reveal_resume_suppresses_rehydrate(
+    plan: RetainedRevealReadPlan,
+    mode: RetainedRehydrateMode,
+) -> bool {
+    matches!(plan, RetainedRevealReadPlan::ResumeAppend { .. })
+        && matches!(mode, RetainedRehydrateMode::InitialRead)
+}
+#[cfg(test)]
+/// Outcome of the FIRST read after a ResumeAppend, decided from the daemon's
+/// own stream signals (deterministic, no heuristics):
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumedReadOutcome {
+    /// Contiguous tail: append the chunks. The boring reveal.
+    AppendChunks,
+    /// The live ring trimmed below our cursor (`resync_required`): the
+    /// returned tail skips a contiguous middle, so appending it would corrupt
+    /// the buffer (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
+    /// Skip the chunks, advance the cursor past the gap, and arm the
+    /// scrollback-preserving visible-screen reconcile (the shipped 2.8.69
+    /// daemon vt100 write) to repaint the authoritative bottom. The client
+    /// keeps its scrollback; only the unrecoverable gap middle is absent —
+    /// strictly more than the old reset+replay preserved. NEVER replay
+    /// history into the buffer here (the gap-fix cascade trap: history
+    /// written into an alternate-screen TUI corrupted codex on switch-back).
+    SkipGapReconcileScreen,
+    /// The daemon's cursor rewound below ours: the runtime was re-created
+    /// (cold re-resume). The existing rewind path owns this — full reset +
+    /// replay of the fresh stream.
+    FullResetReplay,
+}
+#[cfg(test)]
+pub(crate) fn resumed_read_outcome(
+    resync_required: bool,
+    cursor_rewound: bool,
+) -> ResumedReadOutcome {
+    if cursor_rewound {
+        ResumedReadOutcome::FullResetReplay
+    } else if resync_required {
+        ResumedReadOutcome::SkipGapReconcileScreen
+    } else {
+        ResumedReadOutcome::AppendChunks
     }
 }

@@ -4365,27 +4365,6 @@ struct X11CompositorBlurApplyReport {
     property_value_len: u32,
 }
 
-#[cfg(target_os = "linux")]
-fn query_kde_x11_blur_region_property(xid: u32) -> std::result::Result<(bool, u32), String> {
-    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as XprotoConnectionExt};
-
-    if xid == 0 {
-        return Ok((false, 0));
-    }
-    let (connection, _) = x11rb::connect(None).map_err(|error| error.to_string())?;
-    let atom = connection
-        .intern_atom(false, b"_KDE_NET_WM_BLUR_BEHIND_REGION")
-        .map_err(|error| error.to_string())?
-        .reply()
-        .map_err(|error| error.to_string())?
-        .atom;
-    let reply = connection
-        .get_property(false, xid, atom, AtomEnum::CARDINAL, 0, 16)
-        .map_err(|error| error.to_string())?
-        .reply()
-        .map_err(|error| error.to_string())?;
-    Ok((reply.format == 32 && reply.value_len >= 4, reply.value_len))
-}
 
 #[cfg(target_os = "linux")]
 fn set_kde_x11_blur_region(
@@ -4444,28 +4423,6 @@ fn clear_linux_x11_compositor_blur_state() {
     LINUX_X11_COMPOSITOR_BLUR_REVERIFY_GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
-#[cfg(target_os = "linux")]
-fn refresh_linux_x11_compositor_blur_property_state() {
-    if !linux_gtk_backend_is_x11() {
-        return;
-    }
-    let xid = LINUX_X11_COMPOSITOR_BLUR_XID.load(Ordering::SeqCst);
-    if xid == 0 {
-        LINUX_X11_COMPOSITOR_BLUR_PROPERTY_PRESENT.store(false, Ordering::SeqCst);
-        LINUX_COMPOSITOR_BLUR_ACTIVE.store(false, Ordering::SeqCst);
-        return;
-    }
-    match query_kde_x11_blur_region_property(xid) {
-        Ok((present, _value_len)) => {
-            LINUX_X11_COMPOSITOR_BLUR_PROPERTY_PRESENT.store(present, Ordering::SeqCst);
-            LINUX_COMPOSITOR_BLUR_ACTIVE.store(present, Ordering::SeqCst);
-        }
-        Err(_error) => {
-            LINUX_X11_COMPOSITOR_BLUR_PROPERTY_PRESENT.store(false, Ordering::SeqCst);
-            LINUX_COMPOSITOR_BLUR_ACTIVE.store(false, Ordering::SeqCst);
-        }
-    }
-}
 
 #[cfg(target_os = "linux")]
 fn schedule_linux_x11_compositor_blur_reverify(
@@ -5209,15 +5166,6 @@ fn chip_style(palette: Palette, selected: bool) -> String {
 fn titlebar_new_action_style(palette: Palette) -> String {
     shared_menu_item_style(palette, MenuItemTone::Standard, 29, 11.0, "0 10px", 0, true)
 }
-fn titlebar_modal_action_style(_palette: Palette) -> String {
-    format!(
-        "display:inline-flex; align-items:center; justify-content:center; flex:0 1 134px; min-width:134px; max-width:100%; height:31px; padding:0 13px; border:none; border-radius:10px; \
-         background:{}; color:{}; font-size:11.5px; font-weight:700; text-align:center; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; box-shadow:{}; box-sizing:border-box;",
-        "rgb(255,255,255)",
-        "#18222d",
-        "inset 0 0 0 1px rgba(214,223,232,0.92), 0 1px 2px rgba(15,23,42,0.08)",
-    )
-}
 fn rename_ai_action_button_style(palette: Palette) -> String {
     format!(
         "display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; \
@@ -5641,14 +5589,6 @@ fn context_menu_item_style(palette: Palette, item: &RowMenuItem) -> String {
         context_menu_action_style(palette, item.emphasized)
     }
 }
-/// Whether a click on a drawn menu entry may reach the overlay's `on_action`.
-///
-/// A thin adapter over [`context_menu_click_action`] — THE dispatch owner —
-/// kept so "may this item dispatch?" stays askable as a bool. Separators are
-/// part of the same sentence: a divider is never dispatched.
-fn context_menu_item_dispatches(item: &RowMenuItem) -> bool {
-    context_menu_click_action(item).is_some()
-}
 /// A menu item that is drawn but inert. Same style ENGINE and therefore exactly
 /// the same custom-property keys as the other two — only the values differ (no
 /// hover tint, dimmed text). Emitting a different key set here would leave the
@@ -5808,4 +5748,23 @@ fn interface_font_family() -> &'static str {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn interface_font_family() -> &'static str {
     "system-ui, sans-serif"
+}
+
+// ── TEST AFFORDANCES ─────────────────────────────────────────────────────
+// ⛔ Nothing that SHIPS calls these; the test suite does, to assert on
+// behaviour that is still live. They were `dead_code` warnings for exactly
+// that reason, and a warning nobody can act on is how the other 60 in this
+// crate went unread. `#[cfg(test)]` is the accurate statement: not dead,
+// not shipped, and now it cannot drown a real one.
+// ⚠ If a test below is the LAST caller of one of these, the behaviour it
+// characterises may already be gone — check the product path before
+// trusting the green tick.
+#[cfg(test)]
+/// Whether a click on a drawn menu entry may reach the overlay's `on_action`.
+///
+/// A thin adapter over [`context_menu_click_action`] — THE dispatch owner —
+/// kept so "may this item dispatch?" stays askable as a bool. Separators are
+/// part of the same sentence: a divider is never dispatched.
+fn context_menu_item_dispatches(item: &RowMenuItem) -> bool {
+    context_menu_click_action(item).is_some()
 }

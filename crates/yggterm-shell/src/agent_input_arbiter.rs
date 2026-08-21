@@ -194,13 +194,14 @@ impl AgentInputArbiter {
         self.preempt_surface(surface)
     }
 
+
+    #[cfg(test)]
     /// Has this batch been preempted on this surface?
     pub fn is_preempted(&self, surface: &SurfaceKey, batch_id: &str) -> bool {
         self.lanes
             .get(surface)
             .is_some_and(|lane| lane.preempted_batches.iter().any(|id| id == batch_id))
     }
-
     /// Drop a surface's state (surface closed or recreated).
     pub fn forget(&mut self, surface: &SurfaceKey) {
         self.lanes.remove(surface);
