@@ -566,6 +566,33 @@ has a daemon and sessions but no client. `server app clients` answers "is the GU
 variable at it, which is how a second live instance can be READ for comparison. Never DRIVE one:
 a mode change or relaunch corrupts whatever it is measuring.
 
+### ⛔⛔ A FRAME COUNT IS NOT A PAINT — `renderEventCount`, `frame_window` and `frame_gap` ALL READ HEALTHY ON A HALF-PAINTED SCREEN
+
+The renderer repaints only the rows it marked dirty. So a mount that painted two rows and stopped
+has frames, a populated `xterm_render/frame_window`, and a `frame_gap` profile indistinguishable
+from a session that painted everything — because every one of those instruments counts **frames**,
+and the question a person is asking is **coverage**.
+
+⇒ Ask `xterm_paint/settle` instead: `rows_content_unpainted` is rows the terminal HOLDS TEXT ON that
+no frame since the mount has covered. Positive means the screen is showing less than the session
+contains. `scripts/paint-chain.py` prints it per mount with the native half joined on `host_id`.
+
+⚠ Three ways to misread it, each of which turns a fault into a clean bill of health:
+
+* **`rows_with_content: -1` is blind, not empty.** An unreadable buffer collapsed to `0` reads as a
+  terminal with nothing in it — i.e. as perfectly painted.
+* **`visible: false` mounts are expected not to paint.** The churn re-mounts rows nobody is looking
+  at and their renderer is idle by design; that is a cost, not a fault. Filter with `--visible-only`
+  before calling anything broken.
+* **The coverage test is only sound on a MOUNT.** It works because the surface started blank, so
+  every row with text must be painted at least once. Applied to steady state it says nothing.
+
+⛔ And the settle timer runs on the thread under investigation, so it reports `overshoot_ms` rather
+than assuming it fired on time — an overshoot is a UI-thread stall the probe survived, not a slow
+paint. A thread that never comes back emits nothing at all, which is why `mount_open` is emitted at
+the surface: **a mount with no `first_frame` after it never painted**, and that absence is the
+reading.
+
 ### 1.99 ⛔⛔⛔ THE INSTRUMENT THAT INCLUDES ITSELF IN WHAT IT MEASURES
 
 **No table row above predicts this one, because it is not a property of any

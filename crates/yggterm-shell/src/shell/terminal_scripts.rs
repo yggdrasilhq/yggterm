@@ -405,6 +405,375 @@ fn terminal_eval_script_with_canvas_renderer(
                 payload: Object.assign({{ host_id: hostId }}, detail || {{}}),
             }});
         }};
+        // ── the mount→paint chain (category `xterm_paint`) ─────────────────
+        // ⭐ THIS IS THE HALF OF THE CHAIN THAT DID NOT EXIST. Every other
+        // probe above describes steady-state OUTPUT, and every probe on the
+        // Rust side stops at this boundary — so "the mount began" and "the
+        // glyphs arrived" were the same event to every instrument in the
+        // project, and a mount BEGINS WITH AN EMPTY SURFACE. That is why a
+        // half-painted switch and a clean one have been indistinguishable
+        // without a photograph of the screen.
+        //
+        // Four marks over one mount, joined to the native half by `host_id` —
+        // which already encodes the mount epoch, so no second identity is
+        // introduced and nothing has to be threaded across the bridge:
+        //   open    `term.open()` returned: the surface exists and is BLANK
+        //   write   the first bytes the canvas accepted
+        //   parsed  xterm finished parsing them into its buffer
+        //   frame   the renderer painted a frame
+        //
+        // ⛔⛔ AND A FRAME IS NOT A PAINT. The renderer repaints only the rows
+        // it marked dirty, so "a frame happened" says nothing about how much of
+        // the viewport it covered — which is exactly the distinction the eye
+        // makes and the trace could not. `settle` answers the question the eye
+        // asks: of the rows this terminal HOLDS TEXT ON, how many has any frame
+        // since the mount actually covered. On a MOUNT that is a sound test
+        // precisely because the surface started blank — every row must be
+        // painted at least once for its content to be on screen — and it is the
+        // reason this probe is scoped to a mount rather than left running.
+        //
+        // ⛔ AN INSTRUMENT THAT RUNS ON THE THING IT MEASURES READS ZERO. The
+        // settle timer runs on the very thread whose stalls are under
+        // investigation, so it is never trusted to have fired on time: it
+        // reports the MEASURED window beside its nominal deadline, and the
+        // overshoot between them is a UI-thread stall the probe survived rather
+        // than a slow paint. ⚠ What it cannot report is a thread that never
+        // comes back at all — for that the anchor is `mount_open`, emitted at
+        // the surface, so a mount carrying no `first_frame` is a mount that
+        // never painted, and the absence is legible from the native side by
+        // joining on `host_id` alone. Both halves are needed; neither is
+        // sufficient.
+        const YGG_PAINT_SETTLE_MS = 1200;
+        const YGG_PAINT_RECHECK_MS = 4000;
+        // ⛔ `performance.now()` and not `Date.now()`, per the contract: every
+        // number below is a DELTA between two reads inside this one document,
+        // which is what the monotonic clock is for. `ts_ms` — the field that
+        // orders these records against records written by other processes — is
+        // stamped by the emitter from the epoch clock, and the two must not be
+        // mixed.
+        const paintNow = () => (window.performance && window.performance.now)
+            ? window.performance.now()
+            : Date.now();
+        const paintChain = {{
+            scriptStartedAtMs: paintNow(),
+            hostReadyAtMs: 0,
+            openedAtMs: 0,
+            openSpan: null,
+            firstWriteAtMs: 0,
+            firstWriteChars: 0,
+            firstWriteSource: '',
+            firstParsedAtMs: 0,
+            firstFrameAtMs: 0,
+            frames: 0,
+            blankFrames: 0,
+            writes: 0,
+            chars: 0,
+            covered: null,
+            coveredCount: 0,
+            coveredRows: 0,
+            coverageResets: 0,
+            settles: 0,
+        }};
+        const paintDelta = (from, to) => (from > 0 && to > 0) ? Math.max(0, to - from) : null;
+        // ⚠ `null` rather than `false` when the node cannot be measured. An
+        // unmeasurable host and a host measured to be zero-sized are different
+        // findings, and only one of them is about painting.
+        const paintHostVisible = () => {{
+            try {{
+                const node = (term && term.element) || host;
+                if (!node || typeof node.getBoundingClientRect !== 'function') {{
+                    return null;
+                }}
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }} catch (_error) {{
+                return null;
+            }}
+        }};
+        // How many of the viewport's rows this terminal holds text on.
+        // ⛔ `-1` is "the buffer could not be read", which is NOT `0`. Blind is
+        // not empty, and a reader that cannot tell them apart will read an
+        // unreadable buffer as a terminal with nothing in it — i.e. as a
+        // perfectly painted one.
+        const paintRowsWithContent = () => {{
+            try {{
+                const buffer = (term && term.buffer && term.buffer.active) ? term.buffer.active : null;
+                if (!buffer || typeof buffer.getLine !== 'function') {{
+                    return -1;
+                }}
+                const rows = Math.max(0, Number((term && term.rows) || 0));
+                const top = Number(buffer.viewportY || 0);
+                let count = 0;
+                for (let index = 0; index < rows; index += 1) {{
+                    const line = buffer.getLine(top + index);
+                    if (!line || typeof line.translateToString !== 'function') {{
+                        continue;
+                    }}
+                    if (line.translateToString(true).trim().length > 0) {{
+                        count += 1;
+                    }}
+                }}
+                return count;
+            }} catch (_error) {{
+                return -1;
+            }}
+        }};
+        const paintCoverageReset = (rows, reason) => {{
+            const size = Math.max(0, Number(rows) || 0);
+            paintChain.covered = size > 0 ? new Uint8Array(size) : null;
+            paintChain.coveredCount = 0;
+            paintChain.coveredRows = size;
+            if (reason) {{
+                paintChain.coverageResets += 1;
+            }}
+        }};
+        const paintNoteWrite = (data, source) => {{
+            try {{
+                const chars = typeof data === 'string'
+                    ? data.length
+                    : Number((data && data.length) || 0);
+                paintChain.writes += 1;
+                paintChain.chars += chars;
+                if (!paintChain.firstWriteAtMs) {{
+                    paintChain.firstWriteAtMs = paintNow();
+                    paintChain.firstWriteChars = chars;
+                    paintChain.firstWriteSource = String(source || '');
+                    // ⛔⛔ COVERAGE STARTS HERE, NOT AT THE MOUNT — and the
+                    // self-test caught this before it shipped. A frame before
+                    // any bytes painted a BLANK row, so counting it as covered
+                    // lets a mount that blank-painted the whole canvas and then
+                    // painted two rows of content report FULL coverage. That is
+                    // not a small error: it masks exactly the partial paint this
+                    // probe was built to see, and it masks it in the reassuring
+                    // direction. No `coverage_resets` bump — a geometry change
+                    // and the arrival of the first byte are different events and
+                    // must not share a counter.
+                    paintCoverageReset(Number((term && term.rows) || 0), '');
+                }}
+            }} catch (_error) {{}}
+        }};
+        const paintNoteParsed = () => {{
+            if (!paintChain.firstParsedAtMs) {{
+                paintChain.firstParsedAtMs = paintNow();
+            }}
+        }};
+        const paintNoteFrame = (rowStart, rowEnd, rows) => {{
+            try {{
+                paintChain.frames += 1;
+                const viewportRows = Math.max(0, Number(rows) || 0);
+                if (viewportRows > 0 && viewportRows !== paintChain.coveredRows) {{
+                    // A resize repaints the whole canvas, and coverage counted
+                    // against the old geometry answers a question about a
+                    // viewport that no longer exists.
+                    paintCoverageReset(viewportRows, 'rows_changed');
+                }}
+                const covered = paintChain.covered;
+                if (covered && covered.length) {{
+                    const last = covered.length - 1;
+                    const start = Math.max(0, Math.min(last, Number(rowStart) || 0));
+                    const end = Math.max(start, Math.min(last, Number(rowEnd) || 0));
+                    for (let index = start; index <= end; index += 1) {{
+                        if (!covered[index]) {{
+                            covered[index] = 1;
+                            paintChain.coveredCount += 1;
+                        }}
+                    }}
+                }}
+                if (paintChain.firstFrameAtMs) {{
+                    return;
+                }}
+                // ⛔⛔ MEASURED WRONG ON THE FIRST LIVE MOUNT AND KEPT AS A
+                // COMMENT BECAUSE THE MISTAKE IS THE INTERESTING PART. The
+                // first cut latched the first frame outright, and the very
+                // first sandbox mount reported `open→frame 218 ms` with
+                // `writes_before_frame: 0` — a span that measured the canvas
+                // PAINTING ITSELF EMPTY, which is the exact event this probe
+                // exists to distinguish from glyphs arriving. A frame before
+                // any bytes is counted, never latched: it is the blank
+                // surface, and a blank surface repainting is what a ghost
+                // frame IS.
+                if (!paintChain.firstWriteAtMs) {{
+                    paintChain.blankFrames += 1;
+                    return;
+                }}
+                paintChain.firstFrameAtMs = paintNow();
+                const rowsPainted = Math.max(0, (Number(rowEnd) - Number(rowStart)) + 1);
+                const detail = {{
+                    host_id: hostId,
+                    open_to_write_ms: paintDelta(paintChain.openedAtMs, paintChain.firstWriteAtMs),
+                    write_to_parsed_ms: paintDelta(paintChain.firstWriteAtMs, paintChain.firstParsedAtMs),
+                    parsed_to_frame_ms: paintDelta(paintChain.firstParsedAtMs, paintChain.firstFrameAtMs),
+                    write_to_frame_ms: paintDelta(paintChain.firstWriteAtMs, paintChain.firstFrameAtMs),
+                    // ⚠ The synchronous write path parses inside the write call
+                    // and never reaches `onWriteParsed`, so a missing parse mark
+                    // is a route, not a fault. Stated in the record rather than
+                    // left for a reader to infer from a null.
+                    parsed_seen: paintChain.firstParsedAtMs > 0,
+                    first_write_chars: paintChain.firstWriteChars,
+                    first_write_source: paintChain.firstWriteSource,
+                    writes_before_frame: paintChain.writes,
+                    chars_before_frame: paintChain.chars,
+                    // Frames the renderer spent on the surface before it was
+                    // handed a single byte. Not a fault on its own — the canvas
+                    // has to exist before it can hold anything — but it is the
+                    // count that turns "the mount flashed" into a number.
+                    blank_frames_before_write: paintChain.blankFrames,
+                    rows_painted: rowsPainted,
+                    rows: viewportRows,
+                    visible: paintHostVisible(),
+                }};
+                if (paintChain.openSpan) {{
+                    // `duration_ms` is open → first frame: the empty surface to
+                    // the first glyphs on it, which is the span this whole
+                    // instrument exists to name.
+                    paintChain.openSpan.finish(detail);
+                    paintChain.openSpan = null;
+                    return;
+                }}
+                ytrace.emit({{
+                    category: "xterm_paint",
+                    name: "first_frame",
+                    payload: detail,
+                }});
+            }} catch (_error) {{}}
+        }};
+        const paintEmitSettle = (deadlineMs, recheck) => {{
+            try {{
+                paintChain.settles += 1;
+                const windowMs = Math.max(0, paintNow() - paintChain.openedAtMs);
+                const viewportRows = Math.max(0, Number((term && term.rows) || 0));
+                if (viewportRows > 0 && viewportRows !== paintChain.coveredRows) {{
+                    paintCoverageReset(viewportRows, 'rows_changed');
+                }}
+                const rowsWithContent = paintRowsWithContent();
+                const coveredCount = paintChain.coveredCount;
+                // ⭐ THE FIELD THE PROBE EXISTS FOR. Rows this terminal holds
+                // text on that no frame since the mount has covered — i.e. rows
+                // the session contains and the screen is not showing. Positive
+                // is a partially-painted mount, which is what "broken TUI paint
+                // on switching" is from the inside. `null` means the buffer was
+                // unreadable and the question was not answered.
+                const unpainted = rowsWithContent >= 0
+                    ? Math.max(0, Math.min(rowsWithContent, viewportRows) - coveredCount)
+                    : null;
+                // ⛔ `painted` is "a frame landed after bytes reached the
+                // canvas", NOT "a frame happened". The distinction is the whole
+                // instrument: a mount with frames, no writes and an empty
+                // buffer would otherwise report itself complete for having
+                // faithfully painted nothing.
+                const painted = paintChain.firstFrameAtMs > 0;
+                const complete = painted && unpainted === 0;
+                const visible = paintHostVisible();
+                // ⚠ An invisible host is EXPECTED not to paint — the renderer
+                // is idle by design — so rechecking one spends a second record
+                // to restate a known fact. The reason no recheck follows is put
+                // in the first record, because a missing record and a healthy
+                // one look identical.
+                const recheckScheduled = !recheck && !complete && visible === true;
+                ytrace.window("xterm_paint", "settle", {{
+                    host_id: hostId,
+                    window_ms: windowMs,
+                    deadline_ms: deadlineMs,
+                    // How late the timer was. An overshoot past a frame or two
+                    // did not measure a slow paint; it measured a UI thread
+                    // that was not running.
+                    overshoot_ms: Math.max(0, windowMs - deadlineMs),
+                    recheck: Boolean(recheck),
+                    recheck_scheduled: recheckScheduled,
+                    painted,
+                    complete,
+                    frames: paintChain.frames,
+                    blank_frames_before_write: paintChain.blankFrames,
+                    rows: viewportRows,
+                    rows_covered: coveredCount,
+                    rows_with_content: rowsWithContent,
+                    rows_content_unpainted: unpainted,
+                    coverage_resets: paintChain.coverageResets,
+                    writes: paintChain.writes,
+                    chars: paintChain.chars,
+                    open_to_frame_ms: paintDelta(paintChain.openedAtMs, paintChain.firstFrameAtMs),
+                    visible,
+                    document_hidden: Boolean(document.hidden),
+                }});
+                if (recheckScheduled) {{
+                    window.setTimeout(
+                        () => paintEmitSettle(YGG_PAINT_RECHECK_MS, true),
+                        Math.max(0, YGG_PAINT_RECHECK_MS - YGG_PAINT_SETTLE_MS)
+                    );
+                }}
+            }} catch (_error) {{}}
+        }};
+        const paintNoteHostReady = () => {{
+            if (!paintChain.hostReadyAtMs) {{
+                paintChain.hostReadyAtMs = paintNow();
+            }}
+        }};
+        // ⛔ ONE tap per write route, and the sync route is resolved in the SAME
+        // order `flushPendingWrite` resolves its own — wrapping both `writeSync`
+        // surfaces would count every byte twice on whichever build delegates one
+        // to the other, and a doubled byte count is the kind of wrong that reads
+        // as a discovery.
+        const paintInstallWriteTaps = () => {{
+            try {{
+                if (!term || term.__yggPaintTapped) {{
+                    return false;
+                }}
+                term.__yggPaintTapped = true;
+                if (typeof term.write === 'function') {{
+                    const nativeWrite = term.write.bind(term);
+                    term.write = (data, callback) => {{
+                        paintNoteWrite(data, 'write');
+                        return nativeWrite(data, callback);
+                    }};
+                }}
+                const core = term._core;
+                if (core && typeof core.writeSync === 'function') {{
+                    const nativeSync = core.writeSync.bind(core);
+                    core.writeSync = (data, maxSubsequentCalls) => {{
+                        paintNoteWrite(data, 'write_sync');
+                        return nativeSync(data, maxSubsequentCalls);
+                    }};
+                }} else if (core && core._writeBuffer && typeof core._writeBuffer.writeSync === 'function') {{
+                    const writeBuffer = core._writeBuffer;
+                    const nativeSync = writeBuffer.writeSync.bind(writeBuffer);
+                    writeBuffer.writeSync = (data, maxSubsequentCalls) => {{
+                        paintNoteWrite(data, 'write_sync');
+                        return nativeSync(data, maxSubsequentCalls);
+                    }};
+                }}
+                return true;
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
+        const paintNoteMountOpen = (detail) => {{
+            try {{
+                paintChain.openedAtMs = paintNow();
+                paintChain.openSpan = ytrace.span("xterm_paint", "first_frame", {{ host_id: hostId }});
+                paintCoverageReset(Number((term && term.rows) || 0), '');
+                const tapped = paintInstallWriteTaps();
+                ytrace.emit({{
+                    category: "xterm_paint",
+                    name: "mount_open",
+                    payload: Object.assign({{
+                        host_id: hostId,
+                        rows: Number((term && term.rows) || 0),
+                        cols: Number((term && term.cols) || 0),
+                        // The mount's own cost, split where it is spendable:
+                        // waiting for the DOM node to exist is a different
+                        // problem from building the surface once it does.
+                        script_to_host_ms: paintDelta(paintChain.scriptStartedAtMs, paintChain.hostReadyAtMs),
+                        host_to_open_ms: paintDelta(paintChain.hostReadyAtMs, paintChain.openedAtMs),
+                        script_to_open_ms: paintDelta(paintChain.scriptStartedAtMs, paintChain.openedAtMs),
+                        write_taps_installed: tapped,
+                    }}, detail || {{}}),
+                }});
+                window.setTimeout(
+                    () => paintEmitSettle(YGG_PAINT_SETTLE_MS, false),
+                    YGG_PAINT_SETTLE_MS
+                );
+            }} catch (_error) {{}}
+        }};
         const recvTerminalCommand = async () => {{
             if (!terminalDioxusRecv) {{
                 return null;
@@ -459,6 +828,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             sendTerminalEvent({{ kind: "debug", message: `bootstrap host=${{hostId}} mounted after wait` }});
         }}
+        paintNoteHostReady();
         const ensureXtermAssets = async () => {{
             window.__yggtermXtermBootstrapError = null;
             const styleId = "yggterm-xterm-style";
@@ -1380,6 +1750,14 @@ fn terminal_eval_script_with_canvas_renderer(
             screen_in_host: Boolean(host.querySelector('.xterm-screen')),
             open_retried: mountOpenRetried,
             open_error: mountOpenError,
+        }});
+        // The surface now exists and is BLANK. Everything the user eventually
+        // sees is painted after this instant, which is why it is the anchor the
+        // whole mount→paint chain is measured from.
+        paintNoteMountOpen({{
+            open_retried: mountOpenRetried,
+            open_error: String(mountOpenError || ''),
+            screen_in_host: Boolean(host.querySelector('.xterm-screen')),
         }});
         if (mountOpenRetried || mountOpenError) {{
             // Never silent: a mount that needed the husk repair is the ONLY place
@@ -10501,6 +10879,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     currentEntry.writeParsedCount = Number(currentEntry.writeParsedCount || 0) + 1;
                     currentEntry.lastWriteParsedAtMs = Date.now();
                 }}
+                paintNoteParsed();
                 applySoftwareCanvasLayerOptimization('write_parsed');
                 syncXtermInputLineDecoration('write_parsed');
                 scheduleCursorCellBackgroundRefresh('write_parsed');
@@ -10567,6 +10946,13 @@ fn terminal_eval_script_with_canvas_renderer(
             // it owns, over and over.
             try {{
                 traceXtermRender(
+                    renderRange ? renderRange.start : 0,
+                    renderRange ? renderRange.end : 0,
+                    term ? Number(term.rows || 0) : 0
+                );
+                // Same three reads, taken once: two instruments reporting one
+                // frame must not be able to disagree about which rows it was.
+                paintNoteFrame(
                     renderRange ? renderRange.start : 0,
                     renderRange ? renderRange.end : 0,
                     term ? Number(term.rows || 0) : 0

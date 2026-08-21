@@ -57,31 +57,108 @@ painted partially. Both are what "a mount begins with an empty surface" looks li
 rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
 filing three entries for one symptom chain is what made this look half-fixed once already.
 
-**The tracing the owner asked for is END TO END:** kernel call → daemon → client →
-**xterm.js layer** → pixel.
+### ⭐ THE xterm.js HALF OF THE CHAIN NOW EXISTS — 2026-08-21, `xterm_paint`
 
-⛔ **CORRECTED 2026-08-21 — THIS ENTRY SAID THE xterm.js HALF DID NOT EXIST, AND IT DOES.**
-Measured over 6 h on the GUI host: `xterm_render/frame_gap` carries **`rows_painted`
-against `rows`**, so a half-drawn frame is directly countable (2 partial of 4558 late
-frames); `xterm_render/frame_window` carries **`full_canvas_frames` against `count`** and,
-unlike `frame_gap`, is not threshold-gated, so it is the honest denominator; and
-`terminal_js/xterm_write_flush` carries `paint_repair` with its reason. The stale claim
-cost a lane a briefing before it was caught.
+*This section replaced the paragraph that said the tracing "does not exist yet". It did not
+exist; it does now, and leaving the old sentence standing would have routed the next reader
+away from the instrument built to serve this entry.*
 
-⚠ **And `frame_gap` is a trap read as a frame-rate meter: its minimum IS its threshold**
+The tracing asked for is END TO END — kernel call → daemon → client → **xterm.js layer** →
+pixel — and the xterm.js half was the gap: every measurement above stops at the Rust boundary,
+so "the mount began" and "the glyphs arrived" were the same event to every instrument in the
+project. **A mount begins with an empty surface**, so that gap is exactly where the ghost
+frames and the broken TUI paint live.
+
+Three probes, `layer=xterm`, joined to the native half by `host_id` (which already encodes the
+mount epoch, so no second identity was introduced):
+
+| probe | says |
+|---|---|
+| `xterm_paint/mount_open` | the surface exists and is BLANK — the anchor |
+| `xterm_paint/first_frame` | open → first glyphs, split into write / parse / frame |
+| `xterm_paint/settle` | **did this mount paint**: rows covered against rows holding content |
+
+⛔⛔ **A FRAME COUNT IS NOT A PAINT** — the renderer repaints only dirty rows, so a mount that
+painted two rows and stopped has frames, a render window and a healthy frame-gap profile.
+`rows_content_unpainted` is the field: rows the terminal holds text on that no frame since the
+mount has covered. Positive means the screen is showing less than the session contains, which
+is what broken TUI paint is from the inside. The test is sound only because it is scoped to a
+MOUNT — the surface started blank, so every row with text must be painted at least once.
+
+⇒ **A partially-painted frame and a fully-painted one are now distinguishable in the trace,
+without a screenshot.** Read the whole chain with `scripts/paint-chain.py`; the columns and the
+traps are in `docs/observability.md` §2.3.
+
+#### What the instrument read on its first run — and the two things it separated
+
+Sandbox, headless compositor, six surface builds across three local shells. ⚠ These are shell
+sessions on one machine, not the owner's agent rows; the numbers below are the instrument
+working, not a characterisation of his GUI.
+
+| | cold build (first reveal) | rebuild (switch back) |
+|---|---:|---:|
+| `open → first byte` | 411 / 427 / 556 ms | 35 / 39 / 40 ms |
+| blank frames before any byte | 3 / 5 / 5 | 0 / 0 / 0 |
+| `write → parse` | 5–10 ms | — (sync path) |
+| `parse → frame` | 5–18 ms | — |
+| `write → frame` | 10 / 13 / 28 ms | 23 / 24 / 25 ms |
+| rows covered | 62/62, complete | 62/62, complete |
+
+⭐ **THE SEPARATION IS THE RESULT, not the totals.** On a cold build the empty-surface window is
+**97% spent waiting for BYTES and 3% painting them** — and the native half of the same chain says
+why: `terminal_mount/first_output` landed 391 ms after `mount_open`, and the canvas accepted those
+bytes 36 ms later. So that 427 ms is the SESSION starting up, not yggterm being slow to paint, and
+the 36 ms is the bridge hop. Before this probe those three costs were one number.
+
+⚠ **No switch in this run produced a partial or an unpainted mount.** Six of six painted every row
+they held. That is a clean sandbox, not an exoneration: the symptom is reported on a machine with
+~30 agent rows under orchestrator churn, and the instrument exists so the next occurrence is a
+reading rather than an impression.
+
+#### ⛔⛔ AND ONE THING THE INSTRUMENT FOUND ON THE WAY: `host_id` IS NOT ONE SURFACE
+
+Each of the three rows built its terminal surface **twice** — two `terminal_mount/begin` events and
+two `xterm_paint/mount_open` records twelve seconds apart — **both on `mount_epoch: 1`**, with
+`terminal_mount/mount_epoch_reused` sitting between them saying so.
+
+⇒ `host_id` is `<host>-m<mount_epoch>`, so **any count keyed on it collapses repeated surface
+builds into one.** That includes the "5 full terminal mounts / 3 distinct rows" table at the top of
+this entry: those numbers count `begin` events, which is right, but anything that later joins them
+by host id — including the first cut of `scripts/paint-chain.py` — silently kept only the LAST
+build per row. A second build painting badly would have vanished into the first build's clean
+record, which is the churn's own signature being hidden by the instrument sent to measure it.
+`paint-chain.py` now segments on `begin` and labels rebuilds `…#b1`. **Anything else keyed on
+`host_id` in this entry's chain should be re-checked the same way.**
+
+⇒ **RE-CHECKED against the isolation table further down, as that warning asks.** Those four
+windows count EVENT NAMES inside a wall-clock window and join nothing by `host_id`, so epoch
+reuse cannot collapse them; the 5-mounts-per-create figure stands. The mount TARGETS quoted
+there were read from `session_path`, which is stable across rebuilds. ⚠ What the warning does
+touch is any statement of the form "N distinct rows" — that is a host-id count and is a floor,
+not a total.
+
+
+⚠ **WHAT IS STILL MISSING, so nobody reads the above as the whole ask.** The activation ORIGIN
+— user gesture vs app-driven switch — is still not recorded, and it is still the measurement
+that would settle whether the *active session* changes on its own (see the paragraph below).
+That is a native-side event, not an xterm one, and this probe does not supply it.
+
+#### ⚠ AND THE PROBES THAT WERE ALREADY THERE — one of which lies about frame rate
+
+The paragraph this section replaced said the xterm.js layer had no instrument at all.
+That was too strong even before `xterm_paint` existed: `xterm_render/frame_gap` carries
+`rows_painted` against `rows`, `xterm_render/frame_window` carries `full_canvas_frames`
+against `count`, and `terminal_js/xterm_write_flush` carries `paint_repair` with its
+reason. What none of them could do is JOIN a write to the paint that showed it, which is
+the gap `xterm_paint` closes.
+
+⛔ **`frame_gap` read as a frame-rate meter is a trap: its minimum IS its threshold**
 (250 ms), so it counts LATE frames only and any percentage taken from it is meaningless.
-What it says honestly is worth having — **median late-frame gap 499 ms, worst 999 ms.**
-Half a second is comfortably long enough to see the previous row's surface where the new
-one should be. **That is the ghost frame, measured.**
-
-⇒ **The real gap is one link further along.** Nothing carries a **frame id from the write
-that caused a paint to the paint that showed it**, so a frame that painted the WRONG BYTES
-and one that painted the right bytes are identical in the trace. That is a far smaller
-change than instrumenting a layer, and it is the one to ask for. ⇒ It also relocates this
-entry's broken-TUI symptom: at ~0.04% of late frames, "a frame drew half its rows" is
-probably not what is being seen. The candidates that remain are a paint from a STALE
-BUFFER, or a paint that never happened and left the previous surface up — the ghost, not a
-partial draw. Different bugs, different fixes.
+What it says honestly is worth having — **median late-frame gap 499 ms, worst 999 ms**
+over 6 h on the GUI host. Half a second is comfortably long enough to see the previous
+row's surface where the new one should be. **That is the ghost frame, measured** — and it
+is a different defect from an incomplete paint, which is what `rows_content_unpainted`
+above counts.
 
 ### ⭐⭐ THE LADDER SAYS THE BUG IS IN ATTACH, NOT IN MOUNT (measured 2026-08-21, ~2.2 h)
 
