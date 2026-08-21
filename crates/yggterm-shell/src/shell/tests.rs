@@ -61462,6 +61462,63 @@ mod terminal_loop_input_starvation_locks {
             "the write-failure branch lost the attach-retry recovery gate"
         );
     }
+
+    // The reconcile-side twin. The pre_select screen reconcile awaited its
+    // daemon snapshot round trip inline, so any daemon slowness (adoption,
+    // swap-in, saturation) held the WHOLE select loop — pre_select holds of
+    // 2.8–10.0 s were measured in the 2026-08-21 typed window, with the
+    // js_event branch (the keystroke path) queued behind them. The fetch now
+    // spawns off the loop behind an in-flight latch, and the apply decision
+    // runs on the result channel's own select branch.
+    #[test]
+    fn the_reconcile_fetch_is_dispatched_off_the_select_loop() {
+        let source = include_str!("viewport.rs");
+
+        // The pre_select region: guard construction to guard drop.
+        let start = source
+            .find("TerminalLoopBranchGuard::new(\"pre_select\"")
+            .expect("the pre_select guard must still exist");
+        let end = source[start..]
+            .find("drop(pre_select_guard)")
+            .expect("the pre_select guard must still be dropped at region end");
+        let region = &source[start..start + end];
+        assert!(
+            !region.contains(".await"),
+            "the pre_select body awaits something — any round trip here holds \
+             every select branch, keystrokes included. Spawn it and take the \
+             result on its own branch."
+        );
+        assert!(
+            region.contains("screen_reconcile_fetch_in_flight = true"),
+            "the reconcile fetch lost its in-flight latch — a slow daemon now \
+             stacks concurrent snapshot fetches"
+        );
+        assert!(
+            region.contains("spawn_screen_reconcile_fetch("),
+            "the reconcile fetch no longer dispatches off the loop"
+        );
+
+        // The apply branch: on the loop, from the channel, with the decision
+        // gates the inline path had.
+        let apply_at = source
+            .find("screen_reconcile_result_rx.recv()")
+            .expect("the reconcile apply must come back on its own select branch");
+        let apply_branch = &source[apply_at..apply_at + 12_000];
+        assert!(
+            apply_branch.contains("screen_reconcile_decision("),
+            "the apply branch lost the never-repaint-a-working-surface decision"
+        );
+        assert!(
+            apply_branch.contains("screen_reconcile_fetch_failed"),
+            "a failed fetch must be traced, not swallowed as the inline path \
+             once did"
+        );
+        assert!(
+            apply_branch.contains("screen_reconcile_fetch_in_flight = false"),
+            "the apply branch no longer releases the in-flight latch — the \
+             second reconcile of a session's life never fetches"
+        );
+    }
 }
 
 #[cfg(test)]

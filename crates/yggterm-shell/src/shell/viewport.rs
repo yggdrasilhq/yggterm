@@ -6394,6 +6394,20 @@ fn TerminalCanvas(
                     }
                 });
             }
+            // THE RECONCILE FETCH TAKES THE SAME TREATMENT AS THE WRITE LEG.
+            // The pre_select screen reconcile awaited its daemon snapshot
+            // round trip inline, so any daemon slowness (adoption, swap-in,
+            // saturation) held the WHOLE select loop — pre_select holds of
+            // 2.8–10.0 s were measured in the 2026-08-21 typed window, with
+            // the js_event branch (the keystroke path) queued behind them.
+            // The fetch now spawns off the loop behind an in-flight latch and
+            // the decision/apply logic runs on this channel's own select
+            // branch. Payload: (reason, reveal_incomplete, screen — None when
+            // the fetch itself failed, which the inline path swallowed
+            // silently and the branch now traces).
+            let (screen_reconcile_result_tx, mut screen_reconcile_result_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(&'static str, bool, Option<String>)>();
+            let mut screen_reconcile_fetch_in_flight = false;
             let mut startup_resize_repair_scheduled = false;
             // RE-RESUME / REFLOW-BG FIX: when the COLUMN count changes, xterm.js
             // reflows and drops the background attribute of existing cells; a
@@ -6752,138 +6766,34 @@ fn TerminalCanvas(
                             suppressed_screen_reconcile_defer_count =
                                 suppressed_screen_reconcile_defer_count.saturating_add(1);
                         }
+                    } else if screen_reconcile_fetch_in_flight {
+                        // A fetch is already on its way — leave the due stamp
+                        // armed; the pass after completion re-judges the gates.
                     } else {
-                    screen_reconcile_due_at_ms = 0;
-                    // The chain ends when the reconcile actually runs — not when
-                    // a single rearm elapses. Reset here so the next chain's
-                    // depth/age measure that chain alone.
-                    screen_reconcile_defer_chain_depth = 0;
-                    screen_reconcile_defer_chain_began_ms = 0;
-                    let reconcile_reason = screen_reconcile_reason;
-                    screen_reconcile_reason = "post_resize_screen_reconcile";
-                    if let Ok((screen_text, _running, _out, _post, _seq, _spawn)) = terminal_snapshot_async(
-                        endpoint.clone(),
-                        runtime_session_path.clone(),
-                        &trace_home,
-                    )
-                    .await
-                    {
-                        let screen_text = sanitize_terminal_replay_payload(&screen_text);
-                        // Recovery-churn guard (incident-gap-fix-cascade): never
-                        // repaint over a WORKING surface — the agent's own next
-                        // frame repaints it, and a mid-turn overwrite tears. EXCEPT
-                        // when the reveal is confirmed incomplete (client near-blank):
-                        // there is no live frame to tear, so promote DeferWorking to
-                        // Write and fill the blank from the daemon's authoritative
-                        // screen. An unwritable (empty/launch-seed) daemon frame still
-                        // Skips — nothing to paint.
-                        let decision = match screen_reconcile_decision(&screen_text) {
-                            ScreenReconcileDecision::DeferWorking if reveal_incomplete => {
-                                append_trace_event(
-                                    &trace_home,
-                                    "ui",
-                                    "terminal_mount",
-                                    "reveal_forced_incomplete",
-                                    json!({
-                                        "session_path": session_path.clone(),
-                                        "visible_nonblank_rows": last_host_health_visible_nonblank_rows,
-                                        "bytes": screen_text.len(),
-                                    }),
-                                );
-                                ScreenReconcileDecision::Write
-                            }
-                            other => other,
-                        };
-                        match decision {
-                        ScreenReconcileDecision::Write => {
-                            screen_reconcile_unwritable_retries = 0;
-                            // ⛔ THE CLIP IS THE DAEMON'S, AND THIS SIDE MUST NOT
-                            // SECOND-GUESS IT (`screen_reconcile_chunk`).
-                            //
-                            // A daemon screen wider than this viewer really is
-                            // the frame-corruption class — each over-long row
-                            // wraps, every row below it shifts, and the
-                            // payload's later absolute `CSI r;cH` jumps land on
-                            // that spill. The clip for it used to live HERE, and
-                            // that was the bug: this side knows only its own
-                            // width, and a wrapped line carries no break, so
-                            // measuring against the viewer reads the rest of a
-                            // sentence as a ghost and deletes it. Measured on
-                            // the GUI host 2026-08-04 — 504 clips against a
-                            // 170-column PTY reporting a "334-column" screen
-                            // that was two wrapped lines.
-                            //
-                            // Only the daemon holds both numbers (the model the
-                            // text was formatted against, and the PTY the CLI
-                            // was handed), and only their difference is a ghost.
-                            // So it arrives already clipped and is written as
-                            // it came. See
-                            // docs/xterm-bugs.md#screen-model-wider-than-viewer.
-                            let screen_text = screen_text.clone();
-                            let _ = eval.send(TerminalJsCommand::Write {
-                                data: screen_text.clone(),
-                            });
-                            append_trace_event(
-                                &trace_home,
-                                "ui",
-                                "terminal_mount",
-                                reconcile_reason,
-                                json!({
-                                    "session_path": session_path.clone(),
-                                    "bytes": screen_text.len(),
-                                }),
-                            );
-                        }
-                        ScreenReconcileDecision::DeferWorking => {
-                            // RE-ARM, don't drop: a vacuumed/stale reveal frame
-                            // under a working turn must still get its corrective
-                            // write once the turn ends. Codex repaints the live
-                            // region itself meanwhile; the reconcile fires on
-                            // the first quiet+idle tick.
-                            screen_reconcile_due_at_ms = current_millis()
-                                .saturating_add(SCREEN_RECONCILE_DEFER_REARM_MS);
-                            screen_reconcile_reason = reconcile_reason;
-                            append_trace_event(
-                                &trace_home,
-                                "ui",
-                                "terminal_mount",
-                                "screen_reconcile_skipped_working_surface",
-                                json!({
-                                    "session_path": session_path.clone(),
-                                    "reason": reconcile_reason,
-                                    "rearmed": true,
-                                }),
-                            );
-                        }
-                        ScreenReconcileDecision::SkipUnwritable => {
-                            // Unwritable (empty / launch-seed) — previously a
-                            // SILENT give-up. Trace it and re-arm the SAME
-                            // reveal reconcile up to 3 times so the stale
-                            // bottom self-heals once the daemon screen lands.
-                            let retry = screen_reconcile_unwritable_retries < 3;
-                            if retry {
-                                screen_reconcile_unwritable_retries += 1;
-                                screen_reconcile_due_at_ms = current_millis()
-                                    .saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
-                                screen_reconcile_reason = reconcile_reason;
-                            }
-                            append_trace_event(
-                                &trace_home,
-                                "ui",
-                                "terminal_mount",
-                                "screen_reconcile_skipped_unwritable",
-                                json!({
-                                    "session_path": session_path.clone(),
-                                    "reason": reconcile_reason,
-                                    "screen_bytes": screen_text.len(),
-                                    "retry_armed": retry,
-                                    "retries": screen_reconcile_unwritable_retries,
-                                }),
-                            );
-                        }
+                        screen_reconcile_due_at_ms = 0;
+                        // The chain ends when the reconcile actually runs — not when
+                        // a single rearm elapses. Reset here so the next chain's
+                        // depth/age measure that chain alone.
+                        screen_reconcile_defer_chain_depth = 0;
+                        screen_reconcile_defer_chain_began_ms = 0;
+                        let reconcile_reason = screen_reconcile_reason;
+                        screen_reconcile_reason = "post_resize_screen_reconcile";
+                        // ⛔ NO ROUND TRIP ON THE LOOP: this fetch, awaited
+                        // inline, held pre_select 2.8–10.0 s whenever the
+                        // daemon was slow (typed window, 2026-08-21), with the
+                        // keystroke branch queued behind it. The apply logic
+                        // now runs on `screen_reconcile_result_rx`'s own
+                        // select branch.
+                        screen_reconcile_fetch_in_flight = true;
+                        spawn_screen_reconcile_fetch(
+                            endpoint.clone(),
+                            runtime_session_path.clone(),
+                            trace_home.clone(),
+                            reconcile_reason,
+                            reveal_incomplete,
+                            screen_reconcile_result_tx.clone(),
+                        );
                     }
-                }
-                }
                 }
                 if !bootstrap_owner_still_current(state) {
                     release_bootstrap_lease(
@@ -10021,6 +9931,155 @@ fn TerminalCanvas(
                                     );
                                 warn!(session=%session_path, error=%error, "terminal eval bridge closed");
                                 break;
+                            }
+                        }
+                    }
+                    Some((reconcile_reason, reveal_incomplete, fetched)) = screen_reconcile_result_rx.recv() => {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "screen_reconcile_apply",
+                            &session_path,
+                        );
+                        screen_reconcile_fetch_in_flight = false;
+                        match fetched {
+                            None => {
+                                // The inline path swallowed a failed fetch
+                                // silently (the armed reconcile was simply
+                                // lost). Behaviour kept, now visible.
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "screen_reconcile_fetch_failed",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "reason": reconcile_reason,
+                                    }),
+                                );
+                            }
+                            Some(_) if !js_ready => {
+                                // Readiness was lost while the fetch was in
+                                // flight — a write now would land on no host.
+                                // Re-arm the SAME reconcile; the due gate only
+                                // fires under js_ready.
+                                screen_reconcile_due_at_ms = current_millis()
+                                    .saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
+                                screen_reconcile_reason = reconcile_reason;
+                            }
+                            Some(screen_text) => {
+                                let screen_text = sanitize_terminal_replay_payload(&screen_text);
+                                // Recovery-churn guard (incident-gap-fix-cascade): never
+                                // repaint over a WORKING surface — the agent's own next
+                                // frame repaints it, and a mid-turn overwrite tears. EXCEPT
+                                // when the reveal is confirmed incomplete (client near-blank):
+                                // there is no live frame to tear, so promote DeferWorking to
+                                // Write and fill the blank from the daemon's authoritative
+                                // screen. An unwritable (empty/launch-seed) daemon frame still
+                                // Skips — nothing to paint.
+                                let decision = match screen_reconcile_decision(&screen_text) {
+                                    ScreenReconcileDecision::DeferWorking if reveal_incomplete => {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "reveal_forced_incomplete",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "visible_nonblank_rows": last_host_health_visible_nonblank_rows,
+                                                "bytes": screen_text.len(),
+                                            }),
+                                        );
+                                        ScreenReconcileDecision::Write
+                                    }
+                                    other => other,
+                                };
+                                match decision {
+                                ScreenReconcileDecision::Write => {
+                                    screen_reconcile_unwritable_retries = 0;
+                                    // ⛔ THE CLIP IS THE DAEMON'S, AND THIS SIDE MUST NOT
+                                    // SECOND-GUESS IT (`screen_reconcile_chunk`).
+                                    //
+                                    // A daemon screen wider than this viewer really is
+                                    // the frame-corruption class — each over-long row
+                                    // wraps, every row below it shifts, and the
+                                    // payload's later absolute `CSI r;cH` jumps land on
+                                    // that spill. The clip for it used to live HERE, and
+                                    // that was the bug: this side knows only its own
+                                    // width, and a wrapped line carries no break, so
+                                    // measuring against the viewer reads the rest of a
+                                    // sentence as a ghost and deletes it. Measured on
+                                    // the GUI host 2026-08-04 — 504 clips against a
+                                    // 170-column PTY reporting a "334-column" screen
+                                    // that was two wrapped lines.
+                                    //
+                                    // Only the daemon holds both numbers (the model the
+                                    // text was formatted against, and the PTY the CLI
+                                    // was handed), and only their difference is a ghost.
+                                    // So it arrives already clipped and is written as
+                                    // it came. See
+                                    // docs/xterm-bugs.md#screen-model-wider-than-viewer.
+                                    let screen_text = screen_text.clone();
+                                    let _ = eval.send(TerminalJsCommand::Write {
+                                        data: screen_text.clone(),
+                                    });
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        reconcile_reason,
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "bytes": screen_text.len(),
+                                        }),
+                                    );
+                                }
+                                ScreenReconcileDecision::DeferWorking => {
+                                    // RE-ARM, don't drop: a vacuumed/stale reveal frame
+                                    // under a working turn must still get its corrective
+                                    // write once the turn ends. Codex repaints the live
+                                    // region itself meanwhile; the reconcile fires on
+                                    // the first quiet+idle tick.
+                                    screen_reconcile_due_at_ms = current_millis()
+                                        .saturating_add(SCREEN_RECONCILE_DEFER_REARM_MS);
+                                    screen_reconcile_reason = reconcile_reason;
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "screen_reconcile_skipped_working_surface",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "reason": reconcile_reason,
+                                            "rearmed": true,
+                                        }),
+                                    );
+                                }
+                                ScreenReconcileDecision::SkipUnwritable => {
+                                    // Unwritable (empty / launch-seed) — previously a
+                                    // SILENT give-up. Trace it and re-arm the SAME
+                                    // reveal reconcile up to 3 times so the stale
+                                    // bottom self-heals once the daemon screen lands.
+                                    let retry = screen_reconcile_unwritable_retries < 3;
+                                    if retry {
+                                        screen_reconcile_unwritable_retries += 1;
+                                        screen_reconcile_due_at_ms = current_millis()
+                                            .saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
+                                        screen_reconcile_reason = reconcile_reason;
+                                    }
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "screen_reconcile_skipped_unwritable",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "reason": reconcile_reason,
+                                            "screen_bytes": screen_text.len(),
+                                            "retry_armed": retry,
+                                            "retries": screen_reconcile_unwritable_retries,
+                                        }),
+                                    );
+                                }
+                            }
                             }
                         }
                     }
@@ -16851,6 +16910,30 @@ async fn probe_terminal_input_consumption(
         waited_ms: started.elapsed().as_millis() as u64,
         reason: TERMINAL_INPUT_WEDGED_REASON,
     }
+}
+
+/// The pre_select screen reconcile's daemon fetch, OFF the loop. Awaited
+/// inline it held the whole select loop for the round trip (2.8–10.0 s
+/// measured under a slow daemon, 2026-08-21) with the keystroke branch queued
+/// behind it. The result — `None` when the fetch failed — returns on the
+/// loop's `screen_reconcile_result_rx` branch, which owns the apply decision.
+fn spawn_screen_reconcile_fetch(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    trace_home: PathBuf,
+    reconcile_reason: &'static str,
+    reveal_incomplete: bool,
+    result_tx: tokio::sync::mpsc::UnboundedSender<(&'static str, bool, Option<String>)>,
+) {
+    tokio::spawn(async move {
+        let fetched = terminal_snapshot_async(endpoint, session_path, &trace_home)
+            .await
+            .ok()
+            .map(|(screen_text, _running, _out, _post, _seq, _spawn)| screen_text);
+        // The loop dropping its receiver means the session unmounted: nothing
+        // left to reconcile.
+        let _ = result_tx.send((reconcile_reason, reveal_incomplete, fetched));
+    });
 }
 
 async fn terminal_snapshot_async(

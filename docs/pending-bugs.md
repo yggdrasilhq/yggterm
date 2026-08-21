@@ -850,13 +850,16 @@ remainder is due refetches/drains by design). Laptop window: roots **0.29/s** (f
 `ui/block` 0. Remaining dossier items (restore-card 1 Hz tick, retarget noop, hot-leaf-state
 architecture split) are in the 11.12 brief §2 with risk notes.
 
-⛔ **THE FOLD'S "ABSENT FROM CAUSES" DID NOT SURVIVE DAYTIME USE (2026-08-21 typed window):**
-`terminal_attach_host_health_sample` is back as the **TOP cause — 250 renders_preceded over
-79.5 min (~3/min)**. The gate exempts only the ACTIVE-VISIBLE session and a hidden sidebar;
-under real use the sidebar is visible and the samples are for BACKGROUND sessions, which the
-gate never covered. The 01:1x proof window (owner asleep) measured the exempted case, not the
-common one. The narrowing has to gate on "would this sample change what the sidebar shows",
-not on which session it is for.
+⚠ **THE FOLD'S "ABSENT FROM CAUSES" WAS A PROPERTY OF ITS WINDOW, NOT OF THE FIX (2026-08-21
+typed window):** `terminal_attach_host_health_sample` is back as the **TOP cause — 250
+renders_preceded over 79.5 min (~3/min)**. The gate exempts the ACTIVE-VISIBLE session and a
+hidden sidebar; the 01:1x proof window (owner asleep) measured the exempted case. Under real
+use the surviving writes are LEGITIMATE — changed preview lines of background streaming rows,
+visible in an open sidebar, throttled to 2.5 s — so more gating is the WRONG fix and ~0.05/s
+of preview updates fits inside the falsifier's 0.1/s budget. The remaining defect is
+AMPLITUDE: each legitimate one-line preview write re-renders the whole root instead of the
+Sidebar leaf. That is the hot-leaf-state split's first candidate — `live_terminal_sidebar_
+samples` out of `ShellState` into a narrow signal only the sidebar preview subscribes to.
 
 **TYPED-WINDOW RENDER READ, 2026-08-21 10:17–11:37 (79.5 min, laptop, natural typing +
 fleet load):** roots **0.50/s** (pre-fix 1.57, quiet windows 0.29–0.35, target ~0.1) —
