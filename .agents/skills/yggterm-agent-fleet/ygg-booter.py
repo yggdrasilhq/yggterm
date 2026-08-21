@@ -2307,6 +2307,18 @@ def _daemon_screen_text(host, row):
             continue
         if not e.get("screen_available"):
             return None                  # it said plainly that it could not look
+        # ⭐ PREFER THE RENDERED GRID. `screen_plain_rows` (3.1.21+) is the
+        # daemon's own vt100 viewport, one entry per VISIBLE row; `screen_tail`
+        # is the escape stream that paints it. A TUI draws with absolute cursor
+        # moves and emits single spaces as cursor-forward, so on the stream a
+        # modal's nine rows arrive as two lines and its heading is not present
+        # as a substring at all — `_plain_screen` was written to paper over
+        # exactly that, and it cannot recover the row boundaries the stream
+        # never carried. Falls back on an older daemon, where the normalizer is
+        # still the best available.
+        rows = e.get("screen_plain_rows")
+        if isinstance(rows, list) and rows:
+            return "\n".join(rows)
         return "\n".join(e.get("screen_tail") or [])
     return None                          # the daemon has no screen for this row
 
@@ -2347,6 +2359,55 @@ def _daemon_limit_wait(host, row):
     return False
 
 
+def _daemon_row_state(host, row):
+    """The row's STATE as the daemon names it, or None if it cannot say.
+
+    ⭐ ONE OWNER FOR "WHAT IS THIS SCREEN". The daemon (3.1.21+) classifies from
+    the rendered grid, where the words on the screen actually are, and publishes
+    a single state slug with a documented precedence — a question picker outranks
+    `working` because a picker IS mid-turn, a billing dialog outranks the
+    limit-wait footer because their wording overlaps and only one of them is safe
+    to leave alone. Re-deriving any of that here would be a second encoding of
+    the one question this watcher must not get wrong.
+
+    ⛔ None means "this daemon is too old to say", NEVER "nothing is holding the
+    row". Every caller must keep its own refuse-on-doubt behaviour for that case.
+    """
+    uuid = row.rsplit("/", 1)[-1]
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "gate-screen", f"cc-runtime://{uuid}",
+                     "--tail", "1", "--json"], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    try:
+        entries = json.loads((r.stdout or "").strip() or "[]")
+    except Exception:
+        return None
+    if not isinstance(entries, list):
+        return None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("session_key") or "").rsplit("/", 1)[-1] != uuid:
+            continue
+        state = e.get("state")
+        return state if isinstance(state, str) and state else None
+    return None
+
+
+# ⛔ STATES A WRITER MUST NOT TYPE INTO, and WHY each one is here. The remedy and
+# the prohibition ship together in `yggterm_core::screen_state`; this is the
+# watcher's half of that contract — the subset where its remedy (type a message,
+# then Enter) is the wrong act.
+#   startup_gate      a modal reading single keys: a typed message is swallowed,
+#                     and its Enter answers a question nobody read
+#   plan_limit_choice a bare Enter SELECTS, and the options spend money
+#   question_picker   the owner is being asked; typed text vanishes
+#   limit_wait        the CLI resumes by itself; bytes land in the next turn
+STATES_A_WATCHER_MUST_NOT_TYPE_INTO = frozenset({
+    "startup_gate", "plan_limit_choice", "question_picker", "limit_wait",
+})
+
+
 def _screen_shows_a_choice(host, row):
     """TRI-STATE: True a prompt is on screen · False none · None could not look.
 
@@ -2368,6 +2429,14 @@ def _screen_shows_a_choice(host, row):
 
     ⛔ REFUSE ON DOUBT. `None` (could not look) is treated as a refusal by the
     caller, for the same reason the never-arm ledger is: this thing types."""
+    # ⭐ ASK THE DAEMON FIRST. It classifies from the rendered grid and pairs the
+    # money wording with the STRUCTURAL test this function never had — a
+    # selection marker sitting on a numbered option — which is what separates a
+    # dialog awaiting a keypress from a footer merely reporting a limit. Only
+    # when it cannot say do we fall back to matching phrases ourselves.
+    state = _daemon_row_state(host, row)
+    if state is not None:
+        return state in STATES_A_WATCHER_MUST_NOT_TYPE_INTO
     body = _screen_text(host, row)
     if body is None:
         return None                      # could not look, either way

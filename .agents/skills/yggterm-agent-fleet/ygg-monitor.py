@@ -469,6 +469,20 @@ def refine(state, uuid, host=None):
     Returns (state, why). ABANDONED is the new one and the whole point: a row
     whose turn was cut off mid-flight, alive and at rest, waiting forever for a
     turn nobody will finish."""
+    if state["state"] == "IDLE":
+        # ⭐ THE OWNER'S CLASSIFIER. An idle row is normally a finished row — but
+        # a row whose turn was CUT (a daemon swap re-resuming it on a fresh pty)
+        # is also idle, at rest, and at an ordinary composer. Nothing on the
+        # SCREEN separates them; the shape of the last turn does. See
+        # `ygg-babysit.turn_cut_short`.
+        path = state.get("path")
+        if path:
+            try:
+                cut, why = _babysit().turn_cut_short(Path(path))
+            except Exception:
+                cut, why = False, ""
+            if cut:
+                return "CUT_SHORT", f"turn ended but {why}"
     if state["state"] != "STUCK":
         return state["state"], ""
     proc = cli_process(uuid, host)
@@ -1861,7 +1875,7 @@ def tick(a):
             escalate(a.gui_host, s, row, why_text, a.dry_run)
             st["escalated"] = kind
 
-        if state == "ABANDONED":
+        if state in ("ABANDONED", "CUT_SHORT"):
             # ⛔ The guarded writer REFUSES on a draft, a choice prompt or an
             # unreadable screen. This used to log "woke" either way, so a refusal
             # and a delivery were indistinguishable in the one record anybody
