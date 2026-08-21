@@ -272,7 +272,14 @@ impl SessionTitleStore {
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_session_summary_timeline_session_created
-                ON session_summary_timeline(session_id, created_at DESC);",
+                ON session_summary_timeline(session_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS session_copy_generation_attempts (
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source_stamp TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, kind)
+            );",
         )
         .context("failed to initialize title db schema")?;
         Ok(Self { conn })
@@ -563,6 +570,72 @@ impl SessionTitleStore {
     }
 
     /// Forget everything this store holds about one session.
+    /// Remember that generation was ATTEMPTED for this session against this
+    /// exact source state.
+    ///
+    /// ⛔ **The ledger exists because a rejected result reopens its own gate.**
+    /// Both copy gates ask "is what is stored any good?" — a title is missing
+    /// when the stored one is a generated fallback, and a summary needs
+    /// refreshing when the stored one reads as low-signal. So when generation
+    /// fails and the failure is stored honestly (`untitled session`), or
+    /// succeeds into something the classifier dislikes, the gate is open again
+    /// on the very next pass and the same unchanged session re-pays the same
+    /// LLM call forever. Measured 2026-08-21: 2,589 title generations at p50
+    /// 9.3 s — 6.4 hours of wall clock in one retention window — and 1,707
+    /// summaries at p50 3.6 s, on a machine whose owner could not type.
+    ///
+    /// ⚠ The stamp is the SOURCE's identity, not a clock. A retry timer says
+    /// "try again later"; this says the only true thing available — that
+    /// nothing about the input has changed, so nothing about the output can.
+    pub fn record_generation_attempt(
+        &self,
+        session_id: &str,
+        kind: &str,
+        source_stamp: &str,
+    ) -> Result<()> {
+        let attempted_at =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        self.conn.execute(
+            "INSERT INTO session_copy_generation_attempts
+                (session_id, kind, source_stamp, attempted_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, kind) DO UPDATE SET
+               source_stamp = excluded.source_stamp,
+               attempted_at = excluded.attempted_at",
+            params![session_id, kind, source_stamp, attempted_at],
+        )?;
+        Ok(())
+    }
+
+    /// The source state the last attempt for this session+kind ran against.
+    pub fn generation_attempt_stamp(&self, session_id: &str, kind: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_stamp FROM session_copy_generation_attempts
+             WHERE session_id = ?1 AND kind = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![session_id, kind])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, Option<String>>(0)?),
+            None => Ok(None),
+        }
+    }
+
+    /// Forget the attempt, so the next pass generates whatever the source says.
+    ///
+    /// ⛔ Called by the DELETE paths, and that is load-bearing: deleting a
+    /// generated title is the documented repair for a wrong one, and a ledger
+    /// that outlived it would make that repair silently do nothing — the exact
+    /// shape of the summary-caching bug already recorded on
+    /// `apply_session_summary_hint`.
+    pub fn clear_generation_attempt(&self, session_id: &str, kind: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_copy_generation_attempts
+             WHERE session_id = ?1 AND kind = ?2",
+            params![session_id, kind],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_generated_copy(&self, session_id: &str) -> Result<()> {
         self.delete_title(session_id)?;
         self.delete_summary(session_id)?;
@@ -575,6 +648,10 @@ impl SessionTitleStore {
             "DELETE FROM session_titles WHERE session_id = ?1",
             params![session_id],
         )?;
+        // ⛔ And forget the attempt ledger: deleting generated copy is the
+        // documented way to force a regeneration, so a ledger that survived it
+        // would make the repair do nothing.
+        let _ = self.clear_generation_attempt(session_id, "title");
         // ⛔ The durable-session scan memoises rows that include this table's
         // answer, so a title write must drop the memo in THIS process. The
         // scan's file-stamp generation catches a peer process; it cannot catch
@@ -589,6 +666,10 @@ impl SessionTitleStore {
             "DELETE FROM session_summaries WHERE session_id = ?1",
             params![session_id],
         )?;
+        // ⛔ And forget the attempt ledger: deleting generated copy is the
+        // documented way to force a regeneration, so a ledger that survived it
+        // would make the repair do nothing.
+        let _ = self.clear_generation_attempt(session_id, "summary");
         Ok(())
     }
 }
@@ -620,6 +701,23 @@ impl SessionTitleResolver {
         summary: &str,
     ) -> Result<()> {
         self.store.put_manual_summary(session_id, cwd, summary)
+    }
+
+    /// Pass-throughs for the copy-generation attempt ledger. The chore holds a
+    /// resolver, not a store, and routing them here keeps `SessionTitleStore`
+    /// the one owner of the table.
+    pub fn record_generation_attempt(
+        &self,
+        session_id: &str,
+        kind: &str,
+        source_stamp: &str,
+    ) -> Result<()> {
+        self.store
+            .record_generation_attempt(session_id, kind, source_stamp)
+    }
+
+    pub fn generation_attempt_stamp(&self, session_id: &str, kind: &str) -> Result<Option<String>> {
+        self.store.generation_attempt_stamp(session_id, kind)
     }
 
     pub fn clear_title_for_session(&self, session_id: &str) -> Result<()> {
@@ -1589,6 +1687,62 @@ mod tests {
     /// `…probe B` and `…probe C`, created in the same breath, kept theirs. A
     /// trailing `A` reads as the English article to the dangling-fragment rule,
     /// so the composed title was judged junk and the composer amputated the
+    /// The generation-attempt ledger: it must remember an attempt against a
+    /// source state, and it must be FORGOTTEN when the generated copy is
+    /// deleted — deleting is the documented way to force a regeneration, and a
+    /// ledger that outlived it would make that repair silently do nothing.
+    #[test]
+    fn the_generation_ledger_remembers_a_source_and_is_cleared_by_a_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-gen-ledger-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SessionTitleStore::open(&dir).unwrap();
+
+        assert_eq!(
+            store.generation_attempt_stamp("sid", "title").unwrap(),
+            None,
+            "a session nobody has tried has no attempt on record"
+        );
+
+        store
+            .record_generation_attempt("sid", "title", "1700000000000000000")
+            .unwrap();
+        assert_eq!(
+            store.generation_attempt_stamp("sid", "title").unwrap(),
+            Some("1700000000000000000".to_string())
+        );
+        assert_eq!(
+            store.generation_attempt_stamp("sid", "summary").unwrap(),
+            None,
+            "the two kinds are tracked apart — a failed title must not mute \
+             summary generation"
+        );
+
+        // The same session, later, with the transcript grown.
+        store
+            .record_generation_attempt("sid", "title", "1700000999000000000")
+            .unwrap();
+        assert_eq!(
+            store.generation_attempt_stamp("sid", "title").unwrap(),
+            Some("1700000999000000000".to_string()),
+            "an attempt records the source it actually ran against"
+        );
+
+        store.delete_title("sid").unwrap();
+        assert_eq!(
+            store.generation_attempt_stamp("sid", "title").unwrap(),
+            None,
+            "deleting the generated title must reopen generation, or the \
+             documented repair changes nothing the user sees"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// purpose to save the title.
     #[test]
     fn an_agent_plane_title_is_authored_copy_and_is_never_judged_generated() {
