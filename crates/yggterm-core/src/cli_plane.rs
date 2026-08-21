@@ -20,7 +20,8 @@
 //! * TITLE had exactly one event, emitted from one of the two chores, at the
 //!   point a lookup FAILED — never at the point a row was skipped;
 //! * INTEGRATION (resume, re-resume, the scheme a row is re-resolved to) had
-//!   no vocabulary of its own.
+//!   no vocabulary of its own — `restore` gives it one, and it is the moment
+//!   where "this CLI comes back and the reference one does not" is settled.
 //!
 //! ⇒ So this module is not "more logging". It is **one grammar** whose events
 //! share `slug` and `session_path`, so a single filter on `category=="cli"`
@@ -380,6 +381,46 @@ pub fn emit_birth(
     crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "birth", payload);
 }
 
+/// A persisted row was restored, and RE-KEYED on the way in.
+///
+/// The fourth moment of a CLI row's life, and the one that had no vocabulary at
+/// all. Restore does not merely reload a row — it re-resolves it: a raw storage
+/// path becomes a runtime key, a machine key is case-folded, and for a CLI that
+/// mints its own session id the persisted id outranks the key it was born under
+/// (while for a CLI born carrying the row's uuid the key stays authoritative,
+/// because preferring a stored id there once repointed a live row at another
+/// session's transcript).
+///
+/// ⇒ That decision is where "this CLI resumes and the reference one does not"
+/// is actually settled, and it was previously visible only by diffing two
+/// snapshots taken either side of a restart. `rekeyed` says whether the row
+/// moved; the two schemes say what it moved BETWEEN.
+///
+/// ⚖ Emitted once per agent row per restart — bounded by the row count, not by
+/// a tick — and not at all for a plain shell, which is not on this plane.
+pub fn emit_restore(component: &str, from_path: &str, to_path: &str, kind: SessionKind) {
+    if let Some(payload) = restore_payload(from_path, to_path, kind) {
+        crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "restore", payload);
+    }
+}
+
+/// `None` for a kind no CLI descriptor serves — a plain shell is not on this
+/// plane, and giving it a row here would make the CLI counts meaningless.
+fn restore_payload(from_path: &str, to_path: &str, kind: SessionKind) -> Option<Value> {
+    agent_cli_descriptor(kind)?;
+    let mut payload = json!({
+        "session_path": to_path,
+        "from_path": from_path,
+        "slug": slug_of(kind),
+        "kind": format!("{kind:?}"),
+        "rekeyed": from_path != to_path,
+        "from_scheme": CliKeyScheme::of(kind, from_path).prefix,
+        "id_origin": CliIdOrigin::declared_for(kind).label(),
+    });
+    merge(&mut payload, CliKeyScheme::of(kind, to_path).payload());
+    Some(payload)
+}
+
 /// What a composed CLI invocation looks like, without quoting the command.
 ///
 /// ⛔ **The SHAPE, never the command string.** The composed line carries the
@@ -644,6 +685,34 @@ mod tests {
         assert_eq!(base, json!({"a": 1, "b": 2}));
     }
 
+    /// A plain shell is not a CLI row, and counting it as one would make every
+    /// per-CLI figure on this plane a different number than it claims to be.
+    #[test]
+    fn a_restore_that_is_not_an_agent_row_is_not_on_this_plane() {
+        assert!(restore_payload("local://a", "local://a", SessionKind::Shell).is_none());
+        assert!(restore_payload("local://a", "local://a", SessionKind::ClaudeCode).is_some());
+    }
+
+    /// ⭐ The re-key is the whole point of the event: a row that came back
+    /// under a different key took a different path from the reference CLI's,
+    /// and the two schemes say what it moved between.
+    #[test]
+    fn a_restore_reports_the_scheme_a_row_moved_between() {
+        let kept = restore_payload("local://abc", "local://abc", SessionKind::ClaudeCode)
+            .expect("an agent row");
+        assert_eq!(kept["rekeyed"], serde_json::json!(false));
+
+        let moved = restore_payload(
+            "local://abc",
+            "cc-runtime://abc",
+            SessionKind::ClaudeCode,
+        )
+        .expect("an agent row");
+        assert_eq!(moved["rekeyed"], serde_json::json!(true));
+        assert_eq!(moved["from_scheme"], serde_json::json!("local://"));
+        assert_eq!(moved["scheme"], serde_json::json!("cc-runtime://"));
+    }
+
     /// The bytes a written trace line costs beyond its payload — `ts_ms`, `pid`,
     /// `component`, `category`, `name` and the JSON punctuation around them.
     /// Measured off a live trace file, where a 195-byte line carried an 81-byte
@@ -717,7 +786,13 @@ mod tests {
                 persistent: true,
             },
         );
-        for (name, payload) in [("birth", &birth), ("launch", &launch)] {
+        let restore = restore_payload(
+            "local://6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            "cc-runtime://6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            SessionKind::ClaudeCode,
+        )
+        .expect("an agent row is on this plane");
+        for (name, payload) in [("birth", &birth), ("launch", &launch), ("restore", &restore)] {
             let bytes =
                 serde_json::to_string(payload).expect("payload serialises").len() + LINE_ENVELOPE_BYTES;
             assert!(
