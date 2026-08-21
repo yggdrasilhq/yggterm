@@ -30,6 +30,21 @@ copies.
 
 ## Decisions only he makes
 
+- **Who rolls 3.1.16 — and may a lane deploy while you are trying to use the machine?** Seat
+  11.0 was to drive the roll, and it is **not a live row**: its recorded seat is absent from the
+  GUI's table, its four predecessor transcripts have been cold since 20-Aug 15:12 with no process
+  behind any of them, and a second orchestrator reached the same verdict independently. Meanwhile
+  five input-block fixes across two lanes are shipped in code and unproven, all of them in the
+  class you reported as unusable input. **Recommendation: let the next lane that finishes take
+  the roll**, since the constitution already says a restart needs no permission and the daemon/GUI
+  split exists precisely so a deploy does not interrupt other agents — the only thing missing is
+  someone holding the baton. **Done meanwhile:** every fix is committed, pushed and unit-tested,
+  the two queue entries carry FIXED IN CODE — LIVE PROOF OWED, and the owed proof is now a
+  pre-loaded checklist (`scripts/verify-input-block-fixes.sh`) so whoever rolls it spends minutes,
+  not an evening. **To reverse:** name a different driver. Detail: the three input-block entries in
+  `docs/pending-bugs.md`.
+  *Meanwhile:* the lane keeps taking queue items that do not need a deploy.
+
 - **Do we read the embedded controller to get a true fan RPM?** Every ACPI fan interface on the
   reference client was enumerated and sampled and all of them are stubs — there is no tachometer to
   read, which confirms rather than contradicts the "fan speed has to be interpolated" reading. The
