@@ -47,6 +47,19 @@ YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
 #: lane often prints its closing summary and then keeps working for a minute.
 FINISHED_IDLE_MIN = 8.0
 
+#: ⛔⛔ THE CASE THE FIRST VERSION OF THIS TOOL MISSED ENTIRELY, AND IT IS THE
+#: COMMON ONE. `FINISHED` requires a lane to ANNOUNCE that it is done. A lane that
+#: simply stops — turn ended, composer empty, nothing in flight — was classified
+#: WORKING forever, so the sidebar refilled with quiet corpses within the hour and
+#: the owner had to point at them a second time.
+#:
+#: ⇒ A stall is not a fold. The remedy for a row sitting at its own composer with
+#:   work still assigned is ONE `continue`, and a fold would throw away a lane
+#:   that has merely paused. So STALLED is its own verdict with its own remedy,
+#:   and the ledger below makes it once per stall rather than once per sweep.
+STALL_IDLE_MIN = 20.0
+WAKE_LEDGER = os.path.join(os.path.expanduser("~/.yggterm/relay"), "fold-wakes.json")
+
 #: ⚠ A PHRASE LIST IS A GUESS LIST, so it is deliberately NOT the whole test.
 #: It promotes an already-idle row to FINISHED; it can never fold a busy one on
 #: its own. An OR between a strong predicate and a weak one has the strength of
@@ -162,6 +175,68 @@ def host_of(uri):
     return rest.split("/", 1)[0] if "/" in rest else None
 
 
+def screen_state(uuid, host):
+    """The row's own verdict on itself, from the daemon's rendered grid.
+
+    ⛔ THE PATH FORM IS NOT THE ONE THE VERB DOCUMENTS. `server screen <row>`
+    accepts `cc-runtime://<uuid>` and answers `unreadable` for both a bare uuid
+    and the `remote-cc://<host>/<uuid>` form every other verb takes — and
+    `unreadable` is exactly what a genuinely blank screen returns, so a caller
+    using the documented form concludes the row is broken when the verb simply
+    did not resolve the path. Filed; pinned here so this tool cannot inherit it.
+    """
+    cmd = f"{YGG} server screen 'cc-runtime://{uuid}' --state-only"
+    r = run(["ssh", "-n", host, cmd]) if host else run(["bash", "-c", cmd])
+    return (r.stdout or "").strip().splitlines()[0].strip() if r.stdout.strip() else "unknown"
+
+
+def composer_is_empty(uuid, host):
+    """Read the RENDERED screen and look at the composer line itself.
+
+    ⛔⛔ `ready` DOES NOT MEAN EMPTY. A row can be at rest with text sitting in its
+    composer — this fleet has rows holding a dozen repetitions of a wake message
+    that were never sent. Typing a `continue` into one of those submits somebody
+    else's text along with it, which is the single worst thing anything here can
+    do. So the wake reads the composer directly rather than trusting the state.
+    ⚠ It reads the daemon's RENDERED rows, not the raw stream: a screen does not
+    contain the words on it, and a line-shaped rule over the stream is what made
+    `composer_held_draft` unreliable in the first place.
+    """
+    cmd = f"{YGG} server screen 'cc-runtime://{uuid}'"
+    r = run(["ssh", "-n", host, cmd]) if host else run(["bash", "-c", cmd])
+    marker_lines = [ln for ln in (r.stdout or "").splitlines() if ln.lstrip().startswith(("❯", ">", "│ >"))]
+    if not marker_lines:
+        return False, "no composer line found on the rendered screen"
+    tail = marker_lines[-1].lstrip()[1:].strip()
+    return (not tail), ("empty" if not tail else f"holds {len(tail)} char(s)")
+
+
+def wake_ledger():
+    try:
+        return json.load(open(WAKE_LEDGER))
+    except Exception:
+        return {}
+
+
+def note_wake(uuid, mtime):
+    led = wake_ledger()
+    led[uuid] = {"woken_at": time.time(), "transcript_mtime": mtime}
+    os.makedirs(os.path.dirname(WAKE_LEDGER), exist_ok=True)
+    json.dump(led, open(WAKE_LEDGER, "w"))
+
+
+def already_woken_for_this_stall(uuid, mtime):
+    """⛔ ONE continue PER STALL, never one per sweep.
+
+    The ledger keys on the transcript mtime at the moment of the wake: if the row
+    moved afterwards, this is a NEW stall and it may be woken again; if it did not
+    move, the previous wake did not take and repeating it is typing at a row that
+    is not listening — the storm shape this fleet has already paid for twice.
+    """
+    prev = wake_ledger().get(uuid)
+    return bool(prev) and prev.get("transcript_mtime") == mtime
+
+
 def transcript_of(uuid):
     hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
     return hits[0] if hits else None
@@ -207,27 +282,46 @@ def classify(row, live, protected):
     if uuid in protected:
         return "PROTECTED", "listed as a row a person uses"
     tr = transcript_of(uuid)
-    row["idle_min"] = round((time.time() - os.path.getmtime(tr)) / 60, 1) if tr else None
+    row["mtime"] = os.path.getmtime(tr) if tr else None
+    row["idle_min"] = round((time.time() - row["mtime"]) / 60, 1) if tr else None
     if uuid not in live:
         return "DEAD", "no agent process on this host"
     if tr is None:
         return "WORKING", "process alive, no transcript to judge by"
     text = last_assistant_text(tr)
     row["last"] = text.replace("\n", " ")[:200]
-    # ⚠ The veto reads the OPENING too, not the body. Whole-message matching made
-    # it fire on a lane that had opened with "Standing down" and merely quoted the
-    # booter's "a MONITOR is never finished" further down — a false negative that
-    # leaves a corpse seated, which is the failure this tool exists to end. Both
-    # tests read where a lane actually states its status.
-    if STAYING.search(text[:STAND_DOWN_HEAD_CHARS]):
-        return "WORKING", f"declares itself still watching, quiet {row['idle_min']}m"
-    if (
-        row["idle_min"] is not None
-        and row["idle_min"] >= FINISHED_IDLE_MIN
-        and STAND_DOWN.search(text[:STAND_DOWN_HEAD_CHARS])
-    ):
-        return "FINISHED", f"opened by standing down, quiet {row['idle_min']}m"
-    return "WORKING", f"quiet {row['idle_min']}m, no stand-down in its opening"
+    # ⚠ Both phrase tests read the OPENING, not the body. Whole-message matching
+    # made the veto fire on a lane that had opened with "Standing down" and merely
+    # quoted the booter's "a MONITOR is never finished" further down; searching the
+    # body for a stand-down called a live monitor finished. A lane states its
+    # status in its first line and then writes about everything else.
+    said_done = bool(STAND_DOWN.search(text[:STAND_DOWN_HEAD_CHARS]))
+    says_watching = bool(STAYING.search(text[:STAND_DOWN_HEAD_CHARS]))
+    idle = row["idle_min"]
+
+    if idle is not None and idle >= FINISHED_IDLE_MIN and said_done and not says_watching:
+        return "FINISHED", f"opened by standing down, quiet {idle}m"
+
+    # ⛔⛔ A MONITOR IS NOT EXEMPT FROM STALLING — IT IS THE MOST LIKELY THING TO
+    # STALL, AND THE LAST THING ANYONE CHECKS. The first cut let "watch continues"
+    # end the classification, so three watchers sat quiet for forty minutes each
+    # while their own last words asserted they were watching. A row's claim about
+    # itself is a CLAIM; its turn having ended is a FACT. The claim is allowed to
+    # decide whether a quiet row is finished, and never whether it is running.
+    if idle is not None and idle >= STALL_IDLE_MIN:
+        # Ask the row what it is sitting on before calling it stalled. `working`
+        # or `limit_wait` is a row that is fine; a picker or a gate wants a PERSON
+        # and must never be typed at.
+        state = screen_state(row["uuid"], host_of(row["uri"]))
+        row["screen"] = state
+        if state == "ready":
+            note = " (its last words said it was watching)" if says_watching else ""
+            return "STALLED", f"at its composer, turn ended, quiet {idle}m{note}"
+        return "WORKING", f"screen says {state}, quiet {idle}m"
+
+    if says_watching:
+        return "WORKING", f"declares itself still watching, quiet {idle}m"
+    return "WORKING", f"quiet {idle}m, no stand-down in its opening"
 
 
 def harvest(row, verdict, why):
@@ -248,6 +342,36 @@ def harvest(row, verdict, why):
         if row.get("last"):
             fh.write(f"\nits last words:\n\n> {row['last']}\n")
     return path
+
+
+def wake(row, host, apply_it):
+    """One `continue`, and only into a row that is genuinely at rest.
+
+    ⛔ `submitted: false` means the row was mid-output, NOT unreachable. It is
+    never retried — retrying is the defect that types over people.
+    """
+    uri, uuid = row["uri"], row["uuid"]
+    if already_woken_for_this_stall(uuid, row.get("mtime")):
+        log("  already woken for this exact stall — escalating instead of typing again")
+        return False
+    empty, why = composer_is_empty(uuid, host_of(uri))
+    if not empty:
+        log(f"  ⛔ composer is not empty ({why}) — NOT typing into it")
+        return False
+    if not apply_it:
+        log("  (dry run: would send one `continue`)")
+        return True
+    out = run(["ssh", "-n", host, f"printf 'continue' | {YGG} server app terminal submit '{uri}' --stdin"])
+    try:
+        data = json.loads(out.stdout).get("data") or {}
+    except Exception:
+        data = {}
+    if data.get("submitted"):
+        note_wake(uuid, row.get("mtime"))
+        log(f"  woken with one continue ({data.get('bytes')} bytes)")
+        return True
+    log("  ⛔ submit refused (mid-output) — NOT retried, left for the next sweep")
+    return False
 
 
 def agent_pids(uuid):
@@ -403,13 +527,18 @@ def sweep_worktrees(repo, apply_it):
 
 
 def main():
-    global FINISHED_IDLE_MIN
+    global FINISHED_IDLE_MIN, STALL_IDLE_MIN
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sw = sub.add_parser("sweep")
     sw.add_argument("--campaign", help="only rows whose seat starts with this, e.g. 11")
     sw.add_argument("--apply", action="store_true")
     sw.add_argument("--host")
+    sw.add_argument("--wake", action="store_true",
+                    help="send ONE `continue` to each STALLED row (never to a protected one, "
+                         "never twice for the same stall)")
+    sw.add_argument("--stall-idle-min", type=float, default=STALL_IDLE_MIN,
+                    help="a row at its composer, quiet this long, is STALLED (default %(default)s)")
     sw.add_argument("--finished-idle-min", type=float, default=FINISHED_IDLE_MIN,
                     help="a row that announced it was done is folded once it has been "
                          "quiet this long (default %(default)s). Raise it for unattended runs.")
@@ -417,11 +546,16 @@ def main():
     one.add_argument("target")
     one.add_argument("--apply", action="store_true")
     one.add_argument("--host")
+    one.add_argument("--force", action="store_true",
+                     help="fold this row whatever the verdict — for a row an operator has "
+                          "named explicitly and decided about. Never available to `sweep`, "
+                          "and never able to touch a PROTECTED row.")
     wt = sub.add_parser("worktrees")
     wt.add_argument("--apply", action="store_true")
     wt.add_argument("--repo", default=os.path.abspath(os.path.join(HERE, "..", "..", "..")))
     a = ap.parse_args()
     FINISHED_IDLE_MIN = getattr(a, "finished_idle_min", FINISHED_IDLE_MIN)
+    STALL_IDLE_MIN = getattr(a, "stall_idle_min", STALL_IDLE_MIN)
 
     if a.cmd == "worktrees":
         return sweep_worktrees(a.repo, a.apply)
@@ -461,11 +595,17 @@ def main():
                 continue
         verdict, why = classify(row, live, protected)
         counts[verdict] = counts.get(verdict, 0) + 1
-        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·", "PROTECTED": "🔒"}[verdict]
+        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·",
+                "PROTECTED": "🔒", "STALLED": "⏸"}[verdict]
         log(f"{mark} {row['seat']:<7} {row['uuid'][:8]} {verdict:<9} {why}")
-        if verdict in ("DEAD", "FINISHED"):
+        forced = getattr(a, "force", False) and verdict != "PROTECTED"
+        if verdict in ("DEAD", "FINISHED") or forced:
+            if forced and verdict not in ("DEAD", "FINISHED"):
+                log(f"  --force: folding a {verdict} row on an operator's say-so")
             if fold(row, verdict, why, host, a.apply):
                 folded += 1
+        elif verdict == "STALLED" and getattr(a, "wake", False):
+            wake(row, host, a.apply)
     log(f"— {counts} · {'folded' if a.apply else 'would fold'} {folded}")
     if not a.apply:
         log("  nothing was changed. Re-run with --apply.")
