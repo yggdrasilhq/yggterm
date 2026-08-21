@@ -17,6 +17,13 @@ USAGE
     ygg-deliver.py <row-uri-or-uuid> --message <file> [--ack TOKEN]
                    [--wait-min 30] [--host <gui-host>]
 
+⚠ **A LONG WAIT CAN OUTLIVE THE MESSAGE.** Measured 2026-08-21: a correction was
+armed for a working lane, waited the full 30 minutes, and by the time the wait
+expired the lane had independently found the same thing and built the fix — so the
+refusal to deliver was the right answer for the wrong reason. The verb cannot know
+this; the CALLER must re-read a message that waited long before re-arming it. A
+timeout here is a prompt to re-check the content, not just to retry.
+
 ⛔ It refuses a row listed in `never-arm.tsv`. That file marks rows a PERSON is
 using, and its meaning is stronger than "do not wake": typing into one splices
 into what they have half-written and submits the fusion as their turn.
