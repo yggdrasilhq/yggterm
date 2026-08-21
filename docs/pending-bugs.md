@@ -565,59 +565,57 @@ registry-driven per descriptor instead of gated on one `SessionKind`. ⚠ It is 
 a one-line change — `read_live_store_title` is a local-file reader, and doing it
 per CLI over ssh is the actual work. Do not "fix" it by deleting the kind check.
 
-## ⛔⛔ [11.23] A RESTART LANDS ON A WEB SURFACE OVER A LIVE TERMINAL ROW — STALE FIRST, THEN BLANK
+## ⛔ [11.23] A DELIBERATELY DISMISSED WEB SURFACE CAN BE REBUILT BY THE HEARTBEAT THAT RACES IT
 
 **Status:** OPEN
 
-*Owner-reported 2026-08-21, with a frame. He restarted the GUI and the viewport
-came up on an **old, cold webview** — content from a previous surface — which then
-changed to a **blank** one: a chat panel with a search box, `WORK · 2`,
-`Show 2 more`, nothing else.*
+*Found while removing dead webview paths, 2026-08-21. Not owner-reported — nobody
+has hit it, and that may be luck rather than safety.*
 
-⛔ **The row it was drawing is a TERMINAL session.** The metadata rail beside that
-blank page read `Type: Claude Code · running · idle · PTY size 173 × 65`. A live
-agent terminal was on screen as an empty web page.
+`close_web_surface` used to stamp a `web_surface_deliberate_close_ms` map, and its
+doc comment said the heartbeat guard consulted it *"so a racing heartbeat right
+after a close cannot resurrect a ghost overlay"*. **The predicate that consulted
+it had no callers.** The map was written on every close, cleared on every rebuild,
+and never once read — so the guard it advertised has not existed for some time,
+and a heartbeat arriving just after the user closes a surface rebuilds it.
 
-**Two cited paths, and neither is the web surface misbehaving — they are the
-workspace choosing it.**
+⚠ **The bar is not simply missing by accident, and re-arming it blind is the
+wrong move.** The same bar is what once stopped a LIVE app's surface coming back
+after a GUI restart (the "ychrome comes back as a bare terminal" report): the
+daemon replays the vt100 screen on re-attach but never the consumed OSC `open`, so
+the heartbeat is the only thing that can rebuild. Narrowing it to a short
+post-deliberate-close grace was the fix for that, and it is that narrowed form
+whose caller went missing.
 
-**1. The server is CONSTRUCTED in the web surface.** `lib.rs:4210` builds with
-`active_view_mode: WorkspaceViewMode::Rendered`. The enum has two variants
-(`lib.rs:274`), so a fresh server starts in `Rendered` and the terminal must be
-asked for.
+⇒ The map is gone rather than left as a column that decides nothing; the
+`close_web_surface` comment now names the gap. **What is owed is a decision:**
+re-arm the grace (and prove it does not re-break the restart rebuild), or accept
+that a close is advisory and say so in `docs/web-surfaces.md`.
 
-**2. The normaliser can only push TOWARD `Rendered`; there is no path back.**
-`normalize_active_view_mode` (`lib.rs:4234`) returns early if the mode is not
-`Terminal`, sets `Rendered` when there is no active session, and sets `Rendered`
-when the session cannot host a terminal. **Every arm ends in `Rendered`.** Nothing
-anywhere says *"the active row IS a terminal session, therefore show the
-terminal"*.
+**Falsifier:** close a ychrome surface with ✕ and watch for a rebuild inside the
+next heartbeat interval (~4 s). Today it comes back.
 
-⇒ For a product whose thesis is that the terminal handoff IS the product, the
-default is inverted. ⚠ Not a one-line flip: `show_start_page` (`lib.rs:4253`) sets
-`Rendered` deliberately and the start page depends on it. The question is what the
-mode must be **when a terminal-capable session is active**.
+## ⛔⛔ [11.23] PRIVATE CONTENT IN PUBLIC TEST FIXTURES
 
-**3. And an unrelated action flips the user into it as a side effect.**
-`remove_live_session` (`lib.rs:5271`) sets `active_view_mode = Rendered` when the
-row being removed is the active one — so tidying a corpse can move the person's
-viewport onto a web page.
+**Status:** OPEN
 
-### ⭐ THE DEAD CODE IS ALREADY NAMED BY THE COMPILER
+⇒ **Belongs to the leak-removal lane, not this one.**
 
-`cargo check` reports, among others: `remote_preview_payload_terminal_prefill`,
-**`remote_preview_payload_terminal_prefill_before_2_1_103`** — a pre-2.1.103
-variant kept alongside its own successor — `declared_web_surface_open_from_payload`,
-`web_surface_socks_egress_donor`, `preview_blocks_effectively_empty`,
-`rendered_sections_effectively_empty`; and `viewport.rs:14170` still carries a
-comment about "the legacy native child webview".
+Three fixtures in this public repo carry real personal content rather than
+invented examples:
 
-⛔ **`never used` is not `unreachable`.** Check `#[cfg]`, feature gates and dynamic
-dispatch before deleting any of them, and record what was checked.
+- `crates/yggterm-core/src/titles.rs` — a summariser fixture quoting a real
+  conversation about pruning social-media ties, including two personal names.
+  Appears twice in that file (once as separate lines, once as one embedded
+  `context` string).
+- `crates/yggterm-shell/src/shell/tests.rs` — a "stale retained handoff tail"
+  fixture that is a verbatim paragraph from a real session transcript.
 
-⚠ **A blank surface and a missing surface look identical**, which is the fault this
-campaign keeps paying for. If the webview is made to refuse stale content, it must
-SAY so rather than render empty.
+Both are on `main` and in history, so the working-tree fix is only half of it.
+⛔ Not filed in `owner-attention.md`: a leak already public is the relay's
+problem, not a decision only the owner can make.
+
+**Falsifier:** `grep -rn "PRIMARY USER GOALS" crates/` returns the fixture.
 
 ## ⛔⛔⛔ [11.0] REMOVING ONE OF TWO ROWS THAT SHARE A SESSION ID KILLS THE OTHER'S RUNTIME, AND REPORTS THAT IT REAPED NOTHING
 
