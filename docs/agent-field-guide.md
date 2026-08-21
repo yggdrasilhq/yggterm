@@ -2449,6 +2449,38 @@ cargo check --workspace --message-format=json | …filter code.code == "dead_cod
 changed since I last looked"* while being read as *"what is there"*. **Any warning census must
 force the compile it is counting.**
 
+
+## TEST A DAEMON RESTORE AGAINST A CRAFTED `YGGTERM_HOME`, NOT AGAINST THE NEXT RESTART (2026-08-21)
+
+A claim about the restore path reads as untestable — it needs a restart, restarts belong to the
+person using the machine, and so the proof gets parked on "next time it happens". It is not
+untestable. **The daemon honours `YGGTERM_HOME`, restores from `server-state.json` there, and
+writes its own trace into the same home.** One minute, the shipped binary, the real code path,
+nobody's window touched:
+
+```sh
+SB=<a durable dir>; mkdir -p "$SB"
+# server-state.json holding the shape you MEASURED on the live host, not one you imagined
+YGGTERM_HOME="$SB" yggterm-headless server daemon >"$SB/daemon.log" 2>&1 &
+YGGTERM_HOME="$SB" yggterm-headless server status          # wait for it to bind
+YGGTERM_HOME="$SB" ytrace tail --since 10m --lines 5000 --json
+```
+
+Two things that cost a cycle each and are worth knowing first:
+
+- **The state file's enum tags are the SERDE names, not the Rust ones.** `"ClaudeCode"` is
+  rejected with a list of what it wanted (`claude_code`); the parse error is clear, but it
+  kills the daemon at startup and the log is the only place it appears.
+- ⛔ **`pgrep` cannot find it and `pgrep -f` finds your own shell.** `yggterm-headless` is
+  16 characters, past `pgrep`'s comm limit, so `pgrep -x` returns nothing and warns. Identify a
+  sandbox daemon by its ENVIRONMENT instead — scan `/proc/*/environ` for the `YGGTERM_HOME` you
+  set. That is also the only way to be sure you are killing YOUR daemon and not the fleet's.
+
+⇒ **Build the fixture from a measurement, not from the struct definition.** The one that
+settled this bug had `remote_machines` EMPTY, which looked wrong until the live
+`server-state.json` showed the owner's active row was genuinely absent from the scan. A
+fixture assembled from what the code accepts tests the code's opinion of itself.
+
 ## ⛔⛔ NEVER `cargo fix --broken-code` — IT SPLICES SOURCE LINES AND MOSTLY COMPILES (2026-08-21)
 
 `--broken-code` applies a suggestion even when the result does not build, which is the flag's

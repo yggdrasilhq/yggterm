@@ -157,6 +157,10 @@ in `crates/`, and `cargo test -p yggterm-server` is green.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
+⚠ The surface choice and the launch request are both proven on the shipped binary (see the
+sandbox section below). What is still owed is only whether the launched terminal PAINTS — and
+that question belongs to the mount-churn entry, not to this one.
+
 *Reported from the seat 2026-08-21: "Restart hit webview. I switched to this session terminal
 view and it was blank. I think the blank terminal view is switching the webview in restart as a
 mechanism in code."* ⭐ **Two symptoms, one root, and the owner's causal reading was right in
@@ -229,10 +233,38 @@ never enters the remote key builder, so **this restart did not exercise the sche
 all**. That half is proven only by its unit lock (red before, green after), and claiming the
 live run covered it would be reading the reading one wants.
 
-**Falsifier still owed, and now cheap to collect:** the next restart whose ACTIVE row is a
-`remote-cc://` one. `session/restore_view_mode` will name it in `active_session_path`, and
-`decided` must read `Terminal`. ⇒ Until a trace line shows a `remote-cc://` active path, the
-live half of this entry is unfinished.
+### ✔ AND THE REMOTE HALF, PROVEN THE SAME NIGHT — IN A SANDBOX HOME, NOT HIS WINDOW
+
+Waiting for a restart that happened to have a `remote-cc://` row active would have been
+waiting on the owner. The restore path does not need his GUI: point the SHIPPED binary at a
+throwaway `YGGTERM_HOME` holding the persisted shape measured on the live host — a
+`remote-cc://` active path, that row in `live_sessions`, `remote_machines` **empty** — and read
+its own trace.
+
+3.1.35, the deployed build:
+
+```
+active_session_path: remote-cc://…/11111111-…      <- a CC row, the scheme that used to be lost
+persisted: Terminal · row_default: Terminal · decided: Terminal
+supports_terminal: true
+was_a_restored_live_session: true · scan_says_live: false
+```
+
+⭐ **`supports_terminal: true` is the decisive field.** It can only be true if
+`sessions.contains_key(&active_path)` found the row — the exact lookup that missed before,
+when the active path was rewritten to `remote-session://` and the row was filed under
+`remote-cc://`. With an EMPTY scan, so nothing else could have supplied it.
+
+⇒ Both halves now hold: the unit lock red-then-green on the mismatch, and the shipped binary
+answering `Terminal` for a remote CC row on the real restore path.
+
+⚠ **What is still NOT proven, and it is not this bug:** that the terminal then PAINTS. The
+launch is requested; whether the surface fills is the mount-churn entry below, which owns that
+question. **Status here is about which surface is chosen and whether the launch is asked for.**
+
+⭐ **The technique is the reusable part** — a daemon restore is testable against a crafted
+`YGGTERM_HOME` on the shipped binary, with its own trace plane, in about a minute, without
+touching the desktop. Reach for it before parking a restore-path claim on "the next restart".
 
 ## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
 
