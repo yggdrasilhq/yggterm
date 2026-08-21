@@ -455,11 +455,146 @@ The refreshing terminal re-rasterises glyphs on demand, so a cleared or grown at
 correctly for whoever repaints. The coupling is real and any future explanation has to sit beside
 it, but it is a **candidate, not an answer**.
 
-⚠ **What would justify acting on it:** a frame in which `renderer.atlas_shared` is true, a host
-other than the active one has a `last_atlas_clear_at_ms` close to the capture, and the active host
-shows `PARTIAL`. The frame now records all three (`docs/observability.md` §2.3b), so the next
-firing either shows that pattern or rules it out. **Do not "fix" the sharing defensively before
-then** — it is a behaviour change to the paint path with no measured benefit.
+### ⛔⛔ AND IT IS NOW REFUTED A THIRD TIME — the sharing is REAL and it is NOT the cause
+
+*This section closes the question the two experiments above left open. It also states why neither
+of them could have answered it, in either direction.*
+
+⛔ **THE METHOD FAULT IN BOTH EARLIER ARMS: THEY APPLIED THE REPAIR AS PART OF THE PROCEDURE.**
+Each was *"clear the shared atlas via another host, **then full-refresh the measured host**"* — and
+a forced full refresh is precisely the thing that repairs a partial paint. They measured a healed
+surface and recorded that it was healthy. **Neither could have produced a fault whatever the truth
+was**, so "100% of cells painted" was a property of the procedure, not a finding about the atlas.
+
+⭐ **AND A PLAIN-ASCII FIXTURE CANNOT TEST THIS AT ALL — it is the one provably safe case.**
+`TextureAtlas._doWarmUp()` rasterises codepoints **33..125 at DEFAULT fg/bg/ext**, in a fixed
+order, and `clearTexture()` ends by setting `_didWarmUp = false`, so the warm-up runs again after
+every clear — returning default-coloured ASCII **to the same slots it occupied before**. A
+co-owner's stale glyph coordinates for that range therefore stay valid *by construction*. The
+`region-repaint` fixture draws `#=+*` and `STATIC_nnn` at default colour, entirely inside the
+warmed range. ⇒ Anything this mechanism could corrupt has to lie OUTSIDE it: non-ASCII
+(box-drawing, powerline, `❯`, `✶`) and **any coloured or bold cell**, because fg/bg/ext are part of
+the glyph cache key and only the default triple is warmed. That is also a standing answer to *"why
+do plain shells never break"* — a plain shell is default-coloured ASCII.
+
+**The arm that removes both faults, 2026-08-22.** Victim: a static screen of **coloured non-ASCII**
+glyphs (`│─┼╬█▓▒░`, eight colours) plus a live repainting band. Peer: a **different** coloured
+non-ASCII set (`◆◇○●◎★☆♠♣♥`), revealed five times so its own forced refresh wipes and repacks the
+shared atlas. The victim's repair held off throughout — **not by luck, by `input_hot`** (below),
+which is the one gate with no deadline escape.
+
+| | peer | victim |
+|---|---:|---:|
+| forced refreshes GRANTED in the window | **9** | **0** |
+| atlas clears | 9 | 0 |
+| rows disagreeing with the buffer | — | **0 of 62** |
+
+⇒ **Nine real wipes of the shared atlas, the victim never once repaired, and the victim painted
+perfectly** — confirmed by `paint-diff` and by eye on a crop, because `paint-diff` reads ink and
+not glyph identity and would call a wrong-glyph cell `ok`.
+
+⭐ **The clears were REAL, and the counter that says so is not the obvious one.**
+`forced_atlas_clear_count` counts OUR call, and the addon's `clearTexture()` does nothing while the
+first page sits at its origin — so a run can report nine clears having wiped nothing, which would
+have "refuted" a cause it never applied. `page0_version` does not settle it either: `Page.clear()`
+bumps it, but **so does every glyph rasterised into the page** (it moved 1,088 → 8,573 across those
+nine clears). What settles it is the **fill cursor moving backwards** — `page0row` went `8,102` →
+`8,75`, and a page that is only being filled can never go down. Both fields are now in the frame.
+
+⇒ **The sharing stays a real coupling and stops being a suspect.** Do not re-derive it, do not
+"fix" it defensively, and do not spend another arm on it without a new mechanism to test.
+
+### ⛔⛔⛔ THE ROOT CAUSE OF "IT NEVER HEALS": THE DEADLINE IS A BYPASS, NOT A TIMER
+
+*Found 2026-08-22 while building a control for the atlas arm above. It explains the persistence of
+the symptom, which nothing in this entry previously did, and it is the reason the "healing" reading
+higher up is only true when something happens to poke the row.*
+
+**The repair has a deadline that cannot be reached.** `VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS`
+(1,500 ms) was added under the comment *"THE FIX FOR A CLAIM NOBODY CLEARS IS TO MAKE IT EXPIRE"*.
+It is implemented as `fullRefreshOverdue`, a term **inside the grant condition** — so it is only
+ever evaluated when something re-enters `requestVisiblePaint`. The only thing that would is the
+recovery timer, and that is a **single slot per host** which every later
+`scheduleVisiblePaintRecovery` cancels. When the slot is lost, the demand is stranded and the
+expiry never runs, because **an expiry that only fires when someone asks again is not an expiry.**
+
+**Measured — one sandbox host, coloured non-ASCII TUI fixture, no remount (`mounted_at` identical
+across both frames):**
+
+| reading | value |
+|---|---|
+| `pending_full_refresh_demand` | **true, outstanding 43,154 ms** |
+| the deadline it is measured against | 1,500 ms (**28x overdue**) |
+| `pending_recovery` | true, **due 9,074 ms IN THE PAST** |
+| `forced_refresh_skipped_count` across the window | 29 → **29** |
+| `forced_refresh_count` across the window | 2 → **2** |
+| `input_hot` at capture | cold for 5,157 ms |
+
+⚠ **One instrument caveat, stated because it decides whether that 43 s is real.** The
+`pending_full_refresh_demand` pair was first mirrored into the registry **only where a demand was
+REFUSED**, so after a grant it would keep reporting the refused demand and its age — a field that
+says a repair is owed long after it was served. It has since been given a single owner that
+follows the latch on grant, on raise and on refusal. **The 43 s reading above is unaffected: no
+grant occurred anywhere in that window (`forced_refresh_count` 2 → 2), so there was nothing for the
+stale path to misreport.** Frames captured before that fix must not be read across a grant.
+
+⇒ **Both counters frozen means `requestVisiblePaint` was not re-entered even once**, so the
+deadline was never evaluated. The demand's age was very nearly the host's whole lifetime: **that
+row had not been repaired since it mounted.** The client knew a repair was owed, recorded that it
+was owed, and nothing ever served it.
+
+⭐ **THIS REDIRECTS THE "BUILD A DETECTOR" CONCLUSION BELOW, AND IT IS THE CHEAPER HALF.** A
+divergence detector answers *"have the pixels and the buffer come apart"* — expensive, and it has
+to run constantly. But in this failure the client **already knows**: the latch is set, the demand
+is standing, and the only missing piece is something that re-enters the funnel. **Serve the demand
+you already have before building a detector to discover demands you don't.** A detector remains
+right for the other half — a hole opened with no event behind it raises no demand at all — but it
+is no longer the first thing to build.
+
+✅ **FIXED on this lane: `visiblePaintDemandWatchdog`** — a 1 s interval, the same idiom as
+`settleFollowWatchdog` beside it, which re-enters `requestVisiblePaint(true)` when a demand has
+stood past the deadline. It costs nothing while no demand is outstanding. **It deliberately does
+NOT override `input_hot`** (below): a full refresh clears the glyph atlas and redraws every row,
+which must not land mid-keystroke, so the demand is served about a second after typing stops
+instead. That is the whole difference between *deferred* and *stranded*.
+`visible_paint_demand_rescue_count` is in the frame — **non-zero means the recovery timer was lost
+and this caught it**, so the fault stays visible rather than being papered over by its own repair.
+
+### ⛔⛔ THE GATE WITH NO DEADLINE — TYPING DISABLES THE ONLY REPAIR THERE IS
+
+*A better match for the owner's own sentence than anything else measured here: "the TUI rendering
+is broken but typing has no issues." **Typing is not incidental to the symptom; typing is the
+suppressor.***
+
+Three gates can refuse a forced full refresh, and the deadline reaches only two of them:
+
+```js
+requestedForceFullRefresh && term.refresh && !inputHot
+  && (fullRefreshOverdue || (!recentFrameLikeWrite && !fullRefreshRateLimited))
+```
+
+`fullRefreshOverdue` bypasses `recentFrameLikeWrite` and `fullRefreshRateLimited`. **`!inputHot`
+sits outside the parenthesis as a hard AND, so no deadline reaches it.** Every keystroke re-arms it
+for 2,000 ms (`TERMINAL_INPUT_HOT_SUPPRESS_MS`), so anyone typing faster than once per two seconds
+holds the repair off for as long as they keep typing.
+
+**Paired measurement — same fixture, same peer, same five switch rounds, one variable:**
+
+| victim, 5 switch rounds | full refreshes GRANTED | refused `input_hot` |
+|---|---:|---:|
+| **while being typed into** (a keystroke every 700 ms) | **0** | **+9** |
+| **not being typed into** | **+7** | +0 |
+
+The peer row was driven identically in both arms, never typed into, and was granted 9. ⇒ **Typing
+took the victim's repair from seven grants to none**, and the 1,500 ms deadline elapsed ten times
+over inside that window without reaching it.
+
+⚠ **This is recorded as a measured asymmetry, NOT as a thing to "fix" by deleting the gate.** A
+granted refresh clears the shared glyph atlas and redraws every row; firing that mid-keystroke is
+plausibly an input-block source, and the input-block lane owns that call. The watchdog above takes
+the safe half — it serves the demand as soon as typing stops — and leaves the during-typing
+behaviour exactly as it was. **Whether the repair should ever pre-empt typing is an owner-facing
+trade and belongs to the input-block lane, with this table as its input.**
 
 ### ⭐⭐ WHAT THE INSTRUMENT MEASURED ON ITS FIRST REAL USE — the repair is refused ~4 times in 5
 
@@ -521,6 +656,13 @@ and the buffer have come apart.
 well-tuned and should be reused rather than duplicated: the missing piece is a cheap in-page check
 that raises the EXISTING demand when coverage and content diverge. The same-frame read this entry
 delivers is the proof that such a comparison is available inside the webview at all.
+
+⚠ **AMENDED 2026-08-22 — this is still true and it is no longer FIRST.** Measured above: a demand
+already raised can stand for 43 seconds against a 1,500 ms deadline while nothing serves it, on a
+host that was never repaired after mounting. **Serving the demands the client already holds is
+cheaper than detecting new ones and was the larger share of the observed failure**; the watchdog
+that does it is on this lane. The detector still owns the other half — a hole opened with no event
+behind it raises no demand at all — so build it second, not first.
 
 ⚠ **Do NOT reason from the daemon's screen for this.** The daemon's vt100 grid is the source of
 truth for CONTENT and says nothing about what the client painted — that confusion is already a
