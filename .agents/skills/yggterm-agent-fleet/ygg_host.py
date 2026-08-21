@@ -44,30 +44,30 @@ its subject in its own output.**
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ygg_plane  # noqa: E402
 
 _CACHE = {}
 
 
 def _probe(host, timeout=25):
     """Does app control actually ANSWER on this host? Not "is it pingable"."""
-    try:
-        r = subprocess.run(
-            ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
-             "~/.yggterm/bin/yggterm server app rows"],
-            capture_output=True, text=True, timeout=timeout)
-    except Exception:
-        return False
-    out = r.stdout
-    if "{" not in out:
-        return False
-    try:
-        json.loads(out[out.find("{"):])
-    except Exception:
-        # A reply we cannot parse is still a reply from a live app-control
-        # endpoint; the parse defect is a separate, filed problem.
-        return r.returncode == 0
-    return True
+    # ⛔⛔ THE PROBE MUST DRIVE THE BINARY THE CALLERS WILL. It named
+    #     `~/.yggterm/bin/yggterm` while every caller went on to use
+    #     `~/.local/bin/yggterm-headless` — two separate installs, both present,
+    #     kept in step by nothing. A host could answer this and fail the call, and
+    #     the caller would read that as a fact about the ROW rather than about the
+    #     transport, which is the confusion this file's header exists to end.
+    reply = ygg_plane.app(host, "rows", timeout=timeout)
+    if "error" not in reply:
+        return True
+    # ⚠ A reply we cannot parse is still a reply from a live app-control endpoint;
+    #   the parse defect is a separate, filed problem. Only a TRANSPORT failure
+    #   means "this host does not answer".
+    return "did not answer within the timeout" not in (reply.get("error") or "")
 
 
 def _candidates_from_local_daemon():
