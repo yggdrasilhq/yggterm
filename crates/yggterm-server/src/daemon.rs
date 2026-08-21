@@ -19292,7 +19292,25 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             home_dir.clone(),
             crate::host_panic::local_host_label(),
             std::sync::Arc::new(move |incident: &ytrace::diagnosis::Incident| {
-                crate::host_panic::notify_owner(&panic_home, incident);
+                // ⭐ The notification's own pid, on the record. The panic event
+                // above says an incident was DIAGNOSED; only this says a process
+                // was actually started, and the difference is what a reaping
+                // audit needs. Deriving it instead — replaying the panic events
+                // through the fifteen-minute cooldown — is inference, and it was
+                // the weakest link in the falsifier for the zombie leak this
+                // path used to produce. One event per cooldown at most, so it
+                // costs the trace budget nothing.
+                let pid = crate::host_panic::notify_owner(&panic_home, incident);
+                append_trace_event(
+                    &panic_home,
+                    "daemon",
+                    "heartbeat",
+                    "notify_spawned",
+                    serde_json::json!({
+                        "incident_id": incident.id,
+                        "pid": pid,
+                    }),
+                );
             }),
         );
     }
