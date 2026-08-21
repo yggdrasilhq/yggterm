@@ -382,6 +382,35 @@ payload crosses. Bytes written before that fix still have `payload: null` and ca
 ⇒ When a span's payload is null, check the record's `app_version` before concluding the writer is
 at fault.
 
+### 4.2b ⛔⛔ THE REFRESH-SKIP PROBE IS THROTTLED BY THE CONDITION IT REPORTS ON
+
+**Measured on the GUI host, 2026-08-22: across the three newest trace files,
+`xterm_forced_refresh` and `xterm_forced_refresh_skipped` appear ZERO times, while `xterm_render`
+appears 3,872 times in the same files.** The query was checked against that control before the
+absence was believed.
+
+**Why zero, and why it is not "nothing happened".** Both probes go out through `emitPerf`, which
+lists them as hot high-frequency events and throttles them whenever `recentFrameLikeWrite` is hot.
+That flag is armed by any payload containing hide-cursor (`ESC[?25l`), which every TUI emits before
+every redraw — so for an agent CLI it is **effectively always hot**. And it is the *same flag* that
+suppresses the forced full refresh in the first place.
+
+⇒ **The instrument that would tell you the repair is being suppressed is silenced by the
+suppressing condition.** This is the campaign's own law — *an instrument that runs on the thing it
+measures reads zero* — in a new place: ask what STOPS being reported when the fault engages.
+
+⚠ **And the four hot events share ONE rate-limit slot** (`lastPerfEventAtMs`, throttle 900–2200 ms).
+`xterm_write_flush` fires far more often than the other three, so it consumes the budget and
+starves the refresh probes specifically under load — which is precisely when the answer matters.
+
+⛔ **So in the trace, "the repair was suppressed for the whole window" and "no repair was ever
+demanded" are the SAME READING: nothing.** Do not conclude either one from a zero here.
+
+⭐ **The way round it, and it needs no change to the throttle:** the host entry keeps monotonic
+counters (`forcedRefreshCount`, `forcedRefreshSkippedCount`, `skippedPerfEventCount`) that no
+rate-limit can erase. The same-frame paint record (§2.3b) reads them directly, so a captured frame
+carries the true balance of repairs against suppressions even when the trace carries none.
+
 ### 4.3 The registry answers "who is alive" by reading everything that ever was
 
 `ytrace::registry::heartbeat()` appends one line per provider every 15 s to

@@ -78732,6 +78732,31 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             // that never fired and one that fired and did not help
                             // are different faults with the same screenshot.
                             forced_refresh_count: Number(e.forcedRefreshCount || 0),
+                            // ⛔⛔ THE PROBE FOR THIS IS SILENCED BY THE CONDITION
+                            // IT REPORTS ON, WHICH IS WHY THE COUNTER IS READ HERE.
+                            //
+                            // `xterm_forced_refresh_skipped` is emitted through
+                            // `emitPerf`, which lists it as a hot high-frequency
+                            // event and throttles it whenever `recentFrameLikeWrite`
+                            // is hot -- and `recentFrameLikeWrite` is exactly the
+                            // flag that suppresses the refresh, re-armed by every
+                            // TUI frame, so for an agent CLI it is always hot.
+                            // Worse, four hot events share ONE `lastPerfEventAtMs`
+                            // slot and `xterm_write_flush` fires far more often, so
+                            // it eats the budget first.
+                            //
+                            // ⇒ MEASURED on the GUI host, 2026-08-22: across the
+                            // three newest trace files, `xterm_forced_refresh` and
+                            // `xterm_forced_refresh_skipped` appear ZERO times,
+                            // while `xterm_render` appears 3,872 times in the same
+                            // files. In the trace, "the repair was suppressed all
+                            // window" and "no repair was ever demanded" are the
+                            // same reading: nothing. Reading the host's own monotonic
+                            // counters sidesteps the throttle entirely -- a count
+                            // cannot be rate-limited away.
+                            forced_refresh_skipped_count: Number(e.forcedRefreshSkippedCount || 0),
+                            skipped_perf_event_count: Number(e.skippedPerfEventCount || 0),
+                            last_skipped_perf_event_name: String(e.lastSkippedPerfEventName || ''),
                             forced_atlas_clear_count: Number(e.forcedAtlasClearCount || 0),
                             last_atlas_clear_at_ms: Number(e.lastAtlasClearAtMs || 0),
                             retained_write_paint_repair_count:

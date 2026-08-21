@@ -278,6 +278,7 @@ def main() -> int:
                   f"forced_refresh={h.get('forced_refresh_count')} "
                   f"atlas_clears={h.get('forced_atlas_clear_count')} "
                   f"repair={h.get('retained_write_paint_repair_count')} "
+                  f"refresh_SKIPPED={h.get('forced_refresh_skipped_count')} "
                   f"{'REFRESH-SUPPRESSED' if suppressed else ''}")
     cur_char = buf.get("cursor_char") or ""
     print(f"cursor       row {cursor_y} col {cursor_x}  style={buf.get('cursor_style')!r}  cell holds {cur_char!r}")
