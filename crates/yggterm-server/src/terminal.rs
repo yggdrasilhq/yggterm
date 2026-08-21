@@ -637,7 +637,7 @@ pub struct HandoffTakeout {
 
 /// What seating a handed-over PTY under a key would do.
 ///
-/// Three answers, and collapsing any two of them has already cost this project
+/// Four answers, and collapsing any two of them has already cost this project
 /// a daemon that could never retire — see [`TerminalManager::seat_verdict`].
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,8 +647,13 @@ pub enum SeatVerdict {
     /// This key is already seated on the very process being handed over: the
     /// earlier adoption succeeded and only its acknowledgement was lost.
     AlreadySeated,
-    /// A DIFFERENT live child holds this key. Seating would kill one pty to
-    /// install another.
+    /// A DIFFERENT live child holds this key, but it is a STAND-IN this daemon
+    /// spawned for itself and nobody has ever typed into. It yields: the pty
+    /// being offered is the session, and the stand-in is what was standing in
+    /// for it. See [`PtySessionRuntime::is_a_stand_in`].
+    PlaceholderYields,
+    /// A DIFFERENT live child holds this key and it is real work. Seating would
+    /// kill one pty to install another.
     Conflict,
 }
 
@@ -999,7 +1004,17 @@ impl TerminalManager {
             && crate::pty_adoption::process_start_time(shell_pid)
                 .is_some_and(|start| start == shell_start_time);
         if same_child {
-            SeatVerdict::AlreadySeated
+            return SeatVerdict::AlreadySeated;
+        }
+        // ⭐ THE FOURTH ANSWER, AND IT IS WHERE THE DEADLOCK LIVED. A key held
+        // by a stand-in used to read exactly like a key held by real work, so
+        // the successor refused, the sweep went `Partial`, and the predecessor
+        // could never reach the empty hands that let it retire — standing there
+        // holding every OTHER session it owns, none of them reachable. The seat
+        // rule itself was never wrong; it simply had no way to say that what it
+        // was protecting was a placeholder.
+        if existing.is_a_stand_in() {
+            SeatVerdict::PlaceholderYields
         } else {
             SeatVerdict::Conflict
         }
@@ -1032,6 +1047,22 @@ impl TerminalManager {
     ) -> Result<()> {
         match self.seat_verdict(key, shell_pid, shell_start_time) {
             SeatVerdict::Vacant => {}
+            SeatVerdict::PlaceholderYields => {
+                // The husk removal below is what actually retires the stand-in;
+                // this only records that a live child was displaced on purpose,
+                // so a reader who later asks "where did that shell go" has an
+                // answer that names the rule instead of a mystery.
+                trace_terminal_event(
+                    "adopt_placeholder_yielded",
+                    serde_json::json!({
+                        "path": key,
+                        "shell_pid": shell_pid,
+                        "shell_start_time": shell_start_time,
+                        "reason": "the child under this key was spawned by this daemon and \
+                                   never typed into — a stand-in for the pty now arriving",
+                    }),
+                );
+            }
             SeatVerdict::AlreadySeated => {
                 // Idempotent success. `fd` drops here, closing this duplicate
                 // descriptor for a pty we already hold open — which is why it
@@ -1954,6 +1985,21 @@ struct PtySessionRuntime {
     /// comparison and the submit. That gap is what put a supervision tool's
     /// text into the middle of a half-typed sentence and sent it.
     pending_input_line: Arc<Mutex<Vec<u8>>>,
+    /// Bytes of CLIENT input this runtime has ever been handed — never the
+    /// daemon's own writes.
+    ///
+    /// ⭐ It exists to answer one question the seat rule could not ask: *has
+    /// anybody actually worked in this?* `last_activity_ms` cannot, because the
+    /// daemon's own probes and replays stamp it; output cannot, because a shell
+    /// that has done nothing still prints a prompt. Zero here is an exact fact
+    /// about the thing, not an inference from timing or arrival order, which is
+    /// what [`TerminalManager::seat_verdict`] needs it for.
+    ///
+    /// ⛔ Incremented in [`PtySessionRuntime::write`] and NOWHERE else —
+    /// `write_daemon_originated` is the daemon speaking, and counting that here
+    /// would make a readiness probe look like a person, the exact confusion that
+    /// path already carries a war story about.
+    client_input_bytes: Arc<AtomicU64>,
     runtime_output_seen: Arc<AtomicBool>,
     eof_without_output: Arc<AtomicBool>,
     attach_ready_seen: Arc<AtomicBool>,
@@ -3004,6 +3050,7 @@ impl PtySessionRuntime {
             last_output_ms,
             pending_input_draft,
             pending_input_line,
+            client_input_bytes: Arc::new(AtomicU64::new(0)),
             runtime_output_seen,
             eof_without_output,
             attach_ready_seen,
@@ -3154,6 +3201,43 @@ impl PtySessionRuntime {
 
     fn has_runtime_output(&self) -> bool {
         self.runtime_output_seen.load(Ordering::SeqCst)
+    }
+
+    /// Is this runtime a STAND-IN rather than the session's working pty?
+    ///
+    /// ⭐⭐ Two exact facts, both properties of the thing itself, neither of
+    /// them "which of us got here first":
+    ///
+    /// 1. **This daemon spawned the child** rather than receiving it. An
+    ///    ADOPTED child is the session's real pty, the one that has been
+    ///    travelling from daemon to daemon since the session was born; it is
+    ///    never a stand-in and is never displaced.
+    /// 2. **Nobody has ever typed into it.** Not "recently idle" — never, not
+    ///    one byte, for the whole life of the runtime.
+    ///
+    /// Both together describe exactly one thing: a child this daemon built for
+    /// itself because it could not see the real one, and that nobody has done
+    /// any work in. A plain shell at a fresh prompt, or an attach wrapper
+    /// standing in the viewport saying it is waiting to attach.
+    ///
+    /// ⚖ **The honest cost, stated rather than hidden.** A daemon-spawned child
+    /// running unattended work with no human input reads as a stand-in here. For
+    /// a predecessor to be offering that key at all, the session must ALREADY
+    /// have two rival live children, one of which is going to lose — and between
+    /// a locally-improvised child and the one carrying the session's continuous
+    /// history, the travelling one is the session. The alternative is what this
+    /// is replacing: a refusal that pins the predecessor for life and leaves
+    /// every row it owns unreachable.
+    #[cfg(target_os = "linux")]
+    fn is_a_stand_in(&self) -> bool {
+        if self.client_input_bytes.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        !self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_adopted()
     }
 
     fn last_resize_seq(&self) -> u64 {
@@ -3645,6 +3729,8 @@ impl PtySessionRuntime {
         if next.draft != prev_draft {
             self.pending_input_draft.store(next.draft, Ordering::SeqCst);
         }
+        self.client_input_bytes
+            .fetch_add(data.len() as u64, Ordering::SeqCst);
         self.write_daemon_originated(data)
     }
 
@@ -8560,6 +8646,240 @@ line-two on the real screen\r\n\
                 },
             )
         })
+    }
+
+    /// Serve one connection with the REAL successor half AND the REAL seat
+    /// rule, against a live `TerminalManager`.
+    ///
+    /// ⚠ Distinct from [`serve_one_handoff`] on purpose: that one models the
+    /// predicate so the WIRE ORDER can be tested in isolation, and a model is
+    /// exactly the wrong instrument for testing the predicate itself. These
+    /// closures are the daemon's, verbatim in shape — `seat_verdict` decides and
+    /// `adopt_session` installs.
+    #[cfg(target_os = "linux")]
+    fn serve_one_handoff_into(
+        socket: &std::path::Path,
+        manager: Arc<Mutex<TerminalManager>>,
+    ) -> std::thread::JoinHandle<crate::pty_handoff::HandoffServed> {
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket).expect("bind the handoff socket");
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the handoff");
+            crate::pty_handoff::serve_handoff(
+                &stream,
+                &mut |metadata| {
+                    let verdict = manager
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .seat_verdict(
+                            &metadata.runtime_key,
+                            metadata.shell_pid,
+                            metadata.shell_start_time,
+                        );
+                    match verdict {
+                        SeatVerdict::Conflict => {
+                            Some(seat_conflict_reason(&metadata.runtime_key))
+                        }
+                        SeatVerdict::Vacant
+                        | SeatVerdict::AlreadySeated
+                        | SeatVerdict::PlaceholderYields => None,
+                    }
+                },
+                &mut |metadata, fd| {
+                    manager
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .adopt_session(
+                            &metadata.runtime_key,
+                            &metadata.launch_command,
+                            metadata.cwd.as_deref(),
+                            metadata.cols,
+                            metadata.rows,
+                            fd,
+                            metadata.shell_pid,
+                            metadata.shell_start_time,
+                            Some(metadata.screen.as_str()),
+                        )
+                        .map_err(|error| format!("{error:#}"))
+                },
+            )
+        })
+    }
+
+    /// Drive `key` and wait for the shell on the far end to ANSWER.
+    ///
+    /// ⛔ `$$` rather than a literal marker, and for the reason the whole family
+    /// of these tests exists: a pty echoes whatever is written to it, so a
+    /// literal "arrives" from a dead shell and from the WRONG shell alike. The
+    /// shell's own pid is a value only that process can produce, so the answer
+    /// names which of the two candidate shells is really on the far end.
+    #[cfg(target_os = "linux")]
+    fn which_shell_answers(manager: &Arc<Mutex<TerminalManager>>, key: &str) -> String {
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .write(key, "printf 'WHO-%s\\n' $$\n")
+            .expect("write to the seated pty");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut transcript = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(result) = manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .read(key, 0)
+            {
+                transcript = result
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.data.as_str())
+                    .collect::<String>();
+            }
+            // The echo of the command itself contains "WHO-%s"; an ANSWER is
+            // "WHO-" followed by a digit.
+            if transcript
+                .split("WHO-")
+                .skip(1)
+                .any(|tail| tail.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        transcript
+    }
+
+    /// ⛔⛔⛔ A STAND-IN HELD THE KEY, AND REFUSING IT PINNED THE WHOLE DAEMON.
+    ///
+    /// The seat rule was right about the danger and blind about the case. When
+    /// a successor cannot see the daemon that owns a row, it builds its own
+    /// child for that key — a fresh shell at a prompt, or an attach wrapper
+    /// sitting in the viewport saying it is waiting to attach. That child then
+    /// reads as "a DIFFERENT live child", so the predecessor's handoff is
+    /// refused, the sweep goes `Partial` and can never reach `AllMoved`, and the
+    /// predecessor stands there for the rest of its life holding every OTHER
+    /// session it owns — none of which anybody can reach.
+    ///
+    /// ⇒ Measured on the build host: the same key refusing once a minute across
+    /// three successive successor versions, `moved: 10`, `readers_stood_down:
+    /// 11`, for 28 hours.
+    ///
+    /// A stand-in yields. What it is NOT allowed to do is yield a session
+    /// somebody is working in, which is the second arm below.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stand_in_yields_the_key_to_the_sessions_own_pty() {
+        let _env = crate::codex_cli::env_test_guard();
+
+        let rig = HandoffRig::new("standin");
+        let key = "local://stood-in-for-in-test";
+
+        let manager = Arc::new(Mutex::new(TerminalManager::new()));
+        manager
+            .lock()
+            .expect("manager lock")
+            .ensure_session_with_size(key, "bash --norc -i", None, Some((80, 24)))
+            .expect("the successor spawns its own child for a key it cannot otherwise serve");
+        let stand_in_pid = manager
+            .lock()
+            .expect("manager lock")
+            .sessions
+            .get(key)
+            .and_then(|session| session.process_id())
+            .expect("the stand-in has a pid");
+        assert_ne!(
+            stand_in_pid, rig.shell_pid,
+            "the stand-in and the session's own shell must be different processes, \
+             or this test proves nothing"
+        );
+
+        let served = serve_one_handoff_into(&rig.socket, Arc::clone(&manager));
+        let mut support = crate::pty_handoff::PrecommitSupport::default();
+        crate::pty_handoff::send_session(
+            &rig.socket,
+            &rig.metadata(key, true),
+            rig.master_fd(),
+            &mut support,
+        )
+        .expect(
+            "a stand-in must not refuse the session's own pty — a refusal here is the \
+             failure that pins a predecessor for life",
+        );
+        let served = served.join().expect("successor thread");
+        assert!(served.adopted, "the descriptor must have been seated");
+
+        // ⭐ THE PROOF, AND IT CANNOT BE FAKED BY EITHER SHELL BEING ALIVE:
+        // whoever is on the far end of this key now must be the SESSION'S shell.
+        let transcript = which_shell_answers(&manager, key);
+        assert!(
+            transcript.contains(&format!("WHO-{}", rig.shell_pid)),
+            "the key must now be driven by the session's own shell (pid {}), not by the \
+             stand-in (pid {stand_in_pid}); transcript: {transcript}",
+            rig.shell_pid
+        );
+
+        let _ = manager
+            .lock()
+            .expect("manager lock")
+            .shutdown_all(|_key| None::<String>);
+        let _ = std::fs::remove_file(&rig.socket);
+    }
+
+    /// ⛔ AND THE RULE THE FIX ABOVE MUST NOT WEAKEN: A SESSION SOMEBODY IS
+    /// WORKING IN IS NEVER DISPLACED.
+    ///
+    /// ⚠ The two arms differ by ONE byte of client input and nothing else — same
+    /// key, same manager, same real handoff. That is the whole discriminator
+    /// under test, and it is a property of the thing rather than of which of the
+    /// two children arrived first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_somebody_has_typed_into_is_still_a_conflict() {
+        let _env = crate::codex_cli::env_test_guard();
+
+        let rig = HandoffRig::new("typed-in");
+        let key = "local://worked-in-in-test";
+
+        let manager = Arc::new(Mutex::new(TerminalManager::new()));
+        manager
+            .lock()
+            .expect("manager lock")
+            .ensure_session_with_size(key, "bash --norc -i", None, Some((80, 24)))
+            .expect("spawn the successor's own child");
+        // THE ONE BYTE. `write` is the client input path and the only one that
+        // counts — a daemon-authored probe through `write_daemon_originated`
+        // must never make a session look worked-in.
+        manager
+            .lock()
+            .expect("manager lock")
+            .write(key, "\n")
+            .expect("somebody types into it");
+
+        let served = serve_one_handoff_into(&rig.socket, Arc::clone(&manager));
+        let mut support = crate::pty_handoff::PrecommitSupport::default();
+        let error = crate::pty_handoff::send_session(
+            &rig.socket,
+            &rig.metadata(key, true),
+            rig.master_fd(),
+            &mut support,
+        )
+        .expect_err("a child somebody has worked in must still be refused");
+        assert!(
+            !error.committed,
+            "and the refusal still lands before the commit point: {error}"
+        );
+        let served = served.join().expect("successor thread");
+        assert!(!served.adopted);
+        assert!(served.refused_before_commit);
+        assert!(
+            rig.shell_still_answers("WORKED"),
+            "a refused handoff leaves the predecessor's own master driving its shell"
+        );
+
+        let _ = manager
+            .lock()
+            .expect("manager lock")
+            .shutdown_all(|_key| None::<String>);
+        let _ = std::fs::remove_file(&rig.socket);
     }
 
     /// ⛔⛔⛔ A REFUSAL EVALUATED AFTER THE COMMIT POINT COSTS A WHOLE DAEMON.
