@@ -536,6 +536,50 @@ naming nodes that no longer exist — the JS applies batches inside a try/catch 
 rebuild that follows re-creates the tree, so it should be self-correcting, but "should" is
 the word doing the work.
 
+## ⛔⛔ [11.10] A CLI OTHER THAN CLAUDE CODE IS A SECOND-CLASS CITIZEN IN THE ROW PLANE
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-21 with a screenshot, as three separate symptoms he then joined
+himself: "since agy's issues are caught it makes me wonder all other CLI except claude code
+might have this title issue." That join is the hypothesis to test, not a settled fact.*
+
+**1. The working indicator does not animate.** An Antigravity session was demonstrably
+working — the metadata rail read `running · working`, the CLI showed `Running command…` and
+`esc to cancel` — and the row's indicator did not blink. Claude Code rows do. ⇒ Is the
+animation driven by a signal only Claude Code produces, or by a shared state this
+descriptor never sets?
+
+**2. A row is not born with the name the spec requires.** The rule: a new agent-CLI or
+libyggterm app row is named `New {machine} {app}`, and a new terminal `New {machine}
+Terminal`. Observed: a `ytop` row launched from a terminal is named after its working
+directory, as a raw absolute path. `New Yedit` also exists today with no machine name, so this is wider than
+terminals.
+
+⭐ **Root located, so it need not be re-found.** `live_session_default_title`
+(`crates/yggterm-server/src/lib.rs`) titles a Shell/SshShell **by its cwd** and hands every
+other kind the caller's fallback; the agent-CLI fallback is
+`AgentCliDescriptor::new_session_label` (`crates/yggterm-core/src/agent_cli.rs`), which is
+`New {display_name} Session` and carries **no machine name**. ⚠ One rule, one owner, at least
+six callers — and that function's doc comment states the old intent, so the comment moves
+with the code or it becomes the next wrong signpost.
+
+**3. The generated title never arrives.** The row still read `New Antigravity Session` after
+a long working turn. ⚠ **Do not assume the chore simply skips non-Claude CLIs.** A title that
+was generated and never written back is indistinguishable on screen from one never requested,
+and this repo has already recorded both a title livelock and a wrong-decoder-returns-empty
+failure. Establish which of *never asked* / *asked and failed* / *asked, generated, never
+stored* is happening before changing anything.
+
+**Why one entry.** All three are the same shape: the per-CLI descriptor is the single owner
+of what a CLI is called and how its state is shown, and each symptom is a place where only
+Claude Code was wired through. ⇒ Fix by the descriptor for every registered CLI at once, and
+apply it across sidebar row, start page card, metadata rail and the `ls` verbs together.
+
+**Falsifier:** spawn one row of every registered CLI kind and one terminal; every row must be
+born `New {machine} {app}` / `New {machine} Terminal`, must animate while its CLI is working,
+and must carry a generated title once its first turn ends.
+
 ## ⛔⛔ [11.0] A CLIENT RESTART LEAVES A THIRD OF THE ROWS BLANK, AND THE RESTART IS NOW AUTOMATIC
 
 **Status:** OPEN
