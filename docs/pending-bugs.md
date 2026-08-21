@@ -871,6 +871,20 @@ not the population); an isolation harness (per-test temp home, serialized group)
 retry culture. **Falsifier:** two full workspace suites running concurrently on one machine
 both pass.
 
+**⭐ TWO MORE OBSERVATIONS 2026-08-21 (11.14), and they narrow it.** Both were server-suite
+runs that failed exactly one test and passed in isolation immediately after, and in BOTH the
+concurrency was a **`cargo` build, not a second test binary** — the suite was chained behind
+or beside another crate's compile in one shell invocation. That matters because it separates
+the two hypotheses the entry carries: shared mutable state between two *test* processes cannot
+explain a failure whose only companion is a compiler. What both companions do share is CPU and
+IO pressure, which points at **timing-sensitive tests rather than shared state** for at least
+this half of the population. ⚠ Reported as a narrowing, not a verdict: one of the two failures
+went unnamed (a `tail -3` on the runner ate the failure list before it could be read — worth
+noting on its own, since the instrument that was supposed to identify the flake is what lost
+its name). **Cheap next step for whoever takes this:** run the suite under `--test-threads=1`
+beside a heavy build; if it survives, the population is timing, and an isolation harness is
+aimed at the wrong thing.
+
 ## ⚠ [11.10] A STANDING BOOT REFUSAL IS INVISIBLE IN EVERY STATE FILE — ONLY THE LOG KNOWS
 
 **Status:** OPEN
