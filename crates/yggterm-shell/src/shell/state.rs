@@ -78555,6 +78555,131 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                         } catch (_e) {}
                     }
                 }
+                // ⛔⛔ THE SAME-FRAME BUFFER — 11.26's first deliverable.
+                //
+                // A faithful screenshot costs ~6.8 s; a `terminal read-buffer`
+                // costs ~116 ms. On a live agent row the two can NEVER be
+                // sequenced into one frame, so every "the buffer says X but the
+                // screen shows Y" claim ever made on a busy row compared two
+                // moments seven seconds apart — and at least one of them was
+                // just TIME (`Nesting… 1m42s` in the buffer beside
+                // `Whirring… 29s` in the pixels: two different turns).
+                //
+                // This block reads the buffer of the host that was just drawn,
+                // in the SAME synchronous JS turn as the drawImage loop and the
+                // toDataURL below. xterm parses PTY bytes on its own task queue,
+                // which cannot interleave with synchronous script — so the text
+                // recorded here is EXACTLY the text those pixels were composited
+                // from. The comparison stops being an argument and becomes a diff.
+                const readSameFrameBuffer = (entry) => {
+                    if (!entry || !entry.term) { return null; }
+                    const term = entry.term;
+                    const active = term.buffer && term.buffer.active;
+                    if (!active) { return null; }
+                    const host = document.getElementById(entry.hostId);
+                    const rows = Math.max(1, Number(term.rows || 0));
+                    const cols = Math.max(1, Number(term.cols || 0));
+                    const length = Math.max(0, Number(active.length || 0));
+                    const viewportY = Math.max(0, Number(active.viewportY || 0));
+                    const baseY = Math.max(0, Number(active.baseY || 0));
+                    const start = Math.min(Math.max(0, length - 1), viewportY);
+                    const end = Math.min(length, start + rows);
+                    const lines = [];
+                    // ⛔ PER-CELL, NOT PER-STRING. `translateToString(true)` trims
+                    // and collapses: a wide glyph is one char across two cells and
+                    // a trailing run of spaces simply disappears, so a column index
+                    // derived from the string does not address the cell the
+                    // renderer drew. The diff against pixels is per-CELL, so the
+                    // mask is built from the cells themselves — '#' where the cell
+                    // holds a printable glyph, '.' where it does not. Everything
+                    // downstream indexes this, never the string.
+                    const inkMasks = [];
+                    for (let i = start; i < end; i += 1) {
+                        const line = active.getLine(i);
+                        lines.push(line && line.translateToString
+                            ? String(line.translateToString(true) || '') : '');
+                        let mask = '';
+                        if (line && typeof line.getCell === 'function') {
+                            for (let x = 0; x < cols; x += 1) {
+                                let ch = '';
+                                try {
+                                    const cell = line.getCell(x);
+                                    ch = cell && cell.getChars ? String(cell.getChars() || '') : '';
+                                } catch (_e) {}
+                                mask += (ch && ch.trim().length > 0) ? '#' : '.';
+                            }
+                        } else {
+                            mask = '.'.repeat(cols);
+                        }
+                        inkMasks.push(mask);
+                    }
+                    // Row → pixel band. Without this the buffer text and the PNG
+                    // cannot be laid against each other, and the diff degrades
+                    // back into "look at it and squint". `.xterm-screen` is
+                    // exactly rows × cols cells, so the cell size follows from
+                    // its rect with no private-API dependency; the private
+                    // dimensions are read first only because they are exact.
+                    let screenRect = null;
+                    let cellW = 0;
+                    let cellH = 0;
+                    try {
+                        const screen = host ? (host.querySelector('.xterm-screen') || host) : null;
+                        if (screen) {
+                            const sr = screen.getBoundingClientRect();
+                            screenRect = { left: sr.left, top: sr.top, width: sr.width, height: sr.height };
+                            if (sr.height > 0) { cellH = sr.height / rows; }
+                            if (sr.width > 0) { cellW = sr.width / cols; }
+                        }
+                    } catch (_e) {}
+                    try {
+                        const dims = term._core && term._core._renderService
+                            && term._core._renderService.dimensions;
+                        const cell = dims && dims.css && dims.css.cell;
+                        if (cell && Number(cell.height) > 0) { cellH = Number(cell.height); }
+                        if (cell && Number(cell.width) > 0) { cellW = Number(cell.width); }
+                    } catch (_e) {}
+                    // The cursor, because a block cursor that ERASES the glyph
+                    // under it instead of inverting it is one of this bug's three
+                    // measured faces — and it is invisible unless the frame says
+                    // which cell the cursor was on and what that cell held.
+                    const cursorX = Math.max(0, Number(active.cursorX || 0));
+                    const cursorY = Math.max(0, Number(active.cursorY || 0));
+                    let cursorChar = '';
+                    try {
+                        const cline = active.getLine(baseY + cursorY);
+                        const ccell = cline && cline.getCell ? cline.getCell(cursorX) : null;
+                        cursorChar = ccell && ccell.getChars ? String(ccell.getChars() || '') : '';
+                    } catch (_e) {}
+                    return {
+                        session_path: String(entry.sessionPath || ''),
+                        host_id: String(entry.hostId || ''),
+                        rows, cols,
+                        base_y: baseY,
+                        viewport_y: viewportY,
+                        buffer_length: length,
+                        line_count: lines.length,
+                        nonblank_line_count: lines.filter((l) => String(l || '').trim().length > 0).length,
+                        lines,
+                        ink_masks: inkMasks,
+                        cursor_x: cursorX,
+                        cursor_y: cursorY,
+                        cursor_char: cursorChar,
+                        cursor_blink: !!(term.options && term.options.cursorBlink),
+                        cursor_style: String((term.options && term.options.cursorStyle) || ''),
+                        screen_css: screenRect,
+                        cell_css_width: cellW,
+                        cell_css_height: cellH,
+                    };
+                };
+                let sameFrameBuffer = null;
+                let sameFrameBufferError = '';
+                try {
+                    sameFrameBuffer = readSameFrameBuffer(
+                        ordered.length ? ordered[ordered.length - 1] : null
+                    );
+                } catch (error) {
+                    sameFrameBufferError = (error && error.message) ? error.message : String(error);
+                }
                 const dataUrl = out.toDataURL('image/png');
                 send({
                     ok: true,
@@ -78578,6 +78703,11 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                     ),
                     active_session_path: activePath,
                     session_paths: paths,
+                    dpr,
+                    // Same-frame buffer: the text these very pixels were drawn
+                    // from. See readSameFrameBuffer above.
+                    buffer: sameFrameBuffer,
+                    buffer_error: sameFrameBufferError,
                 });
             } catch (error) {
                 send({ ok: false, reason: (error && error.message) ? error.message : String(error) });
@@ -78591,6 +78721,83 @@ async fn eval_active_terminal_canvas_composite() -> Value {
     // send channel, NOT the script's return value) — a plain `return` hangs the recv.
     receive_probe_eval_value(TERMINAL_CANVAS_COMPOSITE_SCRIPT, "").await
 }
+/// Sidecar path for a capture: `<snapshot>.paint-frame.json`.
+fn paint_frame_sidecar_path(snapshot_path: &Path) -> PathBuf {
+    let mut name = snapshot_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".paint-frame.json");
+    snapshot_path.with_file_name(name)
+}
+
+/// ⛔⛔ THE SAME-FRAME PAINT RECORD — write the buffer the composite drew from,
+/// beside the PNG it drew.
+///
+/// A faithful screenshot costs ~6.8 s and a buffer read ~116 ms, so on a live
+/// agent row the two cannot be sequenced into one frame: every prior "the buffer
+/// says X but the screen shows Y" reading on a busy row compared two moments
+/// seven seconds apart, and part of the disagreement was TIME rather than a
+/// paint fault. The composite script now reads the buffer in the SAME
+/// synchronous turn as `toDataURL`, and this writes it out next to the frame —
+/// so the pixels and the text are the same instant by construction and the
+/// comparison is a diff, not an argument. `scripts/paint-diff.py` consumes it.
+///
+/// `png_space` says how CSS px map onto the written PNG, because the two capture
+/// backends write different rectangles: `window` (the merged chrome snapshot —
+/// scale by png_width / win_w) or `frame` (the terminal-only composite — the PNG
+/// IS the frame rect). Recording which one it was is not bookkeeping: a row→pixel
+/// band computed against the wrong space lands on the wrong row and every verdict
+/// after it is confidently wrong.
+fn write_paint_frame_sidecar(
+    snapshot_path: &Path,
+    layer: &Value,
+    png_space: &str,
+    capture_backend: &str,
+) -> Option<Value> {
+    let buffer = layer.get("buffer")?;
+    if buffer.is_null() {
+        return None;
+    }
+    let sidecar = paint_frame_sidecar_path(snapshot_path);
+    let field = |key: &str| layer.get(key).cloned().unwrap_or(Value::Null);
+    let record = json!({
+        "schema": "yggterm.paint_frame/1",
+        "png": snapshot_path.display().to_string(),
+        "png_space": png_space,
+        "capture_backend": capture_backend,
+        "captured_at_ms": current_millis() as u128,
+        "dpr": field("dpr"),
+        "win_w": field("win_w"),
+        "win_h": field("win_h"),
+        "frame_css": json!({
+            "left": field("css_left"),
+            "top": field("css_top"),
+            "width": field("css_width"),
+            "height": field("css_height"),
+        }),
+        "host_count": field("host_count"),
+        "layers_drawn": field("layers"),
+        "session_paths": field("session_paths"),
+        "active_session_path": field("active_session_path"),
+        "buffer": buffer.clone(),
+        "buffer_error": field("buffer_error"),
+    });
+    let text = serde_json::to_string_pretty(&record).ok()?;
+    std::fs::write(&sidecar, text).ok()?;
+    Some(json!({
+        "path": sidecar.display().to_string(),
+        "png_space": png_space,
+        "rows": buffer.get("rows").cloned().unwrap_or(Value::Null),
+        "cols": buffer.get("cols").cloned().unwrap_or(Value::Null),
+        "line_count": buffer.get("line_count").cloned().unwrap_or(Value::Null),
+        "nonblank_line_count": buffer.get("nonblank_line_count").cloned().unwrap_or(Value::Null),
+        "base_y": buffer.get("base_y").cloned().unwrap_or(Value::Null),
+        "viewport_y": buffer.get("viewport_y").cloned().unwrap_or(Value::Null),
+        "cursor_x": buffer.get("cursor_x").cloned().unwrap_or(Value::Null),
+        "cursor_y": buffer.get("cursor_y").cloned().unwrap_or(Value::Null),
+        "cursor_char": buffer.get("cursor_char").cloned().unwrap_or(Value::Null),
+        "session_path": buffer.get("session_path").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 /// Decode the base64 `dataUrl` from an [`eval_active_terminal_canvas_composite`]
 /// result into raw PNG bytes.
 fn decode_composite_data_url(value: &Value) -> Result<Vec<u8>, String> {
@@ -78647,9 +78854,14 @@ async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<
     if let Err(error) = std::fs::write(output_path, &bytes) {
         return Some(json!({ "ok": false, "reason": format!("write_png: {error}") }));
     }
+    // `frame`, not `window`: this backend writes the composite frame itself, so
+    // a CSS rect maps onto it relative to `frame_css`, not to the window.
+    let paint_frame =
+        write_paint_frame_sidecar(output_path, &value, "frame", "xterm_canvas_composite");
     Some(json!({
         "ok": true,
         "bytes": bytes.len(),
+        "paint_frame": paint_frame,
         "width": value.get("width").cloned().unwrap_or(Value::Null),
         "height": value.get("height").cloned().unwrap_or(Value::Null),
         "layers": value.get("layers").cloned().unwrap_or(Value::Null),
@@ -79557,6 +79769,9 @@ async fn process_pending_app_control_requests(
             // (backend, faithful, faithful_reason, is_terminal_region, attempts, output_path)
             let mut success: Option<(String, bool, String, bool, Vec<String>, String)> = None;
             let mut capture_error: Option<String> = None;
+            // The same-frame paint record written beside the PNG, when the
+            // faithful path ran. See `write_paint_frame_sidecar`.
+            let mut paint_frame: Option<Value> = None;
 
             if compositor {
                 match capture_compositor_app_surface(&desktop, output) {
@@ -79590,6 +79805,12 @@ async fn process_pending_app_control_requests(
                         if layer.get("ok").and_then(Value::as_bool) == Some(true) {
                             match overlay_terminal_canvas_layer(output, &layer) {
                                 Ok(()) => {
+                                    paint_frame = write_paint_frame_sidecar(
+                                        output,
+                                        &layer,
+                                        "window",
+                                        "xterm_canvas_composite_over_dom",
+                                    );
                                     success = Some((
                                         "xterm_canvas_composite_over_dom".to_string(),
                                         true,
@@ -79628,10 +79849,13 @@ async fn process_pending_app_control_requests(
                 // Fallback: faithful terminal-only composite (overwrites output) when the
                 // chrome snapshot or the overlay could not complete.
                 if success.is_none()
-                    && capture_active_terminal_canvas_composite(output)
-                        .await
-                        .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
-                        .is_some()
+                    && match capture_active_terminal_canvas_composite(output).await {
+                        Some(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                            paint_frame = v.get("paint_frame").cloned().filter(|v| !v.is_null());
+                            true
+                        }
+                        _ => false,
+                    }
                 {
                     success = Some((
                         "xterm_canvas_composite".to_string(),
@@ -79697,6 +79921,11 @@ async fn process_pending_app_control_requests(
                             "active_session_path": state.read().server.active_session_path(),
                             "capture_backend": backend,
                             "capture_backend_attempts": attempts,
+                            // The buffer THIS frame was composited from, written
+                            // beside the PNG in the same synchronous turn. Null
+                            // when the faithful path did not run (the plain DOM
+                            // snapshot has no xterm buffer behind it).
+                            "paint_frame": paint_frame,
                             "capture_faithful": faithful,
                             "capture_faithful_reason": faithful_reason,
                             "capture_native_web_surface_visible": native_surface_visible,
