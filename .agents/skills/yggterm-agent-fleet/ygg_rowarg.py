@@ -40,6 +40,28 @@ def bare_uuid(value):
     return (value or "").strip().rstrip("/").rsplit("/", 1)[-1].strip()
 
 
+def row_host(row, gui_host=None):
+    """WHICH MACHINE holds this row's work — the daemon's answer, never a parse.
+
+    ⛔⛔ A ROW'S TRANSCRIPT IS NOT NECESSARILY ON THE MACHINE ASKING ABOUT IT, and
+    every evidence check in the fleet asked its own filesystem. Measured on the
+    live plane, 2026-08-22, from one host: **34 rows belonging to another machine
+    read as having no transcript at all**, and on a 4-row sample asked on the host
+    that owns them, 3 had one. A verb that destroys a row on that answer destroys
+    working lanes on every machine but its own.
+
+    ⚖ `machine_key` is published on every remote row, so this is a read, not a
+    parse — the same shape as `row_session_id`: the daemon already knew. A row
+    with no `machine_key` is local TO THE GUI HOST, which is `gui_host` and is
+    not automatically the host running this code.
+    """
+    if isinstance(row, dict):
+        key = (row.get("machine_key") or "").strip()
+        if key:
+            return key
+    return (gui_host or "").strip() or None
+
+
 def add_row_argument(parser, *, dest="uuid", positional=True, required=False):
     """Declare the row argument in every spelling, on any parser.
 
