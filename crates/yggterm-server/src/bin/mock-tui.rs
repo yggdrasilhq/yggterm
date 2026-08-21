@@ -13,6 +13,7 @@
 //!   mock-tui --scenario clear-storm --count 20
 //!   mock-tui --scenario burst --kb 256
 //!   mock-tui --scenario prompt-box
+//!   mock-tui --scenario region-repaint --region bottom --band 3
 //!   mock-tui --scenario web-declare
 //!   mock-tui --replay <path-to-bytes-fixture>
 
@@ -234,6 +235,105 @@ fn main() {
                 }
                 let _ = w.flush();
                 thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // ⭐ THE PER-CLI REGION PATTERN — a screen that is drawn ONCE and then
+        // repainted only inside one band, forever.
+        //
+        // This is the shape behind the owner's "each CLI has its own TUI breakage
+        // part — yours is bottom". An agent CLI does not redraw its whole screen
+        // per frame: it addresses one region (a composer at the bottom, a status
+        // line at the top, a diff pane in the middle) and leaves everything else
+        // alone. So if a frame is ever dropped over the LEFT-ALONE part, the TUI
+        // never re-dirties those cells and the hole latches in the pixels while
+        // the buffer stays correct — which is exactly the reported symptom, and
+        // exactly why the broken region differs per CLI: it is whichever part
+        // that CLI does not repaint.
+        //
+        // ⛔ THE `\x1b[?25l` FRAMING IS LOAD-BEARING, NOT COSMETIC. Hide-cursor
+        // before a redraw is what every TUI emits and what arms the client's
+        // `recentFrameLikeWrite` flag — the discriminator that suppresses the
+        // forced full refresh for agent CLIs while leaving plain shells alone
+        // ("shell sessions never break, our special sessions ONLY break"). A
+        // reproduction that omits it exercises the SHELL path and comes back
+        // green while reproducing nothing.
+        //
+        //   mock-tui --scenario region-repaint [--region bottom|top|middle]
+        //            [--band 3] [--repaints 120] [--gap-ms 40]
+        //            [--screen-rows 40]   (required for top/middle)
+        "region-repaint" => {
+            let region = arg_value(&args, "--region").unwrap_or_else(|| "bottom".to_string());
+            let band: usize = arg_value(&args, "--band")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3)
+                .max(1);
+            let repaints: usize = arg_value(&args, "--repaints")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120);
+            let gap_ms: u64 = arg_value(&args, "--gap-ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40);
+            let screen_rows: usize = arg_value(&args, "--screen-rows")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40);
+            let fill_rows = screen_rows.saturating_sub(1).max(band + 1);
+            // Every static row is filled edge to edge with a row-labelled dense
+            // run. Dense on purpose: a hole in a sparse row is indistinguishable
+            // from a blank cell, so the fixture would hide the thing it is for.
+            for i in 0..fill_rows {
+                let _ = write!(w, "STATIC_{i:03} ");
+                for c in 0..7 {
+                    let _ = write!(w, "{}", "#=+*".repeat(4));
+                    let _ = write!(w, "[{i:03}.{c}]");
+                }
+                let _ = write!(w, "\r\n");
+            }
+            let _ = w.flush();
+            thread::sleep(Duration::from_millis(120));
+            for frame in 0..repaints {
+                let _ = write!(w, "\x1b[?25l");
+                match region.as_str() {
+                    // Absolute addressing: the caller must say how tall the
+                    // screen is, because a top/middle band cannot be reached
+                    // relative to a cursor that lives at the bottom.
+                    "top" | "middle" => {
+                        let first = if region == "top" {
+                            1
+                        } else {
+                            (screen_rows / 2).saturating_sub(band / 2).max(1)
+                        };
+                        for offset in 0..band {
+                            let row = first + offset;
+                            let _ = write!(
+                                w,
+                                "\x1b[{row};1H\x1b[KLIVE_{region}_{offset} frame {frame:04} \
+                                 {}",
+                                "~".repeat(24)
+                            );
+                        }
+                        // Park the cursor back out of the band, as a real TUI does.
+                        let _ = write!(w, "\x1b[{screen_rows};1H");
+                    }
+                    // Relative addressing from the bottom — size-independent, and
+                    // what an inline composer actually does.
+                    _ => {
+                        let _ = write!(w, "\x1b[{}A\r", band.saturating_sub(1));
+                        for offset in 0..band {
+                            let _ = write!(
+                                w,
+                                "\x1b[KLIVE_bottom_{offset} frame {frame:04} {}",
+                                "~".repeat(24)
+                            );
+                            if offset + 1 < band {
+                                let _ = write!(w, "\r\n");
+                            }
+                        }
+                        let _ = write!(w, "\r");
+                    }
+                }
+                let _ = write!(w, "\x1b[?25h");
+                let _ = w.flush();
+                thread::sleep(Duration::from_millis(gap_ms));
             }
         }
         // Plain shell-ish prompt (normal buffer, minimal output).

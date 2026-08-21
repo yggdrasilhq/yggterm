@@ -14189,6 +14189,103 @@ async fn web_surface_native_reconcile_loop(
         // The page reports this (WebKitGTK never emits its own `close` signal for
         // a `window.close()` — proven on the harness), so the SHELL decides:
         // only a tab a script opened may be closed this way.
+        // ── the media probe's door onto the trace plane (layer=webkit) ──
+        //
+        // ⭐ THIS HOP IS THE (ROW, TAB) ADDRESSING, and it is why the probe is
+        // worth having rather than a devtools console being open. `applied`
+        // already joins a surface's `native_id` to the (session_path, tab) that
+        // owns it, so the shell can stamp every record with the row and tab it
+        // came from. The page never says which tab it is — it CANNOT, which is
+        // the point: the same reasoning that makes the contract stamp `pid`
+        // rather than carry it. A page that could name its own tab could name
+        // another's, and every attribution downstream would inherit that.
+        //
+        // ⇒ `ytrace query --category media` is then filterable by row and by
+        // tab without anything in the page cooperating, which is the agent-side
+        // half of "pick which row and which tab to inspect".
+        let trace_batches = desktop.take_web_surface_trace_batches();
+        if !trace_batches.is_empty() {
+            let mut records: Vec<yggterm_core::ForeignTraceRecord> = Vec::new();
+            let mut undecodable = 0usize;
+            let mut unattributed = 0usize;
+            for batch in trace_batches {
+                // A surface whose tab has already gone is not an error: the
+                // page can drain on its way out (`pagehide`), and that batch is
+                // the most interesting one there is. It is counted rather than
+                // dropped silently, but it is dropped — a record that cannot
+                // name its row would pool with every other unattributed row and
+                // is worse than absent.
+                let Some((session_path, tab_id)) = applied
+                    .iter()
+                    .find(|(_, entry)| entry.native_id == batch.surface_id)
+                    .map(|(key, _)| key.clone())
+                else {
+                    unattributed += batch.records.len();
+                    continue;
+                };
+                for raw in batch.records {
+                    let Ok(mut record) =
+                        serde_json::from_value::<yggterm_core::ForeignTraceRecord>(raw)
+                    else {
+                        undecodable += 1;
+                        continue;
+                    };
+                    if let Some(payload) = record.payload.as_object_mut() {
+                        payload.insert("row".to_string(), json!(session_path));
+                        payload.insert("tab".to_string(), json!(tab_id));
+                        payload.insert("surface_id".to_string(), json!(batch.surface_id));
+                    }
+                    records.push(record);
+                }
+            }
+            if !records.is_empty() || undecodable > 0 || unattributed > 0 {
+                let newest_ts_ms = records
+                    .iter()
+                    .map(|record| record.ts_ms)
+                    .max()
+                    .unwrap_or_default();
+                let flush_lag_ms = current_millis().saturating_sub(newest_ts_ms);
+                let submitted = records.len();
+                let batch_trace_home = trace_home.clone();
+                // OFF the loop, for the same reason the terminal bridge moved
+                // off it: validating and writing a batch touches no UI state,
+                // and doing it inline held the one thread every keystroke
+                // crosses.
+                tokio::task::spawn_blocking(move || {
+                    let outcome = append_foreign_trace_batch(&batch_trace_home, records);
+                    if outcome.rejected_total() > 0
+                        || outcome.emitter_dropped > 0
+                        || outcome.over_batch_cap > 0
+                        || outcome.repaired > 0
+                        || undecodable > 0
+                        || unattributed > 0
+                    {
+                        append_trace_event(
+                            &batch_trace_home,
+                            "ui",
+                            "trace_bridge",
+                            "surface_batch_faults",
+                            json!({
+                                "submitted": submitted,
+                                "accepted": outcome.accepted,
+                                "repaired": outcome.repaired,
+                                "over_batch_cap": outcome.over_batch_cap,
+                                "emitter_dropped": outcome.emitter_dropped,
+                                "undecodable": undecodable,
+                                "unattributed": unattributed,
+                                "rejected": outcome
+                                    .rejected
+                                    .iter()
+                                    .map(|(fault, count)| json!({ "fault": fault, "count": count }))
+                                    .collect::<Vec<_>>(),
+                                "flush_lag_ms": flush_lag_ms,
+                            }),
+                        );
+                    }
+                });
+            }
+        }
+
         for request in desktop.take_web_surface_close_requests() {
             let Some((session_path, receiving_tab)) = applied
                 .iter()
@@ -78657,6 +78754,253 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                         } catch (_e) {}
                     }
                 }
+                // ⛔⛔ THE SAME-FRAME BUFFER — 11.26's first deliverable.
+                //
+                // A faithful screenshot costs ~6.8 s; a `terminal read-buffer`
+                // costs ~116 ms. On a live agent row the two can NEVER be
+                // sequenced into one frame, so every "the buffer says X but the
+                // screen shows Y" claim ever made on a busy row compared two
+                // moments seven seconds apart — and at least one of them was
+                // just TIME (`Nesting… 1m42s` in the buffer beside
+                // `Whirring… 29s` in the pixels: two different turns).
+                //
+                // This block reads the buffer of the host that was just drawn,
+                // in the SAME synchronous JS turn as the drawImage loop and the
+                // toDataURL below. xterm parses PTY bytes on its own task queue,
+                // which cannot interleave with synchronous script — so the text
+                // recorded here is EXACTLY the text those pixels were composited
+                // from. The comparison stops being an argument and becomes a diff.
+                const readSameFrameBuffer = (entry) => {
+                    if (!entry || !entry.term) { return null; }
+                    const term = entry.term;
+                    const active = term.buffer && term.buffer.active;
+                    if (!active) { return null; }
+                    const host = document.getElementById(entry.hostId);
+                    const rows = Math.max(1, Number(term.rows || 0));
+                    const cols = Math.max(1, Number(term.cols || 0));
+                    const length = Math.max(0, Number(active.length || 0));
+                    const viewportY = Math.max(0, Number(active.viewportY || 0));
+                    const baseY = Math.max(0, Number(active.baseY || 0));
+                    const start = Math.min(Math.max(0, length - 1), viewportY);
+                    const end = Math.min(length, start + rows);
+                    const lines = [];
+                    // ⛔ PER-CELL, NOT PER-STRING. `translateToString(true)` trims
+                    // and collapses: a wide glyph is one char across two cells and
+                    // a trailing run of spaces simply disappears, so a column index
+                    // derived from the string does not address the cell the
+                    // renderer drew. The diff against pixels is per-CELL, so the
+                    // mask is built from the cells themselves — '#' where the cell
+                    // holds a printable glyph, '.' where it does not. Everything
+                    // downstream indexes this, never the string.
+                    const inkMasks = [];
+                    for (let i = start; i < end; i += 1) {
+                        const line = active.getLine(i);
+                        lines.push(line && line.translateToString
+                            ? String(line.translateToString(true) || '') : '');
+                        let mask = '';
+                        if (line && typeof line.getCell === 'function') {
+                            for (let x = 0; x < cols; x += 1) {
+                                let ch = '';
+                                try {
+                                    const cell = line.getCell(x);
+                                    ch = cell && cell.getChars ? String(cell.getChars() || '') : '';
+                                } catch (_e) {}
+                                mask += (ch && ch.trim().length > 0) ? '#' : '.';
+                            }
+                        } else {
+                            mask = '.'.repeat(cols);
+                        }
+                        inkMasks.push(mask);
+                    }
+                    // Row → pixel band. Without this the buffer text and the PNG
+                    // cannot be laid against each other, and the diff degrades
+                    // back into "look at it and squint". `.xterm-screen` is
+                    // exactly rows × cols cells, so the cell size follows from
+                    // its rect with no private-API dependency; the private
+                    // dimensions are read first only because they are exact.
+                    let screenRect = null;
+                    let cellW = 0;
+                    let cellH = 0;
+                    try {
+                        const screen = host ? (host.querySelector('.xterm-screen') || host) : null;
+                        if (screen) {
+                            const sr = screen.getBoundingClientRect();
+                            screenRect = { left: sr.left, top: sr.top, width: sr.width, height: sr.height };
+                            if (sr.height > 0) { cellH = sr.height / rows; }
+                            if (sr.width > 0) { cellW = sr.width / cols; }
+                        }
+                    } catch (_e) {}
+                    try {
+                        const dims = term._core && term._core._renderService
+                            && term._core._renderService.dimensions;
+                        const cell = dims && dims.css && dims.css.cell;
+                        if (cell && Number(cell.height) > 0) { cellH = Number(cell.height); }
+                        if (cell && Number(cell.width) > 0) { cellW = Number(cell.width); }
+                    } catch (_e) {}
+                    // The cursor, because a block cursor that ERASES the glyph
+                    // under it instead of inverting it is one of this bug's three
+                    // measured faces — and it is invisible unless the frame says
+                    // which cell the cursor was on and what that cell held.
+                    const cursorX = Math.max(0, Number(active.cursorX || 0));
+                    const cursorY = Math.max(0, Number(active.cursorY || 0));
+                    let cursorChar = '';
+                    try {
+                        const cline = active.getLine(baseY + cursorY);
+                        const ccell = cline && cline.getCell ? cline.getCell(cursorX) : null;
+                        cursorChar = ccell && ccell.getChars ? String(ccell.getChars() || '') : '';
+                    } catch (_e) {}
+                    return {
+                        session_path: String(entry.sessionPath || ''),
+                        host_id: String(entry.hostId || ''),
+                        rows, cols,
+                        base_y: baseY,
+                        viewport_y: viewportY,
+                        buffer_length: length,
+                        line_count: lines.length,
+                        nonblank_line_count: lines.filter((l) => String(l || '').trim().length > 0).length,
+                        lines,
+                        ink_masks: inkMasks,
+                        cursor_x: cursorX,
+                        cursor_y: cursorY,
+                        cursor_char: cursorChar,
+                        cursor_blink: !!(term.options && term.options.cursorBlink),
+                        cursor_style: String((term.options && term.options.cursorStyle) || ''),
+                        screen_css: screenRect,
+                        cell_css_width: cellW,
+                        cell_css_height: cellH,
+                    };
+                };
+                // ⛔⛔ THE RENDERER'S OWN STATE, IN THE SAME FRAME AS THE PIXELS.
+                //
+                // The paint fault this record exists for is INTERMITTENT — two
+                // firings in about fifteen attempts — so the strategy of "run it
+                // again with more logging" costs an hour per question and usually
+                // answers none. The frame has to explain itself the one time it
+                // fires. These are the fields that were reached for by hand while
+                // chasing it, captured at composite time instead.
+                //
+                // ⭐ `atlas_index` is the one that is not obvious and is the whole
+                // reason this block exists. MEASURED 2026-08-22: three live hosts
+                // returned THREE atlas objects and ONE distinct atlas — the WebGL
+                // addon keeps a module-level cache and hands every terminal whose
+                // font, theme and DPR match the SAME `TextureAtlas` (it grew to 7
+                // pages under all three at once). So an atlas operation is never
+                // per-terminal: `term.clearTextureAtlas()` wipes a texture every
+                // other host is drawing from, while clearing only ITS own glyph
+                // model and redrawing only ITS own viewport. Equal `atlas_index`
+                // values across hosts is that sharing, visible in the frame.
+                //
+                // ⚠ AND IT IS NOT THE PROVEN CAUSE OF THE GARBLE — two direct
+                // tests refuted it (clear-via-another-host then full-refresh, and
+                // a seven-page flood then full-refresh, both left the measured
+                // host at 100% of cells). It is recorded because it is a real
+                // cross-terminal coupling that any future explanation has to sit
+                // beside, NOT because it is the answer. Do not re-derive either
+                // refutation; do not quote this as the root cause.
+                const readRendererState = () => {
+                    const atlases = [];
+                    const atlasIndexOf = (term) => {
+                        try {
+                            const rs = term._core && term._core._renderService;
+                            const r = rs && rs._renderer;
+                            const inner = (r && r.value) ? r.value : r;
+                            const atlas = inner && inner._charAtlas;
+                            if (!atlas) { return { index: -1, pages: null }; }
+                            let index = atlases.indexOf(atlas);
+                            if (index < 0) { atlases.push(atlas); index = atlases.length - 1; }
+                            return {
+                                index,
+                                pages: (atlas._pages || []).length,
+                                active_pages: (atlas._activePages || []).length,
+                            };
+                        } catch (_e) { return { index: -1, pages: null }; }
+                    };
+                    const hosts = [];
+                    for (const e of ordered) {
+                        if (!e || !e.term) { continue; }
+                        const atlas = atlasIndexOf(e.term);
+                        hosts.push({
+                            session_path: String(e.sessionPath || ''),
+                            host_id: String(e.hostId || ''),
+                            is_active: String(e.sessionPath || '') === activePath,
+                            atlas_index: atlas.index,
+                            atlas_pages: atlas.pages,
+                            atlas_active_pages: atlas.active_pages,
+                            mounted_at: Number(e.mountedAt || 0),
+                            // The repair funnel's own counters. A forced refresh
+                            // that never fired and one that fired and did not help
+                            // are different faults with the same screenshot.
+                            forced_refresh_count: Number(e.forcedRefreshCount || 0),
+                            // ⛔⛔ THE PROBE FOR THIS IS SILENCED BY THE CONDITION
+                            // IT REPORTS ON, WHICH IS WHY THE COUNTER IS READ HERE.
+                            //
+                            // `xterm_forced_refresh_skipped` is emitted through
+                            // `emitPerf`, which lists it as a hot high-frequency
+                            // event and throttles it whenever `recentFrameLikeWrite`
+                            // is hot -- and `recentFrameLikeWrite` is exactly the
+                            // flag that suppresses the refresh, re-armed by every
+                            // TUI frame, so for an agent CLI it is always hot.
+                            // Worse, four hot events share ONE `lastPerfEventAtMs`
+                            // slot and `xterm_write_flush` fires far more often, so
+                            // it eats the budget first.
+                            //
+                            // ⇒ MEASURED on the GUI host, 2026-08-22: across the
+                            // three newest trace files, `xterm_forced_refresh` and
+                            // `xterm_forced_refresh_skipped` appear ZERO times,
+                            // while `xterm_render` appears 3,872 times in the same
+                            // files. In the trace, "the repair was suppressed all
+                            // window" and "no repair was ever demanded" are the
+                            // same reading: nothing. Reading the host's own monotonic
+                            // counters sidesteps the throttle entirely -- a count
+                            // cannot be rate-limited away.
+                            forced_refresh_skipped_count: Number(e.forcedRefreshSkippedCount || 0),
+                            // WHICH gate refused, not just how often. `frame_like`
+                            // is the one that never lapses on an agent row.
+                            forced_refresh_skipped_reasons:
+                                e.forcedRefreshSkippedReasons || null,
+                            last_forced_refresh_skip_reason:
+                                String(e.lastForcedRefreshSkipReason || ''),
+                            skipped_perf_event_count: Number(e.skippedPerfEventCount || 0),
+                            last_skipped_perf_event_name: String(e.lastSkippedPerfEventName || ''),
+                            forced_atlas_clear_count: Number(e.forcedAtlasClearCount || 0),
+                            last_atlas_clear_at_ms: Number(e.lastAtlasClearAtMs || 0),
+                            retained_write_paint_repair_count:
+                                Number(e.retainedWritePaintRepairCount || 0),
+                            last_retained_write_paint_repair_reason:
+                                String(e.lastRetainedWritePaintRepairReason || ''),
+                            // The agent-CLI discriminator itself: while this is in
+                            // the future the forced full refresh is suppressed, so
+                            // its value at capture time says whether the repair
+                            // COULD have run for this host.
+                            recent_frame_like_write_until_ms:
+                                Number(e.recentFrameLikeWriteUntilMs || 0),
+                        });
+                    }
+                    const indices = hosts.map((h) => h.atlas_index).filter((i) => i >= 0);
+                    return {
+                        now_ms: Date.now(),
+                        host_count: hosts.length,
+                        distinct_atlases: atlases.length,
+                        atlas_shared: atlases.length === 1 && indices.length > 1,
+                        hosts,
+                    };
+                };
+                let rendererState = null;
+                let rendererStateError = '';
+                try {
+                    rendererState = readRendererState();
+                } catch (error) {
+                    rendererStateError = (error && error.message) ? error.message : String(error);
+                }
+                let sameFrameBuffer = null;
+                let sameFrameBufferError = '';
+                try {
+                    sameFrameBuffer = readSameFrameBuffer(
+                        ordered.length ? ordered[ordered.length - 1] : null
+                    );
+                } catch (error) {
+                    sameFrameBufferError = (error && error.message) ? error.message : String(error);
+                }
                 const dataUrl = out.toDataURL('image/png');
                 send({
                     ok: true,
@@ -78680,6 +79024,13 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                     ),
                     active_session_path: activePath,
                     session_paths: paths,
+                    dpr,
+                    // Same-frame buffer: the text these very pixels were drawn
+                    // from. See readSameFrameBuffer above.
+                    buffer: sameFrameBuffer,
+                    buffer_error: sameFrameBufferError,
+                    renderer: rendererState,
+                    renderer_error: rendererStateError,
                 });
             } catch (error) {
                 send({ ok: false, reason: (error && error.message) ? error.message : String(error) });
@@ -78693,6 +79044,87 @@ async fn eval_active_terminal_canvas_composite() -> Value {
     // send channel, NOT the script's return value) — a plain `return` hangs the recv.
     receive_probe_eval_value(TERMINAL_CANVAS_COMPOSITE_SCRIPT, "").await
 }
+/// Sidecar path for a capture: `<snapshot>.paint-frame.json`.
+fn paint_frame_sidecar_path(snapshot_path: &Path) -> PathBuf {
+    let mut name = snapshot_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".paint-frame.json");
+    snapshot_path.with_file_name(name)
+}
+
+/// ⛔⛔ THE SAME-FRAME PAINT RECORD — write the buffer the composite drew from,
+/// beside the PNG it drew.
+///
+/// A faithful screenshot costs ~6.8 s and a buffer read ~116 ms, so on a live
+/// agent row the two cannot be sequenced into one frame: every prior "the buffer
+/// says X but the screen shows Y" reading on a busy row compared two moments
+/// seven seconds apart, and part of the disagreement was TIME rather than a
+/// paint fault. The composite script now reads the buffer in the SAME
+/// synchronous turn as `toDataURL`, and this writes it out next to the frame —
+/// so the pixels and the text are the same instant by construction and the
+/// comparison is a diff, not an argument. `scripts/paint-diff.py` consumes it.
+///
+/// `png_space` says how CSS px map onto the written PNG, because the two capture
+/// backends write different rectangles: `window` (the merged chrome snapshot —
+/// scale by png_width / win_w) or `frame` (the terminal-only composite — the PNG
+/// IS the frame rect). Recording which one it was is not bookkeeping: a row→pixel
+/// band computed against the wrong space lands on the wrong row and every verdict
+/// after it is confidently wrong.
+fn write_paint_frame_sidecar(
+    snapshot_path: &Path,
+    layer: &Value,
+    png_space: &str,
+    capture_backend: &str,
+) -> Option<Value> {
+    let buffer = layer.get("buffer")?;
+    if buffer.is_null() {
+        return None;
+    }
+    let sidecar = paint_frame_sidecar_path(snapshot_path);
+    let field = |key: &str| layer.get(key).cloned().unwrap_or(Value::Null);
+    let record = json!({
+        "schema": "yggterm.paint_frame/1",
+        "png": snapshot_path.display().to_string(),
+        "png_space": png_space,
+        "capture_backend": capture_backend,
+        "captured_at_ms": current_millis() as u128,
+        "dpr": field("dpr"),
+        "win_w": field("win_w"),
+        "win_h": field("win_h"),
+        "frame_css": json!({
+            "left": field("css_left"),
+            "top": field("css_top"),
+            "width": field("css_width"),
+            "height": field("css_height"),
+        }),
+        "host_count": field("host_count"),
+        "layers_drawn": field("layers"),
+        "session_paths": field("session_paths"),
+        "active_session_path": field("active_session_path"),
+        "buffer": buffer.clone(),
+        "buffer_error": field("buffer_error"),
+        // The renderer's own state at composite time — atlas sharing, the repair
+        // funnel's counters, and the suppression deadline. See the script.
+        "renderer": field("renderer"),
+        "renderer_error": field("renderer_error"),
+    });
+    let text = serde_json::to_string_pretty(&record).ok()?;
+    std::fs::write(&sidecar, text).ok()?;
+    Some(json!({
+        "path": sidecar.display().to_string(),
+        "png_space": png_space,
+        "rows": buffer.get("rows").cloned().unwrap_or(Value::Null),
+        "cols": buffer.get("cols").cloned().unwrap_or(Value::Null),
+        "line_count": buffer.get("line_count").cloned().unwrap_or(Value::Null),
+        "nonblank_line_count": buffer.get("nonblank_line_count").cloned().unwrap_or(Value::Null),
+        "base_y": buffer.get("base_y").cloned().unwrap_or(Value::Null),
+        "viewport_y": buffer.get("viewport_y").cloned().unwrap_or(Value::Null),
+        "cursor_x": buffer.get("cursor_x").cloned().unwrap_or(Value::Null),
+        "cursor_y": buffer.get("cursor_y").cloned().unwrap_or(Value::Null),
+        "cursor_char": buffer.get("cursor_char").cloned().unwrap_or(Value::Null),
+        "session_path": buffer.get("session_path").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 /// Decode the base64 `dataUrl` from an [`eval_active_terminal_canvas_composite`]
 /// result into raw PNG bytes.
 fn decode_composite_data_url(value: &Value) -> Result<Vec<u8>, String> {
@@ -78749,9 +79181,14 @@ async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<
     if let Err(error) = std::fs::write(output_path, &bytes) {
         return Some(json!({ "ok": false, "reason": format!("write_png: {error}") }));
     }
+    // `frame`, not `window`: this backend writes the composite frame itself, so
+    // a CSS rect maps onto it relative to `frame_css`, not to the window.
+    let paint_frame =
+        write_paint_frame_sidecar(output_path, &value, "frame", "xterm_canvas_composite");
     Some(json!({
         "ok": true,
         "bytes": bytes.len(),
+        "paint_frame": paint_frame,
         "width": value.get("width").cloned().unwrap_or(Value::Null),
         "height": value.get("height").cloned().unwrap_or(Value::Null),
         "layers": value.get("layers").cloned().unwrap_or(Value::Null),
@@ -79659,6 +80096,9 @@ async fn process_pending_app_control_requests(
             // (backend, faithful, faithful_reason, is_terminal_region, attempts, output_path)
             let mut success: Option<(String, bool, String, bool, Vec<String>, String)> = None;
             let mut capture_error: Option<String> = None;
+            // The same-frame paint record written beside the PNG, when the
+            // faithful path ran. See `write_paint_frame_sidecar`.
+            let mut paint_frame: Option<Value> = None;
 
             if compositor {
                 match capture_compositor_app_surface(&desktop, output) {
@@ -79692,6 +80132,12 @@ async fn process_pending_app_control_requests(
                         if layer.get("ok").and_then(Value::as_bool) == Some(true) {
                             match overlay_terminal_canvas_layer(output, &layer) {
                                 Ok(()) => {
+                                    paint_frame = write_paint_frame_sidecar(
+                                        output,
+                                        &layer,
+                                        "window",
+                                        "xterm_canvas_composite_over_dom",
+                                    );
                                     success = Some((
                                         "xterm_canvas_composite_over_dom".to_string(),
                                         true,
@@ -79730,10 +80176,13 @@ async fn process_pending_app_control_requests(
                 // Fallback: faithful terminal-only composite (overwrites output) when the
                 // chrome snapshot or the overlay could not complete.
                 if success.is_none()
-                    && capture_active_terminal_canvas_composite(output)
-                        .await
-                        .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
-                        .is_some()
+                    && match capture_active_terminal_canvas_composite(output).await {
+                        Some(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                            paint_frame = v.get("paint_frame").cloned().filter(|v| !v.is_null());
+                            true
+                        }
+                        _ => false,
+                    }
                 {
                     success = Some((
                         "xterm_canvas_composite".to_string(),
@@ -79799,6 +80248,11 @@ async fn process_pending_app_control_requests(
                             "active_session_path": state.read().server.active_session_path(),
                             "capture_backend": backend,
                             "capture_backend_attempts": attempts,
+                            // The buffer THIS frame was composited from, written
+                            // beside the PNG in the same synchronous turn. Null
+                            // when the faithful path did not run (the plain DOM
+                            // snapshot has no xterm buffer behind it).
+                            "paint_frame": paint_frame,
                             "capture_faithful": faithful,
                             "capture_faithful_reason": faithful_reason,
                             "capture_native_web_surface_visible": native_surface_visible,
