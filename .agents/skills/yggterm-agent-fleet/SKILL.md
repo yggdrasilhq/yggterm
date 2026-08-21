@@ -1838,6 +1838,34 @@ row gets prompted for being recently idle.
 
 ## 10. ⭐⭐ THE N.x ORCHESTRATOR — cluster the remaining work, then run the clusters in parallel
 
+### ⛔⛔ FIRST: THE HYGIENE IS THE ORCHESTRATOR'S JOB. RUN ALL FOUR EVERY WAVE.
+
+Owner-directed 2026-08-21, and written here so no successor has to be told again:
+consolidating worktree work, folding agents AND worktrees, deleting local branches
+as they merge, and the cwd-tree rows left behind by all of it are **the
+orchestrator's**, not a lane's and not a tidy-up somebody might get to.
+
+| duty | verb | what skipping it costs |
+|---|---|---|
+| fold finished and dead rows | `ygg-fold.py sweep --apply` | the sidebar refills with corpses within the hour |
+| **delete landed branches** | `ygg-land.py prune --apply` | 27 had accumulated, months old; each is an invitation to a merge that REVERTS main, and the damage grows with age |
+| **reclaim worktrees** | `ygg-fold.py worktrees --apply` | gigabytes, and a tree nobody stands in still reads as a live lane |
+| **reap the rows that reclaim orphans** | `ygg-fold.py orphans --apply` | ⛔ removing a worktree does NOT remove its rows: the cwd tree keeps a folder for a directory that is gone, holding rows that can only fail when clicked |
+
+⛔ **The fourth exists because the third created the litter it was run to clear**,
+and did it silently — nine such rows had accumulated before anything noticed.
+
+⚖ **A LIVE session in a vanished tree is named and LEFT ALONE.** Its process is
+fine and only its cwd is gone; re-rooting it to the repo's main checkout is a
+product verb this fleet does not have, and killing it for being untidy is not a
+substitute for having one.
+
+⚠ **The scatter itself is still open, and is a product change rather than a sweep:**
+one repo draws ~16 near-identical cwd folders because every lane roots in its own
+worktree. Folding worktree paths under the repo they belong to is filed, not done.
+
+---
+
 **When a campaign's queue stops being a list and becomes a backlog, one relay row
 grinding it in order is the wrong shape.** The relay is serial by construction:
 each session hands to its successor, so throughput is one item at a time no
