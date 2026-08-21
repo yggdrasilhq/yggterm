@@ -2512,6 +2512,23 @@ so a disagreement seen once and re-checked later reads as having healed. Two rea
 at different moments differ by TIME before they differ by anything else — the law this
 guide already carries, walked into while writing this entry.
 
+## THE SOCKET NAME IS HOW A REBASE TELLS YOU THE BINARY IS STALE (2026-08-22)
+
+A sandbox daemon was built to live-prove a fix after rebasing onto a `3.1.40` main.
+`Cargo.toml` said `3.1.40`; the binary answered `--version 3.1.39` and bound
+**`server-3-1-39.sock`**. The protocol version is `env!("CARGO_PKG_VERSION")` baked at
+compile time, and `yggterm-server` was still cached from before the rebase — the §4.1
+rule *"cargo clean -p yggterm-server before ANY release build after a bump"* applies to
+a REBASE exactly as it does to a bump, which is the case that is easy to miss because
+nobody typed a new version number.
+
+⛔ **A GUI and a daemon that disagree here never meet.** The socket name derives from
+that constant, so the mismatched pair simply binds two different sockets and each
+reports itself healthy — there is no error to notice, and the experiment silently
+measures nothing. ⇒ `grep -o 'server-[0-9-]*\.sock' "$SB/daemon.log"` **before**
+trusting a sandbox daemon; it is the same one-line stamp check §4.1 already recommends,
+and here it is the difference between a live proof and a fiction.
+
 ## A DEFAULT SHARED BY MOST OF A TABLE IS WHERE A GUESS HIDES (2026-08-22)
 
 `composer_marker` is per-CLI data, added after a hardcoded `›` made every Claude Code
