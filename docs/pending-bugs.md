@@ -761,36 +761,6 @@ shape, and it is the version recommended.
 a connected model must be scored as absent-backend, or the next reader spends a
 session rediscovering that a CLI nobody has credentials for does not answer.
 
-## ⛔ [11.25] A DAEMON RESPONSE THAT FAILS TO PARSE CAN PANIC THE ERROR MESSAGE ABOUT IT
-
-**Status:** OPEN
-
-*Found 2026-08-21 while sweeping the title path for byte-index truncation. Not
-owner-reported; nobody has hit it, which is a statement about what has been sent
-down the socket so far and not about safety.*
-
-Building the context for a failed daemon-response parse truncates the offending
-line with `&trimmed[..240]`, which is a BYTE index into a string that just came
-off a socket:
-
-```rust
-let snippet = if trimmed.len() > 240 {
-    format!("{}...", &trimmed[..240])   // panics when byte 240 is inside a character
-```
-
-Two callsites, both in the daemon client's response reader. A response carrying
-any multi-byte character across that boundary — a path with an accent, a title
-with a dash, an emoji in an error string — panics **inside the error handler**,
-so a recoverable parse failure becomes a crash, and the message that would have
-explained it is what kills the process.
-
-⇒ Truncate by characters. The same defect in the CLI title cleaner was fixed by
-`first_chars` (`agent_cli.rs`), which is the shape to reuse rather than
-re-derive; a shared helper is probably owed once a third site appears.
-
-⚠ **Do not "fix" it by removing the snippet.** The snippet is what makes an
-unparseable response diagnosable at all — the bug is the index, not the report.
-
 ## ⛔ [11.23] A DELIBERATELY DISMISSED WEB SURFACE CAN BE REBUILT BY THE HEARTBEAT THAT RACES IT
 
 **Status:** OPEN
