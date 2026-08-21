@@ -174,6 +174,7 @@ pub(crate) fn send_session(
 ) -> std::result::Result<HandoffAck, HandoffError> {
     let mut stream = UnixStream::connect(socket_path).map_err(|error| HandoffError {
         committed: false,
+        refused: false,
         message: format!(
             "connecting to successor handoff socket {}: {error}",
             socket_path.display()
@@ -186,6 +187,7 @@ pub(crate) fn send_session(
 
     let mut line = serde_json::to_string(metadata).map_err(|error| HandoffError {
         committed: false,
+        refused: false,
         message: format!("encoding handoff metadata: {error}"),
     })?;
     line.push('\n');
@@ -193,6 +195,7 @@ pub(crate) fn send_session(
         .write_all(line.as_bytes())
         .map_err(|error| HandoffError {
             committed: false,
+            refused: false,
             message: format!("sending handoff metadata: {error}"),
         })?;
 
@@ -215,6 +218,7 @@ pub(crate) fn send_session(
     // THE COMMIT POINT.
     send_master_fd(&stream, master_fd, token.as_bytes()).map_err(|error| HandoffError {
         committed: false,
+        refused: false,
         message: format!("sending master fd: {error}"),
     })?;
 
@@ -224,6 +228,7 @@ pub(crate) fn send_session(
     if !ack.adopted {
         return Err(HandoffError {
             committed: true,
+            refused: true,
             message: format!(
                 "successor took the fd and refused to seat it: {}",
                 ack.error.unwrap_or_else(|| "no reason given".to_string())
@@ -254,12 +259,13 @@ fn read_precommit_verdict(
     let line = match read_line_without_overreading(stream) {
         Ok(line) => line,
         Err(error) if is_timeout(&error) => {
-            *support = PrecommitSupport::Silent;
+            *support = support.saw_silence();
             return Ok(());
         }
         Err(error) => {
             return Err(HandoffError {
                 committed: false,
+                refused: false,
                 message: format!("reading the successor's pre-commit verdict: {error}"),
             });
         }
@@ -268,6 +274,7 @@ fn read_precommit_verdict(
     if trimmed.is_empty() {
         return Err(HandoffError {
             committed: false,
+            refused: false,
             message: "successor closed the handoff before answering whether it could seat \
                       the session"
                 .to_string(),
@@ -275,6 +282,7 @@ fn read_precommit_verdict(
     }
     let verdict: HandoffVerdict = serde_json::from_str(trimmed).map_err(|error| HandoffError {
         committed: false,
+        refused: false,
         message: format!("successor sent an unreadable pre-commit verdict ({error}): {trimmed:?}"),
     })?;
     *support = PrecommitSupport::Speaks;
@@ -283,6 +291,7 @@ fn read_precommit_verdict(
     }
     Err(HandoffError {
         committed: false,
+        refused: true,
         message: format!(
             "successor refused to seat it: {}",
             verdict
@@ -305,6 +314,7 @@ fn read_ack_past_a_late_verdict(
 ) -> std::result::Result<HandoffAck, HandoffError> {
     let no_ack = || HandoffError {
         committed: true,
+        refused: false,
         message: "successor accepted the fd but never acknowledged it".to_string(),
     };
     // At most one verdict can be in flight, so one extra line is the whole
@@ -320,11 +330,13 @@ fn read_ack_past_a_late_verdict(
         }
         return serde_json::from_str(trimmed).map_err(|error| HandoffError {
             committed: true,
+            refused: false,
             message: format!("successor sent an unreadable ack ({error}): {trimmed:?}"),
         });
     }
     Err(HandoffError {
         committed: true,
+        refused: false,
         message: "successor sent pre-commit verdicts but never an ack".to_string(),
     })
 }
@@ -370,6 +382,21 @@ const PRECOMMIT_DISCRIMINANT: &str = "precommit";
 /// build for a verdict costs [`PRECOMMIT_VERDICT_TIMEOUT`]; asking it thirty
 /// times costs a minute and a half of a daemon that is holding the host's PTYs.
 /// Learning it once is the difference between an additive step and a tax.
+///
+/// ⛔⛔ **AND ONE SILENCE IS NOT AN ANSWER — IT TAKES TWO.** A successor answers
+/// from behind its own runtime lock, and that lock is contended precisely
+/// during a handover, which is the only time this code runs. On a single-strike
+/// memo one contended moment would disarm the step for every remaining session
+/// of the sweep — silently reverting to the behaviour being fixed — *and* stamp
+/// `precommit: "silent"` on the trace, which a reader would take to mean the
+/// successor is an old build. That is an instrument answering a different
+/// question from its name, and it is the failure this whole module keeps
+/// catching in other people's code.
+///
+/// A genuinely old successor is silent on every session, so two strikes cost it
+/// one extra wait per sweep and nothing else. `Speaks` is never revoked: a peer
+/// that has answered once is known to answer, and a straggling verdict from it
+/// is stepped over by [`read_ack_past_a_late_verdict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PrecommitSupport {
     /// Nothing learned yet — wait for a verdict.
@@ -377,7 +404,10 @@ pub(crate) enum PrecommitSupport {
     Unknown,
     /// A verdict arrived. This successor will send one again.
     Speaks,
-    /// The successor did not answer before the descriptor. Do not wait again.
+    /// One unanswered wait. An old build and a busy new one look identical
+    /// here, so this decides nothing on its own.
+    OneSilence,
+    /// Silent twice. Do not wait again this sweep.
     Silent,
 }
 
@@ -387,7 +417,18 @@ impl PrecommitSupport {
         match self {
             Self::Unknown => "unknown",
             Self::Speaks => "speaks",
+            Self::OneSilence => "one_silence",
             Self::Silent => "silent",
+        }
+    }
+
+    /// A wait that went unanswered. Only the SECOND one concludes anything.
+    fn saw_silence(self) -> Self {
+        match self {
+            // Never revoked: it has already proved it answers.
+            Self::Speaks => Self::Speaks,
+            Self::Unknown => Self::OneSilence,
+            Self::OneSilence | Self::Silent => Self::Silent,
         }
     }
 }
@@ -444,6 +485,16 @@ pub(crate) struct HandoffError {
     /// `true` — the fd is gone and the session is the successor's; the caller
     /// must NOT keep driving it and must NOT re-send.
     pub committed: bool,
+    /// The successor ANSWERED, and its answer was no.
+    ///
+    /// ⛔ **Not the same question as `!committed`, and conflating them makes a
+    /// counter lie.** A connect that failed and a socket that hung up are also
+    /// uncommitted, but they say something about the WIRE; a refusal says
+    /// something about the successor's own sessions. The pair is a 2×2 worth
+    /// reading as one: refused-before-commit is free and expected, refused
+    /// AFTER it is the defect this protocol step exists to drive to zero, and
+    /// the two failure quadrants are transport problems wearing neither name.
+    pub refused: bool,
     pub message: String,
 }
 
@@ -636,10 +687,23 @@ pub(crate) fn serve_handoff(
     seat: &mut dyn FnMut(&HandoffMetadata) -> Option<String>,
     adopt: &mut dyn FnMut(&HandoffMetadata, OwnedFd) -> std::result::Result<(), String>,
 ) -> HandoffServed {
+    // ⛔ EVERY refusal answers, including the ones that never reach a
+    // descriptor. A predecessor that is told nothing waits out the full ack
+    // timeout with all its readers parked, so silence costs the host ten
+    // seconds per session to say what one line says immediately.
+    let refuse = |key: Option<String>, error: String, before_commit: bool| {
+        let served = HandoffServed::refused(key, error, before_commit);
+        let _ = send_ack(
+            stream,
+            &HandoffAck::refused(served.error.clone().unwrap_or_default()),
+        );
+        served
+    };
+
     let metadata = match receive_metadata(stream) {
         Ok(metadata) => metadata,
         // Nothing was read that could name a session, and no descriptor moved.
-        Err(error) => return HandoffServed::refused_before_commit(None, format!("{error:#}")),
+        Err(error) => return refuse(None, format!("{error:#}"), true),
     };
     let key = Some(metadata.runtime_key.clone());
 
@@ -652,7 +716,7 @@ pub(crate) fn serve_handoff(
             None => HandoffVerdict::proceed(),
         };
         if let Err(error) = send_verdict(stream, &verdict) {
-            return HandoffServed::refused_before_commit(key, format!("{error:#}"));
+            return refuse(key, format!("{error:#}"), true);
         }
     }
     if let Some(reason) = conflict {
@@ -662,22 +726,19 @@ pub(crate) fn serve_handoff(
         // untouched. Taking it only to drop it is what made every trace this
         // refusal produced say "the fd is gone" about a descriptor that never
         // went anywhere.
-        let served = HandoffServed::refused_before_commit(key, reason);
-        let _ = send_ack(stream, &HandoffAck::refused(served.error.clone().unwrap_or_default()));
-        return served;
+        return refuse(key, reason, true);
     }
 
     let fd = match receive_descriptor(stream, &metadata) {
         Ok(fd) => fd,
         Err(error) => {
-            // `receive_descriptor` refuses only a token that does not match the
-            // line, and it drops the descriptor as it does. Nothing about the
-            // predecessor's own master changed, so this is still a refusal it
-            // can survive.
-            let served = HandoffServed::refused_before_commit(key, format!("{error:#}"));
-            let _ =
-                send_ack(stream, &HandoffAck::refused(served.error.clone().unwrap_or_default()));
-            return served;
+            // ⛔ NOT `before_commit`. `receive_descriptor` refuses a token that
+            // disagrees with the line, and by then the `recvmsg` has already
+            // happened — the descriptor crossed and is dropped on the way out.
+            // Booking that as free would make the counter answer a different
+            // question from its name, which is the whole family of defect this
+            // module keeps catching.
+            return refuse(key, format!("{error:#}"), false);
         }
     };
 
@@ -725,12 +786,12 @@ pub(crate) struct HandoffServed {
 }
 
 impl HandoffServed {
-    fn refused_before_commit(runtime_key: Option<String>, error: String) -> Self {
+    fn refused(runtime_key: Option<String>, error: String, before_commit: bool) -> Self {
         Self {
             runtime_key,
             adopted: false,
             error: Some(error),
-            refused_before_commit: true,
+            refused_before_commit: before_commit,
         }
     }
 }
@@ -855,14 +916,96 @@ mod tests {
     fn a_handoff_error_says_whether_the_fd_survived() {
         let before = HandoffError {
             committed: false,
+            refused: false,
             message: "connect failed".to_string(),
         };
         let after = HandoffError {
             committed: true,
+            refused: false,
             message: "no ack".to_string(),
         };
         assert!(before.to_string().contains("the fd stayed"));
         assert!(after.to_string().contains("the fd is gone"));
+    }
+
+    /// ⛔⛔ THE COMPATIBILITY MECHANISM ITSELF, LOCKED.
+    ///
+    /// An older predecessor's metadata line has never heard of
+    /// `precommit_verdict`. If that ever stops defaulting to `false` — a
+    /// `deny_unknown_fields`, a rename, a required field — the successor starts
+    /// volunteering a verdict into a socket where an older build expects its
+    /// ack, and every handover to that build begins reporting "unreadable ack".
+    ///
+    /// ⚠ The failure would be SILENT in exactly the direction nobody tests:
+    /// this build talking to itself is fine, and only a fleet running two
+    /// versions at once would ever see it.
+    #[test]
+    fn an_older_predecessors_line_is_still_readable_and_asks_for_nothing() {
+        // Every field this build knows about EXCEPT the new one — literally
+        // what a build that predates it puts on the wire.
+        let older = serde_json::json!({
+            "version": HANDOFF_WIRE_VERSION,
+            "runtime_key": "local://demo",
+            "launch_command": "bash",
+            "cwd": "/tmp",
+            "cols": 80,
+            "rows": 24,
+            "shell_pid": 4242,
+            "shell_start_time": 999,
+            "screen": "hello\r\n",
+        })
+        .to_string();
+
+        let decoded: HandoffMetadata = serde_json::from_str(&older)
+            .expect("a line from a build that predates the verdict must still decode");
+        assert!(
+            !decoded.precommit_verdict,
+            "an older predecessor asks for nothing, so the successor must say \
+             nothing before the fd — it reads the next line as its ack"
+        );
+
+        // And the reverse direction: our line carries fields an older successor
+        // has never seen, and must not be rejected for it.
+        let ours = serde_json::to_string(&metadata()).unwrap();
+        assert!(
+            ours.contains("precommit_verdict"),
+            "this build must ANNOUNCE that it will read a verdict, or the \
+             successor stays silent and the step never fires"
+        );
+    }
+
+    /// ⛔ THE ONE DESYNC THIS PROTOCOL CAN PRODUCE, AND THE GUARD FOR IT.
+    ///
+    /// A predecessor whose verdict read timed out sends the descriptor anyway.
+    /// A successor that was merely SLOW — a loaded daemon holding its runtime
+    /// lock — then writes its verdict, and that line lands exactly where the
+    /// ack was expected. Without the discriminant it reads as an unparseable
+    /// ack, and a handover that would have succeeded is booked as a failure.
+    #[test]
+    fn a_verdict_that_arrives_late_is_stepped_over_rather_than_read_as_the_ack() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        // Both lines already in the buffer: the reader gave up waiting for the
+        // first, so it meets them in this order.
+        send_verdict(&a, &HandoffVerdict::proceed()).expect("verdict");
+        send_ack(&a, &HandoffAck::adopted_here()).expect("ack");
+
+        let ack = read_ack_past_a_late_verdict(&b)
+            .expect("a late verdict must not be mistaken for an unreadable ack");
+        assert!(ack.adopted);
+        assert_eq!(ack.adopter_pid, Some(std::process::id()));
+    }
+
+    /// The negative control for the test above: without the discriminant the
+    /// skip could match anything, so prove an ACK is never mistaken for a
+    /// verdict and silently swallowed.
+    #[test]
+    fn an_ack_is_never_mistaken_for_a_verdict() {
+        let ack = serde_json::to_string(&HandoffAck::adopted_here()).unwrap();
+        assert!(!line_is_a_precommit_verdict(&ack));
+        let refusal = serde_json::to_string(&HandoffAck::refused("busy".into())).unwrap();
+        assert!(!line_is_a_precommit_verdict(&refusal));
+        let verdict = serde_json::to_string(&HandoffVerdict::refused("busy".into())).unwrap();
+        assert!(line_is_a_precommit_verdict(&verdict));
     }
 
     /// The token must fit the wire's own limit — the screen goes in the line.

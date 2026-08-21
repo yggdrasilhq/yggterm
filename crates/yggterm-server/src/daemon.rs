@@ -4789,6 +4789,7 @@ impl DaemonRuntime {
         // every PTY on the host while it waits.
         let mut precommit = crate::pty_handoff::PrecommitSupport::default();
         let mut refused_before_commit = 0usize;
+        let mut refused_after_commit = 0usize;
         // ⛔⛔ ATTEMPT EVERY SESSION. This loop used to `break` on the first
         // failure, so ONE stuck key abandoned every remaining runtime — measured
         // live 2026-08-14 as `readers_stood_down: 11, moved: 0`, eleven healthy
@@ -4838,8 +4839,16 @@ impl DaemonRuntime {
                     successor_identity = ack.adopter_identity().or(successor_identity);
                 }
                 Err(error) => {
-                    if !error.committed {
-                        refused_before_commit += 1;
+                    // ⛔ `refused` is asked, not `!committed`. A connect that
+                    // failed is uncommitted too, and counting it as a refusal
+                    // would report the successor's sessions when the fault was
+                    // in the wire.
+                    if error.refused {
+                        if error.committed {
+                            refused_after_commit += 1;
+                        } else {
+                            refused_before_commit += 1;
+                        }
                     }
                     first_failure = first_failure.or(Some(format!("{key}: {error}")));
                     continue;
@@ -4863,6 +4872,7 @@ impl DaemonRuntime {
             resumed: released.len(),
             precommit: precommit.as_str(),
             refused_before_commit,
+            refused_after_commit,
         }
     }
 
@@ -14759,6 +14769,7 @@ fn spawn_superseded_self_retire_sweep(
                         // point, and how many refusals that made free.
                         "precommit": outcome.precommit,
                         "refused_before_commit": outcome.refused_before_commit,
+                        "refused_after_commit": outcome.refused_after_commit,
                         "server_version": SERVER_PROTOCOL_VERSION,
                         "pid": std::process::id(),
                     }),
@@ -14824,6 +14835,12 @@ pub(crate) struct HandoffSweepOutcome {
     /// fact about the successor's own sessions — is never read as a transport
     /// fault, which is a fact about the wire.
     pub refused_before_commit: usize,
+    /// ⭐ **THE NUMBER THIS PROTOCOL STEP EXISTS TO DRIVE TO ZERO.** A refusal
+    /// the successor could only voice once it held the descriptor. Nonzero
+    /// means either a successor too old to answer early, or a key that became
+    /// contested between the verdict and the seat — and the two are told apart
+    /// by `precommit`.
+    pub refused_after_commit: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -14839,6 +14856,7 @@ impl HandoffSweepOutcome {
             resumed: 0,
             precommit: crate::pty_handoff::PrecommitSupport::Unknown.as_str(),
             refused_before_commit: 0,
+            refused_after_commit: 0,
         }
     }
 
