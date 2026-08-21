@@ -7405,15 +7405,21 @@ impl YggtermServer {
             self.active_session_path = Some(resolved_key);
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
-        } else if let Some((machine_key, session_id, _kind)) =
+        } else if let Some((machine_key, session_id, kind)) =
             parse_remote_agent_session_path_with_kind(key)
         {
-            let _ = self.open_remote_scanned_session_with_view(
+            // ⛔ THE KIND IS RIGHT HERE, AND IT USED TO BE `_kind`. Parsed off the
+            // row path one line above and dropped, so the open had to re-derive
+            // it from a scan that may not hold the session — and when it did not,
+            // it answered Codex. That is how a `remote-cc://` row asked to be
+            // focused came back as a Codex twin of itself.
+            let _ = self.open_remote_scanned_session_with_view_and_kind(
                 machine_key,
                 session_id,
                 None,
                 None,
                 Some(WorkspaceViewMode::Terminal),
+                Some(kind),
             );
         }
     }
@@ -8615,6 +8621,42 @@ impl YggtermServer {
         title_hint: Option<&str>,
         view_mode: Option<WorkspaceViewMode>,
     ) -> anyhow::Result<String> {
+        self.open_remote_scanned_session_with_view_and_kind(
+            machine_key,
+            session_id,
+            cwd,
+            title_hint,
+            view_mode,
+            None,
+        )
+    }
+
+    /// The same open, for a caller that ALREADY KNOWS which CLI wrote the
+    /// session.
+    ///
+    /// ⛔ **THE SIGNATURE WAS THE BUG.** Taking only `(machine_key, session_id)`
+    /// throws away the one fact that decides everything downstream, and then the
+    /// body has to invent it. `focus_live_session` parsed the kind out of the row
+    /// path it was handed, bound it to `_kind`, and dropped it on the floor one
+    /// line above this call — so a `remote-cc://` row asked to be focused came
+    /// back as a Codex row, because the verb could no longer see what its caller
+    /// had just read.
+    ///
+    /// ⚠ In-process only, deliberately. The daemon's `OpenRemoteSession` request
+    /// carries no kind, and adding one is a WIRE change: it needs a version bump
+    /// in the same commit as the shape stamp, which is a release act and not a
+    /// lane's to take. A caller reaching this through the socket therefore still
+    /// passes `None` and falls to the evidence below, which is correct — it
+    /// genuinely does not know.
+    pub fn open_remote_scanned_session_with_view_and_kind(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        view_mode: Option<WorkspaceViewMode>,
+        known_kind: Option<SessionKind>,
+    ) -> anyhow::Result<String> {
         let launch_terminal = view_mode != Some(WorkspaceViewMode::Rendered);
         let machine_key = normalize_machine_key(machine_key);
         if let Ok(home) = resolve_yggterm_home() {
@@ -8641,14 +8683,85 @@ impl YggtermServer {
             .iter()
             .find(|s| s.session_id == session_id)
             .cloned();
-        let session_path = scanned_for_path
-            .as_ref()
-            .map(|s| s.session_path.clone())
-            .unwrap_or_else(|| remote_scanned_session_path(&machine_key, session_id));
-        let derived_kind = scanned_for_path
-            .as_ref()
-            .and_then(|s| parse_remote_agent_session_path_with_kind(&s.session_path).map(|(_, _, k)| k))
-            .unwrap_or(SessionKind::Codex);
+        // ⛔⛔ "THE SCAN DOES NOT KNOW THIS SESSION" IS NOT "IT IS A CODEX
+        // SESSION", AND THIS IS WHERE IT USED TO BECOME ONE.
+        //
+        // The two fallbacks used to sit three lines apart and AGREE with each
+        // other: an absent scan entry produced `remote-session://<machine>/<id>`
+        // AND `SessionKind::Codex`. Agreeing defaults are the dangerous kind —
+        // the result is a perfectly well-formed row, so nothing downstream can
+        // tell it was invented. Measured on the GUI host 2026-08-21: a live
+        // Claude Code session was opened here (trace `remote_session/open`), the
+        // scan of its machine held 748 sessions and not that one, and the row
+        // that came out carried a Codex scheme, `kind: codex`, and a
+        // `resume-codex … --require-existing` command that can never succeed
+        // against a Claude Code transcript. It became the SELECTED row, so the
+        // owner's viewport showed its error text, and it sat beside the correct
+        // `remote-cc://` row as a twin with the same id and the same label.
+        //
+        // ⚖ NOT the `unwrap_or("remote-session://")` in `agent_scheme`, which was
+        // the first suspect and is innocent: `remote-cc://` IS a registered
+        // ClaudeCode scheme, so the composer never reaches that default for this
+        // kind. The scheme was right for the kind it was handed. The KIND was the
+        // lie, and it was invented right here.
+        //
+        // ⇒ Four answers, most authoritative first, and the last one refuses:
+        // 1. **the scan's own declaration** — the scanner knows which CLI wrote
+        //    the file and stamps the scheme accordingly;
+        // 2. **what the CALLER already read**, because it usually knows and used
+        //    to throw it away (see the doc on this function's `known_kind`);
+        // 3. **a row we already hold for this id** — the daemon owned the correct
+        //    `remote-cc://` row while it minted the twin, and an open that
+        //    invents an identity for a session already on the books is a
+        //    duplicate, not an open;
+        // 4. **otherwise refuse.** This verb's contract is "open a session the
+        //    scanner listed"; with no scan entry, no caller kind and no held row
+        //    there is no evidence about which CLI wrote it, and a guess here is
+        //    not a degraded answer but a fabricated one.
+        let existing_for_id = self
+            .sessions
+            .values()
+            .find(|session| {
+                session.id == session_id
+                    && parse_remote_agent_session_path(&session.session_path)
+                        .is_some_and(|(key, _)| key == machine_key)
+            })
+            .map(|session| (session.session_path.clone(), session.kind));
+        let compose_for_kind = |kind: SessionKind| {
+            // ⛔ The Option-returning composer, never the Codex literal: a kind
+            // with no remote arm must fail to build a path rather than borrow
+            // another CLI's scheme.
+            remote_agent_session_path(kind, &machine_key, session_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "remote session {session_id} on {machine_key} is {kind:?}, which has no \
+                     remote row scheme, so it cannot be opened as a remote row"
+                )
+            })
+        };
+        let (session_path, derived_kind) = if let Some(scanned) = scanned_for_path.as_ref() {
+            match parse_remote_agent_session_path_with_kind(&scanned.session_path) {
+                Some((_, _, kind)) => (scanned.session_path.clone(), kind),
+                // The scanner declared a path whose scheme the registry cannot
+                // place. Same rule: say so rather than pick a CLI.
+                None => anyhow::bail!(
+                    "remote session {session_id} on {machine_key} declares an unrecognized \
+                     row scheme ({}), so its agent CLI cannot be determined; refusing to \
+                     open it as a guess",
+                    scanned.session_path
+                ),
+            }
+        } else if let Some(kind) = known_kind {
+            (compose_for_kind(kind)?, kind)
+        } else if let Some((path, kind)) = existing_for_id {
+            (path, kind)
+        } else {
+            anyhow::bail!(
+                "remote session {session_id} is not in the scan of {machine_key}, its caller \
+                 named no agent CLI, and no row is held for it, so which CLI wrote it is \
+                 unknown; refusing to open it as a guess (rescan the machine, or open the \
+                 row that owns it)"
+            )
+        };
         let target = SshConnectTarget {
             label: machine.label.clone(),
             kind: SessionKind::SshShell,
@@ -32388,6 +32501,110 @@ mod tests {
         );
     }
 
+    /// ⛔⛔ EVERY PROCESS-GLOBAL ENVIRONMENT VARIABLE THIS BINARY'S TESTS MUTATE
+    /// IS LISTED HERE, AND A NEW ONE MUST BE ADDED DELIBERATELY.
+    ///
+    /// `std::env::set_var` is PROCESS-global, and `cargo test` runs a binary's
+    /// tests on many threads at once. So a test that sets `CODEX_HOME`, runs, and
+    /// restores it is not isolated at all — every sibling test on every other
+    /// thread saw the temporary value, and any of them whose product path reads
+    /// that variable can fail for a reason that has nothing to do with what it is
+    /// testing. Measured 2026-08-21: a launch-command assertion failed on a
+    /// `YGGTERM_HOME` pointing at another test's temp directory, and passed in
+    /// isolation immediately after — the shape behind the suite flake that has
+    /// been paid for repeatedly with re-runs.
+    ///
+    /// ⚖ THIS TEST DOES NOT FIX THAT, AND SHOULD NOT PRETEND TO. The fix is to
+    /// thread the seam as an argument, the way `local_agent_store_vouches_for_
+    /// session_in` and `collect_live_store_title_syncs_in` already do, so the
+    /// product path is told where to look instead of reading a global. That is
+    /// per-variable work across a long list, and until it is done this binary's
+    /// tests are only sound single-threaded.
+    ///
+    /// ⇒ What this DOES is stop the list growing silently. The population is the
+    /// expensive part of the problem — a flake whose cause is one of twenty
+    /// invisible globals cannot be reasoned about — so adding a twenty-first is
+    /// made a deliberate act with this comment attached to it.
+    #[test]
+    fn the_process_globals_this_binarys_tests_mutate_are_all_declared() {
+        // Sanctioned because they already exist, NOT because they are safe.
+        // Removing one from this list by threading its seam is the direction of
+        // travel; adding one is a decision to make the flake population larger.
+        const DECLARED: &[&str] = &[
+            "CODEX_HOME",
+            "COLORFGBG",
+            "COLORTERM",
+            "HOME",
+            "NO_COLOR",
+            "PATH",
+            "TERM",
+            "TERM_PROGRAM",
+            "TERM_PROGRAM_VERSION",
+            "YGGTERM_APPEARANCE",
+            "YGGTERM_APP_CONTROL_CLIENT",
+            "YGGTERM_APP_CONTROL_PID",
+            "YGGTERM_GOVERNOR",
+            "YGGTERM_TERM_PROGRAM",
+            // Referenced through their constants rather than spelled.
+            "ENV_YGGTERM_TERMINAL_APPEARANCE",
+            "ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND",
+            "ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND",
+            "ENV_YGGTERM_CC_EXTRA_ARGS",
+            "ENV_YGGTERM_HOME",
+            // A loop restoring a captured (key, value) pair — the key is whatever
+            // that test captured, and the values it can hold are already above.
+            "key",
+        ];
+        // ⛔ THE NEEDLES ARE ASSEMBLED, NEVER SPELLED. A scanner that contains its
+        // own pattern finds itself, and this one did on the first run — reporting
+        // a "variable" cut out of its own source line. Same family as a fixture
+        // that satisfies the assertion it is supposed to test.
+        let needles = [
+            concat!("env::", "set_var("),
+            concat!("env::", "remove_var("),
+        ];
+        let mut found: Vec<String> = Vec::new();
+        for source in [
+            include_str!("lib.rs"),
+            include_str!("terminal.rs"),
+            include_str!("audio_cli.rs"),
+            include_str!("resource_governor.rs"),
+        ] {
+            for line in source.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for call in needles {
+                    let Some(rest) = line.split_once(call).map(|(_, rest)| rest) else {
+                        continue;
+                    };
+                    let name = rest
+                        .split([',', ')'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_start_matches('&')
+                        .trim_matches('"');
+                    // Constants are cited by path; compare on the final segment.
+                    let name = name.rsplit("::").next().unwrap_or(name).trim();
+                    if name.is_empty() || DECLARED.contains(&name) {
+                        continue;
+                    }
+                    found.push(name.to_string());
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        assert!(
+            found.is_empty(),
+            "these process globals are mutated but not declared: {found:?}. \
+             Every entry is a variable a sibling test on another thread can \
+             observe mid-flight; add it to DECLARED only if the seam genuinely \
+             cannot be threaded as an argument."
+        );
+    }
+
     /// ⛔ THE REMOTE TWIN OF THE ABOVE, root-caused 2026-08-20: a remote CC
     /// spawn's `--model` never reached the process although the create
     /// composed it correctly (`launch.applied: true`) — because BOTH remote
@@ -38398,7 +38615,35 @@ terminal_window_id: None,
             remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
-            sessions: Vec::new(),
+            // ⛔ THIS USED TO BE `Vec::new()`, AND THAT MADE THE TEST AN
+            // ACCOMPLICE. With an empty scan, the open had no evidence about
+            // which CLI wrote the session and answered Codex — so this test
+            // asserted `resume-codex` against a row whose kind had been
+            // GUESSED, and it passed for the same reason the scheme-twin
+            // shipped. A suite that shares the code's wrong model cannot catch
+            // it. The session this test is about is a real scanned Codex
+            // session, so it says so, and the launch-refresh assertions below
+            // now rest on a stated fact instead of on the fallback.
+            sessions: vec![RemoteScannedSession {
+                session_path: remote_scanned_session_path(
+                    "guihost",
+                    "019d09a4-c69e-7071-bd9a-8834060029a9",
+                ),
+                session_id: "019d09a4-c69e-7071-bd9a-8834060029a9".to_string(),
+                cwd: "/home/user".to_string(),
+                started_at: "2026-04-01T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 4,
+                user_message_count: 2,
+                assistant_message_count: 2,
+                title_hint: "Q60029a9".to_string(),
+                recent_context: String::new(),
+                cached_precis: None,
+                cached_summary: None,
+                live_runtime: false,
+                title_is_explicit: false,
+                storage_path: "/home/user/.codex/sessions/reopen.jsonl".to_string(),
+            }],
         });
 
         let session_path = server.open_remote_scanned_session(
@@ -39127,6 +39372,153 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), Some(session_path.as_str()));
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Rendered);
         assert!(!server.live_session_order.contains(&session_path));
+        Ok(())
+    }
+
+    /// ⛔⛔ AN UNSCANNED SESSION IS NOT A CODEX SESSION, AND IT USED TO BECOME ONE.
+    ///
+    /// Measured on the GUI host 2026-08-21. A live Claude Code row was opened
+    /// through this verb; the scan of its machine held 748 sessions and not that
+    /// one, so `scanned_for_path` was `None` and the two fallbacks three lines
+    /// apart AGREED: the path became `remote-session://<machine>/<id>` and the
+    /// kind became Codex. The result was a well-formed row nothing downstream
+    /// could question — a Codex-scheme TWIN of a Claude Code session, same id,
+    /// same label, sitting beside the real `remote-cc://` row and carrying a
+    /// `resume-codex … --require-existing` command that can never succeed. It
+    /// became the selected row, so the owner's viewport held its error text.
+    ///
+    /// ⚖ Deliberately NOT a test about `agent_scheme`'s
+    /// `unwrap_or("remote-session://")`, which was the first suspect and is not
+    /// the culprit: `remote-cc://` is a registered ClaudeCode scheme, so the
+    /// composer never reaches that default for this kind. The scheme was right
+    /// for the kind it was given; the kind was invented here.
+    #[test]
+    fn an_unscanned_session_is_never_opened_as_a_guessed_codex_row() -> Result<()> {
+        let session_id = "019cf00a-57bd-7480-a642-495ac1389b8e";
+        let machine = || RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
+            apps: Vec::new(),
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            // ⭐ THE WHOLE POINT: the scan does not hold this session.
+            sessions: Vec::new(),
+        };
+
+        // (1) NOTHING KNOWN AT ALL ⇒ refuse. Before the fix this returned a
+        // well-formed `remote-session://dev/<id>` path and a Codex row.
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(machine());
+        let refused = server.open_remote_scanned_session_with_view(
+            "dev",
+            session_id,
+            Some("/home/user/gh/sample"),
+            None,
+            None,
+        );
+        let error = match refused {
+            Ok(path) => panic!(
+                "an unscanned session must not be opened as a guess; got a row at {path}"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("not in the scan") && error.contains("unknown"),
+            "the refusal must name what is missing rather than fail vaguely: {error}"
+        );
+        assert!(
+            !server
+                .sessions
+                .keys()
+                .any(|path| path.starts_with("remote-session://")),
+            "a refused open must leave no row behind at all"
+        );
+
+        // (2) THE CALLER KNOWS ⇒ its answer is used, and the path is composed
+        // for THAT kind. This is the arm `focus_live_session` now takes: it
+        // parses the kind off the row path it was handed instead of dropping it.
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(machine());
+        let opened = server.open_remote_scanned_session_with_view_and_kind(
+            "dev",
+            session_id,
+            Some("/home/user/gh/sample"),
+            None,
+            None,
+            Some(SessionKind::ClaudeCode),
+        )?;
+        assert_eq!(
+            opened,
+            format!("remote-cc://dev/{session_id}"),
+            "a caller-stated kind must compose ITS scheme, not the Codex literal"
+        );
+        assert_eq!(
+            server.sessions.get(&opened).map(|session| session.kind),
+            Some(SessionKind::ClaudeCode),
+            "and the row must carry that kind, or the launch command resumes the \
+             wrong CLI against the wrong store"
+        );
+        assert!(
+            !server.sessions.contains_key(&format!("remote-session://dev/{session_id}")),
+            "no Codex twin may be minted alongside it"
+        );
+
+        // (3) A ROW WE ALREADY HOLD WINS — the daemon owned the correct
+        // `remote-cc://` row for this very id while it minted the twin, so an
+        // open that invents an identity for a session already on the books is a
+        // duplicate, not an open.
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(machine());
+        let held = format!("remote-cc://dev/{session_id}");
+        let mut existing = snapshot_session(&held, SessionSource::LiveSsh);
+        existing.id = session_id.to_string();
+        existing.kind = SessionKind::ClaudeCode;
+        server
+            .sessions
+            .insert(held.clone(), managed_session_from_snapshot(existing));
+
+        let opened = server.open_remote_scanned_session_with_view(
+            "dev",
+            session_id,
+            Some("/home/user/gh/sample"),
+            None,
+            None,
+        )?;
+        assert_eq!(
+            opened, held,
+            "the open must land on the row that already exists, not mint a twin"
+        );
+        let twins: Vec<&String> = server
+            .sessions
+            .keys()
+            .filter(|path| path.contains(session_id))
+            .collect();
+        assert_eq!(
+            twins.len(),
+            1,
+            "one session id must not end up owning two rows under two schemes: {twins:?}"
+        );
+        assert_eq!(
+            server.sessions.get(&held).map(|session| session.kind),
+            Some(SessionKind::ClaudeCode),
+            "and the kind we already knew must survive the open"
+        );
         Ok(())
     }
 

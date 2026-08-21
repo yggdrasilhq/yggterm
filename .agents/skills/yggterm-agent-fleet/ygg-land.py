@@ -296,6 +296,48 @@ def prune_scratch():
         log(f"  pruned scratch worktree of dead land {pid}")
 
 
+def cmd_prune(a):
+    """⛔ LANDING IS NOT FINISHED WHILE THE BRANCH IS STILL THERE.
+
+    A lane branch whose patches are all in main is not a branch any more — it is a
+    name that will read as work forever. Measured 2026-08-21: 27 of them, none with
+    a worktree, several months old, and every `status` run had to compute and
+    discard them. Worse, each is a live invitation to a merge that would revert
+    main (see the stale-base guard above), and the older it gets the more damage
+    that merge does.
+
+    ⛔ IT DELETES ONLY WHAT `git cherry` CALLS LANDED, and never a branch that still
+    has a worktree — somebody is standing in that one, whatever the patches say.
+    """
+    held = set()
+    for line in git("worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("branch refs/heads/"):
+            held.add(line.split("refs/heads/", 1)[1].strip())
+    gone, kept = [], 0
+    for b in lane_branches():
+        ahead, _ = ahead_behind(b)
+        if ahead is None or ahead > 0:
+            kept += 1
+            continue
+        if b in held:
+            log(f"· {b}: landed, but a worktree is on it — kept")
+            kept += 1
+            continue
+        gone.append(b)
+    for b in gone:
+        sha = git("rev-parse", "--short", b).stdout.strip()
+        if a.apply:
+            r = git("branch", "-D", b)
+            log(f"✔ deleted {b} (was {sha})" if r.returncode == 0
+                else f"⛔ {b}: {r.stderr.strip()[:90]}")
+        else:
+            log(f"would delete {b} (was {sha}, fully landed)")
+    log(f"— {'deleted' if a.apply else 'would delete'} {len(gone)}, kept {kept}")
+    if not a.apply:
+        log("  nothing was changed. Re-run with --apply.")
+    return 0
+
+
 def cmd_land(a):
     prune_scratch()
     targets = lane_branches() if a.all else [a.branch]
@@ -320,6 +362,8 @@ def main():
     ld.add_argument("branch", nargs="?")
     ld.add_argument("--all", action="store_true")
     ld.add_argument("--apply", action="store_true")
+    pr = sub.add_parser("prune", help="delete lane branches whose patches are all in main")
+    pr.add_argument("--apply", action="store_true")
     ld.add_argument("--stale-ok", action="store_true",
                     help="land over a base older than %d days even though main has since "
                          "rewritten the files this branch touches" % STALE_BASE_DAYS)
@@ -329,7 +373,11 @@ def main():
     STALE_OK = getattr(a, "stale_ok", False)
     if getattr(a, "repo", None):
         REPO = os.path.abspath(os.path.expanduser(a.repo))
-    return cmd_status(a) if a.cmd == "status" else cmd_land(a)
+    if a.cmd == "status":
+        return cmd_status(a)
+    if a.cmd == "prune":
+        return cmd_prune(a)
+    return cmd_land(a)
 
 
 if __name__ == "__main__":

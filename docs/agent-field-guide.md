@@ -566,6 +566,51 @@ has a daemon and sessions but no client. `server app clients` answers "is the GU
 variable at it, which is how a second live instance can be READ for comparison. Never DRIVE one:
 a mode change or relaunch corrupts whatever it is measuring.
 
+### ⛔⛔ A FRAME COUNT IS NOT A PAINT — `renderEventCount`, `frame_window` and `frame_gap` ALL READ HEALTHY ON A HALF-PAINTED SCREEN
+
+The renderer repaints only the rows it marked dirty. So a mount that painted two rows and stopped
+has frames, a populated `xterm_render/frame_window`, and a `frame_gap` profile indistinguishable
+from a session that painted everything — because every one of those instruments counts **frames**,
+and the question a person is asking is **coverage**.
+
+⇒ Ask `xterm_paint/settle` instead: `rows_content_unpainted` is rows the terminal HOLDS TEXT ON that
+no frame since the mount has covered. Positive means the screen is showing less than the session
+contains. `scripts/paint-chain.py` prints it per mount with the native half joined on `host_id`.
+
+### ⛔⛔ `host_id` NAMES A ROW AND AN EPOCH — NOT A SURFACE BUILD. ANY JOIN ON IT KEEPS ONLY THE LAST ONE
+
+`host_id` is `<host>-m<mount_epoch>`, and **the epoch is REUSED**: a row can tear its surface down
+and build it again under the same number. So a query that groups by `host_id` silently collapses
+every rebuild into one record — and since it keeps the LAST, **a rebuild that painted badly
+disappears into an earlier build's clean result.** That is the churn's own signature being hidden
+by an instrument sent to measure it.
+
+⚠ **Confirmed on the live GUI, and worse there than in a sandbox.** One row's `mount_identity`
+`…:1` carried **8 separate `terminal_mount/begin` events** inside a single trace window; a join on
+it would have reported one. ⛔ **And `terminal_mount/mount_epoch_reused` is NOT a reliable detector
+of the condition** — that window contained zero of them while the identity repeated eight times, so
+its absence proves nothing.
+
+⇒ **Segment on `terminal_mount/begin`, never on the id alone.** `scripts/paint-chain.py` does this
+and labels rebuilds `…#b1`. Any figure of the form *"N distinct rows/surfaces"* taken from a host-id
+count is a **floor, not a total** — including ones already published in `docs/pending-bugs.md`.
+
+⚠ Three ways to misread it, each of which turns a fault into a clean bill of health:
+
+* **`rows_with_content: -1` is blind, not empty.** An unreadable buffer collapsed to `0` reads as a
+  terminal with nothing in it — i.e. as perfectly painted.
+* **`visible: false` mounts are expected not to paint.** The churn re-mounts rows nobody is looking
+  at and their renderer is idle by design; that is a cost, not a fault. Filter with `--visible-only`
+  before calling anything broken.
+* **The coverage test is only sound on a MOUNT.** It works because the surface started blank, so
+  every row with text must be painted at least once. Applied to steady state it says nothing.
+
+⛔ And the settle timer runs on the thread under investigation, so it reports `overshoot_ms` rather
+than assuming it fired on time — an overshoot is a UI-thread stall the probe survived, not a slow
+paint. A thread that never comes back emits nothing at all, which is why `mount_open` is emitted at
+the surface: **a mount with no `first_frame` after it never painted**, and that absence is the
+reading.
+
 ### 1.99 ⛔⛔⛔ THE INSTRUMENT THAT INCLUDES ITSELF IN WHAT IT MEASURES
 
 **No table row above predicts this one, because it is not a property of any

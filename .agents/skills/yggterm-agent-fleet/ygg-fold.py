@@ -76,8 +76,26 @@ STALL_IDLE_MIN = 20.0
 #:
 #: A wake is only ever correct for a row that is still cheap to resume. Everything
 #: else is harvested and replaced by a fresh lane at the same seat.
+#: A spawn's transcript lags its creation by ~15 s, so a brand-new row legitimately
+#: has none. Past this it has not been briefed at all.
+BRIEFLESS_GRACE_MIN = 10.0
+
 WAKEABLE_MAX_TRANSCRIPT_BYTES = 400_000
 WAKEABLE_MAX_IDLE_MIN = 20.0
+
+
+def process_age_min(uuid):
+    """Minutes since the agent process for this uuid started, from /proc — the one
+    clock a row with no transcript still has."""
+    try:
+        out = subprocess.run(["bash", "-c",
+                              f"for p in $(pgrep -x claude); do "
+                              f"tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q {uuid} "
+                              f"&& stat -c %Y /proc/$p && break; done"],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        return (time.time() - int(out)) / 60 if out else None
+    except Exception:
+        return None
 
 
 def wakeable(transcript_bytes, idle_min):
@@ -361,7 +379,21 @@ def classify(row, live, protected):
     if uuid not in live:
         return "DEAD", "no agent process on this host"
     if tr is None:
-        return "WORKING", "process alive, no transcript to judge by"
+        # ⛔⛔ A LIVE PROCESS WITH NO TRANSCRIPT AT ALL IS THE EMPTIEST POSSIBLE ROW,
+        # AND THIS ARM CALLED IT THE BUSIEST VERDICT IT HAS. A CLI that started and
+        # was never given anything writes no transcript, so it can never be COLD,
+        # FINISHED or DEAD — it is unclassifiable forever and therefore unfoldable
+        # and unsucceedable. Measured 2026-08-21: one row sat in exactly this state
+        # for two hours while every sweep reported it WORKING.
+        #
+        # ⇒ The grace is real — a spawn's transcript lags creation by ~15 s — but it
+        #   is a GRACE, not a permanent exemption. Past it, a row that has never
+        #   written a word has never been briefed, and saying so is the whole point.
+        age = process_age_min(uuid)
+        if age is not None and age > BRIEFLESS_GRACE_MIN:
+            return "BRIEFLESS", (f"alive {age:.0f}m and has never written a transcript — "
+                                 f"it was started and never briefed")
+        return "WORKING", "process alive, no transcript to judge by (still starting?)"
     text = last_assistant_text(tr)
     row["last"] = text.replace("\n", " ")[:200]
     # ⚠ Both phrase tests read the OPENING, not the body. Whole-message matching
@@ -672,7 +704,17 @@ def sweep_worktrees(repo, apply_it):
         # its own output, and the reader believes the summary.
         removed += 1
         if apply_it:
-            r = run(["git", "-C", repo, "worktree", "remove", path])
+            # ⛔ THE COST OF THIS REMOVAL IS THE BUILD DIRECTORY, NOT THE CHECKOUT.
+            # A lane worktree that has been built in carries a multi-gigabyte
+            # `target/`, and deleting it took longer than the shared 120 s timeout
+            # every time — so the sweep failed on exactly the worktrees it most
+            # wants to reclaim, and reported the failure as a refusal. Measured
+            # 2026-08-21: 2.9 GB in one tree. Say the size, then wait for it.
+            size = subprocess.run(["du", "-sh", path], capture_output=True,
+                                  text=True, timeout=300).stdout.split("\t")[0] or "?"
+            log(f"  removing {size} — a built worktree is mostly `target/`")
+            r = subprocess.run(["git", "-C", repo, "worktree", "remove", path],
+                               capture_output=True, text=True, timeout=1800)
             if r.returncode != 0:
                 log(f"  ⛔ refused: {(r.stderr or '').strip()[:160]}")
                 removed -= 1
@@ -685,6 +727,62 @@ def sweep_worktrees(repo, apply_it):
     return 0
 
 
+def cmd_orphans(a, host, live):
+    """⛔⛔ REMOVING A WORKTREE DOES NOT REMOVE ITS ROWS, AND NOTHING SAID SO.
+
+    A lane's session is rooted in the lane's worktree, so the cwd tree draws a
+    folder for it. Reclaim the worktree and the folder stays — pointing at a
+    directory that no longer exists, with rows under it that can only fail when
+    clicked. Measured 2026-08-21, after the first sweep that actually removed
+    anything: 9 such rows across 7 vanished trees, and 7 of them predated that
+    sweep by weeks. ⇒ The tidy-up was creating exactly the litter it was run to
+    clear, and quietly.
+
+    ⚖ A LIVE session in a vanished tree is NOT reaped here. Its process is fine,
+    its cwd is simply gone; re-rooting it to the repo's main checkout is a product
+    verb this tool does not have, so it is named and left alone rather than killed
+    for the crime of being untidy.
+    """
+    rows = rows_census(host)
+    # rows_census keeps only SEATED rows; an orphan usually has no seat left.
+    r = run(["ssh", "-n", host, f"{YGG} server app rows --json"])
+    try:
+        allrows = (json.loads(r.stdout).get("data") or {}).get("rows") or []
+    except Exception:
+        log("⛔ could not read the row list")
+        return 2
+    seen, dead, alive = set(), [], []
+    for row in allrows:
+        path = row.get("full_path") or ""
+        cwd = (row.get("session_cwd") or "").strip()
+        if "://" not in path or path in seen or not cwd:
+            continue
+        seen.add(path)
+        if os.path.isdir(cwd):
+            continue
+        uuid = path.rsplit("/", 1)[-1]
+        (alive if uuid in live else dead).append((path, cwd, row.get("outline_prefix")))
+    for path, cwd, seat in alive:
+        log(f"· {str(seat):<7} {path[-40:]} — ALIVE in a vanished tree {cwd}")
+        log("    left alone: re-rooting a live session is a product verb, not a reap")
+    for path, cwd, seat in dead:
+        log(f"⛔ {str(seat) or '-':<7} {path[-40:]} — dead, and its tree {os.path.basename(cwd)} is gone")
+        if a.apply:
+            row = {"uri": path, "uuid": path.rsplit("/", 1)[-1], "seat": str(seat or "-"),
+                   "label": row_label(allrows, path), "session_cwd": cwd}
+            fold(row, "DEAD", "cwd tree no longer exists", host, True)
+    log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive"
+        + ("" if a.apply else " · nothing was changed. Re-run with --apply."))
+    return 0
+
+
+def row_label(allrows, path):
+    for r in allrows:
+        if (r.get("full_path") or "") == path:
+            return r.get("label") or ""
+    return ""
+
+
 def main():
     global FINISHED_IDLE_MIN, STALL_IDLE_MIN
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -693,6 +791,15 @@ def main():
     sw.add_argument("--campaign", help="only rows whose seat starts with this, e.g. 11")
     sw.add_argument("--apply", action="store_true")
     sw.add_argument("--host")
+    sw.add_argument("--dead-only", action="store_true",
+                    help="classify everything, act ONLY on DEAD. ⛔ The scoping rule — an "
+                         "orchestrator folds its own spawns and nobody else's — protects a "
+                         "JUDGEMENT: whether a quiet lane is finished. A row with no process "
+                         "is not a judgement, so this pass may run unscoped and is the only "
+                         "thing watching campaigns that have no orchestrator of their own")
+    sw.add_argument("--max-respawns", type=int, default=0,
+                    help="0 = no cap. A cap exists because this loop runs unattended: a bad "
+                         "hour must not be able to spawn a lane per cold row across the fleet")
     sw.add_argument("--respawn", action="store_true",
                     help="replace each COLD row: spawn a successor at the same seat from a "
                          "brief distilled from artefacts, prove it holds the brief, and only "
@@ -723,6 +830,10 @@ def main():
                      help="fold this row whatever the verdict — for a row an operator has "
                           "named explicitly and decided about. Never available to `sweep`, "
                           "and never able to touch a PROTECTED row.")
+    orph = sub.add_parser("orphans",
+                          help="rows whose cwd tree no longer exists — reap the dead, name the live")
+    orph.add_argument("--apply", action="store_true")
+    orph.add_argument("--host")
     wt = sub.add_parser("worktrees")
     wt.add_argument("--apply", action="store_true")
     wt.add_argument("--repo", default=os.path.abspath(os.path.join(HERE, "..", "..", "..")))
@@ -754,13 +865,16 @@ def main():
         log("   and with --apply that is the whole fleet reaped in one pass.")
         return 2
 
+    if a.cmd == "orphans":
+        return cmd_orphans(a, host, live)
+
     if a.cmd == "row":
         rows = [r for r in rows if a.target in r["uri"]]
         if not rows:
             log(f"⛔ no seated row matches {a.target}")
             return 2
 
-    counts, folded, seen_rows = {}, 0, []
+    counts, folded, seen_rows, respawned = {}, 0, [], 0
     for row in sorted(rows, key=lambda r: r["seat"]):
         if a.cmd == "sweep" and a.campaign:
             head = row["seat"].split(".")[0]
@@ -770,9 +884,11 @@ def main():
         counts[verdict] = counts.get(verdict, 0) + 1
         if verdict != "PROTECTED":
             seen_rows.append(row)
-        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·",
+        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·", "BRIEFLESS": "⚠",
                 "PROTECTED": "🔒", "STALLED": "⏸", "COLD": "❄"}[verdict]
         log(f"{mark} {row['seat']:<7} {row['uuid'][:8]} {verdict:<9} {why}")
+        if getattr(a, "dead_only", False) and verdict != "DEAD":
+            continue
         forced = getattr(a, "force", False) and verdict != "PROTECTED"
         # ⚠ A single-row call is an operator asking about ONE row, usually because
         # a sweep told them to. Declining in silence makes the two verbs look as
@@ -788,7 +904,12 @@ def main():
         elif verdict == "STALLED" and getattr(a, "wake", False):
             wake(row, host, a.apply)
         elif verdict == "COLD":
-            if getattr(a, "respawn", False):
+            cap = getattr(a, "max_respawns", 0) or 0
+            if getattr(a, "respawn", False) and cap and respawned >= cap:
+                log(f"  ⛔ respawn cap of {cap} reached this sweep — left cold, "
+                    f"its successor brief is written and the next sweep will take it")
+            elif getattr(a, "respawn", False):
+                respawned += 1
                 if respawn(row, why, host, a.apply):
                     folded += 1
             else:
