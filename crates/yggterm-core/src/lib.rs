@@ -2036,9 +2036,19 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     }
     compress_codex_browser_tree(&mut root, false);
 
+    // ⚠ The memo's own numbers ride the same span it makes cheap. A cache
+    // whose hit rate is invisible is a cache nobody can tell has stopped
+    // working — and this one is deliberately invalidated wholesale whenever a
+    // title is written, so a run of misses is a real signal about the
+    // generation chore, not noise.
+    let (memo_hits, memo_misses, memo_rows) =
+        crate::startpage::take_durable_scan_memo_counts();
     perf.annotate(serde_json::json!({
         "total_sessions": total_sessions,
         "cwd_buckets": bucket_count,
+        "scan_memo_hits": memo_hits,
+        "scan_memo_misses": memo_misses,
+        "scan_memo_rows": memo_rows,
     }));
     Ok(codex_browser_tree_to_session_node(&root))
 }

@@ -8,7 +8,8 @@ use crate::{
     run_remote_saved_agent_session_exists, run_remote_saved_codex_session_exists,
     run_remote_scan, run_remote_stage_clipboard_png, run_remote_start_agent, run_remote_start_cc,
     run_remote_start_codex,
-    run_remote_agent_runtime_alive, run_remote_apps, run_remote_terminate_agent,
+    run_remote_agent_runtime_alive, run_remote_apps, run_remote_cli_presence,
+    run_remote_terminate_agent,
     run_remote_terminate_cc,
     run_remote_terminate_codex, run_remote_upsert_generated_copy,
 };
@@ -63,6 +64,7 @@ pub enum RemoteServerCommand {
     /// invisible and an app installed only on the GUI host was offered — with
     /// the GUI host's path — to run on `dev`.
     Apps,
+    CliPresence,
     /// Enumerate Codex/Claude Code processes running on the remote machine and
     /// emit their real CLI session ids. Used by the local daemon to rebind
     /// live remote-Codex rows that still carry a synthesized UUIDv4 id
@@ -254,6 +256,7 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
             codex_home: args.get(3).cloned(),
         },
         "apps" if args.len() == 3 => RemoteServerCommand::Apps,
+        "cli-presence" if args.len() == 3 => RemoteServerCommand::CliPresence,
         "local-codex-identities" if args.len() == 3 => RemoteServerCommand::LocalCodexIdentities,
         "cc-rename" if args.len() == 5 => RemoteServerCommand::CcRename {
             session_id: args[3].clone(),
@@ -364,6 +367,7 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::EnsureManagedCli { tool } => run_remote_ensure_managed_cli(tool),
         RemoteServerCommand::Scan { codex_home } => run_remote_scan(codex_home.as_deref()),
         RemoteServerCommand::Apps => run_remote_apps(),
+        RemoteServerCommand::CliPresence => run_remote_cli_presence(),
         RemoteServerCommand::LocalCodexIdentities => run_remote_local_codex_identities(),
         RemoteServerCommand::CcRename { session_id, title } => {
             run_remote_cc_rename(&session_id, &title)
