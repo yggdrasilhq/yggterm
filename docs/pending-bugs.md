@@ -18,6 +18,41 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+---
+
+## ⛔ [11.26] `web <verb> --session` ADDRESSES A ROW AND SILENTLY ANSWERS ABOUT WHICHEVER TAB IS ACTIVE
+
+**Status:** OPEN
+
+Every `server app web` verb takes `--session <path>` and none takes a tab. Both
+resolvers (`resolve_live_web_surface`, `resolve_live_web_surface_handle`) read
+`surface.active_tab`, so a verb aimed at a session answers about whatever tab
+happens to be in front at the instant it runs.
+
+**Why this is a correctness bug and not a missing convenience.** It fails in the
+reassuring direction: there is no error, no warning, and a perfectly well-formed
+answer — about a different page than the caller meant. Measured while
+investigating a media defect: a probe sequence aimed at one tab followed the user
+onto another mid-investigation, and the only tell was that a later evaluation
+happened to throw `null is not an object` because the new page had no `<video>`.
+Had the new page also had one, the numbers would have been silently blended
+across two documents.
+
+A background tab is NOT out of reach — the surface table shows tabs in state
+`stashed` with `webview: true` and a live `native_id` — so inspecting one
+without bringing it to the front is possible today and simply has no verb.
+
+⛔ **The fix must echo, not just accept.** `#[serde(default)]` means an older GUI
+drops an unknown `tab` field without complaint and answers about the active tab
+— the same silent-wrong-answer this entry is about, reintroduced by the fix.
+`require_frame_echo` in `yggterm-server::lib` is the worked precedent: the
+response must echo `tab_resolved` and the CLI must hard-fail on its absence.
+
+Owner: whoever next touches the web verb surface. The record side of this is
+already solved — media probe records carry a host-stamped `(row, tab)` — so this
+is specifically about the imperative verbs.
+
+## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
 ## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
 
 **Status:** OPEN
@@ -20057,6 +20092,8 @@ fixing it.
 verb exists.
 
 ## ★★ WHO OWNS "IS THIS ROW WORKING?" — three tools, three answers
+
+**Status:** OPEN
 
 ### ⛔ 2026-08-07 — I BECAME THE FOURTH TOOL, ON THE OWNER'S OWN ROW
 
