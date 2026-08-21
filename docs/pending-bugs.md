@@ -2516,6 +2516,7 @@ GiB of swap residency**. Old logic: `7.57 >= 4.0` fires, every 60 s, forever. Ne
 carrying swap residue, once a build on this lock reaches it.
 
 
+
 ## ⚠ [11.0] SWAP RESIDUE MAKES EVERY FIRST TOUCH CRAWL, AND TWO INSTRUMENTS CALLED IT HEALTHY
 
 **Status:** OPEN

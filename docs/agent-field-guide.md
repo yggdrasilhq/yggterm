@@ -2301,6 +2301,7 @@ version that only appears for two minutes reports an enormous rate.
 ⇒ **A window that spans a roll describes the roll.** Check what the running build
 actually contains by ANCESTRY (`git merge-base --is-ancestor <fix> <release>`), never by
 comparing version strings — and then read only the window that build owns.
+
 ## Prove an alarm STOPPED by pinning it to the handover, with the trigger still armed (2026-08-21)
 
 An alarm going quiet proves nothing on its own — the condition may simply have
@@ -2398,3 +2399,4 @@ two SCAFFOLD blocks ("… stays attached", "Launch command prepared:"), which th
 old heuristic already treated as empty — so it coerced correctly and the sandbox
 comes up green on both arms. The discriminating input is a transcript of TOOL
 CALLS with no prose, and no exposed verb injects one into a live row.
+
