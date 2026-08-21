@@ -1931,6 +1931,7 @@ mod tests {
             None,
             None,
             None,
+            ActivationOrigin::user_gesture("test_switch_to_other_row"),
         );
         shell.sidebar_reads_live_since = Some(("local://other".to_string(), now));
 
@@ -1956,6 +1957,7 @@ mod tests {
             None,
             None,
             None,
+            ActivationOrigin::user_gesture("test_switch_back_to_yedit"),
         );
         shell.sidebar_reads_live_since = Some(("local://yedit".to_string(), now));
         assert_eq!(
@@ -59206,7 +59208,9 @@ mod webtabs_menu_switcher_locks {
             (
                 "the session switches away",
                 Box::new(|shell: &mut ShellState| {
-                    shell.server.show_start_page();
+                    shell
+                        .server
+                        .show_start_page(ActivationOrigin::user_gesture("test_switch_away"));
                 }),
             ),
             (
@@ -62247,9 +62251,19 @@ mod media_capture_locks {
             "the row must be RESOLVED by the shared resolver, not looked up a second way"
         );
         assert!(
-            body.contains("spawn_open_session_row(state, row)"),
+            body.contains("spawn_open_session_row("),
             "and opened by the shared opener, or a notification click opens rows \
              differently from every other way of opening one"
+        );
+        // ⭐ AND IT MUST NAME ITSELF A GESTURE. The shared door is now origin-
+        // stamped, which is what lets the mount-churn entry separate a switch
+        // the person made from one the app made. A notification card is a
+        // thing somebody CLICKED, so mislabelling it `app_control` here would
+        // manufacture exactly the app-driven-switch evidence that entry is
+        // trying to establish.
+        assert!(
+            body.contains("ActivationOrigin::user_gesture(\"notification_card_click\")"),
+            "a card the person clicked must reach the trace as a user gesture"
         );
         assert!(
             !body.contains("active_session_path ="),

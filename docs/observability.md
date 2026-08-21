@@ -111,6 +111,7 @@ are distinguished by the record's `layer` field, **not** by `component` — both
 | `xterm` | `xterm_paint/first_frame` | span (wall) | the empty surface to the first glyphs on it. `duration_ms` is open→frame; the payload splits it into `open_to_write_ms`, `write_to_parsed_ms`, `parsed_to_frame_ms` |
 | `xterm` | `xterm_paint/settle` | window | did this mount actually PAINT: `rows_covered` against `rows_with_content`, `rows_content_unpainted`, `complete`, `painted`, `blank_frames_before_write`, plus `overshoot_ms` |
 | `dioxus` | `dioxus_render/component_window` | window | per-component render cost (`renders`, `total_ms`, `max_ms`, `mean_ms`, hottest first) **and** the invalidation causes (`causes[]`, `root_renders`, `renders_unattributed`) |
+| `rust` | `session/activation` | point | **the active row changed, and WHY**: `from`, `to`, `origin`, `origin_site`, `user_gesture`, `previous_origin`, `ms_since_previous_activation`, `redundant_since_previous` |
 | `rust` | `trace_bridge/foreign_batch_faults` | point | what the boundary refused or repaired, and how far behind the emitter was running |
 
 ⭐ **Reading `dioxus_render/component_window` — three numbers, in this order.**
@@ -139,6 +140,59 @@ fault is in applying the attributes. ⛔ The `sample` field is **redacted**: eve
 text is replaced by its length, CSI sequences are verbatim, and an OSC is reduced to its opcode and
 length. Do not read it as a transcript — it is deliberately not one, and the reason is in
 `docs/spec-trace-plane-contract.md` §8.
+
+⭐⭐ **`session/activation` answers the other half of the same question: did the person switch, or did the
+app?** Until it existed, a hand clicking between rows and the app moving on its own produced **exactly
+the same trace** — which is why the mount-churn entry can prove the re-mounting half and not the
+switching half. `user_gesture` is the field; the origin vocabulary behind it is fixed and tested:
+
+| `origin` | means |
+|---|---|
+| `user_gesture` | a hand — a sidebar row, a start-page card, a key, a notification card |
+| `app_control` | the control plane asked. ⚠ **NOT a gesture**: an orchestrator opening a row while somebody reads is the SYMPTOM this entry is about, not the control |
+| `history` | back/forward through the viewport history |
+| `launch` · `restore` · `recovery` | a session starting, a startup/snapshot restore, a repair after the active row vanished |
+| `internal` | anything else — and `origin_site` still names the line, so it is never a dead end |
+
+⛔ **The record exists because the FIELD has exactly one writer, not because somebody remembered to
+log.** An origin stamped at the call sites an author thought of would leave an unexplained switch and
+an *uninstrumented* one looking identical — the same blind spot restated one layer up. A source test
+(`the_active_session_path_has_exactly_one_writer`) fails on a second assignment anywhere in the
+server.
+
+⚠ **Naming the row that is already active is NOT a switch and emits nothing.** Those are counted per
+origin and carried on the next real switch as `redundant_since_previous`, because an idempotent click
+and a repair loop both look like that — and `request_terminal_launch_for_active` alone fired 13 times
+in 1.3 minutes on the GUI host, which as records would be pure restatement that nothing moved.
+
+⛔ **Absence of the probe is not absence of a switch on an older build.** A daemon or GUI predating
+this emits nothing here, and a window with no `session/activation` at all means "this build cannot
+answer", never "nothing switched". Check that the category exists before reading a quiet window.
+
+⛔⛔ **THREE WAYS TO MISREAD IT, all three measured live on 2026-08-21 rather than imagined.**
+
+1. **ONE SWITCH CAN APPEAR TWICE, FROM TWO PROCESSES.** The GUI and the daemon each hold a
+   `YggtermServer`, so each records its own view. A single sidebar click produced
+   `pid=<gui> user_gesture/sidebar_row_select` **and** `pid=<daemon> app_control/attach_seed_remote_snapshot`
+   — the same `from → to`, two origins, and the second one reads like the app switching by itself.
+   ⇒ **Read activation from the GUI's pid** (`server app clients` names it). The daemon's record
+   describes its own bookkeeping, not what moved on screen.
+2. **`user_gesture` NAMES THE CODE PATH, NOT THE HUMAN.** `server app pointer click` and
+   `server app grid click` drive the GUI's real DOM/Dioxus click path on purpose — that is what
+   they are for — so an agent clicking a row lands on `sidebar_row_select` and records
+   `user_gesture: true`. This is not fixable by guessing at the origin, and guessing is worse than
+   the ambiguity. ⇒ **The discriminator is on the plane**: an `app_control/request_stage` with
+   `command: "pointer"` or `"grid"` immediately precedes such a click. A `user_gesture` with no
+   such request in front of it is a hand.
+3. **EVERY SHORT-LIVED CLI PROCESS EMITS ONE.** `yggterm-headless <anything>` builds a
+   `YggtermServer` and restores state, which is a real activation in that process — observed as
+   `restore/restore_persisted_state` from a pid that lived for one command. Same trap as §4.4c
+   for startup events; the cure is the same, filter by the pid you are actually asking about.
+
+⭐ **Cost, measured rather than argued: 0.86% of records and 1.21% of trace BYTES** in a window
+dense with switches. It is bounded by how often the active row CHANGES, and a redundant
+re-activation costs nothing — which is the whole reason the no-op case is a counter and not a
+record.
 
 ⭐⭐ **`xterm_paint/*` answers ONE question the rest of this table cannot: did the glyphs arrive.**
 ⚠ Not because the canvas was uninstrumented — the `xterm_write` and `xterm_render` rows above are

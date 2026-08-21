@@ -184,6 +184,40 @@ def build(rows: list[dict]) -> list[dict]:
     return builds
 
 
+def paint_claim(mount: dict) -> str:
+    """Did the NATIVE side claim this build painted, and was it right?
+
+    ⛔⛔ `terminal_mount/paint_ready` is named for pixels and measures the DOM.
+    Its condition is `child_count > 0 || xterm_present || screen_present ||
+    viewport_present || rows_present` — i.e. "the xterm elements exist" — and it
+    latches a `terminal_host_painted` signal that gates the resume overlay and
+    the recovery paths. Measured on a live GUI 2026-08-21 over 38.5 minutes:
+    **nine builds carried the claim, eight agreed with the renderer, and the
+    ninth was a visible mount holding 41 rows of text that rendered ZERO frames
+    and was still unpainted at the four-second recheck.**
+
+    ⇒ That is the shape worth naming: an instrument that is right in the healthy
+    case and wrong in the failure case is not merely unreliable, it is
+    ANTI-reliable — its eight agreements are what earn it the trust that makes
+    the ninth reading load-bearing. This column exists so the disagreement is
+    never again something someone has to go looking for.
+    """
+    if not any(r.get("name") == "paint_ready" for r in mount["native"]):
+        return "-"
+    settles = mount["settles"]
+    if not settles:
+        return "?"
+    last = settles[-1].get("payload") or {}
+    if last.get("visible") is not True:
+        # An invisible host is expected not to render; the claim is about the
+        # DOM, which is genuinely there. Not a disagreement worth flagging.
+        return "ok"
+    unpainted = last.get("rows_content_unpainted")
+    if last.get("frames", 0) == 0 or (isinstance(unpainted, int) and unpainted > 0):
+        return "LIED"
+    return "ok"
+
+
 def verdict(mount: dict) -> str:
     settles = mount["settles"]
     if not settles:
@@ -223,7 +257,7 @@ def report(mounts: list[dict], visible_only: bool) -> int:
     print(
         f"{'surface build':<38} {'verdict':<9} {'vis':<4} {'rst':>3} "
         f"{'open→wr':>8} {'wr→par':>7} {'par→fr':>7} {'wr→fr':>7} "
-        f"{'blank':>5} {'covered':>9} {'late':>6}  session"
+        f"{'blank':>5} {'covered':>9} {'late':>6} {'claim':>5}  session"
     )
     for mount in ordered:
         state = verdict(mount)
@@ -246,12 +280,19 @@ def report(mounts: list[dict], visible_only: bool) -> int:
             f"{ms(frame.get('write_to_frame_ms')):>7} "
             f"{ms(settle.get('blank_frames_before_write', frame.get('blank_frames_before_write'))):>5} "
             f"{covered:>9} "
-            f"{ms(settle.get('overshoot_ms')):>6}  {mount['session']}"
+            f"{ms(settle.get('overshoot_ms')):>6} "
+            f"{paint_claim(mount):>5}  {mount['session']}"
         )
     print()
     total = sum(counts.values())
     summary = " · ".join(f"{name} {count}" for name, count in sorted(counts.items()))
     print(f"{total} surface builds: {summary or 'none'}")
+    lied = sum(1 for m in ordered if paint_claim(m) == "LIED")
+    if lied:
+        print(
+            f"⛔ {lied} build(s) where terminal_mount/paint_ready claimed paint and the "
+            f"renderer had not drawn the rows the terminal holds — see `paint_claim`"
+        )
     # ⛔ A missing probe and a quiet system look identical, so say which it is.
     if not total:
         print(
@@ -283,6 +324,7 @@ def main() -> int:
                     "build": mount["build"],
                     "session_path": mount["session"],
                     "verdict": verdict(mount),
+                    "paint_ready_claim": paint_claim(mount),
                     "bootstrap_resets": mount["resets"],
                     "mount_open": (mount["open"] or {}).get("payload"),
                     "first_frame": (mount["first_frame"] or {}).get("payload"),
@@ -296,5 +338,44 @@ def main() -> int:
     return report(mounts, args.visible_only)
 
 
+def _selftest() -> int:
+    """⛔ The claim column exists to catch ONE shape, and it caught it once on a
+    live host. A column that silently stops computing is worse than no column,
+    so the shape is pinned here rather than left to the next live sighting."""
+    failing = {
+        "host_id": "h-m1",
+        "native": [{"name": "paint_ready", "payload": {"host_id": "h-m1"}}],
+        "settles": [{"payload": {"visible": True, "frames": 0, "rows_covered": 0,
+                                 "rows_with_content": 41, "rows_content_unpainted": 41}}],
+    }
+    healthy = {
+        "host_id": "h-m1",
+        "native": [{"name": "paint_ready", "payload": {"host_id": "h-m1"}}],
+        "settles": [{"payload": {"visible": True, "frames": 12, "rows_covered": 65,
+                                 "rows_with_content": 40, "rows_content_unpainted": 0}}],
+    }
+    invisible = dict(healthy)
+    invisible = {
+        "host_id": "h-m1",
+        "native": [{"name": "paint_ready", "payload": {"host_id": "h-m1"}}],
+        "settles": [{"payload": {"visible": False, "frames": 0, "rows_covered": 0,
+                                 "rows_with_content": 50, "rows_content_unpainted": 50}}],
+    }
+    unclaimed = {"host_id": "h-m1", "native": [], "settles": healthy["settles"]}
+    checks = [
+        (paint_claim(failing), "LIED", "a visible mount with zero frames must falsify the claim"),
+        (paint_claim(healthy), "ok", "a fully painted mount agrees"),
+        (paint_claim(invisible), "ok", "an invisible host is expected not to render"),
+        (paint_claim(unclaimed), "-", "no claim is not a falsified claim"),
+    ]
+    bad = [(got, want, why) for got, want, why in checks if got != want]
+    for got, want, why in bad:
+        print(f"FAIL: {why} (got {got!r}, want {want!r})", file=sys.stderr)
+    print("paint-chain selftest: %d checks, %d failed" % (len(checks), len(bad)))
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     sys.exit(main())
