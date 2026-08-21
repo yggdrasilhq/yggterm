@@ -18,61 +18,75 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
 
 **Status:** OPEN
 
-*Found 2026-08-22 while exercising the orchestration plane ACROSS CLIs. The row-identity
-half of this is fixed and gated; this is the other half, and it is a different fix.*
+*Narrowed three times, and what is left is now blocked on evidence rather than on work.*
 
-**The measurement.** Eleven callsites across seven fleet verbs answer *"has this row ever
-written a word?"* with one hardcoded glob — the reference CLI's transcript store:
+**Done, each shape taken off a real store and gated:** claude-code, codex and
+antigravity have their prose read AND their turn state classified — `TURN_ENDED` /
+`MIDTURN` / `RATE_LIMITED` — locally and over ssh. The remote probe is **generated
+from** the local classifier rather than transcribed beside it, so the machine watching
+a row and the machine holding it cannot drift.
 
-```
-ygg-spawn.py    proves the brief arrived        ygg-fold.py     harvest before retiring
-ygg-deliver.py  proves delivery, and REAPS      ygg-monitor.py  last prose, stall evidence (x3)
-ygg-babysit.py  liveness over ssh (x2)          ygg-booter.py   evidence marker
-```
+**What is left, and why none of it is typing:**
 
-The registry declares a store for **every** registered CLI, and they do not share a
-layout: one keeps a SQLite database, another a per-session directory, another rollout
-files whose names decorate the id. A row of any of them has no file where these verbs
-look, so the glob returns empty — and **empty is not an error, it is an answer**, the
-same answer a row that has genuinely never done anything would give.
+- **muse** — investigated 2026-08-22: its records are a `payload_type`/`payload` event
+  stream, and across the six largest sessions the tail holds only `runtime.session`
+  (961), `tool_batch.effect.*` and `session.end` — task and command events, **no
+  conversational turn anywhere.** The `session.peer-history.sqlite3` beside it is a
+  line-offset index into that same file, not a second store. muse has been used here
+  as a task runner, not a chat.
+- **pi · grok-build** — no session on either host is large enough to hold a turn.
+- **qwen-code · opencode** — behind the credential gate in the entry below.
+- **codex-litellm** — rides the codex binary and should inherit its shapes, unverified
+  because no session exists.
 
-**Why that is worse than a false negative.** `ygg-deliver`'s reap test is *"has it ever
-written a word"*, and its own comment explains the asymmetry it is guarding: *"losing a
-working lane to a delivery timeout would be far worse than the debris this cleans up."*
-For a row outside the reference store that test can only ever answer no. ⇒ A working
-lane of any other CLI that is merely busy past the deadline is classified as never
-briefed and force-folded. The interlock is correctly reasoned and reads the wrong shelf.
+⛔ **Do not close any of these by reading a CLI's source.** A real store has already
+contradicted a documented layout once in this lane, and a wrong shape here does not
+stay cosmetic — it feeds a stall verdict. Two live examples of why the obvious guess
+is the wrong one: codex writes a `rate_limits` block into a routine `token_count`
+event on essentially every turn (**6,949 occurrences across 25 transcripts, present in
+39 of 40 files**), so a substring match for "rate_limit" would freeze the wake plane
+for every codex row; and antigravity's error records say the model API is
+*overloaded*, which clears on its own and is not an exhausted account.
 
-⚠ **`ygg-booter` reasoned about exactly this and still missed it.** Its marker documents
-that an unreadable result must never be treated as fresh evidence, and picks the safe
-direction deliberately — but "unreadable" was imagined as a permissions or timing
-failure, never as *"this row belongs to a CLI that keeps its transcripts somewhere
-else."* The care was real and aimed one category short.
+⇒ **The unblocker for all seven is the same: one real session on disk per CLI**, which
+is what the greeting run produces as a side effect.
 
-**⛔ The law that should have caught it already exists, and cannot see these files.**
-`no_store_path_literal_outside_the_agent_cli_registry` refuses exactly this hardcoding
-and is enforced in two Rust files by scanning their own source. The orchestration layer
-is Python and sits outside the fence, so the same literal that fails the build in one
-language is unreviewed in the other.
+**What would falsify it being fixed:** `ygg-babysit` classifying a muse row as
+`TURN_ENDED` rather than `EMPTY`.
 
-**The fix, and why it is not a one-liner.** Ask the registry, which already knows each
-store's layout and how a session is recognised inside it — do not re-encode ten layouts
-in Python. Two supply lines are possible and the choice is the real work: a headless
-verb that resolves a row's transcript (one owner, needs a rolled binary before any host
-can use it), or a table generated from the registry and checked in beside the verbs with
-a Rust lock asserting it still matches (no deploy, one more artefact to keep honest).
-**Recommendation: the generated table**, because these verbs run on timers and on hosts
-mid-roll, and a resolver that needs the newest daemon to answer is unavailable exactly
-when a stalled fleet needs reading. ⚠ And a resolved path is not yet a readable
-transcript — one store is a SQLite database, so the ack-grep that proves delivery needs
-a per-store reader, not just a per-store path.
+## ⛔ [99.0] NO NON-REFERENCE CLI HAS EVER COMPLETED AN AUTHENTICATED SESSION HERE, SO THE GREETING RUN CANNOT BE VALIDATED
 
-**What would falsify it being fixed:** `ygg-deliver.py` proving delivery into a row of a
-non-reference CLI, and `ygg-monitor` reporting that row's last prose instead of silence.
+**Status:** AWAITING A DECISION
+
+**Who decides:** the owner — it needs credentials only he holds, and it is listed in
+[`owner-attention.md`](owner-attention.md).
+
+**Measured 2026-08-22 across two hosts.** Of the ten registered CLIs, credentials are
+present for **codex, claude-code, muse and grok-build**; **qwen-code, opencode and
+antigravity have none**, and two others are unclear.
+
+⇒ This is what makes one registry claim untestable rather than wrong. `qwen-code` is
+store-authoritative with a live reader that requires a `.jsonl` transcript, and **27 qwen
+sessions across two hosts contain only `<id>.runtime.json` sidecars** — a pid/cwd marker
+with no title and no conversation, and zero `.jsonl` files. Every one of those sessions
+was an unauthenticated probe that never exchanged a message, so *"this store never writes
+a transcript"* and *"a transcript appears only once a session says something"* predict the
+identical disk, and nothing on these machines separates them.
+
+⛔ **Do not resolve this by reading the CLI's source and declaring it settled** — that is
+how the layout got into the registry in the first place, and a real store has already
+contradicted a documented layout once in this lane. **One authenticated exchange settles
+it**, and the same credential unblocks the greeting run for that CLI.
+
+**Recommendation:** authenticate `qwen-code` first — it is the only CLI whose registry
+declaration currently rests on an unmeasured store — then `opencode`. **Meanwhile the
+greeting run is not blocked**: codex ↔ claude-code exercises delivery across two genuinely
+different store layouts (a decorated file name against a plain one) and both are
+authenticated today.
 
 ## ⛔⛔⛔ [11.20] A ROLL TAKES A LIVE DAEMON'S SOCKET NAME AWAY, AND NOTHING CAN REACH IT AGAIN
 
@@ -245,13 +259,16 @@ caller makes its callees newly dead, so the count falls further than the first s
 **Falsifier:** `cargo check --workspace` after touching every crate root reports zero `dead_code`
 in `crates/`, and `cargo test -p yggterm-server` is green.
 
-## ⛔⛔⛔ [11.27] LEGENDARY — A REFUSED PTY ADOPTION DESTROYS THE MASTER IT HAS ALREADY TAKEN
+## ⛔⛔⛔ [11.0] LEGENDARY — A LIVE DAEMON KEEPS ITS PTY MASTERS AND LOSES ITS NAME, SO NOTHING CAN ATTACH
 
 **Status:** OPEN
 
-**Owner:** seat 11.27; root measured 2026-08-22. ⚠ The first two sections below are the ORIGINAL
-report and its first diagnosis; the correction that renamed this entry is the third section, and
-it is the one to act on.
+*Half of it is fixed — mechanism (a) below — and the entry stays OPEN because mechanism (b), the
+one the user actually saw, is not.*
+
+*⚠ Retitled 2026-08-22. It said "A DAEMON RESTART ORPHANS ITS PTY MASTERS": the masters are not
+orphaned and never were, which is measured below and is why the stated missing piece sent readers
+after a mechanism that already existed.*
 
 *Caught live 2026-08-22 00:38, with the owner locked out of every session on his GUI and having
 to open a KDE terminal outside yggterm to report it. His words: "This is the legendary daemon bug
@@ -281,58 +298,99 @@ daemon restart  ->  PTY MASTERS die with it
 the transcript. The wait is right — attaching is what was asked for. **Together they are a
 deadlock with no self-exit**, and the user-visible symptom is "nothing attaches".
 
-### VERIFIED ON THE MACHINE, NOT INFERRED — and the orchestrator was itself an instance
+### ⛔⛔ TWO PROBES IN THE ORIGINAL REPORT CANNOT DIAGNOSE THIS — corrected 2026-08-22
 
-Measured on this seat's OWN process while it was landing commits and spawning lanes:
+*The table below is kept because it was published and acted on. **Both of its first two rows are
+readings that a perfectly HEALTHY adopted session also produces**, so neither could ever have
+separated healthy from broken. Same family as every other entry here.*
 
-| probe | reading |
-|---|---|
-| `ps -o ppid,etimes` | **PPID 1**, alive 2 h 44 m — reparented to init, working perfectly |
-| `fuser /dev/pts/N` | **only the CLI itself** — the SLAVE side. Nobody holds the master. |
-| peer socket | **ALIVE** — a peer session reached it while the GUI could not |
+| probe | reading | ⛔ why it decides nothing |
+|---|---|---|
+| `ps -o ppid,etimes` | **PPID 1**, alive 2 h 44 m | An adopted child **is** reparented to init. PPID 1 is the EXPECTED state after a SUCCESSFUL adoption, not evidence against one. |
+| `fuser /dev/pts/N` | only the CLI itself — "nobody holds the master" | `fuser` on a slave enumerates holders of the **slave**. The master is an unnamed `/dev/ptmx` descriptor and can never appear there — in ANY case, healthy or not. |
+| peer socket | **ALIVE** — a peer session reached it while the GUI could not | Stands. |
 
-⇒ **The survivors need no rescuing.** Process healthy, transcript intact, peer plane reachable.
+⇒ **The instrument for "is this master held" is a `/dev/ptmx` scan across `/proc/*/fd`**, never
+`fuser` on the slave:
 
-### ⛔⛔ CORRECTED 2026-08-22 — TWO OF THOSE THREE PROBES CANNOT TELL HEALTHY FROM ORPHANED
-
-**Both readings above are TRUE of a perfectly adopted, working session**, so neither one
-separates the two states, and the conclusion drawn from them — *"nobody holds the master"* — was
-never measured.
-
-| the probe | what it actually answers |
-|---|---|
-| `PPID 1` | an adopted child **is** reparented to init. PPID 1 is the EXPECTED state after a SUCCESSFUL adoption, not evidence against one. |
-| `fuser /dev/pts/N` | holders of the **SLAVE**. A master is an unnamed `/dev/ptmx` descriptor and can never appear under `/dev/pts/N`, in any case, healthy or broken. |
-
-⭐ **The instrument that does answer it** is a scan of `/proc/*/fd` for links equal to
-`/dev/ptmx`. Taken live on a row adopted minutes earlier and working normally: `ppid=1`, `fuser`
-naming only its own wrapper, **and the current daemon holding a master fd for it** — all three at
-once. ⇒ Read the master holder from `/proc`, never from `fuser` on the slave.
-
-### ⛔ AND THE STATED MISSING PIECE IS NOT MISSING — IT IS BUILT, WIRED, AND RUNNING
-
-This entry said what was needed was *"a way for a NEW daemon to adopt an orphaned slave PTY"*.
-`pty_adoption.rs` + `pty_handoff.rs` + `pty_handoff_wire.rs` do exactly that over `SCM_RIGHTS`,
-and they run on every daemon swap: **162 `pty_handoff_adopted` events in one night**, with four of
-six handover sweeps reporting `AllMoved` and `all_moved: true`.
-
-**The real defect is narrower and it is a LOSS, not an absence.** The successor's refusal is
-evaluated AFTER the commit point, so a refused session does not merely fail to move — its master
-is destroyed:
-
-```
-Partial { moved: 10, reason: "<key>: successor took the fd and refused to seat it:
-  refusing to adopt <key>: this daemon already runs a live PTY for it
-  (AFTER the commit point — the fd is gone)" }        readers_stood_down: 11
-handoff_settle_window   all_moved=false  held=10  bytes_stolen_after_park=187
+```sh
+for d in /proc/[0-9]*; do
+  n=$(ls -l "$d/fd" 2>/dev/null | grep -c ptmx)
+  [ "${n:-0}" -gt 0 ] && echo "${d#/proc/} $n"
+done
 ```
 
-Twice in one night, the same key, `bytes_stolen_after_park` **187 on exactly those two occasions
-and 0 on every clean one**. `send_session` is metadata → **sendmsg (commit)** → ack, and its own
-module doc states the invariant it breaks: *everything before the sendmsg is recoverable.* The
-metadata already carries the runtime key, the child pid and its start time — everything the
-refusal needs — so the decision can be taken while the descriptor is still the predecessor's.
-⇒ The policy is right; only its TIMING is wrong. Owned by seat **11.27**.
+### ⛔⛔ AND THE STATED MISSING PIECE IS WRONG TWICE OVER — corrected 2026-08-22
+
+*This section said: "What is missing is purely a way for a NEW daemon to adopt an orphaned slave
+PTY". Neither half survives measurement.*
+
+**1. Adoption is BUILT, and it runs.** `pty_adoption.rs`, `pty_handoff.rs` and
+`pty_handoff_wire.rs` are live, not spikes. Measured in one night on the build host: **135
+`pty_handoff_adopted` events** and four retirement sweeps reporting `AllMoved` — 27, 27, 30 and
+31 runtimes moved between daemons with nothing signalled. *(Two stale signposts were pointing the
+other way and are fixed in the same commit: `pty_adoption.rs`'s header said "nothing here is
+wired to the daemon's handoff yet", and `settled-calls.md` said increment 2 was "NOT built".)*
+
+**2. The masters are NOT orphaned.** Measured on the pinned predecessor at the moment of writing:
+**alive 28 h, holding 83 `/dev/ptmx` descriptors**, still bound to its own versioned request
+socket by inode. Nothing was lost. It is **unreachable**, which is a different failure with a
+different cure — see the two mechanisms below.
+
+### THE TWO MECHANISMS, MEASURED
+
+**(a) A refusal evaluated AFTER the commit point pins the predecessor for life. ✅ FIXED.**
+
+The successor's seat check — *is a DIFFERENT live child already under this key?* — ran only once
+the descriptor had crossed. Twice in one night, same key both times:
+
+```text
+superseded_self_retire_sweep  Partial { moved: 10, reason: "…: successor took the fd and
+  refused to seat it: … (AFTER the commit point — the fd is gone)" }   readers_stood_down 11
+handoff_settle_window  all_moved=False settled=True held=10 bytes_stolen_after_park=187
+```
+
+⚠ **"the fd is gone" is itself false**, and believing it is what hid this for so long.
+`HandoffTakeout::master_fd` is BORROWED — the predecessor's runtime keeps its own master and
+`sendmsg` moves a DUPLICATE, which the refusing successor then drops. The real cost is that the
+sweep books a failure it can never clear, so it never reaches `AllMoved`, so **the predecessor
+can never retire** and stands there holding every session it owns.
+
+The policy was right; the MOMENT was wrong. The metadata line already carries the whole input to
+the decision (`runtime_key`, `shell_pid`, `shell_start_time`) and arrives before the fd, so the
+successor now answers a **verdict line** first. ⛔ Deliberately NOT a wire-version bump — a bump
+makes every older successor refuse the whole handoff, and mixed versions are the normal case on a
+fleet, not the edge one. Additive and asked-for instead: the predecessor sets `precommit_verdict`,
+an older successor ignores an unknown field, and the successor answers **only when asked**, so an
+older predecessor never sees a line where it expects its ack.
+
+**Regression locks** (`terminal.rs`, real socket, real `bash`, real `serve_handoff`):
+`a_refused_handoff_is_answered_before_the_descriptor_moves` — asserts `committed == false` AND
+that the predecessor's own master still makes its shell **evaluate** arithmetic afterwards;
+`a_successor_that_never_answers_still_gets_the_descriptor` and
+`a_predecessor_that_never_asks_is_never_sent_a_verdict` — the two compatibility directions, the
+second being the one that would fail silently.
+
+**(b) A live daemon loses its NAME, and that is what strands the sessions. ⛔ STILL OPEN — and it
+is the half the user actually saw.**
+
+Measured at the same minute: the pinned predecessor is bound to the inode that used to be
+`server-<its-version>.sock`, and **that path is now a symlink to the newest daemon's socket**. An
+unlinked unix socket is still bound and still accepting, but no path reaches it. So the GUI asks
+the newest daemon for a row the pinned one owns, the newest daemon does not have it, launches its
+own resume, and the wrapper correctly refuses to start a second one:
+
+```text
+… is already running under yggterm (pid …); waiting to attach instead of starting a
+second resume, which would corrupt the transcript. Waiting 24s so far.
+```
+
+⇒ **That is the deadlock, and (a) is what supplies it with victims.** `probe_socket_occupancy`
+already exists to stop a name being taken from a daemon that merely failed to answer — but
+`refresh_legacy_server_socket_aliases` skips that probe entirely on its
+`versioned_socket_candidate_is_symlink` branch, so once a name has been taken ONCE it is
+re-pointed for ever and the daemon behind it can never get it back. **This half is not fixed here
+and needs its own lane.**
 
 ### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 

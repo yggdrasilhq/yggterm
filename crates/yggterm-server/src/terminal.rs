@@ -635,6 +635,30 @@ pub struct HandoffTakeout {
     pub cwd: Option<String>,
 }
 
+/// What seating a handed-over PTY under a key would do.
+///
+/// Three answers, and collapsing any two of them has already cost this project
+/// a daemon that could never retire — see [`TerminalManager::seat_verdict`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatVerdict {
+    /// Nothing live under this key, or only an exited husk. Seat it.
+    Vacant,
+    /// This key is already seated on the very process being handed over: the
+    /// earlier adoption succeeded and only its acknowledgement was lost.
+    AlreadySeated,
+    /// A DIFFERENT live child holds this key. Seating would kill one pty to
+    /// install another.
+    Conflict,
+}
+
+/// The one wording of a seat conflict, so the pre-commit refusal and the
+/// post-commit one cannot describe the same fact in two ways.
+#[cfg(target_os = "linux")]
+pub fn seat_conflict_reason(key: &str) -> String {
+    format!("refusing to adopt {key}: this daemon already runs a live PTY for it")
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalShutdownSummary {
     pub stopped: usize,
@@ -931,6 +955,56 @@ impl TerminalManager {
         Ok(())
     }
 
+    /// What seating `key` would do — decided WITHOUT a descriptor in hand.
+    ///
+    /// ⛔⛔ **THE ONE ENCODING OF THE SEAT RULE, AND IT MUST STAY ONE.** Two
+    /// callers ask this question at two different moments: the handoff listener
+    /// asks it BEFORE the fd crosses so it can answer the predecessor while a
+    /// refusal is still free, and [`Self::adopt_session`] asks it again with the
+    /// fd already in hand, because the two moments are not the same instant and
+    /// another handoff can seat the key in between. A second copy of the
+    /// predicate would let those two answers drift, and the drift is invisible:
+    /// both paths would still look right in isolation.
+    ///
+    /// ⚠ **IDENTITY, NOT PRESENCE — AND THE DIFFERENCE PINS WHOLE DAEMONS.**
+    /// The handoff has a window between the successor SEATING a pty and the
+    /// predecessor receiving the ack. When the ack is lost, the predecessor
+    /// books a failure and keeps its runtime, then retries — and every retry
+    /// landed on "I already have this key", read as a conflict. **It is the
+    /// opposite: it is proof the earlier adoption succeeded.** The predecessor
+    /// could therefore never complete the move, and because a failure makes the
+    /// sweep `Partial` (`classify_handoff_sweep`), a single key in this state
+    /// pinned EVERY other session on that daemon and it could never reach the
+    /// empty hands that let it retire.
+    ///
+    /// Measured live 2026-08-14 during a version bump: the same key failing once
+    /// a minute, `NoneMoved`, `readers_stood_down: 11` and `moved: 0` — eleven
+    /// healthy runtimes held hostage by one.
+    ///
+    /// ⚠ So the check is the CHILD, not the key. "A live pty exists under this
+    /// key" is also true when this daemon built its OWN pty for the session (an
+    /// independent re-resume), and calling that success would let the
+    /// predecessor drop a runtime whose child is still on the far end — closing
+    /// a pty out from under a live process. Same pid, AND the same start time so
+    /// a recycled pid cannot impersonate it.
+    #[cfg(target_os = "linux")]
+    pub fn seat_verdict(&self, key: &str, shell_pid: u32, shell_start_time: u64) -> SeatVerdict {
+        let Some(existing) = self.sessions.get(key) else {
+            return SeatVerdict::Vacant;
+        };
+        if !existing.is_running() {
+            return SeatVerdict::Vacant;
+        }
+        let same_child = existing.process_id() == Some(shell_pid)
+            && crate::pty_adoption::process_start_time(shell_pid)
+                .is_some_and(|start| start == shell_start_time);
+        if same_child {
+            SeatVerdict::AlreadySeated
+        } else {
+            SeatVerdict::Conflict
+        }
+    }
+
     /// Install a session whose PTY was received from another daemon.
     ///
     /// Refuses to displace a RUNNING runtime under the same key: the whole
@@ -938,6 +1012,10 @@ impl TerminalManager {
     /// session, and silently replacing a live one would kill a PTY to install
     /// another. An exited husk under the key is replaced, exactly as
     /// [`Self::ensure_session_with_size`] does.
+    ///
+    /// ⚠ Still asks [`Self::seat_verdict`] even when the listener already did:
+    /// the pre-commit answer was true a moment ago, and this is the moment that
+    /// actually seats the pty.
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn adopt_session(
@@ -952,37 +1030,9 @@ impl TerminalManager {
         shell_start_time: u64,
         seed: Option<&str>,
     ) -> Result<()> {
-        if let Some(existing) = self.sessions.get(key)
-            && existing.is_running()
-        {
-            // ⛔⛔ IDENTITY, NOT PRESENCE — AND THE DIFFERENCE PINS WHOLE DAEMONS.
-            //
-            // The handoff has a window between the successor SEATING a pty and
-            // the predecessor receiving the ack. When the ack is lost, the
-            // predecessor books a failure and keeps its runtime, then retries —
-            // and every retry landed here, where "I already have this key" was
-            // read as a conflict. **It is the opposite: it is proof the earlier
-            // adoption succeeded.** The predecessor could therefore never
-            // complete the move, and because one failure aborts the whole sweep
-            // (`classify_handoff_sweep`), a single key in this state pinned
-            // EVERY other session on that daemon and it could never reach the
-            // empty hands that let it retire.
-            //
-            // Measured live on dev 2026-08-14 during the 3.0.154 bump: the same
-            // key failing once a minute, `NoneMoved`, `readers_stood_down: 11`
-            // and `moved: 0` — eleven healthy runtimes held hostage by one.
-            //
-            // ⚠ The check must be IDENTITY. "A live pty exists under this key"
-            // is also true when the successor built its OWN pty for the session
-            // (an independent re-resume), and returning success there would let
-            // the predecessor drop a runtime whose child is still on the far end
-            // — closing a pty out from under a live process. So compare the
-            // CHILD: same pid, and the same start time so a recycled pid cannot
-            // impersonate it.
-            let same_child = existing.process_id() == Some(shell_pid)
-                && crate::pty_adoption::process_start_time(shell_pid)
-                    .is_some_and(|start| start == shell_start_time);
-            if same_child {
+        match self.seat_verdict(key, shell_pid, shell_start_time) {
+            SeatVerdict::Vacant => {}
+            SeatVerdict::AlreadySeated => {
                 // Idempotent success. `fd` drops here, closing this duplicate
                 // descriptor for a pty we already hold open — which is why it
                 // cannot hang up on the child.
@@ -999,7 +1049,7 @@ impl TerminalManager {
                 );
                 return Ok(());
             }
-            bail!("refusing to adopt {key}: this daemon already runs a live PTY for it");
+            SeatVerdict::Conflict => bail!("{}", seat_conflict_reason(key)),
         }
         if let Some(runtime) = self.sessions.remove(key) {
             let _ = runtime.shutdown(None);
@@ -8372,6 +8422,349 @@ line-two on the real screen\r\n\
 
         let _ = child_b.kill();
         let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
+    /// A predecessor, a successor, and one real socket between them.
+    ///
+    /// Everything the handoff tests below need and nothing they do not: a live
+    /// `bash` on a real pty for the predecessor, a listener the successor
+    /// serves with the REAL [`crate::pty_handoff::serve_handoff`], and the real
+    /// [`crate::pty_handoff::send_session`] driving it from the other side.
+    #[cfg(target_os = "linux")]
+    struct HandoffRig {
+        socket: std::path::PathBuf,
+        pair: portable_pty::PtyPair,
+        _child: Box<dyn portable_pty::Child + Send + Sync>,
+        shell_pid: u32,
+        shell_start_time: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HandoffRig {
+        fn new(label: &str) -> Self {
+            use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+            let pair = native_pty_system()
+                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .expect("openpty");
+            let mut cmd = CommandBuilder::new("bash");
+            cmd.arg("--norc");
+            cmd.arg("-i");
+            cmd.env("PS1", "");
+            let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+            let shell_pid = child.process_id().expect("bash pid");
+            let shell_start_time =
+                crate::pty_adoption::process_start_time(shell_pid).expect("bash start time");
+            let socket = std::env::temp_dir().join(format!(
+                "ygg-handoff-{label}-{}-{shell_pid}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&socket);
+            Self {
+                socket,
+                pair,
+                _child: child,
+                shell_pid,
+                shell_start_time,
+            }
+        }
+
+        fn metadata(&self, key: &str, precommit_verdict: bool) -> crate::pty_handoff::HandoffMetadata {
+            crate::pty_handoff::HandoffMetadata {
+                version: crate::pty_handoff::HANDOFF_WIRE_VERSION,
+                runtime_key: key.to_string(),
+                launch_command: "bash".to_string(),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                shell_pid: self.shell_pid,
+                shell_start_time: self.shell_start_time,
+                screen: "CARRIED\r\n".to_string(),
+                precommit_verdict,
+            }
+        }
+
+        fn master_fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd;
+            self.pair.master.as_raw_fd().expect("master raw fd")
+        }
+
+        /// The predecessor's OWN master must still drive its shell. Arithmetic,
+        /// never a literal marker: a pty echoes what is written to it, so a
+        /// marker "arrives" even from a shell that died — only a value bash had
+        /// to EVALUATE proves the far end is alive.
+        fn shell_still_answers(&self, marker: &str) -> bool {
+            use std::io::{Read, Write};
+            let mut writer = self.pair.master.take_writer().expect("master writer");
+            let mut reader = self.pair.master.try_clone_reader().expect("master reader");
+            writer
+                .write_all(format!("printf '{marker}-%s\n' $((6*7))\n").as_bytes())
+                .expect("write to the predecessor's master");
+            writer.flush().ok();
+            let want = format!("{marker}-42");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut seen = String::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if seen.contains(&want) {
+                        let _ = tx.send(true);
+                        return;
+                    }
+                }
+                let _ = tx.send(false);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or(false)
+        }
+    }
+
+    /// Serve exactly one connection with the real successor half, and report
+    /// what it decided.
+    ///
+    /// `occupied_by` is the child the successor is already running under the
+    /// key — `None` for a vacant successor.
+    ///
+    /// ⚠ Whether a verdict goes out is NOT a parameter here, and that is the
+    /// contract under test: the successor answers only when the predecessor's
+    /// metadata says it is listening.
+    #[cfg(target_os = "linux")]
+    fn serve_one_handoff(
+        socket: &std::path::Path,
+        occupied_by: Option<(u32, u64)>,
+    ) -> std::thread::JoinHandle<crate::pty_handoff::HandoffServed> {
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket).expect("bind the handoff socket");
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the handoff");
+            crate::pty_handoff::serve_handoff(
+                &stream,
+                &mut |metadata| {
+                    // The real predicate's shape: a DIFFERENT live child under
+                    // the key is a conflict, the same one is not.
+                    match occupied_by {
+                        Some((pid, start))
+                            if (pid, start) != (metadata.shell_pid, metadata.shell_start_time) =>
+                        {
+                            Some(seat_conflict_reason(&metadata.runtime_key))
+                        }
+                        _ => None,
+                    }
+                },
+                &mut |_metadata, fd| {
+                    drop(fd);
+                    Ok(())
+                },
+            )
+        })
+    }
+
+    /// ⛔⛔⛔ A REFUSAL EVALUATED AFTER THE COMMIT POINT COSTS A WHOLE DAEMON.
+    ///
+    /// The successor's seat check is right and does not change: a DIFFERENT
+    /// live child under the same key must not be displaced. It used to run only
+    /// once the descriptor had already crossed, so the predecessor was told
+    /// `committed: true` — *"the fd is gone"* — about a refusal that could have
+    /// been free.
+    ///
+    /// ⚠ **And "the fd is gone" was never true**, which is why this was misread
+    /// for so long: [`HandoffTakeout::master_fd`] is BORROWED, `sendmsg` moves a
+    /// DUPLICATE, and a successor that refuses drops that duplicate. The real
+    /// cost is that the sweep books a failure it can never clear, so the
+    /// predecessor never reaches `AllMoved` and never retires — pinned for life
+    /// holding every session it owns.
+    ///
+    /// So this asserts BOTH halves, and the second is the one that was already
+    /// silently true: the refusal must land before the commit point, AND the
+    /// predecessor's own master must still drive its shell afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_handoff_is_answered_before_the_descriptor_moves() {
+        let _env = crate::codex_cli::env_test_guard();
+
+        let rig = HandoffRig::new("refused");
+        let key = "local://contested-in-test";
+        // The successor already runs a DIFFERENT child under this key: a real
+        // conflict, and the only case the seat rule refuses.
+        let served = serve_one_handoff(&rig.socket, Some((rig.shell_pid + 1, 7)));
+
+        let mut support = crate::pty_handoff::PrecommitSupport::default();
+        let error = crate::pty_handoff::send_session(
+            &rig.socket,
+            &rig.metadata(key, true),
+            rig.master_fd(),
+            &mut support,
+        )
+        .expect_err("a different live child under the key must be refused");
+
+        assert!(
+            !error.committed,
+            "the refusal must land BEFORE the commit point — a sweep that books \
+             a committed failure can never reach AllMoved, and the daemon that \
+             booked it never retires. Got: {error}"
+        );
+        assert_eq!(
+            support,
+            crate::pty_handoff::PrecommitSupport::Speaks,
+            "a successor that answered must be remembered as answering, or every \
+             later session in the sweep pays the timeout again"
+        );
+        let served = served.join().expect("successor thread");
+        assert!(
+            served.refused_before_commit,
+            "the successor must record which side of the commit point it refused on"
+        );
+        assert!(!served.adopted);
+
+        // ⭐ THE HALF THAT MATTERS TO A HUMAN: the session is untouched.
+        assert!(
+            rig.shell_still_answers("REFUSED"),
+            "a refused handoff must leave the predecessor's own master driving \
+             its shell — the agent on the far end never finds out"
+        );
+        let _ = std::fs::remove_file(&rig.socket);
+    }
+
+    /// ⛔ COMPATIBILITY, DIRECTION 1: a NEW predecessor against an OLD successor.
+    ///
+    /// An older successor knows nothing about a verdict and simply blocks in
+    /// `recvmsg`. The new predecessor must not hang waiting for a line that
+    /// will never come — it waits a bounded interval, records that this peer is
+    /// silent, and proceeds exactly as it does today.
+    ///
+    /// ⚠ The memo is the point, not the timeout: a sweep hands over every
+    /// runtime it owns to the same successor, so asking per session would cost
+    /// one timeout per session on a daemon holding the host's PTYs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_successor_that_never_answers_still_gets_the_descriptor() {
+        let _env = crate::codex_cli::env_test_guard();
+
+        let rig = HandoffRig::new("silent");
+        let socket = rig.socket.clone();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind the handoff socket");
+        // An OLD successor, hand-written: it reads the line and goes straight
+        // for the descriptor, exactly as every build before the verdict does.
+        let old = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let metadata = crate::pty_handoff::receive_metadata(&stream).expect("metadata");
+            let fd = crate::pty_handoff::receive_descriptor(&stream, &metadata).expect("fd");
+            drop(fd);
+            crate::pty_handoff::send_ack(&stream, &crate::pty_handoff::HandoffAck::adopted_here())
+                .expect("ack");
+        });
+
+        let mut support = crate::pty_handoff::PrecommitSupport::default();
+        crate::pty_handoff::send_session(
+            &socket,
+            &rig.metadata("local://silent-successor", true),
+            rig.master_fd(),
+            &mut support,
+        )
+        .expect("an older successor must still complete the handoff");
+        old.join().expect("old successor thread");
+
+        assert_eq!(
+            support,
+            crate::pty_handoff::PrecommitSupport::OneSilence,
+            "one silence must be REMEMBERED but must not yet conclude anything: \
+             an old build and a successor briefly behind its own runtime lock \
+             look identical here"
+        );
+        // ⭐ A SECOND silence is what settles it, and only then does the sweep
+        // stop waiting. Proving the transition needs the same peer twice,
+        // because the whole point is that one strike decides nothing.
+        // ⛔ The first listener's socket FILE outlives its listener; a bind over
+        // it is AddrInUse, not a fresh listener.
+        let _ = std::fs::remove_file(&socket);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("rebind the handoff socket");
+        let old = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let metadata = crate::pty_handoff::receive_metadata(&stream).expect("metadata");
+            let fd = crate::pty_handoff::receive_descriptor(&stream, &metadata).expect("fd");
+            drop(fd);
+            crate::pty_handoff::send_ack(&stream, &crate::pty_handoff::HandoffAck::adopted_here())
+                .expect("ack");
+        });
+        crate::pty_handoff::send_session(
+            &socket,
+            &rig.metadata("local://silent-successor-2", true),
+            rig.master_fd(),
+            &mut support,
+        )
+        .expect("still completes");
+        old.join().expect("old successor thread");
+        assert_eq!(
+            support,
+            crate::pty_handoff::PrecommitSupport::Silent,
+            "two silences settle it — from here the sweep stops paying the wait"
+        );
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// ⛔ COMPATIBILITY, DIRECTION 2: an OLD predecessor against a NEW successor.
+    ///
+    /// **This is the direction that fails silently if it fails at all.** An
+    /// older predecessor reads the first line after its own `sendmsg` as its
+    /// ack. A successor that volunteered a verdict would hand it a line it
+    /// cannot parse, and a handover that works today would start reporting
+    /// "unreadable ack" — a regression caused entirely by the fix.
+    ///
+    /// The metadata's `precommit_verdict` flag is what prevents it, and
+    /// `#[serde(default)]` is what makes an old line say `false` without ever
+    /// having heard of the field.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_predecessor_that_never_asks_is_never_sent_a_verdict() {
+        use std::io::Write;
+        let _env = crate::codex_cli::env_test_guard();
+
+        let rig = HandoffRig::new("unasked");
+        let key = "local://unasked-in-test";
+        // A conflict, so the successor has something it WANTS to say early.
+        let served = serve_one_handoff(&rig.socket, Some((rig.shell_pid + 1, 7)));
+
+        // An OLD predecessor, hand-written: no flag, no verdict read, and the
+        // first line it sees after the descriptor is taken to be its ack.
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&rig.socket).expect("connect");
+        let mut line = serde_json::to_string(&rig.metadata(key, false)).expect("encode");
+        line.push('\n');
+        stream.write_all(line.as_bytes()).expect("send metadata");
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+
+        let mut first = Vec::new();
+        {
+            use std::io::Read;
+            let mut byte = [0u8; 1];
+            while let Ok(1) = (&stream).read(&mut byte) {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                first.push(byte[0]);
+            }
+        }
+        let first = String::from_utf8_lossy(&first).into_owned();
+        let ack: crate::pty_handoff::HandoffAck = serde_json::from_str(first.trim()).expect(
+            "the FIRST line an unasking predecessor sees must be an ack it can parse — \
+             a volunteered verdict lands here and breaks a handover that works today",
+        );
+        assert!(!ack.adopted, "the conflict is still refused, just not early");
+
+        let served = served.join().expect("successor thread");
+        assert!(
+            served.refused_before_commit,
+            "the successor still declines to take a descriptor it cannot seat, \
+             whether or not anyone asked it to say so first"
+        );
+        // And the old predecessor's session is untouched either way.
+        assert!(rig.shell_still_answers("UNASKED"));
+        let _ = std::fs::remove_file(&rig.socket);
     }
 
     /// ⛔⛔ THE DISCRIMINATOR THE DUPLICATE-PRUNE RESTS ON.

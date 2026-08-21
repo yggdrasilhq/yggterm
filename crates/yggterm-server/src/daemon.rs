@@ -4783,6 +4783,13 @@ impl DaemonRuntime {
         let mut moved_keys: Vec<String> = Vec::new();
         let mut successor_identity = None::<(u32, u64)>;
         let mut first_failure = None::<String>;
+        // ⭐ Learned ONCE for the whole sweep, not once per session. A successor
+        // that predates the pre-commit verdict costs one timeout here; asking it
+        // per runtime would cost one per runtime, on a daemon that is holding
+        // every PTY on the host while it waits.
+        let mut precommit = crate::pty_handoff::PrecommitSupport::default();
+        let mut refused_before_commit = 0usize;
+        let mut refused_after_commit = 0usize;
         // ⛔⛔ ATTEMPT EVERY SESSION. This loop used to `break` on the first
         // failure, so ONE stuck key abandoned every remaining runtime — measured
         // live 2026-08-14 as `readers_stood_down: 11, moved: 0`, eleven healthy
@@ -4815,14 +4822,34 @@ impl DaemonRuntime {
                 shell_pid: takeout.shell_pid,
                 shell_start_time: takeout.shell_start_time,
                 screen: takeout.screen,
+                // We will read the verdict. Constant from this build: the
+                // successor answers only when told someone is listening, and a
+                // predecessor that never asks is one this daemon is not.
+                precommit_verdict: true,
             };
-            match crate::pty_handoff::send_session(&socket, &metadata, takeout.master_fd) {
+            match crate::pty_handoff::send_session(
+                &socket,
+                &metadata,
+                takeout.master_fd,
+                &mut precommit,
+            ) {
                 Ok(ack) => {
                     moved += 1;
                     moved_keys.push(key.clone());
                     successor_identity = ack.adopter_identity().or(successor_identity);
                 }
                 Err(error) => {
+                    // ⛔ `refused` is asked, not `!committed`. A connect that
+                    // failed is uncommitted too, and counting it as a refusal
+                    // would report the successor's sessions when the fault was
+                    // in the wire.
+                    if error.refused {
+                        if error.committed {
+                            refused_after_commit += 1;
+                        } else {
+                            refused_before_commit += 1;
+                        }
+                    }
                     first_failure = first_failure.or(Some(format!("{key}: {error}")));
                     continue;
                 }
@@ -4843,6 +4870,9 @@ impl DaemonRuntime {
             successor_identity,
             stood_down,
             resumed: released.len(),
+            precommit: precommit.as_str(),
+            refused_before_commit,
+            refused_after_commit,
         }
     }
 
@@ -14735,6 +14765,11 @@ fn spawn_superseded_self_retire_sweep(
                         "outcome": format!("{:?}", outcome.sweep),
                         "readers_stood_down": outcome.stood_down,
                         "readers_resumed": outcome.resumed,
+                        // Whether the successor answered before the commit
+                        // point, and how many refusals that made free.
+                        "precommit": outcome.precommit,
+                        "refused_before_commit": outcome.refused_before_commit,
+                        "refused_after_commit": outcome.refused_after_commit,
                         "server_version": SERVER_PROTOCOL_VERSION,
                         "pid": std::process::id(),
                     }),
@@ -14787,6 +14822,25 @@ pub(crate) struct HandoffSweepOutcome {
     pub stood_down: usize,
     /// Readers woken again because their runtime did not move.
     pub resumed: usize,
+    /// What this sweep learned about the successor's wire — `"speaks"`,
+    /// `"silent"`, or `"unknown"` when nothing needed asking.
+    ///
+    /// ⚠ Mixed-version handoffs are the normal case on a fleet, not the edge
+    /// one, and a compatibility path nobody can see is a compatibility path
+    /// nobody can prove. This is how a reader tells "the pre-commit step did not
+    /// fire" from "there was nothing for it to catch".
+    pub precommit: &'static str,
+    /// Refusals that cost nothing because they landed BEFORE the descriptor
+    /// moved. Counted apart from `first_failure` so a conflict — which is a
+    /// fact about the successor's own sessions — is never read as a transport
+    /// fault, which is a fact about the wire.
+    pub refused_before_commit: usize,
+    /// ⭐ **THE NUMBER THIS PROTOCOL STEP EXISTS TO DRIVE TO ZERO.** A refusal
+    /// the successor could only voice once it held the descriptor. Nonzero
+    /// means either a successor too old to answer early, or a key that became
+    /// contested between the verdict and the seat — and the two are told apart
+    /// by `precommit`.
+    pub refused_after_commit: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -14800,6 +14854,9 @@ impl HandoffSweepOutcome {
             successor_identity: None,
             stood_down: 0,
             resumed: 0,
+            precommit: crate::pty_handoff::PrecommitSupport::Unknown.as_str(),
+            refused_before_commit: 0,
+            refused_after_commit: 0,
         }
     }
 
@@ -15095,85 +15152,100 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
         .spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let outcome = crate::pty_handoff::receive_session(&stream);
-                let (adopted, error) = match outcome {
-                    Ok((metadata, fd)) => {
+                // ⭐⭐ THE SEAT DECISION MOVES AHEAD OF THE DESCRIPTOR.
+                //
+                // The metadata line carries the entire input to the decision —
+                // key, child pid, child start time — and it arrives before the
+                // fd. Answering there is the difference between a refusal that
+                // costs nothing and one that books a failed handoff, which is
+                // what pins a predecessor for the rest of its life.
+                //
+                // The ORDER lives in `serve_handoff`, not here: these two
+                // closures are the only part a daemon does differently from a
+                // test, and keeping the sequence out of this loop is what lets
+                // the regression test drive the real one.
+                let served = crate::pty_handoff::serve_handoff(
+                    &stream,
+                    &mut |metadata| {
+                        let rt = lock_daemon_runtime(&runtime, "pty_handoff_seat_verdict");
+                        matches!(
+                            rt.terminals.seat_verdict(
+                                &metadata.runtime_key,
+                                metadata.shell_pid,
+                                metadata.shell_start_time,
+                            ),
+                            crate::terminal::SeatVerdict::Conflict
+                        )
+                        .then(|| crate::terminal::seat_conflict_reason(&metadata.runtime_key))
+                    },
+                    &mut |metadata, fd| {
                         let mut rt = lock_daemon_runtime(&runtime, "pty_handoff_adopt");
-                        match rt.terminals.adopt_session(
-                            &metadata.runtime_key,
-                            &metadata.launch_command,
-                            metadata.cwd.as_deref(),
-                            metadata.cols,
-                            metadata.rows,
-                            fd,
-                            metadata.shell_pid,
-                            metadata.shell_start_time,
-                            Some(metadata.screen.as_str()),
-                        ) {
-                            Ok(()) => {
-                                // ⛔⛔ PERSIST NOW, NOT ON THE NEXT ROUTINE TICK.
-                                // During a handover the PREDECESSOR's routine
-                                // persistence is muted for ever
-                                // (`superseded_routine_persist_muted`, so it
-                                // cannot clobber the successor's state file),
-                                // and the successor has not yet reached a tick.
-                                // ⇒ there is a window in which NO process on
-                                // the host will write the session state, and it
-                                // is exactly the window where every runtime is
-                                // in flight. Measured 2026-08-13: a successor
-                                // adopted 38 runtimes and was signalled 16 s
-                                // later; **seven agent sessions resolved to
-                                // nothing afterwards** because neither daemon
-                                // had recorded them. A row that was written
-                                // down can be re-resumed — that is what the
-                                // manual `resume-cc --require-existing`
-                                // recovery proved.
-                                let persisted = rt.persist_state_only().is_ok();
-                                append_trace_event(
-                                    &home_dir,
-                                    "daemon",
-                                    "lifecycle",
-                                    "pty_handoff_adopted",
-                                    serde_json::json!({
-                                        "runtime_key": metadata.runtime_key,
-                                        "shell_pid": metadata.shell_pid,
-                                        "cols": metadata.cols,
-                                        "rows": metadata.rows,
-                                        "screen_bytes": metadata.screen.len(),
-                                        // A failure here means the row is live
-                                        // but unrecoverable, which is worth
-                                        // seeing before someone kills a daemon.
-                                        "persisted": persisted,
-                                    }),
-                                );
-                                (true, None)
-                            }
-                            Err(error) => (false, Some(format!("{error:#}"))),
-                        }
-                    }
-                    Err(error) => (false, Some(format!("{error:#}"))),
-                };
-                if let Some(reason) = error.as_deref() {
+                        rt.terminals
+                            .adopt_session(
+                                &metadata.runtime_key,
+                                &metadata.launch_command,
+                                metadata.cwd.as_deref(),
+                                metadata.cols,
+                                metadata.rows,
+                                fd,
+                                metadata.shell_pid,
+                                metadata.shell_start_time,
+                                Some(metadata.screen.as_str()),
+                            )
+                            .map_err(|error| format!("{error:#}"))?;
+                        // ⛔⛔ PERSIST NOW, NOT ON THE NEXT ROUTINE TICK.
+                        // During a handover the PREDECESSOR's routine
+                        // persistence is muted for ever
+                        // (`superseded_routine_persist_muted`, so it cannot
+                        // clobber the successor's state file), and the
+                        // successor has not yet reached a tick. ⇒ there is a
+                        // window in which NO process on the host will write the
+                        // session state, and it is exactly the window where
+                        // every runtime is in flight. Measured 2026-08-13: a
+                        // successor adopted 38 runtimes and was signalled 16 s
+                        // later; **seven agent sessions resolved to nothing
+                        // afterwards** because neither daemon had recorded them.
+                        // A row that was written down can be re-resumed — that
+                        // is what the manual `resume-cc --require-existing`
+                        // recovery proved.
+                        let persisted = rt.persist_state_only().is_ok();
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "pty_handoff_adopted",
+                            serde_json::json!({
+                                "runtime_key": metadata.runtime_key,
+                                "shell_pid": metadata.shell_pid,
+                                "cols": metadata.cols,
+                                "rows": metadata.rows,
+                                "screen_bytes": metadata.screen.len(),
+                                // A failure here means the row is live but
+                                // unrecoverable, which is worth seeing before
+                                // someone kills a daemon.
+                                "persisted": persisted,
+                            }),
+                        );
+                        Ok(())
+                    },
+                );
+                if let Some(reason) = served.error.as_deref() {
                     append_trace_event(
                         &home_dir,
                         "daemon",
                         "lifecycle",
                         "pty_handoff_refused",
-                        serde_json::json!({ "error": reason }),
+                        serde_json::json!({
+                            "error": reason,
+                            "runtime_key": served.runtime_key,
+                            // ⭐ Which side of the commit point this landed on.
+                            // `false` is a descriptor that crossed only to be
+                            // closed, and that is the number this step exists
+                            // to drive to zero.
+                            "before_commit": served.refused_before_commit,
+                        }),
                     );
                 }
-                // ⭐ The ack NAMES this daemon when it adopts. The predecessor
-                // is about to wait for a successor to survive, and "a live
-                // daemon of the right version" is not the same claim as "the
-                // process that took my descriptors is still there".
-                let ack = if adopted {
-                    crate::pty_handoff::HandoffAck::adopted_here()
-                } else {
-                    crate::pty_handoff::HandoffAck::refused(
-                        error.unwrap_or_else(|| "no reason given".to_string()),
-                    )
-                };
-                let _ = crate::pty_handoff::send_ack(&stream, &ack);
             }
         })
         .ok();

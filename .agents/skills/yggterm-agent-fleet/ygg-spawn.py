@@ -38,6 +38,10 @@ import subprocess
 import sys
 import time
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_transcript  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
 
@@ -227,10 +231,11 @@ def main():
     deadline = time.time() + TRANSCRIPT_LAG_GRACE_S
     seen = False
     while time.time() < deadline:
-        for path in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl")):
-            if ack in open(path, errors="replace").read():
-                seen = True
-                break
+        # ⛔ The brief-arrived proof. Hardcoding one store made this unanswerable
+        #    for every other CLI — so a non-reference lane could never be born
+        #    PROVEN, which is the one guarantee this verb exists to give.
+        if ygg_transcript.carries(uuid, ack):
+            seen = True
         if seen:
             break
         time.sleep(3)
