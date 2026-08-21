@@ -139,10 +139,59 @@ touch is any statement of the form "N distinct rows" — that is a host-id count
 not a total.
 
 
-⚠ **WHAT IS STILL MISSING, so nobody reads the above as the whole ask.** The activation ORIGIN
-— user gesture vs app-driven switch — is still not recorded, and it is still the measurement
-that would settle whether the *active session* changes on its own (see the paragraph below).
-That is a native-side event, not an xterm one, and this probe does not supply it.
+### ⭐⭐ THE ACTIVATION ORIGIN NOW EXISTS — 2026-08-21, `session/activation`
+
+*The paragraph this replaces said the origin "is still not recorded" and that adding it was the
+first piece of work this entry wanted. It is recorded now.*
+
+**What it is.** Every change of the active row emits `session/activation` carrying `from`, `to`,
+`origin`, `origin_site` and — the field the entry actually needs — **`user_gesture`**. A hand
+clicking a row and an orchestrator opening one are now different rows in the trace, where before
+they were the same one.
+
+⛔⛔ **AND THE DESIGN IS THE POINT, not the record.** `active_session_path` now has **exactly one
+writer**, and that writer takes an origin as a required argument — so a path that changes the
+active row without saying why does not compile. An origin stamped at the call sites somebody
+remembered would have been worse than nothing here: an unexplained switch and an
+*uninstrumented* one would look identical, which is this entry's original blind spot moved one
+layer up rather than closed. `the_active_session_path_has_exactly_one_writer` fails on a second
+assignment anywhere in the server.
+
+⚠ **`app_control` is deliberately NOT a gesture.** Somebody meant it, but the question here is
+whether the person AT THE MACHINE moved — and an orchestrator opening a row while they read is
+the symptom, not the control. Counting it as a gesture would answer the entry's question with
+the wrong sign.
+
+⚠ **Re-activating the row already active emits nothing.** It is counted per origin and carried
+on the next real switch as `redundant_since_previous`. That is what an idempotent click and a
+repair loop both look like, and `request_terminal_launch_for_active` fired 13 times in 1.3
+minutes in the window at the top of this entry — as records, that is the byte budget spent
+restating that nothing moved.
+
+⇒ **The falsifier this entry has been unable to run is now runnable:** leave the GUI untouched
+with agent rows producing output and count `session/activation` records whose `user_gesture` is
+false and whose `origin` is not `launch`. Any such record is the app changing the active row by
+itself, named at its call site.
+
+⛔ **A quiet window on an older build is not evidence.** A GUI or daemon predating this emits
+nothing here; check the category exists before reading silence as "nothing switched".
+
+**Proven live, headless sandbox, 2026-08-21.** The same action, two doors, two records:
+
+```
+gesture=True   user_gesture  sidebar_row_select    …be01367e -> …471d168f     (a click on the row)
+gesture=False  app_control   app_control_open      …bbc4bc76 -> …be01367e     (server app open)
+```
+
+⚠ **AND THREE READING TRAPS FOUND WHILE PROVING IT**, all measured, all now in
+`docs/observability.md` §2.3: one switch can appear **twice from two processes** (the GUI and the
+daemon each hold a server, and the daemon's copy reads like an app-driven switch — filter by the
+GUI's pid); **`user_gesture` names the code path, not the human**, because `server app pointer|grid
+click` drives the real click path by design, and the discriminator is the `app_control` request
+sitting immediately before it on the plane; and **every short-lived CLI process emits a `restore`
+activation** of its own.
+
+⭐ Cost: **0.86% of records, 1.21% of trace bytes** in a switch-dense window.
 
 #### ⛔ AND ONE OF THE PRE-EXISTING PROBES LIES ABOUT FRAME RATE — with the ghost measured in it
 
@@ -375,6 +424,100 @@ at 0, so a row refused every tick still printed identically to a healthy one —
 reads that through `list | grep <uuid>`, which throws the header away. A sibling lane spent
 ~7.8 hours reading that line and concluding it was armed. `escalated` prints there too, since
 *boots delivered* and *the row woke* are different facts.
+
+## ⛔⛔ [11.22] THE WIRE-SHAPE STAMP IS RED ON `main`, SO THE GATE THAT CATCHES PROTOCOL DRIFT IS OFF
+
+**Status:** AWAITING A DECISION
+
+*Whoever changed the wire owns the bump and the re-stamp; a lane cannot stamp a protocol change
+it did not make and cannot describe.*
+
+`daemon::tests::protocol_shape_stamp_forces_version_bump` fails on `origin/main`. Measured
+2026-08-21 by extracting the two enum blocks from `origin/main`'s own `daemon.rs` and hashing
+them with the project's `fnv1a_build_id`:
+
+* computed `0xb0be92515d8e30a0`
+* stamped `0x59be8a8cd2b159bf` at `STAMPED_AT_VERSION = "3.1.16"`
+
+⇒ **`ServerRequest`/`ServerResponse` changed and landed without the stamp or the version moving
+with them**, which is the exact condition the test exists to prevent: protocol compatibility
+across machines is version-ORDERED, so two builds of one version with different wire shapes make
+the compatibility gate look at them as identical. That is the lost-PTY latch storm of 2026-07-17,
+and the fleet currently coexists several daemon versions by design.
+
+⚠ **It also masks the next drift.** A permanently-red gate is a gate nobody reads, so the next
+wire change lands under a green-looking failure and nobody notices either.
+
+**Not fixed here.** The fix is to bump the workspace version and re-stamp both constants **in the
+same commit as the wire change** — that ordering is the whole contract, and doing it from an
+unrelated lane would stamp a change this lane did not make and cannot describe.
+
+**Falsifier:** `cargo test -p yggterm-server protocol_shape_stamp_forces_version_bump` on a clean
+`origin/main` checkout. It must pass.
+
+## ⛔⛔ [11.22] `cargo test` WRITES 1.6 MiB OF SYNTHETIC EVENTS ONTO THE TRACE PLANE EVERY LANE READS
+
+**Status:** OPEN
+
+Measured 2026-08-21 with an empty `YGGTERM_HOME`: one `cargo test -p yggterm-shell` run writes
+**2624 records, 1658 KiB** into whatever trace home is set — and with no `YGGTERM_HOME` set, that
+home is the real one.
+
+| writer | records | KiB |
+|---|---:|---:|
+| `ui_telemetry/restore_debug` | 551 | 361 |
+| `ui_telemetry/preview_debug` | 550 | 354 |
+| `ui_telemetry/terminal_open_attempt` | 182 | 317 |
+| `terminal_open_attempt/begin` | 116 | 218 |
+| `session/activation` | 574 | 203 |
+| `terminal_identity/sync_error` | 534 | 102 |
+
+⛔ **The cost is not disk, it is EVIDENCE.** A synthetic record is indistinguishable from a real
+one to every reader of this plane — a test-run `session/activation` looks exactly like the app
+changing the active row by itself, which is the very thing that probe exists to establish. And
+retention here is a **byte budget**, so a few suite runs shorten the diagnostic window for every
+lane at once.
+
+⚠ **This is pre-existing and project-wide, not one probe's defect** — five of the six writers
+above predate the activation probe. It is filed now because the sixth made it measurable.
+
+⚠ **Known contamination:** roughly 2000 synthetic `session/activation` records were written into
+the build host's trace file by this lane's own test runs before the guard below existed. They
+carry a short-lived test-binary `pid` and cluster inside the minutes the suite ran; do not read
+them as switches.
+
+**Partly mitigated.** `set_active_session_path` skips the emit under `cfg!(test)`, which removes
+the server crate's own 1224-test suite entirely (measured: 0 records). ⛔ It does **not** cover a
+dependent crate's tests — `yggterm-shell`'s suite compiles `yggterm-server` without the `test`
+cfg, which is where the 574 above still come from.
+
+**The fix belongs to the harness, not to any probe.** Every test process should resolve
+`YGGTERM_HOME` to a temporary directory by construction, so no test can reach the real plane
+whatever it calls. Guarding one probe at a time leaves the other five looking deliberate.
+
+**Falsifier:** `YGGTERM_HOME=$(mktemp -d) cargo test` then count records in that directory. It
+must be zero, for every crate.
+
+## ⚠ [11.22] TWO TESTS PASS ALONE AND FAIL UNDER THE PARALLEL SUITE
+
+**Status:** OPEN
+
+`shell::tests::the_snapshot_cache_dedups_without_writes_and_invalidates_on_one` and
+`host_panic::tests::notify_owner_reaps_the_notification_child` each pass when run alone and fail
+intermittently in a full `cargo test` run — the shell one failed on one run of the suite and not
+the next, on an unchanged tree.
+
+The snapshot-cache one reads `SHELLSTATE_MUT_TOTAL`, a **process-global** counter, and asserts
+that it did not move between two calls. Any other test in the same process that writes shell state
+breaks that assumption, so the test is asserting a property of the PROCESS while claiming one about
+the cache.
+
+⚠ **Why it matters beyond the noise:** an intermittently-red suite is one a lane learns to read
+past, and the next real regression arrives in the same colour. Both tests need to own their
+precondition — a per-test counter, or serialisation — rather than borrow the process's.
+
+⛔ Neither is a product defect and neither is caused by the activation-origin change: both files
+are untouched by it, and both pass in isolation on that branch.
 
 ## ⛔⛔ [11.20] THE DRAFT FLAG IS RESET BY EVERY DAEMON HANDOVER, AND IT FAILS OPEN
 
