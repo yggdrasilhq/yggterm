@@ -6373,18 +6373,35 @@ fn TerminalCanvas(
             // echo read burst is armed at enqueue and the daemon's own
             // `input/pty` probe still stamps the delivery.
             let (terminal_write_tx, mut terminal_write_queue_rx) =
-                tokio::sync::mpsc::unbounded_channel::<String>();
+                tokio::sync::mpsc::unbounded_channel::<(String, u64)>();
             let (terminal_write_failure_tx, mut terminal_write_failure_rx) =
                 tokio::sync::mpsc::unbounded_channel::<(serde_json::Value, anyhow::Error)>();
             {
                 let endpoint = endpoint.clone();
                 let write_path = terminal_input_session_path.clone();
                 tokio::spawn(async move {
-                    while let Some(data) = terminal_write_queue_rx.recv().await {
+                    ensure_loop_branch_share_flusher();
+                    while let Some((data, enqueued_ms)) = terminal_write_queue_rx.recv().await {
+                        // The keystroke→pty span is stamped at the Input arm
+                        // (enqueue) and at the daemon's PTY write, so its p95
+                        // is entirely THIS task's territory: ordering backlog
+                        // (queue wait) plus the daemon RPC. Split the two into
+                        // the windowed share census — a flat RPC p95 names the
+                        // daemon's runtime lock; a queue-wait p95 names one
+                        // slow write holding the ordered line.
+                        record_loop_branch_share(
+                            "writer:queue_wait",
+                            current_millis().saturating_sub(enqueued_ms),
+                        );
                         let shape = yggterm_core::perf::input_shape(&data);
-                        if let Err(error) =
-                            terminal_write_async(endpoint.clone(), write_path.clone(), data).await
-                        {
+                        let rpc_started_ms = current_millis();
+                        let outcome =
+                            terminal_write_async(endpoint.clone(), write_path.clone(), data).await;
+                        record_loop_branch_share(
+                            "writer:rpc",
+                            current_millis().saturating_sub(rpc_started_ms),
+                        );
+                        if let Err(error) = outcome {
                             // The loop dropping its failure receiver means the
                             // session unmounted: nothing left to recover.
                             if terminal_write_failure_tx.send((shape, error)).is_err() {
@@ -7737,7 +7754,7 @@ fn TerminalCanvas(
                                 // enqueue — if the write later fails, the recovery
                                 // branch resets the cadence exactly as the inline
                                 // error path did.
-                                let _ = terminal_write_tx.send(data.clone());
+                                let _ = terminal_write_tx.send((data.clone(), current_millis()));
                                 if is_remote_resume_session {
                                     set_signal_if_changed(terminal_resume_surface_staged, true);
                                     set_signal_if_changed(terminal_live_host_connected, true);

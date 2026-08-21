@@ -1630,8 +1630,26 @@ deploy restart raced the owner's own manual GUI relaunch (12:01:27, systemd desk
 next report can say so plainly. ⚠ The reconcile path has not yet FIRED on the new build (cold
 mounts don't trigger it); its first natural reveal-transition will, and the
 `screen_reconcile_apply` branch guard witnesses it. The echo bar is still graded by the next
-clean typed window — the ~221 ms p95 band is per-iteration loop cost (`read_poll_apply`), a
-separate slice, and is NOT claimed fixed by this deploy.
+clean typed window.
+
+**FIRST `input/loop_share` WINDOW (13:01–13:32, GUI 3.1.21/`8a06ba1c` which contains both
+11.12 slices via the fleet roll) — one result each way:**
+
+- 🟢 **The off-loop fix's falsifier PASSES:** `pre_select` — 52,538 iterations, total 281 ms,
+  **max 14 ms** (was 2.8–10.0 s holds). `screen_reconcile_apply` fired 21 times live, max
+  1 ms — the moved path is exercised and healthy.
+- 🔴 **The per-iteration-cost hypothesis for the 221 ms p95 band is REFUTED:**
+  `read_poll_apply` ran 23,335 times at **mean 0.5 ms** (16 drops over 10 ms) — the ~5,700-line
+  body is cheap per pass, and splitting it would have bought nothing. And the span's own anatomy narrows it
+  further: `input/keystroke` is stamped IN the Rust Input arm (viewport.rs, not JS), so the
+  measured 221 ms p95 EXCLUDES the UI-thread transit entirely — the band lives between the arm
+  and the PTY, i.e. ordered-channel queue wait + the writer task's daemon RPC (the same daemon
+  runtime lock whose inline waits once measured 41.6 s/68.8 s; being off-loop stopped it
+  stalling LATER keystrokes, not the write itself). Next instrument: the writer leg split —
+  windowed rollups of queue-wait and RPC servicing (`writer:queue_wait` / `writer:rpc` in the
+  `loop_share` census). ⚠ Separately: the UI-thread transit before the arm is UNMEASURED (the
+  user feels it; no probe sees it) — a JS-side timestamp would make the chain honest end to
+  end, filed as its own debt.
 
 ## ⛔⛔⛔ [11.5] THE INPUT CHAIN PROVES DELIVERY TO THE PTY, NEVER CONSUMPTION BY THE PROGRAM — AND THAT IS THE GAP "I CANNOT TYPE" FALLS THROUGH
 
