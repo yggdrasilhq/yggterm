@@ -763,6 +763,18 @@ timestamp against `date` before trusting the window**. (Separately: `--since`
 without an explicit `--lines` silently caps at 20 records — the opposite failure,
 same consequence.)
 
+### ⛔ `ytrace query` AND `ytrace tail` READ DIFFERENT DATA — never publish a query COUNT
+
+Measured 2026-08-21 on the laptop, same host, same home, same window: `ytrace
+query --category input --since 90m` returned **zero rows** while `tail --category
+input --since 2h --lines 25000` returned **18,336 events**; and the heartbeat's
+`ui_blocks_per_min` (computed through the same `ytrace::query::summarize`)
+reported **242.6/min** where the incident files hold ~1/min. Two disagreements,
+opposite directions, one shared layer. Until `summarize` is root-caused:
+**events come from `tail --lines N` (plus the newest-timestamp check above) or
+the notebooks; a `query`/`summarize` count or rate is not evidence.** This also
+taints any consumer of `summarize` — `host_panic` density fields included.
+
 ### ⛔⛔ A WEBVIEW FLUSH-GATE TIMEOUT IS NOT EVIDENCE THE UI IS STALE
 
 `webview_edit_flush_timeouts` counts times the VirtualDom was frozen waiting for
