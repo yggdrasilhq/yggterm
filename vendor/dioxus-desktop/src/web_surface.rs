@@ -27,6 +27,7 @@ use gtk::gdk;
 use gtk::prelude::*;
 
 use crate::web_surface_clipboard_image_paste::CLIPBOARD_IMAGE_PASTE_SHIM_JS;
+use crate::web_surface_media_trace::MEDIA_TRACE_SHIM_JS;
 use wry::{
     dpi::{LogicalPosition, LogicalSize, Position, Size},
     http::{Request, Response},
@@ -574,6 +575,25 @@ fn load_tls_pins() -> Vec<TlsPin> {
         .collect()
 }
 
+/// One drain of a surface page's media probe (`web_surface_media_trace`).
+///
+/// The records travel as raw `Value`s because this crate cannot see
+/// `yggterm-core::trace_contract` — and it must not, because a second decoder
+/// for the record grammar is a second encoding of it, which is precisely what
+/// the trace contract exists to prevent. The shell owns the ONE validator; this
+/// side only carries bytes and stamps the thing the page is not allowed to
+/// claim.
+///
+/// ⛔ `surface_id` is stamped HERE, never read from the message, for the same
+/// reason the contract stamps `pid` rather than carrying it: a page that could
+/// name its own surface could name someone else's, and every row/tab
+/// attribution downstream would inherit the lie.
+#[derive(Debug, Clone)]
+pub struct SurfaceTraceBatch {
+    pub surface_id: u64,
+    pub records: Vec<serde_json::Value>,
+}
+
 fn attach_surface_message_channel(
     webview: &wry::WebView,
     surface_id: u64,
@@ -582,6 +602,7 @@ fn attach_surface_message_channel(
     capture_asks: &Rc<RefCell<Vec<PendingCaptureAsk>>>,
     fresh_capture_asks: &Rc<RefCell<Vec<SurfaceCaptureAsk>>>,
     engine_capture_asks: &Rc<RefCell<HashMap<u64, u64>>>,
+    trace_batches: &Rc<RefCell<Vec<SurfaceTraceBatch>>>,
 ) {
     install_tls_pin_handler(webview);
     use webkit2gtk::{UserContentManagerExt as _, WebViewExt as _};
@@ -597,6 +618,7 @@ fn attach_surface_message_channel(
     let capture_asks = capture_asks.clone();
     let fresh_capture_asks = fresh_capture_asks.clone();
     let engine_capture_asks = engine_capture_asks.clone();
+    let trace_batches = trace_batches.clone();
     manager.connect_script_message_received(Some(SURFACE_MESSAGE_HANDLER), move |_, result| {
         let Some(value) = result.js_value() else {
             return;
@@ -604,6 +626,26 @@ fn attach_surface_message_channel(
         let Ok(message) = serde_json::from_str::<serde_json::Value>(&value.to_string()) else {
             return;
         };
+        // The media probe's drain (`web_surface_media_trace`). Checked FIRST
+        // because it is by far the highest-volume message on this channel, and
+        // every branch below it would otherwise be a string compare per drain.
+        //
+        // Nothing is validated or written here: the batch is moved to the shell,
+        // which owns the one validator and does the write off the UI thread.
+        if message.get("type").and_then(|kind| kind.as_str()) == Some("trace") {
+            let Some(records) = message.get("records").and_then(|records| records.as_array())
+            else {
+                return;
+            };
+            if records.is_empty() {
+                return;
+            }
+            trace_batches.borrow_mut().push(SurfaceTraceBatch {
+                surface_id,
+                records: records.clone(),
+            });
+            return;
+        }
         // A page reporting that it is waiting on `getUserMedia()`. The engine
         // will not tell us this on an unpresented surface — see
         // §THE ASK THE ENGINE NEVER RAISES — so the page's own word is the only
@@ -1944,6 +1986,16 @@ pub struct WebSurfaceHost {
     /// `THEME_COLOR_SHIM_JS`). The shell reads it to paint the seam; nothing
     /// here parses it.
     theme_colors: Rc<RefCell<HashMap<u64, String>>>,
+    /// Media-probe drains the shell has not written yet, taken each reconcile
+    /// tick. See [`SurfaceTraceBatch`] and `web_surface_media_trace`.
+    ///
+    /// ⚠ Bounded on the way OUT (the shell takes the whole queue every tick)
+    /// rather than on the way in: the page's own ring already bounds how much
+    /// any one surface can produce per drain, and a second cap here would
+    /// discard records that had already survived the emitter's rationing —
+    /// i.e. it would shed evidence at the one hop that has no back-pressure to
+    /// report it with.
+    trace_batches: Rc<RefCell<Vec<SurfaceTraceBatch>>>,
     /// Capture asks the shell has not been told about yet, drained each
     /// reconcile tick. See the HARDWARE CAPTURE section.
     media_permission_requests: Rc<RefCell<Vec<SurfaceMediaPermissionRequest>>>,
@@ -3842,6 +3894,11 @@ struct SurfaceWindowPlumbing {
     capture_asks: Rc<RefCell<Vec<PendingCaptureAsk>>>,
     fresh_capture_asks: Rc<RefCell<Vec<SurfaceCaptureAsk>>>,
     engine_capture_asks: Rc<RefCell<HashMap<u64, u64>>>,
+    // ...and a popup plays media exactly as a tab does — a site that pops its
+    // player out into its own window is the ordinary case, not the exotic one.
+    // A probe wired on the tab path alone would go quiet at precisely the
+    // moment the user moved the video somewhere more comfortable.
+    trace_batches: Rc<RefCell<Vec<SurfaceTraceBatch>>>,
     userscripts: Vec<SurfaceUserscript>,
     adblock_ruleset: Option<std::path::PathBuf>,
 }
@@ -3997,6 +4054,7 @@ fn build_popup_webview(
         next_media_permission_id,
         capture_asks,
         fresh_capture_asks,
+        trace_batches,
         engine_capture_asks,
         userscripts,
         adblock_ruleset,
@@ -4048,6 +4106,10 @@ fn build_popup_webview(
         // the "verify with your camera" window IS a popup. See
         // §THE ASK THE ENGINE NEVER RAISES.
         .with_initialization_script_for_main_only(CAPTURE_ASK_SHIM_JS, true)
+        // ...and a popup's media is traced like a tab's. ALL FRAMES (`false`):
+        // a player commonly lives in an iframe, and the probe is event-driven,
+        // so a frame with no media schedules nothing and costs nothing.
+        .with_initialization_script_for_main_only(MEDIA_TRACE_SHIM_JS, false)
         // A popup is a SURFACE, so both new-window doors are its too. Without
         // these a `target="_blank"` inside an already-popped-up page (the
         // "Continue with Google" on a consent screen) was answered with a null
@@ -4095,6 +4157,7 @@ fn build_popup_webview(
         capture_asks,
         fresh_capture_asks,
         engine_capture_asks,
+        trace_batches,
     );
     // Capture: the SAME gate a page surface gets, for the same reason a popup
     // gets the passkey shim — the window a site pops up to "verify you" is
@@ -4319,6 +4382,7 @@ impl WebSurfaceHost {
             contexts: Rc::new(RefCell::new(HashMap::new())),
             next_id: Rc::new(Cell::new(1)),
             popups: Rc::new(RefCell::new(Vec::new())),
+            trace_batches: Rc::new(RefCell::new(Vec::new())),
             link_opens: Rc::new(RefCell::new(Vec::new())),
             close_requests: Rc::new(RefCell::new(Vec::new())),
             downloads: Rc::new(RefCell::new(Vec::new())),
@@ -4542,6 +4606,7 @@ impl WebSurfaceHost {
             next_media_permission_id: self.next_media_permission_id.clone(),
             capture_asks: self.capture_asks.clone(),
             fresh_capture_asks: self.fresh_capture_asks.clone(),
+            trace_batches: self.trace_batches.clone(),
             engine_capture_asks: self.engine_capture_asks.clone(),
             userscripts: userscripts.to_vec(),
             adblock_ruleset: adblock_ruleset.map(|path| path.to_path_buf()),
@@ -4674,6 +4739,12 @@ impl WebSurfaceHost {
     /// second ever arrives — see §THE ASK THE ENGINE NEVER RAISES.
     pub fn take_capture_asks(&self) -> Vec<SurfaceCaptureAsk> {
         std::mem::take(&mut self.fresh_capture_asks.borrow_mut())
+    }
+
+    /// Every media-probe drain since the last tick, for the shell to validate
+    /// and write. See [`SurfaceTraceBatch`] and `web_surface_media_trace`.
+    pub fn take_trace_batches(&self) -> Vec<SurfaceTraceBatch> {
+        std::mem::take(&mut self.trace_batches.borrow_mut())
     }
 
     /// Every page currently waiting on `getUserMedia()`, for `server app state`.
@@ -4929,6 +5000,13 @@ impl WebSurfaceHost {
             // because the engine reports nothing at all for a page it has not
             // presented. See §THE ASK THE ENGINE NEVER RAISES.
             .with_initialization_script_for_main_only(CAPTURE_ASK_SHIM_JS, true)
+            // ...and every surface traces its MEDIA onto the trace plane as
+            // `layer=webkit` — the tag the contract reserved before there was
+            // an emitter for it. ALL FRAMES (`false`): a player commonly lives
+            // in an iframe, and a frame with no media costs nothing because
+            // every hook is event-driven and the window timer self-suspends.
+            // See `web_surface_media_trace`.
+            .with_initialization_script_for_main_only(MEDIA_TRACE_SHIM_JS, false)
             .with_url(url);
         if let Some(port) = socks_port {
             builder = builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
@@ -5178,6 +5256,7 @@ impl WebSurfaceHost {
             &self.capture_asks,
             &self.fresh_capture_asks,
             &self.engine_capture_asks,
+            &self.trace_batches,
         );
         {
             use webkit2gtk::WebViewExt as _;
