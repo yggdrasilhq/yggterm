@@ -2,11 +2,20 @@
 # Unwedge a frozen yggterm GUI without killing anything.
 #
 # ⛔ NOT FOR AN UNBOOTABLE ROW. The name invites reaching for this when the
-# booter refuses a row over composer residue ("holds boot-text residue PLUS
-# other content") — this script severs the GUI's edit socket and touches no
-# composer, so it does nothing for that. Residue recovery is the booter's own
-# residue cleaner (ygg-booter.py, `_composer_is_boot_residue_only`); a row it
-# still refuses holds something that may be the owner's and stays refused.
+# booter refuses a row over composer residue — this script severs the GUI's edit
+# socket and touches no composer, so it does nothing for that. The remedy is
+# `ygg-booter.py unjam <row>`, which delivers the stuck text if the daemon can
+# still vouch for the line and clears it if a handover zeroed it. It refuses
+# anything that is not character-for-character our own boot text, and a row it
+# refuses holds something that may be the owner's and stays refused.
+#
+# ⚠ THIS NOTE POINTED AT `_composer_is_boot_residue_only` UNTIL 2026-08-21, and
+# that function had been deleted with the residue cleaner it belonged to (which
+# was firing a Ctrl+C into a live session every five and a half minutes). The
+# booter's escalation message pointed HERE at the same time, so the two files
+# pointed at each other and the thing they both named was gone. An operator
+# following either signpost arrived nowhere, which is how one row sat refused
+# and escalated with a remedy that could not have worked.
 #
 # The GUI freezes when its webview fails to acknowledge an edit batch: dioxus's
 # poll_vdom then skips the ENTIRE VirtualDom -- renders, effects and every
