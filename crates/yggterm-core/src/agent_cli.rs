@@ -2549,8 +2549,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_qwen_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        read_live_store_title: Some(read_qwen_live_store_title),
+        remote_live_store_title: Some(QWEN_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
@@ -2567,7 +2567,31 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         menu_hint: 'k',
         // `state.json` carries `custom_title` with a `title_generated` flag and
         // a 3-attempt cap — the CLI owns it.
-        title_authority: TitleAuthority::Store,
+        // ⛔ WAS `Store`, OVER A STORE THAT HOLDS NO TITLE — and the two halves of
+        // yggterm already disagreed about that.
+        //
+        // `TitleAuthority::Store` makes `session_accepts_generated_copy` refuse
+        // this kind a generated title, on the reasoning that inventing one would
+        // disagree forever with the title the CLI wrote. That reasoning needs
+        // the CLI to have written one.
+        //
+        // ⭐ It does not. `startpage::scan_kimi_sessions` — which locates this
+        // store perfectly well, reversing its hashed bucket via the CLI's own
+        // config — says so in its own comment and falls back to a generated or
+        // heuristic title. Measured independently 2026-08-21 on a machine where
+        // this CLI has been launched: no key anywhere in a session's files is a
+        // title, a cwd or a session id.
+        //
+        // ⇒ So the SCAN path already treated this CLI as generating, while the
+        // LIVE path honoured the declaration and refused to generate. One CLI,
+        // two answers to "who names this row", and the live half's answer was
+        // "nobody" — the row wore its birth title for the life of the session.
+        //
+        // ⚠ Its store being empty of titles is why `read_live_store_title` is
+        // `None` here and why that is NOT the hole the store-authority lock
+        // hunts: there is nothing to read. This flips back only if the CLI
+        // starts writing a title, in the same commit as the reader for it.
+        title_authority: TitleAuthority::Generated,
         // `kimi -r <unknown-id>` CREATES that session rather than failing, so a
         // caller-supplied id at birth is honoured. Its id is a directory name
         // verbatim, with no format validation.
@@ -3441,6 +3465,70 @@ fn read_qwen_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     })
 }
 
+/// The LIVE half of Qwen's title: find this session's own chat file under the
+/// agent store home, then read the title out of it with the same tail parser
+/// the identity scan uses.
+///
+/// ⛔ **This existed as a hole, not as an absence.** `read_live_store_title:
+/// None` is documented to mean UNMEASURED — this CLI's store layout has never
+/// been read off a real machine, so nothing is guessed at. But Qwen's layout
+/// HAS been read: `read_qwen_store_entry` parses its `sessionId` and `cwd`, and
+/// `read_qwen_custom_title_tail` knows the title is a `custom_title` record
+/// re-appended near EOF. So `None` was claiming unmeasured about a store two
+/// functions above it already decode, while the descriptor ALSO declared
+/// `TitleAuthority::Store` — which makes yggterm refuse to generate a title.
+/// A live Qwen row was therefore refused a generated title and offered no
+/// stored one: titled by nothing, for the life of the session.
+///
+/// ⚖ Only the LOOKUP is new here. The format is the existing parsers', and it
+/// is not re-derived — the fixture test exercises finding the right file for an
+/// id, which is the only part this function decides.
+fn read_qwen_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let descriptor = agent_cli_descriptor(SessionKind::QwenCode)?;
+    for root in descriptor.store_roots_absolute(home) {
+        // `<root>/<project>/chats/<file>.jsonl`. The project directory encodes a
+        // cwd, so it cannot be derived from the id and every project is walked.
+        let Ok(projects) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for project in projects.flatten() {
+            let chats = project.path().join("chats");
+            let Ok(files) = std::fs::read_dir(&chats) else {
+                continue;
+            };
+            // ⭐ Cheapest discriminator first: a file NAMED for the session.
+            // Falling through to parsing is not an optimisation detail — it is
+            // the correctness half, because unlike Claude Code's store the
+            // filename here is not contractually the id, and a lookup that
+            // assumed it were would answer nothing for a store that names its
+            // files any other way.
+            let mut fallback = Vec::new();
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if path.file_stem().and_then(|value| value.to_str()) == Some(session_id) {
+                    return read_qwen_custom_title_tail(&path);
+                }
+                fallback.push(path);
+            }
+            for path in fallback {
+                let Some(first) = read_first_jsonl_object(&path) else {
+                    continue;
+                };
+                if first.get("sessionId").and_then(|value| value.as_str()) == Some(session_id) {
+                    return read_qwen_custom_title_tail(&path);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn read_qwen_custom_title_tail(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let file = std::fs::File::open(path).ok()?;
@@ -3700,6 +3788,104 @@ for session_id in ids:
 /// answer for every conversation that has had a turn. A remote row that only
 /// the transcript could name reports `no_title_in_store`, which is true and
 /// cheap; guessing it would have cost a store walk per tick.
+const QWEN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: QWEN_REMOTE_TITLE_SCRIPT,
+    // The title lives in the session's OWN chat file; Qwen keeps no shared index
+    // beside it, so there is nothing to union in.
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
+
+const QWEN_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+TAIL_BYTES = 64 * 1024
+
+# argv: <home-relative glob>... -- <session id>...
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+globs = [value for value in argv[:split] if value.strip()]
+ids = [value for value in argv[split + 1:] if value.strip()]
+if not globs or not ids:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+
+def title_from_tail(path):
+    # The title is a `custom_title` record that this CLI re-appends near EOF, so
+    # the LAST one wins and only the tail has to be read.
+    try:
+        size = path.stat().st_size
+        with open(path, 'rb') as handle:
+            handle.seek(max(0, size - TAIL_BYTES))
+            raw = handle.read().decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+    lines = raw.splitlines()
+    if size > TAIL_BYTES and lines:
+        # First chunk is likely a partial line; drop it.
+        lines = lines[1:]
+    found = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if record.get('type') != 'custom_title':
+            continue
+        for key in ('title', 'customTitle'):
+            value = record.get(key)
+            if value and str(value).strip():
+                found = str(value).strip()
+    return found
+
+def session_id_of(path):
+    # Cheapest first: a file NAMED for the session. The name is not
+    # contractually the id here, so a miss falls through to the first record
+    # rather than being reported as "no such session".
+    if path.stem in wanted:
+        return path.stem
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    return None
+                value = record.get('sessionId')
+                return value if value in wanted else None
+    except Exception:
+        return None
+    return None
+
+candidates = {session_id: [] for session_id in ids}
+for glob in globs:
+    try:
+        matches = sorted(home.glob(glob))
+    except Exception:
+        continue
+    for match in matches:
+        session_id = session_id_of(match)
+        if session_id is None:
+            continue
+        title = title_from_tail(match)
+        if title:
+            candidates[session_id].append(title)
+
+for session_id in ids:
+    found = candidates.get(session_id) or []
+    if found:
+        print(json.dumps({'session_id': session_id, 'candidates': found}, ensure_ascii=False))
+"#;
+
 const ANTIGRAVITY_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     script: ANTIGRAVITY_REMOTE_TITLE_SCRIPT,
     // ⛔ The store globs LEAD, because they are the only source a new
@@ -5426,6 +5612,102 @@ mod tests {
         }
     }
 
+    /// Write a Qwen chat store. `file_stem` is deliberately a parameter: the
+    /// file name is NOT contractually the session id for this CLI, and a lookup
+    /// that assumed it were would answer nothing for a store that names its
+    /// files any other way.
+    fn write_qwen_fixture(home: &std::path::Path, file_stem: &str, session_id: &str, title: &str) {
+        let chats = home.join(".qwen/projects/-home-user-project/chats");
+        std::fs::create_dir_all(&chats).expect("fixture chats directory");
+        let first = serde_json::json!({ "sessionId": session_id, "cwd": "/home/user/project" });
+        // The title is re-appended near EOF by this CLI, and an earlier one is
+        // superseded — so the fixture carries both and the LAST must win.
+        let stale = serde_json::json!({ "type": "custom_title", "title": "an older name" });
+        let current = serde_json::json!({ "type": "custom_title", "title": title });
+        let body = format!("{first}\n{stale}\n{{\"type\":\"message\"}}\n{current}\n");
+        std::fs::write(chats.join(format!("{file_stem}.jsonl")), body).expect("fixture chat");
+    }
+
+    /// ⛔ THE LOOKUP IS THE ONLY PART THIS FUNCTION DECIDES, SO IT IS THE PART
+    /// UNDER TEST. The record format comes from the two parsers that already
+    /// decode this store; what is new is finding the right file for an id.
+    #[test]
+    fn a_live_qwen_row_is_titled_from_its_own_chat_file() {
+        let home = std::env::temp_dir().join(format!("yggterm-qwen-live-{}", uuid::Uuid::new_v4()));
+        let session_id = "b3d17e02-5c48-4a91-8f60-2d7c1a9e4b35";
+        // Named for something OTHER than the id, so the fallback that parses the
+        // first record is what has to find it.
+        write_qwen_fixture(&home, "chat-0007", session_id, "Port the CSV importer");
+        let found = read_qwen_live_store_title(&home, session_id);
+        let named_for_the_id = {
+            let other = std::env::temp_dir().join(format!("yggterm-qwen-live-{}", uuid::Uuid::new_v4()));
+            write_qwen_fixture(&other, session_id, session_id, "Port the CSV importer");
+            let hit = read_qwen_live_store_title(&other, session_id);
+            let _ = std::fs::remove_dir_all(&other);
+            hit
+        };
+        // ⚠ A plainly invented id that no fixture writes. Not an all-zero uuid:
+        // its twelve-zero run trips the privacy guard's identity-number pattern.
+        let miss = read_qwen_live_store_title(&home, "5e2a9c71-0b34-4d8f-9a16-c703e85b2d49");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            found,
+            Some("Port the CSV importer".to_string()),
+            "a chat file not named for its session was not found, so a store that \
+             names its files anything else is titled by nothing"
+        );
+        assert_eq!(named_for_the_id, Some("Port the CSV importer".to_string()));
+        assert_eq!(miss, None, "an id with no chat file must miss, not borrow another row's title");
+    }
+
+    /// The ssh half of the same store, run the way the daemon runs it.
+    #[test]
+    fn a_remote_qwen_row_is_titled_by_its_probe_script() {
+        let home = std::env::temp_dir().join(format!("yggterm-qwen-probe-{}", uuid::Uuid::new_v4()));
+        let session_id = "b3d17e02-5c48-4a91-8f60-2d7c1a9e4b35";
+        write_qwen_fixture(&home, "chat-0007", session_id, "Port the CSV importer");
+
+        let descriptor = agent_cli_descriptor(SessionKind::QwenCode).expect("Qwen is registered");
+        let probe = descriptor
+            .remote_live_store_title
+            .expect("Qwen declares a remote probe");
+        let mut args: Vec<String> = descriptor.remote_store_title_locators();
+        args.push("--".to_string());
+        args.push(session_id.to_string());
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(probe.script)
+            .args(&args)
+            .env("HOME", &home)
+            .output()
+            .expect("python3 is needed to exercise a remote store probe");
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            output.status.success(),
+            "the probe script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_else(|| panic!("the probe answered for nothing: {stdout:?}"));
+        let value: serde_json::Value = serde_json::from_str(line).expect("JSON lines");
+        assert_eq!(value["session_id"], session_id);
+        let candidates: Vec<String> = value["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .map(|candidate| candidate.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            (probe.choose)(&candidates),
+            Some("Port the CSV importer".to_string()),
+            "the re-appended title must supersede the earlier one: {candidates:?}"
+        );
+    }
+
     /// ⛔⛔ A REMOTE PROBE MUST BE ABLE TO OPEN THE SESSION'S OWN FILE.
     ///
     /// A shared index is written when the CLI gets round to it; the session's
@@ -6027,9 +6309,20 @@ mod tests {
     /// declares no `read_live_store_title` can never be named at all, and its
     /// rows wear their birth title for the life of the session.
     ///
-    /// This is a REPORT, not a prohibition: leaving the hook `None` is the
-    /// honest answer for a store nobody has measured. It exists so the hole is
-    /// named in one place, with the measurement each CLI still owes.
+    /// ⭐ **It was a REPORT and is now a PROHIBITION, because both holes it
+    /// named have been closed** (2026-08-21) and they closed in opposite
+    /// directions, which is the point:
+    ///
+    /// * one CLI's store WAS measured — two functions in this file already
+    ///   decoded its layout — so `None` was claiming unmeasured about a store
+    ///   the registry could read. It got a reader.
+    /// * the other declared `Store` over a store the registry cannot locate at
+    ///   all (`session_store_globs` empty). It was not owed a reader; it was
+    ///   owed an honest authority, and now generates.
+    ///
+    /// ⇒ Leaving the hook `None` is still the honest answer for an unmeasured
+    /// store — but then the CLI must not ALSO claim its store is authoritative,
+    /// because the two together are what make a row unnameable.
     #[test]
     fn a_store_titled_cli_without_a_live_reader_can_never_be_titled() {
         let unreachable = AGENT_CLIS
@@ -6040,15 +6333,11 @@ mod tests {
             })
             .map(|descriptor| descriptor.slug)
             .collect::<Vec<_>>();
-        assert_eq!(
-            unreachable,
-            // Both owe a MEASURED store layout on a real machine: neither had a
-            // session on the host this was written from, and Kimi's
-            // `session_store_globs` are empty — its store is not wired at all.
-            vec!["qwen-code", "kimi"],
-            "the set of CLIs that can never be titled has changed; either a \
-             measurement landed (drop it from this list) or a CLI was made \
-             store-authoritative without a reader (measure its store first)",
+        assert!(
+            unreachable.is_empty(),
+            "a CLI is store-authoritative with no reader, so its rows can never \
+             be titled at all: {unreachable:?} — either measure its store and \
+             wire a reader, or stop claiming its store is authoritative",
         );
     }
 

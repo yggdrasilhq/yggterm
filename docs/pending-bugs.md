@@ -680,13 +680,42 @@ that never fires and a system with nothing to report are the same reading.
 outcome**: every classifier enumerates its skips and every sweep emits even when
 nothing happened, so silence now means the chore did not run.
 
-### ⚠ WHAT STILL HAS NO REMOTE PROBE
+### ⭐ AND THE SET THAT STILL NEEDED ONE IS NOW EMPTY
 
-Eight of the ten registered CLIs declare no `remote_live_store_title`. That is
-recorded rather than hidden: such a row reports `skipped_no_reader` on every
-tick instead of vanishing from the count, and the birth event carries
-`store_title_reader:false` so a reader need not wait for a title that was never
-coming. Wiring each is a per-CLI measurement, not a code change.
+An earlier revision of this entry said "eight of the ten CLIs declare no remote
+probe, wiring each is a per-CLI measurement". **That framing was wrong and made
+the remainder look eight times larger than it was.** A store reader is owed only
+by a CLI that claims `TitleAuthority::Store` — which makes yggterm REFUSE to
+generate a title, on the reasoning that inventing one would disagree forever
+with the one the CLI wrote. The six `Generated` CLIs are titled by generation by
+design and owe nothing.
+
+So the real set was **two**, and both are closed (2026-08-21) — in opposite
+directions, which is the part worth keeping:
+
+* **One had already been measured and did not know it.** Its store entry parser
+  and its title-tail parser both sat in the registry, decoding the format, while
+  `read_live_store_title` was `None` — a field documented to mean *"this store
+  has never been read off a real machine"*. It got a local reader and a remote
+  probe, both exercised against a fixture. ⚠ Its chat file is not contractually
+  named for the session, so the lookup matches the stem first and falls back to
+  the first record's id.
+* **The other declared `Store` over a store that holds no title.** Its own
+  scanner says so in a comment and falls back to a generated title — so the SCAN
+  path already treated it as generating while the LIVE path honoured the
+  declaration and refused to. One CLI, two answers to "who names this row", and
+  the live answer was nobody. Its authority is `Generated` now.
+
+⛔ **The lock that named these two was a REPORT and is now a PROHIBITION.** A CLI
+that is store-authoritative with no reader can never be titled at all, so the
+combination is refused rather than listed. Leaving the reader `None` is still
+honest for an unmeasured store — but then the CLI must not also claim its store
+is authoritative.
+
+⇒ A row of a CLI with no reader still reports `skipped_no_reader` every tick
+rather than vanishing from the count, and its birth event carries
+`store_title_reader:false`, so a reader need not wait for a title that was never
+coming.
 
 ## ⛔ [11.25] THE ALL-CLI GREETING RUN HAS NOT BEEN TAKEN
 
@@ -18627,6 +18656,41 @@ who else is typing.
 fix. ⛔ **Do not "fix" the symptom by relaxing the no-op assertion** — that
 assertion is load-bearing (it is what catches a rebuild that never converges),
 and weakening it would trade a real gate for a quiet suite.
+
+### ⛔⛔ AND THE SAME RACE, CAUGHT IN THE ACT WITH A DIFF
+
+`agent_arm_matrix::locality_does_not_fork_the_invocation` fails in roughly one
+full `-p yggterm-server --lib` run in three to six, **never in isolation, and
+identically at HEAD and under unrelated changes** — so it is not a regression,
+it is this entry. The captured pair differs in exactly one thing:
+
+```
+left  … && export COLORFGBG='15;0' && export YGGTERM_TERMINAL_COLOR_FOREGROUND=…
+right … && export COLORFGBG='15;0' && export YGGTERM_HOME='/tmp/yggterm-persist-drop-<pid>-<nanos>' && …
+```
+
+⇒ A sibling test pointed the PROCESS at a temporary home between one build and
+the next, and everything derived from it — the npm prefix, the npm bin on
+`PATH` — moved with it. The two arms never forked; the environment did.
+
+**Two quick fixes were tried and BOTH FAILED, which is the useful part:**
+
+1. **Guard on the identity being intact.** The existing guard samples one value
+   (the pinned background) on each side and treats a match as proof both came
+   from one identity. Widening it to compare the whole colour profile read back
+   from the environment did not help — **the stolen variable was never a colour
+   at all.** ⚠ The one-field sample is still a real hole, just not this one.
+2. **Retry until the pair agrees**, on the reasoning that a genuine fork is a
+   function of KIND and differs every time while a race differs intermittently.
+   Also failed: it still went red, meaning it disagreed on all eight attempts.
+   **The interfering window outlasts a burst of fast retries** — the temporary
+   home is held for the length of a sibling test, not for an instant.
+
+⇒ Both failures corroborate this entry's own note that an isolated
+`YGGTERM_HOME` for the test binary is the answer and that it "needs a real
+answer, not a quick one". ⛔ **Do not attempt a third guard here.** No test can
+defend itself against a process-global variable another test owns; the fix is
+that no test may set it process-globally.
 
 ## ★★★ FIVE VERBS REPORT THE REQUEST, NOT THE EFFECT — one rule, not five patches
 
