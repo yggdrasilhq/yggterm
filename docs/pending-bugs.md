@@ -1685,6 +1685,38 @@ live sidebar shows `11.0`'s members in ascending order with no verb run.
 
 **Status:** OPEN
 
+### ⭐ NARROWED 2026-08-22 — IT IS NOT ONE VERB LYING, IT IS TWO DAEMONS DISAGREEING ABOUT A ROW
+
+Reproduced on the shipped build with a correct `full_path` taken from the listing rather than
+constructed, and the mechanism is sharper than "the verb did not apply it".
+
+| asked | answer |
+|---|---|
+| the GUI host's daemon | `applied: false` · `daemon_message: "no live session for <row>"` · `outline_prefix: null` |
+| the daemon on the host where that session actually runs | `applied: true` · `outline_prefix` reads back the requested seat |
+| **the GUI host again, afterwards** | **still `null`** |
+
+⇒ **The seat applied, on a daemon that is not the one drawing the sidebar.** Both answers are
+locally correct and the row ends up unseated on the only surface a person looks at. A caller that
+believes `applied: true` has been told the truth about the wrong machine.
+
+⭐ **The envelope/operation split is now honest and is the reading to take**: `error` is the
+TRANSPORT's verdict — the request arrived and was handled — and `applied` is the OPERATION's.
+⛔ Neither is the EFFECT. The effect is what the sidebar's own daemon stores, and only a read-back
+against that daemon answers it. Three readings, three different questions, and the two cheap ones
+agree with each other while disagreeing with the one that matters.
+
+⚠ **Why it bites the orchestrator specifically.** A lane spawned so that its session never became
+live on the GUI host is listed there as a row (`kind: Session`, present in `rows --json`) while
+that daemon holds no runtime for it. It therefore cannot be seated where it is drawn, so it is
+invisible to every seat-based census — which is how three live successor lanes came to be running
+with no seat at all, unsupervised, while their own report named seats that collided with three
+other lanes' numbers. **Nothing failed loudly at any point.**
+
+⛔ Seating it by attaching is not a workaround: opening a row takes the owner's screen, and the
+standing prohibition on that outranks the tidiness. The fix belongs where the disagreement is —
+a seat is a property of the ROW and must not be storable per daemon.
+
 Measured 2026-08-21 while a lane claimed its own row. `server app session outline
 <row> <seat>` returned, at the envelope level, `error: null` — and two levels
 down, `applied: false` with `daemon_message: "no live session for <row>"` and the
