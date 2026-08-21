@@ -4464,15 +4464,15 @@ fn app() -> Element {
                 if snapshot.pending_classic_tabs_switch {
                     ClassicTabsSwitchOverlay {
                         palette: snapshot.palette,
-                        folder_count: snapshot
+                        group_count: snapshot
                             .active_web_surface_overlay
                             .as_ref()
-                            .map(|overlay| overlay.folders.len())
+                            .map(|overlay| overlay.tabs.iter().filter(|tab| tab.group_size > 0).count())
                             .unwrap_or(0),
                         filed_count: snapshot
                             .active_web_surface_overlay
                             .as_ref()
-                            .map(|overlay| overlay.tabs.iter().filter(|tab| tab.folder.is_some()).count())
+                            .map(|overlay| overlay.tabs.iter().filter(|tab| tab.group_head.is_some()).count())
                             .unwrap_or(0),
                         on_cancel: move |_| state.with_mut_counted(|shell| shell.cancel_classic_tabs_switch()),
                         on_confirm: move |_| state.with_mut_counted(|shell| shell.confirm_classic_tabs_switch()),
