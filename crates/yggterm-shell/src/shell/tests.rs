@@ -21553,6 +21553,71 @@ mod tests {
         .collect()
     }
 
+    /// ⛔⛔ THE SIDEBAR DRAWS OUTLINE ORDER CONTINUOUSLY — NO VERB RUN AT ALL.
+    ///
+    /// Owner-reported twice on 2026-08-21 as rows not being in ascending order.
+    /// `sort_by_outline` calls itself "the one sort … both the rendered sidebar
+    /// and any verb that reports an order call this", and the rendered sidebar
+    /// was the half that never did: its only caller was the `SortSessions` verb,
+    /// so rendered order was arrival order and correct order was a manual repair
+    /// that every spawn, fold and re-group undid.
+    ///
+    /// The rows arrive here in a deliberately hostile order — reversed, and with
+    /// `11.20` ahead of `11.9` so a lexicographic regression is caught on the
+    /// render path rather than only in the comparator's own suite.
+    #[test]
+    fn the_sidebar_draws_seats_in_ascending_order_without_any_verb() {
+        let drawn = live_rows_for_seats(
+            &[
+                ("remote-session://dev/twenty", "11.20"),
+                ("remote-session://dev/orch", "11.0"),
+                ("remote-session://dev/nine", "11.9"),
+                ("remote-session://dev/ten", "11.10"),
+            ],
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+        assert_eq!(
+            drawn,
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/nine".to_string(), 2),
+                ("remote-session://dev/ten".to_string(), 2),
+                ("remote-session://dev/twenty".to_string(), 2),
+            ],
+            "the seats say the order and the sidebar draws it, at the top level \
+             and inside the set alike"
+        );
+    }
+
+    /// The same, one level deeper and with no head to collect them: three
+    /// top-level books arriving out of order still draw in order, so the fix is
+    /// about the render path rather than about a set's membership vector.
+    #[test]
+    fn top_level_books_draw_in_order_even_with_nothing_to_nest_under() {
+        let drawn = live_rows_for_seats(
+            &[
+                ("remote-session://dev/ten", "10"),
+                ("remote-session://dev/two", "2"),
+                ("remote-session://dev/loose", ""),
+                ("remote-session://dev/one", "1"),
+            ],
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+        assert_eq!(
+            drawn,
+            vec![
+                ("remote-session://dev/one".to_string(), 1),
+                ("remote-session://dev/two".to_string(), 1),
+                ("remote-session://dev/ten".to_string(), 1),
+                // Un-numbered sorts last and keeps its incoming place, which is
+                // the key's own contract.
+                ("remote-session://dev/loose".to_string(), 1),
+            ]
+        );
+    }
+
     /// ⛔⛔ AN ARRANGEMENT ENTRY WHOSE HEAD IS DEAD MAY NOT HIDE ITS MEMBERS.
     ///
     /// Row-set membership persists in settings while rows come and go, and

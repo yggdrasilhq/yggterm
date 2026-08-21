@@ -51867,6 +51867,31 @@ fn push_live_session_rows(
     if !expanded {
         return;
     }
+    // ⭐⭐ OUTLINE ORDER IS A PROPERTY OF THE SEATS, NOT OF ARRIVAL — AND THE
+    // SIDEBAR DRAWS IT CONTINUOUSLY. `sort_by_outline` documents itself as "the
+    // one sort … both the rendered sidebar and any verb that reports an order
+    // call this", and the rendered sidebar was the half that never did: the only
+    // caller was `AppControlCommand::SortSessions`, so correct order was a manual
+    // repair somebody had to remember and every spawn, fold and re-group undid
+    // it. Owner-reported twice on 2026-08-21 as rows not being in ascending
+    // order.
+    //
+    // ⚠ THE COMPARATOR WAS NEVER THE BUG. It parses a seat into `Vec<u64>` and
+    // has a test named for the ten-before-two trap. What was missing is that
+    // nothing on the render path asked it.
+    //
+    // ⚖ A SEATED ROW CAN NO LONGER BE HAND-ORDERED OUT OF SEAT ORDER HERE, and
+    // that is the intended model rather than a casualty: the seat IS the order.
+    // The sort is stable, so un-numbered rows keep the arrangement a drag gave
+    // them and only fall in around the numbered ones.
+    let sessions: Vec<&ManagedSessionView> = {
+        let mut ordered = sessions.to_vec();
+        yggterm_core::session_outline::sort_by_outline(&mut ordered, |session| {
+            session.outline_prefix.clone()
+        });
+        ordered
+    };
+    let sessions = sessions.as_slice();
     let short_ids = unique_session_short_ids_for_pairs(
         &sessions
             .iter()
