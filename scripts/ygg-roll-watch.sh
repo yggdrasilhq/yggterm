@@ -81,6 +81,27 @@ tick() {
     return 0
   fi
 
+  # ⛔⛔ A COMMIT THAT CANNOT CHANGE THE BINARY MUST NOT COST SOMEBODY A RESTART.
+  # Every roll bumps the version, and the version string is compiled in, so a
+  # documentation or script commit still produces a different binary, a different
+  # md5, and therefore a client restart on the owner's desktop. That is a window
+  # taken away to ship a paragraph of prose — and this campaign edits its own
+  # queue file several times an hour, so on an hourly timer it is not an edge
+  # case, it is the common one.
+  #
+  # ⇒ Ask what actually changed. If every path since the running build is inert to
+  #   the build, there is nothing to roll and nothing to restart for. The list is a
+  #   deny-by-default: anything not recognised as inert counts as build-affecting,
+  #   so a new directory errs toward rolling rather than toward silently skipping.
+  local churn
+  churn="$(ssh -n "$build_host" "cd $DEPLOY_TREE && git diff --name-only $running origin/main 2>/dev/null \
+             | grep -vE '^(docs/|CHANGELOG\.md|README\.md|[^/]*\.md$|\.agents/|scripts/)' | head -5" 2>/dev/null)"
+  if [ -z "$churn" ]; then
+    say "main is $main_sha but nothing since $running touches the build — not rolling, not restarting anything"
+    reconcile_client "$live_host" "" "current build"
+    return 0
+  fi
+
   say "main is $main_sha, the live daemon runs $running — rolling"
   [ "$DRY" = 1 ] && { say "(dry run: stopping here)"; return 0; }
 
