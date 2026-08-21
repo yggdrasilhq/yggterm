@@ -155,7 +155,8 @@ def rows_census(host):
         seat = row.get("outline_prefix")
         if seat and "://" in path and path not in seen:
             seen.add(path)
-            out.append({"seat": str(seat), "uri": path, "label": row.get("label") or ""})
+            out.append({"seat": str(seat), "uri": path, "label": row.get("label") or "",
+                        "session_cwd": row.get("session_cwd") or ""})
     return out
 
 
@@ -422,6 +423,13 @@ def successor_brief(row, why):
     path = os.path.join(RELAY, "successors", f"{row['seat']}-successor.md")
     tr = transcript_of(row["uuid"])
     with open(path, "w") as fh:
+        # ⛔ THE ACK TOKEN MUST BE IN THE BRIEF ITSELF. The spawner proves delivery
+        # by finding this exact string in the successor's transcript; a brief that
+        # does not carry it can never verify, and the spawn reports a failure it
+        # did not have.
+        fh.write(f"SUCCESSOR-{row['seat']} — you are seat {row['seat']} on the yggterm campaign. "
+                 f"Your row is already seated, titled and grouped: do not claim it, do not spend "
+                 f"a turn on bookkeeping, start on the work.\n\n")
         fh.write(f"# successor brief for seat {row['seat']}\n\n")
         fh.write(f"*Written from artefacts on {time.strftime('%Y-%m-%d %H:%M')}. The predecessor "
                  f"({row['uuid'][:8]}) was COLD — {why} — and was NEVER PROMPTED, because "
@@ -433,9 +441,54 @@ def successor_brief(row, why):
             fh.write(f"**Its transcript** (read it, do not wake it): `{tr}`\n\n")
         fh.write("**Where its work landed:** `git log --author-date-order` on its lane branch, "
                  "and any `~/.yggterm/relay/` file naming this seat.\n\n")
-        fh.write("⛔ Do not open with a row claim: the seat and title are set by the spawner, and "
-                 "a lane that spends its first turn on bookkeeping ends the turn there.\n")
+        fh.write("**Your first act:** read the transcript above for what your predecessor was "
+                 "doing, then `docs/pending-bugs.md` for the entries carrying your seat, and "
+                 "continue that work. If the predecessor finished, say so in "
+                 "`~/.yggterm/relay/" + row["seat"] + "-to-11.0.md` and stand down.\n\n")
+        fh.write("⛔ The GUI host is the owner's laptop and he is using it. Never restart his "
+                 "window, never run anything that OPENS a row, read-only probes only, and batch "
+                 "them — a quarter of his input blocks are agent probes.\n\n")
+        fh.write("⛔ Do not end a turn on a question. Record it with your recommendation and "
+                 "carry on.\n")
     return path
+
+
+def respawn(row, why, host, apply_it):
+    """Replace a cold lane: spawn its successor FIRST, then fold the predecessor.
+
+    ⛔⛔ THE ORDER IS THE WHOLE DESIGN. Folding first empties the seat, and a seat
+    that is empty for even a minute is a campaign with a hole in it that nobody is
+    watching — and if the spawn then fails, the lane is simply gone. So the
+    successor is created, briefed and PROVEN to hold the brief before anything is
+    removed, and a failed spawn leaves the predecessor exactly where it was.
+    ⚠ The predecessor is never prompted at any point. Everything the successor is
+    told comes from artefacts.
+    """
+    brief = successor_brief(row, why)
+    log(f"  successor brief → {os.path.relpath(brief, os.path.expanduser('~'))}")
+    if not apply_it:
+        log("  (dry run: would spawn a successor at this seat, then fold this row)")
+        return False
+    spawn = os.path.join(HERE, "ygg-spawn.py")
+    if not os.path.exists(spawn):
+        log("  ⛔ ygg-spawn.py is missing — leaving the predecessor alone")
+        return False
+    cwd = row.get("session_cwd") or os.path.expanduser("~/gh/yggterm")
+    r = subprocess.run(
+        [sys.executable, spawn, "--seat", row["seat"],
+         "--title", row["label"] or f"seat {row['seat']}",
+         "--purpose", f"successor to {row['uuid'][:8]}, which went cold",
+         "--cwd", cwd, "--brief", brief,
+         "--ack", f"SUCCESSOR-{row['seat']}"],
+        capture_output=True, text=True, timeout=600)
+    new_row = (r.stdout or "").strip().splitlines()[-1] if r.stdout.strip() else ""
+    if r.returncode != 0 or "://" not in new_row:
+        log(f"  ⛔ successor did not come up (exit {r.returncode}) — predecessor LEFT ALONE")
+        for line in (r.stderr or "").strip().splitlines()[-3:]:
+            log(f"     {line}")
+        return False
+    log(f"  successor is up: {new_row}")
+    return fold(row, "COLD", why, host, True)
 
 
 def agent_pids(uuid):
@@ -598,6 +651,10 @@ def main():
     sw.add_argument("--campaign", help="only rows whose seat starts with this, e.g. 11")
     sw.add_argument("--apply", action="store_true")
     sw.add_argument("--host")
+    sw.add_argument("--respawn", action="store_true",
+                    help="replace each COLD row: spawn a successor at the same seat from a "
+                         "brief distilled from artefacts, prove it holds the brief, and only "
+                         "then fold the predecessor. The predecessor is never prompted.")
     sw.add_argument("--wake", action="store_true",
                     help="send ONE `continue` to each STALLED row (never to a protected one, "
                          "never twice for the same stall)")
@@ -671,10 +728,13 @@ def main():
         elif verdict == "STALLED" and getattr(a, "wake", False):
             wake(row, host, a.apply)
         elif verdict == "COLD":
-            path = successor_brief(row, why)
-            log(f"  successor brief → {os.path.relpath(path, os.path.expanduser('~'))}")
-            log("  ⛔ NOT woken. Spawn a successor at this seat with ygg-spawn.py, then")
-            log(f"     fold this row: ygg-fold.py row {row['uuid'][:8]} --force --apply")
+            if getattr(a, "respawn", False):
+                if respawn(row, why, host, a.apply):
+                    folded += 1
+            else:
+                path = successor_brief(row, why)
+                log(f"  successor brief → {os.path.relpath(path, os.path.expanduser('~'))}")
+                log("  ⛔ NOT woken. Re-run with --respawn to replace it at this seat.")
     log(f"— {counts} · {'folded' if a.apply else 'would fold'} {folded}")
     if not a.apply:
         log("  nothing was changed. Re-run with --apply.")
