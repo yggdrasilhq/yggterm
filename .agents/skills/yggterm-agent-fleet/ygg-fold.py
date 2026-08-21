@@ -178,6 +178,25 @@ def rows_census(host):
     return out
 
 
+def rows_all(host):
+    """Every session row, seated or not. `rows_census` keeps only seated ones
+    because a SWEEP is seat-scoped by design; a single-row call is not."""
+    r = run(["ssh", "-n", host, f"{YGG} server app rows --json"])
+    try:
+        rows = (json.loads(r.stdout).get("data") or {}).get("rows") or []
+    except Exception:
+        return []
+    seen, out = set(), []
+    for row in rows:
+        path = row.get("full_path") or ""
+        if "://" in path and path not in seen:
+            seen.add(path)
+            out.append({"seat": str(row.get("outline_prefix") or "-"), "uri": path,
+                        "label": row.get("label") or "",
+                        "session_cwd": row.get("session_cwd") or ""})
+    return out
+
+
 #: The scan, as one line of shell so it can run here or over ssh unchanged.
 #: ⛔ `pgrep -f <uuid>` matches the asking shell, and over ssh it also matches the
 #: ssh client that carried the query; both were measured lying in both directions.
@@ -304,6 +323,50 @@ def last_assistant_text(path):
             if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text", "").strip():
                 return blk["text"].strip()
     return ""
+
+
+_MANUAL_TITLES = None
+
+
+def manually_titled_uuids(host):
+    """⛔⛔ A ROW A PERSON NAMED BY HAND IS A ROW A PERSON IS KEEPING.
+
+    Measured 2026-08-21, by destroying one. The owner kept a row group of sessions
+    whose transcripts had been deleted long ago — he kept them **for their
+    titles**, as a reading list, because the title alone told him what the item
+    was. The group's HEAD was such a row: no process, no transcript, and its cwd
+    was a mount path that no longer resolves. `orphans` called that DEAD debris
+    and folded it, and it cannot be restored: the session, its transcript and its
+    cwd are all gone, so the restore verb reports `not_found`.
+
+    ⇒ The tool's whole model was that a row's value is its PROCESS. For a bookmark
+      the value is the NAME, and the name is the one thing it still had.
+
+    `session_titles.source = 'manual'` is exactly that marker and it was already in
+    the store: it means a human typed this title. Nothing folds such a row without
+    `--force`, whatever its process or its cwd say.
+    """
+    global _MANUAL_TITLES
+    if _MANUAL_TITLES is not None:
+        return _MANUAL_TITLES
+    # ⛔ The store is resolved from the REMOTE's own home, never written out here:
+    # a literal home path is both wrong on any other account and a private-data
+    # leak into a public repo. The pre-push guard caught exactly that.
+    q = ("import sqlite3,json,os;"
+         "c=sqlite3.connect(os.path.expanduser('~/.yggterm/session-titles.db'));"
+         "print(json.dumps([r[0] for r in c.execute("
+         "\"select session_id from session_titles where source='manual'\")]))")
+    r = run(["ssh", "-n", host, f"python3 -c {json.dumps(q)}"])
+    try:
+        _MANUAL_TITLES = set(json.loads(r.stdout.strip()))
+    except Exception:
+        # ⛔ FAIL CLOSED. If the keepsake list cannot be read, every row looks
+        # unprotected — which is the state that lost one.
+        log("⚠ could not read the manual-title store — treating every row as KEPT")
+        _MANUAL_TITLES = None
+        return "unreadable"
+    log(f"  keepsakes: {len(_MANUAL_TITLES)} row(s) carry a hand-typed title")
+    return _MANUAL_TITLES
 
 
 def protected_uuids():
@@ -751,7 +814,8 @@ def cmd_orphans(a, host, live):
     except Exception:
         log("⛔ could not read the row list")
         return 2
-    seen, dead, alive = set(), [], []
+    seen, dead, alive, keepsakes = set(), [], [], []
+    kept = manually_titled_uuids(host)
     for row in allrows:
         path = row.get("full_path") or ""
         cwd = (row.get("session_cwd") or "").strip()
@@ -761,7 +825,13 @@ def cmd_orphans(a, host, live):
         if os.path.isdir(cwd):
             continue
         uuid = path.rsplit("/", 1)[-1]
+        if kept == "unreadable" or (kept is not None and uuid in kept):
+            keepsakes.append((path, cwd, row.get("outline_prefix")))
+            continue
         (alive if uuid in live else dead).append((path, cwd, row.get("outline_prefix")))
+    for path, cwd, seat in keepsakes:
+        log(f"🔖 {str(seat) or '-':<7} {path[-40:]} — KEPT: hand-typed title, cwd {cwd} is gone")
+        log("    a bookmark's value is its NAME, not its process. Never folded without --force")
     for path, cwd, seat in alive:
         log(f"· {str(seat):<7} {path[-40:]} — ALIVE in a vanished tree {cwd}")
         log("    left alone: re-rooting a live session is a product verb, not a reap")
@@ -771,7 +841,7 @@ def cmd_orphans(a, host, live):
             row = {"uri": path, "uuid": path.rsplit("/", 1)[-1], "seat": str(seat or "-"),
                    "label": row_label(allrows, path), "session_cwd": cwd}
             fold(row, "DEAD", "cwd tree no longer exists", host, True)
-    log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive"
+    log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive, {len(keepsakes)} kept"
         + ("" if a.apply else " · nothing was changed. Re-run with --apply."))
     return 0
 
@@ -871,8 +941,17 @@ def main():
     if a.cmd == "row":
         rows = [r for r in rows if a.target in r["uri"]]
         if not rows:
-            log(f"⛔ no seated row matches {a.target}")
-            return 2
+            # ⛔⛔ THE CENSUS KEEPS ONLY SEATED ROWS, AND AN UNSEATED ROW IS THE ONE
+            # MOST LIKELY TO NEED FOLDING. A row loses its seat when its group head
+            # is folded, or when it was never numbered — so the debris this verb
+            # exists to clear was precisely the debris it refused to look at, with
+            # "no seated row matches" reading as "no such row". Measured
+            # 2026-08-21 on a dead lane whose seat had gone with its twin.
+            rows = [r for r in rows_all(host) if a.target in r["uri"]]
+            if not rows:
+                log(f"⛔ no row matches {a.target}")
+                return 2
+            log(f"  {a.target} has no seat — folding it by path")
 
     counts, folded, seen_rows, respawned = {}, 0, [], 0
     for row in sorted(rows, key=lambda r: r["seat"]):
