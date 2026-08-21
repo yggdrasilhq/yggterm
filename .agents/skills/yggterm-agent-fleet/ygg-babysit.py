@@ -51,6 +51,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ygg_host import resolve_gui_host  # noqa: E402
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_transcript  # noqa: E402
+
 STATE = Path.home() / ".yggterm" / "relay"
 PROJECTS = Path.home() / ".claude" / "projects"
 
@@ -140,12 +144,11 @@ def find_transcript(uuid, host=None):
     another's; the uuid is the only honest key."""
     if host:
         r = subprocess.run(
-            ["ssh", host, f"ls -1 ~/.claude/projects/*/{uuid}.jsonl 2>/dev/null | head -1"],
+            ["ssh", host, f"{ygg_transcript.remote_find_command(uuid)} | head -1"],
             capture_output=True, text=True, timeout=60)
         out = (r.stdout or "").strip()
         return out or None
-    hits = list(PROJECTS.glob(f"*/{uuid}.jsonl"))
-    return str(hits[0]) if hits else None
+    return ygg_transcript.transcript_of(uuid)
 
 
 # ⭐ THE ACCOUNT RAN OUT OF QUOTA — a state a boot cannot improve, like

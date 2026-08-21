@@ -39,6 +39,10 @@ import subprocess
 import sys
 import time
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_transcript  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 RELAY = os.path.expanduser("~/.yggterm/relay")
 YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
@@ -343,8 +347,10 @@ def already_woken_for_this_stall(uuid, mtime):
 
 
 def transcript_of(uuid):
-    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
-    return hits[0] if hits else None
+    # ⛔ Asked before a row is retired, to take its work first. Answering from one
+    #    CLI's store meant a lane of any other CLI looked like it had produced
+    #    nothing worth harvesting.
+    return ygg_transcript.transcript_of(uuid)
 
 
 def last_assistant_text(path):
