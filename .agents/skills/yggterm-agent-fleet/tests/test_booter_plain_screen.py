@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The screen normalizer must match through BOTH spellings of an escape.
+"""The screen normalizer, and the composer read as a ROW rather than a screen.
 
     python3 tests/test_booter_plain_screen.py [--booter <path to ygg-booter.py>]
 
@@ -56,28 +56,84 @@ def main():
         if not any(m in low for m in b.CHOICE_PROMPT_MARKERS):
             failures.append(f"choice prompt MISSED through {name} spelling")
 
-    # 2. Doubled boot residue must read residue-only through either spelling —
-    #    a False here wedges the row forever (refused every tick, boots
-    #    refunded, subscription still reading healthy).
-    twice = b.BOOT_TEXT + b.BOOT_TEXT
-    residue_real = ("earlier conversation output\n❯ "
-                    + twice.replace(" ", "\x1b[1C", 40) + "\n")
-    for name, screen in (("real-bytes", residue_real),
-                         ("literal-escaped", literalize(residue_real))):
-        pre = b._plain_screen(screen)
-        if not b._composer_is_boot_residue_only(pre, b.BOOT_TEXT[:27]):
-            failures.append(f"doubled boot residue NOT residue-only through {name} spelling")
+    # 2. ⛔⛔ THE JAM THIS ENDS. A boot that WORKED stays on the screen as a
+    #    delivered transcript entry, and the agent CLI draws that entry behind
+    #    the SAME glyph the composer uses. The old reader flattened the whole
+    #    screen to one line and found the boot text after a `❯` — so the row
+    #    read "residue in the composer" forever and no clear could ever satisfy
+    #    it. Measured across 19 rows and 434 consecutive refusals.
+    delivered = [
+        "  earlier conversation output",
+        "❯ " + b.BOOT_TEXT[:70],
+        "",
+        "● and the reply the row already gave to it",
+        "✻ Churned for 50s",
+        "─" * 60,
+        "❯",
+        "─" * 60,
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+    ]
+    if b._composer_from_grid(delivered) != "":
+        failures.append("a DELIVERED boot in the transcript read as composer content: "
+                        f"{b._composer_from_grid(delivered)!r}")
 
-    # 3. An owner's words before the copies must still refuse — the cleaner may
-    #    never eat a human's draft, whatever the spelling did to the screen.
-    drafted = ("❯ please hold this thought about the ledger " + b.BOOT_TEXT + "\n")
-    if b._composer_is_boot_residue_only(b._plain_screen(drafted), b.BOOT_TEXT[:27]):
-        failures.append("owner draft before the copy was NOT refused")
+    # 3. The composer's own content is still read, including when it wraps.
+    drafted = [
+        "● some earlier output",
+        "─" * 60,
+        "❯ please hold this thought about the",
+        "  ledger until tomorrow",
+        "─" * 60,
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ]
+    if b._composer_from_grid(drafted) != "please hold this thought about the ledger until tomorrow":
+        failures.append(f"a wrapped composer draft was misread: {b._composer_from_grid(drafted)!r}")
+
+    # 4. No composer drawn at all is NOT an empty composer — one may be typed
+    #    into and the other may not, and returning "" for both is how a watcher
+    #    types into a modal.
+    mid_output = ["● running the sweep", "  Ran 1 shell command", "  ...still going"]
+    if b._composer_from_grid(mid_output) is not None:
+        failures.append("a mid-output screen reported a composer")
+
+    # 5. ⛔⛔ A BALANCE IS NOT A WINDOW. One row out of credits must not stand the
+    #    whole fleet down: no timer clears a balance, so every probe re-arms a
+    #    blackout over every other campaign. Reported live with 23 subscribers
+    #    unwakeable behind one row's billing state.
+    balance = ("You're out of usage credits. Run /usage-credits to keep using "
+               "the model or /model to switch models.")
+    if not b.refusal_is_a_balance_not_a_window(balance):
+        failures.append("an exhausted CREDIT BALANCE was read as a timed quota window")
+
+    # 6. …and the conservative direction, which is the one that must not drift:
+    #    an ordinary session limit is still a window, still account-wide, and
+    #    still stands the fleet down, because there waiting really does clear it.
+    for window in ("You've hit your session limit. Try again at 3pm.",
+                   "Rate limited. Please try again later.",
+                   ""):
+        if b.refusal_is_a_balance_not_a_window(window):
+            failures.append(f"a timed window was misread as a balance: {window[:40]!r}")
+
+    # 7. ⛔ EVERY REFUSAL THIS FILE CAN RETURN MUST BE IN BOTH TABLES. One decides
+    #    whether the row is charged a wake it never received, the other whether
+    #    anybody is ever told it is stuck. A guard that learns a new refusal and
+    #    updates neither is how a lane loses its whole budget in silence — and it
+    #    has happened twice, the second time to the lane that had just read the
+    #    comment warning about the first.
+    import re as _re
+    src = Path(args.booter).read_text()
+    returned = set(_re.findall(r'return "(refused-[a-z-]+)"', src))
+    refunded = set(_re.findall(r'"(refused-[a-z-]+)"', src[src.index("if via in ("):]
+                               [:src[src.index("if via in ("):].index(")")]))
+    for name in sorted(returned - refunded):
+        failures.append(f"{name} is returned but NOT refunded — it is charged as a boot")
+    for name in sorted(returned - set(b.STANDING_REFUSAL_ESCALATE_AFTER)):
+        failures.append(f"{name} is returned but has no escalation threshold — silent forever")
 
     if failures:
         print("⛔ %d failed: %s" % (len(failures), "; ".join(failures)))
         return 1
-    print("✅ plain-screen normalizer: both spellings match, owner drafts still refuse")
+    print("✅ both spellings match; composer read as a ROW; a balance is not a window; every refusal is in both tables")
     return 0
 
 

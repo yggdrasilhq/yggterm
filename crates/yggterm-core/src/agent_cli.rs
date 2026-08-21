@@ -933,6 +933,27 @@ pub struct AgentCliDescriptor {
     ///
     /// `None` ⇒ this CLI is not identified this way and the route is not tried.
     pub live_session_marker: Option<LiveSessionMarker>,
+    /// This CLI's OWN title for one LIVE session, keyed by session id, read
+    /// from the CLI's own store — the pickup a [`TitleAuthority::Store`] CLI
+    /// depends on entirely, because yggterm refuses to generate copy for one.
+    ///
+    /// ⛔ **Distinct from [`Self::read_store_entry`], which is keyed by PATH.**
+    /// The scanner already holds a store file and asks what is in it; a live row
+    /// holds only the id its CLI minted and has to find the file — and for one
+    /// of the two wired CLIs the title is not in a session file at all but in a
+    /// shared index beside the store.
+    ///
+    /// ⛔ **The `&Path` is the AGENT STORE home (`~`), never the yggterm home.**
+    /// The per-CLI arm this replaced passed `resolve_yggterm_home()`, so every
+    /// lookup ran against `~/.yggterm/.gemini/...` — a directory that does not
+    /// exist — and reported `no_title_in_store` for the life of the daemon.
+    /// Measured on the GUI host 2026-08-21: 96 misses in 91 minutes, all for one
+    /// row, whose title the store had held the whole time.
+    ///
+    /// `None` ⇒ UNMEASURED, the same law as [`Self::working_screen_phrases`]:
+    /// this CLI's store layout has not been read off a real machine, so no
+    /// lookup is attempted rather than a plausible path being guessed at.
+    pub read_live_store_title: Option<fn(&Path, &str) -> Option<String>>,
 }
 
 /// How a live session of a CLI is recognised from a path its process holds open.
@@ -1125,6 +1146,13 @@ impl AgentCliDescriptor {
     /// The label the "New … Session" menu entries carry, derived from
     /// [`Self::display_name`] so the menu and the metadata rail cannot disagree
     /// about what this CLI is called.
+    ///
+    /// ⛔ **A MENU STRING, NOT A ROW NAME.** It was both until 2026-08-21, and
+    /// that is how every agent row in a three-machine fleet came to be born
+    /// `New Antigravity Session` with nothing in it to say which machine it was
+    /// on. A row's birth name is [`new_session_birth_title`], which carries the
+    /// machine; this reads well in a menu, where the machine is already implied
+    /// by the row the menu was opened on.
     pub fn new_session_label(&self) -> String {
         format!("New {} Session", self.display_name)
     }
@@ -1672,6 +1700,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
@@ -1783,6 +1812,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::ClaudeCode,
@@ -2016,6 +2046,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_claude_code_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: Some(read_claude_code_live_store_title),
     },
     // ── The 2026-08-08 intake. Every field below was read off the CLI's own
     // source or its installed binary on this date, never from memory; the
@@ -2139,6 +2170,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_pi_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::OpenCode,
@@ -2233,6 +2265,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_no_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::QwenCode,
@@ -2358,6 +2391,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_qwen_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
@@ -2482,6 +2516,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_no_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -2625,6 +2660,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             root: ".local/share/muse/sessions",
             file_name: ".session.lock",
         }),
+        read_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
@@ -2805,6 +2841,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             root: ".gemini/antigravity-cli/presence",
             extension: "lock",
         }),
+        read_live_store_title: Some(read_antigravity_live_store_title),
     },
     // ── The 2026-08-13 intake. Every field below was read off the installed
     // binary (`@xai-official/grok` 1.0.3 `1a29d5bc12`, provisioned into the
@@ -3005,6 +3042,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_grok_build_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        read_live_store_title: None,
     },
 ];
 
@@ -3365,6 +3403,28 @@ pub fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Claude Code: CC names each
+/// transcript `<session-id>.jsonl`, so the id finds the file and the file
+/// carries the title CC wrote (including a mid-session `/rename`).
+fn read_claude_code_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    let projects = agent_cli_descriptor(SessionKind::ClaudeCode)?
+        .store_roots_absolute(home)
+        .into_iter()
+        .next()?;
+    let jsonl = crate::local_cc_session_jsonl_path_in(&projects, session_id)?;
+    crate::read_cc_session_title(&jsonl).ok().flatten()
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Antigravity, which keeps
+/// the answer in three places and none of them is the session file: the shared
+/// `conversation_summaries.db`, then `history.jsonl`, then the conversation's
+/// own brain transcript.
+fn read_antigravity_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    crate::read_antigravity_session_title(home, session_id)
+        .ok()
+        .flatten()
 }
 
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
@@ -3948,19 +4008,111 @@ pub fn agent_cli_open_session_label(kind: Option<SessionKind>) -> String {
 /// first real title arrives, by whichever mechanism owns titles for that kind
 /// ([`TitleAuthority`]) — so this string's job is to be unmistakable for the
 /// few seconds it is on screen, not to be durable.
-pub fn new_session_birth_title(kind: SessionKind) -> String {
+///
+/// ⛔ **AND IT NAMES THE MACHINE, because a row plane spanning several hosts is
+/// what this product is.** The rule is `New {machine} {what it is}` for every
+/// row that is born unnamed — an agent CLI, a libyggterm app, a terminal — and
+/// it is ONE rule with ONE owner. It was three: a shell was titled by its
+/// working directory (so a terminal wore an absolute path), an agent CLI got
+/// `New {display_name} Session` with no machine in it, and an app row wore
+/// whichever MENU ITEM had launched it. Three rows born within a second of each
+/// other therefore agreed about nothing, and none of them said where they were.
+pub fn new_session_birth_title(kind: SessionKind, machine: Option<&str>) -> String {
+    new_row_birth_title(machine, session_kind_birth_noun(kind))
+}
+
+/// What a row of `kind` IS, in the words a person would use — the tail of
+/// [`new_session_birth_title`].
+///
+/// Split out because a libyggterm APP row is a `SessionKind::Shell` whose noun
+/// is its app's label, not "Terminal": the kind alone cannot answer, and the
+/// caller that knows (the one holding the row's `app:<name>:<verb>` stamp)
+/// composes with [`new_row_birth_title`] directly.
+pub fn session_kind_birth_noun(kind: SessionKind) -> &'static str {
     match agent_cli_descriptor(kind) {
-        Some(descriptor) => descriptor.new_session_label(),
+        Some(descriptor) => descriptor.display_name,
         None => match kind {
-            SessionKind::Shell => "New Terminal".to_string(),
-            SessionKind::SshShell => "New SSH Terminal".to_string(),
-            SessionKind::Document => "New Document".to_string(),
+            // Both shells are "Terminal": the machine name already says which
+            // host it is on, so "SSH Terminal" on a row that reads
+            // `New oc Terminal` would be saying it twice.
+            SessionKind::Shell | SessionKind::SshShell => "Terminal",
+            SessionKind::Document => "Document",
             // Unreachable while every agent kind has a descriptor, which
             // `SessionKind::is_agent` derives from this very registry — so a
             // new kind reaching here is a missing registration, not a name to
             // invent. Stay generic rather than guess a product name.
-            _ => "New Session".to_string(),
+            _ => "Session",
         },
+    }
+}
+
+/// Is `title` a name [`new_row_birth_title`] composed — `New [{machine}] {noun}`?
+///
+/// ⛔ **THE RECOGNISER MUST MOVE WITH THE COMPOSER, and this is why it is
+/// derived rather than listed.** Every gate that asks "may this row still be
+/// re-titled" runs through `looks_like_generated_fallback_title`, which was a
+/// table of literal strings — `"new antigravity session"`, `"new terminal"`,
+/// and so on. Put a machine name in the middle and every one of those literals
+/// stops matching, so the chore would read a two-second-old placeholder as a
+/// real title and leave it on the row for ever. Changing the composer without
+/// this would have traded a name with no machine in it for a name that never
+/// gets replaced.
+///
+/// Tight on purpose: `New ` prefix, then AT MOST one token of machine before a
+/// noun this build actually composes with. A real generated title is not this
+/// shape.
+pub fn is_new_row_birth_title(title: &str) -> bool {
+    let Some(rest) = title.trim().strip_prefix("New ") else {
+        return false;
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    birth_nouns().any(|noun| {
+        // ⚠ CASE-SENSITIVE on the noun, and that is what keeps this tight. The
+        // composer always emits the registry's own spelling (`Terminal`,
+        // `Claude Code`), so a real generated title that happens to end in the
+        // same word — "New async terminal" — does not match, while
+        // `New box Terminal` does.
+        let Some(head) = rest.strip_suffix(noun) else {
+            return false;
+        };
+        // Nothing before the noun (no machine), or exactly one token (the
+        // machine name). Two or more is somebody's sentence, not a birth name.
+        match head.trim() {
+            "" => head.is_empty(),
+            machine => !machine.contains(char::is_whitespace),
+        }
+    })
+}
+
+/// Every noun the birth rule can compose with — the registry's display names
+/// plus the non-agent kinds'. `SessionKind::ALL` drives the second half so a new
+/// kind is covered by adding it to the enum, not by remembering this function.
+fn birth_nouns() -> impl Iterator<Item = &'static str> {
+    AGENT_CLIS
+        .iter()
+        .map(|descriptor| descriptor.display_name)
+        .chain(
+            SessionKind::ALL
+                .iter()
+                .filter(|kind| !kind.is_agent())
+                .map(|kind| session_kind_birth_noun(*kind)),
+        )
+}
+
+/// The birth name itself: `New {machine} {what}`.
+///
+/// ⚠ An absent or blank machine degrades to `New {what}` rather than emitting a
+/// double space or the word "unknown". A caller that cannot name the host is
+/// giving a worse answer, not a wrong one, and a stray gap in a sidebar row is
+/// a defect a reader blames on the row rather than on the caller.
+pub fn new_row_birth_title(machine: Option<&str>, what: &str) -> String {
+    let what = what.trim();
+    match machine.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(machine) => format!("New {machine} {what}"),
+        None => format!("New {what}"),
     }
 }
 
@@ -4887,6 +5039,161 @@ mod tests {
             }
         };
         0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+    }
+
+    /// ⛔ EVERY KIND IS BORN NAMING ITS MACHINE, and none is born naming a path.
+    ///
+    /// The defect this locks out, owner-reported 2026-08-21 with a screenshot:
+    /// a `ytop` started in a terminal was called `/home/user/proj` — its working
+    /// directory, in full — while an agent CLI beside it was called
+    /// `New Antigravity Session`, with no machine in it at all. Two families of
+    /// row, two rules, and neither one said which of three machines it was on.
+    ///
+    /// Driven off `SessionKind::ALL`, so a kind added later cannot quietly opt
+    /// out of the rule by not being in whichever list a reviewer remembered.
+    #[test]
+    fn every_kind_is_born_named_after_its_machine() {
+        for kind in SessionKind::ALL {
+            let title = new_session_birth_title(*kind, Some("box"));
+            assert!(
+                title.starts_with("New box "),
+                "{kind:?} is born `{title}`, which does not name its machine",
+            );
+            assert!(
+                !title.contains('/') && !title.contains('\\'),
+                "{kind:?} is born `{title}`, which reads as a path rather than a name",
+            );
+            let noun = session_kind_birth_noun(*kind);
+            assert!(
+                !noun.trim().is_empty(),
+                "{kind:?} has no noun for the birth rule",
+            );
+            assert_eq!(
+                title,
+                format!("New box {noun}"),
+                "{kind:?}: the birth title must be the rule applied to its noun",
+            );
+        }
+    }
+
+    /// A CLI's birth noun is its DISPLAY NAME, from the registry — never its
+    /// slug, its binary, or a product name invented at a call site.
+    #[test]
+    fn an_agent_clis_birth_noun_is_its_display_name() {
+        for descriptor in AGENT_CLIS {
+            assert_eq!(
+                session_kind_birth_noun(descriptor.kind),
+                descriptor.display_name,
+                "{:?} is born under a name the registry does not know it by",
+                descriptor.kind,
+            );
+        }
+        // The two shells share one noun: the machine half already says which
+        // host the row is on, so "SSH Terminal" would say it twice.
+        assert_eq!(session_kind_birth_noun(SessionKind::Shell), "Terminal");
+        assert_eq!(session_kind_birth_noun(SessionKind::SshShell), "Terminal");
+    }
+
+    /// ⛔ WHAT THE COMPOSER MAKES, THE RECOGNISER MUST SEE — for every kind, with
+    /// and without a machine.
+    ///
+    /// This is the trap the birth-name change would otherwise have set. Every
+    /// "may this row still be re-titled" gate runs through
+    /// `looks_like_generated_fallback_title`, which matched a table of literal
+    /// placeholder strings. Put a machine name in the middle of one and the
+    /// literal stops matching — so a row born two seconds ago reads as already
+    /// titled and keeps its placeholder for ever. Trading a name with no machine
+    /// in it for a name that is never replaced is not a fix.
+    #[test]
+    fn a_birth_title_is_recognised_as_the_placeholder_it_is() {
+        for kind in SessionKind::ALL {
+            for machine in [None, Some("box"), Some("build-01")] {
+                let title = new_session_birth_title(*kind, machine);
+                assert!(
+                    is_new_row_birth_title(&title),
+                    "`{title}` is a birth name this build composes and must read \
+                     as a placeholder",
+                );
+                assert!(
+                    crate::looks_like_generated_fallback_title(&title),
+                    "`{title}` must stay replaceable by the title chore",
+                );
+            }
+        }
+        // An app row's birth name too — the same composer, a label the app
+        // registry supplies rather than a kind.
+        assert!(is_new_row_birth_title(&new_row_birth_title(
+            Some("box"),
+            "Terminal"
+        )));
+    }
+
+    /// ⚠ And it must not swallow a REAL title that happens to start with "New".
+    /// The rule is `New ` + at most one machine token + a noun this build
+    /// composes with; anything longer is somebody's sentence.
+    #[test]
+    fn a_real_title_starting_with_new_is_not_mistaken_for_a_birth_name() {
+        for title in [
+            "New retry budget for the fetch loop",
+            "New terminal geometry is wrong after a resize",
+            "Newton solver diverges",
+            "Rewrite the new terminal path",
+            // ⚠ The near miss the case rule exists for: same shape, but the
+            // composer would never spell the noun in lower case.
+            "New async terminal",
+            "New two word Terminal",
+            "New",
+            "",
+        ] {
+            assert!(
+                !is_new_row_birth_title(title),
+                "`{title}` is a real title and must not be discarded as a placeholder",
+            );
+        }
+    }
+
+    /// A caller that cannot name the host degrades to `New {what}` — never an
+    /// empty gap, never the word "unknown".
+    #[test]
+    fn a_nameless_machine_leaves_no_gap_in_the_birth_title() {
+        for machine in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                new_row_birth_title(machine, "Terminal"),
+                "New Terminal",
+                "a blank machine must not leave a hole in the row's name",
+            );
+        }
+        assert_eq!(new_row_birth_title(Some(" box "), "Ytop"), "New box Ytop");
+    }
+
+    /// ⛔ A [`TitleAuthority::Store`] CLI has NO other way to be titled —
+    /// yggterm refuses to generate copy for one on purpose — so one that also
+    /// declares no `read_live_store_title` can never be named at all, and its
+    /// rows wear their birth title for the life of the session.
+    ///
+    /// This is a REPORT, not a prohibition: leaving the hook `None` is the
+    /// honest answer for a store nobody has measured. It exists so the hole is
+    /// named in one place, with the measurement each CLI still owes.
+    #[test]
+    fn a_store_titled_cli_without_a_live_reader_can_never_be_titled() {
+        let unreachable = AGENT_CLIS
+            .iter()
+            .filter(|descriptor| {
+                descriptor.title_is_store_authoritative()
+                    && descriptor.read_live_store_title.is_none()
+            })
+            .map(|descriptor| descriptor.slug)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unreachable,
+            // Both owe a MEASURED store layout on a real machine: neither had a
+            // session on the host this was written from, and Kimi's
+            // `session_store_globs` are empty — its store is not wired at all.
+            vec!["qwen-code", "kimi"],
+            "the set of CLIs that can never be titled has changed; either a \
+             measurement landed (drop it from this list) or a CLI was made \
+             store-authoritative without a reader (measure its store first)",
+        );
     }
 
     /// Every brand colour carries WHITE text, so every brand colour owes AA.

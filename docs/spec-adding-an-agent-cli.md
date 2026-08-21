@@ -111,6 +111,7 @@ the rest of the app needs no edit at all:
 | `title_authority` | `SessionKind::self_generates_copy`'s `matches!(self, ClaudeCode)` |
 | `working_screen_phrases` | the hardcoded phrase list in `screen_text_shows_agent_working` |
 | `id_assigned_at_birth` | whether the remote identity-rebind poll runs |
+| `read_live_store_title` | `collect_live_cc_title_syncs` + `collect_live_antigravity_title_syncs` — two hand-written chore arms that seven of the ten registered CLIs were in neither of |
 | `install` | `ManagedCliTool`'s hand-mapped npm package names |
 
 ⚠ **The three shipped CLIs carry HISTORICAL spellings** that may not be renamed:
@@ -258,9 +259,58 @@ inherited `npm_config_prefix` writes the shared prefix and overwrites the
 published symlink. ⇒ **A self-updater earns the preference by being a different
 mechanism, not by existing.** Ask it, in the recon.
 
-### Step 9 — title lifecycle (`New <CLI> Session` → generated title)
+### Step 9 — title lifecycle (`New {machine} <CLI>` → a real title)
 
-Unlike `claude-code` (store holds `custom-title`/`ai-title`) and like `codex` (`Generated`), a CLI that writes **no** title (e.g. `muse`) must still show a two-phase lifecycle: new row → explicit `"New <CLI> Session"` (`set_session_title_explicit` at `terminal new` in `crates/yggterm-server/src/lib.rs:2501`), then after the first user prompt + assistant turn appears in its `store_globs` (for `muse`: `.local/share/muse/sessions/**/session.jsonl` + `session-index.db`), the daemon background title chore (same poll/throttle as `claude` — `LIVE_SUMMARY_REFRESH_HORIZON` 30 min, `crates/yggterm-server/src/daemon.rs:11682`) replaces it via `set_session_title_hint()` (passive, respects explicit) using `SessionTitleStore::heuristic_title_from_context()` / `request_litellm_title()`. The `looks_like_generated_fallback_title()` list (`crates/yggterm-core/src/titles.rs:2837`) must include the new CLI's daemon-derived placeholder (`"muse code stays attached daemon"` was missing for `muse`, so it persisted). Add `read_muse_session_title()` mirroring `read_cc_session_title()` and include it in `stored_missing`.
+**Phase 1, the birth name, is not yours to write.** Every row of every kind is
+born `New {machine} {what it is}` from
+`yggterm_core::agent_cli::new_session_birth_title`, which reads your
+`display_name` out of the registry. There is no per-CLI arm and no call site to
+add — registering the descriptor is the whole of it. ⛔ Do not compose a birth
+title anywhere else: the machine half is known only to the daemon, and a hint
+composed in the shell or handed in by a launcher is a second answer that wins by
+arriving first. (That is how a `ytop` row came to be called `/home/user/proj`
+and every agy row `New Antigravity Session`, on all three machines at once.)
+
+**Phase 2 depends on one field, `title_authority`, and the two arms are not
+symmetric.**
+
+* `Generated` — yggterm's own chore names the row: after the first user prompt
+  and assistant turn appear under your `session_store_globs`, the daemon
+  background copy chore replaces the birth name via `set_session_title_hint()`
+  (passive, so it never overwrites an owner rename) using
+  `SessionTitleStore::heuristic_title_from_context()` / `request_litellm_title()`.
+  ⚠ Add your CLI's daemon-derived placeholder to
+  `looks_like_generated_fallback_title()` (`crates/yggterm-core/src/titles.rs`)
+  or the row keeps it for ever — the chore will not replace a string it does not
+  recognise as a placeholder.
+* `Store` — **yggterm refuses to generate copy for you**
+  (`session_accepts_generated_copy`), because inventing a title beside one your
+  CLI already wrote leaves two names disagreeing for ever. ⛔ **So a `Store` CLI
+  that does not also wire `read_live_store_title` can never be titled at all**,
+  and its rows wear the birth name for the life of the session. Wire it: a
+  `fn(&Path /* the AGENT STORE home, `~` */, &str /* session id */) ->
+  Option<String>` beside your `read_store_entry`, and the one chore
+  (`collect_live_store_title_syncs`) picks it up for every CLI at once.
+  `a_store_titled_cli_without_a_live_reader_can_never_be_titled` names the CLIs
+  that still owe this measurement.
+
+⚠ **`read_live_store_title` is keyed by ID, `read_store_entry` by PATH, and the
+difference is the whole reason both exist.** A scanner already holds a store
+file; a live row holds only the id its CLI minted and has to find the file — and
+for at least one CLI the title is not in a session file at all but in a shared
+index beside the store. ⛔ And the `&Path` it is handed is the **agent store
+home** (`startpage::agent_store_home`), never `resolve_yggterm_home()`: a wrong
+home is not an error, it is an empty directory, and an empty directory answers
+"this session has no title" indistinguishably from the truth.
+
+⚠ **A CLI with `id_assigned_at_birth:false` cannot be titled until it is
+rebound.** The row is born with a uuid yggterm minted and its store has never
+heard of; the identity poll (`live_session_marker`) swaps in the real one. Until
+that lands, every store lookup misses — and the miss looks exactly like a store
+with no title in it. The `store_title_miss` trace event carries the id it asked
+about for precisely this reason: an id that is still the row's birth uuid means
+the REBIND failed, which is a different repair from a store that is genuinely
+empty.
 
 ### Step 10 — prove it
 
