@@ -20139,6 +20139,47 @@ mod tests {
         assert_eq!(style.shell_radius, "0px");
         assert_eq!(style.host_radius, "0px");
     }
+    /// The pad hit-tests a press in its OWN coordinates, because the handles are
+    /// inert. These are the assertions that let them be inert.
+    #[test]
+    fn theme_editor_press_grabs_the_stop_under_it() {
+        let positions = [(48.0 / 286.0, 72.0 / 286.0)];
+        assert_eq!(theme_editor_stop_at(&positions, 48.0, 72.0), Some(0));
+        // Just inside the handle's edge.
+        assert_eq!(theme_editor_stop_at(&positions, 58.0, 72.0), Some(0));
+    }
+
+    #[test]
+    fn theme_editor_press_on_bare_pad_grabs_nothing() {
+        let positions = [(48.0 / 286.0, 72.0 / 286.0)];
+        // 12px away on one axis — outside the 11px handle radius.
+        assert_eq!(theme_editor_stop_at(&positions, 60.0, 72.0), None);
+        assert_eq!(theme_editor_stop_at(&[], 10.0, 10.0), None);
+    }
+
+    /// ⛔ TOPMOST WINS. The handles paint in index order, so the LAST is the one
+    /// drawn on top and the one a press must take. Iterating forwards hands the
+    /// press to whichever stop happens to be underneath, and the dot the user
+    /// aimed at stays put while a hidden one moves.
+    #[test]
+    fn theme_editor_press_takes_the_topmost_of_overlapping_stops() {
+        let overlapping = [
+            (100.0 / 286.0, 100.0 / 286.0),
+            (103.0 / 286.0, 103.0 / 286.0),
+        ];
+        assert_eq!(theme_editor_stop_at(&overlapping, 101.0, 101.0), Some(1));
+    }
+
+    /// The grab radius is the handle's own half-width, so the hittable target is
+    /// exactly the circle the eye sees — the press is round, not square.
+    #[test]
+    fn theme_editor_grab_radius_is_circular_not_square() {
+        let positions = [(100.0 / 286.0, 100.0 / 286.0)];
+        // (8,8) is inside the 11px square but outside the 11px circle (|d|~11.3).
+        assert_eq!(theme_editor_stop_at(&positions, 108.0, 108.0), None);
+        assert_eq!(theme_editor_stop_at(&positions, 107.0, 107.0), Some(0));
+    }
+
     /// The pad has painted a 24px grid since it was built. Until the snap
     /// landed, that grid was DECORATION — a stop could only be eyeballed onto a
     /// line it was drawn beside. These assertions are what make it real.
@@ -42000,6 +42041,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -43043,6 +43085,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -43248,6 +43291,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -43453,6 +43497,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -43661,6 +43706,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -43873,6 +43919,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -44077,6 +44124,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -44281,6 +44329,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -44526,6 +44575,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -44733,6 +44783,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -44979,6 +45030,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),
@@ -45502,6 +45554,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cli_install_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
             theme_accent: String::new(),
             shell_tint: String::new(),
             chrome_material_tint: String::new(),

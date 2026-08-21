@@ -105,8 +105,24 @@ fi
 echo "corner-contract: gui=${YGGTERM_GUI_BIN:-<resolver default>}"
 echo "corner-contract: starting Wayland-native arm (radius ${RADIUS}px, bg #101418)"
 bash "$SANDBOX" stop --name "$NAME" >/dev/null 2>&1
-bash "$SANDBOX" start --name "$NAME" --under-glass 0 >/dev/null 2>&1 \
-  || { echo "corner-contract: UNTESTED — sandbox failed to start" >&2; exit 3; }
+# ⚠ A TEARDOWN IS NOT INSTANT, AND STARTING INTO ONE READS AS A BROKEN TEST.
+# `stop` returns before the compositor has released its socket, so an immediate
+# `start` finds the old one still there and fails — reported as "UNTESTED —
+# sandbox failed to start", which is indistinguishable from a real harness
+# problem and sent me diagnosing the GUI instead of the race. Retry rather than
+# sleep blindly: the second attempt is enough in practice, and a genuine failure
+# still fails both times.
+started=0
+for attempt in 1 2 3; do
+  if bash "$SANDBOX" start --name "$NAME" --under-glass 0 >/dev/null 2>&1; then
+    started=1
+    break
+  fi
+  bash "$SANDBOX" stop --name "$NAME" >/dev/null 2>&1
+  sleep 2
+done
+[ "$started" = 1 ] \
+  || { echo "corner-contract: UNTESTED — sandbox failed to start after 3 attempts" >&2; exit 3; }
 
 # The sandbox compositor tiles with a titlebar and a border by default. Those
 # belong to SWAY, not to yggterm, and sampling them instead of the window's own
