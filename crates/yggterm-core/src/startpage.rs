@@ -130,9 +130,10 @@ type DurableFileStamp = (u128, u64);
 /// ⭐ **The scan is a POLL, and almost nothing it reads has changed.** The GUI
 /// re-runs it every 8 s and the daemon chore every 12 s over a corpus of
 /// hundreds of JSONL transcripts totalling gigabytes; measured 2026-08-21 on
-/// the owner's laptop at p50 4.6 s per run (13.9 s on the larger corpus), with
+/// a GUI host at p50 4.6 s per run (13.9 s on the larger corpus), with
 /// duty cycles of 87-109% of a 60 s window — the dominant steady CPU burn on
-/// the machine, while the owner could not type. Per file per run the old path
+/// the machine, alongside recorded input-block incidents. Per file per run
+/// the old path
 /// paid a fresh SQLite connection (schema batch included), a multi-megabyte
 /// tail read, and a `serde_json` parse of every line in that tail — up to
 /// three times over.

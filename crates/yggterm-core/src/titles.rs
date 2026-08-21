@@ -582,7 +582,7 @@ impl SessionTitleStore {
     /// on the very next pass and the same unchanged session re-pays the same
     /// LLM call forever. Measured 2026-08-21: 2,589 title generations at p50
     /// 9.3 s — 6.4 hours of wall clock in one retention window — and 1,707
-    /// summaries at p50 3.6 s, on a machine whose owner could not type.
+    /// summaries at p50 3.6 s, on a host recording input-block incidents.
     ///
     /// ⚠ The stamp is the SOURCE's identity, not a clock. A retry timer says
     /// "try again later"; this says the only true thing available — that
