@@ -30,6 +30,9 @@ import subprocess
 import sys
 import time
 
+#: Default: the yggterm checkout this script lives in. ⚠ NOT the only repo an
+#: orchestrator lands — ytop carries lane branches from two seats whose work must
+#: merge harmoniously, and landing them by hand loses every guard below.
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 
 
@@ -37,7 +40,10 @@ def log(msg):
     print(f"{time.strftime('%H:%M:%S')} ygg-land {msg}")
 
 
-def git(*args, cwd=REPO, check=False):
+def git(*args, cwd=None, check=False):
+    # ⛔ `cwd=REPO` as a DEFAULT ARGUMENT binds at import and would ignore --repo
+    # entirely, while every call site still looked correct.
+    cwd = cwd or REPO
     r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=300)
     if check and r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
@@ -317,9 +323,12 @@ def main():
     ld.add_argument("--stale-ok", action="store_true",
                     help="land over a base older than %d days even though main has since "
                          "rewritten the files this branch touches" % STALE_BASE_DAYS)
+    ap.add_argument("--repo", help="checkout to land in (default: this script's yggterm repo)")
     a = ap.parse_args()
-    global STALE_OK
+    global STALE_OK, REPO
     STALE_OK = getattr(a, "stale_ok", False)
+    if getattr(a, "repo", None):
+        REPO = os.path.abspath(os.path.expanduser(a.repo))
     return cmd_status(a) if a.cmd == "status" else cmd_land(a)
 
 
