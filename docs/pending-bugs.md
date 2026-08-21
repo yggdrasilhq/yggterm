@@ -688,6 +688,50 @@ tick instead of vanishing from the count, and the birth event carries
 `store_title_reader:false` so a reader need not wait for a title that was never
 coming. Wiring each is a per-CLI measurement, not a code change.
 
+## ⛔ [11.25] THE ALL-CLI GREETING RUN HAS NOT BEEN TAKEN
+
+**Status:** AWAITING A DECISION
+
+**Who decides:** the owner — it spends money and wants a screen.
+
+**The ask:** spawn one session of every registered CLI through the normal path,
+make them greet each other, and score each one **per stage** — born, titled,
+resumable, addressable, delivered — because "CLI X is broken" is not actionable
+and "CLI X is born untitled and cannot be addressed" is.
+
+**Not taken, deliberately.** N agent sessions cost real money, and the run wants
+a GUI to open rows in — which on the reference client is the machine a person is
+working on. That is a spend-and-screen call, not an engineering one.
+
+**Recommendation: take it in a sandbox home against a headless daemon, not on
+the live client, and scope it to the CLIs with a working backend.** Two CLIs are
+known to have no connected model and will fail for that reason alone — that is a
+recorded absence, not a finding, and including them buys nothing. A sandbox run
+answers the same per-stage question without opening a row on anybody's desktop;
+only if a stage turns out to need the real GUI does this need his window.
+
+**What the campaign did instead, and it changes what the run has to discover:**
+
+* Four of the five stages are now answerable at rest rather than by spawning.
+  The registry locks assert which CLIs have a store reader, which have a remote
+  arm, which can be titled on each side of the local/remote seam, and which
+  resume selector each one gets. A stage that a lock can answer should not cost
+  an agent session.
+* The `cli_plane` grammar means the run, when taken, is READABLE: one filter on
+  `category=="cli"` yields a row's whole life — birth, launch shape, every title
+  attempt with its skips enumerated, and the re-key across a restart. Before it,
+  the run would have produced four vocabularies and no way to diff one CLI's
+  path against the reference one's.
+
+⇒ So the residue the run uniquely buys is the **delivered** stage — whether a
+row of each CLI can actually be addressed and receive a message — plus resume
+under real conditions. That is a much smaller and cheaper run than the original
+shape, and it is the version recommended.
+
+⚠ **Known-absent backends are recorded, not chased.** A CLI failing for want of
+a connected model must be scored as absent-backend, or the next reader spends a
+session rediscovering that a CLI nobody has credentials for does not answer.
+
 ## ⛔ [11.25] A DAEMON RESPONSE THAT FAILS TO PARSE CAN PANIC THE ERROR MESSAGE ABOUT IT
 
 **Status:** OPEN
