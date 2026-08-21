@@ -6,7 +6,7 @@
 //! asked what it showed, the daemon what it thinks the page should be, and a
 //! Python oracle can walk the raw jsonls independently.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::agent_cli::{AGENT_CLIS, AgentStoreEntry};
@@ -113,12 +113,157 @@ pub fn agent_store_home(yggterm_home: &Path) -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| yggterm_home.to_path_buf())
 }
 
+/// What a memoised row was derived from: the transcript's own `(mtime_ns, len)`.
+///
+/// Both halves, not just mtime: an agent CLI appends to its JSONL many times a
+/// second, and a filesystem whose mtime granularity is coarser than the append
+/// rate would otherwise hand back a row built from a shorter file.
+///
+/// ⚠ NANOseconds, deliberately. At millisecond resolution a title written and
+/// re-read inside the same millisecond — which is exactly what the titles
+/// sweep does to verify its own writes — reads as "unchanged", and the sweep
+/// would report that its write had not landed.
+type DurableFileStamp = (u128, u64);
+
+/// Per-process memo for the durable-session scan.
+///
+/// ⭐ **The scan is a POLL, and almost nothing it reads has changed.** The GUI
+/// re-runs it every 8 s and the daemon chore every 12 s over a corpus of
+/// hundreds of JSONL transcripts totalling gigabytes; measured 2026-08-21 on
+/// the owner's laptop at p50 4.6 s per run (13.9 s on the larger corpus), with
+/// duty cycles of 87-109% of a 60 s window — the dominant steady CPU burn on
+/// the machine, while the owner could not type. Per file per run the old path
+/// paid a fresh SQLite connection (schema batch included), a multi-megabyte
+/// tail read, and a `serde_json` parse of every line in that tail — up to
+/// three times over.
+///
+/// None of that work can produce a different answer for a file that has not
+/// changed, so it is done once and remembered.
+///
+/// ⛔ **A row is NOT a pure function of its transcript.** `load_generated_title`
+/// reads the title store, which the generation chore writes behind the scan's
+/// back — so a memo keyed on the transcript alone would pin a freshly
+/// generated title out of sight forever, which is the instrument-freezing
+/// failure this project pays for most often. The store's own stamp is
+/// therefore the memo's GENERATION: when it moves, every row is rebuilt. One
+/// `stat` per scan buys that, against one SQLite open per row.
+#[derive(Default)]
+struct DurableScanMemo {
+    generation: Option<DurableFileStamp>,
+    rows: HashMap<PathBuf, (DurableFileStamp, StartpageDurableRow)>,
+    hits: usize,
+    misses: usize,
+}
+
+static DURABLE_SCAN_MEMO: std::sync::OnceLock<std::sync::Mutex<DurableScanMemo>> =
+    std::sync::OnceLock::new();
+
+fn durable_scan_memo() -> &'static std::sync::Mutex<DurableScanMemo> {
+    DURABLE_SCAN_MEMO.get_or_init(|| std::sync::Mutex::new(DurableScanMemo::default()))
+}
+
+/// `(mtime_ms, len)` for a path, or `None` when it cannot be stat'ed.
+///
+/// A file that cannot be stat'ed is never memoised: an unknown stamp must read
+/// as "rebuild", never as "unchanged".
+fn durable_file_stamp(path: &Path) -> Option<DurableFileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((mtime, meta.len()))
+}
+
+/// The generation stamp: the title store's own `(mtime, len)`, folded with its
+/// write-ahead log when one exists.
+///
+/// ⚠ The `-wal` half matters — under WAL journalling a committed write lands in
+/// the sidecar and the main file's mtime can sit still until a checkpoint, so
+/// reading only the `.db` would declare the store unchanged after a title was
+/// written. Absent files fold in as zeroes, which is a stable stamp of their
+/// own ("there is no store").
+fn durable_scan_generation(home: &Path) -> DurableFileStamp {
+    // ⛔ EVERY store the row builder might read, not just the likely one.
+    // `load_generated_title` resolves through `dirs::home_dir()` and falls back
+    // from `~/.yggterm` to `~`, while this scan is handed a `home` that a
+    // caller may have resolved differently. A generation that watched one path
+    // while the rows were built from another would go stale silently — the
+    // exact shape of failure the memo is supposed to be safe against — so all
+    // of them fold in, at three `stat`s per scan.
+    let mut candidates = vec![
+        home.join(".yggterm").join(crate::titles::TITLE_DB_FILENAME),
+        home.join(crate::titles::TITLE_DB_FILENAME),
+    ];
+    if let Some(user_home) = dirs::home_dir() {
+        candidates.push(user_home.join(".yggterm").join(crate::titles::TITLE_DB_FILENAME));
+        candidates.push(user_home.join(crate::titles::TITLE_DB_FILENAME));
+    }
+    candidates.sort();
+    candidates.dedup();
+    let mut mtime: u128 = 0;
+    let mut len: u64 = 0;
+    for db in candidates {
+        // ⚠ The `-wal` sidecar matters: under WAL journalling a committed write
+        // lands there and the main file's mtime can sit still until a
+        // checkpoint, so reading only the `.db` would call the store unchanged
+        // just after a title was written.
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        for path in [db, wal] {
+            let (path_mtime, path_len) = durable_file_stamp(&path).unwrap_or((0, 0));
+            mtime = mtime.rotate_left(1) ^ path_mtime;
+            len = len.rotate_left(1) ^ path_len;
+        }
+    }
+    (mtime, len)
+}
+
+/// Drop every memoised row, unconditionally.
+///
+/// ⛔ The in-process net for a title write. The `(mtime, len)` generation stamp
+/// is the CROSS-process net — it is how a GUI notices that the daemon wrote a
+/// title — but a stamp can only ever be as fine as the clock behind it, and a
+/// process that writes a title and immediately rescans to check its own work
+/// must not be told the corpus is unchanged. Writers call this directly, so
+/// that path does not depend on a timestamp at all.
+pub(crate) fn invalidate_durable_scan_memo() {
+    let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
+    memo.rows.clear();
+    memo.generation = None;
+}
+
+/// Memo counters for the run that just finished, and a reset for the next one.
+/// Reported on the scan's perf span so the memo cannot quietly stop working:
+/// a hit rate that collapses is a fact about the corpus, and it must be
+/// readable without attaching a debugger.
+pub fn take_durable_scan_memo_counts() -> (usize, usize, usize) {
+    let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
+    let counts = (memo.hits, memo.misses, memo.rows.len());
+    memo.hits = 0;
+    memo.misses = 0;
+    counts
+}
+
 /// Walk every registered agent CLI's store globs under `home` and return
 /// one entry per readable session file, using the descriptor's own
 /// `read_store_entry` so title/cwd semantics stay single-sourced.
 pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
     let mut out = Vec::new();
     let mut seen_paths = HashSet::<PathBuf>::new();
+    // Generation check FIRST, before a single file is read: a title written
+    // since the last scan invalidates every memoised row at once, because the
+    // store is consulted for every row and a per-row test would cost the very
+    // SQLite open the memo exists to avoid.
+    {
+        let generation = durable_scan_generation(home);
+        let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
+        if memo.generation != Some(generation) {
+            memo.generation = Some(generation);
+            memo.rows.clear();
+        }
+    }
     for descriptor in AGENT_CLIS {
         debug_assert!(
             !descriptor.session_store_globs.is_empty()
@@ -170,6 +315,14 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
     // Add Codex-family legacy roots that live under `~/.codex/sessions` with
     // date subdirectories — already covered by AGENT_CLIS walk, but keep as
     // fallback if walk missed due to permission.
+
+    // Forget what this walk did not meet. A memo that only ever grows would
+    // hold rows for deleted transcripts for the life of the process, and would
+    // report a row count that no longer describes the corpus.
+    {
+        let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
+        memo.rows.retain(|path, _| seen_paths.contains(path));
+    }
     out
 }
 
@@ -620,6 +773,25 @@ fn walk_and_collect(
             if is_noise_session_file(&path) {
                 continue;
             }
+            // ⭐ The memo, checked before any read. A transcript whose
+            // `(mtime, len)` is unchanged since the last scan cannot produce a
+            // different row, and rebuilding it is what made this walk the
+            // machine's dominant steady burn. An unstampable file falls
+            // through to the full path rather than being remembered wrong.
+            let stamp = durable_file_stamp(&path);
+            if let Some(stamp) = stamp {
+                let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((cached_stamp, row)) = memo.rows.get(&path)
+                    && *cached_stamp == stamp
+                {
+                    let row = row.clone();
+                    memo.hits += 1;
+                    drop(memo);
+                    out.push(row);
+                    continue;
+                }
+                memo.misses += 1;
+            }
             if let Some(entry) = descriptor.store_entry(&path) {
                 let mut row = StartpageDurableRow::from_entry(entry, descriptor.kind, &path);
                 // Weird-title filtering on sight (heading 9): if title/detail looks generated, try heuristic.
@@ -667,6 +839,10 @@ fn walk_and_collect(
                             row.effective_title = row.generated_title.clone();
                         }
                     }
+                }
+                if let Some(stamp) = stamp {
+                    let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
+                    memo.rows.insert(path.clone(), (stamp, row.clone()));
                 }
                 out.push(row);
             }
@@ -965,5 +1141,109 @@ mod scan_truth_tests {
         assert!(kind_has_dedicated_scanner(crate::SessionKind::OpenCode));
         assert!(kind_has_dedicated_scanner(crate::SessionKind::Kimi));
         assert!(!kind_has_dedicated_scanner(crate::SessionKind::Codex));
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-scan-memo-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An append must move the stamp. This is the whole safety of the memo: a
+    /// transcript that grew has a row that changed, and a stamp that could not
+    /// tell would serve the shorter file's row forever.
+    #[test]
+    fn durable_file_stamp_moves_when_a_transcript_grows() {
+        let dir = scratch("stamp");
+        let file = dir.join("session.jsonl");
+        std::fs::write(&file, b"{\"one\":1}\n").unwrap();
+        let before = super::durable_file_stamp(&file).expect("a written file stamps");
+
+        std::fs::write(&file, b"{\"one\":1}\n{\"two\":2}\n").unwrap();
+        let after = super::durable_file_stamp(&file).expect("a grown file stamps");
+        assert_ne!(before, after, "an append must be visible in the stamp");
+        assert_ne!(before.1, after.1, "and the length half alone already says so");
+
+        assert!(
+            super::durable_file_stamp(&dir.join("absent.jsonl")).is_none(),
+            "a file that cannot be stat'ed has no stamp — an unknown stamp must \
+             read as REBUILD, never as unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generation is what stops the memo pinning a stale TITLE, which is
+    /// the failure a transcript-only key would have.
+    #[test]
+    fn durable_scan_generation_moves_when_a_title_is_written() {
+        let home = scratch("generation");
+        std::fs::create_dir_all(home.join(".yggterm")).unwrap();
+        let before = super::durable_scan_generation(&home);
+
+        let store = crate::SessionTitleStore::open(&home.join(".yggterm")).unwrap();
+        store
+            .put_manual_title("session-under-test", "/tmp", "a new name")
+            .unwrap();
+        let after = super::durable_scan_generation(&home);
+        assert_ne!(
+            before, after,
+            "a title written behind the scan's back must invalidate every \
+             memoised row — the row builder consults this store"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The in-process net, which does not depend on a clock at all: the titles
+    /// sweep writes a title and rescans to verify its own work, and those two
+    /// steps can be closer together than any filesystem timestamp resolves.
+    #[test]
+    fn a_title_write_drops_the_memo_in_this_process() {
+        let home = scratch("invalidate");
+        std::fs::create_dir_all(home.join(".yggterm")).unwrap();
+        {
+            let mut memo = super::durable_scan_memo()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            memo.generation = Some((1, 1));
+            memo.rows.insert(
+                PathBuf::from("/nonexistent/session.jsonl"),
+                (
+                    (1, 1),
+                    StartpageDurableRow {
+                        session_id: "aaaa".to_string(),
+                        cwd: "/tmp".to_string(),
+                        title: None,
+                        generated_title: None,
+                        effective_title: None,
+                        detail: None,
+                        kind: crate::SessionKind::Codex,
+                        modified_epoch_ms: 0,
+                        storage_path: "/nonexistent/session.jsonl".to_string(),
+                        display_path: "codex://aaaa".to_string(),
+                    },
+                ),
+            );
+        }
+
+        let store = crate::SessionTitleStore::open(&home.join(".yggterm")).unwrap();
+        store
+            .put_manual_title("aaaa", "/tmp", "renamed by the sweep")
+            .unwrap();
+
+        let memo = super::durable_scan_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            memo.rows.is_empty() && memo.generation.is_none(),
+            "a title write must drop the memo outright, so the next scan cannot \
+             report that the write did not land"
+        );
+        drop(memo);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

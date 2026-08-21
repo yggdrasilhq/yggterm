@@ -2926,17 +2926,22 @@ fn read_codex_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             None
         }
     });
+    // ⛔ ONE tail read for the whole entry. `extract_tail_context` seeks a
+    // multi-megabyte window to the end of the transcript and `serde_json`-parses
+    // every line in it; this used to happen TWICE per file per scan — once for
+    // the title fallback and unconditionally again for the detail — over a
+    // corpus of hundreds of files, on an 8 s poll.
+    let tail_context = crate::titles::extract_tail_context(path).ok();
     let title = db_title
         .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
         .or_else(|| {
-            crate::titles::extract_tail_context(path)
-                .ok()
-                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+            tail_context
+                .as_deref()
+                .and_then(crate::titles::heuristic_title_from_context)
                 .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
                 .filter(|s| !s.contains("/home/"))
         });
-    let detail = crate::titles::extract_tail_context(path)
-        .ok()
+    let detail = tail_context
         .filter(|context| !context.trim().is_empty())
         .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c))
         .filter(|c| !c.contains("/home/.yggterm/clipboard"));
@@ -3014,17 +3019,22 @@ fn read_pi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             None
         }
     });
+    // ⛔ ONE tail read for the whole entry. `extract_tail_context` seeks a
+    // multi-megabyte window to the end of the transcript and `serde_json`-parses
+    // every line in it; this used to happen TWICE per file per scan — once for
+    // the title fallback and unconditionally again for the detail — over a
+    // corpus of hundreds of files, on an 8 s poll.
+    let tail_context = crate::titles::extract_tail_context(path).ok();
     let title = db_title
         .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
         .or_else(|| {
-            crate::titles::extract_tail_context(path)
-                .ok()
-                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+            tail_context
+                .as_deref()
+                .and_then(crate::titles::heuristic_title_from_context)
                 .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
                 .filter(|s| !s.contains("/home/"))
         });
-    let detail = crate::titles::extract_tail_context(path)
-        .ok()
+    let detail = tail_context
         .filter(|context| !context.trim().is_empty())
         .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c));
     Some(AgentStoreEntry {
