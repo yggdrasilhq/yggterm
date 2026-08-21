@@ -25224,60 +25224,61 @@ impl ShellState {
     /// withheld until the restore is slow enough to be worth mentioning, and a
     /// ticker that raised it would put a toast on every fast reveal — trading
     /// one annoyance for a louder one.
-    fn refresh_terminal_restore_card(&mut self) -> bool {
+    /// Exactly what a restore-card refresh WOULD write, computed without
+    /// touching anything.
+    ///
+    /// ⭐ ONE ENCODING, TWO CALLERS: the writer applies this, and
+    /// [`Self::restore_card_refresh_is_inert`] compares it against what the card
+    /// already holds. The alternative — a predicate that re-derives "would this
+    /// change anything" beside the writer's own logic — is the second encoding
+    /// the SSOT law forbids, and the failure mode is silent: the two answers
+    /// drift and the card either freezes or never stops re-rendering.
+    fn terminal_restore_card_update(&self) -> Option<TerminalRestoreCardUpdate> {
         if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
-            return false;
+            return None;
         }
-        let Some(session_path) = self.server.active_session_path().map(ToOwned::to_owned) else {
-            return false;
-        };
+        let session_path = self.server.active_session_path().map(ToOwned::to_owned)?;
         let job_key = terminal_resume_notification_job_key(&session_path);
-        let Some(existing) = self
+        let existing = self
             .notifications
             .iter()
-            .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
-        else {
-            return false;
-        };
+            .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))?;
         // The two recovery sites word their own situation ("remounting a blank
         // retained surface", "waiting for a prompt-ready terminal") and that
         // wording is more specific than anything derivable here. Only the
         // stage-driven card is re-worded; every card still gets a live bar.
         let owns_message = existing.title == "Restoring Remote Terminal"
             && existing.tone == NotificationTone::Info;
+        let tone = existing.tone;
+        let title = existing.title.clone();
+        let existing_message = existing.message.clone();
         let host_label = self
             .server
             .session_for_path(&session_path)
             .map(|session| session.host_label.clone())
             .unwrap_or_default();
-        let Some((fraction, stage)) = self.terminal_restore_progress(&session_path, &host_label)
-        else {
-            return false;
-        };
-        let (tone, title, message) = {
-            let existing = self
-                .notifications
-                .iter()
-                .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
-                .expect("the card was found a moment ago");
-            (
-                existing.tone,
-                existing.title.clone(),
-                if owns_message {
-                    stage
-                } else {
-                    existing.message.clone()
-                },
-            )
-        };
-        self.upsert_job_notification(
+        let (fraction, stage) = self.terminal_restore_progress(&session_path, &host_label)?;
+        Some(TerminalRestoreCardUpdate {
             job_key,
             tone,
             title,
-            message,
-            Some(fraction),
+            message: if owns_message { stage } else { existing_message },
+            fraction: fraction.clamp(0.0, 1.0),
+            session_path,
+        })
+    }
+    fn refresh_terminal_restore_card(&mut self) -> bool {
+        let Some(update) = self.terminal_restore_card_update() else {
+            return false;
+        };
+        self.upsert_job_notification(
+            update.job_key,
+            update.tone,
+            update.title,
+            update.message,
+            Some(update.fraction),
             false,
-            Some(session_path),
+            Some(update.session_path),
         );
         true
     }
@@ -28291,15 +28292,37 @@ impl ShellState {
     /// rest the user is normally focused on a terminal row, so the candidate is
     /// `Some` and the open-gate arm is the one that actually runs. Locked by
     /// `an_inert_input_gate_tick_really_writes_nothing`.
+    ///
+    /// ⛔⛔ AND THE EMPTINESS TEST MUST BE PER-PATH, WHICH THE PROSE ABOVE HAS
+    /// SAID SINCE IT WAS WRITTEN AND THE CODE DID NOT DO. It asked whether the
+    /// maps were empty GLOBALLY, but the open-gate arm only ever removes the
+    /// CANDIDATE's entry — so one stale entry left by a row that is no longer
+    /// focused answered "not inert" on every tick, for a tick that would then
+    /// remove nothing. That pinned a full app-root re-render at 1 Hz for the
+    /// rest of the process, armed by a single past refusal.
+    ///
+    /// ⚠ And it self-heals in exactly the wrong direction, which is why an idle
+    /// machine never shows it: the clear-all arm needs `candidate == None`,
+    /// i.e. the terminal view left, the row switched to a non-agent one, or the
+    /// **window unfocused**. So the 1 Hz render persists precisely while the
+    /// owner is using the app and evaporates the moment he looks away.
     fn input_gate_deadline_tick_is_inert(&self) -> bool {
-        if !self.input_gate_denied_since_ms.is_empty()
-            || !self.input_gate_stuck_reported.is_empty()
-        {
-            return false;
-        }
         match self.input_gate_deadline_candidate() {
-            None => true,
-            Some(session_path) => !self.remote_resume_input_gate_is_shut(&session_path),
+            // The clear-all arm: inert once there is nothing left to clear.
+            None => {
+                self.input_gate_denied_since_ms.is_empty()
+                    && self.input_gate_stuck_reported.is_empty()
+            }
+            Some(session_path) => {
+                // A shut gate INSERTS (and may restore); never inert.
+                if self.remote_resume_input_gate_is_shut(&session_path) {
+                    return false;
+                }
+                // An open gate removes THIS path from both maps and nothing
+                // else. Another path's leftovers are not work for this tick.
+                !self.input_gate_denied_since_ms.contains_key(&session_path)
+                    && !self.input_gate_stuck_reported.contains(&session_path)
+            }
         }
     }
     /// The same question for the restore card the deadline tick refreshes
@@ -28308,18 +28331,42 @@ impl ShellState {
     /// active session, or no card under this session's job key means there is
     /// nothing to re-word or re-bar. A card that IS up answers `false` and
     /// takes the write, because its bar must keep moving.
+    /// ⛔⛔ "A CARD IS UP" IS NOT THE SAME QUESTION AS "THE CARD WOULD CHANGE",
+    /// AND ANSWERING THE FIRST COST A RENDER PER SECOND FOR THE CARD'S WHOLE
+    /// LIFE. The old predicate said "not inert" whenever ANY card existed under
+    /// this session's job key, so every long-lived card pinned a full app-root
+    /// re-render at 1 Hz — including the ones that by construction never change,
+    /// and including a card raised on a row whose surface is already broken,
+    /// which is the worst moment to be spending renders.
+    ///
+    /// Only the stage-driven card ("Restoring Remote Terminal") re-words itself,
+    /// and only that one carries an elapsed-seconds string that really does move
+    /// every tick; its bar keeps ticking exactly as before. Every other card
+    /// keeps its own wording and a stage-derived fraction, both stable between
+    /// stages — so it now costs renders only when a stage actually advances.
+    ///
+    /// The comparison covers every field `upsert_job_notification` writes.
+    /// `created_at_ms` is deliberately NOT among them: it is bumped on every
+    /// call, so including it would make the predicate permanently false and
+    /// restore the bug. Skipping the bump is safe because an unfinished card is
+    /// `persistent` and exempt from the age filter, and the transition to
+    /// finished flips `persistent` — which IS compared, so that tick takes the
+    /// write.
     fn restore_card_refresh_is_inert(&self) -> bool {
-        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
-            return true;
-        }
-        let Some(session_path) = self.server.active_session_path() else {
+        let Some(update) = self.terminal_restore_card_update() else {
             return true;
         };
-        let job_key = terminal_resume_notification_job_key(session_path);
-        !self
-            .notifications
-            .iter()
-            .any(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
+        let progress = Some(update.fraction);
+        let persistent = !notification_progress_is_finished(progress);
+        self.notifications.iter().any(|notification| {
+            notification.job_key.as_deref() == Some(update.job_key.as_str())
+                && notification.tone == update.tone
+                && notification.title == update.title
+                && notification.message == update.message
+                && notification.progress == progress
+                && notification.persistent == persistent
+                && notification.source.as_deref() == Some(update.session_path.as_str())
+        })
     }
     /// ⛔ THE ESCAPE HATCH THE GATE NEVER HAD. See
     /// [`INPUT_GATE_STUCK_RESTORE_AFTER_MS`].
@@ -31875,6 +31922,17 @@ fn safe_push_notification(
             "suppressed notification panic"
         );
     }
+}
+/// The exact write a restore-card refresh would perform. See
+/// [`ShellState::terminal_restore_card_update`].
+#[derive(Debug, Clone, PartialEq)]
+struct TerminalRestoreCardUpdate {
+    job_key: String,
+    tone: NotificationTone,
+    title: String,
+    message: String,
+    fraction: f32,
+    session_path: String,
 }
 fn set_signal_if_changed<T>(mut signal: Signal<T>, value: T)
 where

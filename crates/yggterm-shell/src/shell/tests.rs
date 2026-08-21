@@ -33639,6 +33639,109 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
 
+    // ⛔ The tick only ever acts on the CANDIDATE, so "is any clock running
+    // anywhere" was the wrong question and it was asked once a second forever.
+    // A row the owner has switched away from leaves its entry behind — nothing
+    // removes it while a candidate exists — and that one leftover pinned a full
+    // app-root re-render at 1 Hz for the rest of the process.
+    #[test]
+    fn a_stale_gate_clock_from_another_row_no_longer_pins_a_render_per_second() {
+        let focused = "remote-cc://example-host/gate-focused-open";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(focused);
+        // Open the focused row's gate: the tick's only job for it is to remove
+        // its own entries, and it has none.
+        shell.terminal_resume_ready_paths.insert(focused.to_string());
+        assert!(!shell.remote_resume_input_gate_is_shut(focused));
+        shell.input_gate_denied_since_ms.clear();
+        shell.input_gate_stuck_reported.clear();
+        assert!(shell.input_gate_deadline_tick_is_inert());
+
+        let other = "remote-cc://example-host/gate-row-since-left".to_string();
+        shell.input_gate_denied_since_ms.insert(other.clone(), 1);
+        shell.input_gate_stuck_reported.insert(other.clone());
+        assert!(
+            shell.input_gate_deadline_tick_is_inert(),
+            "another row's leftovers are not work for a tick that can only touch the candidate"
+        );
+
+        // The proof that skipping is safe: running the real tick anyway leaves
+        // those leftovers exactly where they were.
+        let denied_before = shell.input_gate_denied_since_ms.clone();
+        let reported_before = shell.input_gate_stuck_reported.clone();
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(Some(focused.to_string()), 900_000),
+            None
+        );
+        assert_eq!(shell.input_gate_denied_since_ms, denied_before);
+        assert_eq!(shell.input_gate_stuck_reported, reported_before);
+
+        // The candidate's OWN clock is still work, and so is the clear-all arm.
+        shell.input_gate_denied_since_ms.insert(focused.to_string(), 1);
+        assert!(
+            !shell.input_gate_deadline_tick_is_inert(),
+            "the focused row's own clock must still be removed"
+        );
+        shell.window_focused = false;
+        assert!(
+            !shell.input_gate_deadline_tick_is_inert(),
+            "no candidate with leftovers still owes a clear-all"
+        );
+    }
+
+    // ⛔ "A card is up" is a different question from "the card would change",
+    // and answering the first spent a render per second for the card's whole
+    // life — including on a row whose surface is already broken, which is the
+    // worst moment to be spending them.
+    #[test]
+    fn a_card_that_would_not_change_no_longer_costs_a_render_per_second() {
+        let session_path = "remote-cc://example-host/card-inert";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        shell.settings.in_app_notifications = true;
+        let job_key = terminal_resume_notification_job_key(session_path);
+        // A card that words its own situation — the shape every site except the
+        // stage-driven one raises, including the seed's refusal.
+        shell.upsert_job_notification(
+            job_key.clone(),
+            NotificationTone::Warning,
+            "Terminal Screen Unavailable",
+            "the daemon answered an empty screen",
+            None,
+            false,
+            Some(session_path.to_string()),
+        );
+        // One refresh writes exactly what the update says; the predicate must
+        // then agree, because both read the same computation.
+        assert!(shell.refresh_terminal_restore_card());
+        assert!(
+            shell.restore_card_refresh_is_inert(),
+            "writer and predicate must agree by construction, or the card either \
+             freezes or never stops re-rendering"
+        );
+
+        // A stage that actually advances is work again.
+        let attempt_id = shell
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+            .expect("the scaffold opened an attempt");
+        shell
+            .terminal_open_attempts
+            .get_mut(&attempt_id)
+            .expect("attempt")
+            .first_output_at_ms = Some(1);
+        assert!(
+            !shell.restore_card_refresh_is_inert(),
+            "a stage advance moves the bar and must take the write"
+        );
+        assert!(shell.refresh_terminal_restore_card());
+        assert!(shell.restore_card_refresh_is_inert());
+
+        // And with no card at all there is nothing to refresh.
+        shell.clear_job_notification(&job_key);
+        assert!(shell.restore_card_refresh_is_inert());
+        assert!(!shell.refresh_terminal_restore_card());
+    }
+
     /// The owner's "once in a while a session stops responding to inputs".
     /// 2026-08-16 ALL-sessions fix: deadlines are 0 — immediate restore.
     #[test]
