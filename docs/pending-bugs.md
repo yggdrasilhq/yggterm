@@ -76,6 +76,39 @@ lingering daemons retire, and while they linger their sessions stay split across
 ⛔ **And the daemons whose names were already taken cannot be rescued by this fix or any
 other.** Their sockets are unlinked; there is no path to them. They end when they end.
 
+## ⛔ [11.0] THE FLEET MEMORY INDEX IS OVER ITS LOAD LIMIT, SO SOME DOORS ARE INVISIBLE EVERY SESSION
+
+**Status:** OPEN
+
+`~/.claude/projects/-home-pi-gh-yggterm/memory/MEMORY.md` is **26.8 KB against a 24.4 KB
+load limit**, and the harness says so out loud at session start: *"Only part of it was
+loaded."* That file is the index every session reads to find anything, so the overflow is
+not a tidiness problem — **an unknown tail of doors is silently absent from every agent's
+context**, including doors marked ⛔⛔⛔.
+
+**Where the bytes are.** 57 of its 164 lines are over the file's own stated 200-character
+budget, and those 57 lines hold **16.5 KB of the 26.8 KB**. The index states the rule it is
+breaking: *"Keep index entries to one line under ~200 chars; move detail into topic files."*
+
+**Why this is not a five-minute fix, and why it must not be done casually.** The overflow is
+not padding — those lines carry the sharpest sentence of each finding, which is exactly why
+they grew. ⛔ **The detail cannot be assumed to exist in the target file: a spot check of
+twelve over-long lines could not confirm the overflow text anywhere in the file each one
+points at.** So a trim is a deletion of knowledge unless each line's surplus is MOVED, and
+each move needs a short door written in its place that still earns the entry.
+
+⚠ **And the split is not atomic across the fleet.** `fleet-memory-sync` moves files
+independently and never deletes, so a compacted parent landing on a peer before its
+children orphans every moved door there, silently — and a pruned entry is restored by any
+peer that still has it. The index's own header carries both traps: ship the children first
+(additive, overwrites nothing), then the parent, and prune on EVERY peer — a deletion on
+one machine is undone by the first peer that still holds the file.
+
+**Falsifier:** session start reports no truncation warning, and the union of the parent plus
+every sub-index names at least as many doors as it does today. ⇒ **Audit by the UNION —
+comparing parent against parent shows a fake door deficit**, which the index also warns
+about and which has already misled once.
+
 ## ⛔⛔⛔ [11.0] LEGENDARY — THE APP RE-RENDERED 44 TIMES A SECOND BECAUSE THE BRANCH THAT FOUND NOTHING TO DO ASKED ITSELF AGAIN
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
