@@ -629,51 +629,94 @@ grows faster than one agent could write and nothing reads its rate.
 **Falsifier:** restart the client while an agent row is running, then
 `pgrep -af <session-id>` — exactly one process, and the row still paints.
 
-## ⛔⛔ [11.0] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
+## ⛔⛔ [11.25] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Owner-reported 2026-08-21 against a live Antigravity row still wearing its
+cwd-derived birth name.*
+
+**The observation that closes this entry:** that row, or one opened the same
+way, carrying a title from its own store after the lane branch lands and the
+daemon is swapped. Nothing below has been seen on the deployed plane — this seat
+does not land or deploy.
+
+**What was wrong, and it was two things stacked.**
+
+**(1) The gap between two chores, each believing the other had it.** A row keyed
+`remote-<slug>://` for any CLI other than Claude Code was skipped by the local
+chore for being remote, and refused by the remote chore for not being Claude
+Code. ⚠ "Local" there meant the PATH SCHEME, not the machine — a session on the
+daemon's own host, opened through the remote path, fell in the gap. Fixed by
+making the remote pickup registry-driven per descriptor: `remote_live_store_title`
+on the descriptor, `remote_store_title_poll_decisions` in the daemon, and one ssh
+per (machine, CLI) per tick.
+
+**(2) ⛔⛔ AND THE FIX FOR (1) READ THE TWO STORES THAT ARE EMPTY WHEN IT
+MATTERS.** The first remote probe asked the shared index and the shared history
+file, which is where a title lives once a CLI has got round to writing it there.
+Measured against a real store: of the **eight most recently touched
+conversations, ZERO had a row in the index and six had no history entry** — while
+**all eight** carried a usable prompt in their own transcript. So the probe
+answered "no title in store" for exactly the rows a person is looking at, which
+is the same reading as the defect it was written to repair. The A/B on that
+store: **2 of 8 answered before, 8 of 8 after.**
+
+⇒ The locator set is now the union of the CLI's own session store globs and the
+named files in its home, ranked so the chosen title still matches the local
+reader's precedence. Locked by
+`every_remote_title_probe_can_reach_the_sessions_own_store`.
+
+### ⛔ THE INSTRUMENT BUILT TO CATCH THIS COULD NOT SEE EITHER HALF
+
+`cli/store_title_miss` was emitted only from the chore that never looked at
+these rows, and only at the point a *lookup* failed — never at the point a row
+was *skipped*. Measured: zero such events in a 40,000-event window while an
+untitled row sat in the sidebar. **Independently re-measured 2026-08-21 on a
+99.9-minute, 40,248-event window: `cli/*` was 0.000% of the plane** — a probe
+that never fires and a system with nothing to report are the same reading.
+
+⇒ Replaced by the `cli_plane` grammar, whose rule is that **a skip is an
+outcome**: every classifier enumerates its skips and every sweep emits even when
+nothing happened, so silence now means the chore did not run.
+
+### ⚠ WHAT STILL HAS NO REMOTE PROBE
+
+Eight of the ten registered CLIs declare no `remote_live_store_title`. That is
+recorded rather than hidden: such a row reports `skipped_no_reader` on every
+tick instead of vanishing from the count, and the birth event carries
+`store_title_reader:false` so a reader need not wait for a title that was never
+coming. Wiring each is a per-CLI measurement, not a code change.
+
+## ⛔ [11.25] A DAEMON RESPONSE THAT FAILS TO PARSE CAN PANIC THE ERROR MESSAGE ABOUT IT
 
 **Status:** OPEN
 
-*Owner-reported 2026-08-21 against a live Antigravity row still wearing its
-cwd-derived birth name. The registry-driven title fix landed and is real — it
-fixed ONE of the two chores.*
+*Found 2026-08-21 while sweeping the title path for byte-index truncation. Not
+owner-reported; nobody has hit it, which is a statement about what has been sent
+down the socket so far and not about safety.*
 
-**The gap is between two chores, and each one believes the other has it.**
+Building the context for a failed daemon-response parse truncates the offending
+line with `&trimmed[..240]`, which is a BYTE index into a string that just came
+off a socket:
 
 ```rust
-// daemon.rs:11838  collect_live_store_title_syncs_in — the registry-driven one
-let is_local_row = session.session_path.starts_with("local://")
-    || descriptor.runtime_key_scheme
-        .is_some_and(|scheme| session.session_path.starts_with(scheme));
-if !is_local_row { continue; }        // "a remote-*:// row rides the OTHER chore"
-
-// daemon.rs:12042  remote_cc_title_poll_paths — the other chore
-if session.kind != SessionKind::ClaudeCode { continue; }
+let snippet = if trimmed.len() > 240 {
+    format!("{}...", &trimmed[..240])   // panics when byte 240 is inside a character
 ```
 
-⇒ **A row keyed `remote-<slug>://` for any CLI other than Claude Code is skipped by
-the local chore for being remote, and refused by the remote chore for not being
-Claude Code.** It is titled by nothing, so it keeps whatever name it was born with.
+Two callsites, both in the daemon client's response reader. A response carrying
+any multi-byte character across that boundary — a path with an accent, a title
+with a dash, an emoji in an error string — panics **inside the error handler**,
+so a recoverable parse failure becomes a crash, and the message that would have
+explained it is what kills the process.
 
-⚠ **"Local" here means the PATH SCHEME, not the machine.** A session running on
-this very host, opened through the remote path, carries a `remote-*://` key and
-falls in the gap. The observed row was on the daemon's own fleet.
+⇒ Truncate by characters. The same defect in the CLI title cleaner was fixed by
+`first_chars` (`agent_cli.rs`), which is the shape to reuse rather than
+re-derive; a shared helper is probably owed once a third site appears.
 
-### ⛔⛔ AND THE INSTRUMENT BUILT TO CATCH THIS CANNOT SEE IT
-
-`cli/store_title_miss` was added precisely so a failed title pickup is
-distinguishable from an empty store. It is emitted **from the local chore only**,
-and the local chore never looks at these rows. Measured: **zero `store_title_miss`
-events in a 40,000-event trace window** while an untitled row sat in the sidebar.
-
-⇒ A probe that never fires and a system with nothing to report are the same
-reading. The miss counter must be emitted where the DECISION TO SKIP is made, not
-only where a lookup fails — a row skipped for its scheme is exactly the case
-nobody hears about.
-
-**The fix has the shape the local chore already took:** make the remote pickup
-registry-driven per descriptor instead of gated on one `SessionKind`. ⚠ It is not
-a one-line change — `read_live_store_title` is a local-file reader, and doing it
-per CLI over ssh is the actual work. Do not "fix" it by deleting the kind check.
+⚠ **Do not "fix" it by removing the snippet.** The snippet is what makes an
+unparseable response diagnosable at all — the bug is the index, not the report.
 
 ## ⛔ [11.23] A DELIBERATELY DISMISSED WEB SURFACE CAN BE REBUILT BY THE HEARTBEAT THAT RACES IT
 
