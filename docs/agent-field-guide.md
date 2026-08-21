@@ -2151,3 +2151,22 @@ is the fix. If the condition has lapsed, you have measured the weather.
 ⇒ Applied to the swap-residency alarm: swap 7.15 GiB against a 4.0 GiB old trigger —
 armed — with zero incidents from the fixed version across ten minutes, against a prior
 0.82/min. That is a falsifier answered; "no incidents lately" would not have been.
+## `ytrace tail` cannot compute a RATE in either direction (measured 2026-08-21)
+
+The cap (~20 records) is already noted above as inflating frequency. It distorts the
+other way too, and that failure is quieter because the number comes out SMALLER and a
+small number reads as good news.
+
+- **Frequency from `tail` is too HIGH**: a fixed record count divided by the short span
+  those records happen to cover. Produced ~67/min for an event whose true rate was ~2/min.
+- **A TOTAL from `tail` is too LOW**: summing `duration_ms` over a truncated sample and
+  dividing by its span under-counts everything the cap dropped. Produced "5.2% of a
+  core" for a render cost the span query put at 11.3% — a 2x under-report that would
+  have been published as a 9x win.
+
+⇒ **Anything divided by time comes from `ytrace query` (spans) or `ytrace incidents`
+(incident flag). `tail` is for READING RECORDS, never for arithmetic over them.**
+
+⭐ The under-report was caught only because two instruments were compared and disagreed.
+When a measurement is about to become a headline, take it twice by different means — a
+single instrument agreeing with your hopes is not a reading.
