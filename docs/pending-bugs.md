@@ -22275,6 +22275,39 @@ render path then does no I/O and both columns answer the same question by constr
 bin dir, then comparing its `This machine` count against what another host's matrix reports
 for that same machine over ssh. Equal counts falsify the divergence; unequal counts are it.
 
+## ⛔ NOTHING RUNS `ygg-land`, SO A LANE EITHER SITS UNLANDED OR BREAKS THE SPLIT ITSELF
+
+**Status:** OPEN
+
+⚠ **This is one layer ABOVE the roll gap below it, not a duplicate of it.** That entry owns
+`main` → the machine someone is using. This one owns a lane branch → `main`. Both are absent;
+either alone strands work, and they fail in the same silent direction.
+
+`ygg-land.py`'s own header states the split it enforces: *"a LANE pushes its own branch and
+says it is ready. The ORCHESTRATOR lands it and is the only thing that rolls."* The lane half
+works — branches are pushed. **The orchestrator half is nobody.** No process anywhere runs the
+verb, on any interval, and the seat the split names has been dead since the afternoon.
+
+**Measured 2026-08-21 19:56:** `ygg-land.py status` reports **9 branches carrying unlanded
+work**. One of them had been pushed, tested and green for two hours while its author believed
+the mechanism would take it, because the mechanism took two other branches in that window —
+which is the tell. A queue that empties sometimes reads as a queue that is being served.
+
+⛔ **And the lane is left with only bad options.** Wait, and the work never reaches the roll
+that builds from `main`. Or land itself, which is exactly what the split forbids, and which
+this lane then did — deliberately and recorded here, because landing without rolling touches
+neither of the two hazards the split names (divergence, which landing *removes*, and two
+agents allocating two versions, which only rolling can cause). ⚠ **That reasoning is sound for
+one branch and does not generalise:** the moment two lanes reach it at once it is the
+divergence the split exists to prevent, arrived at by the same argument.
+
+**The shape of the fix:** supervise `ygg-land.py land --all` the way the other recurring jobs
+are supervised, so its lifetime does not depend on a session; and give "when did a land last
+run" a surface, so its absence is reported rather than inferred from a branch that sat.
+
+**Falsified by:** a supervisor that runs the verb after its launching session exits, or any
+surface answering how long it has been since a land completed.
+
 ## [11.9] THE JOB THAT LANDS EVERY LANE'S WORK IS ITSELF A LOOP NOBODY RESTARTS
 
 **Status:** OPEN
