@@ -221,6 +221,22 @@ STANDING_REFUSAL_ESCALATE_AFTER = {
     # paging one buys nothing. Same argument as the fleet-wide RATE-LIMITED
     # hold. It is still COUNTED and still shown, so the wait is never invisible.
     "refused-limit-wait": None,
+    # ⛔ THIS LANE ADDED FOUR REFUSALS AND HAD TO COME BACK FOR THIS TABLE AND FOR
+    # THE REFUND LIST BESIDE IT — which is the exact omission the comment on that
+    # list was written about, committed by the person who had just read it.
+    # ⇒ A guard that learns a new refusal is not finished until BOTH lists know
+    #   the name: one decides whether the row is charged a wake it never got, the
+    #   other whether anybody is ever told.
+    # No composer drawn is an observation of the ROW and clears when it moves on.
+    "refused-no-composer": STANDING_REFUSAL_TICKS,
+    # ⛔ These two do NOT clear themselves. A write that could not be confirmed
+    # stands in the composer until somebody takes it out, and refusing to type a
+    # second copy is correct and permanent — so the row is alive, unwakeable, and
+    # nothing about waiting changes that. Bounded tight, like a blind instrument.
+    "refused-unconfirmed-write": MAX_BOOTS,
+    "refused-submit-unconfirmed": MAX_BOOTS,
+    # Our own state directory refusing a write. Also does not clear itself.
+    "refused-no-ledger": MAX_BOOTS,
 }
 
 # ⭐⭐ HOW LONG THE FLEET HOLDS AFTER SEEING A 429 (reported 2026-08-13: "during a
@@ -245,6 +261,12 @@ STANDING_REFUSAL_ESCALATE_AFTER = {
 # and the owner is the person whose quota it is — he already knows. A watchdog
 # that pages about the weather teaches people to ignore it, which is the failure
 # the CONTEXT_DEAD arm was written to undo.
+#
+# ⛔⛔ EVERY LINE ABOVE IS ABOUT A TIMED WINDOW AND NONE OF IT HOLDS FOR AN
+# EXHAUSTED CREDIT BALANCE — see `refusal_is_a_balance_not_a_window`. There the
+# limit is not account-wide (the refusal offers `/model`, a per-row switch), a
+# timer clears nothing, and a human CAN fix it. That class takes a per-row
+# suspension and one escalation, and the fleet stays wakeable.
 RATE_LIMIT_HOLD_SECS = 1800
 
 # ⭐ HOW LONG A MANUAL DISARM LASTS BY DEFAULT.
@@ -936,6 +958,46 @@ def _evidence_marker(uuid):
     return None
 
 
+# ⛔⛔ A BALANCE IS NOT A WINDOW, AND ONLY ONE OF THEM IS ACCOUNT-WIDE.
+#
+# The fleet-wide hold is right for a SESSION LIMIT: the account is out of quota
+# for a while, a timer clears it, and booting other rows meanwhile just walks
+# them into the same wall one at a time.
+#
+# It is WRONG for an exhausted CREDIT BALANCE, and the refusal says so itself —
+# it offers `/model` as a remedy, which is a PER-ROW switch, and a balance is
+# restored by a purchase rather than by waiting. So on that class the fleet hold
+# has no upside and a fleet-scale downside: the row is deterministically
+# unbootable, the timer clears nothing, and every probe re-arms a blackout over
+# every other campaign's rows. Reported live 2026-08-21 with 23 subscribers
+# unwakeable behind one row's billing state; the same shape ran 7.4 continuous
+# hours on 2026-08-14.
+#
+# ⚖ AND THE ESCALATION RULE INVERTS WITH IT. The note on RATE_LIMIT_HOLD_SECS
+# says not to page a human about a quota window, because a human cannot grant
+# quota. A human CAN add credits and CAN switch model — so this is the carve-out
+# that note describes, not an exception to it.
+#
+# ⚠ Matched on the refusal's own wording, which is the only evidence there is:
+# the API reports both classes with the same status.
+BALANCE_REFUSAL_MARKERS = (
+    "out of usage credits", "usage-credits", "purchase more credits",
+    "credit balance", "insufficient credits", "add credits",
+)
+
+
+def refusal_is_a_balance_not_a_window(tail):
+    """True when the refusal is an exhausted balance rather than a timed window.
+
+    ⛔ CONSERVATIVE BY CONSTRUCTION: anything it does not recognise is treated as
+    a WINDOW, so every refusal whose wording has not been measured keeps today's
+    fleet-wide behaviour. A wrong True stops holding the fleet during a real
+    account outage; a wrong False costs what it costs today, which is at least
+    visible in the log."""
+    low = (tail or "").lower()
+    return any(marker in low for marker in BALANCE_REFUSAL_MARKERS)
+
+
 def note_rate_limit(uuid, tail):
     """A subscriber was refused on quota ⇒ hold the whole fleet.
 
@@ -1472,6 +1534,13 @@ def clear_standing_refusal(s):
     s.pop("standing_refusal", None)
     s.pop("blind_skips", None)
     s.pop("blind_escalated", None)
+    # ⭐ AND A BALANCE SUSPENSION ENDS THE SAME WAY AND ONLY THAT WAY. It cannot
+    # expire on a timer, for the reason it was not armed on one — nothing about
+    # waiting restores a balance. A row that has written again has been paid for
+    # by somebody, and that is the only evidence available.
+    for key in ("balance_suspended", "balance_marker", "balance_since",
+                "balance_escalated"):
+        s.pop(key, None)
 
 
 def note_standing_refusal(s, via):
@@ -2209,8 +2278,27 @@ def cmd_list(args):
         #    a watchdog unfalsifiable, and it is how one outage ran 7.5 hours
         #    with every instrument green.
         held = "  ⏸ SUPPRESSED — fleet quota hold, no boot can be delivered" if rl else ""
+        # ⛔⛔ AND THE STANDING REFUSAL GOES ON THIS LINE TOO, for the same reason
+        #    the suppression does. It is recorded on the subscription — but a row
+        #    refused on every tick still PRINTS as `boots=0` beside a healthy one,
+        #    because a refused boot is refunded. The datum existing is not the
+        #    same as anybody seeing it, and the header nobody reads is where it
+        #    would otherwise live. A sibling lane lost ~7.8 hours reading exactly
+        #    this line and concluding it was armed.
+        rec = s.get("standing_refusal") or {}
+        refused = ""
+        if s.get("balance_suspended"):
+            refused = ("  ⛔ SUSPENDED — refused for an exhausted CREDIT BALANCE; neither "
+                       "waiting nor a boot can clear it (add credits, or switch model)")
+        elif rec.get("ticks"):
+            mins = int((time.time() - rec.get("since", time.time())) // 60)
+            refused = (f"  ⚠ REFUSED {rec['ticks']}x for {mins}m ({rec.get('reason')})"
+                       f" — armed, and NOT being woken")
+        # ⭐ AND "IT WOKE" IS A THIRD FACT. `boots` is a stall counter that gets
+        #    refunded; a row can be escalated for never waking while it reads 0.
+        woke = "  ⚠ ESCALATED — boots delivered, no turn started" if s.get("escalated") else ""
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
-            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{held}{mark}")
+            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{held}{refused}{woke}{mark}")
     log(f"{len(subs)} subscription(s) in {SUBS}"
         + (f" — ⛔ {lapsed} LAPSED and no longer watched" if lapsed else ""))
     return 0
@@ -3163,10 +3251,43 @@ def tick(args):
                         log(f"   ⚠ could not record the retirement: {exc}")
                     sub_path(uuid).unlink(missing_ok=True)
                 continue
-            # A LIVE row refused on quota is the real thing: hold the FLEET, do
-            # not escalate (a human cannot grant quota), and do not unsubscribe
-            # — unlike CONTEXT_DEAD this ends by itself, and the row is meant
-            # to still be watched when it does.
+            # ⛔⛔ AN EXHAUSTED BALANCE IS THIS ROW'S PROBLEM, NOT THE FLEET'S.
+            #    Suspend ONE row, tell a human ONCE, and leave every other
+            #    campaign wakeable — see `refusal_is_a_balance_not_a_window`.
+            #    ⛔ It cannot expire on a timer, for exactly the reason it was not
+            #    armed on one: nothing about waiting restores a balance. It ends
+            #    when the row WRITES SOMETHING NEW, which is the same
+            #    anti-stale-artefact discipline `note_rate_limit` uses — a frozen
+            #    tail is evidence about a moment, never about now.
+            if refusal_is_a_balance_not_a_window(c.get("tail")):
+                marker = _evidence_marker(uuid)
+                if marker is not None and s.get("balance_marker") != marker:
+                    s["balance_marker"] = marker
+                    s.pop("balance_escalated", None)   # a NEW refusal is news
+                s["balance_suspended"] = True
+                s["balance_since"] = s.get("balance_since") or int(time.time())
+                if not s.get("balance_escalated"):
+                    rc = max(rc, 4)
+                    escalate(host, row,
+                             "refused for an exhausted CREDIT BALANCE, not a timed quota "
+                             "window. No timer clears this and no boot can: it needs "
+                             "credits added or a different model. This row is suspended "
+                             "until it writes again; the rest of the fleet is NOT held.")
+                    s["balance_escalated"] = True
+                note_standing_refusal(s, "balance-exhausted")
+                if s.get("boots"):
+                    s["boots"] -= 1
+                action = "SUSPENDED:balance"
+                log(f"{'BALANCE':<14} {c['age'] / 60:>6.1f}m  {action:<12} {uuid[:8]}  "
+                    f"refused for exhausted credits, which no wait can fix — holding THIS "
+                    f"ROW only; the fleet stays wakeable")
+                if not args.dry_run:
+                    update_sub(uuid, s)
+                continue
+            # A LIVE row refused on a timed WINDOW is the real account-wide
+            # thing: hold the FLEET, do not escalate (a human cannot grant
+            # quota), and do not unsubscribe — unlike CONTEXT_DEAD this ends by
+            # itself, and the row is meant to still be watched when it does.
             rl = note_rate_limit(uuid, c["tail"])
             # ⭐ GIVE THE LAST ATTEMPT BACK. That boot was refused by the API
             #    before the agent ran, so counting it toward MAX_BOOTS would
@@ -3233,7 +3354,9 @@ def tick(args):
                 via = boot(host, row, args.dry_run)
                 if via in ("refused-draft", "refused-choice-prompt",
                            "refused-screen-unreadable", "refused-draft-race",
-                           "refused-limit-wait"):
+                           "refused-limit-wait", "refused-no-composer",
+                           "refused-unconfirmed-write", "refused-submit-unconfirmed",
+                           "refused-no-ledger"):
                     # ⛔ A refusal is NOT a failed boot and must not count as one.
                     # The row is idle because its owner is mid-sentence, which is
                     # the one state where booting is worse than waiting — so give

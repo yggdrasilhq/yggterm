@@ -244,6 +244,63 @@ fail once and stay failed.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔⛔ [11.20] ONE ROW'S BILLING STATE DECIDED WHETHER THE WHOLE FLEET COULD BE WOKEN — FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Reported by another lane 2026-08-21 with the measurement attached; confirmed from the hold
+file before anything was changed.*
+
+The wake plane arms a **fleet-wide** hold when a subscriber is refused on quota, and the
+reasoning written beside it is sound: the limit is account-wide, detection is necessarily
+per-row, and holding only the refused row would walk every other subscriber into the same
+wall one at a time.
+
+**That is true of a timed WINDOW and false of an exhausted BALANCE.** The hold in force read
+*"You're out of usage credits. Run `/usage-credits` … or `/model` to switch models."*
+
+⇒ Not account-wide — the refusal itself offers `/model`, a **per-row** switch. Not clearable
+by waiting — a balance is restored by a purchase. So the timer expires, the next tick probes,
+the same wall answers, and the blackout re-arms **indefinitely**. Measured with **23
+subscribers unwakeable behind one row's billing state**; a sibling campaign records the same
+shape running 7.4 continuous hours on 2026-08-14.
+
+⚖ **The escalation rule inverts with it.** The note beside the hold says not to page a human
+about a quota window because a human cannot grant quota. A human **can** add credits and
+**can** switch model — so this is the carve-out that note describes, not an exception to it.
+
+**Fixed:** a balance refusal takes a **per-row suspension** plus one escalation, and the
+fleet stays wakeable. It cannot expire on a timer — for the reason it was not armed on one —
+and ends when the row WRITES SOMETHING NEW. Wording it does not recognise is still treated as
+a window, so nothing measured changes behaviour.
+
+**Live proof owed:** one balance refusal that suspends its own row while the other
+subscribers stay wakeable in the same tick.
+
+## ⛔⛔ [11.20] A GUARD LEARNED FOUR NEW REFUSALS AND TOLD NEITHER TABLE — FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+A refused boot is refunded, because the row was never asked. That refund is keyed off a
+literal list of refusal names, and a second list decides when a standing refusal is escalated.
+**This lane added four refusals in one commit and updated neither list** — so those rows were
+charged a wake they never received, could reach `MAX_BOOTS` and be escalated for "not waking"
+without ever being asked anything, and their standing refusal would never have been reported.
+
+⚠ **That is the identical omission the comment above the refund list was written about**, and
+it was committed by the lane that had just read it. A comment naming a trap does not close it.
+
+**Fixed:** all four registered in both tables, and a test now derives the set of refusals the
+file can RETURN and fails if either table is missing one — so the next guard that learns a
+refusal cannot ship half-registered.
+
+⭐ **And a standing refusal now prints on the ROW'S OWN LINE**, beside the fleet-hold
+suppression. It was already recorded on the subscription, but a refunded boot leaves `boots`
+at 0, so a row refused every tick still printed identically to a healthy one — and everybody
+reads that through `list | grep <uuid>`, which throws the header away. A sibling lane spent
+~7.8 hours reading that line and concluding it was armed. `escalated` prints there too, since
+*boots delivered* and *the row woke* are different facts.
+
 ## ⛔⛔ [11.20] THE DRAFT FLAG IS RESET BY EVERY DAEMON HANDOVER, AND IT FAILS OPEN
 
 **Status:** OPEN

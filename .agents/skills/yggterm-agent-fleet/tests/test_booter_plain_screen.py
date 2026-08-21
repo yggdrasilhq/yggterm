@@ -96,10 +96,44 @@ def main():
     if b._composer_from_grid(mid_output) is not None:
         failures.append("a mid-output screen reported a composer")
 
+    # 5. ⛔⛔ A BALANCE IS NOT A WINDOW. One row out of credits must not stand the
+    #    whole fleet down: no timer clears a balance, so every probe re-arms a
+    #    blackout over every other campaign. Reported live with 23 subscribers
+    #    unwakeable behind one row's billing state.
+    balance = ("You're out of usage credits. Run /usage-credits to keep using "
+               "the model or /model to switch models.")
+    if not b.refusal_is_a_balance_not_a_window(balance):
+        failures.append("an exhausted CREDIT BALANCE was read as a timed quota window")
+
+    # 6. …and the conservative direction, which is the one that must not drift:
+    #    an ordinary session limit is still a window, still account-wide, and
+    #    still stands the fleet down, because there waiting really does clear it.
+    for window in ("You've hit your session limit. Try again at 3pm.",
+                   "Rate limited. Please try again later.",
+                   ""):
+        if b.refusal_is_a_balance_not_a_window(window):
+            failures.append(f"a timed window was misread as a balance: {window[:40]!r}")
+
+    # 7. ⛔ EVERY REFUSAL THIS FILE CAN RETURN MUST BE IN BOTH TABLES. One decides
+    #    whether the row is charged a wake it never received, the other whether
+    #    anybody is ever told it is stuck. A guard that learns a new refusal and
+    #    updates neither is how a lane loses its whole budget in silence — and it
+    #    has happened twice, the second time to the lane that had just read the
+    #    comment warning about the first.
+    import re as _re
+    src = Path(args.booter).read_text()
+    returned = set(_re.findall(r'return "(refused-[a-z-]+)"', src))
+    refunded = set(_re.findall(r'"(refused-[a-z-]+)"', src[src.index("if via in ("):]
+                               [:src[src.index("if via in ("):].index(")")]))
+    for name in sorted(returned - refunded):
+        failures.append(f"{name} is returned but NOT refunded — it is charged as a boot")
+    for name in sorted(returned - set(b.STANDING_REFUSAL_ESCALATE_AFTER)):
+        failures.append(f"{name} is returned but has no escalation threshold — silent forever")
+
     if failures:
         print("⛔ %d failed: %s" % (len(failures), "; ".join(failures)))
         return 1
-    print("✅ choice prompt matches through both spellings; the composer is read as a ROW")
+    print("✅ both spellings match; composer read as a ROW; a balance is not a window; every refusal is in both tables")
     return 0
 
 
