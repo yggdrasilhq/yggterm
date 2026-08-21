@@ -475,8 +475,8 @@ pub fn notify_owner(home: &Path, incident: &ytrace::diagnosis::Incident) {
     // dropped `Child` is never waited on — so every fifteen-minute notification
     // left a permanent zombie in the daemon's process table. Measured
     // 2026-08-21: 79 of them under a daemon that had been up 19.9 hours, the
-    // oldest exactly as old as the daemon. See `yggterm_core::child_reaper`.
-    let _ = yggterm_core::child_reaper::spawn_and_reap(
+    // oldest exactly as old as the daemon. See `yggterm_platform::child_reaper`.
+    let _ = yggterm_platform::child_reaper::spawn_and_reap(
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     );
@@ -536,7 +536,7 @@ mod tests {
     /// `Child` is never waited on — so every fifteen-minute owner notification
     /// left a zombie in the daemon's table for the daemon's whole life
     /// (measured 2026-08-21: 79 of them under one 19.9-hour daemon). The
-    /// primitive is unit-tested in `yggterm_core::child_reaper`; this asserts
+    /// primitive is unit-tested in `yggterm_platform::child_reaper`; this asserts
     /// that THIS function actually routes through it.
     ///
     /// ⚠ The fake home is load-bearing for SAFETY, not just isolation:

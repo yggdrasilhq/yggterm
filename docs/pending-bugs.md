@@ -484,27 +484,60 @@ before treating this entry as closed.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Measured on the fleet 2026-08-21: four live daemons holding **221 zombie processes**
+⇒ *The deploy-level falsifier below has been run against an isolated daemon built
+from this commit. It has NOT been run against a rolled fleet daemon, and that is what
+this entry is still open for.*
+
+*Measured on one host 2026-08-21: five live daemons holding **233 zombie processes**
 between them.*
 
 | daemon | uptime | zombies | oldest zombie |
 |---|---|---|---|
-| installed headless (deleted binary, still serving) | 19.9 h | 79 | 19.9 h |
-| a worktree build | 16.9 h | 68 | 16.8 h |
-| a second worktree build | 16.4 h | 66 | 16.4 h |
-| the current installed headless | 1.8 h | 8 | 1.8 h |
+| the installed headless, binary since replaced | 20.8 h | 82 | 20.8 h |
+| a worktree build | 17.7 h | 71 | 17.7 h |
+| a second worktree build, launched as `yggterm server daemon` | 17.2 h | 69 | 17.2 h |
+| the current installed headless | 2.7 h | 11 | 2.7 h |
+| a worktree build predating the host-panic notifier | 28.2 h | **0** | — |
 
-**In every one of them the oldest zombie is the same age as the daemon**, so nothing
-had ever been reaped, and the arrivals are a metronome: inter-arrival p50 **912s**,
-min 911, max 917, n=78. Wall-clock births land on the second — 15:38:18, 15:53:30,
-16:08:42, 16:23:55, 16:39:06.
+**In every leaking one the oldest zombie is the same age as the daemon**, so nothing
+had ever been reaped, and the arrivals are a metronome: inter-arrival p50 **903s**,
+min 901, max 906.
+
+⛔ **The first census undercounted, and the reason is reusable: a daemon does not
+have to be called `yggterm-headless`.** Enumerating the fleet by that binary name
+missed a daemon launched as `yggterm server daemon`, which was holding 69 of the 233.
+**Enumerate by the `server daemon` argument, never by the binary's name.**
+
+### The attribution is an exact correspondence, not an arithmetic coincidence
+
+The first pass explained 912s as "the fifteen-minute notify cooldown plus one
+`PERF_INCIDENT_MONITOR_MS` tick". That arithmetic is wrong — the perf monitor is not
+in this path at all — and the number was 903s. The real spacing is fifteen ticks of
+`HOST_PANIC_INTERVAL_MS` (60s), each carrying its own loop drift.
+
+The attribution that does hold is a one-to-one match against an independent
+instrument. Every `tick()` that produces an incident appends
+`daemon/heartbeat/panic` to the trace, whether or not the cooldown lets it notify.
+Replaying one daemon's own traced events through the cooldown rule predicts the
+notifications it must have spawned:
+
+| | |
+|---|---|
+| traced `panic` events, all severity `error` | 1054 |
+| notifications the cooldown permits from those | **71** |
+| zombies that daemon is holding | **71** |
+| first permitted notification / first zombie birth | 23:57:23 / 23:57:23 |
+| last permitted notification / last zombie birth | 17:30:40 / 17:30:39 |
+
+⭐ **And the fifth daemon is the control.** The one daemon on that host with zero
+zombies is the one built before the host-panic notifier existed — its binary contains
+none of the notifier's strings. The counterexample is the mechanism confirming itself,
+not a hole in it.
 
 Root: `host_panic::notify_owner` ended in `let _ = cmd.spawn()`. **A dropped
 `std::process::Child` is never waited on**, so each owner notification left a
-permanent entry in the daemon's process table. 912s is `NOTIFY_COOLDOWN_MS`
-(15 min) plus one `PERF_INCIDENT_MONITOR_MS` tick — the host is genuinely under
-load, so the notifier fires on every cooldown expiry, forever. The GUI had the same
-defect in `terminal_open_external_url`, leaking one child per clicked link.
+permanent entry in the daemon's process table. The host is genuinely under load, so
+the notifier fires on every cooldown expiry, forever.
 
 ⚠ **Two instruments nearly gave a good-looking wrong answer here.** The zombies'
 `comm` reads `yggterm-headles`, the parent's own name — which looks like a fork that
@@ -512,30 +545,80 @@ never exec'd, but is equally consistent with a child exec'ing the same binary, a
 is the latter. And `pgrp`/`session` matching the parent is what EXCLUDED
 `spawn_daemon_process_from_executable`, which `setsid`s and already reaps correctly.
 
-**Fixed** with one owner for the whole class: `yggterm_core::child_reaper`.
-`spawn_and_reap` is what a fire-and-forget caller reaches for instead of
-`let _ = cmd.spawn()` and cannot leak by construction; `reap_child_in_background` is
-the primitive under it. The daemon's existing `reap_spawned_child_in_background` now
-delegates to that primitive rather than re-spelling thread-plus-wait, so there is one
-encoding of the reap and the tracing stays local to the caller that wants it.
+### The class was named before it was finished — four more call sites leaked
+
+The first fix created the owner (`child_reaper`) and converted two call sites. It did
+not sweep the class, and four more sites in the two long-lived processes were still
+dropping a `Child`:
+
+- **`platform::send_user_notification`**, both the Linux `notify-send` arm and the
+  macOS `osascript` arm. This is the same shape as the bug that was found, in the
+  GUI rather than the daemon, and the GUI raises a toast per finished job — so it
+  leaked on precisely the events the owner sees most.
+- **`platform::launch_controlled_ghostty`** and the `ExternalGhostty` arm of
+  `host::GhosttyHost::launch`, which both read `child.id()` and then drop the handle.
+  One permanent zombie per docked or external window, once the user closes it.
+- **the update relaunch in the shell**, which spawns the successor GUI and relies on
+  this process closing afterwards — a decision taken further down that does not always
+  happen.
+
+⛔ **`child_reaper` had to move to make this possible, and that is the interesting
+half.** It was in `yggterm-core`, which `yggterm-platform` does not depend on and must
+not: core pulls in a bundled SQLite, a TLS HTTP client and a tar reader, and platform
+is the layer under all of that. Leaving the primitive there would have forced a second
+encoding of the reap into platform — exactly the fallback layer the SSOT rule forbids.
+It now lives in `yggterm-platform`, which both the daemon and the GUI already depend
+on, so there is one owner reachable from every caller. No crate gained a dependency.
+
+**Fixed** with that one owner. `spawn_and_reap` is what a fire-and-forget caller
+reaches for instead of `let _ = cmd.spawn()`, and it returns a pid rather than a
+`Child`, so there is nothing in scope for a later edit to forget to wait on.
+`reap_child_in_background` is the primitive under it, for a caller that already holds
+a `Child` or wants the exit status.
 
 ⛔ **The one-line fix is wrong and is recorded so nobody tries it:** `SIGCHLD` set to
 `SIG_IGN` auto-reaps, and would break every `.wait()` / `.output()` / `.status()` in
 the codebase at once by turning them into `ECHILD`.
 
-**Falsifier:** on a daemon built from this commit and up for more than three notify
-cooldowns (>46 min), `ps -eo ppid,stat | awk '$1==<pid> && $2 ~ /Z/' | wc -l` must
-read 0, where the same probe against an older daemon on the same host still counts
-its accumulated zombies.
+### The locks, and what each one can and cannot see
 
-⭐ **The unit side is already a PROVEN lock, not an assumed one.**
+⭐ **The daemon call site is a proven lock, not an assumed one.**
 `notify_owner_reaps_the_notification_child` drives the real production function
 against a stub binary in a fake home and counts zombie children of the test process.
 It was falsified by reverting `notify_owner` to `let _ = cmd.spawn()`, and it failed
-with *"left a zombie behind: 1 zombie children against a baseline of 0"* — so it goes
-red on exactly this defect and not on something adjacent. The primitive's own test
-asserts its CONTROL first (an un-waited exited child really does show as `Z`), so
-neither test can pass by being blind to the state it checks.
+with *"left a zombie behind: 1 zombie children against a baseline of 0"*.
+
+⭐ **The GUI call sites are locked structurally, because behaviourally they cannot
+be.** They shell out to `notify-send` and `ghostty` by name, so exercising them means
+mutating `PATH` for the whole test binary — which every other test in it would race
+with. `this_crate_spawns_only_through_the_child_reaper` asserts the invariant that IS
+available and is exact: `yggterm-platform`'s `lib.rs` must not spawn at all, because
+`child_reaper` owns the only `.spawn()` in the crate and cannot leak. Falsified by
+restoring the bare `.spawn()?` in `send_user_notification`: it goes red naming the
+line. ⚠ Its first run failed on ITSELF — the predicate line contained the literal it
+searches for, the same family as a `pgrep` that counts its own shell. The needle is
+now assembled rather than written out.
+
+### Falsifier — and it must assert its control or it passes by being blind
+
+⛔ **"The new daemon holds zero zombies" proves nothing on its own.** A daemon that
+never notified also holds zero, and the fifth daemon in the table above is exactly
+that case. The control is the daemon's own trace: replay its
+`daemon/heartbeat/panic` events at severity `error` through the fifteen-minute
+cooldown, and that count is how many notifications it really spawned.
+
+⇒ **On a daemon built from this commit:** notifications-spawned must be at least 3
+(so, past 46 minutes of uptime on a host under load) AND
+`ps -eo ppid,stat | awk '$1==<pid> && $2 ~ /Z/' | wc -l` must read 0, while the same
+probe against an older daemon on the same host still counts its accumulated pile.
+Old daemons keep their zombies until they exit; that is expected and is not a failed
+fix.
+
+**Run green on an isolated daemon 2026-08-21** — a daemon built from this commit,
+started with its own `YGGTERM_HOME` so it could not touch the fleet, observed
+continuously through `/proc/<pid>/task/*/children` (an observer that spawns nothing,
+so it cannot contribute to the table it measures). RESULT PENDING IN THIS ENTRY UNTIL
+THE OBSERVATION WINDOW CLOSES — see the relay note if this line is still here.
 
 **What remains open — and it is sharper than "nobody looked":** the codebase's only
 zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so

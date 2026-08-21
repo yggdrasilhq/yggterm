@@ -11,7 +11,6 @@ mod browser;
 pub mod browser_import;
 pub mod cli_args;
 pub mod cli_install;
-pub mod child_reaper;
 pub mod click_grid;
 pub mod gl_probe;
 mod icon;
