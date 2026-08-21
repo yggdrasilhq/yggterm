@@ -27873,6 +27873,7 @@ mod tests {
                 label: "New yRDP".to_string(),
                 args: Vec::new(),
                 keytip: String::new(),
+                row_spawn: true,
             }],
             keytip: String::new(),
         };
@@ -27886,6 +27887,7 @@ mod tests {
                 label: "New Yggdrasil Maker".to_string(),
                 args: Vec::new(),
                 keytip: String::new(),
+                row_spawn: true,
             }],
             keytip: String::new(),
         };
@@ -52483,6 +52485,115 @@ mod webtabs_menu_switcher_locks {
             tab.group_size = size;
         }
         tabs
+    }
+
+    // ======================================================================
+    // CURATION: A ROW MENU OFFERS ONLY WHAT IS A ROW (item 7)
+    // ======================================================================
+
+    fn app_with_verbs(name: &str, verbs: &[(&str, &str, bool)]) -> AppManifest {
+        AppManifest {
+            name: name.to_string(),
+            label: name.to_string(),
+            icon: String::new(),
+            binary: format!("/opt/{name}/bin/{name}"),
+            verbs: verbs
+                .iter()
+                .map(|(id, label, row_spawn)| AppVerb {
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                    args: Vec::new(),
+                    keytip: String::new(),
+                    row_spawn: *row_spawn,
+                })
+                .collect(),
+            keytip: String::new(),
+        }
+    }
+
+    /// The owner's ask, from a screenshot: terminal-invoked dashboards and
+    /// booters are meaningless as row spawns and must not be offered there.
+    /// ⚠ …and must STILL be offered by the surfaces where opening one is a
+    /// reasonable thing to do.
+    #[test]
+    fn the_row_menu_drops_verbs_that_are_not_rows_and_the_other_surfaces_keep_them() {
+        let apps = vec![
+            app_with_verbs("browser", &[("new", "New Browser", true)]),
+            app_with_verbs(
+                "monitor",
+                &[
+                    ("open", "Fleet overview", false),
+                    ("boot", "Fleet booter", false),
+                    ("session", "New Monitor Session", true),
+                ],
+            ),
+        ];
+
+        let rows: Vec<String> = app_row_spawn_entries(&apps)
+            .into_iter()
+            .map(|(_, verb)| verb.label)
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["New Browser".to_string(), "New Monitor Session".to_string()],
+            "a row menu offers what would BE a row, and nothing else"
+        );
+
+        // ⛔ The shared owner is untouched, so the titlebar `+` and the start
+        // page still offer everything. Filtering there instead would have
+        // removed these verbs from every surface at once.
+        let everywhere: Vec<String> = app_launcher_entries(&apps)
+            .into_iter()
+            .map(|(_, verb)| verb.label)
+            .collect();
+        assert!(everywhere.contains(&"Fleet overview".to_string()));
+        assert!(everywhere.contains(&"Fleet booter".to_string()));
+        assert_eq!(everywhere.len(), 4);
+    }
+
+    /// ⛔ AN OPT-OUT, NEVER AN OPT-IN. Every manifest written before the field
+    /// existed keeps every verb it had — an opt-in would have emptied every row
+    /// menu in the fleet at once, silently.
+    #[test]
+    fn a_manifest_written_before_the_flag_keeps_all_its_verbs() {
+        let manifest: AppManifest = serde_json::from_str(
+            r#"{"name":"browser","label":"Browser","binary":"/opt/browser/bin/browser",
+                "verbs":[{"id":"new","label":"New Browser"}]}"#,
+        )
+        .expect("an old manifest still parses");
+        assert!(
+            manifest.verbs[0].row_spawn,
+            "a verb that says nothing is a row spawn"
+        );
+        assert_eq!(app_row_spawn_entries(&[manifest]).len(), 1);
+
+        // ⛔ …and a verb built in CODE agrees with the same verb read from
+        // disk. A derived `Default` would make this false, so the one built in
+        // code would silently vanish from the row menu.
+        assert!(AppVerb::default().row_spawn);
+    }
+
+    /// An app whose verbs are ALL non-rows must not leave an empty submenu
+    /// behind: the gate that decides whether to draw "Open libyggterm App" has
+    /// to ask the same question the submenu's contents do.
+    #[test]
+    fn an_app_with_no_row_verbs_leaves_no_empty_submenu() {
+        let apps = vec![app_with_verbs(
+            "monitor",
+            &[("open", "Fleet overview", false)],
+        )];
+        assert!(app_row_spawn_entries(&apps).is_empty());
+        assert!(libyggterm_app_menu_items(&apps, false).is_empty());
+        assert!(
+            !app_launcher_entries(&apps).is_empty(),
+            "…while the surfaces that should still offer it are unaffected"
+        );
+        let gate = function_body(&product_source(), "fn row_menu_items(");
+        assert!(
+            !gate.contains("app_launcher_entries(apps).is_empty()"),
+            "the submenu gate must ask what the submenu will CONTAIN, or an \\
+             app with no row verbs draws an empty menu:\\n{gate}"
+        );
     }
 
     // ======================================================================

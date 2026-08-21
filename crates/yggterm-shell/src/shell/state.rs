@@ -40347,6 +40347,30 @@ fn app_launcher_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
         .filter(|(app, verb)| seen.insert((app.name.clone(), verb.id.clone())))
         .collect()
 }
+/// The launcher entries a ROW MENU may offer: the ones whose verbs are session
+/// ROWS.
+///
+/// ⭐ The row menu spawns a session and puts a row in the sidebar for it. That
+/// is right for "New Ychrome" and wrong for a terminal-invoked dashboard or a
+/// fleet booter — the user gets a row for something that was never a session,
+/// which is what the owner asked to have removed.
+///
+/// ⛔ The APP decides, through [`AppVerb::row_spawn`]. yggterm cannot: the verbs
+/// to leave out live in other apps' manifests, so the only alternative was to
+/// hardcode another app's name, which is the anti-pattern the libyggterm
+/// contract exists to prevent.
+///
+/// ⚠ ONLY the row menu asks this. The titlebar `+` and the start page keep
+/// calling [`app_launcher_entries`], because "open my dashboard" is a reasonable
+/// thing to offer there and a meaningless thing to spawn a row for. A filter
+/// applied to the shared owner instead would have removed those verbs from every
+/// surface at once, which is a different (and unasked-for) change.
+fn app_row_spawn_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
+    app_launcher_entries(apps)
+        .into_iter()
+        .filter(|(_, verb)| verb.row_spawn)
+        .collect()
+}
 /// Launch a libyggterm app's verb: open a terminal session wherever the user
 /// asked, then type the app's command into it.
 ///
