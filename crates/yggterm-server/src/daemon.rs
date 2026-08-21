@@ -2400,19 +2400,25 @@ pub fn daemon_process_pids(home_dir: &Path) -> Option<Vec<u32>> {
     Some(pids)
 }
 
-/// Does this daemon process listen on a socket inside `home_dir`?
+/// Every socket path inside `home_dir` this daemon process is BOUND to.
+///
+/// ⛔⛔ THE BIND TABLE IS THE ONLY INSTRUMENT THAT CAN ANSWER *"WHOSE ADDRESS IS
+/// THIS NAME"*. A path is a filesystem fact: it can be unlinked, or replaced by
+/// a symlink to somebody else, while the socket behind it stays bound and
+/// accepting — the kernel goes on reporting the name it was bound to long after
+/// that name stopped leading there. Anything that DIALS a path is blind to the
+/// difference by construction, because a dial follows the path and reports on
+/// whatever answers at the end of it.
 #[cfg(target_os = "linux")]
-fn daemon_pid_serves_home(
+fn daemon_pid_bound_names_in_home(
     pid: u32,
     bind_names: &HashMap<String, PathBuf>,
     home_dir: &Path,
-) -> bool {
+) -> Vec<PathBuf> {
     let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        // Its descriptors are unreadable, so its home is unknown. Counting it
-        // would invent a shortfall; the sweep's own `unable` count is where an
-        // unanswerable daemon belongs, not here.
-        return false;
+        return Vec::new();
     };
+    let mut bound = Vec::new();
     for fd in fds.flatten() {
         let Ok(target) = std::fs::read_link(fd.path()) else {
             continue;
@@ -2424,15 +2430,84 @@ fn daemon_pid_serves_home(
         else {
             continue;
         };
-        if bind_names
-            .get(inode)
-            .and_then(|path| path.parent())
-            .is_some_and(|parent| parent == home_dir)
-        {
-            return true;
+        let Some(path) = bind_names.get(inode) else {
+            continue;
+        };
+        if path.parent() == Some(home_dir) && !bound.contains(path) {
+            bound.push(path.clone());
         }
     }
-    false
+    bound
+}
+
+/// Does this daemon process listen on a socket inside `home_dir`?
+///
+/// ⚠ Unreadable descriptors read as "no" on purpose: its home is then unknown,
+/// and counting it would invent a shortfall. The sweep's own `unable` count is
+/// where an unanswerable daemon belongs, not here.
+#[cfg(target_os = "linux")]
+fn daemon_pid_serves_home(
+    pid: u32,
+    bind_names: &HashMap<String, PathBuf>,
+    home_dir: &Path,
+) -> bool {
+    !daemon_pid_bound_names_in_home(pid, bind_names, home_dir).is_empty()
+}
+
+/// How many PTY masters this process holds — the number that decides what dies
+/// if it goes.
+///
+/// ⛔ `/dev/ptmx`, NEVER `fuser` on a slave. A master is an unnamed descriptor
+/// and can never appear among the holders of `/dev/pts/N`, healthy or not, so
+/// the `fuser` reading twice quoted as proof of an orphaned PTY is a reading
+/// every healthy adopted session also produces. `None` is "could not read its
+/// descriptors", never "holds nothing".
+#[cfg(target_os = "linux")]
+fn pty_master_count(pid: u32) -> Option<usize> {
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    let mut total = 0usize;
+    for fd in fds.flatten() {
+        let Ok(target) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        if target.to_string_lossy().ends_with("ptmx") {
+            total += 1;
+        }
+    }
+    Some(total)
+}
+
+/// How long this process has been alive, asked of the kernel rather than of the
+/// process.
+///
+/// ⚠ A daemon that cannot be dialled cannot be asked its own uptime, and uptime
+/// is exactly the fact that separates *"stranded since yesterday"* from
+/// *"started a moment ago and not listening yet"* — two states that otherwise
+/// render identically as "did not answer".
+///
+/// `/proc/<pid>/stat` field 22 is start time in clock ticks since boot and
+/// `/proc/uptime` is now. The fields are counted from the LAST `)` because the
+/// comm field is parenthesised and may itself contain spaces and brackets, so
+/// splitting the whole line mis-indexes every field after it.
+#[cfg(target_os = "linux")]
+fn process_uptime_ms(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let start_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    // SAFETY: `sysconf` reads a static system parameter and touches no memory
+    // we own.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let alive_secs = uptime_secs - (start_ticks as f64 / ticks_per_second as f64);
+    Some(if alive_secs <= 0.0 {
+        0
+    } else {
+        (alive_secs * 1000.0) as u64
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -15382,6 +15457,146 @@ pub struct DaemonCensusRow {
     pub is_default_endpoint: bool,
 }
 
+/// What became of the socket name a daemon we could not dial is still bound to.
+///
+/// ⛔ THE FOUR OUTCOMES ARE DIFFERENT DIAGNOSES AND MUST NOT BE MERGED. Only
+/// [`Self::Diverted`] is a lost name; a wedged daemon still holding its own name
+/// is a different fault with a different fix, and printing one verdict for both
+/// would hide the second inside the first — the same accident as merging the two
+/// build silences one column over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonNameVerdict {
+    /// The name is now a symlink to something else. ⛔ Dialling it reaches the
+    /// TARGET, which answers — so an occupancy probe that follows the path
+    /// reports this name healthy and occupied while the daemon actually bound
+    /// to it is reachable by nothing.
+    Diverted { now_reaches: String },
+    /// Nothing stands at the name any more. No path leads here at all.
+    Unlinked,
+    /// A real socket file still stands at this name, so this daemon went
+    /// unreached for some OTHER reason — a wedged accept loop, a dial that
+    /// timed out, or a successor that bound a replacement socket at the same
+    /// path. ⚠ Not a name theft, and must not be reported as one.
+    Present,
+    /// The kernel's bind table could not be read, so the name is UNKNOWN rather
+    /// than lost.
+    Unknown,
+}
+
+/// One socket name a daemon is bound to, and what became of it.
+///
+/// ⛔⛔ A DAEMON HAS MORE THAN ONE NAME, AND REPORTING ONE OF THEM IS A COIN
+/// FLIP. Measured on the build host: pid 777830 is bound to BOTH
+/// `server-3-1-12.sock` (a symlink to the newest daemon — lost) and
+/// `pty-handoff-3-1-12.sock` (a real socket file — intact). Picking whichever
+/// descriptor the `/proc` walk reached first reported "name intact" about a
+/// daemon nothing can dial, which is the reassuring half of the truth and the
+/// exact failure this census exists to end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonBoundName {
+    pub path: String,
+    pub verdict: DaemonNameVerdict,
+    /// `true` for the versioned REQUEST socket. ⭐ This is the name every dial
+    /// uses, so its loss is what makes a daemon unreachable; losing an auxiliary
+    /// name is a smaller fact and must not be reported as the same one.
+    pub is_request_socket: bool,
+}
+
+/// A daemon PROCESS on this host that the census could not dial.
+///
+/// ⛔⛔ THIS IS THE ROW `server daemons` COULD NOT PRINT, AND THE OMISSION WAS
+/// STRUCTURAL. The census enumerates versioned socket NAMES and dials them, so a
+/// daemon whose name was taken has no name left to enumerate and is invisible
+/// *by construction* — measured on a build host as two rows printed while a
+/// third daemon was alive at 28 h holding 83 PTY masters. The population always
+/// read smaller and healthier than it was, and every session that daemon owned
+/// answered "no session here matches" from every other daemon on the host.
+///
+/// Every field here is asked of the kernel, because the one thing that cannot be
+/// done with a daemon in this state is ask it anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrandedDaemonRow {
+    pub pid: u32,
+    /// EVERY socket path this process is bound to, from the kernel's bind
+    /// table — the names it *had*, not necessarily names that still reach it.
+    /// Empty only when the bind table could not be read.
+    pub bound_names: Vec<DaemonBoundName>,
+    /// PTY masters held. `None` is "could not read its descriptors", never
+    /// "holds nothing".
+    pub pty_master_count: Option<usize>,
+    pub uptime_ms: Option<u64>,
+    /// `/proc/<pid>/exe` verbatim, including Linux's " (deleted)" suffix — same
+    /// contract, and same trap, as [`DaemonCensusRow::exe`].
+    pub exe: Option<String>,
+    pub exe_deleted: bool,
+}
+
+/// Every yggterm daemon on this host: the ones that answered, and the ones that
+/// are running and could not be reached.
+///
+/// ⛔ ONE TYPE, BECAUSE THERE IS ONE QUESTION. "Which daemons are on this host"
+/// used to be answered by three instruments that disagreed — this census (dials
+/// names), `server rows drafts` (dials names AND scans the process table), and a
+/// throwaway script. Two answers to one question is what this repo forbids, and
+/// the answer a reader trusted was the one that could not see the failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostDaemonCensus {
+    /// Daemons that answered a dial, oldest first.
+    pub reached: Vec<DaemonCensusRow>,
+    /// Daemon processes serving this home that answered nothing, oldest first.
+    pub stranded: Vec<StrandedDaemonRow>,
+    /// How many daemon processes serve this home. ⛔ `None` is "the process
+    /// table could not be read" — an unverifiable coverage claim, never a
+    /// confirmed one.
+    pub daemon_processes_on_host: Option<usize>,
+}
+
+impl HostDaemonCensus {
+    /// The one wording for *"did this reach every daemon on the host?"*.
+    pub fn coverage(&self) -> &'static str {
+        daemon_coverage_verdict(self.daemon_processes_on_host, self.stranded.len())
+    }
+}
+
+/// ⚠ For tests and for callers that only have dialled rows. It records
+/// `daemon_processes_on_host: None`, so such a census reports its coverage as
+/// UNVERIFIED rather than complete — which is the truth about a list nobody
+/// checked against the process table.
+impl From<Vec<DaemonCensusRow>> for HostDaemonCensus {
+    fn from(reached: Vec<DaemonCensusRow>) -> Self {
+        Self {
+            reached,
+            stranded: Vec::new(),
+            daemon_processes_on_host: None,
+        }
+    }
+}
+
+/// The one wording for *"did we reach every daemon on this host?"*, shared by
+/// every verb that asks.
+///
+/// ⛔⛔ A COVERAGE COUNT IS NOT COVERAGE. `server rows drafts` once reported
+/// `daemons_seen: 1` and `unable: 0` on a host running four daemons — it
+/// declared it had asked everybody, having asked one in four. The only way to
+/// know what was missed is to compare what ANSWERED against what is RUNNING.
+///
+/// ⛔ `None` is UNVERIFIED, never complete: a process table that could not be
+/// read must not read like a confirmation.
+pub fn daemon_coverage_verdict(
+    daemon_processes_on_host: Option<usize>,
+    unreached: usize,
+) -> &'static str {
+    match daemon_processes_on_host {
+        None => "unverified — this host's process table could not be read",
+        Some(_) if unreached == 0 => "every daemon process on this host answered",
+        Some(_) => {
+            "INCOMPLETE — a daemon is running on this host that was never reached; \
+             what it owns is unexamined, not absent"
+        }
+    }
+}
+
 /// How a `--endpoint` selector was read. Returned alongside the endpoint so a
 /// caller can say WHICH daemon it aimed at, in the selector's own terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15471,11 +15686,21 @@ pub fn resolve_daemon_endpoint_selector(
     bail!("pid selectors are unix-only");
 }
 
-/// Every reachable daemon on this host, as rows.
+/// Every daemon PROCESS on this host — dialled where a name still reaches it,
+/// and asked of the kernel where none does.
+///
+/// ⛔ IT USED TO BE "EVERY REACHABLE DAEMON", WEARING THIS NAME. The census
+/// walks versioned socket paths and dials them, so a daemon whose name was
+/// re-pointed at a successor had nothing left to enumerate and never appeared —
+/// the one instrument an agent reaches for to find a lingering daemon was blind
+/// to exactly the daemons this project's hardest lane is about.
 #[cfg(unix)]
-pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
+pub fn daemon_census(home_dir: &Path) -> HostDaemonCensus {
     let default_label = owner_endpoint_label(&default_endpoint(home_dir));
-    let mut rows = reachable_versioned_daemon_statuses(home_dir)
+    let statuses = reachable_versioned_daemon_statuses(home_dir);
+    let reached_pids: HashSet<u32> =
+        statuses.iter().map(|(_, status)| status.server_pid).collect();
+    let mut rows = statuses
         .into_iter()
         .map(|(endpoint, status)| {
             let exe = fs::read_link(format!("/proc/{}/exe", status.server_pid))
@@ -15514,19 +15739,119 @@ pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
             .cmp(&left.uptime_ms)
             .then(left.pid.cmp(&right.pid))
     });
-    rows
+    let (stranded, daemon_processes_on_host) = stranded_daemons(home_dir, &reached_pids);
+    HostDaemonCensus {
+        reached: rows,
+        stranded,
+        daemon_processes_on_host,
+    }
 }
 
 #[cfg(not(unix))]
-pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
+pub fn daemon_census(home_dir: &Path) -> HostDaemonCensus {
     let _ = home_dir;
-    Vec::new()
+    HostDaemonCensus::default()
+}
+
+/// The daemon processes serving this home that answered nothing, plus how many
+/// daemon processes there are in total.
+///
+/// ⛔ The returned count is `None` when the process table could not be read.
+/// That is the denominator of the coverage claim, and a missing denominator must
+/// never be reported as a met one.
+#[cfg(target_os = "linux")]
+fn stranded_daemons(
+    home_dir: &Path,
+    reached_pids: &HashSet<u32>,
+) -> (Vec<StrandedDaemonRow>, Option<usize>) {
+    let Some(pids) = daemon_process_pids(home_dir) else {
+        return (Vec::new(), None);
+    };
+    let total = pids.len();
+    let bind_names = unix_socket_bind_names();
+    let mut rows: Vec<StrandedDaemonRow> = pids
+        .into_iter()
+        .filter(|pid| !reached_pids.contains(pid))
+        .map(|pid| {
+            let mut bound_names: Vec<DaemonBoundName> = bind_names
+                .as_ref()
+                .map(|names| daemon_pid_bound_names_in_home(pid, names, home_dir))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| DaemonBoundName {
+                    verdict: name_verdict_for_bound_path(&path),
+                    is_request_socket: parse_versioned_server_socket_name(&path).is_some(),
+                    path: path.to_string_lossy().into_owned(),
+                })
+                .collect();
+            // The request socket first: it is the name every dial uses, so it is
+            // the one a reader must see before any auxiliary name reassures them.
+            bound_names.sort_by(|left, right| {
+                right
+                    .is_request_socket
+                    .cmp(&left.is_request_socket)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
+            let exe = fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            StrandedDaemonRow {
+                pid,
+                bound_names,
+                pty_master_count: pty_master_count(pid),
+                uptime_ms: process_uptime_ms(pid),
+                exe_deleted: exe.as_deref().is_some_and(|link| link.ends_with(" (deleted)")),
+                exe,
+            }
+        })
+        .collect();
+    // Oldest first, for the same reason the dialled rows are: a census is read
+    // to find what has been lingering longest. `None` uptime sorts last, because
+    // an unknown age is not evidence of a long one.
+    rows.sort_by(|left, right| {
+        right
+            .uptime_ms
+            .unwrap_or(0)
+            .cmp(&left.uptime_ms.unwrap_or(0))
+            .then(left.pid.cmp(&right.pid))
+    });
+    (rows, Some(total))
+}
+
+/// Does the path this daemon bound still lead back to this daemon?
+///
+/// ⛔ `symlink_metadata`, never `metadata`: the whole question is whether the
+/// name has been diverted, and following the link is how you come back with the
+/// successor's health and call it this daemon's.
+#[cfg(target_os = "linux")]
+fn name_verdict_for_bound_path(path: &Path) -> DaemonNameVerdict {
+    match fs::symlink_metadata(path) {
+        Err(_) => DaemonNameVerdict::Unlinked,
+        Ok(meta) if meta.file_type().is_symlink() => DaemonNameVerdict::Diverted {
+            now_reaches: fs::read_link(path)
+                .map(|target| target.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "<unreadable link>".to_string()),
+        },
+        Ok(_) => DaemonNameVerdict::Present,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stranded_daemons(
+    home_dir: &Path,
+    reached_pids: &HashSet<u32>,
+) -> (Vec<StrandedDaemonRow>, Option<usize>) {
+    // ⚠ No `/proc`, so the process table cannot be read here at all. That is
+    // reported as UNVERIFIED coverage rather than as an empty stranded list
+    // meaning "there are none".
+    let _ = (home_dir, reached_pids);
+    (Vec::new(), None)
 }
 
 /// Render the census as the table a human reads. Pure, so the wording is
 /// unit-testable and cannot drift from the data.
-pub fn format_daemon_census(rows: &[DaemonCensusRow]) -> String {
-    format_daemon_census_with_queued_swap(rows, None, 0)
+pub fn format_daemon_census(census: &HostDaemonCensus) -> String {
+    format_daemon_census_with_queued_swap(census, None, 0)
 }
 
 /// What the BUILD column shows for a daemon that did not give a commit.
@@ -15564,7 +15889,7 @@ pub fn run_server_daemons_census(home_dir: &Path, json: bool) -> anyhow::Result<
     // about the others. Without this an agent rebuilds it from `ps`,
     // `readlink /proc/<pid>/exe` and a trace grep, every time, and gets a
     // different subset each time.
-    let rows = crate::daemon_census(home_dir);
+    let census = crate::daemon_census(home_dir);
     // §4: "is a swap owed on this host?" has no other place to be asked. It
     // is a host fact, so it rides the host-wide census rather than any one
     // daemon's status.
@@ -15581,7 +15906,15 @@ pub fn run_server_daemons_census(home_dir: &Path, json: bool) -> anyhow::Result<
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "daemons": rows,
+                // ⛔ `daemons` IS WHAT ANSWERED, AND IT ALWAYS WAS. A consumer
+                // counting this array is counting dials, not daemons — the
+                // denominator is the field below it, and the same three field
+                // names are used by `server rows drafts` so the two verbs cannot
+                // answer this question in different dialects.
+                "daemons": census.reached,
+                "daemon_processes_on_host": census.daemon_processes_on_host,
+                "daemons_running_but_never_reached": census.stranded,
+                "coverage": census.coverage(),
                 "queued_hot_restart": queued,
                 "interrupted_sessions": interrupted,
             }))?
@@ -15590,7 +15923,7 @@ pub fn run_server_daemons_census(home_dir: &Path, json: bool) -> anyhow::Result<
         print!(
             "{}",
             crate::format_daemon_census_with_queued_swap(
-                &rows,
+                &census,
                 queued.as_ref(),
                 now_ms
             )
@@ -15611,12 +15944,23 @@ pub fn run_server_daemons_census(home_dir: &Path, json: bool) -> anyhow::Result<
 /// attaching it to any one row would make it look like that daemon's property
 /// and lose it the moment that daemon goes. One line under the table, once.
 pub fn format_daemon_census_with_queued_swap(
-    rows: &[DaemonCensusRow],
+    census: &HostDaemonCensus,
     queued: Option<&hot_restart_queue::QueuedHotRestart>,
     now_ms: u64,
 ) -> String {
-    if rows.is_empty() {
-        let mut out = "no reachable yggterm daemons on this host\n".to_string();
+    let rows = &census.reached;
+    if rows.is_empty() && census.stranded.is_empty() {
+        // ⛔ AN ABSENCE MUST SAY WHICH KIND IT IS. "None answered" and "none are
+        // running" are different facts, and the census could only ever measure
+        // the first — so when the process table could not be read to settle the
+        // second, the line says so instead of implying it.
+        let mut out = if census.daemon_processes_on_host.is_none() {
+            "no yggterm daemon answered on this host — and the process table \
+             could not be read, so this is COULD NOT ASK, not THERE ARE NONE\n"
+                .to_string()
+        } else {
+            "no reachable yggterm daemons on this host\n".to_string()
+        };
         if let Some(queued) = queued {
             out.push_str(&hot_restart_queue::format_queued_swap(queued, now_ms));
         }
@@ -15651,11 +15995,109 @@ pub fn format_daemon_census_with_queued_swap(
             ));
         }
     }
+    out.push_str(&format_stranded_daemons(census));
     if let Some(queued) = queued {
         out.push_str(&hot_restart_queue::format_queued_swap(queued, now_ms));
     }
     out.push_str("  (* = the daemon this CLI talks to by default)\n");
     out
+}
+
+/// The daemons the table above could not print, under the table that could not
+/// print them.
+///
+/// ⛔ THEY ARE NOT COLUMNS IN THAT TABLE, AND THAT IS DELIBERATE. Every number
+/// up there is what a daemon SAID about itself; every number here is what the
+/// kernel says about a process that can say nothing. `OWNED` and a `/dev/ptmx`
+/// descriptor count are close enough to look interchangeable and are two
+/// different measurements — putting one under the other's heading is how a
+/// column comes to mean two things and stops meaning either.
+fn format_stranded_daemons(census: &HostDaemonCensus) -> String {
+    if census.stranded.is_empty() {
+        // ⚠ Silence here would be a coverage claim, and an unverifiable one is
+        // exactly the reading that has twice passed for a clean bill of health.
+        if census.daemon_processes_on_host.is_none() {
+            return "  ⚠ coverage unverified — this host's process table could not be \
+                    read, so a daemon may be running that nothing above can see\n"
+                .to_string();
+        }
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(
+        "\n  ⛔ RUNNING AND UNREACHABLE — alive, holding PTYs, and answering to no name:\n",
+    );
+    for row in &census.stranded {
+        let hours = row
+            .uptime_ms
+            .map(|ms| format!("{:.1}h", ms as f64 / 3_600_000.0))
+            .unwrap_or_else(|| "?".to_string());
+        out.push_str(&format!(
+            "  ⛔ {pid:<9} {hours:>7}  {masters} PTY master(s) held  {exe}{deleted}\n",
+            pid = row.pid,
+            masters = row
+                .pty_master_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            exe = row.exe.as_deref().unwrap_or("<unreadable>"),
+            deleted = if row.exe_deleted { "  ⚠ REPLACED ON DISK" } else { "" },
+        ));
+        for line in format_daemon_name_verdicts(row) {
+            out.push_str(&format!("       {line}\n"));
+        }
+    }
+    out.push_str(
+        "       every session these own answers \"no session here matches\" from every \
+         other daemon on this host\n",
+    );
+    out
+}
+
+/// What happened to each name a stranded daemon is bound to — one line each, in
+/// terms of the consequence rather than of the topology.
+///
+/// ⛔ EVERY NAME, NOT A SUMMARY. A daemon bound to a lost request socket and an
+/// intact auxiliary one is unreachable, and any wording that reduces the two to
+/// a single verdict has to choose which half to tell. The request socket sorts
+/// first, so the name that decides reachability is the line a reader meets.
+fn format_daemon_name_verdicts(row: &StrandedDaemonRow) -> Vec<String> {
+    if row.bound_names.is_empty() {
+        return vec![
+            "name unknown — the kernel's bind table could not be read, so this is \
+             NOT a report that it has no name"
+                .to_string(),
+        ];
+    }
+    row.bound_names
+        .iter()
+        .map(|name| {
+            let path = &name.path;
+            // ⚠ The request socket and an auxiliary one fail with different
+            // consequences, and only the first makes the daemon undialable.
+            let role = if name.is_request_socket {
+                "request socket"
+            } else {
+                "auxiliary socket"
+            };
+            match &name.verdict {
+                DaemonNameVerdict::Diverted { now_reaches } => format!(
+                    "⛔ {role} NAME LOST: {path} is now a symlink to {now_reaches}, so \
+                     dialling it reaches THAT daemon, which answers — nothing reaches \
+                     this one"
+                ),
+                DaemonNameVerdict::Unlinked => format!(
+                    "⛔ {role} NAME GONE: {path} no longer exists, so no path leads here"
+                ),
+                DaemonNameVerdict::Present => format!(
+                    "{role} intact: {path} — this name was not taken, so a failure to \
+                     answer on it is a different fault"
+                ),
+                DaemonNameVerdict::Unknown => {
+                    format!("{role} {path}: state unreadable")
+                }
+            }
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -24376,6 +24818,240 @@ mod tests {
         assert!(reason.contains("+2 more session(s)"), "{reason}");
     }
 
+    fn stranded_row(pid: u32, uptime_ms: u64) -> super::StrandedDaemonRow {
+        super::StrandedDaemonRow {
+            pid,
+            bound_names: vec![super::DaemonBoundName {
+                path: "/home/user/.yggterm/server-9-9-9.sock".to_string(),
+                verdict: super::DaemonNameVerdict::Diverted {
+                    now_reaches: "server-9-9-10.sock".to_string(),
+                },
+                is_request_socket: true,
+            }],
+            pty_master_count: Some(83),
+            uptime_ms: Some(uptime_ms),
+            exe: Some("/home/user/.local/bin/example-headless".to_string()),
+            exe_deleted: false,
+        }
+    }
+
+    /// ⛔ THE ROW THE CENSUS COULD NOT PRINT. Dialling names cannot find a
+    /// daemon whose name was taken, so the population read smaller and healthier
+    /// than it was — two rows on a host running three, the missing one holding
+    /// every PTY that mattered. This locks the daemon into the OUTPUT, not into
+    /// a field somebody has to know to ask for.
+    #[test]
+    fn a_running_unreachable_daemon_appears_in_the_census_it_used_to_be_invisible_to() {
+        let census = super::HostDaemonCensus {
+            reached: vec![census_row(11, 60_000)],
+            stranded: vec![stranded_row(4242, 104_400_000)],
+            daemon_processes_on_host: Some(2),
+        };
+        let rendered = super::format_daemon_census(&census);
+        assert!(rendered.contains("4242"), "the pid must be printed: {rendered}");
+        assert!(
+            rendered.contains("29.0h"),
+            "uptime is what separates 'stranded since yesterday' from 'just \
+             started', and it must be visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("83 PTY master(s) held"),
+            "what dies if it goes is the whole reason to print the row: {rendered}"
+        );
+        assert!(
+            rendered.contains("NAME LOST"),
+            "the verdict must be in the text, not only in the JSON: {rendered}"
+        );
+        assert!(
+            rendered.contains("server-9-9-10.sock"),
+            "the name must say what it now reaches: {rendered}"
+        );
+        assert_eq!(
+            census.coverage(),
+            "INCOMPLETE — a daemon is running on this host that was never reached; \
+             what it owns is unexamined, not absent"
+        );
+    }
+
+    /// ⛔ THE CONTROL. A daemon that did not answer while still holding its own
+    /// name is a DIFFERENT fault — wedged, or dialled past a timeout — and
+    /// reporting it as a name theft would send the reader to the socket sweep for
+    /// a bug that is not there.
+    #[test]
+    fn a_stranded_daemon_that_still_holds_its_name_is_not_reported_as_a_theft() {
+        let mut row = stranded_row(4243, 60_000);
+        row.bound_names[0].verdict = super::DaemonNameVerdict::Present;
+        let rendered = super::format_daemon_census(&super::HostDaemonCensus {
+            reached: Vec::new(),
+            stranded: vec![row],
+            daemon_processes_on_host: Some(1),
+        });
+        assert!(
+            !rendered.contains("NAME LOST"),
+            "an intact name must not read as a stolen one: {rendered}"
+        );
+        assert!(
+            rendered.contains("request socket intact"),
+            "and it must say which fault this actually is: {rendered}"
+        );
+    }
+
+    /// ⛔⛔ THE DEFECT THE LIVE HOST FOUND IN THIS CENSUS'S OWN FIRST VERSION.
+    /// A daemon holds several bound names; the first draft reported whichever
+    /// descriptor the `/proc` walk reached first. On pid 777830 that was
+    /// `pty-handoff-3-1-12.sock`, a real socket file, so the census printed
+    /// "name intact" about a daemon whose `server-3-1-12.sock` was a symlink to
+    /// the newest daemon and which nothing could dial. A reassuring half-truth
+    /// about the exact condition the verb exists to find.
+    #[test]
+    fn a_daemon_with_one_lost_name_and_one_intact_one_reports_both_lost_name_first() {
+        let mut row = stranded_row(777830, 107_280_000);
+        row.bound_names.push(super::DaemonBoundName {
+            path: "/home/user/.yggterm/pty-handoff-9-9-9.sock".to_string(),
+            verdict: super::DaemonNameVerdict::Present,
+            is_request_socket: false,
+        });
+        let rendered = super::format_daemon_census(&super::HostDaemonCensus {
+            reached: Vec::new(),
+            stranded: vec![row],
+            daemon_processes_on_host: Some(1),
+        });
+        assert!(
+            rendered.contains("request socket NAME LOST"),
+            "the name that decides reachability must be reported lost: {rendered}"
+        );
+        assert!(
+            rendered.contains("auxiliary socket intact"),
+            "and the intact one must still be shown, as the auxiliary it is: {rendered}"
+        );
+        let lost = rendered.find("request socket NAME LOST").expect("lost line");
+        let intact = rendered.find("auxiliary socket intact").expect("intact line");
+        assert!(
+            lost < intact,
+            "the reassuring line must never be the one a reader meets first: {rendered}"
+        );
+    }
+
+    /// ⛔⛔ `symlink_metadata`, NEVER `metadata`. The entire question is whether
+    /// the name has been diverted; following the link comes back with the
+    /// SUCCESSOR's health and reports it as this daemon's. With `metadata` the
+    /// diverted arm below returns `Present` and the census goes quiet about the
+    /// exact condition it exists to find.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_diverted_name_is_read_without_following_the_link() {
+        let dir = std::env::temp_dir().join(format!("ygg-namever-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let real = dir.join("server-1-0-0.sock");
+        std::fs::write(&real, b"").expect("a file stands in for a bound socket file");
+        assert_eq!(
+            super::name_verdict_for_bound_path(&real),
+            super::DaemonNameVerdict::Present
+        );
+
+        let target = dir.join("server-1-0-1.sock");
+        std::fs::write(&target, b"").expect("the successor's socket");
+        let diverted = dir.join("server-0-9-9.sock");
+        std::os::unix::fs::symlink(&target, &diverted).expect("symlink");
+        match super::name_verdict_for_bound_path(&diverted) {
+            super::DaemonNameVerdict::Diverted { now_reaches } => assert!(
+                now_reaches.contains("server-1-0-1.sock"),
+                "the verdict must name what took the name: {now_reaches}"
+            ),
+            other => panic!("a symlinked name is diverted, not {other:?}"),
+        }
+
+        assert_eq!(
+            super::name_verdict_for_bound_path(&dir.join("server-0-0-1.sock")),
+            super::DaemonNameVerdict::Unlinked
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⛔⛔ AN UNVERIFIABLE COVERAGE CLAIM MUST NOT READ LIKE A CONFIRMED ONE.
+    /// `server rows drafts` once reported `daemons_seen: 1` and `unable: 0` on a
+    /// host running four — it declared it had asked everybody, having asked one
+    /// in four. Both verbs now take their wording from here, so they cannot
+    /// answer the same question differently.
+    #[test]
+    fn coverage_separates_could_not_ask_from_asked_everybody() {
+        assert!(
+            super::daemon_coverage_verdict(None, 0).starts_with("unverified"),
+            "an unreadable process table is not a clean bill of health"
+        );
+        assert_eq!(
+            super::daemon_coverage_verdict(Some(3), 0),
+            "every daemon process on this host answered"
+        );
+        assert!(
+            super::daemon_coverage_verdict(Some(3), 1).starts_with("INCOMPLETE"),
+            "one unreached daemon makes the whole sweep incomplete"
+        );
+    }
+
+    /// ⛔ "NONE ANSWERED" AND "THERE ARE NONE" ARE DIFFERENT FACTS, and the
+    /// census could only ever measure the first. When the process table could not
+    /// settle the second, the empty line must say so rather than imply it.
+    #[test]
+    fn an_empty_census_that_could_not_read_the_process_table_says_could_not_ask() {
+        let rendered = super::format_daemon_census(&super::HostDaemonCensus::default());
+        assert!(
+            rendered.contains("COULD NOT ASK"),
+            "an unverified absence must not be printed as a settled one: {rendered}"
+        );
+
+        let asked = super::format_daemon_census(&super::HostDaemonCensus {
+            daemon_processes_on_host: Some(0),
+            ..Default::default()
+        });
+        assert!(
+            asked.contains("no reachable yggterm daemons"),
+            "and a verified absence still reads plainly: {asked}"
+        );
+        assert!(!asked.contains("COULD NOT ASK"), "{asked}");
+    }
+
+    /// ⛔ A LIST WITH NO STRANDED ROWS IS NOT A COVERAGE CLAIM unless the process
+    /// table was actually read. Silence there is how an unchecked list came to
+    /// pass for a complete one.
+    #[test]
+    fn a_census_nobody_checked_against_the_process_table_admits_it_under_the_table() {
+        let rendered = super::format_daemon_census(&vec![census_row(11, 60_000)].into());
+        assert!(
+            rendered.contains("coverage unverified"),
+            "an unchecked census must say so under its own table: {rendered}"
+        );
+    }
+
+    /// The `/proc` readers, against this very process — the one subject whose
+    /// answers are known independently.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_kernel_readers_answer_for_a_process_we_already_know() {
+        let me = std::process::id();
+        let uptime = super::process_uptime_ms(me).expect("our own uptime is readable");
+        // A test binary that has been alive for a week is a parse error, not a
+        // long-running test; `/proc/<pid>/stat` field indexing is exactly what
+        // goes wrong here, because the comm field is parenthesised.
+        assert!(
+            uptime < 7 * 24 * 3_600_000,
+            "an implausible uptime means the stat fields were mis-indexed: {uptime}ms"
+        );
+        assert!(
+            super::pty_master_count(me).is_some(),
+            "our own descriptors are readable, so this is a count and not a refusal"
+        );
+        assert_eq!(
+            super::process_uptime_ms(u32::MAX),
+            None,
+            "a pid that cannot exist is 'could not read', which must be None \
+             rather than a fabricated zero"
+        );
+    }
+
     fn census_row(pid: u32, uptime_ms: u64) -> super::DaemonCensusRow {
         super::DaemonCensusRow {
             pid,
@@ -24403,7 +25079,7 @@ mod tests {
     /// ELSE, and to say it differently for the two silences.
     #[test]
     fn the_census_names_the_running_build_and_admits_when_it_cannot() {
-        let named = super::format_daemon_census(&[census_row(11, 60_000)]);
+        let named = super::format_daemon_census(&vec![census_row(11, 60_000)].into());
         assert!(named.contains("BUILD"), "{named}");
         assert!(
             named.contains("abc123def456"),
@@ -24414,7 +25090,7 @@ mod tests {
         old.build_commit = String::new();
         let mut unstamped = census_row(13, 60_000);
         unstamped.build_commit = crate::build_identity::UNSTAMPED.to_string();
-        let rendered = super::format_daemon_census(&[old, unstamped]);
+        let rendered = super::format_daemon_census(&vec![old, unstamped].into());
         assert!(
             rendered.contains("(pre-field)"),
             "a daemon too old to answer is dated, not blanked: {rendered}"
@@ -24511,7 +25187,10 @@ mod tests {
 
     #[test]
     fn an_empty_census_says_so_rather_than_printing_a_bare_header() {
-        let rendered = super::format_daemon_census(&[]);
+        let rendered = super::format_daemon_census(&super::HostDaemonCensus {
+            daemon_processes_on_host: Some(0),
+            ..Default::default()
+        });
         assert!(rendered.contains("no reachable yggterm daemons"), "{rendered}");
         assert!(!rendered.contains("PID"), "an empty table is not an answer: {rendered}");
     }
@@ -24521,7 +25200,7 @@ mod tests {
         let mut row = census_row(4242, 3_600_000);
         row.exe = Some("/home/user/.local/bin/yggterm-headless (deleted)".to_string());
         row.exe_deleted = true;
-        let rendered = super::format_daemon_census(&[row]);
+        let rendered = super::format_daemon_census(&vec![row].into());
         assert!(rendered.contains("REPLACED ON DISK"), "{rendered}");
         assert!(rendered.contains("(deleted)"), "the raw link must survive: {rendered}");
     }
@@ -24542,7 +25221,7 @@ mod tests {
         settled.hot_restart_blocker_count = 2;
         settled.permanent_blocker_count = 2;
 
-        let rendered = super::format_daemon_census(&[waiting, settled]);
+        let rendered = super::format_daemon_census(&vec![waiting, settled].into());
         assert!(rendered.contains("deferring: agent is working"), "{rendered}");
         assert!(rendered.contains("lingering: a plain shell"), "{rendered}");
     }
@@ -27200,7 +27879,14 @@ mod tests {
             relay_boundary_at_ms: None,
             relay_boundary_by: None,
         };
-        let rendered = super::format_daemon_census_with_queued_swap(&[], Some(&queued), 1_800_000);
+        let rendered = super::format_daemon_census_with_queued_swap(
+            &super::HostDaemonCensus {
+                daemon_processes_on_host: Some(0),
+                ..Default::default()
+            },
+            Some(&queued),
+            1_800_000,
+        );
         assert!(rendered.contains("swap owed → 9.9.9"), "{rendered}");
         assert!(rendered.contains("30m ago"), "{rendered}");
         assert!(
