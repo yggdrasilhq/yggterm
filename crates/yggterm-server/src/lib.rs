@@ -67,6 +67,7 @@ mod codex_cli {
     pub use crate::managed_cli::*;
 }
 mod daemon;
+mod lock_holder_trace;
 pub mod daemon_bridge;
 pub mod grid_overlay;
 pub mod host_panic;
