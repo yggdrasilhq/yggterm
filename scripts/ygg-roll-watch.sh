@@ -24,6 +24,10 @@
 set -uo pipefail
 
 INTERVAL=3600
+#: How many times ONE tick will re-sync and build again when the deploy refuses
+#: because main moved under it. Two: a third attempt losing the same race means
+#: main advances faster than a build takes, and the answer to that is a human.
+DEPLOY_ATTEMPTS=2
 ONCE=0
 DRY=0
 while [ $# -gt 0 ]; do
@@ -72,22 +76,69 @@ tick() {
   say "main is $main_sha, the live daemon runs $running — rolling"
   [ "$DRY" = 1 ] && { say "(dry run: stopping here)"; return 0; }
 
-  # ⛔ PREFLIGHT BEFORE THE BUILD, ALWAYS. The ancestry gate is correct and it
-  # used to be asked only after 2-3 minutes of compiling had already been spent;
-  # on a busy fleet main advances mid-build and the deploy then refuses on a race
-  # that did not exist when the build began.
-  ssh -n "$build_host" "cd $DEPLOY_TREE && git reset --hard -q origin/main && scripts/deploy-fleet.sh --preflight" >>"$LOG" 2>&1 || {
-    say "⛔ preflight refused — not building. See $LOG"; return 0; }
+  # ⛔⛔ THE DEPLOY'S ANSWER IS THE ONLY EVIDENCE THAT ANYTHING WAS DEPLOYED, AND
+  # THIS FUNCTION USED TO THROW IT AWAY. The `deploy-fleet.sh` call took no exit
+  # status and the `say "deployed ..."` beneath it fired unconditionally. What
+  # that hid is not an exotic failure; on a busy fleet it is the ORDINARY one.
+  # `deploy-fleet.sh` refuses a build whose HEAD is not a descendant of
+  # origin/main; main advances during the two minutes the build takes; so the
+  # preflight passes and the deploy then refuses on a commit that did not exist
+  # when the build began.
+  #
+  # Measured 2026-08-21: the refusal named a commit that landed mid-build, a
+  # version number was burned, NOTHING reached any host, and this watcher reported
+  # `deployed 3.1.25 to disk fleet-wide`. The one instrument whose entire purpose
+  # is to notice that the fleet is behind was asserting hourly that it was current
+  # — and an instrument that fails toward "all clear" is worse than no instrument,
+  # because it stops anyone else from looking.
+  #
+  # ⇒ Three changes, and the middle one is what makes the loop converge:
+  #    1. read the status, and never claim a deploy that did not answer;
+  #    2. on the mid-build race, RE-SYNC AND BUILD AGAIN in this same tick.
+  #       Waiting an hour to lose the identical race is not patience — the busier
+  #       main is, the more certainly the next tick loses it too;
+  #    3. prove it on a host afterwards, because "the deploy command exited 0" and
+  #       "the binary a machine will execute changed" are different claims.
+  local ver="" attempt=1 deployed=0
+  while [ "$attempt" -le "$DEPLOY_ATTEMPTS" ]; do
+    # ⛔ PREFLIGHT BEFORE THE BUILD, ALWAYS, AND ON EVERY ATTEMPT. The ancestry
+    # gate is correct and it used to be asked only after 2-3 minutes of compiling
+    # had already been spent.
+    ssh -n "$build_host" "cd $DEPLOY_TREE && git fetch -q origin && git reset --hard -q origin/main && scripts/deploy-fleet.sh --preflight" >>"$LOG" 2>&1 || {
+      say "⛔ preflight refused on attempt $attempt — not building. See $LOG"; return 0; }
 
-  local ver; ver="$(ssh -n "$build_host" "cd $DEPLOY_TREE && scripts/bump-version.sh 2>/dev/null")"
-  [ -z "$ver" ] && { say "⛔ could not allocate a version — skipping"; return 0; }
-  say "allocated $ver"
+    ver="$(ssh -n "$build_host" "cd $DEPLOY_TREE && scripts/bump-version.sh 2>/dev/null")"
+    [ -z "$ver" ] && { say "⛔ could not allocate a version — skipping"; return 0; }
+    say "allocated $ver (attempt $attempt of $DEPLOY_ATTEMPTS)"
 
-  ssh -n "$build_host" "cd $DEPLOY_TREE && cargo build --release" >>"$LOG" 2>&1 || {
-    say "⛔ build failed — nothing deployed. See $LOG"; return 0; }
+    ssh -n "$build_host" "cd $DEPLOY_TREE && cargo build --release" >>"$LOG" 2>&1 || {
+      say "⛔ build failed — nothing deployed. See $LOG"; return 0; }
 
-  ssh -n "$build_host" "cd $DEPLOY_TREE && scripts/deploy-fleet.sh" >>"$LOG" 2>&1
-  say "deployed $ver to disk fleet-wide"
+    if ssh -n "$build_host" "cd $DEPLOY_TREE && scripts/deploy-fleet.sh" >>"$LOG" 2>&1; then
+      deployed=1
+      break
+    fi
+
+    local landed; landed="$(ssh -n "$build_host" "cd $DEPLOY_TREE && git fetch -q origin && git rev-list --count HEAD..origin/main" 2>/dev/null)"
+    if [ "${landed:-0}" -gt 0 ] 2>/dev/null && [ "$attempt" -lt "$DEPLOY_ATTEMPTS" ]; then
+      say "⚠ deploy refused: $landed commit(s) landed on main during the build — re-syncing and building again"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    say "⛔ deploy REFUSED and $ver reached no host. See $LOG — NOTHING was deployed."
+    return 0
+  done
+  [ "$deployed" = 1 ] || { say "⛔ deploy did not succeed in $DEPLOY_ATTEMPTS attempts — nothing deployed."; return 0; }
+
+  # ⛔ READ IT BACK OFF A MACHINE. The census the deploy writes is the deploy's
+  # own account of itself; the installed binary is the fleet's.
+  local installed; installed="$(ssh -n "$live_host" '~/.local/bin/yggterm-headless --version 2>/dev/null' | awk '{print $NF}')"
+  if [ "$installed" = "$ver" ]; then
+    say "deployed $ver to disk fleet-wide (verified on $live_host)"
+  else
+    say "⛔ the deploy reported success but $live_host has ${installed:-nothing} on disk, not $ver"
+    return 0
+  fi
 
   # ⚠ THE DAEMON ADOPTS ON ITS OWN TERMS AND THAT IS NOT A FAILURE. It defers
   # while its own sessions are active, which on a machine that is always active
@@ -135,7 +186,14 @@ tick() {
 reconcile_client() {  # host disk_md5(optional) label
   local live_host="$1" gui_disk="$2" ver="$3" gui_running
   [ -n "$gui_disk" ] || gui_disk="$(ssh -n "$live_host" 'md5sum ~/.local/bin/yggterm 2>/dev/null | cut -c1-10')"
-  gui_running="$(ssh -n "$live_host" 'for g in $(pgrep -x yggterm); do x=$(readlink /proc/$g/exe 2>/dev/null); case "$x" in "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*) md5sum /proc/$g/exe | cut -c1-10;; esac; done' 2>/dev/null | head -1)"
+  # ⛔⛔ NEVER `head -1` A PROCESS SET. `restart_gui` below already learned this
+  # the hard way and takes every pid; the DETECTION half was still asking only the
+  # first, which is the same bug one step earlier and strictly worse — if the
+  # first process happens to match disk, this returns "already runs this build"
+  # and the stale sibling is never restarted, so the repair never even begins.
+  # Hosts here routinely carry more than one installed GUI process. ⇒ Take the
+  # distinct images; anything but exactly one, equal to disk, is work to do.
+  gui_running="$(ssh -n "$live_host" 'for g in $(pgrep -x yggterm); do x=$(readlink /proc/$g/exe 2>/dev/null); case "$x" in "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*) md5sum /proc/$g/exe | cut -c1-10;; esac; done' 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ *$//')"
   if [ -z "$gui_running" ]; then
     say "no installed GUI process on $live_host — nothing to restart"
     return 0
@@ -144,7 +202,7 @@ reconcile_client() {  # host disk_md5(optional) label
     say "GUI on $live_host already runs this build ($gui_disk)"
     return 0
   fi
-  say "GUI on $live_host runs $gui_running, disk is $gui_disk — notifying, then restarting it"
+  say "GUI on $live_host runs [$gui_running], disk is $gui_disk — notifying, then restarting it"
   ssh -n "$live_host" "~/.local/bin/yggterm-headless server app notify 'yggterm $ver — restarting the window' \
     'The daemon is already on this build. Restarting the window now so client and daemon match; your sessions are owned by the daemon and survive it.' --tone info" >/dev/null 2>&1
   sleep "$GUI_RESTART_GRACE_SECS"
