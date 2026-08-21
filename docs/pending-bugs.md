@@ -1839,7 +1839,33 @@ and worth factoring once.
 
 **Also still open:** a preserved owner that has not answered in ~1 s is a different
 problem from a busy one, so the proxied call arguably wants a much shorter budget
-than the direct one. Not done.
+than the direct one. ~~Not done.~~
+
+✅ **DONE, AND LIVE-PROVEN 2026-08-21 (measurement by the 11.15 monitor, which did not
+write the fix).** `633e22d8` gave the proxied fan-out exactly that shorter budget:
+`PROXY_FANOUT_BUDGET_MS` = 750 for the whole pass and `PROXY_SLOW_PEER_MS` = 250 to back
+a peer off — against the direct call's 10 s — and it backs off on COST, answered or not,
+which was the half the old error-only guard could never see.
+
+**Acceptance read on the running build (3.1.21, verified by ancestry to contain
+`633e22d8`), `daemon_request/snapshot`:**
+
+| window | n | p50 | p95 | max |
+|---|---:|---:|---:|---:|
+| pre-fix, 2 h | 121 | 10,081 ms | 10,240 ms | 11,035 ms |
+| **post-fix, 30 min** | **330** | **4.9 ms** | **13.2 ms** | 10,131 ms |
+
+⇒ **p95 fell from 10,240 ms to 13.2 ms**, and the call count TRIPLED in a quarter of the
+window — the handler stopped being the thing every other request queued behind. The
+`proxied_working_flags_slow_peer` / `_budget_spent` traces are firing, so the bound is
+engaging rather than merely being unreachable.
+
+⚠ **TWO HONEST QUALIFIERS.** (1) One call in 330 still shows **max 10,131 ms**, so a full
+timeout is still reachable on some path — the bound caps the fan-out, not every route into
+the handler, and this entry does not close on that number alone. (2) A 2-hour window still
+reports p95 10,111 ms, because it STRADDLES pre-fix builds. Read the post-fix window only,
+and check the running build by ancestry rather than by version string — a window that spans
+a roll describes the roll.
 
 **⭐ PRE-FIX BASELINE, for the acceptance read — captured on `dev` 2026-08-20 13:0x,
 before the hoist was deployed** (`ytrace tail --category request --lines 200000`,
