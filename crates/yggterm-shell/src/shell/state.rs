@@ -57542,28 +57542,57 @@ fn app_control_created_launch_report(
     created_path: Option<&str>,
     requested: &AgentLaunchOptions,
 ) -> Value {
-    let launch_command = created_path.and_then(|path| {
+    let created = created_path.and_then(|path| {
         snapshot
             .live_sessions
             .iter()
             .chain(snapshot.active_session.iter())
             .find(|session| session.session_path == path)
-            .map(|session| session.launch_command.clone())
     });
-    let expected = created_path
-        .and_then(|path| {
-            snapshot
-                .live_sessions
-                .iter()
-                .chain(snapshot.active_session.iter())
-                .find(|session| session.session_path == path)
-        })
-        .map(|session| requested.launch_tokens(session.kind).unwrap_or_default())
-        .unwrap_or_default();
-    // Every requested token must be present in the command the row carries.
+    let launch_command = created.map(|session| session.launch_command.clone());
+    // ⛔ THE VERDICT COMES FROM WHAT THE ROW STORES, NEVER FROM THE COMMAND
+    // STRING — because the command string is re-derived and the stored options
+    // are what every re-derivation consults.
+    //
+    // This field used to be a substring test against `launch_command`, and that
+    // is a question about an artifact rather than about the row: the snapshot
+    // post-processor rebuilds a remote row's command (the identity refresh
+    // fires between a remote row's birth and its first spawn), so `applied`
+    // could read `false` for a spawn whose flag DID reach the process, and
+    // could read `true` for a create that composed the token into a string
+    // while failing to store it on the row — which is the shape the remote
+    // `--model` drop hid behind for a day. A row that stores the option
+    // re-applies it at every rebuild, relaunch and restore; a row that merely
+    // had it spelled into one command loses it at the first refresh. So the
+    // stored options are the only durable answer, and the string test is
+    // demoted to what it always was: an observation about the command as it
+    // reads right now, reported beside the verdict rather than as it.
+    let stored = created.map(|session| session.agent_launch_options.clone());
+    let applied = created.map(|session| {
+        // A kind that cannot express the request is NOT "applied". The token
+        // builder refuses rather than ignores, and swallowing that refusal into
+        // an empty expectation is how a `--model` on a shell row would report
+        // success while going nowhere.
+        if requested.launch_tokens(session.kind).is_err() {
+            return false;
+        }
+        let stored = &session.agent_launch_options;
+        requested
+            .model
+            .as_ref()
+            .is_none_or(|model| stored.model.as_deref() == Some(model.as_str()))
+            && requested
+                .permission_mode
+                .is_none_or(|mode| stored.permission_mode == Some(mode))
+    });
+    // Every requested token present in the command the row carries RIGHT NOW.
     // Quoting is the launch builder's business, so compare on the unquoted
-    // token — `--model` and `'--model'` are the same statement.
-    let applied = launch_command.as_ref().map(|command| {
+    // token — `--model` and `'--model'` are the same statement. Informational:
+    // it can differ from `applied` in both directions, and when it does, the
+    // difference is a re-derivation artifact and not a verdict.
+    let command_carries_tokens = created.map(|session| {
+        let expected = requested.launch_tokens(session.kind).unwrap_or_default();
+        let command = &session.launch_command;
         expected
             .iter()
             .all(|token| command.contains(token.as_str()))
@@ -57572,10 +57601,15 @@ fn app_control_created_launch_report(
         "model": requested.model,
         "permission_mode": requested.permission_mode.map(|mode| mode.name()),
         "applied": applied,
+        "stored_model": stored.as_ref().and_then(|stored| stored.model.clone()),
+        "stored_permission_mode": stored
+            .as_ref()
+            .and_then(|stored| stored.permission_mode)
+            .map(|mode| mode.name()),
+        "command_carries_tokens": command_carries_tokens,
         "launch_command": launch_command,
     })
 }
-
 fn app_control_created_session_path(
     snapshot: &ServerUiSnapshot,
     message: Option<&str>,

@@ -39914,6 +39914,126 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         }
     }
 
+    /// ⛔ `launch.applied` IS A FACT ABOUT THE ROW, NOT ABOUT THE COMMAND STRING.
+    ///
+    /// Root-caused as the narrowed residue of the remote `--model` drop: the
+    /// snapshot post-processor RE-DERIVES a remote row's `launch_command`
+    /// between its birth and its first spawn, so a verdict computed by
+    /// substring-testing that string answers a question about a rebuildable
+    /// artifact. It can read `false` for a spawn whose flag reached the
+    /// process, and — the more expensive direction — `true` for a create that
+    /// spelled the token into one command without storing it on the row, which
+    /// loses the model at the very next refresh.
+    ///
+    /// Both directions are asserted here, and both fail on the pre-fix tree:
+    /// it answered `applied: false` for the stored-but-re-derived row and
+    /// `applied: true` for the spelled-but-unstored one.
+    #[test]
+    fn launch_applied_reads_the_stored_options_not_the_re_derived_command() {
+        let path = "remote-cc://testhost/4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        let requested = AgentLaunchOptions {
+            model: Some("sample-model-tier".to_string()),
+            permission_mode: None,
+        };
+
+        // (1) THE MASK: the row STORES the model, so every rebuild re-applies
+        // it and the flag is on the process — but the command as it reads right
+        // now is a re-derivation that does not spell it.
+        let mut stored_but_re_derived = test_snapshot_session_view(path);
+        stored_but_re_derived.kind = SessionKind::ClaudeCode;
+        stored_but_re_derived.agent_launch_options = requested.clone();
+        stored_but_re_derived.launch_command =
+            "ssh dev -- yggterm server remote cc-resume …".to_string();
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(stored_but_re_derived.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![stored_but_re_derived],
+            apps: Vec::new(),
+        };
+        let report = app_control_created_launch_report(&snapshot, Some(path), &requested);
+        assert_eq!(
+            report["applied"],
+            serde_json::json!(true),
+            "the row stores the option, so every rebuild re-applies it — a \
+             re-derived command that does not happen to spell it is not a \
+             failed launch, and reporting it as one is the mask this closes"
+        );
+        assert_eq!(
+            report["stored_model"],
+            serde_json::json!("sample-model-tier"),
+            "the verdict must be auditable: report what the row stores"
+        );
+        assert_eq!(
+            report["command_carries_tokens"],
+            serde_json::json!(false),
+            "the string observation is still reported — beside the verdict, \
+             never as it"
+        );
+
+        // (2) THE WORSE DIRECTION: the token is spelled into the command but
+        // the create never stored it, so the first identity refresh erases it.
+        // The old substring test called this a success.
+        let mut spelled_but_unstored = test_snapshot_session_view(path);
+        spelled_but_unstored.kind = SessionKind::ClaudeCode;
+        spelled_but_unstored.agent_launch_options = AgentLaunchOptions::default();
+        spelled_but_unstored.launch_command =
+            "ssh dev -- yggterm server remote cc-resume … --model sample-model-tier".to_string();
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(spelled_but_unstored.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![spelled_but_unstored],
+            apps: Vec::new(),
+        };
+        let report = app_control_created_launch_report(&snapshot, Some(path), &requested);
+        assert_eq!(
+            report["applied"],
+            serde_json::json!(false),
+            "an option that lives only inside a string the daemon rewrites is \
+             not an applied option"
+        );
+        assert_eq!(
+            report["command_carries_tokens"],
+            serde_json::json!(true),
+            "the command really does spell it — which is exactly why the two \
+             answers must be separate fields"
+        );
+    }
+
+    /// A kind with no CLI to pass the flag to must not report success. The
+    /// token builder REFUSES rather than ignores; swallowing that refusal into
+    /// an empty expectation is how `--model` on a shell row would read applied.
+    #[test]
+    fn launch_applied_refuses_a_kind_that_cannot_express_the_request() {
+        let path = "local://shell-row";
+        let requested = AgentLaunchOptions {
+            model: Some("sample-model-tier".to_string()),
+            permission_mode: None,
+        };
+        let mut shell_row = test_snapshot_session_view(path);
+        shell_row.kind = SessionKind::Shell;
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(shell_row.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![shell_row],
+            apps: Vec::new(),
+        };
+        let report = app_control_created_launch_report(&snapshot, Some(path), &requested);
+        assert_eq!(
+            report["applied"],
+            serde_json::json!(false),
+            "a shell row has no CLI to pass --model to, so nothing was applied"
+        );
+    }
+
     #[test]
     fn superseded_client_handoff_selects_outgoing_active_live_session() {
         let stale_path = "remote-session://dev/stale";
