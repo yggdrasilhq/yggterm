@@ -174,7 +174,11 @@ def rows_census(host):
         if seat and "://" in path and path not in seen:
             seen.add(path)
             out.append({"seat": str(seat), "uri": path, "label": row.get("label") or "",
-                        "session_cwd": row.get("session_cwd") or ""})
+                        "session_cwd": row.get("session_cwd") or "",
+                        # ⛔ THE DAEMON ALREADY KNOWS WHO IS WORKING — this is the
+                        # flag that drives the blinking indicator a person watches.
+                        "busy": bool(row.get("busy")),
+                        "busy_reason": row.get("busy_reason") or ""})
     return out
 
 
@@ -471,6 +475,21 @@ def classify(row, live, protected):
     row["idle_min"] = round((time.time() - row["mtime"]) / 60, 1) if tr else None
     if uuid not in live:
         return "DEAD", "no agent process on this host"
+
+    # ⛔⛔ ASK THE DAEMON WHETHER THIS ROW IS WORKING. IT KNOWS, AND THIS TOOL WAS
+    # GUESSING. `busy` is the same flag that drives the blinking working
+    # indicator, so a census that disagrees with it disagrees with what a person
+    # is looking at — and it did: six rows reported WORKING while the sidebar
+    # showed two. The cause is that WORKING is this classifier's DEFAULT verdict,
+    # so every row it could not place read as the busiest thing it has, exactly
+    # as BRIEFLESS rows did before they got a name.
+    #
+    # ⇒ A busy row is WORKING on the daemon's word and no further test is needed.
+    #   A row the daemon calls idle is NOT working, and the idle/stall/cold tests
+    #   below become meaningful instead of being a guess about a row that may
+    #   have been mid-turn all along.
+    if row.get("busy"):
+        return "WORKING", f"the daemon says {row.get('busy_reason') or 'working'}"
     if tr is None:
         # ⛔⛔ A LIVE PROCESS WITH NO TRANSCRIPT AT ALL IS THE EMPTIEST POSSIBLE ROW,
         # AND THIS ARM CALLED IT THE BUSIEST VERDICT IT HAS. A CLI that started and
@@ -521,6 +540,21 @@ def classify(row, live, protected):
                 return "STALLED", f"at its composer, quiet {idle}m, {size // 1000}KB — still cheap to resume{note}"
             return "COLD", (f"quiet {idle}m with a {size // 1000}KB transcript — "
                             f"harvest and replace, never prompt{note}")
+        # ⛔⛔ AND `unreadable` MUST NOT PROMOTE AN IDLE ROW TO WORKING. This arm
+        # existed to protect a row that is mid-output or at a picker — states
+        # where typing is destructive — but it fired on rows whose SURFACE IS
+        # GONE, and a lost grid is not evidence of activity. With the daemon
+        # already saying idle, that read the quietest possible row as busy: three
+        # rows sat WORKING for half an hour each while the sidebar's own working
+        # indicator showed them dark, which is what the owner was looking at when
+        # he said the census disagreed with his eyes.
+        if state == "unreadable":
+            size = os.path.getsize(tr) if tr else 0
+            row["bytes"] = size
+            return "COLD", (f"quiet {idle}m with NO READABLE SCREEN and a "
+                            f"{size // 1000}KB transcript — it cannot be woken, because "
+                            f"nothing can check whether a prompt is waiting. Harvest and "
+                            f"replace{note if 'note' in dir() else ''}")
         return "WORKING", f"screen says {state}, quiet {idle}m"
 
     if says_watching:
