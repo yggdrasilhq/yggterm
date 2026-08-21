@@ -371,6 +371,30 @@ gate-screen working/idle heuristics) must learn the agents-hint signature (dim c
 `← N agent` footer, no `esc to interrupt`) as IDLE-WITH-BACKGROUND-AGENT, and the
 typed-residue detector must require the footer's absence before claiming residue.
 
+**⭐ CORRECTED AND HALF-CLOSED 2026-08-21 (11.14): the daemon's own draft guard was never
+fooled, and it uses a BETTER discriminator than the one filed above.** `--refuse-if-draft`
+resolves through `terminal_composer_row_holds_draft` →
+`composer_content_is_human_typed`, which walks the composer's raw tail tracking SGR **faint**
+and decides at the first printable glyph: *faint means the CLI drew it, not the human*. The
+hint is drawn dim, so the guard already answers "no draft" and a boot was never actually
+refused by it. ⇒ **Do not add a footer test to that path** — the footer is a proxy for the
+thing, and faint IS the thing.
+
+**What was genuinely missing is the answer for every reader that is not the daemon**, and
+that is now shipped: `gate-screen` carries `shows_background_agent_hint` (descriptor-driven,
+measured from a real CLI painting `❯ · ← 1 agent` and `← for agents`), beside the union
+`screen_text_shows_agent_background_hint`.
+
+**⛔ AND HERE IS WHY THE BOOTER CANNOT EVER SETTLE THIS ITSELF, WHICH IS THE OPEN HALF.** Its
+`_plain_screen` deliberately strips every CSI — it has to, because a raw screen writes runs of
+spaces as cursor-forward and sprays SGR mid-word, so phrase matching finds nothing without it.
+But SGR faint is precisely the signal that separates chrome from a draft, so the normalisation
+that makes the booter's phrase tests work is the same step that destroys its ability to tell a
+hint from typed text. **A reader that has thrown the discriminator away must ASK, not
+re-derive:** `server gate-screen --json` now answers `shows_background_agent_hint`, and the
+write path already answers through `--refuse-if-draft`. Routed to the booter's owner; this
+lane did not edit the machinery that types into live rows at 03:2x with no way to live-test it.
+
 ## ⚠ [11.0] A DEAD SESSION'S SURFACE ECHOES MOUSE-TRACKING AS TEXT
 
 **Status:** OPEN
