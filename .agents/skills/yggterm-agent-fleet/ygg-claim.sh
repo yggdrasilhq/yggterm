@@ -290,7 +290,24 @@ def num(r):
     return None
 def isme(r):  return uuid in (r.get("full_path") or "")
 def ispred(r):return bool(pred) and r.get("full_path")==pred.get("full_path")
-others=[r for r in sess if not isme(r) and not ispred(r)]
+def seatable(r):
+    # ⛔⛔ ONLY AN ADDRESSABLE ROW CAN HOLD A SEAT, AND num() WILL HAPPILY PARSE
+    # ONE OUT OF ANYTHING. title() falls back to `label`, so a CWD-TREE row whose
+    # label is literally a digit string — a directory named "6914973" — parses as
+    # major 6914973 and joins the majors pool. The fallback below then hands out
+    # max+1, the next claim sees THAT and hands out max+2, and the seat number
+    # GROWS BY ONE PER CLAIM FOREVER. Measured 2026-08-21: three consecutive
+    # lanes seated at 6914975.0, 6914976.0 and 6914977.0.
+    #
+    # ⚠ The "never hand out a seat someone already holds" guard below cannot
+    # catch this, and that is the instructive part: 6914977 was genuinely free.
+    # A uniqueness check answers "is this taken", never "is this sane".
+    #
+    # A row that can be addressed has a scheme (local:// cc-runtime://
+    # remote-cc:// remote-session://). A filesystem path in the cwd tree does
+    # not, and it is not a session anyone can seat.
+    return "://" in (r.get("full_path") or "")
+others=[r for r in sess if not isme(r) and not ispred(r) and seatable(r)]
 
 # A BARE MAJOR IS NOT A SEAT. A top-level row sits at "N.0", never at "N".
 # Two orchestrators in one spawn batch landed bare ("11", "12") while their own
@@ -364,7 +381,16 @@ if not n:
         while k in used: k+=1
         n=seat(major, k)
     else:
+        # ⛔ AND REFUSE AN ABSURD MAJOR RATHER THAN HANDING IT OUT. `others` is
+        # already restricted to addressable rows above, which removes the known
+        # poisoner; this is the backstop for the next one nobody has met yet. A
+        # fleet does not run hundreds of concurrent campaigns, so a derived major
+        # past the bound is evidence the pool is contaminated, not evidence of a
+        # busy fleet — and handing it out is what makes the damage PERMANENT,
+        # because the next claim reads it back as a legitimate sibling.
+        SANE_MAX_MAJOR=200
         majors={num(r)[0] for r in others if num(r)}
+        majors={m for m in majors if m <= SANE_MAX_MAJOR}
         n=seat((max(majors)+1) if majors else 1)
 
 # ⛔⛔ WHATEVER WAS DERIVED, NEVER HAND OUT A SEAT SOMEONE ALREADY HOLDS.

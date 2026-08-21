@@ -100,6 +100,39 @@ def main():
                    "AAA", "alpha"),
             "8.0")
 
+        # ⛔⛔ THE MILLION-SEAT RATCHET. A CWD-TREE row is not a session and can
+        # never hold a seat, but `num()` parses a major out of ANY row and
+        # `title()` falls back to `label` — so a directory literally named
+        # "6914973" joined the majors pool and the fallback handed out
+        # max+1. The next claim then read THAT back as a legitimate sibling and
+        # handed out max+2: the seat grew by one per claim, forever, and could
+        # not recover on its own. Three consecutive live lanes were seated at
+        # 6914975.0, 6914976.0 and 6914977.0 on 2026-08-21.
+        #
+        # ⚠ The uniqueness guard cannot catch this and that is the lesson:
+        # 6914977 was genuinely FREE. "Is this seat taken" and "is this seat
+        # sane" are different questions and only one of them was being asked.
+        check(
+            "a digit-named cwd-tree row cannot poison the majors pool",
+            derive(prog,
+                   [row("remote-cc://h/AAA", None, "alpha: orchestrator"),
+                    row("remote-cc://h/BBB", "7.0", "beta orchestration"),
+                    row("/home/user/work/6914973", None, "6914973")],
+                   "AAA", "alpha"),
+            "8.0")
+
+        # And the backstop, for the poisoner nobody has met yet: an absurd major
+        # that somehow reaches the pool is DISCARDED rather than incremented,
+        # because handing it out is what makes the damage permanent.
+        check(
+            "an absurd major is refused, not incremented",
+            derive(prog,
+                   [row("remote-cc://h/AAA", None, "alpha: orchestrator"),
+                    row("remote-cc://h/BBB", "7.0", "beta orchestration"),
+                    row("remote-cc://h/CCC", "6914973.0", "poisoned lane")],
+                   "AAA", "alpha"),
+            "8.0")
+
         # Inheriting a seat means the WHOLE seat.
         replaced = [row("remote-cc://h/NEW", None, "render lane"),
                     row("remote-cc://h/OLD", "11.4", "render lane")]
