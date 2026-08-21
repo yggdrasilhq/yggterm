@@ -12,6 +12,37 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.13] THE FLEET WAKE PATH IS EFFECTIVELY DEAD — 196 BOOTS ABORTED, 2 ROWS EVER WOKEN
+
+Counted from one day of `booter.log`: **196 `⛔ ABORTING BOOT … boot text never appeared on
+screen after 6 s. Enter NOT sent`**, against exactly **two rows in the entire fleet that have
+ever recorded a boot** (`boots: 3` and `boots: 1`). Every other subscription, across every
+campaign, sits at `boots: 0`.
+
+**Two distinct failure modes, and both end with a row that does not wake.**
+1. **Abort before Enter.** The booter writes the boot text, then re-reads the rendered grid to
+   confirm it landed before sending Enter. The text never appears, so it refuses. ⭐ The GUARD
+   is working exactly as designed (`7d2fa0ea` — refuse rather than type blind); what it is
+   telling us is that **the write is not reaching the screen**.
+2. **Enter sent, no wake.** The one row with `boots: 3` was ESCALATED anyway —
+   *"did not wake after 3 boots"* — so even a completed boot did not resume it.
+
+⚠ **It is not the remote plane and not row visibility.** Booted and aborting rows have the
+identical `remote-cc://<machine>/<uuid>` shape, the same watcher host, and all read
+`hidden_by_collapse: None, expanded: True` in the listing. Whatever separates them is not
+structural, and a fix aimed at the remote proxy would be aimed at nothing.
+
+**Why this outranks every individual stalled row.** The relay is built on the assumption that a
+session may land, defer, and be resumed. That assumption is currently false, so **any lane that
+hands over by standing by is a lane that stops** — with a brief written, a subscription live,
+and no error anywhere. Rows then escalate for being idle, which reads as a row problem and is
+not one.
+
+⇒ **Until this is fixed, a handover must SPAWN its successor, never defer to the booter**, and
+a brief must say so. ⇒ **The tell:** read `boots:` on the subscription. `0` after hours of
+quiet is this, not a quiet campaign. ⚠ Do not read "the row woke up" as evidence a boot
+landed — a human typing into a row looks identical from every instrument the fleet has.
+
 ## ⛔⛔ [11.13] A SPAWNED ROW IS AUTO-SUBSCRIBED BY BARE UUID, LAPSES UNWATCHED, AND NEVER WAKES
 
 Spawning a row auto-subscribes it to the booter and stores the row as a **bare uuid**. The
@@ -20,11 +51,22 @@ watcher resolves rows against the GUI host's listing, where that session appears
 counted absent, and after 3 consecutive listings the subscription LAPSES:
 `⛔ LAPSED — absent from 3 consecutive row listings · NOT WATCHED; re-subscribe to clear`.
 
-⇒ **The row is then never booted.** Measured: a successor spawned at 11:50 sat at `boots: 0`
-for **193 minutes** having ended its turn expecting to be woken, while a monitor subscription
-created BY HAND with the full path was booted reliably over the same period, on the same host,
-by the same watcher. The stored identifier is the only difference. ⚠ The row is visible in the
+⇒ **The row is then never WATCHED.** Measured: a successor spawned at 11:50 sat at `boots: 0`
+for **193 minutes** having ended its turn expecting to be woken, with `gone_sightings: 3` and
+repeated `LAPSED … NOT WATCHED` lines naming it. Re-subscribing with the addressable path
+printed `⭐ CLEARING A LAPSE`, reset the sightings, and moved the row into the boot path — it
+began receiving boot ATTEMPTS where previously it received none. ⚠ The row is visible in the
 listing the whole time — this is a key-matching failure, not a visibility one.
+
+⛔ **CORRECTION, and it retracts the comparison this entry first shipped with.** The original
+text claimed a hand-subscribed monitor "was booted reliably over the same period", offered as
+proof that the identifier was the only difference. **That was false and was never checked.**
+That monitor's own record reads `boots: 0` — it had never been booted either; it was being
+woken by its OWNER each turn, which is indistinguishable from a boot when you do not look. ⇒
+The lapse is real and is fixed by resolving the row; it is simply NOT sufficient to get a row
+woken, because the boot itself then fails for an unrelated reason — see the entry below.
+⚠ The general shape: **a true finding propped up by evidence nobody measured**, and the
+evidence was the part that felt too obvious to check.
 
 **Why this is worse than a missed wake-up: it breaks THE RELAY, silently.**
 1. ⛔ **The handover looks complete.** The spawn returns, the row works, lands, writes a
