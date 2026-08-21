@@ -151,6 +151,51 @@ def split_by_clock(rows: list[dict]) -> dict[str, list[dict]]:
     return dict(out)
 
 
+def split_by_version(rows: list[dict]) -> dict[str, list[dict]]:
+    """Partition records by the EMITTER's ``app_version``, because a fleet
+    mid-roll writes several builds into one stream.
+
+    ⛔ A window chosen by wall clock reports whatever mix of versions it happens
+    to span and attributes it to the build running now. That is how a FIXED
+    class reads as a live one, and how a stale p95 reads as current. Measured
+    2026-08-21, all three in one session: one class read 0.81/min across a
+    straddling window and 0.00/min once split by emitter; a snapshot handler's
+    p95 read 10,110 ms across a roll and 13.2 ms on the build that fixed it; a
+    deploy's own remote install read as a steady-state stall.
+
+    ⚠ The retiring daemon keeps emitting for SECONDS after its successor binds —
+    that is the version-coexistence the daemon/GUI split is built on — so a
+    record timestamped after a handover may still carry the old version. Trust
+    this field, not the clock.
+    """
+    out: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        out[row.get("app_version") or "unknown"].append(row)
+    return dict(out)
+
+
+def version_spans(records: list[dict]) -> dict[str, tuple[int, int, float]]:
+    """Per version: ``(first_ts_ms, last_ts_ms, minutes)``.
+
+    ⛔ A rate must be divided by the bucket's OWN span, never by the window you
+    asked for. A version present for two minutes of a six-hour window otherwise
+    reports a rate three orders of magnitude too low — or, if it is the newest
+    build and barely represented, a reassuring near-zero that means only that it
+    has not been running long.
+
+    Returns nothing for a version with fewer than two timestamped records: a
+    span needs two points, and inventing one is how a single record becomes an
+    infinite rate.
+    """
+    out: dict[str, tuple[int, int, float]] = {}
+    for version, rows in split_by_version(records).items():
+        stamps = sorted(r["ts_ms"] for r in rows if isinstance(r.get("ts_ms"), (int, float)))
+        if len(stamps) < 2:
+            continue
+        out[version] = (stamps[0], stamps[-1], (stamps[-1] - stamps[0]) / 60_000.0)
+    return out
+
+
 def core_fraction(record: dict) -> float | None:
     """Cores burned, for a cpu-clock span. ``None`` when the interval is missing.
 
