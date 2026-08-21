@@ -538,7 +538,9 @@ the word doing the work.
 
 ## ⛔⛔ [11.0] A CLIENT RESTART LEAVES A THIRD OF THE ROWS BLANK, AND THE RESTART IS NOW AUTOMATIC
 
-**Status:** OPEN — mitigated by a repair sweep; the seed race itself is not fixed.
+**Status:** OPEN
+
+*A repair sweep is shipped and is explicitly not a fix; the seed race itself is untouched.*
 
 *Owner-reported 2026-08-21 as "input bugs are getting fancier by deleting the UI itself".*
 
