@@ -388,6 +388,49 @@ def _land_once(branch, apply_it, attempt, attempts, needs_check=True):
                 return False
             log(f"  {name}: ok")
 
+        # ⛔ A LANDING MAY NEVER LOWER THE WORKSPACE VERSION, AND NOTHING ELSE
+        # WOULD HAVE NOTICED. A lane testing cross-version behaviour has to build
+        # an OLDER binary, and the only way to do that is to edit the workspace
+        # version in its own tree — which is correct, and is one `git add -A` away
+        # from landing on main. Nothing downstream reads a version as a claim that
+        # could be false: the roll's "is the fleet current" gate compares it, the
+        # version-bump script allocates from it, and daemons pick an endpoint
+        # named after it. A number that went BACKWARDS makes all three answer
+        # confidently and wrongly, for as long as it takes someone to notice by
+        # hand. Caught 2026-08-22 with a lane sitting on a 3.1.30 pin under a
+        # 3.1.37 main, deliberately and correctly, with its commits clean.
+        # ⚠ Compared as tuples of integers, never as strings: "3.1.9" > "3.1.37"
+        # lexically, so a string compare fails on precisely the boundary that
+        # matters most and passes everywhere else.
+        def _workspace_version(rev_or_path, in_tree):
+            try:
+                if in_tree:
+                    text = open(os.path.join(rev_or_path, "Cargo.toml")).read()
+                else:
+                    text = git("show", f"{rev_or_path}:Cargo.toml").stdout
+            except OSError:
+                return None
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("version") and "=" in line:
+                    raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    parts = raw.split(".")
+                    if all(part.isdigit() for part in parts) and parts:
+                        return tuple(int(part) for part in parts)
+                    return None
+            return None
+        merged_version = _workspace_version(wt, True)
+        main_version = _workspace_version("origin/main", False)
+        if merged_version and main_version and merged_version < main_version:
+            log("  ⛔ this landing LOWERS the workspace version "
+                f"({'.'.join(map(str, main_version))} -> "
+                f"{'.'.join(map(str, merged_version))}) — not landed")
+            log("     A cross-version test pin belongs in the lane's working tree, "
+                "never in a commit. Drop the Cargo.toml hunk and land again.")
+            return False
+        if merged_version:
+            log(f"  version: {'.'.join(map(str, merged_version))} — not a regression")
+
         # ⛔ AND IT MUST COMPILE. Landing something that does not build blocks
         # every other lane, because they all branch from main.
         # ⚠ On a retry whose only new commits are inert, the check already passed on

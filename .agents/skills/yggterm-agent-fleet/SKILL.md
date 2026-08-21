@@ -3240,6 +3240,68 @@ as mysterious to them as it did to you.
 
 ### Claude Code
 
+**0. ⛔⛔ `--no-activate` WEDGES A `remote-cc` ROW BEFORE ITS PTY, AND EVERY STEP OF §3
+PASSES ANYWAY.** Measured 2026-08-22 spawning a successor onto the same machine
+(`--machine-key dev`) with `--no-activate`, as §3's own example shows.
+
+- **Tell — and it is the nastiest part:** the four-step spawn reports *complete success*.
+  `input-check` right after `terminal new` answers `consuming_input:true,
+  composer_shown:true`. `submit` answers `submitted:true, bytes:4604`. The transcript file
+  appears and **the ACK token is in it**. By every check §3 prescribes, the row is armed.
+  **It then never produces a single assistant turn.** Minutes later the same row answers
+  `consuming_input:false, composer_shown:false, activity:unknown`, and **both `submit` and
+  `send` are refused** (`submitted:false` / `accepted:false`), so the §9 single-`continue`
+  remedy cannot be delivered either.
+- **The screen is the only instrument that names it** (`server snapshot` →
+  `live_sessions[].terminal_lines`):
+
+  ```
+  Queue remote Yggterm resume <uuid>
+  Target host: <machine>
+  Workspace: <cwd>
+  Daemon PTY: request main viewport terminal stream     <-- parked here forever
+  ```
+
+  The queued remote resume is waiting for a viewport stream that `--no-activate` never
+  asked for. The row is `selected:true` in the listing and that changes nothing — selection
+  is not the request the resume is blocked on.
+- **Fix:** spawn WITHOUT `--no-activate`. The identical brief into an identical row then
+  answers `consuming_input:true`, takes the submit, and grows its transcript from 38 KB to
+  252 KB in sixty seconds with twenty assistant turns.
+- ⛔⛔ **CORRECTION, SAME DAY: `--no-activate` IS NOT THE ONLY CAUSE, AND THE TWO FAILURES NEED
+  OPPOSITE REMEDIES.** A later spawn WITHOUT `--no-activate` produced the same symptom at the
+  transcript — ACK present, **zero assistant entries**, no growth. It was a different fault,
+  and `input-check` is what tells them apart:
+
+  | | wedged resume | plain stall |
+  |---|---|---|
+  | `consuming_input` | **false** | **true** |
+  | `composer_shown` | false | true |
+  | screen | parked on *"Daemon PTY: request main viewport terminal stream"* | normal composer |
+  | `submit` / `send` | both **refused** | accepted |
+  | remedy | respawn without `--no-activate` | **one `continue`** — it woke in 4 turns |
+
+  ⇒ **Read `input-check` BEFORE choosing a remedy.** Respawning a merely-stalled row throws
+  away a live agent that one word would have started; sending `continue` to a wedged one
+  cannot be delivered at all. ⚠ The transcript symptom is IDENTICAL in both cases, which is
+  why the ACK check alone cannot route you — it tells you the brief arrived, and both of these
+  are failures *after* arrival.
+- ⛔ **So §3 step 4 is necessary and NOT sufficient.** The ACK token proves the brief was
+  DELIVERED; it does not prove the agent ever RAN. A transcript that contains your token and
+  nothing but `user`/metadata entries is a row that took your brief and died holding it.
+  ⇒ **Add a fifth check: transcript GROWTH, or an `assistant` role in it.** One line:
+
+  ```sh
+  python3 -c "import json,sys;print({d.get('message',{}).get('role') for d in map(json.loads,open(sys.argv[1])) if isinstance(d.get('message'),dict)})" <transcript>
+  # want 'assistant' in the set. Only 'user' = took the brief, never ran.
+  ```
+- ⚠ **Reaping it needs the `cc-runtime://` path, and the listing keeps the row anyway.**
+  `session remove` on the `remote-cc://` spelling answered `accepted:true, live_processes:[],
+  "no live session"` and the row stayed listed — §7's law, the verb reports the request and
+  not the effect. Confirm death by process identity and by `live_processes:[]`, then leave
+  the stale listing for a sweep rather than re-removing it.
+
+
 **1. ⛔ The first-run workspace-trust gate holds the row before its composer, and
 `--dangerously-skip-permissions` does NOT skip it.** It is a *trust* gate, not a
 *permission* gate, and it fires whenever the cwd has never hosted a Claude Code

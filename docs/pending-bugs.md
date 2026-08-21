@@ -223,118 +223,168 @@ caller makes its callees newly dead, so the count falls further than the first s
 **Falsifier:** `cargo check --workspace` after touching every crate root reports zero `dead_code`
 in `crates/`, and `cargo test -p yggterm-server` is green.
 
-## ⛔⛔⛔ [11.0] LEGENDARY — A RESTART PUT A LIVE AGENT ON THE WEB VIEW AND LEFT ITS TERMINAL BLANK, FROM ONE HARDCODED SCHEME
+## ⛔⛔⛔ [11.27] LEGENDARY — A REFUSED PTY ADOPTION DESTROYS THE MASTER IT HAS ALREADY TAKEN
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-⚠ The surface choice and the launch request are both proven on the shipped binary (see the
-sandbox section below). What is still owed is only whether the launched terminal PAINTS — and
-that question belongs to the mount-churn entry, not to this one.
+**Owner:** seat 11.27; root measured 2026-08-22. ⚠ The first two sections below are the ORIGINAL
+report and its first diagnosis; the correction that renamed this entry is the third section, and
+it is the one to act on.
 
-*Reported from the seat 2026-08-21: "Restart hit webview. I switched to this session terminal
-view and it was blank. I think the blank terminal view is switching the webview in restart as a
-mechanism in code."* ⭐ **Two symptoms, one root, and the owner's causal reading was right in
-shape** — both come from the restore concluding the active row has no terminal.
+*Caught live 2026-08-22 00:38, with the owner locked out of every session on his GUI and having
+to open a KDE terminal outside yggterm to report it. His words: "This is the legendary daemon bug
+in action." The evidence screenshot is staged OUTSIDE any repo at
+`~/.yggterm/relay/evidence/daemon-attach-deadlock-20260822-0038.png` — ⛔ a faithful screenshot
+leaks by BACKGROUND and must never land in `~/gh`.*
 
-**The root is a key mismatch, and it is one function.** `remote_scanned_session_path()` builds
-`remote-session://…` — the CODEX scheme, hardcoded, because a scanned row has no kind to
-consult. The restore path used it to normalise the persisted active path, so **every
-`remote-cc://` row was silently rewritten into a `remote-session://` key**, while
-`restore_live_session` inserted that same row under `remote_agent_session_path(ClaudeCode, …)`
-= `remote-cc://…`.
+**What he saw, repeating in the viewport:**
 
-⇒ `self.sessions.contains_key(&active_path)` is therefore **false for every Claude Code row**,
-and everything downstream follows:
+```
+yggterm: Claude Code session <uuid> is already running under yggterm (pid …);
+waiting to attach instead of starting a second resume, which would corrupt the
+transcript. Nothing to close. Waiting 12s so far. / Waiting 24s so far.
+```
 
-| consequence | what the person sees |
+### THE DEADLOCK — and both halves are individually CORRECT
+
+```
+daemon restart  ->  PTY MASTERS die with it
+                ->  the CLI processes reparent to init and SURVIVE, unharmed
+                ->  a new daemon correctly REFUSES a second resume (it would corrupt the transcript)
+                ->  but it holds no master fd to attach to
+                ->  it waits, and nothing ever ends the wait
+```
+
+⭐ **Neither half is a bug on its own.** The refusal is right — a second `--resume` would corrupt
+the transcript. The wait is right — attaching is what was asked for. **Together they are a
+deadlock with no self-exit**, and the user-visible symptom is "nothing attaches".
+
+### VERIFIED ON THE MACHINE, NOT INFERRED — and the orchestrator was itself an instance
+
+Measured on this seat's OWN process while it was landing commits and spawning lanes:
+
+| probe | reading |
 |---|---|
-| the surface derive is skipped, and the trailing `normalize_active_view_mode` finds a path with no session | `Terminal` demoted to `Rendered` — **the restart lands on the web view** |
-| the terminal launch is skipped for the same reason | switching back by hand finds **a blank surface with nothing attached** |
+| `ps -o ppid,etimes` | **PPID 1**, alive 2 h 44 m — reparented to init, working perfectly |
+| `fuser /dev/pts/N` | **only the CLI itself** — the SLAVE side. Nobody holds the master. |
+| peer socket | **ALIVE** — a peer session reached it while the GUI could not |
 
-⚠ **The warning was already written, one function away.** The doc on
-`remote_scanned_session_path`'s neighbour says: *"Takes the SCANNER'S OWN answer rather than
-rebuilding one. The scanner already knows which agent CLI wrote the file and stamps the scheme
-accordingly; re-deriving it here means guessing."* The restore made exactly that guess, in the
-one path where being wrong loses the row.
+⇒ **The survivors need no rescuing.** Process healthy, transcript intact, peer plane reachable.
 
-**A second, independent defect found on the way, and fixed with it.** The restore's launch gate
-also required `remote_scanned_session_path_is_live()`, which reads the `live_runtime` flag on
-the SCAN — and `clear_remote_machine_live_runtime_flags` strips that flag at persist time,
-because a runtime cannot be asserted alive across a process restart. Measured on the GUI host:
-**0 of 1,483** persisted remote sessions carried `live_runtime`, so that conjunct was false on
-every restart regardless of the key bug. ⇒ **Blind is not dead.** The liveness statement that
-survives is the row's presence in `live_sessions`, and the gate asks that now.
+### ⛔⛔ CORRECTED 2026-08-22 — TWO OF THOSE THREE PROBES CANNOT TELL HEALTHY FROM ORPHANED
 
-⚠ Measured the same evening and worth keeping: the owner's active row was in `live_sessions`
-with `keep_alive: true` and **not in `remote_machines` at all** — so a restore that rebuilds
-remote rows from the scan loses every row the scan has since dropped. The fallback path for
-that exists and is correct; it was the key it filed the row under that was wrong.
+**Both readings above are TRUE of a perfectly adopted, working session**, so neither one
+separates the two states, and the conclusion drawn from them — *"nobody holds the master"* — was
+never measured.
 
-**Regression lock:** `a_restarted_remote_agent_row_still_gets_its_terminal_launched`, built
-from the persisted shape actually measured on the host — a `remote-cc://` row in
-`live_sessions`, `remote_machines` empty. It carries its own control asserting the scan's
-liveness reads FALSE, so it cannot pass by that instrument starting to work. **Verified red
-before the fix (`left: Rendered, right: Terminal`) and green after.**
+| the probe | what it actually answers |
+|---|---|
+| `PPID 1` | an adopted child **is** reparented to init. PPID 1 is the EXPECTED state after a SUCCESSFUL adoption, not evidence against one. |
+| `fuser /dev/pts/N` | holders of the **SLAVE**. A master is an unnamed `/dev/ptmx` descriptor and can never appear under `/dev/pts/N`, in any case, healthy or broken. |
 
-**The instrument that did not exist.** No probe recorded the decision that picks the user's
-surface — the restore's perf span counts sessions and machines and says nothing about the one
-field that decides what is on screen, which is why every report of this has been a guess about
-which of four writers fired. `session/restore_view_mode` now records the persisted mode, the
-row's own default, whether it supports a terminal, and BOTH liveness readings side by side.
+⭐ **The instrument that does answer it** is a scan of `/proc/*/fd` for links equal to
+`/dev/ptmx`. Taken live on a row adopted minutes earlier and working normally: `ppid=1`, `fuser`
+naming only its own wrapper, **and the current daemon holding a master fd for it** — all three at
+once. ⇒ Read the master holder from `/proc`, never from `fuser` on the slave.
 
-### LIVE, 2026-08-21 23:34 on 3.1.35 — HALF PROVEN, AND THE HALF MATTERS
+### ⛔ AND THE STATED MISSING PIECE IS NOT MISSING — IT IS BUILT, WIRED, AND RUNNING
 
-The roll restarted the GUI and the new probe answered:
+This entry said what was needed was *"a way for a NEW daemon to adopt an orphaned slave PTY"*.
+`pty_adoption.rs` + `pty_handoff.rs` + `pty_handoff_wire.rs` do exactly that over `SCM_RIGHTS`,
+and they run on every daemon swap: **162 `pty_handoff_adopted` events in one night**, with four of
+six handover sweeps reporting `AllMoved` and `all_moved: true`.
+
+**The real defect is narrower and it is a LOSS, not an absence.** The successor's refusal is
+evaluated AFTER the commit point, so a refused session does not merely fail to move — its master
+is destroyed:
 
 ```
-persisted: Terminal · before_normalize: Terminal · row_default: Terminal · decided: Terminal
-supports_terminal: true
-was_a_restored_live_session: true      <- the liveness that survives a restart
-scan_says_live: false                  <- the erased flag the old gate read
+Partial { moved: 10, reason: "<key>: successor took the fd and refused to seat it:
+  refusing to adopt <key>: this daemon already runs a live PTY for it
+  (AFTER the commit point — the fd is gone)" }        readers_stood_down: 11
+handoff_settle_window   all_moved=false  held=10  bytes_stolen_after_park=187
 ```
 
-⭐ **The two liveness readings disagree on the live machine, exactly as predicted.** That is
-the second defect caught in the act rather than argued from source: the old gate would have
-taken the `false` and skipped the launch on a row that was demonstrably a restored live
-session. No demotion occurred — `decided: Terminal`.
+Twice in one night, the same key, `bytes_stolen_after_park` **187 on exactly those two occasions
+and 0 on every clean one**. `send_session` is metadata → **sendmsg (commit)** → ack, and its own
+module doc states the invariant it breaks: *everything before the sendmsg is recoverable.* The
+metadata already carries the runtime key, the child pid and its start time — everything the
+refusal needs — so the decision can be taken while the descriptor is still the predecessor's.
+⇒ The policy is right; only its TIMING is wrong. Owned by seat **11.27**.
 
-⛔ **BUT THE ACTIVE ROW AT THIS RESTART WAS `local://…`, NOT `remote-cc://`.** A local path
-never enters the remote key builder, so **this restart did not exercise the scheme mismatch at
-all**. That half is proven only by its unit lock (red before, green after), and claiming the
-live run covered it would be reading the reading one wants.
+### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 
-### ✔ AND THE REMOTE HALF, PROVEN THE SAME NIGHT — IN A SANDBOX HOME, NOT HIS WINDOW
+The report reaching this seat said *"all sessions are breaking out like this"*. Checked instead of
+echoed: **every session that OUTLIVED a daemon restart is orphaned; every session born after it
+has a parent and attaches normally.** Four live lanes checked at the same minute all had real
+PPIDs. ⇒ The blast radius is the survivor set, which is exactly the set the constitution promises
+to protect.
 
-Waiting for a restart that happened to have a `remote-cc://` row active would have been
-waiting on the owner. The restore path does not need his GUI: point the SHIPPED binary at a
-throwaway `YGGTERM_HOME` holding the persisted shape measured on the live host — a
-`remote-cc://` active path, that row in `live_sessions`, `remote_machines` **empty** — and read
-its own trace.
+### ⚠ A SECOND INSTRUMENT LYING, IN THE SAME FRAME
 
-3.1.35, the deployed build:
+The GUI's **Session Metadata panel reported a pid that does not exist on the host.** The live
+process was a different pid entirely. ⇒ **That panel is not reading the process**; do not diagnose
+from it. Same family as every other entry here — a field named for a thing, answering about
+something else.
 
-```
-active_session_path: remote-cc://…/11111111-…      <- a CC row, the scheme that used to be lost
-persisted: Terminal · row_default: Terminal · decided: Terminal
-supports_terminal: true
-was_a_restored_live_session: true · scan_says_live: false
-```
+### WHY THIS IS LEGENDARY AND NOT MERELY BAD
 
-⭐ **`supports_terminal: true` is the decisive field.** It can only be true if
-`sessions.contains_key(&active_path)` found the row — the exact lookup that missed before,
-when the active path was rewritten to `remote-session://` and the row was filed under
-`remote-cc://`. With an EMPTY scan, so nothing else could have supplied it.
+It is the CONSTITUTION failing in its most expensive direction. Every guarantee about
+version-coexisting daemons held — the work *did* survive the restart, exactly as promised — and
+it became **invisible and undrivable anyway**. The owner could not reach a single session on his
+own machine, while all of them were healthy.
 
-⇒ Both halves now hold: the unit lock red-then-green on the mismatch, and the shipped binary
-answering `Terminal` for a remote CC row on the real restore path.
+⇒ The owner-settled spec that governs the fix is in `settled-calls.md`
+(**THE GUI IS A VIEWER, NEVER A LIFELINE**). Clause 2 is the one that names this defect: **row
+liveness must not be defined by attachability.**
 
-⚠ **What is still NOT proven, and it is not this bug:** that the terminal then PAINTS. The
-launch is requested; whether the surface fills is the mount-churn entry below, which owns that
-question. **Status here is about which surface is chosen and whether the launch is asked for.**
+**Falsifier:** restart the daemon under a live agent row, then attach to that row from a fresh
+client — the scrollback comes back, the row drives, and nothing reports a wait. And the negative
+control: the CLI's pid must be the SAME one before and after, or something started a second
+resume.
 
-⭐ **The technique is the reusable part** — a daemon restore is testable against a crafted
-`YGGTERM_HOME` on the shipped binary, with its own trace plane, in about a minute, without
-touching the desktop. Reach for it before parking a restore-path claim on "the next restart".
+## ⛔⛔ [11.26] THE SANDBOX HARNESS FILLS A RAM DISK AND THEN REPORTS CLEAN RESULTS IT NEVER RENDERED
+
+**Status:** OPEN
+
+⛔⛔ **THE DANGEROUS HALF IS NOT THE LEAK, IT IS THE SHAPE OF THE FAILURE.** A reproduction loop
+of eight trials ran to completion and printed a clean verdict for every one of them. **No GUI had
+started in any of them.** `underglass-sandbox.sh start` failed, `env` then found no
+`wayland-display`, every app-control call returned nothing, the diff parsed nothing, and the loop
+reported *"not caught in 8 trials"* — a sentence that reads as evidence of absence and was
+produced by a harness that rendered no pixels at all. Had that line been believed, the honest
+conclusion "this fault is rarer than we thought" would have been recorded from a run that tested
+nothing.
+
+**The mechanism, measured 2026-08-22.** `underglass-sandbox.sh stop` **preserves the sandbox home
+by design** (the header says so — "sandbox home is preserved for inspection"). Nothing ever reaps
+them. They accumulate under `$XDG_RUNTIME_DIR`, which is a **tmpfs — RAM, not disk**. Found: **48
+dead sandbox homes holding a 51 GB tmpfs at 100% full**, several at 2.4–2.9 GB each, the oldest
+weeks old and belonging to lanes long since landed. `start` then dies with
+`cat: write error: No space left on device` and returns **rc=0**.
+
+⚠ **And it is a SHARED host, so this is other people's failure too.** Three sandboxes were LIVE at
+the time, owned by other sessions (their compositors still running). A blanket cleanup would have
+killed live work; the reap has to check `sway.pid` liveness per directory and skip anything whose
+compositor answers. 48 dead homes were reaped this way and 33 GB returned, with the three live
+ones untouched.
+
+**What it wants, in order of value:**
+
+1. ⭐ **`start` must FAIL LOUDLY.** Returning rc=0 having written no display file is the whole
+   defect — every caller downstream then measures nothing and says so in the language of success.
+   A missing `wayland-display` after `start` is an error, not a state.
+2. **`stop` should reap by default**, with `--keep` for the inspection case the header describes.
+   Preserving by default is backwards: the inspection case is rare and deliberate, the leak is
+   automatic and invisible.
+3. **A liveness-checked sweeper** — skip any directory whose `sway.pid` is alive, because the host
+   is shared.
+4. ⚠ **Callers must not `eval "$(sandbox env)"` in a loop.** It exports `HOME`, so the next
+   iteration's `start` runs against the previous trial's sandbox home. The script header already
+   warns about the `HOME` export; it does not say that a LOOP is where it bites.
+
+⇒ Filed from the 11.26 lane, which lost a full reproduction run to it. It belongs to whoever owns
+the sandbox harness, not to the paint bug.
 
 ## ⛔⛔⛔ [11.26] LEGENDARY — THE TUI PAINTS WRONG WHILE THE BUFFER IS CORRECT, AND EACH CLI BREAKS IN A DIFFERENT REGION
 
@@ -372,25 +422,182 @@ mount-churn entry below — `preview_layer_style` and `terminal_layer_style` bot
 dim placeholder text positioned by a cursor-address escape. A real terminal draws the cell and
 inverts it; ours drew the block instead of the cell.
 
-### ⛔⛔ THE INSTRUMENT GAP THAT HAS KEPT THIS UNSOLVED — MEASURED, NOT GUESSED
+### ✅ THE INSTRUMENT NOW EXISTS — 2026-08-22, the same-frame paint record
 
-**A faithful screenshot takes 6,824 ms. A buffer read takes 116 ms.**
+*This section replaces the one that said the instrument had to be built first and that "until it
+exists, every claim here is two samples and a hope". It exists, and the claims below are one frame.*
 
-⇒ **On a live agent row the two can never be sequenced into one frame.** Every "the buffer says
-X but the screen shows Y" comparison ever made on a busy row has compared two moments seven
-seconds apart — which is why this class keeps producing readings that look like a contradiction
-and are partly just TIME. Caught red-handed doing it in this very investigation: a "simultaneous"
-pair came back `Nesting… 1m42s` in the buffer and `Whirring… 29s` in the pixels, two different
-turns.
+**The gap it closed, restated because the number is the argument.** A faithful screenshot costs
+**~6,824 ms**; a buffer read costs **~116 ms**. On a live agent row the two can never be sequenced
+into one frame, so every prior comparison in this class was two moments seven seconds apart — a
+"simultaneous" pair caught in this very investigation returned `Nesting… 1m42s` from the buffer
+beside `Whirring… 29s` from the pixels, two different turns of the same agent.
 
-⭐ **THEREFORE THE FIRST DELIVERABLE IS AN INSTRUMENT, NOT A FIX: capture the buffer INSIDE the
-webview, in the same frame as the composite.** The screenshot path already runs in the webview
-(`capture_backend: xterm_canvas_composite_over_dom`); having it emit the xterm buffer it
-composited from turns "the pixels disagree with the buffer" from an argument into a diff. Until
-that exists, every claim here is two samples and a hope.
+`server app screenshot` now writes **`<out.png>.paint-frame.json`** beside the PNG. The composite
+script reads the drawn host's xterm buffer in the **same synchronous JS turn** as the drawImage
+loop and `toDataURL`; xterm parses PTY bytes on its own task queue, which cannot interleave with
+synchronous script, so the sidecar text is exactly what those pixels were drawn from — one moment
+by construction. `scripts/paint-diff.py` turns the pair into per-CELL verdicts. Full contract and
+the three things it cannot see: `docs/observability.md` §2.3b.
 
-⇒ Then, and only then, the per-region question becomes answerable: for each CLI, which escape
-sequence in its breaking region is the one the client mis-renders.
+### ⭐⭐ REPRODUCED IN A SANDBOX, AND THE REGIONALITY IS EXPLAINED
+
+**The fixture.** `mock-tui --scenario region-repaint` draws a screen once, then repaints only a
+3-row band forever, with the `\x1b[?25l` framing every TUI emits. ⛔ That framing is load-bearing,
+not cosmetic: it is what arms the client's `recentFrameLikeWrite`, the discriminator that
+suppresses the forced full refresh for agent CLIs and leaves plain shells alone. A reproduction
+without it exercises the SHELL path and comes back green while reproducing nothing.
+
+**What one frame showed** (fresh sandbox GUI, 4 rows, 12 switches at 0.7 s):
+
+| | |
+|---|---|
+| cells the buffer held | 4,112 |
+| cells the pixels held | **760 (18%)** |
+| rows disagreeing | **47 of 51** |
+| rows correct | **0, 1, 2 — and only those** |
+
+⭐⭐ **ROWS 0–2 ARE THE LIVE REPAINTING BAND. THAT IS THE OWNER'S CLUE, MECHANICALLY.** The only
+rows that painted correctly were the ones the TUI redraws every frame; every row it leaves alone
+was broken. So the broken region is **whichever part of its screen that CLI does not repaint** —
+which is different for every CLI, and is exactly why one CLI's top breaks, another's middle, and
+another's bottom. Nothing about the renderer is regional; the TUI's own redraw pattern is.
+
+A crop of the frame confirms it by eye rather than by field: dense `#=+*` runs in the buffer came
+out as scattered glyph fragments and wrong glyphs — the stale-texture-atlas garble signature, not
+blank cells.
+
+**Two facts that bound it, and the second is the honest half:**
+
+- ⭐ **It heals.** Left alone with the churn stopped, the same row read **51/51 rows, 100% of cells**
+  twenty seconds later. The repair machinery (forced full refresh, 1500 ms deadline, 750 ms
+  rate-limit) does fire — the earlier reading of the code, that a hole "latches forever", is WRONG
+  and is corrected here rather than left to be inherited.
+- ⚠ **It is INTERMITTENT: 2 reproductions in ~23 attempts**, which is consistent with a race during
+  mount churn rather than a deterministic path. Both reproductions needed a **fresh GUI** — a warm
+  GUI did not reproduce under the same churn, and a second churn on an already-healed GUI never
+  did. Warm mounts, cold rows on a warm GUI, streaming vs idle, and switch gaps from 0.05 s to
+  0.7 s were all tried and all painted clean.
+
+⭐ **THE MOST PROMISING UNTESTED LEAD — MEMORY PRESSURE, stated as a correlation and NOT a cause.**
+Both firings happened while `$XDG_RUNTIME_DIR` — **a tmpfs, i.e. RAM** — was at **51 GB / 100%
+full** from 48 leaked sandbox homes (see the harness entry above). After 33 GB was reclaimed, **8
+further trials with a verified-working harness reproduced nothing.** A machine with tens of GB of
+RAM held by a tmpfs is exactly the condition under which a compositor evicts GPU textures, and a
+stale glyph atlas is what the captured frame looked like.
+
+⚠ **This is a before/after correlation confounded with everything else that changed, and it is
+recorded as a lead, not a finding.** The test that would settle it: fill the tmpfs to near
+capacity, then run `hunt.sh`. ⛔ **It must be run on a host with NO other live sandboxes** — the
+runtime dir is shared, three other sessions had live compositors in it during this work, and
+filling it would take their work down. That constraint is why this lane did not run the test.
+
+⇒ If it holds, this bug is a *memory-pressure* symptom and joins the resource-watch lane rather
+than being purely a renderer defect — and it would explain why the owner, on a laptop, sees
+constantly what a sandbox reproduces twice in twenty-three tries.
+
+⚠ **One control could not be settled and must not be assumed:** in both reproductions the broken
+row was also the FIRST row captured after the churn, so "which band is live" and "captured first"
+are confounded. A reversed-order run on a fresh GUI did not reproduce at all, so it separated
+nothing. **Do not quote the top/middle/bottom labels as a finding** — what IS established is
+live-band-correct / static-region-broken, which holds whichever band was live.
+
+### ⛔⛔ EVERY TERMINAL SHARES ONE GLYPH ATLAS — measured, and NOT the cause
+
+**Measured live, 2026-08-22:** three terminal hosts returned **three atlas objects and ONE distinct
+atlas**, which grew to **7 pages under all three at once**. The WebGL addon keeps a module-level
+cache (`acquireTextureAtlas`) and hands every terminal whose font, theme and DPR match the **same
+`TextureAtlas`**, tracking them in an `ownedBy` list. Every yggterm row matches, so **every row
+shares one atlas.**
+
+⇒ **An atlas operation is therefore never per-terminal, and the addon's own clear says so:**
+
+```js
+clearTextureAtlas(){ this._charAtlas?.clearTexture(); this._clearModel(!0); this._requestRedrawViewport(); }
+```
+
+It wipes the **shared** texture, then clears only **this** renderer's glyph model and redraws only
+**this** viewport. Every other owner keeps a model pointing into a texture that was just wiped. We
+call this per-host on the forced-refresh funnel — i.e. on every switch-in, foreground and reveal.
+
+⛔⛔ **AND IT IS NOT THE PROVEN CAUSE OF THE GARBLE. Two direct tests refuted it — do not
+re-derive them, and do not quote the sharing as the root cause:**
+
+| experiment | result |
+|---|---|
+| clear the shared atlas via another host, then full-refresh the measured host | **100% of cells painted** — clean |
+| flood the atlas to 7 pages from another host, then full-refresh the measured host | **100% of cells painted** — clean |
+
+The refreshing terminal re-rasterises glyphs on demand, so a cleared or grown atlas is handled
+correctly for whoever repaints. The coupling is real and any future explanation has to sit beside
+it, but it is a **candidate, not an answer**.
+
+⚠ **What would justify acting on it:** a frame in which `renderer.atlas_shared` is true, a host
+other than the active one has a `last_atlas_clear_at_ms` close to the capture, and the active host
+shows `PARTIAL`. The frame now records all three (`docs/observability.md` §2.3b), so the next
+firing either shows that pattern or rules it out. **Do not "fix" the sharing defensively before
+then** — it is a behaviour change to the paint path with no measured benefit.
+
+### ⭐⭐ WHAT THE INSTRUMENT MEASURED ON ITS FIRST REAL USE — the repair is refused ~4 times in 5
+
+One frame, three hosts running a TUI fixture under switch churn for ~30 s:
+
+| host | full refreshes GRANTED | REFUSED | refusal reasons |
+|---|---:|---:|---|
+| active | 7 | **31** | `rate_limited` 23, `frame_like` 8 |
+| other | 6 | 29 | `rate_limited` 18, `frame_like` 11 |
+| other | 7 | 22 | `rate_limited` 15, `frame_like` 7 |
+
+⇒ **~82 demands raised, ~20 granted.** The repair that is the only thing which fixes a partial
+paint is refused about four times in five, on a fixture doing nothing more exotic than emitting
+hide-cursor before each frame.
+
+⚠ **AND IT CORRECTS THE STORY THE CODE COMMENT TELLS.** That comment names
+`!recentFrameLikeWrite` as "an AGENT-CLI-ONLY suppression … the owner's discriminator, in one
+boolean". Measured, the dominant refusal is **`rate_limited` (56 of 82), not `frame_like` (26)** —
+the 750 ms floor refuses more than twice as often as the agent-CLI gate. The two are not
+equivalent: a `rate_limited` refusal lapses in 750 ms and is re-armed, whereas `frame_like` is
+re-armed by every TUI frame and only escapes via the 1500 ms deadline. **Anyone reasoning about
+this suppression from the comment alone will weight the wrong gate.**
+
+⛔ **AND EVERY GRANTED REFRESH WIPES THE SHARED ATLAS.** `atlas_clears` equals `forced_refresh` on
+all three hosts, so ~20 wipes of the one texture all three are drawing from, inside 30 seconds —
+see the shared-atlas section above for why that is a coupling and not yet a proven cause.
+
+⛔⛔ **NONE OF THIS IS IN THE TRACE.** ~82 refusals, ~20 granted refreshes and ~20 shared-atlas
+wipes, and the probes for them emitted nothing (§4.2b). Every number in this table came from
+counters read in the frame.
+
+### ⛔⛔ AND THE TRACE CANNOT ANSWER WHETHER THE REPAIR RAN — the probe shares the fault's own gate
+
+**GUI host, 2026-08-22: `xterm_forced_refresh` and `xterm_forced_refresh_skipped` appear ZERO
+times across the three newest trace files; `xterm_render` appears 3,872 times in the same files.**
+(The query was checked against that control first.)
+
+Both probes are throttled by `recentFrameLikeWrite` — **the same flag that suppresses the forced
+refresh**, armed by the hide-cursor every TUI emits before every redraw, so always hot for an agent
+CLI. Four hot probes also share one rate-limit slot, and `xterm_write_flush` eats it first.
+
+⇒ **"The repair was suppressed all window" and "no repair was ever demanded" are the same reading
+in the trace: nothing.** Any past conclusion drawn from a zero on these two probes is void.
+
+⭐ **Worked around without touching the throttle:** the host keeps monotonic counters no
+rate-limit can erase, and the same-frame record now reads them directly, so a captured frame
+carries the true repair-vs-suppression balance even when the trace carries none. Detail:
+`docs/observability.md` §4.2b.
+
+### ⛔ THE CODE FINDING: EVERY REPAIR TRIGGER IS EVENT-DRIVEN, NOTHING DETECTS A DIVERGENCE
+
+`requestVisiblePaint(true)` — the only thing that repairs a partial paint — is raised from settled
+resize, reveal, retained write, focus, foreground and mount. **Every one of them is an event known
+in advance to be risky. None of them is a detector.** So a hole opened by a dropped frame on a
+visible, steady row raises no demand at all, and nothing in the client can notice that the pixels
+and the buffer have come apart.
+
+⇒ **The natural next step is a detector, not another repair.** The repair path is already
+well-tuned and should be reused rather than duplicated: the missing piece is a cheap in-page check
+that raises the EXISTING demand when coverage and content diverge. The same-frame read this entry
+delivers is the proof that such a comparison is available inside the webview at all.
 
 ⚠ **Do NOT reason from the daemon's screen for this.** The daemon's vt100 grid is the source of
 truth for CONTENT and says nothing about what the client painted — that confusion is already a
@@ -639,7 +846,37 @@ row's surface where the new one should be. **That is the ghost frame, measured**
 is a different defect from an incomplete paint, which is what `rows_content_unpainted`
 above counts.
 
-### ⭐⭐ THE LADDER SAYS THE BUG IS IN ATTACH, NOT IN MOUNT (measured 2026-08-21, ~2.2 h)
+### ⛔ THE ATTACH CLIFF HAS CLOSED — RE-MEASURED PER BUILD 2026-08-22, AND THE LOW RUNG MOVED
+
+The ladder below was summed over a plane spanning several builds. Segmented by `app_version`,
+attach is no longer where mounts are lost:
+
+| build | `begin` | `js_ready` | `attach_ready` | `first_output` | `paint_ready` |
+|---|---:|---:|---:|---:|---:|
+| 3.1.35 | 19 | 19 | 13 | 15 | 14 |
+| 3.1.36 | 35 | 31 | 28 | 32 | 26 |
+| **3.1.37** | **24** | **24** | **22** | **22** | **16** |
+
+⇒ On the shipped build **22 of 24 mounts attach**, against the 9-of-17 that named this section.
+The lowest rung is now **`paint_ready`, at 16 of 24**.
+
+⛔ **Do not subtract these columns from each other** — the same warning the original measurement
+carried, and it binds harder now. The rungs are not strictly nested (`first_output` exceeds
+`attach_ready` on two builds), so "8 mounts attached and never painted" is NOT what this table
+says. It says how many of each event fired. **Which mounts are missing which rung is a join on the
+mount identity, and `xterm_paint`'s `mount_open` is the key** — segment on it, because a host id
+is reused across mount epochs.
+
+⚠ And `paint_ready` is the DOM-presence check named for pixels, already recorded below as right
+eight times in nine. Its ABSENCE is a stronger reading than its presence: the elements never
+appeared at all.
+
+⚠ **The reason the old numbers were wrong is not that anyone measured badly** — it is that a
+retained trace outlives the build that wrote it, so any aggregate over the file mixes a bug with
+its fix. Two other headlines from the same plane the same night were entirely one dead build. Take
+every rung count with the build beside it.
+
+### ⭐⭐ THE LADDER SAYS THE BUG IS IN ATTACH, NOT IN MOUNT (measured 2026-08-21, ~2.2 h — ⚠ POOLED ACROSS BUILDS, see above)
 
 Rung by rung: `begin` 17 → `ensure_begin` 17 → `bootstrap_spawn_scheduled` 17 →
 `js_eval_created` 17 → `js_ready` 16 → **`attach_ready` 9** → `first_meaningful_output` 9.
@@ -1605,6 +1842,38 @@ live sidebar shows `11.0`'s members in ascending order with no verb run.
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
 **Status:** OPEN
+
+### ⭐ NARROWED 2026-08-22 — IT IS NOT ONE VERB LYING, IT IS TWO DAEMONS DISAGREEING ABOUT A ROW
+
+Reproduced on the shipped build with a correct `full_path` taken from the listing rather than
+constructed, and the mechanism is sharper than "the verb did not apply it".
+
+| asked | answer |
+|---|---|
+| the GUI host's daemon | `applied: false` · `daemon_message: "no live session for <row>"` · `outline_prefix: null` |
+| the daemon on the host where that session actually runs | `applied: true` · `outline_prefix` reads back the requested seat |
+| **the GUI host again, afterwards** | **still `null`** |
+
+⇒ **The seat applied, on a daemon that is not the one drawing the sidebar.** Both answers are
+locally correct and the row ends up unseated on the only surface a person looks at. A caller that
+believes `applied: true` has been told the truth about the wrong machine.
+
+⭐ **The envelope/operation split is now honest and is the reading to take**: `error` is the
+TRANSPORT's verdict — the request arrived and was handled — and `applied` is the OPERATION's.
+⛔ Neither is the EFFECT. The effect is what the sidebar's own daemon stores, and only a read-back
+against that daemon answers it. Three readings, three different questions, and the two cheap ones
+agree with each other while disagreeing with the one that matters.
+
+⚠ **Why it bites the orchestrator specifically.** A lane spawned so that its session never became
+live on the GUI host is listed there as a row (`kind: Session`, present in `rows --json`) while
+that daemon holds no runtime for it. It therefore cannot be seated where it is drawn, so it is
+invisible to every seat-based census — which is how three live successor lanes came to be running
+with no seat at all, unsupervised, while their own report named seats that collided with three
+other lanes' numbers. **Nothing failed loudly at any point.**
+
+⛔ Seating it by attaching is not a workaround: opening a row takes the owner's screen, and the
+standing prohibition on that outranks the tidiness. The fix belongs where the disagreement is —
+a seat is a property of the ROW and must not be storable per daemon.
 
 Measured 2026-08-21 while a lane claimed its own row. `server app session outline
 <row> <seat>` returned, at the envelope level, `error: null` — and two levels
@@ -3099,6 +3368,36 @@ instrumentation is the missing instrument — measure WHICH component invalidate
 render granularity (sidebar/preview updates must not repaint the terminal viewport), signal
 coalescing (bound renders per second), and a cached negative for the declare probe.
 
+### ⛔ THE CACHED NEGATIVE IS NOT A LONGER CEILING — the backoff already exists and its ceiling is right
+
+Read before touching this: `restore_app_surfaces_tick` already backs off, `BASE 2.5 s` doubling to
+`CEILING 60 s`, keyed on the runtime token so a handover restarts the schedule. **The 60.1 s median
+inter-arrival measured across 45 session paths IS that ceiling** — the system is at its designed
+steady state, not missing a backoff.
+
+⛔ **And raising the ceiling is the wrong fix, for a reason that was live-caught.** A row exists
+before its app does: a `terminal new` followed by an app declares about five seconds after the row
+is born, and the ceiling exists so the client is still asking then. Its own comment records the
+2026-07-31 case where treating "no declare" as durable left a session with no contribution for its
+whole life, so every webview it built carried an empty policy. A longer ceiling also delays an app
+launched into a row that has been open for hours — the same defect with a slower fuse.
+
+**Two designs that do not trade the birth window away:**
+
+1. ⭐ **Ask once for the set, not once per row.** The per-session request has no bulk form, so N
+   live rows cost N round trips a minute forever. One request returning the session paths that hold
+   any declare replaces all of them, and the client then asks per session only for the few that
+   changed. ⚠ Needs a new request variant and therefore cross-version handling — an older daemon
+   cannot answer it, and a preserved owner must be proxied exactly as the per-session form already
+   is.
+2. **Gate the ask on new bytes.** A declare arrives as OSC in that row's own stream, so a row that
+   has produced no output since the last ask cannot have declared. ⚠ `ManagedSessionView` carries
+   no output marker today; adding one is a server-side change, which is what makes (1) and (2) the
+   same size rather than (2) being the cheap one.
+
+⛔ **Sequencing:** both touch `daemon.rs`, where seat 11.27 is landing the PTY-handoff commit-point
+fix. Do not open a second lane in that file concurrently — take this after 11.27 lands.
+
 **That instrument now exists and is always on.** Trace plane, `layer:"dioxus"`, probe
 `dioxus_render/component_window`. Read it in three steps: `root_renders` is the denominator, so a
 component whose `renders` equals it was memoized by nothing; `renders_unattributed` counts root
@@ -3880,6 +4179,50 @@ instrument this campaign built — the monitor, the booter, the board, the watch
 orchestrator sampling loop — pays for its readings in his typing latency. This is the cheapest
 large win left in the input lane and it needs no product change: it is a question of how often we
 ask, and whether a read has to cross the UI thread at all.
+
+### ⭐ STILL TRUE SEVEN BUILDS LATER — measured per build 2026-08-22, and the per-build split matters
+
+⛔ **Read this table by ROW, never summed.** A retained trace spans several builds and a fixed bug
+keeps testifying from the archive; two headlines were drawn from the pooled file this night and
+both were false. See the ytrace notes, *a trace file outlives the build that wrote it*.
+
+| build | window | `ui/block` incidents | rate | blocked total | worst |
+|---|---:|---:|---:|---:|---:|
+| 3.1.32 | 37 min | 64 | 1.73/min | 36.0 s | 5857 ms |
+| 3.1.33 | 19 min | 38 | 1.97/min | 16.4 s | 3533 ms |
+| 3.1.34 | 14 min | 40 | 2.86/min | 24.2 s | 3378 ms |
+| 3.1.35 | 49 min | 40 | 0.81/min | 34.8 s | 5812 ms |
+| 3.1.36 | 21 min | 34 | 1.66/min | 28.1 s | 5169 ms |
+| 3.1.37 | 10 min | 8 | 0.80/min | 6.2 s | 3338 ms |
+
+⇒ The class is not closed. On the newest build **3 of 8 blocks still follow `app_control/*`** —
+`request_begin` ×2 and `watchdog_spawned` ×1 — and the probe rate that produces them is
+**288 `describe_rows` requests in the first 22 minutes of that build, a sustained 10–27 per minute
+with a median gap of 1.6 s.** ⚠ n=8 on a 10-minute window: the rate is a reading, not a trend.
+
+⚠ **And the orchestrator sampling loop is part of the traffic it is measuring** — a census sweep, a
+spawn's input-check and a fold each cross this path. The instrument and the load remain the same
+traffic, which is what makes the fix a question of cadence and of whether a read must cross the UI
+thread at all, not of anyone probing less carefully.
+
+⛔ **The `ui/block` filter that reads correctly is `payload.incident == true`.** `payload.kind` is
+`"fault"`, and filtering on `kind == "incident"` — which is what a reader naturally tries, and what
+one campaign note still says — returns **zero** over a plane holding 235 of them. Every block is
+also written twice, once as the LLM-facing complaint record and once as a bare duration record, so
+an unfiltered count doubles.
+
+### ⭐ THE DECLARE PROBE'S CADENCE IS NOW EXACT — a correct negative, re-asked every minute, per row
+
+The fix direction *"a cached negative for the declare probe"* recorded elsewhere in this file now
+has its number. Over 3.5 h on the GUI host: **7,718 `app_declare/daemon_declare_absent` events
+across 45 distinct session paths — a median inter-arrival of 60.1 s per path**, i.e. one poll per
+row per minute, every minute, for an answer that has never once changed. The daemon side of the
+same ladder is **15,439 `terminal_app_declares` round trips**, and the pair costs **8.3% of the
+trace plane's bytes** on a plane whose retention is a byte budget everyone shares.
+
+⇒ It is not a fault and every individual answer is right; the SERIES is the defect. A plain agent
+row has no sidebar declare and never will, so the negative is cacheable until the row declares —
+and a declare arrives as an event the daemon already receives, so nothing needs polling at all.
 
 ⚠ **Partly self-inflicted, and it must be said.** A scan that reads every seated row one request
 at a time is the worst available shape, and one seat ran two of them the day this was measured.
