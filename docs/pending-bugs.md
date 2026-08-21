@@ -18,30 +18,43 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [99.0] A TRANSCRIPT IS NOW FOUND FOR EVERY CLI, BUT ONLY THE REFERENCE ONE IS READ AS PROSE
+## ⛔ [99.0] THREE CLIs' TRANSCRIPTS ARE READ AS PROSE; THE REST RETURN A BLANK, AND ONE REMOTE CLASSIFIER IS STILL SINGLE-CLI
 
 **Status:** OPEN
 
-*The finding-the-file half is fixed and gated (`ygg_transcript`, `cli-stores.json`,
-`the_fleet_transcript_table_matches_the_registry`). This is what is left, stated narrowly
-so it is not mistaken for the larger defect it came from.*
+*Narrowed twice. Finding the file is fixed and gated; reading it is fixed for the three
+shapes that were measured. This is the remainder, stated so it is not mistaken for the
+larger defect it came from.*
 
-`ygg-monitor`'s `_last_prose` now locates any CLI's transcript and then parses it as the
-reference CLI's record format. Another CLI's file is therefore found and read as **empty
-prose** — better than the old silence, because the file's size and mtime now answer the
-stall and evidence questions correctly, but still not the row's last words.
+**Read correctly today**, each shape taken off a real store and gated:
+claude-code (`assistant` → `message.content[].text`), codex (`response_item` →
+`payload.role=assistant`, `content[].output_text`), antigravity (`PLANNER_RESPONSE` →
+`content`, with `thinking` deliberately NOT read — it is the model's scratchpad, not
+what it said).
 
-⚖ **Why the split is the right shape rather than half a job.** Finding the file was one
-defect with one fix and it unblocked every caller at once, including the two that DESTROY
-things. Reading a record is a different question per CLI and each answer needs a real
-store to check against — the same measurement discipline, one CLI at a time, and no
-caller is blocked while it is done.
+**Still returning a blank:**
 
-**Ack-grep is unaffected** and that is deliberate: proving a message arrived only needs
-the token FOUND, not parsed, so cross-CLI delivery proof works today.
+- **muse** — its records carry no `type`/`role` key at all, so its turn shape has not
+  been identified. It has a large real store here, so this is measurable now and needs
+  no credential.
+- **pi · grok-build** — no session on either host is big enough to read a turn from.
+- **qwen-code** — blocked behind the credential gate in the entry below.
 
-**What would falsify it being fixed:** `ygg-monitor status` showing a non-reference row's
-actual last sentence instead of a blank.
+⛔ **A blank is the honest answer and must stay that way.** `prose_of` returns nothing
+for an unrecognised record rather than reaching for the longest string it can find,
+because a wrong answer here does not stay cosmetic — it feeds a stall verdict, and a
+tool call rendered as "what the row last said" would read as a healthy row.
+
+**And one classifier is still single-CLI:** `ygg-babysit`'s remote probe decides
+`TURN_ENDED` / `MIDTURN` / `RATE_LIMITED` from `type in ("assistant","user")`,
+`isApiErrorMessage` and `tool_use` blocks — all reference-CLI spellings. Its READ is
+now bounded (that was the urgent half, and it runs over ssh), but for any other CLI it
+answers `EMPTY`. ⚠ Its rate-limit discriminator must stay identical to the local one:
+a local row and a remote row disagreeing about whether an account has quota is a fleet
+that boots half of itself into a wall.
+
+**What would falsify it being fixed:** `ygg-monitor status` showing a muse row's last
+sentence, and `ygg-babysit` classifying a codex row as `TURN_ENDED` rather than `EMPTY`.
 
 ## ⛔ [99.0] NO NON-REFERENCE CLI HAS EVER COMPLETED AN AUTHENTICATED SESSION HERE, SO THE GREETING RUN CANNOT BE VALIDATED
 

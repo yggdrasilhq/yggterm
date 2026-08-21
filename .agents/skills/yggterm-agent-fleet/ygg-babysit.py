@@ -187,7 +187,24 @@ def api_rate_limited(rec):
 REMOTE_PROBE = r'''
 import json,os,sys,time
 p=sys.argv[1]
-try: rows=[json.loads(l) for l in open(p) if l.strip()]
+# ⛔⛔ BOUNDED, AND THIS ONE RUNS ON SOMEBODY ELSE'S MACHINE. It used to parse the
+#    whole file, which was survivable only while it could be handed one CLI's
+#    transcripts. The row lookup now resolves every CLI's store, and the largest
+#    transcript on this fleet is 1,481 MB against a p95 of 5.4 MB — so the old
+#    line would have allocated gigabytes over ssh, on a laptop, on a timer.
+#    A partial first record is dropped rather than repaired.
+TAIL=2000000
+try:
+    _sz=os.path.getsize(p)
+    with open(p,"rb") as _h:
+        if _sz>TAIL: _h.seek(_sz-TAIL); _h.readline()
+        _blob=_h.read()
+    rows=[]
+    for _l in _blob.decode("utf-8","replace").splitlines():
+        _l=_l.strip()
+        if not _l: continue
+        try: rows.append(json.loads(_l))
+        except ValueError: continue
 except Exception as e: print(json.dumps(["UNREADABLE",0,str(e)])); sys.exit()
 age=time.time()-os.path.getmtime(p)
 last=next((r for r in reversed(rows) if r.get("type") in ("assistant","user")),None)
