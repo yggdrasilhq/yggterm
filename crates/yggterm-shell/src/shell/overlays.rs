@@ -1966,22 +1966,25 @@ fn LaunchFlagsSettingsSection(
 
 /// The machine list the CLI-installation modal draws, local first.
 ///
-/// ⛔ **Only the local machine is PROBED.** The GUI can read its own `PATH`;
-/// every other machine is reachable only over ssh, which is the provisioner's
-/// path and not the renderer's. Remote hosts are therefore reported as
-/// `Unknown`, which the modal renders as "not probed" — an honest blank rather
-/// than an `Absent` that would make the primary button offer installs it cannot
-/// perform against hosts it has not contacted.
+/// The local machine is probed here, directly against this process's `PATH`.
+/// Every remote machine reports its OWN `PATH` back over the existing ssh scan
+/// (`server remote cli-presence`), so both columns are produced by the same core
+/// probe — the remote one just runs on the remote.
+///
+/// ⛔ **A machine with an EMPTY report is `Unknown`, never `Absent`.** That is
+/// what an unreachable host, a host never yet refreshed, and a host whose
+/// yggterm predates the verb all produce. Rendering it as absence would make the
+/// primary button offer to install ten CLIs onto a machine nobody has contacted.
 fn cli_install_machines(
     snapshot: &SharedSnapshot,
 ) -> Vec<yggterm_core::cli_install::MachineCliStatus> {
-    use yggterm_core::cli_install::{local_machine_status, CliPresence, MachineCliStatus};
+    use yggterm_core::cli_install::{local_machine_status, machine_status_from_report};
     let mut machines = vec![local_machine_status("This machine")];
     machines.extend(snapshot.remote_machines.iter().map(|machine| {
-        MachineCliStatus::build(
+        machine_status_from_report(
             machine.machine_key.clone(),
             machine.label.clone(),
-            |_| CliPresence::Unknown,
+            &machine.cli_presence,
         )
     }));
     machines

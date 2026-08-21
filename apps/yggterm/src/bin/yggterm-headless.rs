@@ -498,6 +498,10 @@ fn discover_remote_machines_from_app_state() -> Result<Vec<RemoteMachineSnapshot
         .into_iter()
         .map(|machine| RemoteMachineSnapshot {
             apps: Vec::new(),
+            // This projection carries routing only; presence is filled by the
+            // machine refresh. Empty here reads as "not probed", which is
+            // correct for a machine this view has not asked.
+            cli_presence: Vec::new(),
             machine_key: machine.machine_key,
             label: machine.label,
             ssh_target: machine.ssh_target,
