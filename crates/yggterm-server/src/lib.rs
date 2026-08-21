@@ -23559,7 +23559,9 @@ pub fn run_row_drafts() -> anyhow::Result<()> {
     let mut drafted = Vec::<serde_json::Value>::new();
     let mut unable = 0usize;
     let mut answered_sessions = 0usize;
+    let mut reached_pids = std::collections::HashSet::<u32>::new();
     for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
+        reached_pids.insert(runtime.server_pid);
         let states = runtime.pending_input_drafts.clone();
         let can_answer = states.is_some();
         if !can_answer {
@@ -23594,6 +23596,35 @@ pub fn run_row_drafts() -> anyhow::Result<()> {
             "drafts_here": can_answer.then_some(here),
         }));
     }
+    // ⛔⛔ A COVERAGE COUNT IS NOT COVERAGE. This verb answered `daemons_seen: 1`
+    // and `daemons_or_rows_unable_to_answer: 0` on a host running four daemons —
+    // i.e. it declared it had asked everybody, having asked one in four.
+    //
+    // The contract above protects a daemon that ANSWERS "I am too old to say".
+    // It does nothing for one that is never ENUMERATED, because there is then
+    // nobody to be blind: the fan-out walks SOCKETS, and a version bump replaces
+    // older sockets with symlinks to the newest, so several daemons collapse
+    // onto one reachable path and the rest are invisible rather than silent.
+    //
+    // ⇒ The only way to know what was missed is to compare what answered against
+    // what is RUNNING. A daemon process this sweep never reached is counted as
+    // unable to answer, which makes the verdict `blind` — and blind is not clear,
+    // which is the whole point of the verb.
+    //
+    // ⚠ And when the process table itself cannot be read, that is reported as
+    // `null` rather than as zero: an unverifiable coverage claim must not read
+    // like a confirmed one.
+    let daemon_pids = daemon::daemon_process_pids();
+    let unreached: Vec<u32> = daemon_pids
+        .as_ref()
+        .map(|pids| {
+            pids.iter()
+                .copied()
+                .filter(|pid| !reached_pids.contains(pid))
+                .collect()
+        })
+        .unwrap_or_default();
+    unable += unreached.len();
     // The precedence is a tested rule, not a local `if` — see `draft_sweep_verdict`.
     let verdict = daemon::draft_sweep_verdict(drafted.len(), unable);
     write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
@@ -23618,6 +23649,17 @@ pub fn run_row_drafts() -> anyhow::Result<()> {
                      a `local://` or `cc-runtime://` key there, and only the PTY \
                      host's answer bears on migrating it",
         "daemons_seen": daemons.len(),
+        // ⛔ THE DENOMINATOR. `daemons_seen` alone is a count of what answered,
+        // which is exactly the number that read as full coverage while three
+        // daemons in four went unasked. `null` here means the process table
+        // could not be read, so coverage is UNVERIFIED rather than complete.
+        "daemon_processes_on_host": daemon_pids.as_ref().map(|pids| pids.len()),
+        "daemons_running_but_never_reached": unreached,
+        "coverage": match daemon_pids.as_ref() {
+            None => "unverified — this host's process table could not be read",
+            Some(_) if unreached.is_empty() => "every daemon process on this host answered",
+            Some(_) => "INCOMPLETE — a daemon is running that this sweep never reached; its sessions are unexamined, not clean",
+        },
         "daemons_or_rows_unable_to_answer": unable,
         "sessions_answered": answered_sessions,
         "drafts_present": drafted.len(),

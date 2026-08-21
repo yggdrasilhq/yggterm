@@ -1436,6 +1436,16 @@ impl TerminalManager {
             //    draft check reads back as a person typing.
             |text| self.write_daemon_originated(key, text),
             || self.session_screen_snapshot(key),
+            // ⛔⛔ THE KEYSTROKE ARM ON PURPOSE, AND IT MUST STAY THAT WAY.
+            //    Every other reader of "does this composer hold a draft" was
+            //    moved to `session_composer_holds_draft`, the union with the
+            //    rendered composer row, because the counter is zeroed by a
+            //    handover. NOT THIS ONE: the closure is re-consulted INSIDE the
+            //    probe loop, after this very function has typed its marker into
+            //    the composer — so the grid arm would read our own probe as a
+            //    person mid-sentence and abort the submit it was asked to make.
+            //    The counter is the correct instrument here precisely because
+            //    `write_daemon_originated` is invisible to it.
             || self.session_has_pending_input_draft(key),
             data,
             timeout,
