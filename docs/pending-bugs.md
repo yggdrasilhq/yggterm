@@ -27,10 +27,18 @@ campaign, sits at `boots: 0`.
 2. **Enter sent, no wake.** The one row with `boots: 3` was ESCALATED anyway —
    *"did not wake after 3 boots"* — so even a completed boot did not resume it.
 
-⚠ **It is not the remote plane and not row visibility.** Booted and aborting rows have the
-identical `remote-cc://<machine>/<uuid>` shape, the same watcher host, and all read
-`hidden_by_collapse: None, expanded: True` in the listing. Whatever separates them is not
+⚠ **For the ABORT mode it is not the remote plane and not row visibility.** Booted and aborting
+rows have the identical `remote-cc://<machine>/<uuid>` shape, the same watcher host, and all read
+`hidden_by_collapse: None, expanded: True` in the listing. Whatever separates *those two* is not
 structural, and a fix aimed at the remote proxy would be aimed at nothing.
+
+⛔ **NARROWED 2026-08-21 — this sentence used to read "it is not row visibility" without
+qualification, and that generalisation is false.** It was drawn from rows that were all present in
+the GUI host's tree, which is the one population in which visibility cannot be the variable. A
+third mode was then measured directly: **a live, working session that is absent from the GUI host's
+tree entirely**, so nothing ever reaches the boot code at all — see the entry below. ⇒ The abort
+counts here are evidence about rows that ARE listed. They say nothing about rows that are not, and
+the fleet-wide `boots: 0` figure mixes both populations.
 
 **Why this outranks every individual stalled row.** The relay is built on the assumption that a
 session may land, defer, and be resumed. That assumption is currently false, so **any lane that
@@ -43,51 +51,76 @@ a brief must say so. ⇒ **The tell:** read `boots:` on the subscription. `0` af
 quiet is this, not a quiet campaign. ⚠ Do not read "the row woke up" as evidence a boot
 landed — a human typing into a row looks identical from every instrument the fleet has.
 
-## ⛔⛔ [11.13] A SPAWNED ROW IS AUTO-SUBSCRIBED BY BARE UUID, LAPSES UNWATCHED, AND NEVER WAKES
+## ⛔⛔ [11.13] A LIVE, WORKING SESSION CAN BE ABSENT FROM THE GUI HOST'S ROW TREE — SO THE WATCHER LAPSES IT AND NOTHING CAN REACH IT
 
-Spawning a row auto-subscribes it to the booter and stores the row as a **bare uuid**. The
-watcher resolves rows against the GUI host's listing, where that session appears as an
-**addressable path** (`remote-cc://<host>/<uuid>`). The bare uuid matches nothing, the row is
-counted absent, and after 3 consecutive listings the subscription LAPSES:
-`⛔ LAPSED — absent from 3 consecutive row listings · NOT WATCHED; re-subscribe to clear`.
+⛔ **THIS ENTRY REPLACES A FALSIFIED MECHANISM. Re-measured 2026-08-21 16:45-16:50 against a
+session that was alive and writing while it was measured.** The previous text said a spawned row
+is auto-subscribed by BARE UUID, that the bare uuid "matches nothing" in the GUI host's listing,
+and — explicitly — that *"the row is visible in the listing the whole time; this is a key-matching
+failure, not a visibility one."* **All three are wrong.** What follows is what the instruments
+actually say. The lapse it described is real; the cause it named is not.
 
-⇒ **The row is then never WATCHED.** Measured: a successor spawned at 11:50 sat at `boots: 0`
-for **193 minutes** having ended its turn expecting to be woken, with `gone_sightings: 3` and
-repeated `LAPSED … NOT WATCHED` lines naming it. Re-subscribing with the addressable path
-printed `⭐ CLEARING A LAPSE`, reset the sightings, and moved the row into the boot path — it
-began receiving boot ATTEMPTS where previously it received none. ⚠ The row is visible in the
-listing the whole time — this is a key-matching failure, not a visibility one.
+### THE MEASUREMENT
+A delegate spawned onto a worker host was alive throughout: its process was up, and its transcript
+was growing to the second at every reading. In the same instant:
 
-⛔ **CORRECTION, and it retracts the comparison this entry first shipped with.** The original
-text claimed a hand-subscribed monitor "was booted reliably over the same period", offered as
-proof that the identifier was the only difference. **That was false and was never checked.**
-That monitor's own record reads `boots: 0` — it had never been booted either; it was being
-woken by its OWNER each turn, which is indistinguishable from a boot when you do not look. ⇒
-The lapse is real and is fixed by resolving the row; it is simply NOT sufficient to get a row
-woken, because the boot itself then fails for an unrelated reason — see the entry below.
-⚠ The general shape: **a true finding propped up by evidence nobody measured**, and the
-evidence was the part that felt too obvious to check.
+| probe | answer |
+|---|---|
+| the **GUI host's** row tree (640 rows, 234 sessions, non-empty ⇒ it *did* answer) | the uuid appears **0 times in 878 KB** |
+| the **worker host's** own row tree | present, **9 hits**, path `remote-cc://<worker>/<uuid>` — the correct addressable form |
+| the OS | process alive, transcript age 0.0m, still growing |
 
-**Why this is worse than a missed wake-up: it breaks THE RELAY, silently.**
-1. ⛔ **The handover looks complete.** The spawn returns, the row works, lands, writes a
-   successor brief — and nothing ever wakes it. The chain stops with every artefact present
-   and no error anywhere.
-2. ⛔ **The booter WARNS at subscribe time and subscribes anyway** — *"does not resolve to a
-   live row on host X — subscribing anyway; the first tick will retire it if it stays gone"* —
-   then does exactly that. The warning goes to a log nobody tails, at the one moment the caller
-   is not reading, while the reply says `subscribed`.
-3. ⚠ **Invisible from inside the row:** a session cannot tell a watched subscription from an
-   unwatched one. Both look like "I deferred and stood by".
+Of the **8** `remote-cc://<worker>/` sessions in the worker host's tree, **exactly one — this one —
+is missing from the GUI host's tree.** The other seven propagated. 22 of the 23 live sessions on
+that worker were listed on the GUI host; this was the twenty-third.
 
-**Fix: resolve the row AT SUBSCRIBE TIME.** The verb already accepts `scheme://host/<uuid>`,
-and the subscriber already knows how to look a session up — it warns that it could not. ⛔ Do
-not refuse outright: a row may legitimately be subscribed before it appears. Resolve, store the
-addressable form, and re-resolve on the tick that would otherwise count a sighting as gone.
+⇒ **The row was created, with the right path, on the worker's plane, and never reached the GUI
+host's tree.** Intermittent propagation, not a systematic gap and not a naming gap.
 
-**Workaround:** after spawning, re-subscribe with the full path —
-`ygg-booter.py subscribe "remote-cc://<host>/<uuid>" --campaign <c> --kind task` — which prints
-`⭐ CLEARING A LAPSE` and resets the sightings. ⚠ **The tell: `boots: 0` on a row that has been
-quiet for hours is this bug, not a quiet campaign.**
+### WHY THE OLD MECHANISM CANNOT BE RIGHT — from the code, not from a guess
+1. **The presence check never sees the stored string.** The tick calls
+   `row_presence(host, uuid)` with the **uuid**, and `resolve_row_path` reduces any identifier with
+   `ident.rstrip("/").split("/")[-1]` — so a bare uuid and `scheme://host/<uuid>` **normalize to the
+   same key**. The stored form cannot decide presence.
+2. **It was subscribed with the FULL addressable path FIRST, and that failed too.** The log shows
+   the full `remote-cc://<worker>/<uuid>` form at the first subscribe, answered by
+   *"does not resolve to a live row on <gui-host> — subscribing anyway"*. A second subscribe 26 s
+   later stored the bare uuid. Both were absent for the same reason: the row was not there.
+3. The lapse then proceeded correctly — absent 1/3, 2/3, LAPSED — and `row_presence` behaved
+   exactly as designed. **The watchdog is not the defect here; it is the only thing that reported it.**
+
+### ⚠ THE BARE UUID IS STILL A REAL DEFECT — one layer down, and it is the SEND, not the check
+`boot()` passes the **raw stored `row` string** to `server terminal write '<row>'` and
+`server app terminal submit '<row>'` with no `resolve_row_path` in between. So a subscription
+holding a bare uuid addresses nothing **when a boot is finally attempted**, while every presence
+reading above it looks fine. ⇒ Worse, **re-subscribing DOWNGRADES a good record**: the first
+subscribe here stored the addressable path, the second overwrote it with the bare uuid. The
+documented "workaround" of re-subscribing can therefore make the send target worse while printing
+success.
+⇒ **Fix: resolve at subscribe time AND at send time**, and never overwrite a resolved path with an
+unresolved one.
+
+### WHY THIS BREAKS THE RELAY, SILENTLY
+1. ⛔ **The handover looks complete.** The spawn returns, the delegate reads its brief, ACKs, and
+   works — the initial prompt rides the spawn, so nothing about the first turn reveals the problem.
+2. ⛔ **The delegate is unreachable and unbootable from the moment it lands.** No row on the GUI
+   host means no steer, no correction, no boot, and **no seat in the sidebar** — the owner cannot
+   see that the work is running at all.
+3. ⛔ **It ends at the end of its first turn.** Whatever is not committed by then is stranded, and
+   the chain stops with every artefact present and no error anywhere.
+4. ⚠ **Invisible from inside the row:** a session cannot tell a watched subscription from an
+   unwatched one, nor a propagated row from an orphaned one. Both look like "I landed and stood by".
+
+### THE TELLS, AND THE ONLY SAFE HANDOVER UNTIL THIS IS FIXED
+- ⭐ **After spawning, read the GUI host's row tree for the new uuid — do not read the spawn's own
+  return value.** The spawn verb reports that it started a process, which is true and is not the
+  question. If the uuid is absent from the GUI host's tree, **the delegate is orphaned**: it will
+  work one turn and then be gone.
+- ⚠ `boots: 0` plus `LAPSED — absent from N consecutive row listings` on a session whose transcript
+  is still GROWING is this bug, and it is the opposite of what it reads like. A lapsed record is
+  evidence about the ROW TREE, never about whether the work is happening.
+- ⛔ **Do not hand a lane over by standing by.** Spawn, then verify the row on the GUI host, and
+  carry the standing order that the successor must spawn its own successor rather than defer.
 
 ## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
 
