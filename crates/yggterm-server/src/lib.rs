@@ -4572,6 +4572,11 @@ impl YggtermServer {
         self.active_session_path.as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn redundant_activations_for_test(&self) -> &BTreeMap<&'static str, u32> {
+        &self.redundant_activations
+    }
+
     /// The ONE writer for the active row, and the only place an activation is
     /// recorded.
     ///
@@ -4605,6 +4610,25 @@ impl YggtermServer {
             .last_activation_at_ms
             .replace(now_ms)
             .map(|previous_at| now_ms.saturating_sub(previous_at));
+        // ⛔⛔ A TEST MUST NOT WRITE A SWITCH ONTO THE PLANE EVERY LANE READS,
+        // and this was MEASURED before it shipped rather than reasoned about:
+        // one run of one activation test put two records into the real
+        // `event-trace.jsonl`, and a full suite run had already left 2087
+        // there. Three costs, and the first is the one that matters — a
+        // synthetic switch is **indistinguishable from a real one** to every
+        // reader of this plane, so a test run manufactures exactly the
+        // app-driven-switch evidence the probe exists to establish. Then it
+        // spends a retention budget measured in BYTES, and then it makes ~1200
+        // parallel tests contend on one file.
+        //
+        // ⚠ `cfg!(test)` covers this crate's own suite, which is where every
+        // activation test lives and where the volume is. It does NOT cover a
+        // dependent crate's tests — that build has no `test` cfg here — so the
+        // second guard is the home itself: a suite run with no `YGGTERM_HOME`
+        // set has nothing this probe should be appending to.
+        if cfg!(test) {
+            return;
+        }
         let Ok(home) = resolve_yggterm_home() else {
             return;
         };
@@ -31829,7 +31853,149 @@ mod tests {
         );
     }
     use super::ActivationOrigin;
+    use super::ActivationOriginKind;
     use super::PreviewBlockKind;
+
+    /// ⛔⛔ THE PROPERTY THAT MAKES THE ORIGIN WORTH ANYTHING: there is exactly
+    /// ONE writer for the active row.
+    ///
+    /// The mount-churn entry cannot say whether the active session changes on
+    /// its own, and the reason is not that nobody looked — it is that a person
+    /// clicking and the app switching produce the same trace. An origin
+    /// recorded at the call sites somebody remembered would replace that with
+    /// something worse: an unexplained switch and an uninstrumented one would
+    /// look identical, and a reader would have no way to tell "the app did this
+    /// by itself" from "we forgot to say". A second assignment anywhere in this
+    /// file re-opens that hole silently, so the file is scanned for one.
+    ///
+    /// ⚠ A SOURCE scan and not a behavioural one, deliberately: the defect is
+    /// the EXISTENCE of a second write path, and a behavioural test can only
+    /// ever cover the paths its author already thought of — which is the same
+    /// blind spot restated.
+    #[test]
+    fn the_active_session_path_has_exactly_one_writer() {
+        let source = include_str!("lib.rs");
+        let assignments: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("self.active_session_path ="))
+            .collect();
+        assert_eq!(
+            assignments.len(),
+            1,
+            "`active_session_path` must be assigned in exactly one place \
+             (`set_active_session_path`); found {}: {assignments:?}. A second \
+             assignment is a switch that reaches the screen without reaching \
+             the trace, and it is indistinguishable from a switch nobody made.",
+            assignments.len()
+        );
+        // And that one assignment must be inside the funnel, not somewhere the
+        // scan happens to tolerate.
+        let funnel = source
+            .split_once("fn set_active_session_path(")
+            .expect("the funnel must exist")
+            .1;
+        assert!(
+            funnel
+                .split_once("\n    fn ")
+                .map(|(body, _)| body)
+                .unwrap_or(funnel)
+                .contains("self.active_session_path = next;"),
+            "the one assignment must be the funnel's own"
+        );
+    }
+
+    /// A switch is recorded; naming the row that is already active is not.
+    ///
+    /// ⚠ Both halves matter. Without the first the instrument is silent about
+    /// the thing it was built for. Without the second it would spend a record
+    /// per redundant re-activation — and `request_terminal_launch_for_active`
+    /// alone fired 13 times in 1.3 minutes on the GUI host, restating that
+    /// nothing moved, on a plane whose retention is a byte budget.
+    #[test]
+    fn a_redundant_activation_is_counted_and_a_real_one_is_recorded() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://one",
+            None,
+            None,
+            None,
+            None,
+            ActivationOrigin::user_gesture("test_click_one"),
+        );
+        assert_eq!(server.active_session_path(), Some("local://one"));
+        assert_eq!(
+            server.redundant_activations_for_test().values().sum::<u32>(),
+            0,
+            "the first activation of a row is a switch, not a repeat"
+        );
+        // The same row again, from a different origin: no switch happened, and
+        // the trace must not claim one.
+        server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://one",
+            None,
+            None,
+            None,
+            None,
+            ActivationOrigin::app_control("test_reopen_same"),
+        );
+        assert_eq!(
+            server
+                .redundant_activations_for_test()
+                .get("app_control")
+                .copied(),
+            Some(1),
+            "re-activating the row already active is counted, never recorded as a switch"
+        );
+        // A real switch clears the tally, because the counts describe the
+        // interval since the previous switch and nothing longer.
+        server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://two",
+            None,
+            None,
+            None,
+            None,
+            ActivationOrigin::user_gesture("test_click_two"),
+        );
+        assert_eq!(server.active_session_path(), Some("local://two"));
+        assert!(
+            server.redundant_activations_for_test().is_empty(),
+            "the tally is carried on the switch record and then reset"
+        );
+    }
+
+    /// ⛔ The vocabulary is fixed and it is what a reader filters on. A renamed
+    /// variant silently empties every query written against the old word —
+    /// including the one question this whole change exists to answer.
+    #[test]
+    fn the_origin_words_are_stable_and_only_a_gesture_is_a_gesture() {
+        for (kind, word) in [
+            (ActivationOriginKind::UserGesture, "user_gesture"),
+            (ActivationOriginKind::AppControl, "app_control"),
+            (ActivationOriginKind::History, "history"),
+            (ActivationOriginKind::Launch, "launch"),
+            (ActivationOriginKind::Restore, "restore"),
+            (ActivationOriginKind::Recovery, "recovery"),
+            (ActivationOriginKind::Internal, "internal"),
+        ] {
+            assert_eq!(kind.as_str(), word);
+        }
+        assert!(ActivationOrigin::user_gesture("x").is_user_gesture());
+        // ⚠ An orchestrator opening a row while somebody reads is the SYMPTOM,
+        // not the control. Counting app-control as a gesture would answer the
+        // entry's question with the wrong sign.
+        assert!(!ActivationOrigin::app_control("x").is_user_gesture());
+        assert!(!ActivationOrigin::recovery("x").is_user_gesture());
+        assert!(!ActivationOrigin::internal("x").is_user_gesture());
+    }
+
     use super::app_control_open_path_ready;
     use super::canonicalize_remote_machine_alias;
     use super::{parse_remote_agent_session_path, remote_scanned_row_path};
