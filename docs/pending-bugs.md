@@ -22215,5 +22215,50 @@ automating it further: the loop notifies and then RESTARTS the client, by an own
 reversed its original refusal to do so — so a supervisor is a decision about when someone's
 window may be restarted, not merely about uptime.
 
+**Re-measured four hours later, and the entry survives it.** The deployed version has since
+moved forward and now carries the fixes that were stranded — but **the roller did not do it**:
+no process carries the loop, and its log has not gained a line since the cycle that stopped it.
+Some other hand rolled the build. The gap it describes had already begun to reopen at the time
+of the re-measurement, with `main` sitting five commits past the deployed release.
+
+⚠ **That is the failure mode, not a reprieve from it.** A deploy that happens because somebody
+happened to do one is the same absent mechanism as a deploy that does not happen; it merely
+fails silently in the direction that looks fine. Reading "the fix arrived" as evidence the
+lane is healthy is the specific mistake this entry exists to prevent, and it is available to
+be made every time the gap is small.
+
 **Falsified by:** finding a supervisor that brings it back after its launching session exits,
 or any surface that reports how long it has been since a roll completed.
+
+## [11.9] THE PRESENCE MATRIX HAS NO READ-ONLY SURFACE, SO VERIFYING IT TAKES SOMEONE'S SCREEN
+
+**Status:** OPEN
+
+Every remote machine's `cli_presence` report is carried on `RemoteMachineSnapshot` and is
+what the "Agent CLI installation" modal renders. **It is not projected into `server app
+state`**, the read-only describe verb an agent uses to ask the running GUI what it holds.
+The projection carries each machine's `label`, `health`, `session_count`,
+`remote_deploy_state` and `ssh_target`, and drops the presence report entirely — a grep for
+`cli_presence` over a full describe payload returns zero hits.
+
+**What that costs.** The only way to read the matrix the user actually sees is to open the
+Settings modal on the running GUI, and the screenshot does not composite a modal while a
+terminal view is active, so the main area has to be swapped to the start page first. On a
+machine somebody is working on, verifying this one field means taking their viewport. That
+is why a fix to the matrix that was proven correct at the CLI on four machines still could
+not be confirmed as *rendered* without interrupting someone.
+
+**Why the CLI proof is not a substitute.** Per-machine `server remote cli-presence` answers
+what each machine reports about itself. It cannot show that the GUI asked, that the answer
+survived the wire, or that the row rendered against the right machine — which is precisely
+the class of fault this matrix exists to surface, and one that has already shipped once as a
+column labelled with the wrong host's answer.
+
+**The shape of the fix.** Project the presence report into the describe payload beside the
+machine entries that are already there. The field is serialized on the snapshot type
+already; only the projection drops it. A read-only verb that returns per-machine
+present/total makes this matrix verifiable by any seat, at any time, without touching a
+running window.
+
+**Falsified by:** any read-only verb or describe field that returns the per-machine
+present/total counts the modal renders.
