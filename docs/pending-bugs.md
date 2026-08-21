@@ -19798,6 +19798,37 @@ whose head was filtered out becomes a dangling pointer. `order_web_tabs_by_group
 draws a dangling head at root rather than dropping the tab, so that case is survivable — but
 only if the remap happens at all.
 
+## ⛔ EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS, AND NOTHING AUDITS THEM
+
+**Status:** OPEN. Measured 2026-08-21 while fixing `ygg-booter.py`.
+
+The fleet scripts live at `.agents/skills/yggterm-agent-fleet/*.py`, **inside the repo**, so
+every git worktree has its own copy. Both the watcher daemon and any agent invoking a verb
+resolve them by **RELATIVE** path — the live watcher's command line is literally
+`python3 .agents/skills/yggterm-agent-fleet/ygg-booter.py watch --host … --interval 300`.
+
+⇒ **Which copy runs is decided by the process's CWD**, not by anything anyone chose. When a
+fix to a fleet script lands on one lane's branch, it is live for sessions standing in that
+worktree and nowhere else. Measured right after committing a booter fix: 1 of 5 worktrees had
+it; the running watcher was in a worktree that did not, and neither did three other lanes.
+
+**Why this is worse than ordinary branch propagation.** These scripts are the fleet's
+INSTRUMENTS — the thing every lane uses to decide whether a row is alive, to defer a boot, to
+claim a seat. A lane running a stale copy gets stale *answers about other lanes*, and it has
+no way to tell: the script reports success in its own terms either way. A behavioural fix to
+an instrument is invisible to the sessions that most need it.
+
+⚠ **Same shape as the split install the daemon audit already reports for the binaries** ("do
+NOT trust one path's `--version` as the host's version; fix the deploy to write every copy").
+The audit covers `yggterm`/`yggterm-headless` and **does not cover the scripts**, so this half
+fails silently.
+
+**What is wanted:** either the audit grows a check that every worktree's fleet scripts agree
+(cheap: hash them and report disagreement, the way the binary audit does), or the scripts stop
+being resolved relatively — a single installed copy on PATH, with the in-repo tree as its
+source. ⛔ Do NOT "fix" an instance by copying the file into other worktrees: they are live
+checkouts holding other lanes' uncommitted work.
+
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
 **Status:** OPEN. Hit 2026-08-20 on the shared `~/gh/yggterm` checkout.
