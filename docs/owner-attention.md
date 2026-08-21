@@ -30,24 +30,6 @@ copies.
 
 ## Decisions only he makes
 
-- **Who runs the next roll?** *(narrowed 2026-08-21 ~10:0x — the work is no longer the
-  blocker, only the driver is.)* Seat 11.0 was to drive it and is **not a live row**: its
-  recorded seat is absent from the GUI's table, its predecessor transcripts have been cold
-  since 20-Aug 15:12 with no process behind any of them, and a second orchestrator reached the
-  same verdict independently. **What changed:** every lane's work, including five input-block
-  fixes in the class you reported as unusable input, is now on `origin/main` — so a roll built
-  from main carries all of it, and nothing is waiting to be merged. What remains is one person
-  deciding to run it. **Recommendation: let the next lane that finishes take it**, since the
-  constitution already says a restart needs no permission and the daemon/GUI split exists so a
-  deploy does not interrupt other agents. **Why no lane has simply done it:** a roll needs a
-  VERSION BUMP, and allocating a fleet-wide number is a release act every other lane's builds
-  ride on — that is an orchestrator's call, not a lane's. The pieces are all in place: the
-  deploy worktree exists on main, `scripts/bump-version.sh` allocates the number safely, and
-  `scripts/verify-input-block-fixes.sh` proves the five fixes afterwards. **To reverse:** name
-  a different driver, or say a lane may allocate the number.
-  *Meanwhile:* the lane keeps taking queue items that need no deploy, and stays subscribed to
-  run the verification the moment a roll lands.
-
 - **Do we read the embedded controller to get a true fan RPM?** Every ACPI fan interface on the
   reference client was enumerated and sampled and all of them are stubs — there is no tachometer to
   read, which confirms rather than contradicts the "fan speed has to be interpolated" reading. The
