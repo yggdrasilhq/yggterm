@@ -193,19 +193,20 @@ seats, and both failures are silent. A cheaper interim that needs no timing at a
 ask whether the row has a live agent PROCESS before destroying it, since a row with one
 has manifestly not failed to be born.
 
-## ⛔ [99.1] A FRESHLY BORN AGENT ROW REPORTS AN UNSENT DRAFT NOBODY TYPED
+## ⛔ [99.1·99.2] A COMPOSER'S PLACEHOLDER HINT IS COUNTED AS AN UNSENT DRAFT
 
 **Status:** OPEN
 
-Both agent rows created during the greeting run were reported as holding a composer
-draft, on a daemon where nothing had ever been typed into either. `terminal submit`
-therefore refused the FIRST message a row is ever sent — its brief — with
-`submitted:false` and *"the composer holds an unsent draft — refusing to probe, because
-the probe types a marker and clears the line with Ctrl+U and would destroy it"*.
+*Root-caused 2026-08-22 and deliberately not fixed here: the repair is in the daemon's
+composer reader, and this lane's scope was the fleet verbs. The root cause is below,
+which is the expensive half.*
 
-The rendered grid disagrees. `server screen` on that row shows an empty composer: the
-placeholder hint and the status line, nothing typed. Two instruments, one row, opposite
-answers, seconds apart.
+Rows are reported as holding a composer draft on planes where nothing has ever been
+typed into them. `terminal submit` therefore refuses the FIRST message a row is ever
+sent — its brief — with `submitted:false` and *"the composer holds an unsent draft —
+refusing to probe, because the probe types a marker and clears the line with Ctrl+U
+and would destroy it"*, and `input-check` answers `consuming_input:false` for the same
+reason.
 
 ⛔ **The refusal is correct behaviour on a wrong reading, which is why it is dangerous.**
 The law forbids retrying `submitted:false`, so a spawner that hits this has no way to
@@ -213,31 +214,49 @@ brief the row it just created, and the row then routes to the reap as never-brie
 `send` plus a lone carriage return delivers past it, but that path has no draft guard at
 all — it is the workaround, not the fix.
 
-⚠ On the live plane the same census reported 4 drafts across 36 owned sessions, which is
-plausible and not a mass false positive. So the trigger is something about a NEW row, not
-the detector in general. ⚠ Sandbox caveat as above.
+### The root cause, measured in a sandbox on 2026-08-22
 
-⇒ Recommended: find what the detector reads on a composer that has never been typed into,
-and give it a state for "no composer has appeared yet" distinct from "a draft is held" —
-the same distinction `input-check` already draws when it answers *"input readiness is
-unanswerable rather than false"*. A single boolean cannot carry three answers, which is
-the shape of every other defect this run surfaced.
+`session_composer_holds_draft` is the UNION of two arms — a keystroke counter and the
+rendered grid — and either saying "there is text there" is enough to refuse. The grid
+arm is `yggterm_core::composer_row_holds_text`, which finds the composer marker on the
+composer row and returns true when **anything at all** follows it:
 
-## ⛔ [99.1] THE FLEET VERBS CANNOT BE AIMED AT A SANDBOX, SO THEY ARE NEVER TESTED AGAINST ONE
+    let head = text[marker.len_utf8()..].trim();
+    return Some(!head.is_empty() || !content.trim().is_empty());
 
-**Status:** OPEN
+⇒ **A CLI that draws a placeholder hint on its composer row when the composer is empty
+is indistinguishable, at that line, from a person mid-sentence.** Replayed over the
+rendered rows of an idle agent row that had just COMPLETED a turn, the marker's `head`
+was that CLI's suggestion text, so the arm returns true — and keeps returning it, for
+as long as the hint is drawn.
 
-`ygg-deliver`, `ygg-spawn`, `ygg-monitor` and `ygg-fold` all reach the row plane as
-`ssh <gui-host> ~/.local/bin/yggterm-headless server app …`. The binary path is a module
-constant and the home it resolves is the real one, so there is no way to point any of
-them at an isolated `YGGTERM_HOME` — `--host` moves which machine answers, never which
-home. A sandbox row plane is now reachable (recipe in the field guide), and these verbs
-still cannot be run against it.
+**The other arm is excluded, and this is what makes it a root cause rather than a
+suspicion:** a second row of a different CLI reported `composer_held_draft:true` when
+not one byte had ever been written to it by anything — no send, no submit, no probe —
+so the keystroke counter cannot be what produced it.
 
-⇒ That is why every defect in them has been found on somebody's live desktop, including
-the three fixed in this lane. Recommended: let the binary and the home come from the
-environment the caller already has to set anyway, so the verbs can be exercised in a
-sandbox before they are trusted with a destructive decision on a real row.
+⚖ **The entry this replaces called the trigger "something about a NEW row". It is not.**
+It is what the CLI paints on that line, so it lasts exactly as long as the hint does:
+transient for a CLI that clears it after boot, and observed persisting through a
+completed turn for one that does not. **The earlier live census — 4 drafts across 36
+owned sessions — was not re-measured here**, so how much of the fleet this reaches is
+still open; the per-CLI shape of the hint decides it, not the age of the row.
+
+⇒ Recommended: the grid arm must distinguish CHROME on the composer row from CONTENT.
+The same file already has `composer_row_is_chrome` for rows BELOW the composer and a
+per-CLI `composer_footer_hints` list feeding it; a per-CLI `composer_placeholder_hints`
+is the shape that already exists here. ⛔ **Do not fix it by dropping the grid arm** —
+it is there because the keystroke counter is zeroed by a daemon handover, and the two
+cover each other. ⛔ And do not widen it to "ignore any short line": a person's
+half-typed sentence starts short.
+
+**What would falsify it being fixed:** an idle agent row of a CLI that draws a
+placeholder, on a plane where nothing has been typed, answering `composer_held_draft:
+false` — while a row with one real character typed into it still answers `true`.
+
+⭐ **It is now rehearsable without a desktop.** A sandbox `YGGTERM_HOME` + GUI reproduces
+it in about four minutes (recipe: field guide; aiming the verbs: fleet skill §11.9),
+which is how it was root-caused.
 
 ## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
 
