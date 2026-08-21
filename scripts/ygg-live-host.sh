@@ -82,12 +82,27 @@ has_gui() {  # host ("" = this machine)
     [ -n "$BIN" ] || return 1
     out="$("$BIN" server app clients 2>/dev/null)" || return 1
   fi
+  # ⛔⛔ "HAS A GUI CLIENT" IS NOT "IS THE LIVE DESKTOP", AND THE DIFFERENCE IS
+  # A WHOLE HOST. The headless build hosts run their own yggterm GUI against an
+  # Xvfb display (`:10.0`) for sandbox and capture work, so a bare non-empty
+  # client list is TRUE on every machine in the fleet — and this function's
+  # answer decides where deploys, screenshots and UI proof are aimed. Measured
+  # 2026-08-21: with the list-length test, a headless host resolved itself as
+  # the live GUI host.
+  #
+  # ⇒ A DESKTOP client has a SEAT and a sandbox client does not. The reply
+  #   already carries it: `wayland_display` on a Wayland desktop, `xauthority`
+  #   on an X one; the Xvfb client has neither. Require a seat, not a count.
   printf '%s' "$out" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(1)
 c=d.get("clients")
 if c is None: c=(d.get("data") or {}).get("clients")
-sys.exit(0 if (c and len(c)>0) else 1)' 2>/dev/null
+if not c: sys.exit(1)
+seated=[x for x in c
+        if (x.get("wayland_display") or "").strip()
+        or (x.get("xauthority") or "").strip()]
+sys.exit(0 if seated else 1)' 2>/dev/null
 }
 
 remember() {  # host — cache the answer where the override already lives
