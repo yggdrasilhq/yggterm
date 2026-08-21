@@ -78671,6 +78671,97 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                         cell_css_height: cellH,
                     };
                 };
+                // ⛔⛔ THE RENDERER'S OWN STATE, IN THE SAME FRAME AS THE PIXELS.
+                //
+                // The paint fault this record exists for is INTERMITTENT — two
+                // firings in about fifteen attempts — so the strategy of "run it
+                // again with more logging" costs an hour per question and usually
+                // answers none. The frame has to explain itself the one time it
+                // fires. These are the fields that were reached for by hand while
+                // chasing it, captured at composite time instead.
+                //
+                // ⭐ `atlas_index` is the one that is not obvious and is the whole
+                // reason this block exists. MEASURED 2026-08-22: three live hosts
+                // returned THREE atlas objects and ONE distinct atlas — the WebGL
+                // addon keeps a module-level cache and hands every terminal whose
+                // font, theme and DPR match the SAME `TextureAtlas` (it grew to 7
+                // pages under all three at once). So an atlas operation is never
+                // per-terminal: `term.clearTextureAtlas()` wipes a texture every
+                // other host is drawing from, while clearing only ITS own glyph
+                // model and redrawing only ITS own viewport. Equal `atlas_index`
+                // values across hosts is that sharing, visible in the frame.
+                //
+                // ⚠ AND IT IS NOT THE PROVEN CAUSE OF THE GARBLE — two direct
+                // tests refuted it (clear-via-another-host then full-refresh, and
+                // a seven-page flood then full-refresh, both left the measured
+                // host at 100% of cells). It is recorded because it is a real
+                // cross-terminal coupling that any future explanation has to sit
+                // beside, NOT because it is the answer. Do not re-derive either
+                // refutation; do not quote this as the root cause.
+                const readRendererState = () => {
+                    const atlases = [];
+                    const atlasIndexOf = (term) => {
+                        try {
+                            const rs = term._core && term._core._renderService;
+                            const r = rs && rs._renderer;
+                            const inner = (r && r.value) ? r.value : r;
+                            const atlas = inner && inner._charAtlas;
+                            if (!atlas) { return { index: -1, pages: null }; }
+                            let index = atlases.indexOf(atlas);
+                            if (index < 0) { atlases.push(atlas); index = atlases.length - 1; }
+                            return {
+                                index,
+                                pages: (atlas._pages || []).length,
+                                active_pages: (atlas._activePages || []).length,
+                            };
+                        } catch (_e) { return { index: -1, pages: null }; }
+                    };
+                    const hosts = [];
+                    for (const e of ordered) {
+                        if (!e || !e.term) { continue; }
+                        const atlas = atlasIndexOf(e.term);
+                        hosts.push({
+                            session_path: String(e.sessionPath || ''),
+                            host_id: String(e.hostId || ''),
+                            is_active: String(e.sessionPath || '') === activePath,
+                            atlas_index: atlas.index,
+                            atlas_pages: atlas.pages,
+                            atlas_active_pages: atlas.active_pages,
+                            mounted_at: Number(e.mountedAt || 0),
+                            // The repair funnel's own counters. A forced refresh
+                            // that never fired and one that fired and did not help
+                            // are different faults with the same screenshot.
+                            forced_refresh_count: Number(e.forcedRefreshCount || 0),
+                            forced_atlas_clear_count: Number(e.forcedAtlasClearCount || 0),
+                            last_atlas_clear_at_ms: Number(e.lastAtlasClearAtMs || 0),
+                            retained_write_paint_repair_count:
+                                Number(e.retainedWritePaintRepairCount || 0),
+                            last_retained_write_paint_repair_reason:
+                                String(e.lastRetainedWritePaintRepairReason || ''),
+                            // The agent-CLI discriminator itself: while this is in
+                            // the future the forced full refresh is suppressed, so
+                            // its value at capture time says whether the repair
+                            // COULD have run for this host.
+                            recent_frame_like_write_until_ms:
+                                Number(e.recentFrameLikeWriteUntilMs || 0),
+                        });
+                    }
+                    const indices = hosts.map((h) => h.atlas_index).filter((i) => i >= 0);
+                    return {
+                        now_ms: Date.now(),
+                        host_count: hosts.length,
+                        distinct_atlases: atlases.length,
+                        atlas_shared: atlases.length === 1 && indices.length > 1,
+                        hosts,
+                    };
+                };
+                let rendererState = null;
+                let rendererStateError = '';
+                try {
+                    rendererState = readRendererState();
+                } catch (error) {
+                    rendererStateError = (error && error.message) ? error.message : String(error);
+                }
                 let sameFrameBuffer = null;
                 let sameFrameBufferError = '';
                 try {
@@ -78708,6 +78799,8 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                     // from. See readSameFrameBuffer above.
                     buffer: sameFrameBuffer,
                     buffer_error: sameFrameBufferError,
+                    renderer: rendererState,
+                    renderer_error: rendererStateError,
                 });
             } catch (error) {
                 send({ ok: false, reason: (error && error.message) ? error.message : String(error) });
@@ -78779,6 +78872,10 @@ fn write_paint_frame_sidecar(
         "active_session_path": field("active_session_path"),
         "buffer": buffer.clone(),
         "buffer_error": field("buffer_error"),
+        // The renderer's own state at composite time — atlas sharing, the repair
+        // funnel's counters, and the suppression deadline. See the script.
+        "renderer": field("renderer"),
+        "renderer_error": field("renderer_error"),
     });
     let text = serde_json::to_string_pretty(&record).ok()?;
     std::fs::write(&sidecar, text).ok()?;
