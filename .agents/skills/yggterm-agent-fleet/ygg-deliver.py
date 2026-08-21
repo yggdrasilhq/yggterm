@@ -31,6 +31,8 @@ into what they have half-written and submits the fusion as their turn.
 import argparse, glob, json, os, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from ygg_rowarg import row_session_id  # noqa: E402
 YGG = "~/.local/bin/yggterm-headless"
 POLL_S = 20
 
@@ -126,7 +128,13 @@ def main():
         log(f"⛔ no row matches {a.target}")
         return 3
     uri = row["full_path"]
-    uuid = uri.rsplit("/", 1)[-1]
+    # ⛔ The ROW's own id, never a slice of its address. `full_path` is an
+    #    ADDRESS, and only a live `scheme://host/<uuid>` one ends in the id —
+    #    a row at rest is a store path, and one CLI's store names every
+    #    session file identically, so slicing collapsed five rows onto one.
+    #    Everything below keys on this: the never-arm guard that stops us
+    #    typing over a person, the temp file, and the reap.
+    uuid = row_session_id(row)
 
     why = never_armed(uuid)
     if why:

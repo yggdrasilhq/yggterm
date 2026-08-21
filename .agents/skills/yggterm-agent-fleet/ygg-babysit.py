@@ -543,8 +543,21 @@ def resolve_row_path(host, ident):
         d = ygg(host, "server", "app", "rows")
         for r in (d.get("data", {}) or {}).get("rows", []) or []:
             path = r.get("path") or ""
-            if path:
-                _ROWS_CACHE[path.rstrip("/").split("/")[-1]] = path
+            if not path:
+                continue
+            # ⛔ INDEX A ROW UNDER BOTH SPELLINGS OF ITS NAME. The daemon
+            #    publishes the row's real id; the tail of its address is only
+            #    the same string when the address is a live `scheme://host/<id>`
+            #    one. For a row at rest the tail is a FILE NAME — and one CLI
+            #    names every session file identically, so five rows shared a key
+            #    and a lookup by real id missed all five. A miss here is not
+            #    inert: `escalate` falls through to the notifying session, so the
+            #    card lands on the orchestrator that noticed instead of the row
+            #    that is stuck — the exact failure the next function warns about.
+            sid = (r.get("session_id") or "").strip()
+            if sid:
+                _ROWS_CACHE[sid] = path
+            _ROWS_CACHE.setdefault(path.rstrip("/").split("/")[-1], path)
     return _ROWS_CACHE.get(uuid)
 
 

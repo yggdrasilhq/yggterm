@@ -18,6 +18,62 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+
+**Status:** OPEN
+
+*Found 2026-08-22 while exercising the orchestration plane ACROSS CLIs. The row-identity
+half of this is fixed and gated; this is the other half, and it is a different fix.*
+
+**The measurement.** Eleven callsites across seven fleet verbs answer *"has this row ever
+written a word?"* with one hardcoded glob — the reference CLI's transcript store:
+
+```
+ygg-spawn.py    proves the brief arrived        ygg-fold.py     harvest before retiring
+ygg-deliver.py  proves delivery, and REAPS      ygg-monitor.py  last prose, stall evidence (x3)
+ygg-babysit.py  liveness over ssh (x2)          ygg-booter.py   evidence marker
+```
+
+The registry declares a store for **every** registered CLI, and they do not share a
+layout: one keeps a SQLite database, another a per-session directory, another rollout
+files whose names decorate the id. A row of any of them has no file where these verbs
+look, so the glob returns empty — and **empty is not an error, it is an answer**, the
+same answer a row that has genuinely never done anything would give.
+
+**Why that is worse than a false negative.** `ygg-deliver`'s reap test is *"has it ever
+written a word"*, and its own comment explains the asymmetry it is guarding: *"losing a
+working lane to a delivery timeout would be far worse than the debris this cleans up."*
+For a row outside the reference store that test can only ever answer no. ⇒ A working
+lane of any other CLI that is merely busy past the deadline is classified as never
+briefed and force-folded. The interlock is correctly reasoned and reads the wrong shelf.
+
+⚠ **`ygg-booter` reasoned about exactly this and still missed it.** Its marker documents
+that an unreadable result must never be treated as fresh evidence, and picks the safe
+direction deliberately — but "unreadable" was imagined as a permissions or timing
+failure, never as *"this row belongs to a CLI that keeps its transcripts somewhere
+else."* The care was real and aimed one category short.
+
+**⛔ The law that should have caught it already exists, and cannot see these files.**
+`no_store_path_literal_outside_the_agent_cli_registry` refuses exactly this hardcoding
+and is enforced in two Rust files by scanning their own source. The orchestration layer
+is Python and sits outside the fence, so the same literal that fails the build in one
+language is unreviewed in the other.
+
+**The fix, and why it is not a one-liner.** Ask the registry, which already knows each
+store's layout and how a session is recognised inside it — do not re-encode ten layouts
+in Python. Two supply lines are possible and the choice is the real work: a headless
+verb that resolves a row's transcript (one owner, needs a rolled binary before any host
+can use it), or a table generated from the registry and checked in beside the verbs with
+a Rust lock asserting it still matches (no deploy, one more artefact to keep honest).
+**Recommendation: the generated table**, because these verbs run on timers and on hosts
+mid-roll, and a resolver that needs the newest daemon to answer is unavailable exactly
+when a stalled fleet needs reading. ⚠ And a resolved path is not yet a readable
+transcript — one store is a SQLite database, so the ack-grep that proves delivery needs
+a per-store reader, not just a per-store path.
+
+**What would falsify it being fixed:** `ygg-deliver.py` proving delivery into a row of a
+non-reference CLI, and `ygg-monitor` reporting that row's last prose instead of silence.
+
 ## ⛔⛔⛔ [11.20] A ROLL TAKES A LIVE DAEMON'S SOCKET NAME AWAY, AND NOTHING CAN REACH IT AGAIN
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -879,51 +935,137 @@ grows faster than one agent could write and nothing reads its rate.
 **Falsifier:** restart the client while an agent row is running, then
 `pgrep -af <session-id>` — exactly one process, and the row still paints.
 
-## ⛔⛔ [11.0] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
+## ⛔⛔ [11.25] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *Owner-reported 2026-08-21 against a live Antigravity row still wearing its
-cwd-derived birth name. The registry-driven title fix landed and is real — it
-fixed ONE of the two chores.*
+cwd-derived birth name.*
 
-**The gap is between two chores, and each one believes the other has it.**
+**The observation that closes this entry:** that row, or one opened the same
+way, carrying a title from its own store after the lane branch lands and the
+daemon is swapped. Nothing below has been seen on the deployed plane — this seat
+does not land or deploy.
 
-```rust
-// daemon.rs:11838  collect_live_store_title_syncs_in — the registry-driven one
-let is_local_row = session.session_path.starts_with("local://")
-    || descriptor.runtime_key_scheme
-        .is_some_and(|scheme| session.session_path.starts_with(scheme));
-if !is_local_row { continue; }        // "a remote-*:// row rides the OTHER chore"
+**What was wrong, and it was two things stacked.**
 
-// daemon.rs:12042  remote_cc_title_poll_paths — the other chore
-if session.kind != SessionKind::ClaudeCode { continue; }
-```
+**(1) The gap between two chores, each believing the other had it.** A row keyed
+`remote-<slug>://` for any CLI other than Claude Code was skipped by the local
+chore for being remote, and refused by the remote chore for not being Claude
+Code. ⚠ "Local" there meant the PATH SCHEME, not the machine — a session on the
+daemon's own host, opened through the remote path, fell in the gap. Fixed by
+making the remote pickup registry-driven per descriptor: `remote_live_store_title`
+on the descriptor, `remote_store_title_poll_decisions` in the daemon, and one ssh
+per (machine, CLI) per tick.
 
-⇒ **A row keyed `remote-<slug>://` for any CLI other than Claude Code is skipped by
-the local chore for being remote, and refused by the remote chore for not being
-Claude Code.** It is titled by nothing, so it keeps whatever name it was born with.
+**(2) ⛔⛔ AND THE FIX FOR (1) READ THE TWO STORES THAT ARE EMPTY WHEN IT
+MATTERS.** The first remote probe asked the shared index and the shared history
+file, which is where a title lives once a CLI has got round to writing it there.
+Measured against a real store: of the **eight most recently touched
+conversations, ZERO had a row in the index and six had no history entry** — while
+**all eight** carried a usable prompt in their own transcript. So the probe
+answered "no title in store" for exactly the rows a person is looking at, which
+is the same reading as the defect it was written to repair. The A/B on that
+store: **2 of 8 answered before, 8 of 8 after.**
 
-⚠ **"Local" here means the PATH SCHEME, not the machine.** A session running on
-this very host, opened through the remote path, carries a `remote-*://` key and
-falls in the gap. The observed row was on the daemon's own fleet.
+⇒ The locator set is now the union of the CLI's own session store globs and the
+named files in its home, ranked so the chosen title still matches the local
+reader's precedence. Locked by
+`every_remote_title_probe_can_reach_the_sessions_own_store`.
 
-### ⛔⛔ AND THE INSTRUMENT BUILT TO CATCH THIS CANNOT SEE IT
+### ⛔ THE INSTRUMENT BUILT TO CATCH THIS COULD NOT SEE EITHER HALF
 
-`cli/store_title_miss` was added precisely so a failed title pickup is
-distinguishable from an empty store. It is emitted **from the local chore only**,
-and the local chore never looks at these rows. Measured: **zero `store_title_miss`
-events in a 40,000-event trace window** while an untitled row sat in the sidebar.
+`cli/store_title_miss` was emitted only from the chore that never looked at
+these rows, and only at the point a *lookup* failed — never at the point a row
+was *skipped*. Measured: zero such events in a 40,000-event window while an
+untitled row sat in the sidebar. **Independently re-measured 2026-08-21 on a
+99.9-minute, 40,248-event window: `cli/*` was 0.000% of the plane** — a probe
+that never fires and a system with nothing to report are the same reading.
 
-⇒ A probe that never fires and a system with nothing to report are the same
-reading. The miss counter must be emitted where the DECISION TO SKIP is made, not
-only where a lookup fails — a row skipped for its scheme is exactly the case
-nobody hears about.
+⇒ Replaced by the `cli_plane` grammar, whose rule is that **a skip is an
+outcome**: every classifier enumerates its skips and every sweep emits even when
+nothing happened, so silence now means the chore did not run.
 
-**The fix has the shape the local chore already took:** make the remote pickup
-registry-driven per descriptor instead of gated on one `SessionKind`. ⚠ It is not
-a one-line change — `read_live_store_title` is a local-file reader, and doing it
-per CLI over ssh is the actual work. Do not "fix" it by deleting the kind check.
+### ⭐ AND THE SET THAT STILL NEEDED ONE IS NOW EMPTY
+
+An earlier revision of this entry said "eight of the ten CLIs declare no remote
+probe, wiring each is a per-CLI measurement". **That framing was wrong and made
+the remainder look eight times larger than it was.** A store reader is owed only
+by a CLI that claims `TitleAuthority::Store` — which makes yggterm REFUSE to
+generate a title, on the reasoning that inventing one would disagree forever
+with the one the CLI wrote. The six `Generated` CLIs are titled by generation by
+design and owe nothing.
+
+So the real set was **two**, and both are closed (2026-08-21) — in opposite
+directions, which is the part worth keeping:
+
+* **One had already been measured and did not know it.** Its store entry parser
+  and its title-tail parser both sat in the registry, decoding the format, while
+  `read_live_store_title` was `None` — a field documented to mean *"this store
+  has never been read off a real machine"*. It got a local reader and a remote
+  probe, both exercised against a fixture. ⚠ Its chat file is not contractually
+  named for the session, so the lookup matches the stem first and falls back to
+  the first record's id.
+* **The other declared `Store` over a store that holds no title.** Its own
+  scanner says so in a comment and falls back to a generated title — so the SCAN
+  path already treated it as generating while the LIVE path honoured the
+  declaration and refused to. One CLI, two answers to "who names this row", and
+  the live answer was nobody. Its authority is `Generated` now.
+
+⛔ **The lock that named these two was a REPORT and is now a PROHIBITION.** A CLI
+that is store-authoritative with no reader can never be titled at all, so the
+combination is refused rather than listed. Leaving the reader `None` is still
+honest for an unmeasured store — but then the CLI must not also claim its store
+is authoritative.
+
+⇒ A row of a CLI with no reader still reports `skipped_no_reader` every tick
+rather than vanishing from the count, and its birth event carries
+`store_title_reader:false`, so a reader need not wait for a title that was never
+coming.
+
+## ⛔ [11.25] THE ALL-CLI GREETING RUN HAS NOT BEEN TAKEN
+
+**Status:** AWAITING A DECISION
+
+**Who decides:** the owner — it spends money and wants a screen.
+
+**The ask:** spawn one session of every registered CLI through the normal path,
+make them greet each other, and score each one **per stage** — born, titled,
+resumable, addressable, delivered — because "CLI X is broken" is not actionable
+and "CLI X is born untitled and cannot be addressed" is.
+
+**Not taken, deliberately.** N agent sessions cost real money, and the run wants
+a GUI to open rows in — which on the reference client is the machine a person is
+working on. That is a spend-and-screen call, not an engineering one.
+
+**Recommendation: take it in a sandbox home against a headless daemon, not on
+the live client, and scope it to the CLIs with a working backend.** Two CLIs are
+known to have no connected model and will fail for that reason alone — that is a
+recorded absence, not a finding, and including them buys nothing. A sandbox run
+answers the same per-stage question without opening a row on anybody's desktop;
+only if a stage turns out to need the real GUI does this need his window.
+
+**What the campaign did instead, and it changes what the run has to discover:**
+
+* Four of the five stages are now answerable at rest rather than by spawning.
+  The registry locks assert which CLIs have a store reader, which have a remote
+  arm, which can be titled on each side of the local/remote seam, and which
+  resume selector each one gets. A stage that a lock can answer should not cost
+  an agent session.
+* The `cli_plane` grammar means the run, when taken, is READABLE: one filter on
+  `category=="cli"` yields a row's whole life — birth, launch shape, every title
+  attempt with its skips enumerated, and the re-key across a restart. Before it,
+  the run would have produced four vocabularies and no way to diff one CLI's
+  path against the reference one's.
+
+⇒ So the residue the run uniquely buys is the **delivered** stage — whether a
+row of each CLI can actually be addressed and receive a message — plus resume
+under real conditions. That is a much smaller and cheaper run than the original
+shape, and it is the version recommended.
+
+⚠ **Known-absent backends are recorded, not chased.** A CLI failing for want of
+a connected model must be scored as absent-backend, or the next reader spends a
+session rediscovering that a CLI nobody has credentials for does not answer.
 
 ## ⛔ [11.23] A DELIBERATELY DISMISSED WEB SURFACE CAN BE REBUILT BY THE HEARTBEAT THAT RACES IT
 
@@ -18728,6 +18870,56 @@ quick one.
 
 **Falsifier:** `ls -l --time-style=full-iso ~/.yggterm/event-trace.*.jsonl`
 before and after `cargo test -p yggterm-shell`; if no mtime moves, this is wrong.
+
+⚠ **UPDATE 2026-08-21 — the anticipated failure has now been SEEN, once.**
+`local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id` went red in a
+full `-p yggterm-server --lib` run and passed on its own and in the two full runs
+after it. It asserts that a second `refresh_local_cc_relaunch_launch_command` is
+a no-op, which only holds while "derived truth" does not move between the two
+calls — and derived truth is read from the machine's live agent store, which on
+a developer box is being written continuously by the agent sessions running on
+it. So this is no longer "corrupts no test": it is a test whose result depends on
+who else is typing.
+
+⇒ It raises the priority of the isolated `YGGTERM_HOME` rather than changing the
+fix. ⛔ **Do not "fix" the symptom by relaxing the no-op assertion** — that
+assertion is load-bearing (it is what catches a rebuild that never converges),
+and weakening it would trade a real gate for a quiet suite.
+
+### ⛔⛔ AND THE SAME RACE, CAUGHT IN THE ACT WITH A DIFF
+
+`agent_arm_matrix::locality_does_not_fork_the_invocation` fails in roughly one
+full `-p yggterm-server --lib` run in three to six, **never in isolation, and
+identically at HEAD and under unrelated changes** — so it is not a regression,
+it is this entry. The captured pair differs in exactly one thing:
+
+```
+left  … && export COLORFGBG='15;0' && export YGGTERM_TERMINAL_COLOR_FOREGROUND=…
+right … && export COLORFGBG='15;0' && export YGGTERM_HOME='/tmp/yggterm-persist-drop-<pid>-<nanos>' && …
+```
+
+⇒ A sibling test pointed the PROCESS at a temporary home between one build and
+the next, and everything derived from it — the npm prefix, the npm bin on
+`PATH` — moved with it. The two arms never forked; the environment did.
+
+**Two quick fixes were tried and BOTH FAILED, which is the useful part:**
+
+1. **Guard on the identity being intact.** The existing guard samples one value
+   (the pinned background) on each side and treats a match as proof both came
+   from one identity. Widening it to compare the whole colour profile read back
+   from the environment did not help — **the stolen variable was never a colour
+   at all.** ⚠ The one-field sample is still a real hole, just not this one.
+2. **Retry until the pair agrees**, on the reasoning that a genuine fork is a
+   function of KIND and differs every time while a race differs intermittently.
+   Also failed: it still went red, meaning it disagreed on all eight attempts.
+   **The interfering window outlasts a burst of fast retries** — the temporary
+   home is held for the length of a sibling test, not for an instant.
+
+⇒ Both failures corroborate this entry's own note that an isolated
+`YGGTERM_HOME` for the test binary is the answer and that it "needs a real
+answer, not a quick one". ⛔ **Do not attempt a third guard here.** No test can
+defend itself against a process-global variable another test owns; the fix is
+that no test may set it process-globally.
 
 ## ★★★ FIVE VERBS REPORT THE REQUEST, NOT THE EFFECT — one rule, not five patches
 

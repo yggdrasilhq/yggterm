@@ -20,7 +20,8 @@
 //! * TITLE had exactly one event, emitted from one of the two chores, at the
 //!   point a lookup FAILED — never at the point a row was skipped;
 //! * INTEGRATION (resume, re-resume, the scheme a row is re-resolved to) had
-//!   no vocabulary of its own.
+//!   no vocabulary of its own — `restore` gives it one, and it is the moment
+//!   where "this CLI comes back and the reference one does not" is settled.
 //!
 //! ⇒ So this module is not "more logging". It is **one grammar** whose events
 //! share `slug` and `session_path`, so a single filter on `category=="cli"`
@@ -273,6 +274,42 @@ impl CliTitleOutcome {
     }
 }
 
+/// One row's title outcome for one chore tick.
+fn title_payload(
+    session_path: &str,
+    kind: SessionKind,
+    session_id: &str,
+    chore: CliTitleChore,
+    outcome: CliTitleOutcome,
+    detail: Value,
+) -> Value {
+    let mut payload = json!({
+        "session_path": session_path,
+        "slug": slug_of(kind),
+        "session_id": session_id,
+        "chore": chore.label(),
+        "outcome": outcome.label(),
+    });
+    merge(&mut payload, CliKeyScheme::of(kind, session_path).payload());
+    merge(&mut payload, detail);
+    payload
+}
+
+/// The tick summary one chore emits.
+fn sweep_payload(
+    chore: CliTitleChore,
+    considered: usize,
+    untitled: usize,
+    counts: &BTreeMap<&'static str, usize>,
+) -> Value {
+    json!({
+        "chore": chore.label(),
+        "considered": considered,
+        "left_untitled": untitled,
+        "by_outcome": counts,
+    })
+}
+
 /// The edge-trigger memory: the last signature emitted per (chore, row).
 ///
 /// ⚖ A `Mutex<HashMap>` and not a lock-free structure because it is touched
@@ -305,14 +342,13 @@ fn sweep_state() -> &'static Mutex<HashMap<CliTitleChore, (BTreeMap<&'static str
 /// descriptor drove this row and how is it keyed", is emitted only for agent
 /// kinds, and derives every field from the registry rather than from the
 /// callsite. Neither can be reconstructed from the other.
-pub fn emit_birth(
-    component: &str,
+fn birth_payload(
     session_path: &str,
     kind: SessionKind,
     session_id: &str,
     machine: Option<&str>,
     cwd_present: bool,
-) {
+) -> Value {
     let scheme = CliKeyScheme::of(kind, session_path);
     let mut payload = json!({
         "session_path": session_path,
@@ -329,7 +365,60 @@ pub fn emit_birth(
             .is_some_and(|descriptor| descriptor.read_live_store_title.is_some()),
     });
     merge(&mut payload, scheme.payload());
+    payload
+}
+
+/// A row was created for an agent CLI.
+pub fn emit_birth(
+    component: &str,
+    session_path: &str,
+    kind: SessionKind,
+    session_id: &str,
+    machine: Option<&str>,
+    cwd_present: bool,
+) {
+    let payload = birth_payload(session_path, kind, session_id, machine, cwd_present);
     crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "birth", payload);
+}
+
+/// A persisted row was restored, and RE-KEYED on the way in.
+///
+/// The fourth moment of a CLI row's life, and the one that had no vocabulary at
+/// all. Restore does not merely reload a row — it re-resolves it: a raw storage
+/// path becomes a runtime key, a machine key is case-folded, and for a CLI that
+/// mints its own session id the persisted id outranks the key it was born under
+/// (while for a CLI born carrying the row's uuid the key stays authoritative,
+/// because preferring a stored id there once repointed a live row at another
+/// session's transcript).
+///
+/// ⇒ That decision is where "this CLI resumes and the reference one does not"
+/// is actually settled, and it was previously visible only by diffing two
+/// snapshots taken either side of a restart. `rekeyed` says whether the row
+/// moved; the two schemes say what it moved BETWEEN.
+///
+/// ⚖ Emitted once per agent row per restart — bounded by the row count, not by
+/// a tick — and not at all for a plain shell, which is not on this plane.
+pub fn emit_restore(component: &str, from_path: &str, to_path: &str, kind: SessionKind) {
+    if let Some(payload) = restore_payload(from_path, to_path, kind) {
+        crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "restore", payload);
+    }
+}
+
+/// `None` for a kind no CLI descriptor serves — a plain shell is not on this
+/// plane, and giving it a row here would make the CLI counts meaningless.
+fn restore_payload(from_path: &str, to_path: &str, kind: SessionKind) -> Option<Value> {
+    agent_cli_descriptor(kind)?;
+    let mut payload = json!({
+        "session_path": to_path,
+        "from_path": from_path,
+        "slug": slug_of(kind),
+        "kind": format!("{kind:?}"),
+        "rekeyed": from_path != to_path,
+        "from_scheme": CliKeyScheme::of(kind, from_path).prefix,
+        "id_origin": CliIdOrigin::declared_for(kind).label(),
+    });
+    merge(&mut payload, CliKeyScheme::of(kind, to_path).payload());
+    Some(payload)
 }
 
 /// What a composed CLI invocation looks like, without quoting the command.
@@ -368,7 +457,12 @@ pub fn emit_launch(component: &str, kind: SessionKind, shape: CliInvocationShape
         component,
         CLI_PLANE_CATEGORY,
         "launch",
-        json!({
+        launch_payload(kind, shape),
+    );
+}
+
+fn launch_payload(kind: SessionKind, shape: CliInvocationShape<'_>) -> Value {
+    json!({
             "slug": slug_of(kind),
             "kind": format!("{kind:?}"),
             "action": shape.action,
@@ -378,8 +472,7 @@ pub fn emit_launch(component: &str, kind: SessionKind, shape: CliInvocationShape
             "extra_arg_tokens": shape.extra_arg_tokens,
             "persistent": shape.persistent,
             "id_origin": CliIdOrigin::declared_for(kind).label(),
-        }),
-    );
+    })
 }
 
 /// One chore tick's pass over the live rows: it records an outcome per row and
@@ -448,15 +541,14 @@ impl CliTitleSweep {
             return;
         }
 
-        let mut payload = json!({
-            "session_path": session_path,
-            "slug": slug_of(kind),
-            "session_id": session_id,
-            "chore": self.chore.label(),
-            "outcome": outcome.label(),
-        });
-        merge(&mut payload, CliKeyScheme::of(kind, session_path).payload());
-        merge(&mut payload, detail);
+        let payload = title_payload(
+            session_path,
+            kind,
+            session_id,
+            self.chore,
+            outcome,
+            detail,
+        );
         crate::perf::ytrace_emit_event(self.component, CLI_PLANE_CATEGORY, "title", payload);
     }
 
@@ -495,12 +587,7 @@ impl CliTitleSweep {
             self.component,
             CLI_PLANE_CATEGORY,
             "title_sweep",
-            json!({
-                "chore": self.chore.label(),
-                "considered": considered,
-                "left_untitled": self.untitled,
-                "by_outcome": self.counts,
-            }),
+            sweep_payload(self.chore, considered, self.untitled, &self.counts),
         );
     }
 }
@@ -596,5 +683,123 @@ mod tests {
         let mut base = json!({"a": 1});
         merge(&mut base, json!({"b": 2}));
         assert_eq!(base, json!({"a": 1, "b": 2}));
+    }
+
+    /// A plain shell is not a CLI row, and counting it as one would make every
+    /// per-CLI figure on this plane a different number than it claims to be.
+    #[test]
+    fn a_restore_that_is_not_an_agent_row_is_not_on_this_plane() {
+        assert!(restore_payload("local://a", "local://a", SessionKind::Shell).is_none());
+        assert!(restore_payload("local://a", "local://a", SessionKind::ClaudeCode).is_some());
+    }
+
+    /// ⭐ The re-key is the whole point of the event: a row that came back
+    /// under a different key took a different path from the reference CLI's,
+    /// and the two schemes say what it moved between.
+    #[test]
+    fn a_restore_reports_the_scheme_a_row_moved_between() {
+        let kept = restore_payload("local://abc", "local://abc", SessionKind::ClaudeCode)
+            .expect("an agent row");
+        assert_eq!(kept["rekeyed"], serde_json::json!(false));
+
+        let moved = restore_payload(
+            "local://abc",
+            "cc-runtime://abc",
+            SessionKind::ClaudeCode,
+        )
+        .expect("an agent row");
+        assert_eq!(moved["rekeyed"], serde_json::json!(true));
+        assert_eq!(moved["from_scheme"], serde_json::json!("local://"));
+        assert_eq!(moved["scheme"], serde_json::json!("cc-runtime://"));
+    }
+
+    /// The bytes a written trace line costs beyond its payload — `ts_ms`, `pid`,
+    /// `component`, `category`, `name` and the JSON punctuation around them.
+    /// Measured off a live trace file, where a 195-byte line carried an 81-byte
+    /// payload.
+    const LINE_ENVELOPE_BYTES: usize = 114;
+
+    /// ⛔⛔ STATE THE PROBE'S SHARE OF THE PLANE, AND KEEP STATING IT.
+    ///
+    /// Trace retention is a BYTE budget shared by every lane, so a probe's cost
+    /// is taken out of everyone else's window. One lane's span-per-flush turned
+    /// out to be 48.7% of all trace bytes and halved every other lane's
+    /// retention — measured only after it had shipped.
+    ///
+    /// ⇒ The share is asserted here rather than written in a commit message,
+    /// because a number in a commit message describes the day it was written
+    /// and this one has to stay true. The live plane it is measured against
+    /// carried **86.9 KiB/min over a 99.9-minute, 40,248-event window**.
+    ///
+    /// The steady state is what matters: birth and launch are per-session
+    /// events (a person opening a row), while the two title chores tick
+    /// continuously forever. With every row's outcome unchanged — the normal
+    /// case, since a title is picked up once and then stays — an edge-triggered
+    /// chore emits nothing per row, and the whole recurring cost of this module
+    /// is one heartbeat sweep per chore.
+    #[test]
+    fn the_cli_plane_states_its_share_of_the_trace_byte_budget() {
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        // A deliberately unkind sweep: every outcome present at once, which is
+        // the widest `by_outcome` map the payload can carry.
+        for outcome in CliTitleOutcome::ALL {
+            counts.insert(outcome.label(), 7);
+        }
+        let sweep = sweep_payload(CliTitleChore::Remote, 49, 21, &counts);
+        let sweep_bytes = serde_json::to_string(&sweep).expect("payload serialises").len()
+            + LINE_ENVELOPE_BYTES;
+
+        let sweeps_per_hour = 2 * (3600 / SWEEP_HEARTBEAT.as_secs() as usize);
+        let steady_bytes_per_hour = sweeps_per_hour * sweep_bytes;
+
+        // The measured plane, over the window this was calibrated against.
+        const PLANE_KIB_PER_MIN: usize = 87;
+        let plane_bytes_per_hour = PLANE_KIB_PER_MIN * 1024 * 60;
+        let share_per_mille = 1000 * steady_bytes_per_hour / plane_bytes_per_hour;
+
+        assert!(
+            share_per_mille <= 10,
+            "the CLI plane's steady-state cost is {steady_bytes_per_hour} bytes/hour, \
+             {}.{}% of a {PLANE_KIB_PER_MIN} KiB/min plane — state the new share and \
+             justify it before raising this ceiling",
+            share_per_mille / 10,
+            share_per_mille % 10
+        );
+
+        // The per-event half, bounded so a field added to birth or launch is a
+        // decision rather than a drift.
+        let birth = birth_payload(
+            "remote-example://build-box/6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            SessionKind::ClaudeCode,
+            "6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            Some("build-box"),
+            true,
+        );
+        let launch = launch_payload(
+            SessionKind::ClaudeCode,
+            CliInvocationShape {
+                action: "resume",
+                selector: "--resume",
+                carries_id: true,
+                re_roots_with_cwd: false,
+                extra_arg_tokens: 2,
+                persistent: true,
+            },
+        );
+        let restore = restore_payload(
+            "local://6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            "cc-runtime://6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            SessionKind::ClaudeCode,
+        )
+        .expect("an agent row is on this plane");
+        for (name, payload) in [("birth", &birth), ("launch", &launch), ("restore", &restore)] {
+            let bytes =
+                serde_json::to_string(payload).expect("payload serialises").len() + LINE_ENVELOPE_BYTES;
+            assert!(
+                bytes <= 600,
+                "the {name} event costs {bytes} bytes; it fires once per session event, \
+                 so it is affordable, but a field was added without anyone saying so"
+            );
+        }
     }
 }

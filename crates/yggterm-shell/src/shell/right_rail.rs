@@ -531,7 +531,49 @@ fn WebOmniboxBar(
                 placeholder: "Search or enter address",
                 onfocus: {
                     let address_input_id = input_id.clone();
+                    let nav_path = nav_path.clone();
                     move |_| {
+                        // ⛔⛔ FOCUS IS THE TRIGGER, WHOEVER CAUSED IT. Owner-
+                        // reported: *"Not all omnibox highlight in vertical tab
+                        // mode spawn the command palette."*
+                        //
+                        // The palette is DERIVED — it is open exactly when the
+                        // active surface holds an `address_draft`
+                        // (`web_command_palette_open`). Until now the only
+                        // non-test caller of `web_surface_begin_address_edit`
+                        // was `focus_web_omnibox`, the path Ctrl+L and a new
+                        // typing-ready tab take. **Clicking the field took a
+                        // different road**: the DOM focused, the text below
+                        // selected — the "highlight" the report names — and no
+                        // draft was ever set, so the palette did not open.
+                        //
+                        // One gesture, two outcomes, decided by which code path
+                        // happened to focus the input. Beginning the edit here
+                        // makes the DOM's own focus event the single trigger, so
+                        // every way in agrees. It is idempotent: the edit begins
+                        // from the current URL, and a focus that arrives via
+                        // `focus_web_omnibox` has already set the same draft.
+                        // ⚠ ONLY when there is no draft yet. Beginning the edit
+                        // RESETS the draft to the tab's URL — right for Ctrl+L,
+                        // which is a deliberate "address me", and wrong here: a
+                        // focus event can arrive while the user is mid-word (a
+                        // re-render that returns focus, a click back into a
+                        // field they had already typed into), and resetting
+                        // then would eat what they had typed. That is the same
+                        // complaint as the completion race one handler below,
+                        // and it must not be reintroduced by the fix for the
+                        // palette.
+                        let has_draft = state.with(|shell| {
+                            shell
+                                .web_surfaces
+                                .get(&nav_path)
+                                .is_some_and(|surface| surface.address_draft.is_some())
+                        });
+                        if !has_draft {
+                            state.with_mut_counted(|shell| {
+                                shell.web_surface_begin_address_edit(&nav_path)
+                            });
+                        }
                         let _ = document::eval(&format!(
                             r#"(function(){{
                                 var el = document.getElementById('{id}');
@@ -557,15 +599,52 @@ fn WebOmniboxBar(
                         if let Some((completed, typed_len, completed_len)) = completion {
                             let completed_js = serde_json::to_string(&completed)
                                 .unwrap_or_else(|_| "\"\"".to_string());
+                            // ⛔⛔ THIS WRITE-BACK IS ASYNCHRONOUS AND THE USER IS
+                            // STILL TYPING INTO THE FIELD IT WRITES TO. Owner-
+                            // reported: *"Typing in the command palette is a
+                            // nightmare. It just does not let me type."*
+                            //
+                            // `oninput` fires, this schedules a frame, and the
+                            // frame lands ~16 ms later. A fast typist's next
+                            // keystroke arrives FIRST — and then the frame
+                            // overwrites the field with the completion computed
+                            // for the PREVIOUS keystroke, discarding the
+                            // character that was just typed. It reads exactly
+                            // like the field fighting you, and it gets worse the
+                            // faster you type, which is why it feels like the
+                            // omnibox refusing input rather than a race.
+                            //
+                            // ⇒ The completion is only valid for the text it was
+                            // computed FROM. Check that the field still holds
+                            // that prefix at the moment the frame runs; if the
+                            // user has moved on, drop this completion silently
+                            // — a later `oninput` has already produced the right
+                            // one. Never write a value derived from a keystroke
+                            // the field has already left behind.
+                            // ⚠ `typed_len` is a BYTE offset (it comes from
+                            // `value.len()`), so slice by bytes — and guard the
+                            // boundary rather than risk a panic on a non-ASCII
+                            // address the user pasted a prefix of.
+                            let typed_prefix = completed
+                                .is_char_boundary(typed_len)
+                                .then(|| completed[..typed_len].to_string())
+                                .unwrap_or_default();
+                            let typed_prefix_js = serde_json::to_string(&typed_prefix)
+                                .unwrap_or_else(|_| "\"\"".to_string());
                             let _ = document::eval(&format!(
                                 r#"requestAnimationFrame(function(){{
                                     var el = document.getElementById('{id}');
                                     if (!el) return;
+                                    // Still what we completed from? A completion
+                                    // for text the user has left behind must not
+                                    // land on top of what they typed since.
+                                    if (el.value !== {typed_prefix} && el.value !== {completed}) return;
                                     if (el.value !== {completed}) el.value = {completed};
                                     if (el.setSelectionRange) el.setSelectionRange({start}, {end});
                                 }});"#,
                                 id = address_input_id,
                                 completed = completed_js,
+                                typed_prefix = typed_prefix_js,
                                 start = typed_len,
                                 end = completed_len,
                             ));
