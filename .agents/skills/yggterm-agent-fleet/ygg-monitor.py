@@ -1064,6 +1064,25 @@ def _record_release(uuid, reason):
 def cmd_unsubscribe(a):
     uuid = _bare_uuid(a.uuid)
     p = sub_path(uuid)
+    # ⛔⛔ THIS VERB REFUSED THE PREFIX THAT `list` ITSELF PRINTS, AND SAID
+    # "NOT SUBSCRIBED" ABOUT A ROW IT HAD JUST DISPLAYED. `list` renders eight
+    # characters; the store is keyed on thirty-six; and the mismatch reported
+    # itself as an absence rather than as a lookup failure — the same shape as
+    # the `escalate_to` prefix bug this file already carries a comment about,
+    # arriving through the verb that REMOVES instead of the one that ROUTES.
+    # Measured 2026-08-21: three dead orchestrators were "unsubscribed" three
+    # times and stayed in the list, still absorbing escalations.
+    # ⚠ An ambiguous prefix is refused BY NAME rather than resolved to the first
+    #   match: unsubscribing the wrong row is silent and undoes a supervision.
+    if not p.exists() and len(uuid) < 36:
+        hits = sorted(q.stem for q in SUBS.glob(f"{uuid}*.json"))
+        if len(hits) == 1:
+            uuid, p = hits[0], sub_path(hits[0])
+        elif len(hits) > 1:
+            log(f"⛔ '{a.uuid}' is a PREFIX matching {len(hits)} subscriptions — name one in full:")
+            for h in hits:
+                log(f"   {h}")
+            return 2
     if p.exists():
         p.unlink()
         # ⛔ Record it BEFORE reporting success. A release that leaves no trace
