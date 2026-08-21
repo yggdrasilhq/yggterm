@@ -397,6 +397,22 @@ impl RowSets {
     /// page, which ignores the arrangement, kept showing them, and the two
     /// surfaces disagreed by exactly that count. Arrangement may nest and
     /// order; it may not make a row disappear.
+    /// Reorder every set's members by a key the CALLER computes.
+    ///
+    /// ⛔ THE KEY COMES FROM OUTSIDE BECAUSE THIS MODULE REFUSES TO KNOW WHAT A
+    /// SEAT IS. The containment relation and the numbering are deliberately
+    /// separate — `row_set_outline` is the one bridge between them — so the
+    /// ordering rule is passed in rather than reached for.
+    ///
+    /// Stable, so members sharing a key keep the order they were inserted in:
+    /// that is what lets un-numbered rows hold the place a drag gave them while
+    /// seated ones fall into outline order around them.
+    pub fn sort_members_by_key<K: Ord>(&mut self, key: impl Fn(&str) -> K) {
+        for members in self.members.values_mut() {
+            members.sort_by_cached_key(|member| key(member));
+        }
+    }
+
     pub fn visible_rows<'a>(
         &'a self,
         top_level: impl IntoIterator<Item = &'a str>,
