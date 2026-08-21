@@ -11812,6 +11812,14 @@ fn remote_cc_title_poll_paths(
         else {
             continue;
         };
+        // ⛔ The writer's rule, asked of the writer's own predicate. Polling a
+        // row whose title the owner set spends an ssh round trip to rediscover
+        // a delta `set_session_title_hint` will refuse — and a refused delta
+        // never stops being a delta, so the row re-arms the chore on every
+        // tick forever. See [`ManagedSessionView::title_is_owner_set`].
+        if session.title_is_owner_set() {
+            continue;
+        }
         if !working_paths.contains(&session.session_path)
             && confirmed_paths.contains(&session.session_path)
         {
@@ -12383,27 +12391,46 @@ fn run_background_copy_chore(
     }
 
     let mut runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_apply");
+    // ⭐ Count what LANDED, not what was proposed. A proposal the writer
+    // refuses changes nothing, so counting it as an update tells the chore's
+    // backoff that work is happening and pins the tick at its 12 s floor for
+    // the daemon's whole life — with an ssh, a locked screen sweep and a
+    // multi-MB persist on every one of those ticks. The detectors now share
+    // the writer's refusal predicate, and this is the second net: any FUTURE
+    // refusal path stops re-arming the cadence by construction.
+    let mut applied = 0usize;
     for update in &updates {
-        if let Some(title) = update.title.as_deref() {
-            runtime
+        if let Some(title) = update.title.as_deref()
+            && runtime
                 .server
-                .set_session_title_hint(&update.session_path, title);
+                .set_session_title_hint(&update.session_path, title)
+        {
+            applied += 1;
         }
         if let Some(summary) = update.summary.as_deref() {
             runtime
                 .server
                 .set_session_summary_hint(&update.session_path, summary);
+            applied += 1;
         }
     }
-    runtime.persist()?;
+    // Nothing changed ⇒ nothing to write. `persist` serializes the whole
+    // multi-MB server state under the write lock (p50 87 ms on the owner's
+    // laptop, 2108 calls in one retention window), and a tick that applied
+    // nothing was paying that for an identical file.
+    if applied > 0 {
+        runtime.persist()?;
+    }
     append_trace_event(
         runtime.store.home_dir(),
         "daemon",
         "background_copy",
         "tick",
-        serde_json::json!({ "updates": updates.len() }),
+        // Both numbers, always: `updates` alone read as progress while the
+        // same refused delta was being rediscovered every tick.
+        serde_json::json!({ "updates": updates.len(), "applied": applied }),
     );
-    Ok(updates.len())
+    Ok(applied)
 }
 
 fn remote_codex_identity_poll_enabled() -> bool {
@@ -27975,6 +28002,73 @@ mod tests {
         let picked = super::remote_cc_title_poll_paths(&sessions, &working, &confirmed);
         let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
         assert_eq!(paths, vec!["remote-cc://practice/aaaa"]);
+
+        // ⛔ THE LIVELOCK LOCK. A row the owner titled is refused by
+        // `set_session_title_hint`, so polling it can only rediscover a delta
+        // that will never be written — and a delta that is never satisfied
+        // re-arms the chore on every tick. The detector must share the
+        // writer's predicate, so an owner-titled row is not polled AT ALL,
+        // working or not.
+        let mut owner_titled = sessions.clone();
+        owner_titled[0].title_is_explicit = true;
+        owner_titled[0].title = "11.15 [daemon-burn]".to_string();
+        let picked = super::remote_cc_title_poll_paths(&owner_titled, &working, &confirmed);
+        assert!(
+            picked.is_empty(),
+            "an owner-titled working row must not be polled: the write is refused, \
+             so every poll re-detects the same permanently-unsatisfiable delta"
+        );
+
+        // ⚠ The empty-title arm: `title_is_explicit` with nothing in the title
+        // protects nothing, so the row is still polled rather than stranded.
+        let mut explicit_but_blank = sessions.clone();
+        explicit_but_blank[0].title_is_explicit = true;
+        explicit_but_blank[0].title = "   ".to_string();
+        let picked = super::remote_cc_title_poll_paths(&explicit_but_blank, &working, &confirmed);
+        let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
+        assert_eq!(paths, vec!["remote-cc://practice/aaaa"]);
+    }
+
+    /// The writer's own half of the same law: a refusal and a no-op both
+    /// answer `false`, because the caller's question is "did this row change",
+    /// and a chore that reads a refusal as an update never decays to idle.
+    #[test]
+    fn title_hint_reports_refusal_and_noop_as_not_applied() {
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(
+            crate::SessionKind::ClaudeCode,
+            Some("/home/user"),
+            Some("home/pi claude"),
+        );
+
+        assert!(
+            server.set_session_title_hint(&path, "picked up from the transcript"),
+            "a fresh derived title on an underived row lands"
+        );
+        assert!(
+            !server.set_session_title_hint(&path, "picked up from the transcript"),
+            "the same title again changes nothing and must not read as an update"
+        );
+
+        server.set_session_title_explicit(&path, "3.1 [lane]: the owner's own name");
+        assert!(
+            !server.set_session_title_hint(&path, "picked up from the transcript"),
+            "an owner-titled row REFUSES the hint, and the refusal must be visible \
+             to the caller — this is the signal the 12 s livelock lacked"
+        );
+        assert_eq!(
+            server
+                .live_sessions()
+                .iter()
+                .find(|session| session.session_path == path)
+                .map(|session| session.title.as_str()),
+            Some("3.1 [lane]: the owner's own name"),
+            "and the owner's title still stands"
+        );
     }
 
     #[test]
