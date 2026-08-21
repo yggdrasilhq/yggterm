@@ -199,6 +199,17 @@ the supervisor to respawn on clean child exit), honouring the active-viewport co
 until the viewer is idle, bounded). **Falsifier:** swap the binary, run the verb, and the new
 pid runs the new image with the supervisor alive and every row intact.
 
+⚠ **MEASURED 2026-08-21 (11.14) — half of claim (2) is stale: `server app launch --replace`
+IS a clean path on a detached-GUI host.** Run twice on the integrator host, it retired the
+incumbent and brought the GUI up on the CURRENT disk image (`74430ab3` → `12f1e2288018`) with
+the row table intact (710 → 712, the delta being probe rows) and every daemon-owned PTY
+untouched — including the caller's own session, whose PTY is parented to the daemon and not
+to the GUI. It also refuses by name rather than silently adding a second GUI (`launching would
+ADD a second one … Re-run with --replace`). ⛔ **The supervisor half of claim (1) is NOT
+falsified and was not testable there:** that host's GUI is parented to pid 1, so there is no
+supervised pair to lose. Re-test the supervisor claim where the GUI actually runs under one
+before treating this entry as closed.
+
 ## ⛔⛔ [11.9] THE HOT-RESTART GATE COMPARES VERSION STRINGS, SO A SAME-VERSION REBUILD NEVER ROLLS
 
 **Status:** OPEN
@@ -260,9 +271,49 @@ through `push_notification_with`, which the code states is the ONE enforcement p
 sound setting, and job cards do not pass through it. Adding a direct `emit_notification_chime`
 call here would be exactly the second delivery path that comment forbids, so the silence is
 ended with a card and an OS notification instead. If the chime turns out to be the half that
-matters, it belongs in the job-card path for every card, not in this one caller. **What live proof still owes:** raise a
-picker on the live host after the roll and read the dot, the Status, `gate-screen` and the
-card — and confirm the card's wording survives a row whose title is empty.
+matters, it belongs in the job-card path for every card, not in this one caller. **LIVE-PROVEN 2026-08-21 on 3.1.16 (11.14), on a throwaway Claude Code row so no owner row
+was touched.** A real CLI was driven until it raised a picker; it painted the measured phrase
+`Enter to select · ↑/↓ to navigate · Esc to cancel` verbatim, and all four readers answered:
+`gate-screen` → `screen_shows_question_picker: true` plus the STOPPED line; `server snapshot`
+→ `awaiting_user_choice: true`; the sidebar dot lit (`busy: true`); and the card raised as
+*“Waiting On Your Answer — … has stopped and is asking you to choose. Answer it on the row:
+arrow keys to move, Enter to select, Esc to cancel. ⛔ Typed text is ignored while a picker is
+up.”* ⭐ **Negative control:** the CLI's first-run trust prompt — also a select list, painting
+`Enter to confirm · Esc to cancel` — did NOT trip the detector, so it keys on the picker, not
+on select-lists generally. ⚠ **Measured propagation lag:** the daemon flipped the flag ~40 s
+before the dot lit and ~50 s before the card appeared, on a GUI reporting
+`background_refresh_suspended: true` / `idle_policy: active_viewport`. That is a conditioned
+number, not a general one — it has NOT been measured on a focused foreground GUI, and if it
+holds there it is too slow for a "this row is waiting on you" signal.
+
+**Two sub-legs still owed, and both are instrument problems rather than doubts about the fix:**
+(a) the metadata **Status** string (`asking you a question`) is produced in `right_rail.rs`
+from the same `awaiting_user_choice` field in the same precedence order, but **no app-control
+verb exposes the right rail**, so it cannot be read back by an agent — `server app state`
+never contains the string even with the row revealed and the card up. (b) The empty-title card
+wording is covered in code (`if label.is_empty()` drops the quoted clause) but was not
+exercised: `terminal new` without `--title` still synthesises one (`Agent unnamed claude-code:
+…`), and `session rename <row> ""` did not blank what the card reads, so that branch may be
+unreachable in practice.
+
+⛔⛔ **AND THE ENTRY'S OWN RATIONALE IS INVERTED FOR claude-code — MEASURED, TEN CONSECUTIVE
+SIMULTANEOUS SAMPLES.** Everything above (and the comments in `daemon.rs`, `sidebar.rs` and
+`right_rail.rs`) says *a row holding a picker is MID-TURN, so `working` reads `Some(true)` and
+the misread is "busy working"*. Live, with the picker confirmed up, the daemon's
+`session.working` reads **`false`**, because the per-CLI descriptor's working phrase leaves the
+screen when the picker takes it. ⇒ **The misread this state actually prevents is the OPPOSITE
+and the worse one: the row reads IDLE — i.e. finished — while it is stopped and eating every
+sentence typed at it.** The fix and its precedence are unaffected (testing
+`awaiting_user_choice` before `working` is correct under either reading); only the stated
+reason is wrong, and it is wrong in the direction that makes the bug sound milder than it is.
+
+⚠ **A second reader disagrees with the first, at the same instant, every time.**
+`gate-screen` reported `screen_text_shows_agent_working: true` on the same row, in the same
+sample, in all ten pairs where `server snapshot` reported `working: false`. They are different
+matchers by design — the daemon uses THIS CLI's descriptor, `gate-screen`'s field is the
+kind-agnostic union — but they share a name, and the agnostic one is the one a verifier reads
+first because it is printed in the gate output. Prefer the snapshot's `working` for a single
+known CLI.
 
 ⛔ **ONE HALF OF THE WANTED LIST WAS DELIBERATELY NOT BUILT, AND THE REASON IS THE
 MEASUREMENT.** "Typed text is refused" would break the thing it means to protect: the
@@ -662,7 +713,28 @@ the arm back if the row leaves the screen, and on exhaustion REFUSES LOUDLY: a n
 string recorded on the open attempt — which flips the rehydrate mode, changes the identity
 key, and engages the existing recovery lane as a second net exactly once. `retained_rehydrate_empty`
 now mirrors to ytrace too; it was the only witness to the 13-minute blank and was reachable
-only by reading the file trace by hand. ⚠ **This converges the owner's symptom without
+only by reading the file trace by hand.
+
+**PARTIAL LIVE PROOF 2026-08-21 on 3.1.16 (11.14) — the seed path RUNS and CONVERGES; the
+retry ladder is still unexercised.** Revealing a retained REMOTE RESUME row produced two full
+cycles against the version-stamped daemon socket (`…/server-3-1-16.sock`, i.e. the build
+under test), mode `collapsed-scrollback-recovery`:
+`retained_rehydrate_daemon_ready_begin` → `…_daemon_ready_wait` (**929 ms**, past the
+telemetry threshold, i.e. the daemon was NOT immediately readable — the exact condition that
+used to strand the arm) → `retained_rehydrate_begin` → **`retained_rehydrate_end`**. No blank
+canvas. Zero `retained_rehydrate_empty`, so zero `retry_scheduled` and zero `refused`: the
+ladder above `end` has never fired, because the failure did not occur.
+
+⛔ **AND IT CANNOT BE MANUFACTURED ON A HEALTHY FLEET, WHICH IS WHY THIS ARM KEEPS READING AS
+"NOT RUN".** Checked directly: of 53 `remote-cc://oc/` rows, exactly one has no transcript on
+the target host, and that one is a freshly-created probe — a `start-cc`, which does not take
+this path at all. The healthy attach is `request_to_ready_ms: 300`, so there is no window to
+race by hand. ⇒ **This arm closes by WATCHING for the shape when the fault next occurs, not by
+staging it.** The verdict to apply then is one relationship: every `retained_rehydrate_empty`
+must be followed by `retry_scheduled`, then `end` or a named `refused`; an `empty` alone is
+the bug unfixed.
+
+⚠ **This converges the owner's symptom without
 touching either daemon-side root** — the re-requested seed succeeds seconds later, as the
 control case did — so the four defects below are unchanged and still own the blockade.
 
