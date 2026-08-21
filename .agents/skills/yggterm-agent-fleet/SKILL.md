@@ -2841,13 +2841,43 @@ that separates this from a real hang**, and it was right both times.
 gate and a slow start are indistinguishable through `input-check`, and only one of
 them is fixed by waiting.
 
-**The fix is a bare `\r`**, and it is safe here for a reason worth stating rather
-than assuming: the highlight sits on the option that grants nothing beyond what
-the spawn already intended, and the gate is about a directory you chose. ⚠ That
-reasoning does NOT generalise to every highlighted prompt — a plan-limit or
-billing dialog wears the same shape and its options spend money. The rule stays:
-`❯` adjacent to exactly one numbered option is a selection, and you must read
-WHICH option before pressing Enter.
+⛔⛔ **CORRECTED WITHIN THE HOUR, BY THE OWNER, AND THE FIRST VERSION OF THIS
+ENTRY WAS WRONG IN THE MOST EXPENSIVE WAY.** It said *"the fix is a bare `\r`"*.
+A bare `\r` was sent, `input-check` was then asked and answered
+**`consuming_input: true`**, the brief was submitted and returned
+`submitted: true`, and the brief's token appeared in the transcript three times.
+Every instrument agreed. **The row was still sitting on the trust screen**, and
+the owner discovered it by switching to the row and reading it with his eyes;
+the brief had been QUEUED behind the gate and only ran once he pressed Yes by
+hand.
+
+⇒ **THE REAL LESSON IS NOT ABOUT THIS GATE.** `submitted:true` means the bytes
+were written, and a PTY accepts bytes whether or not anything is consuming them —
+so a queued brief and a delivered brief are byte-identical from the writer's
+side. The transcript check in §3 step 4 does not separate them either: it passes
+as soon as the text lands in the file, which happens when the gate clears,
+whenever that is. ⚠ **And `input-check` reported `consuming_input: true` for a row
+that was demonstrably consuming nothing** — treat that field as *"a write was
+accepted"*, never as *"an agent is reading"*.
+
+⛔ **AND THE PROCEDURAL ERROR THAT MADE IT INVISIBLE, which is the reusable half:**
+the `\r` was written with its output redirected to `/dev/null` and its answer
+never read, and then a DIFFERENT instrument was asked whether it had worked. **A
+verb whose result you discard has not been checked by asking something else.**
+The write may have failed outright; nobody will ever know, because the one record
+that could have said so was thrown away.
+
+⇒ **THE ONLY VERIFICATION THAT HELD WAS THE SCREEN.** After any write meant to
+dismiss a gate, READ THE SCREEN BACK and confirm the gate is gone. Not the write's
+success, not readiness, not the transcript — the pixels.
+
+⚠ The Enter itself is still the right ACTION at this gate, and it is safe here for
+a reason worth stating rather than assuming: the highlight sits on the option that
+grants nothing beyond what the spawn already intended, and the gate is about a
+directory you chose. That reasoning does NOT generalise — a plan-limit or billing
+dialog wears the same shape and its options spend money. The rule stays: `❯`
+adjacent to exactly one numbered option is a selection, and you must read WHICH
+option before pressing Enter.
 
 ⚠ **It fires per (CLI, directory), so a brand-new worktree hits it even though
 every sibling checkout is trusted** — which is exactly when a spawn recipe looks
