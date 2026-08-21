@@ -57,17 +57,18 @@ painted partially. Both are what "a mount begins with an empty surface" looks li
 rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
 filing three entries for one symptom chain is what made this look half-fixed once already.
 
-### ⭐ THE xterm.js HALF OF THE CHAIN NOW EXISTS — 2026-08-21, `xterm_paint`
+### ⭐ THE MOUNT→PAINT SPAN NOW EXISTS — 2026-08-21, `xterm_paint`
 
-*This section replaced the paragraph that said the tracing "does not exist yet". It did not
-exist; it does now, and leaving the old sentence standing would have routed the next reader
-away from the instrument built to serve this entry.*
+*This section replaced the paragraph that said the tracing "does not exist yet", which would
+otherwise have routed the next reader away from the instrument built to serve this entry.*
 
-The tracing asked for is END TO END — kernel call → daemon → client → **xterm.js layer** →
-pixel — and the xterm.js half was the gap: every measurement above stops at the Rust boundary,
-so "the mount began" and "the glyphs arrived" were the same event to every instrument in the
-project. **A mount begins with an empty surface**, so that gap is exactly where the ghost
-frames and the broken TUI paint live.
+⚠ **And it corrects that paragraph in the other direction too.** The xterm.js layer was NOT
+uninstrumented: `xterm_render/frame_gap` already carried `rows_painted` against `rows` and
+`frame_window` carried `full_canvas_frames`, and this probe is built on them rather than
+beside them. What did not exist is a probe that **spans the mount**. Every existing probe
+counts events in a running terminal; every native probe stops at the bridge; so "the mount
+began" and "the glyphs arrived" were the same event to all of them. **A mount begins with an
+empty surface**, which is exactly where the ghost frames and the broken TUI paint live.
 
 Three probes, `layer=xterm`, joined to the native half by `host_id` (which already encodes the
 mount epoch, so no second identity was introduced):
@@ -143,14 +144,11 @@ not a total.
 that would settle whether the *active session* changes on its own (see the paragraph below).
 That is a native-side event, not an xterm one, and this probe does not supply it.
 
-#### ⚠ AND THE PROBES THAT WERE ALREADY THERE — one of which lies about frame rate
+#### ⛔ AND ONE OF THE PRE-EXISTING PROBES LIES ABOUT FRAME RATE — with the ghost measured in it
 
-The paragraph this section replaced said the xterm.js layer had no instrument at all.
-That was too strong even before `xterm_paint` existed: `xterm_render/frame_gap` carries
-`rows_painted` against `rows`, `xterm_render/frame_window` carries `full_canvas_frames`
-against `count`, and `terminal_js/xterm_write_flush` carries `paint_repair` with its
-reason. What none of them could do is JOIN a write to the paint that showed it, which is
-the gap `xterm_paint` closes.
+*The inventory of what was already there is in the correction at the top of this section; this
+is the one reading from it that must not be taken at face value.* (`terminal_js/xterm_write_flush`
+belongs on that inventory too — it carries `paint_repair` with its reason.)
 
 ⛔ **`frame_gap` read as a frame-rate meter is a trap: its minimum IS its threshold**
 (250 ms), so it counts LATE frames only and any percentage taken from it is meaningless.

@@ -406,13 +406,14 @@ fn terminal_eval_script_with_canvas_renderer(
             }});
         }};
         // ── the mount→paint chain (category `xterm_paint`) ─────────────────
-        // ⭐ THIS IS THE HALF OF THE CHAIN THAT DID NOT EXIST. Every other
-        // probe above describes steady-state OUTPUT, and every probe on the
-        // Rust side stops at this boundary — so "the mount began" and "the
-        // glyphs arrived" were the same event to every instrument in the
-        // project, and a mount BEGINS WITH AN EMPTY SURFACE. That is why a
-        // half-painted switch and a clean one have been indistinguishable
-        // without a photograph of the screen.
+        // ⭐ WHAT WAS MISSING WAS NOT xterm INSTRUMENTATION — it was a probe
+        // that SPANS THE MOUNT. The probes above are real and are used here:
+        // they count write-queue depth, painted frames and screen resets. But
+        // every one of them counts EVENTS in a running terminal, and every
+        // probe on the Rust side stops at this boundary — so "the mount began"
+        // and "the glyphs arrived" were the same event to all of them, and a
+        // mount BEGINS WITH AN EMPTY SURFACE. That is why a half-painted switch
+        // and a clean one have been indistinguishable without a photograph.
         //
         // Four marks over one mount, joined to the native half by `host_id` —
         // which already encodes the mount epoch, so no second identity is

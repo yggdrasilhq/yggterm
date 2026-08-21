@@ -9091,14 +9091,14 @@ mod tests {
 
     #[test]
     fn the_mount_paint_chain_marks_open_write_parse_and_frame() {
-        // ⛔⛔ THE HALF OF THE CHAIN THAT DID NOT EXIST. Every other probe in
-        // this file stops at the Rust boundary or describes steady-state
-        // output, so "the mount began" and "the glyphs arrived" were one event
-        // to every instrument in the project — and a mount begins with an EMPTY
-        // surface. Without these four marks a half-painted switch and a clean
-        // one are indistinguishable in the trace, which is the reason the
-        // ghost-frame and broken-TUI-paint symptoms can only be judged from a
-        // photograph of the screen.
+        // ⛔⛔ THE SPAN NO PROBE COVERED. The canvas was instrumented — frame
+        // ranges, queue depth, screen resets — but every one of those counts
+        // events in a RUNNING terminal, and every native probe stops at the
+        // bridge, so "the mount began" and "the glyphs arrived" were one event
+        // to all of them. A mount begins with an EMPTY surface. Without these
+        // four marks a half-painted switch and a clean one are
+        // indistinguishable in the trace, which is why the ghost-frame and
+        // broken-TUI-paint symptoms could only be judged from a photograph.
         //
         // Reachability is the property under test, not presence: a helper that
         // exists and is never called is a probe that reads zero forever, and

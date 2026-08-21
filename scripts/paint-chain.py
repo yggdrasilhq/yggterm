@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Read the mount->paint chain end to end, in one query.
 
-⛔⛔ WHY THIS EXISTS. Until the `xterm_paint` probes landed, every instrument in
-this project stopped at the Rust boundary: the native side could say a terminal
-MOUNTED and the canvas could say it was busy, but nothing could say whether the
-glyphs ever arrived — and a mount begins with an EMPTY surface. So a ghost frame
-(the old row still on screen, the new mount not yet painted) and a broken TUI
-paint (a mount that painted some rows and stopped) were both invisible: they
-looked exactly like a healthy mount plus a screenshot nobody took.
+⛔⛔ WHY THIS EXISTS. The native side could say a terminal MOUNTED and the canvas
+could say how busy it was, and nothing could say whether the glyphs ever arrived
+— because every probe on either side counts EVENTS in a running terminal, and a
+mount begins with an EMPTY surface. So a ghost frame (the old row still on
+screen, the new mount not yet painted) and a broken TUI paint (a mount that
+painted some rows and stopped) were both invisible: they looked exactly like a
+healthy mount plus a screenshot nobody took.
 
 This joins the two halves on `host_id`, which already encodes the mount epoch
 (`<host>-m<epoch>`), so no new identity is introduced anywhere.
