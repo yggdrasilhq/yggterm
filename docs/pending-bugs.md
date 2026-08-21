@@ -444,6 +444,24 @@ shows `PARTIAL`. The frame now records all three (`docs/observability.md` §2.3b
 firing either shows that pattern or rules it out. **Do not "fix" the sharing defensively before
 then** — it is a behaviour change to the paint path with no measured benefit.
 
+### ⛔⛔ AND THE TRACE CANNOT ANSWER WHETHER THE REPAIR RAN — the probe shares the fault's own gate
+
+**GUI host, 2026-08-22: `xterm_forced_refresh` and `xterm_forced_refresh_skipped` appear ZERO
+times across the three newest trace files; `xterm_render` appears 3,872 times in the same files.**
+(The query was checked against that control first.)
+
+Both probes are throttled by `recentFrameLikeWrite` — **the same flag that suppresses the forced
+refresh**, armed by the hide-cursor every TUI emits before every redraw, so always hot for an agent
+CLI. Four hot probes also share one rate-limit slot, and `xterm_write_flush` eats it first.
+
+⇒ **"The repair was suppressed all window" and "no repair was ever demanded" are the same reading
+in the trace: nothing.** Any past conclusion drawn from a zero on these two probes is void.
+
+⭐ **Worked around without touching the throttle:** the host keeps monotonic counters no
+rate-limit can erase, and the same-frame record now reads them directly, so a captured frame
+carries the true repair-vs-suppression balance even when the trace carries none. Detail:
+`docs/observability.md` §4.2b.
+
 ### ⛔ THE CODE FINDING: EVERY REPAIR TRIGGER IS EVENT-DRIVEN, NOTHING DETECTS A DIVERGENCE
 
 `requestVisiblePaint(true)` — the only thing that repairs a partial paint — is raised from settled
