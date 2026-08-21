@@ -1668,6 +1668,24 @@ unresolved one.
 - ⛔ **Do not hand a lane over by standing by.** Spawn, then verify the row on the GUI host, and
   carry the standing order that the successor must spawn its own successor rather than defer.
 
+
+### ⭐ A LIVE INSTANCE, 2026-08-22 00:26 — caught while it was still running
+
+A lane spawned a successor, verified it armed by transcript content, and stood down. The
+successor **is running** — `claude --resume <uuid>`, pid alive, 43 KB transcript written four
+minutes earlier — and `server app rows --json` **does not list it at all**.
+
+⇒ So the failure is not a stale row or a lapsed watcher: **the row was never in the tree while
+the process was healthy from the first minute.** Every instrument an orchestrator has is
+keyed on the row, so this session is invisible to the census, to `ygg-fold` and to the booter,
+while doing real work in a real checkout.
+
+⚠ **And note what the spawning lane checked.** It verified the brief arrived by grepping the
+TRANSCRIPT, which is the right check for delivery and says nothing about whether a ROW exists.
+Two different questions, one of which nobody was asking. ⇒ A spawn is only complete when the
+row is readable back out of `rows --json`; `ygg-spawn.py` does that read-back, and a lane that
+hand-assembles a spawn from primitives does not.
+
 ## ⛔⛔ [11.13] AN ABSENCE-LAPSE IS PERMANENT AND NEVER RE-CHECKED, SO ONE TRANSIENT LISTING GAP UNWATCHES A LIVE SESSION FOREVER
 
 **Status:** OPEN
