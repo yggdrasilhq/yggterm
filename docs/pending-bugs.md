@@ -358,12 +358,25 @@ the name whenever the census cannot be read.
 ⭐⭐ **AND PREVENTION RESCUES NOBODY, SO THE DAEMON TAKES ITS NAME BACK.** An unlinked socket
 inode cannot be re-linked to a path by anything, so every daemon already stranded stays stranded
 under prevention alone — the memory finding said outright that they *"cannot be rescued by
-anything"*, and that is now false. A live daemon re-binds its own versioned name, and only when
-what stands there is a symlink or nothing; a DIFFERENT real socket file at that name belongs to
-whoever bound it and is left alone. Reclaiming the name is a complete cure because everything
-that looks for a daemon looks by name — `reachable_versioned_daemon_statuses` dials the versioned
-paths, the bridge resolver asks those daemons which one owns a runtime key, and the cross-daemon
-reconcile addresses siblings the same way.
+anything"*, and that is now false. A live daemon re-binds its own versioned name. Reclaiming it is
+a complete cure because everything that looks for a daemon looks by name —
+`reachable_versioned_daemon_statuses` dials the versioned paths, the bridge resolver asks those
+daemons which one owns a runtime key, and the cross-daemon reconcile addresses siblings the same
+way.
+
+⛔ **Two guards, and a wrong `true` in either is this same defect aimed at a different victim.**
+A DIFFERENT real socket file at the name belongs to whoever bound it and is left alone. And a
+RETIRING daemon never re-binds: it unlinked that path itself, for a successor that has not bound
+yet, so taking it back would fail that successor's bind on an address already in use — from the
+process handing over to it.
+
+⚠ **A THIRD PATH EMPTIES THE NAME, and it looks like the innocent case.** A re-pointed alias whose
+target daemon later dies becomes a DANGLING symlink, and the next client to dial it unlinks it
+(`clear_local_daemon_socket_link_escaping_home` — correct behaviour over garbage). The name is then
+ABSENT while its owner is still bound to it: the same stranding with the evidence removed. An
+absent name is also the shape of somebody else's bind window, so it comes back only while the
+KERNEL still names this daemon as bound to it — a daemon that has not bound yet appears nowhere in
+that table at all.
 
 ### ⚠⚠ A THIRD INSTRUMENT LYING, AND IT IS THE ENUMERATION VERB ITSELF
 
