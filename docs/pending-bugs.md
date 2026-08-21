@@ -132,6 +132,42 @@ lingering daemons retire, and while they linger their sessions stay split across
 ⛔ **And the daemons whose names were already taken cannot be rescued by this fix or any
 other.** Their sockets are unlinked; there is no path to them. They end when they end.
 
+## ⛔ [11.0] THE TWO SUPERVISION LOOPS HAVE NO UNIT, SO NOTHING RESTARTS THEM
+
+**Status:** OPEN
+
+`ygg-booter.py watch` and `ygg-monitor.py watch` are the fleet's supervision plane — the booter
+wakes a stalled row, the monitor escalates one that needs a decision. Measured 2026-08-22: both
+run as **bare `ppid 1` processes** started by sessions that ended hours earlier (one at 14:42 the
+previous day, the other at 20:56), and `systemctl --user list-units` knows neither of them.
+
+⇒ **If either dies, nothing brings it back and nothing says so.** This is the class that already
+cost this project a fleet-wide wake outage — a watchdog whose only staleness check ran at startup,
+the one moment it is least likely to be false — and the roll watcher was moved onto a systemd
+timer for exactly this reason. The other two never were.
+
+⚠ **Both are healthy right now** by the booter's own criterion (a live pid AND a log written
+within the window — it distinguishes those, having once reported a healthy watcher that ticked
+into `/dev/null` for 21 hours). This entry is about what happens when one is not.
+
+### ⛔ WHY THIS WAS FILED RATHER THAN FIXED ON THE SPOT
+
+A unit is not a drop-in here and the naive version is worse than the gap:
+
+- The booter already owns a **singleton guard** and a **self re-exec that keeps its pid**, so a
+  unit must agree with both. A `Restart=always` unit whose process exits 0 because the guard found
+  a live instance is a slow restart spin, not supervision.
+- Starting a unit while the bare instance still runs gives **two watchers**, and a watcher's job is
+  to type into rows. Double-waking a row is a worse failure than an unsupervised one — it is the
+  harm the whole never-type-over-a-person rule exists to prevent.
+- ⇒ The transition has to be one deliberate act: stop the bare process, start the unit, and prove
+  exactly one watcher is alive afterwards **by identity, not by count** — this fleet's own law,
+  and `pgrep -f` matches the shell asking the question.
+
+⭐ The shape that works is already proven next door: `ygg-roll-watch.timer`, hourly, `--once` per
+firing, pointed at the deploy checkout and **never a lane worktree**, because worktrees are
+reclaimed on schedule and a unit pointing into one breaks silently later.
+
 ## ⛔ [11.0] THE FLEET MEMORY INDEX IS OVER ITS LOAD LIMIT, SO SOME DOORS ARE INVISIBLE EVERY SESSION
 
 **Status:** OPEN
