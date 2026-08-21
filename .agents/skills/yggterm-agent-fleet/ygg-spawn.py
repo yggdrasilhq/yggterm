@@ -47,6 +47,11 @@ YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
 #: delivered" about a brief that is on its way.
 TRANSCRIPT_LAG_GRACE_S = 90
 
+#: How long to wait for a freshly created agent row to start CONSUMING INPUT.
+#: ⚠ Generous on purpose: a machine already running twenty agents starts the
+#: twenty-first slowly, and that is precisely when an unattended respawn runs.
+READY_WAIT_S = 420
+
 
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')} ygg-spawn {msg}", file=sys.stderr)
@@ -163,16 +168,28 @@ def main():
     elif not a.no_group:
         log("⚠ no head row found for this campaign — left at the top level")
 
-    # 4. WAIT FOR IT TO BE READING INPUT. A cold agent row needs SECONDS, and the
-    #    composer is drawn well before the input loop is live.
-    ready = False
-    for _ in range(6):
+    # 4. WAIT FOR IT TO BE READING INPUT. The composer is drawn well before the
+    #    input loop is live, so this is a real wait and not a formality.
+    #
+    # ⛔⛔ THIS WAIT WAS 30 SECONDS AND A COLD AGENT CLI TAKES LONGER, SO EVERY
+    #    UNATTENDED SPAWN FAILED HERE. Measured 2026-08-21: two automated respawns
+    #    in a row timed out at 30 s, refused their submit, and exited — and because
+    #    a hand-run spawn is watched by someone who simply re-runs it, the ceiling
+    #    only ever bit the automated path. That is why no cold row was ever
+    #    replaced by the hourly loop even after `--respawn` was wired: the verb it
+    #    calls could not finish.
+    #
+    # ⇒ Wait on a DEADLINE, not on a fixed number of tries, and make the deadline
+    #   generous — a machine running twenty agents starts the twenty-first slowly,
+    #   which is exactly when a respawn is needed most.
+    ready, deadline = False, time.time() + READY_WAIT_S
+    while time.time() < deadline:
         v = (app(host, f"terminal input-check '{row}' --check-timeout-ms 20000").get("data") or {})
         if v.get("consuming_input"):
             ready = True
             break
-        time.sleep(5)
-    log(f"input-check consuming_input={ready}")
+        time.sleep(10)
+    log(f"input-check consuming_input={ready} (waited {READY_WAIT_S}s at most)")
 
     # 5. SUBMIT, and read the answer. ⛔ `submitted:false` means MID-OUTPUT, never
     #    unreachable, and is NEVER retried — that is the bug that types over people.
@@ -180,8 +197,27 @@ def main():
     subprocess.run(["scp", "-q", a.brief, f"{host}:{remote_brief}"], timeout=120)
     sub = (app(host, f"terminal submit '{row}' --stdin", stdin_path=remote_brief).get("data") or {})
     if not sub.get("submitted"):
-        log("⛔ submit refused (mid-output). NOT retried. The row exists and is seated;")
-        log(f"   deliver by file and let the wake sweep pick it up: {a.brief}")
+        # ⛔⛔ NEVER RETRY A `submitted:false` — that is the bug that types over
+        # people. But printing advice and exiting leaves a SEATED, BRIEFLESS row
+        # behind, and nothing ever comes back for it: measured 2026-08-21, three
+        # such rows, one alive for over two hours, each one also holding a seat
+        # that its own predecessor still held. A failed spawn that leaves debris
+        # is worse than one that cleans up after itself.
+        #
+        # ⇒ Hand the brief to `ygg-deliver`, which waits for the row to be able to
+        #   take it and then submits ONCE. The row stays; the caller is told the
+        #   delivery is armed rather than done, and a respawn still refuses to fold
+        #   its predecessor because the brief is not yet PROVEN.
+        deliver = os.path.join(HERE, "ygg-deliver.py")
+        if os.path.exists(deliver):
+            subprocess.Popen([deliver, uuid, "--message", a.brief, "--ack", ack,
+                              "--wait-min", "30"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log("⛔ submit refused (mid-output). NOT retried — delivery ARMED via ygg-deliver,")
+            log("   which waits for the row to be consuming input and then submits once.")
+        else:
+            log("⛔ submit refused (mid-output). NOT retried. The row exists and is seated;")
+            log(f"   deliver by file: {a.brief}")
         print(row)
         return 5
     log(f"submitted {sub.get('bytes')}B")
