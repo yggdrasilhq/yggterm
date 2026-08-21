@@ -16141,8 +16141,92 @@ struct TerminalLoopBranchGuard {
     started_ms: u64,
 }
 
+/// Per-branch rollup of EVERY guard drop, not only the >120 ms outliers.
+/// `loop_block` sees the giants; it cannot see a flat per-iteration cost —
+/// the measured keystroke→pty p95 of ~221 ms is hypothesised to be one
+/// `read_poll_apply` pass, and that hypothesis is untestable from a probe
+/// with a 120 ms floor. A per-iteration event would flood the byte-budget
+/// retention (the one-span-per-flush lesson: a probe's SHARE of the plane is
+/// the test), so drops accumulate here and ONE `input/loop_share` event per
+/// branch flushes per 60 s window — a handful of events a minute, total.
+#[derive(Default)]
+struct LoopBranchShare {
+    count: u64,
+    total_ms: u64,
+    max_ms: u64,
+    over_10_ms: u64,
+    over_30_ms: u64,
+    over_60_ms: u64,
+    over_120_ms: u64,
+}
+
+static LOOP_BRANCH_SHARES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, LoopBranchShare>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static LOOP_BRANCH_FLUSHER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const LOOP_BRANCH_SHARE_FLUSH_MS: u64 = 60_000;
+
+fn record_loop_branch_share(branch: &'static str, held_ms: u64) {
+    let Ok(mut shares) = LOOP_BRANCH_SHARES.lock() else {
+        return;
+    };
+    let agg = shares.entry(branch).or_default();
+    agg.count += 1;
+    agg.total_ms += held_ms;
+    agg.max_ms = agg.max_ms.max(held_ms);
+    if held_ms > 10 {
+        agg.over_10_ms += 1;
+    }
+    if held_ms > 30 {
+        agg.over_30_ms += 1;
+    }
+    if held_ms > 60 {
+        agg.over_60_ms += 1;
+    }
+    if held_ms > 120 {
+        agg.over_120_ms += 1;
+    }
+}
+
+fn ensure_loop_branch_share_flusher() {
+    if LOOP_BRANCH_FLUSHER_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(LOOP_BRANCH_SHARE_FLUSH_MS)).await;
+            let drained: Vec<(&'static str, LoopBranchShare)> = {
+                let Ok(mut shares) = LOOP_BRANCH_SHARES.lock() else {
+                    continue;
+                };
+                shares.drain().collect()
+            };
+            for (branch, agg) in drained {
+                yggterm_core::perf::ytrace_emit_event(
+                    "shell",
+                    "input",
+                    "loop_share",
+                    json!({
+                        "branch": branch,
+                        "window_ms": LOOP_BRANCH_SHARE_FLUSH_MS,
+                        "count": agg.count,
+                        "total_ms": agg.total_ms,
+                        "max_ms": agg.max_ms,
+                        "over_10_ms": agg.over_10_ms,
+                        "over_30_ms": agg.over_30_ms,
+                        "over_60_ms": agg.over_60_ms,
+                        "over_120_ms": agg.over_120_ms,
+                    }),
+                );
+            }
+        }
+    });
+}
+
 impl TerminalLoopBranchGuard {
     fn new(branch: &'static str, session_path: &str) -> Self {
+        ensure_loop_branch_share_flusher();
         Self {
             branch,
             session_path: session_path.to_string(),
@@ -16154,6 +16238,7 @@ impl TerminalLoopBranchGuard {
 impl Drop for TerminalLoopBranchGuard {
     fn drop(&mut self) {
         let held_ms = current_millis().saturating_sub(self.started_ms);
+        record_loop_branch_share(self.branch, held_ms);
         if held_ms < TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS {
             return;
         }

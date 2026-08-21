@@ -61519,6 +61519,40 @@ mod terminal_loop_input_starvation_locks {
              second reconcile of a session's life never fetches"
         );
     }
+
+    // The share rollup exists because `loop_block`'s 120 ms floor cannot see a
+    // flat per-iteration cost — the ~221 ms keystroke→pty p95 band needs the
+    // sub-floor distribution. The rollup must therefore record EVERY drop,
+    // BEFORE the floor check, or the instrument quietly regrows the blind
+    // spot it was built to remove.
+    #[test]
+    fn every_loop_branch_drop_lands_in_the_share_rollup() {
+        let source = include_str!("viewport.rs");
+        let drop_at = source
+            .find("impl Drop for TerminalLoopBranchGuard")
+            .expect("the loop branch guard must still have a Drop impl");
+        let drop_impl = &source[drop_at..drop_at + 1_200];
+        let record_at = drop_impl
+            .find("record_loop_branch_share(")
+            .expect("the guard's Drop no longer feeds the share rollup");
+        let floor_at = drop_impl
+            .find("TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS")
+            .expect("the loop_block floor check must still exist");
+        assert!(
+            record_at < floor_at,
+            "the share record moved behind the >120 ms floor — sub-floor \
+             iterations are invisible again, which is the exact blind spot \
+             this rollup exists to remove"
+        );
+        // And the flush stays aggregated: one event per branch per window,
+        // never per iteration — a per-iteration event's SHARE of the trace
+        // plane is the failure the one-span-per-flush incident named.
+        assert!(
+            source.contains("ensure_loop_branch_share_flusher"),
+            "the share flusher is gone — the rollup accumulates forever and \
+             emits nothing"
+        );
+    }
 }
 
 #[cfg(test)]
