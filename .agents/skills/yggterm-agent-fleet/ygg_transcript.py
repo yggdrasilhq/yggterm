@@ -294,3 +294,164 @@ def last_prose(path):
         return ""
     record = last_matching_record(path, lambda r: prose_of(r) is not None)
     return prose_of(record) if record is not None else ""
+
+
+def classify_record(record):
+    """What this one transcript record says about the turn — for any measured CLI.
+
+    Returns one of ``"rate_limited"``, ``"spoke"``, ``"turn_end"``, ``"turn_start"``,
+    ``"user"``, or ``None`` for a record that settles nothing.
+
+    ⛔⛔ **THIS FUNCTION'S SOURCE IS SHIPPED OVER SSH VERBATIM** by
+    `remote_probe_source()`, so the machine watching a row and the machine holding it
+    cannot disagree. The queue entry that asked for this said why: *a local row and a
+    remote row differing about whether the account has quota is a fleet that boots
+    half of itself into a wall.* Keeping two copies in step by discipline is what
+    failed before; there is one copy now and the remote one is generated from it.
+
+    ⇒ It must stay SELF-CONTAINED — no imports, no module globals — because the
+    embedded copy runs with nothing else around it.
+
+    ⛔ **The rate-limit test is the dangerous one, and the obvious version is wrong.**
+    Codex writes a `rate_limits` block into a `token_count` event on essentially every
+    turn — routine remaining-quota telemetry, measured at 6,949 occurrences across 25
+    transcripts, present in 39 of 40 files. A substring match for "rate_limit" would
+    therefore report almost every codex session as rate limited and freeze the wake
+    plane for all of them. The real signal is an `error` event whose
+    `codex_error_info` says the limit was *exceeded*.
+    """
+    if not isinstance(record, dict):
+        return None
+
+    kind = record.get("type")
+
+    # ── Claude Code ──────────────────────────────────────────────────────────
+    if kind in ("assistant", "user"):
+        if record.get("isApiErrorMessage") and (
+            record.get("apiErrorStatus") == 429 or record.get("error") == "rate_limit"
+        ):
+            return "rate_limited"
+        if kind == "user":
+            return "user"
+        blocks = [b for b in (record.get("message") or {}).get("content") or []
+                  if isinstance(b, dict)]
+        if any(b.get("type") == "tool_use" for b in blocks):
+            return "turn_start"          # the model is mid-turn, calling a tool
+        return "spoke"
+
+    # ── Codex: explicit turn boundaries, which the reference CLI does not have ──
+    if kind == "event_msg":
+        payload = record.get("payload") or {}
+        event = payload.get("type")
+        if event == "error":
+            info = str(payload.get("codex_error_info") or "")
+            message = str(payload.get("message") or "")
+            if "usage_limit" in info or "rate_limit" in info:
+                return "rate_limited"
+            if "usage limit" in message.lower():
+                return "rate_limited"
+            return None
+        if event == "task_complete":
+            return "turn_end"
+        if event == "turn_aborted":
+            return "turn_end"
+        if event == "task_started":
+            return "turn_start"
+        if event == "agent_message":
+            return "spoke"
+        if event == "user_message":
+            return "user"
+        # ⛔ `token_count` lands here and settles NOTHING, on purpose. See above.
+        return None
+
+    # ── Antigravity: a flat step log, one record per action ───────────────────
+    if kind == "PLANNER_RESPONSE":
+        return "spoke" if (record.get("content") or "").strip() else None
+    if kind == "USER_INPUT":
+        return "user"
+    if kind in ("RUN_COMMAND", "VIEW_FILE", "CODE_ACTION"):
+        return "turn_start"              # an action, so the turn is still running
+    # ⛔ ERROR_MESSAGE is deliberately NOT read as a rate limit. Every sample found
+    #    on a real store was a tool-call parse failure or "the model API is currently
+    #    overloaded" — an OVERLOAD, which clears on its own, not an exhausted
+    #    account, which does not. Freezing a row's wake plane for the first would be
+    #    a self-inflicted outage, so this CLI has no rate-limit branch until one has
+    #    actually been seen.
+
+    return None
+
+
+def classify_records(records):
+    """Fold a tail of records into one verdict: the probe's output contract.
+
+    ⚠ Scans NEWEST FIRST and stops at the first record that settles the question, so
+    a rate limit three turns ago does not outrank a turn that finished since.
+    """
+    for record in reversed(records):
+        verdict = classify_record(record)
+        if verdict is None:
+            continue
+        if verdict == "rate_limited":
+            return "RATE_LIMITED"
+        if verdict in ("turn_start", "user"):
+            return "MIDTURN"
+        if verdict in ("turn_end", "spoke"):
+            return "TURN_ENDED"
+    return "EMPTY"
+
+
+#: The remote probe, minus the two functions that decide anything — those are spliced
+#: in from THIS module at call time so the far machine runs the same code as this one.
+_PROBE_TEMPLATE = '''
+import json,os,sys,time
+%(classify_record)s
+%(classify_records)s
+%(prose_of)s
+p=sys.argv[1]
+# ⛔⛔ BOUNDED, AND THIS RUNS ON SOMEBODY ELSE'S MACHINE. Parsing a whole transcript
+#    was survivable only while this could be handed one CLI's files; the row lookup
+#    now resolves every CLI's store and the largest here is 1,481 MB against a p95 of
+#    5.4 MB. A partial leading record is dropped rather than repaired.
+TAIL=%(tail)d
+try:
+    _sz=os.path.getsize(p)
+    with open(p,"rb") as _h:
+        if _sz>TAIL: _h.seek(_sz-TAIL); _h.readline()
+        _blob=_h.read()
+    rows=[]
+    for _l in _blob.decode("utf-8","replace").splitlines():
+        _l=_l.strip()
+        if not _l: continue
+        try: rows.append(json.loads(_l))
+        except ValueError: continue
+except Exception as e:
+    print(json.dumps(["UNREADABLE",0,str(e)])); sys.exit()
+age=time.time()-os.path.getmtime(p)
+state=classify_records(rows)
+text=""
+if state in ("TURN_ENDED","RATE_LIMITED"):
+    for _r in reversed(rows):
+        _t=prose_of(_r)
+        if _t: text=" ".join(_t.split())[:300]; break
+print(json.dumps([state,age,text]))
+'''
+
+
+def remote_probe_source():
+    """The probe to run on another host — carrying THIS module's own decisions.
+
+    ⛔⛔ **THE POINT IS THAT THERE IS NO SECOND COPY.** `classify_record` used to have
+    a twin written out longhand inside a string, and the two were kept in step by a
+    comment asking the next reader to remember. The queue entry spelled out the cost
+    of forgetting: *a local row and a remote row disagreeing about whether the account
+    has quota is a fleet that boots half of itself into a wall.* The deciding
+    functions are now spliced in from this module, so drift is not something anyone
+    has to remember to avoid.
+    """
+    import inspect
+    return _PROBE_TEMPLATE % {
+        "classify_record": inspect.getsource(classify_record),
+        "classify_records": inspect.getsource(classify_records),
+        "prose_of": inspect.getsource(prose_of),
+        "tail": TAIL_BYTES,
+    }

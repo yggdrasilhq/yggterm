@@ -178,49 +178,21 @@ def find_transcript(uuid, host=None):
 # this as work — the anti-flap counter is not fooled. It is the BOOT that was
 # wrong, not the accounting.
 def api_rate_limited(rec):
-    """Is this transcript record the CLI reporting an account-level rate limit?"""
-    if not isinstance(rec, dict) or not rec.get("isApiErrorMessage"):
-        return False
-    return rec.get("apiErrorStatus") == 429 or rec.get("error") == "rate_limit"
+    """Is this transcript record the CLI reporting an account-level rate limit?
+
+    ⛔ Delegated to `ygg_transcript.classify_record`, which is the SAME source the
+    remote probe runs — see `remote_probe_source`. This used to be one of two
+    hand-kept copies, and a local row and a remote row disagreeing about whether an
+    account has quota is a fleet that boots half of itself into a wall.
+    """
+    return ygg_transcript.classify_record(rec) == "rate_limited"
 
 
-REMOTE_PROBE = r'''
-import json,os,sys,time
-p=sys.argv[1]
-# ⛔⛔ BOUNDED, AND THIS ONE RUNS ON SOMEBODY ELSE'S MACHINE. It used to parse the
-#    whole file, which was survivable only while it could be handed one CLI's
-#    transcripts. The row lookup now resolves every CLI's store, and the largest
-#    transcript on this fleet is 1,481 MB against a p95 of 5.4 MB — so the old
-#    line would have allocated gigabytes over ssh, on a laptop, on a timer.
-#    A partial first record is dropped rather than repaired.
-TAIL=2000000
-try:
-    _sz=os.path.getsize(p)
-    with open(p,"rb") as _h:
-        if _sz>TAIL: _h.seek(_sz-TAIL); _h.readline()
-        _blob=_h.read()
-    rows=[]
-    for _l in _blob.decode("utf-8","replace").splitlines():
-        _l=_l.strip()
-        if not _l: continue
-        try: rows.append(json.loads(_l))
-        except ValueError: continue
-except Exception as e: print(json.dumps(["UNREADABLE",0,str(e)])); sys.exit()
-age=time.time()-os.path.getmtime(p)
-last=next((r for r in reversed(rows) if r.get("type") in ("assistant","user")),None)
-if last is None: print(json.dumps(["EMPTY",age,""])); sys.exit()
-if last["type"]=="user": print(json.dumps(["MIDTURN",age,""])); sys.exit()
-# ⛔ Same discriminator as api_rate_limited() above, and it must stay the same:
-#    a local row and a remote row differing about whether the account has quota
-#    is a fleet that boots half of itself into a wall.
-if last.get("isApiErrorMessage") and (last.get("apiErrorStatus")==429 or last.get("error")=="rate_limit"):
-    t=" ".join(" ".join(c.get("text","") for c in (last.get("message",{}).get("content") or []) if isinstance(c,dict) and c.get("type")=="text").split())
-    print(json.dumps(["RATE_LIMITED",age,t[:300]])); sys.exit()
-items=[c for c in (last.get("message",{}).get("content") or []) if isinstance(c,dict)]
-if any(c.get("type")=="tool_use" for c in items): print(json.dumps(["MIDTURN",age,""])); sys.exit()
-t=" ".join(" ".join(c.get("text","") for c in items if c.get("type")=="text").split())
-print(json.dumps(["TURN_ENDED",age,t[:300]]))
-'''
+#: ⛔⛔ GENERATED, NEVER TRANSCRIBED. The functions that decide anything are spliced
+#: in from `ygg_transcript` at import time, so the machine watching a row and the
+#: machine holding it cannot drift apart. It also classifies every measured CLI now —
+#: a codex row used to come back `EMPTY`, which reads as "idle" and is not.
+REMOTE_PROBE = ygg_transcript.remote_probe_source()
 
 
 def turn_state_remote(host, path):
