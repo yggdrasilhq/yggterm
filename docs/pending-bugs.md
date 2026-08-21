@@ -688,7 +688,37 @@ row's surface where the new one should be. **That is the ghost frame, measured**
 is a different defect from an incomplete paint, which is what `rows_content_unpainted`
 above counts.
 
-### ⭐⭐ THE LADDER SAYS THE BUG IS IN ATTACH, NOT IN MOUNT (measured 2026-08-21, ~2.2 h)
+### ⛔ THE ATTACH CLIFF HAS CLOSED — RE-MEASURED PER BUILD 2026-08-22, AND THE LOW RUNG MOVED
+
+The ladder below was summed over a plane spanning several builds. Segmented by `app_version`,
+attach is no longer where mounts are lost:
+
+| build | `begin` | `js_ready` | `attach_ready` | `first_output` | `paint_ready` |
+|---|---:|---:|---:|---:|---:|
+| 3.1.35 | 19 | 19 | 13 | 15 | 14 |
+| 3.1.36 | 35 | 31 | 28 | 32 | 26 |
+| **3.1.37** | **24** | **24** | **22** | **22** | **16** |
+
+⇒ On the shipped build **22 of 24 mounts attach**, against the 9-of-17 that named this section.
+The lowest rung is now **`paint_ready`, at 16 of 24**.
+
+⛔ **Do not subtract these columns from each other** — the same warning the original measurement
+carried, and it binds harder now. The rungs are not strictly nested (`first_output` exceeds
+`attach_ready` on two builds), so "8 mounts attached and never painted" is NOT what this table
+says. It says how many of each event fired. **Which mounts are missing which rung is a join on the
+mount identity, and `xterm_paint`'s `mount_open` is the key** — segment on it, because a host id
+is reused across mount epochs.
+
+⚠ And `paint_ready` is the DOM-presence check named for pixels, already recorded below as right
+eight times in nine. Its ABSENCE is a stronger reading than its presence: the elements never
+appeared at all.
+
+⚠ **The reason the old numbers were wrong is not that anyone measured badly** — it is that a
+retained trace outlives the build that wrote it, so any aggregate over the file mixes a bug with
+its fix. Two other headlines from the same plane the same night were entirely one dead build. Take
+every rung count with the build beside it.
+
+### ⭐⭐ THE LADDER SAYS THE BUG IS IN ATTACH, NOT IN MOUNT (measured 2026-08-21, ~2.2 h — ⚠ POOLED ACROSS BUILDS, see above)
 
 Rung by rung: `begin` 17 → `ensure_begin` 17 → `bootstrap_spawn_scheduled` 17 →
 `js_eval_created` 17 → `js_ready` 16 → **`attach_ready` 9** → `first_meaningful_output` 9.
