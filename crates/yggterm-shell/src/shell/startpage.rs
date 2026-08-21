@@ -1201,7 +1201,11 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                             "data-yggterm-start-action": "open-recent",
                                             "data-keytip-exempt": "list-item",
                                             style: "{open_button_style}",
-                                            onclick: move |_| spawn_open_session_row(state, row_for_click.clone()),
+                                            onclick: move |_| spawn_open_session_row(
+                                                state,
+                                                row_for_click.clone(),
+                                                ActivationOrigin::user_gesture("start_page_card_click"),
+                                            ),
                                             "{open_button_label}"
                                         }
                                         button {
