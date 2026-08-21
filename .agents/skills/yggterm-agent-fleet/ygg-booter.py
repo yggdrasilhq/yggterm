@@ -3494,8 +3494,11 @@ def tick(args):
                                    f"correct and is NOT being relaxed; the standing "
                                    f"condition is the defect. Nothing clears this by "
                                    f"itself: the row is alive, is not being woken, and no "
-                                   f"counter rises to say so. For boot-text residue try "
-                                   f"`ygg-unwedge.sh`.")
+                                   f"counter rises to say so. If the composer holds "
+                                   f"exactly our own boot text, `ygg-booter.py unjam "
+                                   f"<row>` delivers or clears it; it refuses "
+                                   f"anything that is not character-for-character "
+                                   f"ours.")
                         escalate(host, row, why + " The row is NOT being woken by anything.")
                         rec["escalated"] = True
                         action = f"{action}→ESCALATED"
@@ -3822,12 +3825,117 @@ def cmd_status(args):
     return 0 if (alive and not mute) else 1
 
 
+# The one control byte this file may send into a composer, named once.
+COMPOSER_CLEAR_LINE = "\u0015"          # Ctrl+U — clears the composer line
+
+
+def cmd_unjam(args):
+    """Recover a row jammed by OUR OWN unsent boot text. Refuses anything else.
+
+    ⛔⛔ THE HOLE THIS FILLS HAD TWO SIGNPOSTS AND NO FLOOR. The escalation for a
+    standing `refused-draft` said *"for boot-text residue try `ygg-unwedge.sh`"*;
+    that script's own header says it is NOT for an unbootable row and points back
+    here, at `_composer_is_boot_residue_only` — a function this file no longer
+    has, because the residue cleaner was deleted (correctly: it was firing a
+    Ctrl+C into a live campaign session every five and a half minutes for three
+    hours). So each signpost pointed at the other, the thing they both named was
+    gone, and an operator following either arrived nowhere. A row jammed this way
+    sat refused and escalated with a remedy that could not have worked.
+
+    ⛔⛔ AND IT CANNOT CLEAR ITSELF, FOR A REASON WORTH KNOWING. The ledger's
+    "COMPLETE it next tick" path is `--submit-iff-line-equals`, which compares
+    against the input line the DAEMON built from bytes it forwarded. That line is
+    reconstructed from zero when a newer daemon adopts the session — so across a
+    handover the comparison is 0 bytes against 458 and the submit can never fire.
+    Measured 2026-08-21 on a live row: the rendered screen held all 458 bytes and
+    the daemon answered `holds 0 bytes, expected 458`. The atomic submit and the
+    draft flag share one blind spot, so the guard that made the writer safe is
+    also what makes these rows permanently unrecoverable.
+
+    ⭐ WHAT MAKES TYPING HERE PERMISSIBLE AT ALL IS AN EXACT MATCH, and nothing
+    weaker. The composer reconstructed from the rendered grid must equal
+    `BOOT_TEXT` CHARACTER FOR CHARACTER — not contain it, not start with it.
+    Verified byte-exact against a live jammed row before this was written. A
+    prefix or a substring test would fire on a row where somebody had typed after
+    our text, and that is somebody's sentence.
+
+    ⚖ It is a VERB, not a tick action. Every guard in this file exists to stop a
+    timer typing into a row; the answer to one of them being unrecoverable is a
+    person asking for it, not the loop deciding on its own.
+    """
+    row = resolve(args.host, args.row) or args.row
+    if not row:
+        log("⛔ unjam: name a row")
+        return 64
+    short = row.rsplit("/", 1)[-1][:8]
+    # The same state guards a boot takes, in the same order and for the same
+    # reasons — a modal reads single keys, and blind is not clear.
+    choice = _screen_shows_a_choice(args.host, row)
+    if choice is not False:
+        log(f"⛔ NOT UNJAMMING {short} — " + ("its screen shows a prompt awaiting a "
+            "choice" if choice else "its screen could not be read, so a waiting "
+            "prompt cannot be ruled out") + ". Blind is not clear.")
+        return 1
+    readable, composer = _composer_row_content(args.host, row)
+    if not readable or composer is None:
+        log(f"⛔ NOT UNJAMMING {short} — its composer row could not be read.")
+        return 1
+    if composer == "":
+        log(f"⭐ {short} has an EMPTY composer — nothing is jamming it. "
+            f"If it is still not being woken, the reason is elsewhere.")
+        return 0
+    pending = _pending_write(row) or {}
+    ours = {BOOT_TEXT, pending.get("text") or BOOT_TEXT}
+    if composer not in ours:
+        log(f"⛔ REFUSING to touch {short} — its composer holds {len(composer)} "
+            f"character(s) that are NOT exactly our own boot text. This may be a "
+            f"person's unsent sentence, and nothing here gets to decide it is not. "
+            f"Read it with `server screen` and clear it by hand if it is yours.")
+        return 1
+    if args.dry_run:
+        log(f"⭐ {short} holds EXACTLY our own boot text ({len(composer)} chars) "
+            f"and nothing else. --dry-run: not touching it.")
+        return 0
+    # 1. THE BOOT WAS INTENDED, SO TRY TO DELIVER IT FIRST. If the daemon's line
+    #    survived, this presses Enter on our own text under its lock and the row
+    #    gets the wake it was owed — strictly better than throwing it away.
+    if _atomic_submit(args.host, row, composer) is True:
+        _clear_pending_write(row)
+        log(f"⭐ UNJAMMED {short} by DELIVERING it — the daemon's line still held "
+            f"exactly our text, so the Enter it never got has now been pressed.")
+        return 0
+    # 2. The daemon cannot vouch for the line (a handover zeroed it), so the
+    #    atomic path can never fire on this row again. Clear it and let the next
+    #    tick write once, from a composer that is provably empty.
+    log(f"⚠ {short}: the daemon cannot confirm the line (a handover reconstructs "
+        f"it from zero), so the atomic submit can never fire here. Clearing our "
+        f"own text instead — the next tick writes once into an empty composer.")
+    _run(BB.row_host(row, args.host) or args.host,
+         ["server", "terminal", "write", f"cc-runtime://{row.rsplit('/', 1)[-1]}",
+          "--stdin"], COMPOSER_CLEAR_LINE,
+         remote_binary="$HOME/.local/bin/yggterm-headless")
+    time.sleep(1.0)
+    # ⛔ READ IT BACK. Every verb in this file reports the REQUEST unless it is
+    #    made to report the EFFECT, and "I sent a Ctrl+U" is not "the line is
+    #    gone" — a composer that did not clear must not be reported as recovered.
+    readable, after = _composer_row_content(args.host, row)
+    if readable and after == "":
+        _clear_pending_write(row)
+        log(f"⭐ UNJAMMED {short} — read back EMPTY. It boots normally from here.")
+        return 0
+    log(f"⛔ {short} did NOT clear: it still holds "
+        f"{'an unreadable composer' if not readable else str(len(after or '')) + ' character(s)'}. "
+        f"Nothing further is attempted — the next step is an interrupt, and that "
+        f"ends a turn, which is a person's call and not this verb's.")
+    return 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="boot a stalled session that subscribed")
     ap.add_argument("action",
                     choices=["subscribe", "unsubscribe", "defer", "list", "tick",
                              "watch", "status", "disarm", "arm", "coverage", "retire",
-                             "never-arm", "optout", "hold"])
+                             "never-arm", "optout", "hold", "unjam"])
     ap.add_argument("--secs", type=int, default=0,
                     help=f"defer: boot window for one long wait, clamped to "
                          f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
@@ -3932,6 +4040,7 @@ def main():
         "disarm": cmd_disarm,
         "arm": cmd_arm,
         "hold": cmd_hold,
+        "unjam": cmd_unjam,
     }[args.action](args)
 
 

@@ -627,10 +627,26 @@ silently breaks the probe.
 correctly, but it cannot tell a caller *what* the line is, and a row whose CLI has not
 yet redrawn its composer is invisible to both arms at once.
 
-**Live proof owed, and it cannot be taken without a roll:** the falsifier below reads
-the daemon's own `pending_input_drafts`, which the DAEMON builds — so it needs a daemon
-running this code, and the roll watcher has been dead since 15:51 today (its own queue
-entry). Ask for it after the next deploy.
+**LIVE-PROVEN 2026-08-21 on the deployed 3.1.30 daemon, both halves.** Four sessions it
+owns, every composer read EMPTY off the rendered grid and the sweep naming none of them;
+then ONE character typed into one of those composers and the sweep names that row. The
+negative control is not a fixture: a sibling row acquired a draft between the two reads
+on its own, so the sweep was discriminating rather than answering true to everything.
+
+⚠ **The `input-check` RELAY of the same field is still owed**, and it is not a code gap:
+the field is rendered by the GUI, and the GUI on the owner's machine predates this
+change (it only picks one up on a restart, which this lane does not take). Asked on a
+row mid-output it answered `composer_shown: false` and, correctly, **typed nothing** —
+so the refusal path holds; what is unproven is the tri-state rendering.
+
+⛔ **AND THE ATOMIC SUBMIT SHARES THE BLIND SPOT — measured, and it is why boot-text
+residue cannot clear itself.** `--submit-iff-line-equals` compares against the same
+daemon-built input line, so across a handover it compares 0 bytes against 458 and can
+never fire. On a live jammed row the rendered screen held all 458 bytes and the daemon
+answered `holds 0 bytes, expected 458`. ⇒ The ledger's "COMPLETE it next tick" path is
+guaranteed to fail on any write that predates a handover, which makes such a row
+permanently unrecoverable by the safe path. `ygg-booter.py unjam` is the floor under
+that; adopt-path seeding would remove the need for it.
 
 ## ⛔⛔⛔ [11.20] `composer_held_draft` HAD NO DISCRIMINATOR LEFT — CONFIRMED, AND FIXED
 
