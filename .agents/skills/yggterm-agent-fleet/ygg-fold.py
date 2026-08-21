@@ -58,6 +58,37 @@ FINISHED_IDLE_MIN = 8.0
 #:   that has merely paused. So STALLED is its own verdict with its own remedy,
 #:   and the ledger below makes it once per stall rather than once per sweep.
 STALL_IDLE_MIN = 20.0
+
+#: ⛔⛔⛔ NEVER KICK A COLD SESSION. THE STANDING FLEET LAW, AND THIS TOOL BROKE IT.
+#:
+#: The law is old and it is written down: succeed a cold session by HARVESTING its
+#: transcript, never by prompting it — cold cache times large context multiply,
+#: **the asking IS the expense**, and prompting it makes it warm, so respawning
+#: afterwards wastes exactly what you just spent. A fork with no middle: touch
+#: nothing and succeed it from artefacts, or having touched it, keep it.
+#:
+#: ⇒ WHERE THE STEER WAS GETTING LOST, because it is worth naming: the law lives
+#:   in the skill under "succeeding a session", framed as *do not ASK a cold row
+#:   what it was doing*. Someone implementing a WAKE path does not read that as
+#:   applying to them — a `continue` does not feel like asking. It is the same
+#:   expense. So the rule now lives HERE, at the point where the decision is
+#:   actually made, and the code cannot express "wake" without first asking cold.
+#:
+#: A wake is only ever correct for a row that is still cheap to resume. Everything
+#: else is harvested and replaced by a fresh lane at the same seat.
+WAKEABLE_MAX_TRANSCRIPT_BYTES = 400_000
+WAKEABLE_MAX_IDLE_MIN = 20.0
+
+
+def wakeable(transcript_bytes, idle_min):
+    """May this stalled row be prompted, or must it be harvested and replaced?
+
+    Both tests must pass. A small transcript that has gone cold is cheap to
+    resume; a large one is expensive whether or not the cache still holds it,
+    because the whole context is re-read either way. ⛔ An OR here would have the
+    strength of the weaker test, which is how a 5 MB row gets prompted.
+    """
+    return transcript_bytes <= WAKEABLE_MAX_TRANSCRIPT_BYTES and idle_min <= WAKEABLE_MAX_IDLE_MIN
 WAKE_LEDGER = os.path.join(os.path.expanduser("~/.yggterm/relay"), "fold-wakes.json")
 
 #: ⚠ A PHRASE LIST IS A GUESS LIST, so it is deliberately NOT the whole test.
@@ -316,7 +347,12 @@ def classify(row, live, protected):
         row["screen"] = state
         if state == "ready":
             note = " (its last words said it was watching)" if says_watching else ""
-            return "STALLED", f"at its composer, turn ended, quiet {idle}m{note}"
+            size = os.path.getsize(tr) if tr else 0
+            row["bytes"] = size
+            if wakeable(size, idle):
+                return "STALLED", f"at its composer, quiet {idle}m, {size // 1000}KB — still cheap to resume{note}"
+            return "COLD", (f"quiet {idle}m with a {size // 1000}KB transcript — "
+                            f"harvest and replace, never prompt{note}")
         return "WORKING", f"screen says {state}, quiet {idle}m"
 
     if says_watching:
@@ -372,6 +408,34 @@ def wake(row, host, apply_it):
         return True
     log("  ⛔ submit refused (mid-output) — NOT retried, left for the next sweep")
     return False
+
+
+def successor_brief(row, why):
+    """Distil a cold row into something a fresh lane can start from.
+
+    ⛔ THIS IS THE ONLY LEGITIMATE WAY TO GET A COLD LANE'S STATE. Everything here
+    is read from ARTEFACTS — the row's own title, purpose and last written words,
+    and the files it left behind. Nothing is asked of the session, because asking
+    is the expense the law exists to avoid.
+    """
+    os.makedirs(os.path.join(RELAY, "successors"), exist_ok=True)
+    path = os.path.join(RELAY, "successors", f"{row['seat']}-successor.md")
+    tr = transcript_of(row["uuid"])
+    with open(path, "w") as fh:
+        fh.write(f"# successor brief for seat {row['seat']}\n\n")
+        fh.write(f"*Written from artefacts on {time.strftime('%Y-%m-%d %H:%M')}. The predecessor "
+                 f"({row['uuid'][:8]}) was COLD — {why} — and was NEVER PROMPTED, because "
+                 f"prompting a cold session is the expense this replaces.*\n\n")
+        fh.write(f"**Its title:** {row['label']}\n\n")
+        if row.get("last"):
+            fh.write(f"**The last thing it wrote:**\n\n> {row['last']}\n\n")
+        if tr:
+            fh.write(f"**Its transcript** (read it, do not wake it): `{tr}`\n\n")
+        fh.write("**Where its work landed:** `git log --author-date-order` on its lane branch, "
+                 "and any `~/.yggterm/relay/` file naming this seat.\n\n")
+        fh.write("⛔ Do not open with a row claim: the seat and title are set by the spawner, and "
+                 "a lane that spends its first turn on bookkeeping ends the turn there.\n")
+    return path
 
 
 def agent_pids(uuid):
@@ -596,7 +660,7 @@ def main():
         verdict, why = classify(row, live, protected)
         counts[verdict] = counts.get(verdict, 0) + 1
         mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·",
-                "PROTECTED": "🔒", "STALLED": "⏸"}[verdict]
+                "PROTECTED": "🔒", "STALLED": "⏸", "COLD": "❄"}[verdict]
         log(f"{mark} {row['seat']:<7} {row['uuid'][:8]} {verdict:<9} {why}")
         forced = getattr(a, "force", False) and verdict != "PROTECTED"
         if verdict in ("DEAD", "FINISHED") or forced:
@@ -606,6 +670,11 @@ def main():
                 folded += 1
         elif verdict == "STALLED" and getattr(a, "wake", False):
             wake(row, host, a.apply)
+        elif verdict == "COLD":
+            path = successor_brief(row, why)
+            log(f"  successor brief → {os.path.relpath(path, os.path.expanduser('~'))}")
+            log("  ⛔ NOT woken. Spawn a successor at this seat with ygg-spawn.py, then")
+            log(f"     fold this row: ygg-fold.py row {row['uuid'][:8]} --force --apply")
     log(f"— {counts} · {'folded' if a.apply else 'would fold'} {folded}")
     if not a.apply:
         log("  nothing was changed. Re-run with --apply.")
