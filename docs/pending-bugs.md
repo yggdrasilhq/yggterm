@@ -1538,6 +1538,32 @@ steady-state minutes, not the two GUI restarts the window contains — worst **3
 (after `dioxus_render/component_window`), so the "no block above 1 s" clause FAILS.
 `webview_edit_stall` incidents in the same 3 h: **zero** — that class did not fire.
 
+⛔ **THAT LAST LINE WENT STALE THE SAME DAY. RE-MEASURED 2026-08-21 AFTERNOON (11.15 monitor,
+GUI host, daemon 3.1.20, a 116-minute window): the class is FIRING — 76 `webview/edit_stall`
+incidents — and `ui/block` is at 2.23/min against the 0.68/min this entry records for the
+morning window.** Counted with `ytrace incidents` (payload.incident=true), not with the span
+query, and not with `ytrace tail`, which is silently capped at 20 records and gave a rate
+3x too high before the cap was noticed.
+
+⭐ **AND THE TWO INSTRUMENTS ARE WATCHING ONE EVENT.** The edit-stall diagnosis reads
+*"webview edit plane stalled: N new flush-gate timeout(s) (VirtualDom frozen ~2s each), **0**
+new unapplied batch(es) (DOM divergence, restart-only), N late ack(s)"* — and `ui/block` in the
+same window has p95 1,969ms, max 3,317ms. A ~2s VirtualDom freeze and a ~2s UI block are the
+same freeze seen from two sides, which is worth more than either count alone.
+
+⇒ **`0 unapplied batches` is the load-bearing half of that string.** This is NOT the
+acked-batch-that-never-applied class (DOM divergence, restart-only); the plane is not corrupt,
+it is STALLING. So the fix is on the freeze, not on the edit transport.
+
+⚠ The incidents cluster rather than spread: 39 and 21 in two adjacent ten-minute buckets, 12
+in another, spanning app_version 3.1.18 and 3.1.19 — bursts under some condition, not a
+constant drip, so a short quiet window will show zero and mean nothing.
+
+⚠ And do NOT read the `last_activity` field on a single `ui/block` as its cause. Across the
+sampled blocks it is `None` for half, then `app_declare/daemon_declare_absent` (4),
+`dioxus_render/component_window` (3), `input_policy/applied` (1), `interactive_request/
+worker_start` (1). Attribution is DIFFUSE; one payload read alone names a false culprit.
+
 **What the window attributes, and what it cannot:**
 
 1. ⭐ **The echo tail is NOT the UI thread.** Of 309 slow (>200 ms) keystrokes, only **3**

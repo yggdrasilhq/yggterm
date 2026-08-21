@@ -2060,3 +2060,31 @@ result.
 
 Cleanup: kill by EXE, not by pattern — `pgrep -f <path>` matches the shell that holds
 the path in its own command line, so it reports a stray that is your own probe.
+
+## Counting incidents: three verbs, three different answers (measured 2026-08-21)
+
+Asking "how often does this fire" has a right instrument and two wrong ones, and the
+wrong ones do not announce themselves.
+
+- ⛔ **`ytrace tail` is silently capped** (20 records). Deriving a RATE from it divides
+  a real count by the window those 20 records happen to span, which is short — so the
+  rate comes out high and confident. A tail that returns exactly 19-20 records is
+  showing you the cap, not the population. Caught giving ~67/min for an event whose
+  true rate was ~2/min.
+- ⚠ **`ytrace query` counts SPANS**, so it answers only for things that are timed. An
+  EVENT (`daemon_declare_absent`) has no duration and returns no row at all — which
+  reads as "it never happened" rather than "wrong instrument".
+- ✅ **`ytrace incidents --since <window> --json` is the one that answers the
+  question**, because it filters on `payload.incident=true`.
+
+⭐ **And when two instruments describe the same duration, check whether they are two
+findings or one event.** A `webview/edit_stall` reporting *"VirtualDom frozen ~2s"* and
+a `ui/block` with p95 1,969ms in the same window are one freeze seen twice. Reporting
+them as two problems doubles the apparent defect count and halves the chance either is
+diagnosed.
+
+⛔ **Never take `last_activity` on a single incident as its cause.** It records what
+happened most recently before the block, so the most FREQUENT event wins by accident.
+Across a sample it was `None` for half the blocks, with four different named
+activities splitting the rest — one payload read alone would have named a culprit that
+is not one.
