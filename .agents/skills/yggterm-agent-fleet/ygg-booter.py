@@ -1439,7 +1439,30 @@ def cmd_defer(args):
         log(f"deferral cleared for {uuid[:8]} — back to the {BOOT_AFTER_SECS}s default")
         return 0
 
-    asked = int(args.secs)
+    # ⛔ `--hours` belongs to `disarm`, but nothing stopped it being passed HERE,
+    # and `--secs` defaults to 0 — so `defer --hours 3` read zero seconds,
+    # clamped up to the 60s floor, wrote a clean read-back and reported success.
+    # A request to go quiet for three hours became a boot in one minute, and the
+    # reply said it worked. Reported 2026-08-21 by a long-running row that had
+    # asked for hours and was woken in 60s.
+    #
+    # Honour the flag rather than rejecting it: an agent reaching for `--hours`
+    # on a "how long to wait" verb has guessed the right thing, and a tool that
+    # punishes the natural guess is the defect. `--secs` still wins if both are
+    # given, being the more specific.
+    if args.secs:
+        asked = int(args.secs)
+    elif args.hours:
+        asked = int(float(args.hours) * 3600)
+    else:
+        # ⛔ Never silently mean "60 seconds". A bare `defer` is someone asking
+        # for a long wait without saying how long — the one reading under which
+        # the old behaviour was catastrophic rather than merely wrong.
+        log("⛔ defer needs a duration: pass --secs <n> or --hours <n> "
+            f"(clamped to {MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s). "
+            "Refusing rather than deferring for the 60s floor, which is what a "
+            "bare defer used to do while reporting success.")
+        return 2
     secs = max(MIN_BOOT_AFTER_SECS, min(asked, MAX_BOOT_AFTER_SECS))
     if secs != asked:
         log(f"⚠ clamped {asked}s to {secs}s — the {MAX_BOOT_AFTER_SECS}s ceiling is the "
