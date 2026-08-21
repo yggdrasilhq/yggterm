@@ -191,6 +191,7 @@ fn discover_remote_machines_from_app_state() -> Result<Vec<RemoteMachineSnapshot
         .machines
         .into_iter()
         .map(|machine| RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: machine.machine_key,
             label: machine.label,
@@ -208,6 +209,7 @@ fn explicit_remote_machines(machine_targets: &[String]) -> Vec<RemoteMachineSnap
     machine_targets
         .iter()
         .map(|target| RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
             apps: Vec::new(),
             machine_key: target.clone(),
             label: target.clone(),

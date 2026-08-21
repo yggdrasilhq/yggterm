@@ -50,7 +50,7 @@ The wording states the separation plainly: each CLI is published by its own
 vendor under its own licence, yggterm does not redistribute it, installing
 fetches it into the user's own account, and nothing is fetched until they agree.
 
-## §3 Presence: probed locally, honest everywhere else
+## §3 Presence: every machine probes ITSELF
 
 `CliPresence` has four states and `Unknown` is a real one.
 
@@ -59,8 +59,23 @@ fetches it into the user's own account, and nothing is fetched until they agree.
   running `--version` per CLI per repaint costs a process each time, and at least
   one vendor CLI unpacks a payload on first invocation — a probe that expensive
   changes the machine it measures.
-- **Every other machine** reports `Unknown`, rendered as *"not probed"*. Reaching
-  a remote host is the provisioner's ssh path, not the renderer's.
+- **Every remote machine reports its OWN `PATH`** through
+  `server remote cli-presence`, fetched on the existing machine-refresh ssh path
+  beside the app-registry fetch. ⭐ **The remote runs the same core function on
+  itself** that the GUI runs locally, so "is this binary here" has one
+  implementation rather than an ssh-side reimplementation that could answer
+  differently.
+- ⛔ **Only the measured fact crosses the wire.** `CliPresenceReport` is
+  `{slug, present, version}`. Display name, install method and whether a CLI is
+  recommended are DERIVED from the registry by the receiver — a remote shipping
+  its own idea of a display name would be a second registry that can disagree
+  with the first.
+- ⛔ **A slug the report omits stays `Unknown`, never `Absent`**, and a machine
+  with no report at all renders *"not probed"*. That covers three different
+  hosts — unreachable, never-refreshed, and running a yggterm older than the
+  verb — none of which is a host that is missing its CLIs. A failed fetch KEEPS
+  the machine's previous report rather than blanking it, the same
+  `None`-vs-`Some(vec![])` discipline the app-registry fetch uses.
 
 ⛔ **`Unknown` must never render as `Absent`.** An unreachable host is not a host
 missing its CLIs, and treating it as one makes the primary button offer installs
@@ -89,11 +104,12 @@ The primary action runs a **foreground** managed-CLI refresh for **this machine*
 after re-reading consent at the point of fetch (the button is not the only path
 to the code, so it is not the only gate).
 
-⚠ **It does not sweep the fleet.** The provisioner owns a fleet scope
+⚠ **It does not yet sweep the fleet.** Remote **probing** now works (§3), so the
+matrix tells the truth about every reachable machine; remote **installing** is
+still the open half. The provisioner owns a fleet scope
 (`ManagedCliRefreshScope::Fleet`, machine key `*`), and wiring the button to it
-would promise the user work the modal cannot report progress for. The remote
-half — probing and installing over ssh, with per-machine progress — is the open
-piece of this surface.
+would promise the user work the modal cannot report progress for — per-machine
+progress is what that half needs before the button can claim it.
 
 ⛔ **Do not "fix" that by relaxing the incidental install gate.**
 `YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL` defaults off because that arm fires on
