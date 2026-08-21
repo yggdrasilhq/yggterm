@@ -9,8 +9,92 @@ enforces them.
 Statuses: **OPEN** · **FIXED IN CODE — LIVE PROOF OWED** (name the observation
 that would falsify it) · **AWAITING A DECISION** (name who decides).
 
+⭐ **LEGENDARY** in a title is an owner-set priority, not a status. It marks a defect
+that makes the product unusable for the person using it, and it outranks every other
+entry in this file regardless of how tractable those are. A lane may not park a
+LEGENDARY item behind easier work, and an entry only becomes or stops being LEGENDARY
+on the owner's word.
+
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
+
+## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
+
+**Status:** OPEN
+
+*Promoted to LEGENDARY by the owner 2026-08-21, from the symptom he named as the
+interface blinking, changing session and beeping.*
+
+**What is measured, over one 1.3-minute window on the GUI host, app at 3.1.26.**
+
+| what | count in 1.3 min |
+|---|---|
+| full terminal mounts (`terminal_mount/begin`) | 5 |
+| `terminal_mount/bootstrap_reset` | 7 |
+| …of those, landing on an **inactive retained host** — a row nobody was looking at | 3 |
+| `session/request_terminal_launch_for_active_begin` | 13 |
+| distinct rows involved | 3 |
+
+⇒ **A row the user is not looking at is being torn down and re-mounted roughly every
+twenty seconds, and a mount begins with an empty surface.** That is the mechanism
+behind "the viewport is empty": nothing has to fail for the screen to go blank, the
+mount simply starts that way and the row is re-mounted for reasons that have nothing
+to do with the user. The blank-surface recovery paths are firing alongside it in the
+same window — `retained_empty_surface_settle_wait` ×2,
+`blank_host_snapshot_replay_rejected`, `blank_retry_poison_recovery_begin`,
+`resume_recovery_begin/end`, `reveal_forced_incomplete` ×2 — so the recovery
+machinery is not idle, it is losing.
+
+⚠ **What is NOT established, and must not be asserted.** Whether the *active session*
+also changes on its own. It was observed on three different rows inside thirty seconds,
+but the owner was at the machine and a person clicking between rows produces exactly the
+same trace. **No instrument here separates his click from an app-driven switch**, so the
+switching half is unproven while the re-mounting half is not. ⇒ The measurement that
+would settle it is an activation event carrying its ORIGIN (user gesture vs internal),
+which the trace does not currently record. Adding that origin is the first piece of work
+this entry wants, because without it nobody can ever tell these two apart.
+
+**Falsifier:** leave the GUI untouched for ten minutes with several agent rows producing
+output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
+row. It must be zero.
+
+## ⛔⛔ [11.0] THE FLEET'S OWN PROBES ARE A TOP-TWO SOURCE OF THE OWNER'S INPUT BLOCKS
+
+**Status:** OPEN
+
+*Measured 2026-08-21 on the GUI host. Nobody had asked this question: the campaign has
+spent weeks optimising what the product costs him and never once measured what WATCHING
+it costs him.*
+
+**The traffic.** In one 1.3-minute window the GUI served **89 `describe_state` and 26
+`describe_rows`** app-control requests — about **88 agent probes per minute**, roughly
+one and a half per second, none of them from the person using the machine.
+
+**The cost.** Over a 30-minute window, 92 `ui/block` faults: p50 585 ms, p90 1092 ms,
+max 6207 ms, **62.5 seconds of blocked UI thread out of 1788 — 3.5% of wall time**. By
+attribution:
+
+| subject | blocks |
+|---|---|
+| `app_control/request_begin` + `request_end` | **22 (24%)** |
+| `dioxus_render/component_window` | 14 |
+| `terminal_io/dispatch` | 9 |
+| `ui_telemetry/preview_debug` | 7 |
+| `app_declare/daemon_declare_absent` | 6 |
+
+⇒ **A quarter of his input blocks are agents asking his GUI how it is doing.** Every
+supervision instrument this campaign built — the monitor, the booter, the board, the
+watchers, and every orchestrator sampling loop — pays for its readings in his typing
+latency. That is the cheapest large win left in the input lane, and it needs no product
+change at all: it is a question about how often we ask, and whether a read has to cross
+the UI thread.
+
+⚠ **This entry is partly self-inflicted and says so.** Scans that read every seated row
+one request at a time are the worst shape available, and this seat ran two of them today.
+
+**Falsifier:** quiet every fleet probe for ten minutes and re-measure. If
+`app_control/*` attribution does not fall to near zero, the requests are not the cause
+and this entry is wrong.
 
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
@@ -29,6 +113,15 @@ verified" — naming the symptom (the seat is wrong) and not the cause (the writ
 was refused, and said so, in a field nobody reads). A caller that checks `error`
 — the obvious field, and the one every other verb uses — concludes the seat was
 set.
+
+**⭐ NEW EVIDENCE 2026-08-21, and it narrows the mechanism.** Spawning a row with
+`server app terminal new --outline 11.19` returned `error: null` and set **no seat at
+all** (`outline_prefix: null` in the same reply) — and a separate `server app session
+outline <row> 11.19` a minute later answered `applied: true` and took. So the refusal is
+not about the verb or the path: the same write succeeds once the row exists and fails
+when issued as part of the birth. ⇒ That is also the owner's oldest outstanding request
+— a row born into its group at its seat — so the two are one piece of work, and the seat
+argument at spawn is currently accepted and discarded in silence.
 
 **Measured further.** The row is listed by `server app rows` under exactly the
 path the verb refuses (`kind: Session`, `full_path` identical to the argument),
