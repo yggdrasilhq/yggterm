@@ -35,6 +35,10 @@ against the fleet.
 `--anomalies` prints only what is wrong, which is what a steer should carry.
 """
 import argparse
+
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from ygg_rowarg import row_session_id  # noqa: E402
 import importlib.util
 import json
 import os
@@ -155,7 +159,7 @@ def collect(gui_host, campaign=None):
         if campaign and seat.split(".")[0] != str(campaign):
             continue
         path = r.get("full_path") or ""
-        uuid = path.rsplit("/", 1)[-1]
+        uuid = row_session_id(r)
         host = path.split("//", 1)[-1].split("/", 1)[0] if "//" in path else ""
         host = host if host and host != uuid else ""
         info = meta.get(uuid, {})

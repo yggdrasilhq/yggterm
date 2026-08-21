@@ -174,6 +174,7 @@ def rows_census(host):
         if seat and "://" in path and path not in seen:
             seen.add(path)
             out.append({"seat": str(seat), "uri": path, "label": row.get("label") or "",
+                        "session_id": (row.get("session_id") or "").strip(),
                         "session_cwd": row.get("session_cwd") or "",
                         # ⛔ THE DAEMON ALREADY KNOWS WHO IS WORKING — this is the
                         # flag that drives the blinking indicator a person watches.
@@ -197,6 +198,7 @@ def rows_all(host):
             seen.add(path)
             out.append({"seat": str(row.get("outline_prefix") or "-"), "uri": path,
                         "label": row.get("label") or "",
+                        "session_id": (row.get("session_id") or "").strip(),
                         "session_cwd": row.get("session_cwd") or ""})
     return out
 
@@ -465,8 +467,27 @@ def branch_state(row):
     return f" · {br.rsplit('/', 1)[-1]}: nothing unlanded" + (", tree dirty" if dirty else "")
 
 
+def _row_id(row):
+    """This row's session id — published by the daemon, never sliced off its path.
+
+    ⚠ **The scheme filter is what has been protecting this file, not the slice.**
+    `rows_census` and `rows_all` both keep only rows whose address contains
+    `://`, and a live `scheme://host/<uuid>` address does end in the id — so the
+    old slice was right for every row fold could actually see. That is a narrow
+    escape rather than a design: widen either filter by one line and a row whose
+    address is a store path starts being classified under the name of its file.
+
+    ⇒ Ask the row. `session_id` is populated on every session row the daemon
+    publishes, and the fallback exists only for the dicts this file builds itself.
+    """
+    return (row.get("session_id") or "").strip() or row["uri"].rsplit("/", 1)[-1]
+
+
 def classify(row, live, protected):
-    uuid = row["uri"].rsplit("/", 1)[-1]
+    # ⛔ `protected` is the list of rows a PERSON is using, and it is keyed by
+    #    session id — so a sliced id silently fails to match and this function
+    #    would classify a row somebody is typing in as reapable.
+    uuid = _row_id(row)
     row["uuid"] = uuid
     if uuid in protected:
         return "PROTECTED", "listed as a row a person uses"
@@ -1007,7 +1028,7 @@ def cmd_orphans(a, host, live):
     for path, cwd, seat in dead:
         log(f"⛔ {str(seat) or '-':<7} {path[-40:]} — dead, and its tree {os.path.basename(cwd)} is gone")
         if a.apply:
-            row = {"uri": path, "uuid": path.rsplit("/", 1)[-1], "seat": str(seat or "-"),
+            row = {"uri": path, "uuid": uuid, "seat": str(seat or "-"),
                    "label": row_label(allrows, path), "session_cwd": cwd}
             fold(row, "DEAD", "cwd tree no longer exists", host, True)
     log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive, {len(keepsakes)} kept"

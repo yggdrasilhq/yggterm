@@ -66,7 +66,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ygg_host import resolve_gui_host  # noqa: E402
-from ygg_rowarg import add_row_argument, bare_uuid, resolve_row  # noqa: E402
+from ygg_rowarg import add_row_argument, bare_uuid, resolve_row, row_session_id  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 STATE = Path.home() / ".yggterm" / "relay"
@@ -617,7 +617,7 @@ def escalate(host, sub, row, why, dry):
     # than into a void — the whole point of the plane.
     orphaned = ""
     if to:
-        live = {(r.get("full_path") or "").rsplit("/", 1)[-1]
+        live = {row_session_id(r)
                 for r in (ygg(host, "server", "app", "rows").get("data") or {}).get("rows", [])}
         # ⚠ An EMPTY row list is an instrument failure, not a dead target. Falling
         # back on it would route every escalation to the human the moment ssh
@@ -1591,7 +1591,7 @@ def fishy_audit(subs, dry):
                 # ⛔ Blind means blind. An unanswered row plane must not be
                 # allowed to say a live escalation target is dead — that would
                 # send the orchestrator to repoint a subscription that is fine.
-                live_row_set = ({(r.get("full_path") or "").rsplit("/", 1)[-1]
+                live_row_set = ({row_session_id(r)
                                  for r in _rows} if _ok else None)
             # ⛔ TWO LENGTHS OF THE SAME IDENTIFIER, COMPARED BY EQUALITY.
             # `escalate_to` is stored verbatim, so a subscription made with a
@@ -1701,7 +1701,7 @@ def seat_audit(gui_host, subs, dry):
     for r in rows:
         t = r.get("session_title") or ""
         if re.match(r"^\d+(\.\d+)*\.?\s", t):
-            if is_mine(r.get("outline_prefix") or "", (r.get("full_path") or "").rsplit("/", 1)[-1]):
+            if is_mine(r.get("outline_prefix") or "", row_session_id(r)):
                 findings.append(f"⚠ TITLE CARRIES ITS OWN NUMBER (renders twice): {t[:52]}")
             else:
                 foreign_numbered_titles += 1
@@ -1721,7 +1721,7 @@ def seat_audit(gui_host, subs, dry):
     # THAT CAUGHT A REAPED ROW BACK FROM THE DEAD holding a live CLI in a worktree
     # its own successor was editing — so it is worth keeping even though most hits
     # are other campaigns minding their own business.
-    seat_of = {(r.get("full_path") or "").rsplit("/", 1)[-1]: (r.get("outline_prefix") or "")
+    seat_of = {row_session_id(r): (r.get("outline_prefix") or "")
                for r in rows}
     known = {s["uuid"] for s in subs}
     unsupervised_foreign = 0
