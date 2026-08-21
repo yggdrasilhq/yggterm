@@ -647,6 +647,72 @@ falsified and was not testable there:** that host's GUI is parented to pid 1, so
 supervised pair to lose. Re-test the supervisor claim where the GUI actually runs under one
 before treating this entry as closed.
 
+## ⛔ [11.15] EVERY DAEMON LEAKS A ZOMBIE EVERY FIFTEEN MINUTES, AND NOTHING COUNTS THEM
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Measured on the fleet 2026-08-21: four live daemons holding **221 zombie processes**
+between them.*
+
+| daemon | uptime | zombies | oldest zombie |
+|---|---|---|---|
+| installed headless (deleted binary, still serving) | 19.9 h | 79 | 19.9 h |
+| a worktree build | 16.9 h | 68 | 16.8 h |
+| a second worktree build | 16.4 h | 66 | 16.4 h |
+| the current installed headless | 1.8 h | 8 | 1.8 h |
+
+**In every one of them the oldest zombie is the same age as the daemon**, so nothing
+had ever been reaped, and the arrivals are a metronome: inter-arrival p50 **912s**,
+min 911, max 917, n=78. Wall-clock births land on the second — 15:38:18, 15:53:30,
+16:08:42, 16:23:55, 16:39:06.
+
+Root: `host_panic::notify_owner` ended in `let _ = cmd.spawn()`. **A dropped
+`std::process::Child` is never waited on**, so each owner notification left a
+permanent entry in the daemon's process table. 912s is `NOTIFY_COOLDOWN_MS`
+(15 min) plus one `PERF_INCIDENT_MONITOR_MS` tick — the host is genuinely under
+load, so the notifier fires on every cooldown expiry, forever. The GUI had the same
+defect in `terminal_open_external_url`, leaking one child per clicked link.
+
+⚠ **Two instruments nearly gave a good-looking wrong answer here.** The zombies'
+`comm` reads `yggterm-headles`, the parent's own name — which looks like a fork that
+never exec'd, but is equally consistent with a child exec'ing the same binary, and it
+is the latter. And `pgrp`/`session` matching the parent is what EXCLUDED
+`spawn_daemon_process_from_executable`, which `setsid`s and already reaps correctly.
+
+**Fixed** with one owner for the whole class: `yggterm_core::child_reaper`.
+`spawn_and_reap` is what a fire-and-forget caller reaches for instead of
+`let _ = cmd.spawn()` and cannot leak by construction; `reap_child_in_background` is
+the primitive under it. The daemon's existing `reap_spawned_child_in_background` now
+delegates to that primitive rather than re-spelling thread-plus-wait, so there is one
+encoding of the reap and the tracing stays local to the caller that wants it.
+
+⛔ **The one-line fix is wrong and is recorded so nobody tries it:** `SIGCHLD` set to
+`SIG_IGN` auto-reaps, and would break every `.wait()` / `.output()` / `.status()` in
+the codebase at once by turning them into `ECHILD`.
+
+**Falsifier:** on a daemon built from this commit and up for more than three notify
+cooldowns (>46 min), `ps -eo ppid,stat | awk '$1==<pid> && $2 ~ /Z/' | wc -l` must
+read 0, where the same probe against an older daemon on the same host still counts
+its accumulated zombies.
+
+⭐ **The unit side is already a PROVEN lock, not an assumed one.**
+`notify_owner_reaps_the_notification_child` drives the real production function
+against a stub binary in a fake home and counts zombie children of the test process.
+It was falsified by reverting `notify_owner` to `let _ = cmd.spawn()`, and it failed
+with *"left a zombie behind: 1 zombie children against a baseline of 0"* — so it goes
+red on exactly this defect and not on something adjacent. The primitive's own test
+asserts its CONTROL first (an un-waited exited child really does show as `Z`), so
+neither test can pass by being blind to the state it checks.
+
+**What remains open — and it is sharper than "nobody looked":** the codebase's only
+zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
+that a corpse is never reported as a survivor. That is CORRECT for a teardown question
+("did this process really go away") and it is precisely why the leak was invisible:
+the one function that knows what a zombie is exists to filter them out, and nothing
+anywhere COUNTS them as a resource. A process-table census in the resource watch is
+not built here — routed to the 6.7 usability/resource-watch seat, which owns
+MEMORY > CPU > SPACE, rather than fixed by this lane.
+
 ## ⛔⛔ [11.15] A GATE THAT JUDGES THE STORED ANSWER REOPENS ITSELF WHEN THE ANSWER IS BAD
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -6562,6 +6628,28 @@ act on.
 
 ⭐ **The discriminator that worked, and it needs no new verb:** **transcript ROW-COUNT growth.** A busy
 row grows; an unreachable one is frozen. Sample twice a few seconds apart.
+
+⛔⛔ **THERE IS A THIRD STATE, AND IT IS THE ONE THE ROW LISTING CANNOT SEE: the session is DEAD.**
+Measured 2026-08-21 against a live orchestrator row. Its transcript had been frozen for 95 minutes,
+NO process on the host carried its uuid — and `server app rows` still listed it as
+`busy: false, busy_reason: "idle"`. So the refusal is correct and unavoidable (there is no composer
+because there is no CLI), while every surface an agent would consult to check first says the row is
+healthy and available.
+
+⇒ The two-state framing above is not enough: **busy** (drains at its turn boundary), **superseded
+socket** (never drains, restart the terminal), **dead** (never drains, and the row is a corpse the
+listing renders as idle). The transcript-growth probe cannot separate the last two — both are frozen
+— so the join to the PROCESS TABLE is what settles it.
+
+⚠ **And `terminal_process_id` is NOT the tell**, though it looks like one. Measured on the same
+listing: it is `None` on **all 120 live agent rows**, including the 8 reading
+`busy_reason: agent_working_daemon` — so it does not discriminate anything on this surface, and a
+reader who reached for it would conclude every row is dead.
+
+⇒ **What this costs:** an agent addressing a dead row pays a 30-second timeout per attempt and gets
+a message describing the wrong cause. Four of six reports from one lane were lost this way before
+the row was checked out-of-band. **`busy_reason: "idle"` currently conflates "waiting for input"
+with "no longer exists".**
 
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
