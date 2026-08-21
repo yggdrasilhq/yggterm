@@ -308,6 +308,48 @@ def protected_uuids():
     return out
 
 
+_FETCHED = set()
+
+
+def branch_state(row):
+    """⛔ A TRANSCRIPT SAYS WHAT A SESSION BELIEVED. ITS BRANCH SAYS WHAT IT DID.
+
+    Every arm above this reads PROSE — a phrase list of ways a lane might announce
+    it is done. That list is the same hand-written match this project keeps paying
+    for: a lane that opened "Done. Landed on main as <sha>." matched none of the
+    nine phrases and classified WORKING at nineteen minutes idle, while its branch
+    had nothing left to land and its own last words said so.
+
+    ⇒ So do not widen the phrase list. Ask the artefact instead and hand the
+    ANSWER to whoever decides. This never reclassifies on its own — a lane with a
+    clean branch may be mid-thought, and "has nothing unlanded" is not "has
+    nothing left to do". It is the one fact a person needs and the transcript
+    cannot give.
+    """
+    cwd = (row.get("session_cwd") or "").strip()
+    if not cwd or not os.path.isdir(os.path.join(cwd, ".git")) and not os.path.exists(os.path.join(cwd, ".git")):
+        return ""
+    def g(*args):
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                              text=True, timeout=60)
+    br = g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if not br.startswith("lane/"):
+        return ""
+    # One fetch per checkout per run. `origin/main` is a cached note of where the
+    # server was, and a stale one reports landed work as unlanded.
+    if cwd not in _FETCHED:
+        _FETCHED.add(cwd)
+        g("fetch", "-q", "origin")
+    c = g("cherry", "origin/main", br)
+    if c.returncode != 0:
+        return ""
+    unlanded = [l for l in c.stdout.splitlines() if l.startswith("+")]
+    dirty = bool(g("status", "--porcelain").stdout.strip())
+    if unlanded:
+        return f" · {br.rsplit('/', 1)[-1]}: {len(unlanded)} unlanded" + (", tree dirty" if dirty else "")
+    return f" · {br.rsplit('/', 1)[-1]}: nothing unlanded" + (", tree dirty" if dirty else "")
+
+
 def classify(row, live, protected):
     uuid = row["uri"].rsplit("/", 1)[-1]
     row["uuid"] = uuid
@@ -357,8 +399,8 @@ def classify(row, live, protected):
         return "WORKING", f"screen says {state}, quiet {idle}m"
 
     if says_watching:
-        return "WORKING", f"declares itself still watching, quiet {idle}m"
-    return "WORKING", f"quiet {idle}m, no stand-down in its opening"
+        return "WORKING", f"declares itself still watching, quiet {idle}m{branch_state(row)}"
+    return "WORKING", f"quiet {idle}m, no stand-down in its opening{branch_state(row)}"
 
 
 def harvest(row, verdict, why):
@@ -667,6 +709,16 @@ def main():
     one.add_argument("target")
     one.add_argument("--apply", action="store_true")
     one.add_argument("--host")
+    # ⛔⛔ THE SINGLE-ROW VERB MUST ANSWER THE SAME QUESTION THE SWEEP ASKED.
+    # `sweep --stall-idle-min 10` printed COLD and named `row <uuid> --force
+    # --apply` as the remedy in its own output; `row` then read the module
+    # default of 20 and replied WORKING, folding nothing. Two classifiers, one
+    # question, different answers, and no hint that a threshold was the whole
+    # difference. Measured 2026-08-21 on a lane whose work was already landed.
+    one.add_argument("--stall-idle-min", type=float, default=STALL_IDLE_MIN,
+                     help="the same threshold sweep takes; a verdict is only "
+                          "meaningful beside the threshold that produced it")
+    one.add_argument("--finished-idle-min", type=float, default=FINISHED_IDLE_MIN)
     one.add_argument("--force", action="store_true",
                      help="fold this row whatever the verdict — for a row an operator has "
                           "named explicitly and decided about. Never available to `sweep`, "
@@ -722,6 +774,12 @@ def main():
                 "PROTECTED": "🔒", "STALLED": "⏸", "COLD": "❄"}[verdict]
         log(f"{mark} {row['seat']:<7} {row['uuid'][:8]} {verdict:<9} {why}")
         forced = getattr(a, "force", False) and verdict != "PROTECTED"
+        # ⚠ A single-row call is an operator asking about ONE row, usually because
+        # a sweep told them to. Declining in silence makes the two verbs look as
+        # though they disagree about the row, when they disagree about a number.
+        if a.cmd == "row" and verdict not in ("DEAD", "FINISHED") and not forced:
+            log(f"  not folded: {verdict} at --stall-idle-min {STALL_IDLE_MIN:g} "
+                f"(idle {row.get('idle_min')}m). A lower threshold, or --force, folds it.")
         if verdict in ("DEAD", "FINISHED") or forced:
             if forced and verdict not in ("DEAD", "FINISHED"):
                 log(f"  --force: folding a {verdict} row on an operator's say-so")
