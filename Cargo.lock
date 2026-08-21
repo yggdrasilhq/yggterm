@@ -7218,7 +7218,7 @@ dependencies = [
 [[package]]
 name = "ytrace"
 version = "0.1.0"
-source = "git+https://github.com/yggdrasilhq/ytrace?branch=main#77f70dc334daa0e47721d67f61bf9bb854161a22"
+source = "git+https://github.com/yggdrasilhq/ytrace?branch=main#358b864ad86f3a4d65b94028aa2633c7350e83d8"
 dependencies = [
  "anyhow",
  "clap",
