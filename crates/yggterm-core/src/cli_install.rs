@@ -24,6 +24,7 @@
 //! Once granted, the recommended plan is the ruling: everything, everywhere.
 
 use crate::agent_cli::{AgentCliDescriptor, CliInstall, AGENT_CLIS};
+use serde::{Deserialize, Serialize};
 
 /// Whether the user has acknowledged that yggterm may fetch third-party CLIs
 /// on their behalf.
@@ -286,6 +287,65 @@ fn is_executable_file(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
+/// One CLI's measured presence on one machine, as it crosses the wire.
+///
+/// ⛔ **ONLY THE MEASURED FACT TRAVELS.** Display name, install method, whether the
+/// CLI is recommended — all of that is DERIVED from the registry by whoever receives
+/// this, never sent. A remote host shipping its own idea of a CLI's display name would
+/// be a second registry that can disagree with the first, which is the exact shape the
+/// single-source-of-truth law forbids. What the remote knows and the local side cannot
+/// is one bit: *is the binary there.*
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct CliPresenceReport {
+    pub slug: String,
+    pub present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Probe every registered CLI on THIS machine and return the wire report.
+/// Run on the remote host, by the remote host, against its own `PATH`.
+pub fn local_presence_report() -> Vec<CliPresenceReport> {
+    AGENT_CLIS
+        .iter()
+        .filter(|descriptor| descriptor.slug != "shell")
+        .map(|descriptor| {
+            let presence = probe_local_presence(descriptor);
+            CliPresenceReport {
+                slug: descriptor.slug.to_string(),
+                present: presence.is_present(),
+                version: match presence {
+                    CliPresence::Present { version } => version,
+                    _ => None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Rebuild a machine's matrix from a report a remote host sent back.
+///
+/// ⛔ **A slug the report does not mention stays `Unknown`, never `Absent`.** The two
+/// cases it separates are "that host told us the binary is missing" and "that host is
+/// running an older build that did not know to look" — and only the first is work.
+/// Collapsing them would let a version skew read as a fleet-wide absence and offer
+/// installs nobody asked for.
+pub fn machine_status_from_report(
+    machine_key: impl Into<String>,
+    display_label: impl Into<String>,
+    report: &[CliPresenceReport],
+) -> MachineCliStatus {
+    MachineCliStatus::build(machine_key, display_label, |descriptor| {
+        match report.iter().find(|row| row.slug == descriptor.slug) {
+            Some(row) if row.present => CliPresence::Present {
+                version: row.version.clone(),
+            },
+            Some(_) => CliPresence::Absent,
+            None => CliPresence::Unknown,
+        }
+    })
+}
+
 /// One machine's worth of work, as the modal's action button would perform it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct InstallPlan {
@@ -479,6 +539,57 @@ mod tests {
         // probe labelled with a remote machine's key is the exact confusion
         // this module was written to prevent.
         assert_eq!(local_machine_status("here").machine_key, "");
+    }
+
+    #[test]
+    fn a_report_round_trips_into_the_same_matrix() {
+        let report = local_presence_report();
+        assert_eq!(report.len(), AGENT_CLIS.iter().filter(|d| d.slug != "shell").count());
+        let json: Vec<String> = report
+            .iter()
+            .map(|row| serde_json::to_string(row).expect("serialises"))
+            .collect();
+        let back: Vec<CliPresenceReport> = json
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("round-trips"))
+            .collect();
+        assert_eq!(report, back);
+        let direct = local_machine_status("box");
+        let rebuilt = machine_status_from_report("box", "box", &back);
+        assert_eq!(
+            direct.rows.iter().map(|r| (r.slug, r.presence.is_present())).collect::<Vec<_>>(),
+            rebuilt.rows.iter().map(|r| (r.slug, r.presence.is_present())).collect::<Vec<_>>(),
+            "a probe here and the same probe reported from there must agree"
+        );
+    }
+
+    #[test]
+    fn a_cli_missing_from_the_report_is_unknown_not_absent() {
+        // The version-skew case: an older remote build reports only the CLIs it knew
+        // about. The ones it never mentioned must not be counted as installable work.
+        let partial = vec![CliPresenceReport {
+            slug: "claude-code".to_string(),
+            present: true,
+            version: None,
+        }];
+        let status = machine_status_from_report("box", "box", &partial);
+        let unknown = status
+            .rows
+            .iter()
+            .filter(|row| matches!(row.presence, CliPresence::Unknown))
+            .count();
+        assert!(unknown > 0, "unmentioned CLIs stay Unknown");
+        assert_eq!(status.installable().count(), 0, "Unknown is never work");
+        assert!(recommended_plans(&[status], InstallConsent::Granted).is_empty());
+    }
+
+    #[test]
+    fn an_empty_report_leaves_every_cli_unknown() {
+        // What an unreachable host produces. It must read as "not probed", never as a
+        // machine that is missing everything.
+        let status = machine_status_from_report("box", "box", &[]);
+        assert_eq!(status.summary(), "not probed");
+        assert_eq!(status.installable().count(), 0);
     }
 
     #[test]
