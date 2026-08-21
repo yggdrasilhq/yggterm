@@ -128,6 +128,117 @@ already solved — media probe records carry a host-stamped `(row, tab)` — so 
 is specifically about the imperative verbs.
 
 ## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
+
+**Status:** OPEN
+
+Two agent rows lost their process during a cross-CLI greeting run. Neither death was
+recorded anywhere, and every instrument that a fleet verb consults kept describing them
+as healthy:
+
+    owned_terminal_session_count      4      ← the daemon knows
+    live_terminal_sessions          5 entries ← the list does not
+    server rows departed              0      ← the ONE owner of "where did it go and why"
+    server app rows                 live_member:true, presence:live_rail,
+                                    wedge_suspected:false, busy_reason:"idle"
+    server screen                   "no session here matches …"
+
+⛔ **`busy_reason:"idle"` is the specific danger.** Idle is the green light every
+delivery verb waits for, so a brief aimed at a dead row passes the readiness gate,
+writes into nothing, and the row then has no transcript — which routes it straight to
+the reap. `ygg-fold` decides DEAD by *"uuid not in live"*, and the uuid IS in live, so
+the seat is never reclaimed either: it is held forever by a process that does not exist.
+
+⚖ **The count is its own witness**, and that is what makes this cheap to detect: owned
+and live disagreed by exactly the number of dead rows, both times. Whatever removes a
+PTY from the owned set already knows; nothing tells the live list or the ledger.
+
+⇒ Recommended: make the departure ledger the single place a row's disappearance is
+recorded, and derive `live_member` from PTY ownership rather than from a list that is
+only ever appended to. Until then a sweep cannot distinguish a working lane from a
+corpse, which is the assumption every watchdog in the fleet is built on.
+
+⚠ Observed in a headless sandbox (`YGGTERM_HOME` + Xvfb, recipe in the field guide).
+The rendering half of that environment does not travel to a desktop; the daemon half is
+the same binary the fleet runs everywhere, and the ledger and the owned/live split are
+both daemon-side. **Reproduce on a desktop before assuming the scope is wider than the
+evidence.**
+
+## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
+
+**Status:** OPEN
+
+`ygg-deliver`'s reap destroys a row whose transcript is ABSENT, on the stated premise
+that such a row *"has never written a word, so it was never briefed and cannot become
+anything"*. Measured during the greeting run: a codex row that had been briefed, had
+run a shell command, and had reported its result **had written no transcript at all**
+— no store file existed for it twenty minutes after birth.
+
+⚖ The premise is calibrated on one CLI. `ygg-spawn` allows 90 s of transcript lag from
+a measurement taken on a CLI that accepts a caller-supplied session id, so its row id
+IS its transcript id from the first byte. Four registered CLIs declare
+`id_assigned_at_birth: false`; they mint their own id and write on their own schedule,
+and until then the row's id addresses nothing. ABSENT is literally true for them and
+the inference drawn from it is false.
+
+⛔ **Not fixed by the FOUND/ABSENT/UNMEASURABLE split**, deliberately — that separated
+"we did not look" from "we looked", and this is a case where we looked in the right
+place and the answer is still not evidence.
+
+⇒ Recommended, and NOT taken here because it needs a measurement this lane does not
+have: find out how long after birth each `id_assigned_at_birth:false` CLI first writes
+a store file, and treat ABSENT inside that window as UNMEASURABLE. **Do not guess the
+threshold** — too short destroys working lanes, too long lets briefless debris hold
+seats, and both failures are silent. A cheaper interim that needs no timing at all:
+ask whether the row has a live agent PROCESS before destroying it, since a row with one
+has manifestly not failed to be born.
+
+## ⛔ [99.1] A FRESHLY BORN AGENT ROW REPORTS AN UNSENT DRAFT NOBODY TYPED
+
+**Status:** OPEN
+
+Both agent rows created during the greeting run were reported as holding a composer
+draft, on a daemon where nothing had ever been typed into either. `terminal submit`
+therefore refused the FIRST message a row is ever sent — its brief — with
+`submitted:false` and *"the composer holds an unsent draft — refusing to probe, because
+the probe types a marker and clears the line with Ctrl+U and would destroy it"*.
+
+The rendered grid disagrees. `server screen` on that row shows an empty composer: the
+placeholder hint and the status line, nothing typed. Two instruments, one row, opposite
+answers, seconds apart.
+
+⛔ **The refusal is correct behaviour on a wrong reading, which is why it is dangerous.**
+The law forbids retrying `submitted:false`, so a spawner that hits this has no way to
+brief the row it just created, and the row then routes to the reap as never-briefed.
+`send` plus a lone carriage return delivers past it, but that path has no draft guard at
+all — it is the workaround, not the fix.
+
+⚠ On the live plane the same census reported 4 drafts across 36 owned sessions, which is
+plausible and not a mass false positive. So the trigger is something about a NEW row, not
+the detector in general. ⚠ Sandbox caveat as above.
+
+⇒ Recommended: find what the detector reads on a composer that has never been typed into,
+and give it a state for "no composer has appeared yet" distinct from "a draft is held" —
+the same distinction `input-check` already draws when it answers *"input readiness is
+unanswerable rather than false"*. A single boolean cannot carry three answers, which is
+the shape of every other defect this run surfaced.
+
+## ⛔ [99.1] THE FLEET VERBS CANNOT BE AIMED AT A SANDBOX, SO THEY ARE NEVER TESTED AGAINST ONE
+
+**Status:** OPEN
+
+`ygg-deliver`, `ygg-spawn`, `ygg-monitor` and `ygg-fold` all reach the row plane as
+`ssh <gui-host> ~/.local/bin/yggterm-headless server app …`. The binary path is a module
+constant and the home it resolves is the real one, so there is no way to point any of
+them at an isolated `YGGTERM_HOME` — `--host` moves which machine answers, never which
+home. A sandbox row plane is now reachable (recipe in the field guide), and these verbs
+still cannot be run against it.
+
+⇒ That is why every defect in them has been found on somebody's live desktop, including
+the three fixed in this lane. Recommended: let the binary and the home come from the
+environment the caller already has to set anyway, so the verbs can be exercised in a
+sandbox before they are trusted with a destructive decision on a real row.
+
 ## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
 
 **Status:** OPEN
