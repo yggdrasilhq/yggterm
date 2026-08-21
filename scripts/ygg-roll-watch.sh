@@ -12,15 +12,22 @@
 #
 #   scripts/ygg-roll-watch.sh [--interval 3600] [--once] [--dry-run] [--sweep]
 #
-# ⭐ WHAT IT DELIBERATELY WILL NOT DO: restart the GUI. Every other step here is
-# invisible to the person using the machine — a build on a build host, binaries
-# written to disk, and a daemon that adopts on its own terms when its own
-# sessions allow it, which is the constitution working rather than a compromise.
-# Restarting the GUI is the one step a human FEELS, it is the step that has cost
-# this owner a blank viewport and a lost composer more than once, and a timer is
-# the worst possible chooser of its moment. So the GUI half is reported and left
-# to a human or an orchestrator. ⇒ A CI job that can only ever improve things
-# silently is one nobody has to supervise.
+# ⛔⛔ IT DOES RESTART THE GUI, AND THIS HEADER USED TO PROMISE THE OPPOSITE.
+# The build, the binaries and the daemon adoption are all invisible to the person
+# using the machine; the client restart is not, and it is the step a human FEELS.
+# This file refused it on exactly that reasoning until an owner ruling reversed
+# the call: a client left behind its own daemon costs confusing failures nobody
+# can attribute, on someone else's machine, while a restart costs seconds and the
+# sessions survive it by construction because the daemon owns the PTYs. So the
+# client is notified, given a grace window, then restarted. The full ruling and
+# the weighing are recorded at `reconcile_client`'s callsite, which is where the
+# behaviour lives.
+#
+# ⇒ **THEREFORE THIS IS NOT A JOB THAT CAN ONLY EVER IMPROVE THINGS SILENTLY, and
+# anyone deciding whether to start it must know that.** A seat told to leave the
+# owner's window alone must NOT start this loop. A stale guarantee in a header is
+# worse than no guarantee: it is read once, believed, and never re-checked
+# against the code beneath it.
 set -uo pipefail
 
 #: ⛔ CAPTURED BEFORE THE PARSER EATS THEM: the re-exec below must relaunch with

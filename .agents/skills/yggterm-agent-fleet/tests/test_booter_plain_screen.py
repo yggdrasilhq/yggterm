@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The screen normalizer must match through BOTH spellings of an escape.
+"""The screen normalizer, and the composer read as a ROW rather than a screen.
 
     python3 tests/test_booter_plain_screen.py [--booter <path to ygg-booter.py>]
 
@@ -56,28 +56,50 @@ def main():
         if not any(m in low for m in b.CHOICE_PROMPT_MARKERS):
             failures.append(f"choice prompt MISSED through {name} spelling")
 
-    # 2. Doubled boot residue must read residue-only through either spelling —
-    #    a False here wedges the row forever (refused every tick, boots
-    #    refunded, subscription still reading healthy).
-    twice = b.BOOT_TEXT + b.BOOT_TEXT
-    residue_real = ("earlier conversation output\n❯ "
-                    + twice.replace(" ", "\x1b[1C", 40) + "\n")
-    for name, screen in (("real-bytes", residue_real),
-                         ("literal-escaped", literalize(residue_real))):
-        pre = b._plain_screen(screen)
-        if not b._composer_is_boot_residue_only(pre, b.BOOT_TEXT[:27]):
-            failures.append(f"doubled boot residue NOT residue-only through {name} spelling")
+    # 2. ⛔⛔ THE JAM THIS ENDS. A boot that WORKED stays on the screen as a
+    #    delivered transcript entry, and the agent CLI draws that entry behind
+    #    the SAME glyph the composer uses. The old reader flattened the whole
+    #    screen to one line and found the boot text after a `❯` — so the row
+    #    read "residue in the composer" forever and no clear could ever satisfy
+    #    it. Measured across 19 rows and 434 consecutive refusals.
+    delivered = [
+        "  earlier conversation output",
+        "❯ " + b.BOOT_TEXT[:70],
+        "",
+        "● and the reply the row already gave to it",
+        "✻ Churned for 50s",
+        "─" * 60,
+        "❯",
+        "─" * 60,
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+    ]
+    if b._composer_from_grid(delivered) != "":
+        failures.append("a DELIVERED boot in the transcript read as composer content: "
+                        f"{b._composer_from_grid(delivered)!r}")
 
-    # 3. An owner's words before the copies must still refuse — the cleaner may
-    #    never eat a human's draft, whatever the spelling did to the screen.
-    drafted = ("❯ please hold this thought about the ledger " + b.BOOT_TEXT + "\n")
-    if b._composer_is_boot_residue_only(b._plain_screen(drafted), b.BOOT_TEXT[:27]):
-        failures.append("owner draft before the copy was NOT refused")
+    # 3. The composer's own content is still read, including when it wraps.
+    drafted = [
+        "● some earlier output",
+        "─" * 60,
+        "❯ please hold this thought about the",
+        "  ledger until tomorrow",
+        "─" * 60,
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ]
+    if b._composer_from_grid(drafted) != "please hold this thought about the ledger until tomorrow":
+        failures.append(f"a wrapped composer draft was misread: {b._composer_from_grid(drafted)!r}")
+
+    # 4. No composer drawn at all is NOT an empty composer — one may be typed
+    #    into and the other may not, and returning "" for both is how a watcher
+    #    types into a modal.
+    mid_output = ["● running the sweep", "  Ran 1 shell command", "  ...still going"]
+    if b._composer_from_grid(mid_output) is not None:
+        failures.append("a mid-output screen reported a composer")
 
     if failures:
         print("⛔ %d failed: %s" % (len(failures), "; ".join(failures)))
         return 1
-    print("✅ plain-screen normalizer: both spellings match, owner drafts still refuse")
+    print("✅ choice prompt matches through both spellings; the composer is read as a ROW")
     return 0
 
 

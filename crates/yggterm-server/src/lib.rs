@@ -158,7 +158,8 @@ pub use daemon::{
     verify_shadow_client_can_attach,
     DRAFT_REFUSAL_MESSAGE, DaemonCensusRow, DaemonSelectorKind, daemon_census,
     format_daemon_census, format_daemon_census_with_queued_swap, resolve_daemon_endpoint_selector,
-    terminal_submit_was_refused_for_line, terminal_write_guarded, terminal_write_guarded_full,
+    terminal_submit_landed, terminal_submit_was_refused_for_line, terminal_write_guarded,
+    terminal_write_guarded_full,
     terminal_write_was_refused_for_draft,
     HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
     HOT_RESTART_BLOCKER_WORKING,
@@ -20747,12 +20748,15 @@ fn trace_local_daemon_child_event(
 }
 
 fn reap_spawned_child_in_background(
-    mut child: std::process::Child,
+    child: std::process::Child,
     endpoint: ServerEndpoint,
     daemon_exe: PathBuf,
 ) {
     let child_pid = child.id();
-    std::thread::spawn(move || match child.wait() {
+    // ONE encoding of "wait on a background thread" — see
+    // `yggterm_platform::child_reaper`. What is local to this caller is the
+    // TRACING of the outcome, not the reaping mechanism.
+    yggterm_platform::child_reaper::reap_child_in_background(child, move |result| match result {
         Ok(status) => trace_local_daemon_child_event(
             &endpoint,
             "spawned_daemon_exit",
@@ -21179,6 +21183,7 @@ fn bridge_remote_runtime_session_stdio(
                     _snapshot_post_resize_output_seen,
                     _snapshot_last_resize_seq,
                     _runtime_spawn_id,
+                    _composer_holds_draft,
                 )) => {
                     let snapshot_text =
                         bridge_initial_snapshot_text_for_path(path, Some(snapshot.as_str()))
@@ -27284,12 +27289,18 @@ pub fn run_app_control_read_terminal_buffer(
         // it carries no scrollback geometry and no cell attributes.
         let endpoint = resolve_client_daemon_endpoint(&home).endpoint;
         let retained = mode == "full";
+        // ⚠ The two snapshots answer the same shape minus the composer verdict:
+        // the RETAINED one is a stored frame and cannot vouch for what is in a
+        // composer NOW, so it does not carry the field and is not given one here.
         let screen = if retained {
             crate::daemon::terminal_retained_snapshot(&endpoint, session_path)
+                .map(|(text, running, seen, post, seq, spawn)| {
+                    (text, running, seen, post, seq, spawn, None)
+                })
         } else {
             crate::daemon::terminal_snapshot(&endpoint, session_path)
         };
-        if let Ok((text, running, runtime_output_seen, _, _, _)) = screen {
+        if let Ok((text, running, runtime_output_seen, _, _, _, _)) = screen {
             let fallback = daemon_screen_read_terminal_buffer_payload(
                 session_path,
                 mode,

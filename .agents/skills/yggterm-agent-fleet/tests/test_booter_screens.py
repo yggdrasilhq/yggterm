@@ -244,40 +244,96 @@ print(json.dumps(out))
 
 
 def choice_prompt_screens(booter_path, sb):
-    """`_pty_type_and_enter` must refuse a row whose SCREEN shows a choice prompt.
+    """The guarded writer: what it refuses, and that it NEVER types twice.
 
-    ⛔ Driven in-process with `_run` stubbed, because the point of two of the three
-    screens is what happens when the screen CANNOT be read — and an unreadable
+    ⛔ Driven in-process with `_run` stubbed, because most of these screens are
+    about what happens when the screen cannot be trusted — and an unreadable
     screen is not a clear one. A watchdog that types must refuse on doubt."""
-    code = r'''
-import importlib.util, sys, types
+    code = r"""
+import importlib.util, json, sys, types
 spec = importlib.util.spec_from_file_location("bb", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 ROW = "remote-cc://testhost/aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+UUID = ROW.rsplit("/", 1)[-1]
 out = {}
-def stub(screen_text, accept=True):
+WRITES = []
+
+def grid(rows):
+    return json.dumps([{"session_key": "cc-runtime://" + UUID,
+                        "screen_available": True, "screen_plain_rows": rows}])
+
+# One fake CLI for every verb the writer drives, counting TEXT WRITES.
+# The count is the assertion: every storm pinned here is a SECOND copy of the
+# same text, so a test that only checked the return value would pass on the
+# exact defect.
+def stub(screen_text, rows=None, submitted=True):
     def _run(host, argv, stdin_text="", **kw):
         r = types.SimpleNamespace(stdout="", stderr="", returncode=0)
         if "read-buffer" in argv:
             r.stdout = screen_text
+        elif "--submit-iff-line-equals" in argv:
+            r.stdout = json.dumps({"submitted": bool(submitted),
+                                   "refused_for_line": not submitted})
+        elif "screen" in argv or "gate-screen" in argv:
+            r.stdout = grid(rows if rows is not None else [])
+        elif "write" in argv:
+            WRITES.append(stdin_text)
+            r.stdout = '{"accepted": true}'
         else:
-            r.stdout = '{"data": {"accepted": true}}' if accept else "{}"
+            r.stdout = '{"data": {"accepted": true}}'
         return r
     return _run
 
-# 1. a plan-limit prompt on screen ⇒ REFUSE, and never reach the write
+EMPTY = ["  earlier output", "\u2500" * 40, "\u276f", "\u2500" * 40,
+         "  bypass permissions on (shift+tab to cycle)"]
+
+# 1. a plan-limit prompt on screen => REFUSE, and never reach the write
 m._run = stub("You have hit your session limit. 1. Stop and wait  2. Team account")
 out["refuses_choice"] = m._pty_type_and_enter("h", ROW) == "refused-choice-prompt"
 
-# 2. the screen could not be read ⇒ REFUSE. Blind is not clear.
+# 2. the screen could not be read => REFUSE. Blind is not clear.
 m._run = stub("")
 out["refuses_blind"] = m._pty_type_and_enter("h", ROW) == "refused-screen-unreadable"
 
-# 3. an ordinary working screen ⇒ proceed
-m._run = stub("pi@host:~$ some ordinary output scrolling by")
-out["proceeds_when_clear"] = m._pty_type_and_enter("h", ROW) == "pty-write"
-import json; print(json.dumps(out))
-'''
+# 3. an ordinary screen with an EMPTY composer => proceed, exactly one write
+WRITES.clear()
+m._run = stub("pi@host:~$ some ordinary output scrolling by", EMPTY)
+out["proceeds_when_clear"] = (m._pty_type_and_enter("h", ROW) == "pty-write"
+                              and len(WRITES) == 1)
+
+# 4. A DELIVERED MESSAGE IN THE TRANSCRIPT IS NOT COMPOSER RESIDUE. This is the
+#    jam: the same glyph prefixes a sent message, so a boot that WORKED read
+#    back as residue and the row then refused every later boot forever.
+WRITES.clear()
+delivered = ["  earlier output", "\u276f " + m.BOOT_TEXT[:60], "",
+             "the reply the row already gave", "\u2500" * 40, "\u276f",
+             "\u2500" * 40, "  bypass permissions on (shift+tab to cycle)"]
+m._run = stub("pi@host:~$ output", delivered)
+out["delivered_boot_is_not_residue"] = (m._pty_type_and_enter("h", ROW) == "pty-write"
+                                        and len(WRITES) == 1)
+
+# 5. a composer that already holds SOMEBODY'S words => refuse, write nothing
+WRITES.clear()
+held = ["\u2500" * 40, "\u276f please hold this thought", "\u2500" * 40,
+        "  bypass permissions on (shift+tab to cycle)"]
+m._run = stub("pi@host:~$ output", held)
+out["refuses_a_held_composer"] = (m._pty_type_and_enter("h", ROW) == "refused-draft"
+                                  and WRITES == [])
+
+# 6. THE STORM ITSELF. The submit cannot be confirmed, so the text stays in the
+#    composer unsent - and the NEXT tick must complete it, never type a second
+#    copy. Two ticks, exactly one text write between them.
+WRITES.clear()
+m._run = stub("pi@host:~$ output", EMPTY, submitted=False)
+first = m._pty_type_and_enter("h", ROW)
+typed_once = len(WRITES)
+m._run = stub("pi@host:~$ output", EMPTY, submitted=True)
+second = m._pty_type_and_enter("h", ROW)
+out["unconfirmed_submit_is_not_retyped"] = (
+    first == "refused-submit-unconfirmed" and typed_once == 1
+    and second == "pty-write" and len(WRITES) == 1)
+print(json.dumps(out))
+"""
     env = dict(os.environ, HOME=str(sb.home))
     r = subprocess.run([sys.executable, "-c", code, str(booter_path)],
                        capture_output=True, text=True, timeout=90, env=env)
@@ -286,12 +342,17 @@ import json; print(json.dumps(out))
     except Exception:
         got = {}
     for k, label in (
-        ("refuses_choice", "⛔⛔ boot REFUSES a row whose screen shows a choice prompt"),
-        ("refuses_blind", "⛔ boot REFUSES when the screen cannot be read"),
-        ("proceeds_when_clear", "boot PROCEEDS on an ordinary screen"),
+        ("refuses_choice", "\u26d4\u26d4 boot REFUSES a row whose screen shows a choice prompt"),
+        ("refuses_blind", "\u26d4 boot REFUSES when the screen cannot be read"),
+        ("proceeds_when_clear", "boot PROCEEDS on an ordinary screen, with ONE write"),
+        ("delivered_boot_is_not_residue",
+         "\u26d4\u26d4 a DELIVERED boot in the transcript is not composer residue"),
+        ("refuses_a_held_composer", "\u26d4 a composer holding words is never typed into"),
+        ("unconfirmed_submit_is_not_retyped",
+         "\u26d4\u26d4 an unconfirmed submit is COMPLETED next tick, never typed twice"),
     ):
         check(label, got.get(k) is True,
-              f"got={got.get(k)!r} rc={r.returncode} {(r.stderr or r.stdout)[-200:]}")
+              f"got={got.get(k)!r} rc={r.returncode} {(r.stderr or r.stdout)[-260:]}")
 
 
 def main():
@@ -422,6 +483,13 @@ def main():
         choice_prompt_screens(a.booter, sb)
         reset_time_screens(a.booter, sb)
 
+        # ⛔ CLEAR THE HOLD THE STAGE ABOVE LEFT BEHIND. `reset_time_screens`
+        #    exercises the quota hold and arms one, and a hold SUPPRESSES every
+        #    wakeup — so this assertion, which is the last line between a
+        #    watchdog and a person's composer, silently stopped running and read
+        #    as a plain failure. A suite whose stages leak state into each other
+        #    tests whichever order it happens to run in.
+        (sb.state / "booter.rate-limit-hold").unlink(missing_ok=True)
         sb.unreadable()
         r = sb.monitor("tick", "--dry-run")
         check("⛔ the monitor WAKES NOBODY while the attended list is unreadable",

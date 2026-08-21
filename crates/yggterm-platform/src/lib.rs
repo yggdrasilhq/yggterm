@@ -1,3 +1,5 @@
+pub mod child_reaper;
+
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use std::io::BufReader;
@@ -109,17 +111,27 @@ pub fn configure_background_service_command(command: &mut Command) {
     }
 }
 
+/// Raise a desktop notification through whatever this platform's notifier is.
+///
+/// ⛔ **REAPED, NOT JUST LAUNCHED.** Both arms used to end in a bare
+/// `.spawn()?` whose `Child` was dropped on the next line, which is the same
+/// defect that made every daemon accumulate a zombie per owner notification —
+/// see [`child_reaper`] for the measurement. This one sits in the GUI, the
+/// other long-lived process this project ships, and the GUI raises a toast for
+/// every finished job, so it leaked on exactly the events the owner sees most.
+/// Routing through `spawn_and_reap` means no `Child` is ever in scope here to
+/// be dropped, so the leak cannot come back by an edit that forgets to wait.
 pub fn send_user_notification(title: &str, message: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        Command::new("notify-send")
+        let mut command = Command::new("notify-send");
+        command
             .arg(title)
             .arg(message)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawning notify-send")?;
+            .stderr(Stdio::null());
+        child_reaper::spawn_and_reap(&mut command).context("spawning notify-send")?;
         return Ok(());
     }
 
@@ -130,14 +142,14 @@ pub fn send_user_notification(title: &str, message: &str) -> Result<()> {
             serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string()),
             serde_json::to_string(title).unwrap_or_else(|_| "\"Yggterm\"".to_string())
         );
-        Command::new("osascript")
+        let mut command = Command::new("osascript");
+        command
             .arg("-e")
             .arg(script)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawning macOS notification")?;
+            .stderr(Stdio::null());
+        child_reaper::spawn_and_reap(&mut command).context("spawning macOS notification")?;
         return Ok(());
     }
 
@@ -893,7 +905,12 @@ pub fn launch_controlled_ghostty(
         bail!(status.detail);
     }
 
-    let child = Command::new("ghostty")
+    // ⛔ Reaped, not just launched. The pid is all this function wants, and
+    // taking it off a `Child` that is then dropped is what left one permanent
+    // zombie per docked window for the life of the process — see
+    // [`child_reaper`]. `spawn_and_reap` hands back the pid and nothing else.
+    let mut command = Command::new("ghostty");
+    command
         .arg("--gtk-single-instance=false")
         .arg(format!("--x11-instance-name={token}"))
         .arg("--window-decoration=none")
@@ -904,15 +921,15 @@ pub fn launch_controlled_ghostty(
         .arg(launch_command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let process_id = child_reaper::spawn_and_reap(&mut command)
         .context("failed to spawn controlled Ghostty host")?;
 
     Ok(ControlledGhosttyLaunch {
-        process_id: child.id(),
+        process_id,
         lines: vec![
             format!("$ {launch_command}"),
-            format!("ghostty pid {}", child.id()),
+            format!("ghostty pid {process_id}"),
             format!("controlled host token {token}"),
             "Linux controlled host adapter launched an undecorated Ghostty window for viewport docking."
                 .to_string(),
@@ -1103,4 +1120,53 @@ fn command_exists(command: &str) -> bool {
         .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    /// ⛔ EVERY PROCESS THIS CRATE LAUNCHES GOES THROUGH [`child_reaper`].
+    ///
+    /// This crate is linked into the daemon AND the GUI — the two long-lived
+    /// processes yggterm ships — so a `Child` dropped in here is a permanent
+    /// entry in a process table that nobody ever clears. That is not
+    /// hypothetical: `send_user_notification` and `launch_controlled_ghostty`
+    /// both used to end in a bare `.spawn()?`, and the same shape in the
+    /// daemon's notifier had accumulated 233 zombies across one host's daemons
+    /// by the time anyone counted.
+    ///
+    /// A behavioural test cannot cover this: the callers shell out to
+    /// `notify-send` and `ghostty` by name, so exercising them means mutating
+    /// `PATH` for the whole test binary, which every other test in it would
+    /// race with. The invariant that IS available is structural and exact —
+    /// this file must not spawn at all. `child_reaper` owns the one `.spawn()`
+    /// in the crate, and it cannot leak.
+    ///
+    /// ⇒ If this fails, do not add a `.wait()` next to your new call. Use
+    /// `child_reaper::spawn_and_reap`, which never hands back a `Child` for a
+    /// later edit to forget about. A genuinely waited child (piped stdio, an
+    /// exit status the caller reads) belongs in a module of its own, not here.
+    #[test]
+    fn this_crate_spawns_only_through_the_child_reaper() {
+        let source = include_str!("lib.rs");
+        let offenders: Vec<_> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                // ⚠ Assembled, not written out: a literal needle here matches
+                // the line that carries it, and the first run of this test
+                // failed on itself. A scan that includes its own query is the
+                // same family as a `pgrep` that counts its own shell.
+                !trimmed.starts_with("//") && trimmed.contains(concat!(".spawn", "("))
+            })
+            .map(|(index, line)| format!("lib.rs:{}: {}", index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "this crate must launch processes through child_reaper::spawn_and_reap, \
+             never by spawning here — a dropped Child is a zombie for the life of \
+             the daemon or GUI this crate is linked into:\n{}",
+            offenders.join("\n"),
+        );
+    }
 }

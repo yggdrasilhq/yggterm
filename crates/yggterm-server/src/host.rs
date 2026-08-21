@@ -104,7 +104,12 @@ impl GhosttyHostSupport {
                 })
             }
             GhosttyHostKind::ExternalGhostty => {
-                let child = Command::new("ghostty")
+                // Reaped, not just launched: this window outlives the call and
+                // the handle would be dropped here, leaving a zombie behind for
+                // the life of the daemon once the user closes it. See
+                // `yggterm_platform::child_reaper`.
+                let mut command = Command::new("ghostty");
+                command
                     .arg("--gtk-single-instance=false")
                     .arg("-e")
                     .arg("bash")
@@ -112,11 +117,11 @@ impl GhosttyHostSupport {
                     .arg(launch_command)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
+                    .stderr(Stdio::null());
+                let process_id = yggterm_platform::child_reaper::spawn_and_reap(&mut command)
                     .map_err(|error| format!("failed to spawn ghostty: {error}"))?;
                 Ok(GhosttyLaunchOutcome {
-                    process_id: Some(child.id()),
+                    process_id: Some(process_id),
                     embedded_surface_reserved: false,
                     host_token: None,
                     host_mode: GhosttyTerminalHostMode::ExternalWindow,
@@ -124,7 +129,7 @@ impl GhosttyHostSupport {
                     embedded_surface_detail: None,
                     lines: vec![
                         format!("$ {}", launch_command),
-                        format!("ghostty pid {}", child.id()),
+                        format!("ghostty pid {process_id}"),
                         "external Ghostty host launched a terminal window".to_string(),
                     ],
                 })

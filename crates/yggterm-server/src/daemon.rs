@@ -3292,6 +3292,21 @@ pub enum ServerResponse {
         // fails OPEN (no guard) on 0.
         #[serde(default)]
         runtime_spawn_id: u64,
+        /// Does this row's composer hold typed-but-unsent text?
+        ///
+        /// ⛔ THREE STATES, AND `None` IS NOT PERMISSION. `None` means nobody
+        /// could answer — an older daemon that has never heard of the field
+        /// deserializes to exactly that, rather than to a confident `false`
+        /// that would license a probe's Ctrl+U over somebody's sentence.
+        ///
+        /// ⭐ It rides on the snapshot the readiness probe ALREADY fetches, so
+        /// asking the one daemon that can answer costs no extra round trip.
+        /// The alternative — deriving it client-side from `text` — is the
+        /// defect this replaces: `text` is the escape stream, it is not
+        /// row-shaped, and the SGR bit that used to separate a person's typing
+        /// from the CLI's own chrome stopped carrying that distinction.
+        #[serde(default)]
+        composer_holds_draft: Option<bool>,
     },
     TerminalRetainedSnapshot {
         text: String,
@@ -7670,6 +7685,7 @@ impl DaemonRuntime {
                 _post_resize_output_seen,
                 _last_resize_seq,
                 _runtime_spawn_id,
+                _composer_holds_draft,
             )) => {
                 if !runtime_output_seen || snapshot.trim().is_empty() {
                     return false;
@@ -10496,6 +10512,7 @@ impl DaemonRuntime {
                                 post_resize_output_seen,
                                 last_resize_seq,
                                 runtime_spawn_id,
+                                composer_holds_draft,
                             )) => {
                                 return Ok(ServerResponse::TerminalSnapshot {
                                     text,
@@ -10504,6 +10521,10 @@ impl DaemonRuntime {
                                     post_resize_output_seen,
                                     last_resize_seq,
                                     runtime_spawn_id,
+                                    // The owner's answer, forwarded. This
+                                    // daemon does not hold the line and must
+                                    // not invent one.
+                                    composer_holds_draft,
                                 });
                             }
                             Err(error) => {
@@ -10530,6 +10551,9 @@ impl DaemonRuntime {
                         .session_post_resize_output_seen(&runtime_path),
                     last_resize_seq: self.terminals.session_last_resize_seq(&runtime_path),
                     runtime_spawn_id: self.terminals.session_runtime_spawn_id(&runtime_path),
+                    composer_holds_draft: self
+                        .terminals
+                        .session_composer_holds_draft(&runtime_path),
                 }
             }
             ServerRequest::TerminalRetainedSnapshot { path } => {
@@ -10764,11 +10788,18 @@ impl DaemonRuntime {
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
-                    match terminal_write_guarded(
+                    // ⛔⛔ THE CONDITIONAL SUBMIT TRAVELS TOO. It used to be
+                    // dropped here, and a conditional submit carries no data —
+                    // so a row held by a preserved owner answered a write of
+                    // zero bytes: the Enter was never pressed and nothing said
+                    // so. The guard silently became a no-op for exactly the
+                    // rows a version-coexisting fleet keeps alive longest.
+                    match terminal_write_guarded_full(
                         &owner_endpoint,
                         &runtime_path,
                         &data,
                         refuse_if_draft,
+                        submit_iff_line_equals.clone(),
                     ) {
                         // ⛔ Propagate the owner's message rather than dropping
                         // it. This arm used to answer a bare `Ack { None }`, so a
@@ -16323,7 +16354,7 @@ pub fn terminal_read(
 pub fn terminal_snapshot(
     endpoint: &ServerEndpoint,
     path: &str,
-) -> Result<(String, bool, bool, bool, u64, u64)> {
+) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalSnapshot {
@@ -16337,6 +16368,7 @@ pub fn terminal_snapshot(
             post_resize_output_seen,
             last_resize_seq,
             runtime_spawn_id,
+            composer_holds_draft,
         } => Ok((
             text,
             running,
@@ -16344,6 +16376,7 @@ pub fn terminal_snapshot(
             post_resize_output_seen,
             last_resize_seq,
             runtime_spawn_id,
+            composer_holds_draft,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
@@ -16563,9 +16596,29 @@ pub fn terminal_write_guarded_full(
     )?)
 }
 
+/// The prefix a conditional submit CONFIRMS with. A caller that presses Enter
+/// through this verb has exactly one honest reading of "it landed", and this is
+/// it — see [`terminal_submit_landed`].
+pub const SUBMIT_LANDED_MESSAGE: &str = "submitted:";
+
 /// Did a conditional submit REFUSE because the line differed?
 pub fn terminal_submit_was_refused_for_line(message: Option<&str>) -> bool {
     message.is_some_and(|message| message.starts_with(SUBMIT_LINE_REFUSAL_MESSAGE))
+}
+
+/// Did the conditional submit actually PRESS ENTER?
+///
+/// ⛔⛔ "NOT REFUSED" IS NOT "SUBMITTED", and treating them as the same is how a
+/// writer believes it has delivered a message that is still sitting unsent in a
+/// composer. A conditional submit carries no data, so a daemon that never
+/// evaluated the condition — because it does not own the row — answers a plain
+/// write of zero bytes: nothing refused, nothing typed, nothing submitted. A
+/// caller reading only the two refusal flags scores that as success, stops
+/// watching, and the next cycle types a SECOND copy of the same text on top of
+/// the first. That is the storm this repository has now paid for twice.
+/// ⇒ The affirmative answer is the daemon saying it submitted, and nothing else.
+pub fn terminal_submit_landed(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.starts_with(SUBMIT_LANDED_MESSAGE))
 }
 
 /// Did this write land, or was it refused because the owner has unsent text?

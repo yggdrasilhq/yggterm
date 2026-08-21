@@ -1294,6 +1294,37 @@ impl TerminalManager {
             .map(|session| session.screen_plain_rows())
     }
 
+    /// Does this session's composer hold typed-but-unsent text?
+    ///
+    /// ⭐ ONE OWNER FOR THE ONE QUESTION A WRITER MUST NOT GET WRONG, and it is
+    /// a UNION of two independent readings because each is blind where the
+    /// other sees:
+    ///
+    /// * `pending_input_draft` — reconstructed from the bytes forwarded through
+    ///   this daemon's `write`. Exact, byte-level, TOCTOU-free. ⛔ But it is
+    ///   built from zero when a runtime is created, so a session ADOPTED by a
+    ///   newer daemon starts reading "clean" while the person's sentence is
+    ///   still standing in the composer. Handovers are routine, so on this
+    ///   arm alone the guard fails OPEN after every one of them.
+    /// * the RENDERED COMPOSER ROW — what a person can see, which survives any
+    ///   handover because it lives in the vt100 grid rather than in a counter.
+    ///   ⛔ But it cannot see a line the CLI has not drawn yet.
+    ///
+    /// ⇒ Either arm saying "there is text there" is enough to refuse, and
+    /// `None` means neither could answer — which is not permission. The costs
+    /// are not symmetric: a needless refusal delays a wake, and a wrong "it is
+    /// empty" spends somebody's unsent sentence.
+    pub fn session_composer_holds_draft(&self, key: &str) -> Option<bool> {
+        let keystrokes = self.session_has_pending_input_draft(key);
+        let grid = self
+            .session_screen_plain_rows(key)
+            .and_then(|rows| yggterm_core::composer_row_holds_text(&rows));
+        match (keystrokes, grid) {
+            (None, None) => None,
+            (left, right) => Some(left.unwrap_or(false) || right.unwrap_or(false)),
+        }
+    }
+
     /// The libyggterm declares the daemon has retained for this session (the
     /// app's latest `web-surface` / `sidebar` payloads). Empty for a plain
     /// shell, and empty again once the app emits its `close`.
