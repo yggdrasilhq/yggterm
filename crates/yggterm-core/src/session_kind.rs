@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Hash` so a kind can key a map directly. Without it, callers that need to
+// group by CLI reach for the slug string instead — a second spelling of an
+// identity the enum already owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
     Codex,

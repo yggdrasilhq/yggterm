@@ -10,6 +10,7 @@ pub mod opencode;
 pub mod pi;
 pub mod qwen;
 
+use yggterm_core::cli_plane::CliInvocationShape;
 use crate::{SessionKind, shell_single_quote};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -3864,18 +3865,40 @@ pub(crate) fn managed_cli_shell_command_configured(
     // and adding it here was a wrong-headed guess. The real wrapper-vs-manual
     // divergence lives in yggterm's PTY/preservation path, not in CLI flags.
     let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(kind);
-    let invocation = match action {
-        ManagedCliAction::Launch => format!("{}{}", tool.binary_name(), extra_args),
+    let (invocation, shape) = match action {
+        ManagedCliAction::Launch => (
+            format!("{}{}", tool.binary_name(), extra_args),
+            CliInvocationShape {
+                action: "launch",
+                selector: "",
+                carries_id: false,
+                re_roots_with_cwd: false,
+                extra_arg_tokens: 0,
+                persistent: false,
+            },
+        ),
         ManagedCliAction::ResumePicker { persistent } => {
             let prefix = if persistent { "exec " } else { "" };
             let tokens = descriptor
                 .map(|descriptor| descriptor.resume_picker_tokens())
                 .unwrap_or_default();
-            format!(
-                "{prefix}{}{}{}",
-                tool.binary_name(),
-                extra_args,
-                join_invocation_tokens(&tokens)
+            (
+                format!(
+                    "{prefix}{}{}{}",
+                    tool.binary_name(),
+                    extra_args,
+                    join_invocation_tokens(&tokens)
+                ),
+                CliInvocationShape {
+                    action: "resume_picker",
+                    selector: descriptor
+                        .map(|descriptor| descriptor.resume_selector_token())
+                        .unwrap_or_default(),
+                    carries_id: false,
+                    re_roots_with_cwd: false,
+                    extra_arg_tokens: 0,
+                    persistent,
+                },
             )
         }
         ManagedCliAction::Resume {
@@ -3887,14 +3910,44 @@ pub(crate) fn managed_cli_shell_command_configured(
             let tokens = descriptor
                 .map(|descriptor| descriptor.resume_tokens(&quoted, has_cwd))
                 .unwrap_or_else(|| vec![quoted.clone()]);
-            format!(
-                "{prefix}{}{}{}",
-                tool.binary_name(),
-                extra_args,
-                join_invocation_tokens(&tokens)
+            (
+                format!(
+                    "{prefix}{}{}{}",
+                    tool.binary_name(),
+                    extra_args,
+                    join_invocation_tokens(&tokens)
+                ),
+                CliInvocationShape {
+                    action: "resume",
+                    selector: descriptor
+                        .map(|descriptor| descriptor.resume_selector_token())
+                        .unwrap_or_default(),
+                    carries_id: !session_id.trim().is_empty(),
+                    re_roots_with_cwd: descriptor
+                        .is_some_and(|descriptor| descriptor.resume_re_roots_with_cwd)
+                        && has_cwd,
+                    extra_arg_tokens: 0,
+                    persistent,
+                },
             )
         }
     };
+    // ⭐ THE ONE COMPOSER, SO NO PER-CLI ARM CAN COMPOSE UNSEEN. This is where
+    // "codex got `resume <id>`, Claude Code got `--resume <id>`, this one got
+    // no selector at all" becomes a readable fact instead of something you
+    // recover by reading `managed_cli`.
+    //
+    // ⛔ The SHAPE, never the composed line. `parts` carries the user's cwd,
+    // their configured flags and an exported environment; putting it on the
+    // trace plane would turn a diagnostic surface into a disclosure one.
+    yggterm_core::cli_plane::emit_launch(
+        "daemon",
+        kind,
+        CliInvocationShape {
+            extra_arg_tokens: split_extra_args(&extra_args).len(),
+            ..shape
+        },
+    );
     parts.push(invocation);
     Ok(parts.join(" && "))
 }
