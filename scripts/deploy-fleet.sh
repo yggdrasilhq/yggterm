@@ -465,8 +465,64 @@ for host in $HOSTS; do
          printf "    on disk  %-42s %-9s %-14s %s\n" "$p" "$v" "$c" "$(md5sum "$p" 2>/dev/null | cut -c1-10)"
        done
        $HOME/.yggterm/bin/yggterm-headless server daemons 2>/dev/null |
-         sed "s/^/    running  /" || echo "    running  <no census: this host has no reachable daemon>"'
+         sed "s/^/    running  /" || echo "    running  <no census: this host has no reachable daemon>"
+       # ⛔⛔ THE GUI PROCESS IS THE THIRD PLANE AND IT WAS INVISIBLE HERE.
+       # `server daemons` censuses DAEMONS. The GUI is a separate long-lived
+       # process that goes on executing the image it was loaded with, and it is
+       # the only plane a UI fix can be proven on — so a roll could report every
+       # copy ✅ and every daemon current while a host kept rendering a build
+       # from before the roll. Measured 2026-08-21: one host ran a NINE-HOUR-OLD
+       # pre-roll GUI, with three new recovery counters simply absent, and the
+       # audit called the fleet clean because it checks INSTALLS, not PROCESSES.
+       # ⇒ The comment above this block used to say the running GUI could not be
+       #   named because the deploy had replaced the file its /proc/<pid>/exe
+       #   pointed at. It can: the kernel keeps that inode reachable through
+       #   /proc for the life of the process, deleted or not, so it hashes fine
+       #   and the answer is exact rather than inferred.
+       # ⛔ A SANDBOX GUI IS NOT A STALE GUI, AND CONFLATING THEM MAKES THIS
+       # WARNING WORTHLESS. A build host runs several yggterm GUIs at once —
+       # each lane drives one out of its OWN worktree target/release, which is
+       # the entire point of a sandbox and must never be reported as behind.
+       # Only a GUI running from an INSTALLED path is claiming to be this
+       # deploy. Measured 2026-08-21: one host had six GUI processes, four of
+       # them lane sandboxes; warning on all six would have trained the reader
+       # to ignore the two that mattered.
+       for g in $(pgrep -x yggterm 2>/dev/null); do
+         x=$(readlink /proc/$g/exe 2>/dev/null)
+         m=$(md5sum /proc/$g/exe 2>/dev/null | cut -c1-10)
+         case "$x" in
+           "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*|"$HOME/.cargo/bin/"*|"$HOME/bin/"*) k="installed";;
+           *) k="sandbox";;
+         esac
+         printf "    gui      pid %-8s %-11s %-10s %s\n" \
+           "$g" "${m:-(unreadable)}" "$k" "${x:-?}"
+       done
+       [ -z "$(pgrep -x yggterm 2>/dev/null)" ] && echo "    gui      (no GUI process on this host)"'
   if is_self "$host"; then bash -c "$cen"; else ssh "$host" bash -c "'$cen'"; fi
+done
+
+# ⛔ AND SAY IT OUT LOUD RATHER THAN LEAVING IT IN A COLUMN. A stale GUI is the
+# one staleness that reads as a working system: the window is up, the rows are
+# there, and only the fix you shipped is missing. The daemons are EXPECTED to
+# trail (that is the constitution); the GUI is not, because nothing retires it
+# on its own terms — somebody has to restart it.
+for host in $HOSTS; do
+  [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] && continue
+  # Only INSTALLED GUIs are claiming to be this deploy; see the note in the census.
+  probe='for g in $(pgrep -x yggterm 2>/dev/null); do
+           x=$(readlink /proc/$g/exe 2>/dev/null)
+           case "$x" in "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*|"$HOME/.cargo/bin/"*|"$HOME/bin/"*)
+             md5sum /proc/$g/exe 2>/dev/null | cut -c1-10;; esac
+         done'
+  if is_self "$host"; then running=$(bash -c "$probe"); else running=$(ssh "$host" bash -c "'$probe'"); fi
+  [ -z "$running" ] && continue
+  for m in $running; do
+    if [ "$m" != "${GUI_SUM:0:10}" ]; then
+      echo "⚠ deploy-fleet: $host is RUNNING a GUI built from $m, not this build (${GUI_SUM:0:10})."
+      echo "   Nothing retires a GUI on its own terms — restart it or the UI half of this"
+      echo "   roll is not live on that host, however green every other line above reads."
+    fi
+  done
 done
 
 if [ "$FAILED" != 0 ]; then echo "⛔ deploy-fleet: at least one copy did not read back"; exit 1; fi
