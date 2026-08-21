@@ -354,17 +354,10 @@ def transcript_of(uuid):
 
 
 def last_assistant_text(path):
-    try:
-        recs = [json.loads(l) for l in open(path) if l.strip()]
-    except Exception:
-        return ""
-    for rec in reversed(recs):
-        if rec.get("type") != "assistant":
-            continue
-        for blk in (rec.get("message") or {}).get("content") or []:
-            if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text", "").strip():
-                return blk["text"].strip()
-    return ""
+    # ⛔⛔ BOUNDED — see ygg_transcript.TAIL_BYTES. Reading a whole transcript is
+    #    only survivable while the biggest one you can reach is small, and that
+    #    stopped being true when the lookup learned every CLI's store.
+    return ygg_transcript.last_prose(path)
 
 
 _MANUAL_TITLES = None

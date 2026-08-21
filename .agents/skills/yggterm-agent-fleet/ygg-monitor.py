@@ -298,17 +298,10 @@ def _last_prose(uuid):
     hits = ygg_transcript.transcript_paths(uuid)
     if not hits:
         return ""
-    try:
-        recs = [json.loads(l) for l in open(hits[0], errors="replace") if l.strip()]
-    except Exception:
-        return ""
-    for rec in reversed(recs):
-        if rec.get("type") != "assistant":
-            continue
-        for blk in (rec.get("message") or {}).get("content") or []:
-            if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text", "").strip():
-                return blk["text"].strip()
-    return ""
+    # ⛔⛔ BOUNDED. This used to parse the WHOLE file, which was survivable only
+    #    while it could see one CLI's store. The largest transcript on this fleet
+    #    is 1,481 MB — 274x the p95 — and this runs on a TIMER.
+    return ygg_transcript.last_prose(hits[0])
 
 
 def cli_process(uuid, host=None):
