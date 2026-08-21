@@ -253,36 +253,6 @@ name, so no successor can advertise), and it stays open on its own terms.
 
 **The observation still owed:** the falsifier above, run on a real roll.
 
-## ⛔⛔ [11.15] A DETECTOR THAT DOES NOT SHARE THE WRITER'S REFUSAL RE-DETECTS ITS DELTA FOREVER
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*Measured 2026-08-21 from daemon traces on two hosts.*
-
-The background copy chore sat at its 12s floor for a daemon's entire life. 243 identical
-`remote_cc_title_pickup` events for ONE row in ~45 minutes, the same `new_title` every time
-and `previous_title` never advancing — each one paying an ssh round trip, an all-sessions
-screen sweep under the runtime lock, and a multi-MB `persist` under the write lock (daemon
-persist p50 87ms x2,108 in one retention window). `background_copy` ticks reported
-`updates: 1-2` on 55 of 55 consecutive ticks, so the 60s idle backoff never engaged.
-
-**Root.** `remote_cc_title_poll_paths` selected every WORKING remote-cc row and the collector
-emitted an update whenever the remote JSONL title differed from the row's title — while
-`set_session_title_hint` silently refuses any row whose title a human set. The delta was real
-and permanently unsatisfiable, and because the chore's backoff keys on `update_count > 0`,
-every tick read as productive.
-
-**Fixed** by one predicate asked by both sides — `ManagedSessionView::title_is_owner_set`,
-which `session_title_is_explicit` now delegates to and the poll selector skips on, so an
-owner-titled row costs no ssh at all. Second net, because remembering this bug is not a
-mechanism: `set_session_title_hint` reports whether it landed (refusal and no-op both answer
-false), the chore counts APPLIED updates rather than proposed ones, and a tick that applied
-nothing no longer serializes the state file. The tick trace carries both numbers.
-
-**Falsifier:** with one owner-titled remote-cc row live, `background_copy` tick gaps must
-decay from 12s to the 60s idle ceiling, and `remote_cc_title_pickup` must stop repeating for
-that row.
-
 ## ⛔⛔ [11.15] A GATE THAT JUDGES THE STORED ANSWER REOPENS ITSELF WHEN THE ANSWER IS BAD
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -317,6 +287,18 @@ daemon that has it on rather than showing in today's numbers.
 title generation must be attempted ONCE, not once per eligible pass — and must be attempted
 again the moment that transcript grows.
 
+### ⚠ STILL NOT FALSIFIABLE ON 3.1.18 — generation remains env-disabled on both daemons
+
+Checked live 2026-08-21 on a build verified to contain the fix. `copy_generation/summary` shows
+7 spans in 2h (p50 10,027ms) and no title spans, consistent with generation being off in the
+daemon and the remaining calls riding the GUI path this fix does not touch. The ledger banks
+against the next daemon that has generation ON.
+
+⭐ The SIBLING half of this lane's work IS proven live, and it is the stronger signal: the
+background copy chore now ticks at exactly **60.0s gaps with `updates=0`** — the
+`BACKGROUND_COPY_MAX_IDLE_CHORE_MS` ceiling — where it had been pinned at a 12.0s p50 with
+updates on every tick. Chore span cost fell to p50 305ms, and `daemon/persist` to p50 56ms.
+
 ## ⛔⛔ [11.15] THE LOCAL TREE SCAN RE-DERIVES A CORPUS THAT DID NOT CHANGE
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -349,6 +331,36 @@ it would trade sidebar freshness for nothing.
 **Falsifier:** on a quiet corpus, `local_tree_scan` p50 must fall by an order of magnitude and
 the span must report `scan_memo_hits` approximately equal to the row count with near-zero
 misses; a session file that is appended to must still show its new content on the next scan.
+
+### ⛔ THE FALSIFIER WAS RUN LIVE ON 3.1.18 AND IT DID **NOT** PASS — AND THE REASON MATTERS
+
+*Measured on the GUI host 2026-08-21, against a build verified by ancestry to contain the fix.*
+
+Every `local_tree_scan` span reports `scan_memo_hits: 0, scan_memo_misses: 678`, and **every
+one comes from a different pid** — 5 scans, 5 distinct processes, none scanning twice. `hits: 0`
+on a first scan is CORRECT (the memo starts empty); the point is that no process ever gets to a
+SECOND scan.
+
+⇒ **The premise of the fix was wrong about production.** The memo is per-process and assumed the
+scan is a poll inside a long-running GUI. In practice the dominant caller is
+`startup/load_browser_tree` (6 spans, p50 4,329ms) — the tree is built once at GUI start, and
+the 8s `BROWSER_TREE_REFRESH_POLL_MS` poll is gated hard enough that it essentially does not
+re-fire in a 2-hour window. A per-process memo cannot help a process that scans once.
+
+What DID land: the single-tail-read cut, which helps every scan including startup (measured A/B
+on a 745-row corpus, cold: 10,827ms -> 9,202ms, -15%). On this host, before 4,616ms vs after
+4,328ms — real but within noise.
+
+⚠ **AND THE ITEM IS NOT WORTH CHASING FURTHER.** Total scan cost in a 2-hour window is 38.3s
+(background) + 27.8s (startup) = 66s of 7,200s = **0.9% of a core.** The order-of-magnitude win
+would need a CROSS-process (on-disk) cache so startup scans are cheap too; that is the correct
+fix and it is deliberately NOT being built, because it would be real work against a 0.9% item
+while `render/web_content` (16.6% of a core sustained) and `daemon_request/snapshot` (p50
+10,081ms of lock-holding, 121 times in 2h) are the actual burn. Recorded so the next reader does
+not re-derive this.
+
+**What remains open:** only the cross-process half, and only if the corpus or the startup rate
+grows enough to matter. The in-process defect is fixed and unit-tested.
 
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
@@ -514,7 +526,9 @@ the word doing the work.
 
 ## ⛔⛔ [11.0] THE PANIC WATCHDOG'S MEMORY ARM THRESHOLDS A LEVEL, SO IT CANNOT EVER CLEAR
 
-**Status:** OPEN — the fix is a change to the `ytrace` crate, not to this repo.
+**Status:** OPEN
+
+⚠ The fix is a change to the `ytrace` crate, not to this repo.
 
 *Measured on the GUI host 2026-08-21, while the owner was reporting input latency.*
 
@@ -619,7 +633,9 @@ viewport — no bytes appear.
 
 ## ⚠ [11.0] SPAWN TITLES: THE MACHINE IS MISSING, AND AN APP SPAWN BYPASSES THE ONE BUILDER
 
-**Status:** PARTLY OPEN. Re-measured against the tree 2026-08-21. The owner spec asks
+**Status:** OPEN
+
+PARTLY open. Re-measured against the tree 2026-08-21. The owner spec asks
 for a `New {Machine} {App}` convention composed by ONE title builder, plus
 context-menu sessions reading the CLI's DISPLAY NAME rather than its slug.
 
@@ -662,7 +678,9 @@ and a second, non-primary verb of the same app lands distinguishable from it.
 
 ## ⚠ [11.0] THE LIBYGGTERM CONTEXT MENU: CURATION — the registry and per-host halves are DONE
 
-**Status:** PARTLY OPEN. Re-measured against the tree 2026-08-21; two of the three
+**Status:** OPEN
+
+PARTLY open. Re-measured against the tree 2026-08-21; two of the three
 halves were already built when this was filed, and the entry said otherwise.
 
 Owner spec, from a screenshot: (1) REMOVE Fleet-topology / booter / monitor style
@@ -1717,6 +1735,20 @@ the invocation.
 *Found 2026-08-20 while root-causing the input freeze from the GUI side. The GUI
 half is fixed (the read no longer starves the keystroke branch); this is the
 amplifier underneath it, and it is not the GUI's to fix.*
+
+⛔ **RE-MEASURED LIVE ON 3.1.18, 2026-08-21 — STILL FIRING, AND IT IS NOW THE LARGEST
+DAEMON-SIDE ITEM.** `daemon_request/snapshot` over a 2-hour window: **121 calls, p50 10,081ms,
+p95 10,240ms, max 11,035ms** — a hard bimodal ~10s mode matching the bounded transport timeout,
+so roughly **20 minutes of full-daemon deafness in 2 hours**. `ui/block` records 197 incidents
+in the same window (p50 411ms, max 3,372ms). The 3.1.15 lock-free fix (`ffe53157`) covered
+`TerminalRead` ONLY; the `Snapshot` handler still performs peer working-flags round trips inside
+the runtime lock via `refresh_proxied_working_flags`, throttled at `PROXIED_WORKING_REFRESH_MS`
+= 1,500ms, so the stall recurs while any slow preserved owner exists.
+
+⇒ The fix shape is already proven in-tree: give `Snapshot` what `ffe53157` gave `TerminalRead`
+— collect the unanswered paths and owner endpoints under a brief lock, DROP the lock, do the
+round trips lock-free, re-take only to store. Measurement contributed by the 11.15 daemon-burn
+lane, which did NOT take the fix: this entry's owner has it.
 
 **The shape.** Every client request is handled under ONE global lock:
 `spawn_unix_client_handler` gives each connection its own thread, but
@@ -20408,7 +20440,9 @@ reader knows the instrument's reach ended before the answer did.
 
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
-**Status:** OPEN. Hit 2026-08-20 on the shared `~/gh/yggterm` checkout.
+**Status:** OPEN
+
+Hit 2026-08-20 on the shared checkout.
 
 The shared checkout is used by several lanes at once. Something rebased it onto `origin/main`
 mid-flight; to do that it ran a `stash` first. The rebase finished, the branch moved, and the
@@ -20441,7 +20475,9 @@ innocent has still been edited by someone.
 
 ## ygg-claim: a fresh top-level claim can derive a PID-shaped seat number
 
-**Status:** OPEN. Hit 2026-08-21 claiming a fresh orchestrator row.
+**Status:** OPEN
+
+Hit 2026-08-21 claiming a fresh orchestrator row.
 
 A fresh session (no existing `outline_prefix`, predecessor already retired) ran the claim
 script and was seated as **`6914974.0`** — a number that looks like a process id, not a seat.
@@ -20457,7 +20493,9 @@ corollary that a wrong seat is repaired with the outline verb, never a re-claim.
 
 ## server app session outline: calling it without a seat CLEARS the prefix — a read that writes
 
-**Status:** OPEN. Hit 2026-08-21, immediately after the repair above.
+**Status:** OPEN
+
+Hit 2026-08-21, immediately after the repair above.
 
 `server app session outline <row> 12.0` applies the seat. The natural way to READ it back is
 to call the same verb without the seat argument — and that call **applies the empty string**:
@@ -20471,7 +20509,9 @@ safe read-back is a listing instrument, not the verb itself.
 
 ## [19.1] `server app session outline` REPORTS `error: null` WHILE `applied: false`, SO A SEAT SILENTLY DOES NOT LAND
 
-**Status:** OPEN — observed 2026-08-21 against the current build.
+**Status:** OPEN
+
+observed 2026-08-21 against the current build.
 
 A CLI-runtime session renamed its own row successfully and then set its seat number in the
 same claim. **The rename landed; the seat did not.** The read-back showed an empty prefix,
@@ -20503,7 +20543,9 @@ or neither does.
 
 ## [19.2] REPORT — CROSS-CLI ORCHESTRATION: WHAT BLOCKS DRIVING A NON-CLAUDE AGENT CLI AS A FLEET LANE
 
-**Status:** AWAITING A DECISION (orchestration owner). Not a defect report — a survey, written
+**Status:** AWAITING A DECISION
+
+(orchestration owner). Not a defect report — a survey, written
 after actually launching a third-party agent CLI as a work lane on 2026-08-21. It worked, but
 none of the fleet machinery reached it.
 
