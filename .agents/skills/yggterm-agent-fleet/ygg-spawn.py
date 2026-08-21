@@ -29,6 +29,12 @@ USAGE
                  --cwd /path/to/worktree --brief brief.txt [--ack ACK-TOKEN]
 
 Prints the new row's uri on stdout. Diagnostics go to stderr.
+
+⭐ **IT CAN BE AIMED AT A SANDBOX.** `YGGTERM_HOME=$SB
+YGG_HEADLESS_BIN=$SB/bin/yggterm-headless ygg-spawn.py …` births the row on an
+isolated plane on this machine — no ssh, nobody's desktop, and a seven-step verb
+that was previously only ever rehearsed by spending a real seat. `ygg_appctl`
+owns that question for every fleet verb.
 """
 import argparse
 import glob
@@ -40,10 +46,10 @@ import time
 
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_appctl  # noqa: E402
 import ygg_transcript  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
 
 #: The transcript lags the submit. Measured 2026-08-21: brief accepted at
 #: 13:33:58 with submitted:true, transcript created 13:34:12.500 — 14.5 s, with
@@ -59,25 +65,6 @@ READY_WAIT_S = 420
 
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')} ygg-spawn {msg}", file=sys.stderr)
-
-
-def gui_host():
-    r = subprocess.run(
-        [os.path.join(HERE, "..", "..", "..", "scripts", "ygg-live-host.sh"), "--quiet"],
-        capture_output=True, text=True, timeout=60,
-    )
-    return (r.stdout or "").strip() or os.environ.get("YGG_GUI_HOST", "")
-
-
-def app(host, argstr, stdin_path=None):
-    cmd = f"{YGG} server app {argstr}"
-    if stdin_path:
-        cmd += f" < {stdin_path}"
-    r = subprocess.run(["ssh", "-n", host, cmd], capture_output=True, text=True, timeout=180)
-    try:
-        return json.loads(r.stdout)
-    except Exception:
-        return {"error": (r.stderr or r.stdout or "unparseable").strip()[:200]}
 
 
 def main():
@@ -98,14 +85,20 @@ def main():
     ap.add_argument("--kind", default="claude-code")
     ap.add_argument("--machine-key", default="dev")
     ap.add_argument("--model", default="claude-opus-5")
-    ap.add_argument("--host")
+    ap.add_argument("--host", help="the machine whose GUI answers; `local` for this one "
+                                   "(a sandbox). $YGGTERM_HOME and $YGG_HEADLESS_BIN aim "
+                                   "the home and the binary — see ygg_appctl.")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    host = a.host or gui_host()
-    if not host:
-        log("⛔ no GUI host")
+    # ⛔ WHICH PLANE THIS ROW IS BORN ON — machine, home and binary, stated once.
+    #    A sandbox home makes this verb rehearsable; it used to be provable only
+    #    by spending a seat on somebody's live desktop.
+    plane = ygg_appctl.resolve(a.host)
+    if plane is None:
+        log("⛔ no row plane — app control did not answer anywhere.")
         return 2
+    app = plane.app_json
     if not os.path.exists(a.brief):
         log(f"⛔ no such brief file: {a.brief}")
         return 2
@@ -127,7 +120,7 @@ def main():
         return 0
 
     # 1. CREATE, never activated: a spawn must not take the owner's screen.
-    reply = app(host, f"terminal new --kind {a.kind} --machine-key {a.machine_key} "
+    reply = app(f"terminal new --kind {a.kind} --machine-key {a.machine_key} "
                       f"--cwd {a.cwd} --title {json.dumps(a.title)} "
                       f"--purpose {json.dumps(a.purpose)} --no-activate "
                       f"--model {a.model} --permission-mode bypass --outline {a.seat}")
@@ -145,8 +138,8 @@ def main():
     if (data.get("seat") or {}).get("honoured") or data.get("outline_prefix") == a.seat:
         log(f"seat {a.seat} honoured at create")
     else:
-        app(host, f"session outline '{row}' {a.seat}")
-        rows = (app(host, "rows --json").get("data") or {}).get("rows") or []
+        app(f"session outline '{row}' {a.seat}")
+        rows = (app("rows --json").get("data") or {}).get("rows") or []
         got = next((r.get("outline_prefix") for r in rows if r.get("full_path") == row), None)
         if str(got) != a.seat:
             log(f"⛔ seat did not take: wanted {a.seat}, row reads {got}")
@@ -159,15 +152,15 @@ def main():
     if a.no_group:
         log("left at the top level (--no-group)")
     elif not into:
-        rows = (app(host, "rows --json").get("data") or {}).get("rows") or []
+        rows = (app("rows --json").get("data") or {}).get("rows") or []
         head_seat = a.seat.split(".")[0] + ".0"
         into = next((r.get("full_path") for r in rows
                      if str(r.get("outline_prefix")) == head_seat), None)
     if into and not a.no_group:
         if "://" not in into:
-            rows = (app(host, "rows --json").get("data") or {}).get("rows") or []
+            rows = (app("rows --json").get("data") or {}).get("rows") or []
             into = next((r["full_path"] for r in rows if into in (r.get("full_path") or "")), into)
-        res = app(host, f"row-set '{row}' --into '{into}'")
+        res = app(f"row-set '{row}' --into '{into}'")
         log(f"nested under {str(into)[-42:]}: accepted={(res.get('data') or {}).get('accepted')}")
     elif not a.no_group:
         log("⚠ no head row found for this campaign — left at the top level")
@@ -188,7 +181,7 @@ def main():
     #   which is exactly when a respawn is needed most.
     ready, deadline = False, time.time() + READY_WAIT_S
     while time.time() < deadline:
-        v = (app(host, f"terminal input-check '{row}' --check-timeout-ms 20000").get("data") or {})
+        v = (app(f"terminal input-check '{row}' --check-timeout-ms 20000").get("data") or {})
         if v.get("consuming_input"):
             ready = True
             break
@@ -197,9 +190,8 @@ def main():
 
     # 5. SUBMIT, and read the answer. ⛔ `submitted:false` means MID-OUTPUT, never
     #    unreachable, and is NEVER retried — that is the bug that types over people.
-    remote_brief = f"/tmp/ygg-spawn-{uuid[:8]}.brief"
-    subprocess.run(["scp", "-q", a.brief, f"{host}:{remote_brief}"], timeout=120)
-    sub = (app(host, f"terminal submit '{row}' --stdin", stdin_path=remote_brief).get("data") or {})
+    staged_brief = plane.put(a.brief, f"/tmp/ygg-spawn-{uuid[:8]}.brief")
+    sub = (app(f"terminal submit '{row}' --stdin", stdin_path=staged_brief).get("data") or {})
     if not sub.get("submitted"):
         # ⛔⛔ NEVER RETRY A `submitted:false` — that is the bug that types over
         # people. But printing advice and exiting leaves a SEATED, BRIEFLESS row
