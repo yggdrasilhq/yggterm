@@ -76,8 +76,26 @@ STALL_IDLE_MIN = 20.0
 #:
 #: A wake is only ever correct for a row that is still cheap to resume. Everything
 #: else is harvested and replaced by a fresh lane at the same seat.
+#: A spawn's transcript lags its creation by ~15 s, so a brand-new row legitimately
+#: has none. Past this it has not been briefed at all.
+BRIEFLESS_GRACE_MIN = 10.0
+
 WAKEABLE_MAX_TRANSCRIPT_BYTES = 400_000
 WAKEABLE_MAX_IDLE_MIN = 20.0
+
+
+def process_age_min(uuid):
+    """Minutes since the agent process for this uuid started, from /proc — the one
+    clock a row with no transcript still has."""
+    try:
+        out = subprocess.run(["bash", "-c",
+                              f"for p in $(pgrep -x claude); do "
+                              f"tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q {uuid} "
+                              f"&& stat -c %Y /proc/$p && break; done"],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        return (time.time() - int(out)) / 60 if out else None
+    except Exception:
+        return None
 
 
 def wakeable(transcript_bytes, idle_min):
@@ -156,6 +174,25 @@ def rows_census(host):
         if seat and "://" in path and path not in seen:
             seen.add(path)
             out.append({"seat": str(seat), "uri": path, "label": row.get("label") or "",
+                        "session_cwd": row.get("session_cwd") or ""})
+    return out
+
+
+def rows_all(host):
+    """Every session row, seated or not. `rows_census` keeps only seated ones
+    because a SWEEP is seat-scoped by design; a single-row call is not."""
+    r = run(["ssh", "-n", host, f"{YGG} server app rows --json"])
+    try:
+        rows = (json.loads(r.stdout).get("data") or {}).get("rows") or []
+    except Exception:
+        return []
+    seen, out = set(), []
+    for row in rows:
+        path = row.get("full_path") or ""
+        if "://" in path and path not in seen:
+            seen.add(path)
+            out.append({"seat": str(row.get("outline_prefix") or "-"), "uri": path,
+                        "label": row.get("label") or "",
                         "session_cwd": row.get("session_cwd") or ""})
     return out
 
@@ -288,6 +325,50 @@ def last_assistant_text(path):
     return ""
 
 
+_MANUAL_TITLES = None
+
+
+def manually_titled_uuids(host):
+    """⛔⛔ A ROW A PERSON NAMED BY HAND IS A ROW A PERSON IS KEEPING.
+
+    Measured 2026-08-21, by destroying one. The owner kept a row group of sessions
+    whose transcripts had been deleted long ago — he kept them **for their
+    titles**, as a reading list, because the title alone told him what the item
+    was. The group's HEAD was such a row: no process, no transcript, and its cwd
+    was a mount path that no longer resolves. `orphans` called that DEAD debris
+    and folded it, and it cannot be restored: the session, its transcript and its
+    cwd are all gone, so the restore verb reports `not_found`.
+
+    ⇒ The tool's whole model was that a row's value is its PROCESS. For a bookmark
+      the value is the NAME, and the name is the one thing it still had.
+
+    `session_titles.source = 'manual'` is exactly that marker and it was already in
+    the store: it means a human typed this title. Nothing folds such a row without
+    `--force`, whatever its process or its cwd say.
+    """
+    global _MANUAL_TITLES
+    if _MANUAL_TITLES is not None:
+        return _MANUAL_TITLES
+    # ⛔ The store is resolved from the REMOTE's own home, never written out here:
+    # a literal home path is both wrong on any other account and a private-data
+    # leak into a public repo. The pre-push guard caught exactly that.
+    q = ("import sqlite3,json,os;"
+         "c=sqlite3.connect(os.path.expanduser('~/.yggterm/session-titles.db'));"
+         "print(json.dumps([r[0] for r in c.execute("
+         "\"select session_id from session_titles where source='manual'\")]))")
+    r = run(["ssh", "-n", host, f"python3 -c {json.dumps(q)}"])
+    try:
+        _MANUAL_TITLES = set(json.loads(r.stdout.strip()))
+    except Exception:
+        # ⛔ FAIL CLOSED. If the keepsake list cannot be read, every row looks
+        # unprotected — which is the state that lost one.
+        log("⚠ could not read the manual-title store — treating every row as KEPT")
+        _MANUAL_TITLES = None
+        return "unreadable"
+    log(f"  keepsakes: {len(_MANUAL_TITLES)} row(s) carry a hand-typed title")
+    return _MANUAL_TITLES
+
+
 def protected_uuids():
     """Rows nothing may fold: the owner's own, and anything opted out of waking.
 
@@ -361,7 +442,21 @@ def classify(row, live, protected):
     if uuid not in live:
         return "DEAD", "no agent process on this host"
     if tr is None:
-        return "WORKING", "process alive, no transcript to judge by"
+        # ⛔⛔ A LIVE PROCESS WITH NO TRANSCRIPT AT ALL IS THE EMPTIEST POSSIBLE ROW,
+        # AND THIS ARM CALLED IT THE BUSIEST VERDICT IT HAS. A CLI that started and
+        # was never given anything writes no transcript, so it can never be COLD,
+        # FINISHED or DEAD — it is unclassifiable forever and therefore unfoldable
+        # and unsucceedable. Measured 2026-08-21: one row sat in exactly this state
+        # for two hours while every sweep reported it WORKING.
+        #
+        # ⇒ The grace is real — a spawn's transcript lags creation by ~15 s — but it
+        #   is a GRACE, not a permanent exemption. Past it, a row that has never
+        #   written a word has never been briefed, and saying so is the whole point.
+        age = process_age_min(uuid)
+        if age is not None and age > BRIEFLESS_GRACE_MIN:
+            return "BRIEFLESS", (f"alive {age:.0f}m and has never written a transcript — "
+                                 f"it was started and never briefed")
+        return "WORKING", "process alive, no transcript to judge by (still starting?)"
     text = last_assistant_text(tr)
     row["last"] = text.replace("\n", " ")[:200]
     # ⚠ Both phrase tests read the OPENING, not the body. Whole-message matching
@@ -719,7 +814,8 @@ def cmd_orphans(a, host, live):
     except Exception:
         log("⛔ could not read the row list")
         return 2
-    seen, dead, alive = set(), [], []
+    seen, dead, alive, keepsakes = set(), [], [], []
+    kept = manually_titled_uuids(host)
     for row in allrows:
         path = row.get("full_path") or ""
         cwd = (row.get("session_cwd") or "").strip()
@@ -729,7 +825,13 @@ def cmd_orphans(a, host, live):
         if os.path.isdir(cwd):
             continue
         uuid = path.rsplit("/", 1)[-1]
+        if kept == "unreadable" or (kept is not None and uuid in kept):
+            keepsakes.append((path, cwd, row.get("outline_prefix")))
+            continue
         (alive if uuid in live else dead).append((path, cwd, row.get("outline_prefix")))
+    for path, cwd, seat in keepsakes:
+        log(f"🔖 {str(seat) or '-':<7} {path[-40:]} — KEPT: hand-typed title, cwd {cwd} is gone")
+        log("    a bookmark's value is its NAME, not its process. Never folded without --force")
     for path, cwd, seat in alive:
         log(f"· {str(seat):<7} {path[-40:]} — ALIVE in a vanished tree {cwd}")
         log("    left alone: re-rooting a live session is a product verb, not a reap")
@@ -739,7 +841,7 @@ def cmd_orphans(a, host, live):
             row = {"uri": path, "uuid": path.rsplit("/", 1)[-1], "seat": str(seat or "-"),
                    "label": row_label(allrows, path), "session_cwd": cwd}
             fold(row, "DEAD", "cwd tree no longer exists", host, True)
-    log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive"
+    log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive, {len(keepsakes)} kept"
         + ("" if a.apply else " · nothing was changed. Re-run with --apply."))
     return 0
 
@@ -759,6 +861,15 @@ def main():
     sw.add_argument("--campaign", help="only rows whose seat starts with this, e.g. 11")
     sw.add_argument("--apply", action="store_true")
     sw.add_argument("--host")
+    sw.add_argument("--dead-only", action="store_true",
+                    help="classify everything, act ONLY on DEAD. ⛔ The scoping rule — an "
+                         "orchestrator folds its own spawns and nobody else's — protects a "
+                         "JUDGEMENT: whether a quiet lane is finished. A row with no process "
+                         "is not a judgement, so this pass may run unscoped and is the only "
+                         "thing watching campaigns that have no orchestrator of their own")
+    sw.add_argument("--max-respawns", type=int, default=0,
+                    help="0 = no cap. A cap exists because this loop runs unattended: a bad "
+                         "hour must not be able to spawn a lane per cold row across the fleet")
     sw.add_argument("--respawn", action="store_true",
                     help="replace each COLD row: spawn a successor at the same seat from a "
                          "brief distilled from artefacts, prove it holds the brief, and only "
@@ -830,10 +941,19 @@ def main():
     if a.cmd == "row":
         rows = [r for r in rows if a.target in r["uri"]]
         if not rows:
-            log(f"⛔ no seated row matches {a.target}")
-            return 2
+            # ⛔⛔ THE CENSUS KEEPS ONLY SEATED ROWS, AND AN UNSEATED ROW IS THE ONE
+            # MOST LIKELY TO NEED FOLDING. A row loses its seat when its group head
+            # is folded, or when it was never numbered — so the debris this verb
+            # exists to clear was precisely the debris it refused to look at, with
+            # "no seated row matches" reading as "no such row". Measured
+            # 2026-08-21 on a dead lane whose seat had gone with its twin.
+            rows = [r for r in rows_all(host) if a.target in r["uri"]]
+            if not rows:
+                log(f"⛔ no row matches {a.target}")
+                return 2
+            log(f"  {a.target} has no seat — folding it by path")
 
-    counts, folded, seen_rows = {}, 0, []
+    counts, folded, seen_rows, respawned = {}, 0, [], 0
     for row in sorted(rows, key=lambda r: r["seat"]):
         if a.cmd == "sweep" and a.campaign:
             head = row["seat"].split(".")[0]
@@ -843,9 +963,11 @@ def main():
         counts[verdict] = counts.get(verdict, 0) + 1
         if verdict != "PROTECTED":
             seen_rows.append(row)
-        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·",
+        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·", "BRIEFLESS": "⚠",
                 "PROTECTED": "🔒", "STALLED": "⏸", "COLD": "❄"}[verdict]
         log(f"{mark} {row['seat']:<7} {row['uuid'][:8]} {verdict:<9} {why}")
+        if getattr(a, "dead_only", False) and verdict != "DEAD":
+            continue
         forced = getattr(a, "force", False) and verdict != "PROTECTED"
         # ⚠ A single-row call is an operator asking about ONE row, usually because
         # a sweep told them to. Declining in silence makes the two verbs look as
@@ -861,7 +983,12 @@ def main():
         elif verdict == "STALLED" and getattr(a, "wake", False):
             wake(row, host, a.apply)
         elif verdict == "COLD":
-            if getattr(a, "respawn", False):
+            cap = getattr(a, "max_respawns", 0) or 0
+            if getattr(a, "respawn", False) and cap and respawned >= cap:
+                log(f"  ⛔ respawn cap of {cap} reached this sweep — left cold, "
+                    f"its successor brief is written and the next sweep will take it")
+            elif getattr(a, "respawn", False):
+                respawned += 1
                 if respawn(row, why, host, a.apply):
                     folded += 1
             else:

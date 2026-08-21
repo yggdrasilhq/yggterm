@@ -230,6 +230,7 @@ tick() {
 #: else's work; the cost of waiting another hour is a row in a list.
 fold_sweep() {
   local fold="$REPO/.agents/skills/yggterm-agent-fleet/ygg-fold.py"
+  local fold_repo_land="$REPO/.agents/skills/yggterm-agent-fleet/ygg-land.py"
   [ -x "$fold" ] || return 0
 
   # ⛔⛔ TWO REFUSALS, AND BOTH WERE LEARNED BY BREAKING THEM ON THE FIRST RUN.
@@ -262,11 +263,42 @@ fold_sweep() {
   #    not. ⇒ Scope is explicit, and an empty scope does nothing at all.
   local apply="--apply"
   [ "$DRY" = 1 ] && apply=""
+  # ⛔⛔ --respawn IS WHY A COLD ROW EVER COMES BACK, AND IT WAS MISSING. --wake only
+  #    ever touches STALLED; a COLD row may never be prompted by law, so its only
+  #    remedy is harvest-and-replace, which is --respawn. Without it this loop
+  #    detected cold rows hourly, wrote a successor brief for each hourly, and
+  #    spawned nothing — measured 2026-08-21 with three rows cold for 43-51 minutes
+  #    and their briefs rewritten on every pass. A detector that needs an operator
+  #    is not an orchestration layer.
+  # ⚠ CAPPED, because this runs unattended: one bad hour must not spawn a lane per
+  #    cold row across the fleet. Over the cap they stay cold and the next sweep
+  #    takes them, which is a delay rather than a loss.
   local campaign
   for campaign in $FOLD_CAMPAIGNS; do
-    python3 "$fold" sweep --campaign "$campaign" $apply --wake --finished-idle-min 45 --stall-idle-min 10 2>&1 \
-      | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|[⛔✔🔒])' || true
+    python3 "$fold" sweep --campaign "$campaign" $apply --wake --respawn --max-respawns 2 \
+      --finished-idle-min 45 --stall-idle-min 10 2>&1 \
+      | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|[⛔✔🔒⚠❄])' || true
   done
+  # ⛔⛔ AND REPORT THE DIVERGENCE EVERY HOUR, UNASKED. Forty commits of delivered
+  #    work — five owner mandates, an entire UX programme — sat on lane branches
+  #    while every brief reported them CLOSED and live-proven, because a lane's
+  #    "0/0" means its branch agrees with its own remote and says nothing about
+  #    main. The roll builds from origin/main, so it shipped nothing while
+  #    everyone believed otherwise. Nobody was lying: the number answered an
+  #    adjacent question. ⇒ The loop that BUILDS from main is the right place to
+  #    say what is not in it, because it is the one thing that runs unasked.
+  python3 "$fold_repo_land" status 2>&1 \
+    | sed 's/^/  /' | tee -a "$LOG" | grep -E 'READY|carrying unlanded|look ahead' || true
+
+  # ⛔ AND ONE UNSCOPED PASS THAT ACTS ONLY ON THE DEAD. The scoping rule above
+  #    protects a JUDGEMENT — whether a quiet lane is finished — and another
+  #    campaign's row is that campaign's to judge. A row whose PROCESS IS GONE is
+  #    not a judgement, and campaigns without an orchestrator of their own were
+  #    watched by nothing at all: a dead row sat seated while three of its
+  #    neighbours went cold unnoticed, because this loop only ever swept one
+  #    campaign number.
+  python3 "$fold" sweep --dead-only $apply 2>&1 \
+    | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|⛔)' || true
   python3 "$fold" worktrees $apply 2>&1 \
     | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|✔)' || true
 }

@@ -13584,11 +13584,14 @@ fn TerminalCanvas(
                                 web_frame_bg,
                             ),
                             // ROOT TABS ONLY. A strip has nowhere to draw a
-                            // folder, so a filed tab is not here — it is in the
-                            // overflow menu at the end of the strip. The modal
+                            // tree, so a row inside a group is not here — it is
+                            // in the overflow menu at the end of the strip. A
+                            // group HEAD is at root and stays in the bar: it is
+                            // a page like any other, and hiding it would lose
+                            // the tab that carries the group's name. The modal
                             // that guards the switch out of vertical mode says
                             // exactly this, so it is never a silent loss.
-                            {web_overlay.tabs.iter().filter(|tab| tab.folder.is_none()).map(|tab| {
+                            {web_overlay.tabs.iter().filter(|tab| tab.group_head.is_none()).map(|tab| {
                                 let tab_id = tab.id;
                                 let tab_label = tab.label.clone();
                                 let tab_active = tab.active;
@@ -13703,17 +13706,22 @@ fn TerminalCanvas(
                             // used to be (that toggle now lives in the app's own
                             // settings pane, which is where a browser setting
                             // belongs). It holds the tabs the strip cannot draw:
-                            // the ones filed in folders, grouped by folder. It
-                            // exists only when there is something in it — a user
-                            // who never made a folder never sees it.
+                            // the ones inside a ROW GROUP, under their head.
+                            // It exists only when there is something in it — a
+                            // user with no groups never sees it.
                             {
                                 let filed: Vec<WebSurfaceOverlayTabView> = web_overlay
                                     .tabs
                                     .iter()
-                                    .filter(|tab| tab.folder.is_some())
+                                    .filter(|tab| tab.group_head.is_some())
                                     .cloned()
                                     .collect();
-                                let folders = web_overlay.folders.clone();
+                                let heads: Vec<WebSurfaceOverlayTabView> = web_overlay
+                                    .tabs
+                                    .iter()
+                                    .filter(|tab| tab.group_size > 0)
+                                    .cloned()
+                                    .collect();
                                 let overflow_open = web_tab_overflow_open;
                                 (!filed.is_empty()).then(|| rsx! {
                                     div {
@@ -13726,7 +13734,7 @@ fn TerminalCanvas(
                                                 theme.foreground,
                                                 if overflow_open { "1" } else { "0.75" },
                                             ),
-                                            title: "Tabs in folders ({filed.len()})",
+                                            title: "Tabs in groups ({filed.len()})",
                                             onclick: move |_| {
                                                 state.with_mut_counted(|shell| shell.toggle_web_tab_overflow());
                                             },
@@ -13766,15 +13774,15 @@ fn TerminalCanvas(
                                                      box-shadow:0 12px 30px rgba(0,0,0,0.28), inset 0 0 0 1px rgba(127,127,127,0.30);",
                                                     theme.background, theme.foreground,
                                                 ),
-                                                for folder in folders.iter() {
+                                                for head in heads.iter() {
                                                     div {
-                                                        key: "ovf-{folder.id}",
+                                                        key: "ovf-{head.id}",
                                                         div {
                                                             style: "font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; \
                                                                     opacity:0.55; padding:6px 8px 3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                                            "▸ {folder.name}"
+                                                            "▸ {head.label}"
                                                         }
-                                                        for tab in filed.iter().filter(|tab| tab.folder.as_deref() == Some(folder.id.as_str())) {
+                                                        for tab in filed.iter().filter(|tab| tab.group_head == Some(head.id)) {
                                                             {
                                                                 let tab_id = tab.id;
                                                                 let tab_label = tab.label.clone();
@@ -16717,7 +16725,17 @@ fn probe_retry_backoff(previous: Duration) -> Duration {
 struct TerminalInputProbeVerdict {
     consuming_input: bool,
     composer_shown: bool,
-    composer_held_draft: bool,
+    /// ⛔⛔ TRI-STATE, AND `None` IS NOT `false`. This was a `bool` built with
+    /// `unwrap_or(false)`, so a composer NOBODY COULD READ was reported to the
+    /// caller as one holding no draft — while the write-permission logic three
+    /// lines away correctly refused to touch it. The logic kept the distinction
+    /// and the report threw it away, which is the worse half: `wedged` is
+    /// computed from this field, so an unreadable composer produced a POSITIVE
+    /// claim that the row was wedged, complete with a remedy that restarts it.
+    /// That is a restart recommended for a live agent row on the strength of a
+    /// reading that never happened. **Blind is not clear, and it is not broken
+    /// either.**
+    composer_held_draft: Option<bool>,
     /// What the row is DOING, read off the CLI's own chrome. Carried beside
     /// liveness rather than derived from it — a healthy IDLE row consumes input
     /// exactly as well as a working one, and reporting only the first is how a
@@ -16793,7 +16811,9 @@ async fn probe_terminal_input_consumption(
         return TerminalInputProbeVerdict {
             consuming_input: false,
             composer_shown: false,
-            composer_held_draft: false,
+            // No composer was ever drawn, so nothing was read: `None`, not
+            // "there is no draft".
+            composer_held_draft: None,
             activity,
             waited_ms: started.elapsed().as_millis() as u64,
             reason: TERMINAL_INPUT_NO_COMPOSER_REASON,
@@ -16812,7 +16832,7 @@ async fn probe_terminal_input_consumption(
             return TerminalInputProbeVerdict {
                 consuming_input: false,
                 composer_shown: true,
-                composer_held_draft: composer_draft_now.unwrap_or(false),
+                composer_held_draft: composer_draft_now,
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: match composer_draft_now {
@@ -16855,7 +16875,7 @@ async fn probe_terminal_input_consumption(
             return TerminalInputProbeVerdict {
                 consuming_input: true,
                 composer_shown: true,
-                composer_held_draft: composer_held_draft.unwrap_or(false),
+                composer_held_draft,
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: TERMINAL_INPUT_CONSUMING_REASON,
@@ -16871,7 +16891,7 @@ async fn probe_terminal_input_consumption(
             return TerminalInputProbeVerdict {
                 consuming_input: false,
                 composer_shown: true,
-                composer_held_draft: composer_draft_now.unwrap_or(false),
+                composer_held_draft: composer_draft_now,
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: match composer_draft_now {
@@ -16896,7 +16916,7 @@ async fn probe_terminal_input_consumption(
     TerminalInputProbeVerdict {
         consuming_input: false,
         composer_shown: true,
-        composer_held_draft: composer_held_draft.unwrap_or(false),
+        composer_held_draft,
         activity,
         waited_ms: started.elapsed().as_millis() as u64,
         reason: TERMINAL_INPUT_WEDGED_REASON,

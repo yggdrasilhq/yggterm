@@ -368,26 +368,6 @@ answered. **To reverse:** it is a view-layer rule; no data change either way.
 
 ---
 
-## The 11.0 orchestrator row is DEAD, unwatched, and only he decides whether it returns
-
-**Measured 2026-08-21 16:2x by the 11.15 monitor.** The `11.0 cli-integration:
-orchestrator` row has been gone for ~95 minutes: its transcript is frozen, no process on
-the GUI host carries its uuid, and it is **not in the booter's subscriber list**, so
-nothing will notice or boot it. Its 8 MB transcript is intact and harvestable.
-
-**What needs him:** whether that seat comes back at all, and if so whether a successor
-harvests the transcript or he resumes it himself. Respawning a fleet orchestrator is
-outward-facing and resource-carrying, and the seat is his to fill — so the relay has not
-done it. Detail on why the row still *looks* healthy: the "no agent composer row
-appeared" entry in `docs/pending-bugs.md`, which now carries the third state.
-
-**Done meanwhile:** the relay is not blocked. This lane's own ledger is closed and its
-reports are being delivered by file under `~/.yggterm/relay/` instead of to the row, so
-nothing is lost while the seat is empty; the other live lanes are unaffected.
-**To reverse:** nothing to undo — no row was spawned and no seat was claimed.
-
----
-
 ## Nothing is waiting on him for these, and they are the relay's actual queue
 
 Said explicitly because the tab is easier to read when it is short: everything

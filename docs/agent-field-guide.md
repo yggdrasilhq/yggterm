@@ -2066,11 +2066,46 @@ A gate that decides whether to roll a daemon can only be trusted once it has bee
 watched refusing AND accepting. Both halves need a real daemon, and neither is worth
 spending someone's live sessions on.
 
-`YGGTERM_HOME` gives a complete, isolated plane: its own socket directory, its own
-bind lock, its own state. A daemon started under it cannot see or disturb the real one
-— and if the variable is not exported before the daemon starts, the daemon resolves
-the REAL home, finds the real bind lock and refuses. That refusal is the guard
-working; it is not a reason to force anything.
+`YGGTERM_HOME` gives an isolated STATE plane: its own socket directory, its own bind
+lock, its own database and trace. If the variable is not exported before the daemon
+starts, the daemon resolves the REAL home, finds the real bind lock and refuses. That
+refusal is the guard working; it is not a reason to force anything.
+
+⛔⛔ **A FRESH SANDBOX HOME LOOKS LIKE A BRAND-NEW MACHINE, AND THE DAEMON TREATS IT
+AS ONE.** The managed-CLI fleet sweep is interval-gated by a marker file **inside the
+home**, so an empty sandbox home has no marker, reads as never-swept, and is due the
+moment the five-minute startup grace expires. Measured 2026-08-21: two sandbox daemons
+each began a full managed-CLI install fan-out — `npm install <agent-cli>@latest`, once
+per managed CLI — about five minutes in, unasked, and had consumed **1.6 GB** between
+npm store, cache and staging by the fifteen-minute mark. Nothing in the measurement it
+was launched for wanted any of that.
+
+⭐ **What it does NOT do, checked before it was written down here:** it does not touch
+the machine's shared managed-CLI store, even though the launching shell exports
+`NPM_CONFIG_PREFIX` pointing straight at it. `ManagedCliPaths::resolve` re-derives the
+prefix, the bin dir and the npm cache from `resolve_yggterm_home()`, and the installer
+sets `NPM_CONFIG_PREFIX` explicitly per invocation — so the inherited value never
+reaches npm. ⚠ The first draft of this note said the opposite, from a daemon's
+environment plus a shared directory's mtime, and both are consistent with an
+attribution that is simply wrong. **An inherited variable is evidence about the
+process, never about what the process did with it.**
+
+⇒ **Seed the sweep marker so the sweep is not due, and scrub the environment anyway** —
+the install is expensive whoever it lands on:
+
+```sh
+python3 -c "import time,sys;open(sys.argv[1],'w').write(str(int(time.time()*1000)))" \
+  "$SB/managed-cli-fleet-sweep"
+env -u DISPLAY -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
+  HOME="$SBHOME" YGGTERM_HOME="$SB" NPM_CONFIG_PREFIX="$SBHOME/npm" \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  YGGTERM_GOVERNOR=0 YGGTERM_DAEMON_IDLE_SHUTDOWN_MS=10800000 \
+  "$SB/bin/yggterm-headless" server daemon &
+```
+
+⚠ `YGGTERM_DAEMON_IDLE_SHUTDOWN_MS` matters more than it looks: the default is **90
+seconds**, so a sandbox daemon with no sessions retires itself before any measurement
+that needs minutes of uptime has begun, and the disappearance reads like a crash.
 
 ```sh
 SB=$(mktemp -d); mkdir -p "$SB/bin"
@@ -2105,6 +2140,73 @@ result.
 
 Cleanup: kill by EXE, not by pattern — `pgrep -f <path>` matches the shell that holds
 the path in its own command line, so it reports a stray that is your own probe.
+
+## Counting a daemon's zombies, and why zero is not an answer (measured 2026-08-21)
+
+A long-lived process accumulates one permanent process-table entry per child it spawns
+and never waits on. Nothing in the watch plane counts them, so the census is by hand:
+
+```sh
+# ⛔ Enumerate by the ARGUMENT, never the binary name — a daemon does not have to be
+#    called yggterm-headless, and one launched as `yggterm server daemon` was holding
+#    69 of a 233-zombie fleet total that a name-based sweep reported as 164.
+ps -eo pid,ppid,stat,etimes,args --no-headers |
+  awk '/server daemon/ && !/awk/ {print}'
+# then, per daemon pid:
+ps -eo ppid,stat --no-headers | awk -v P=<pid> '$1==P && $2 ~ /^Z/' | wc -l
+```
+
+⛔⛔ **ZERO ZOMBIES IS NOT A PASS. It is the reading a daemon that never spawned
+anything also gives**, and the fleet reliably has one of those — an older build without
+the code path under test. Any claim that a reap works needs the count of things it
+actually launched, standing beside the zero:
+
+- **From 3.1.30 on, read it:** `daemon/heartbeat/notify_spawned` carries the pid.
+  ⚠ The event is written on the failure path too, with a null pid — filter on `spawned`.
+- **On an older daemon, infer it:** take its `daemon/heartbeat/panic` events at severity
+  `error` and replay them through `NOTIFY_COOLDOWN_MS`. That is what the count was
+  before the event existed, and it is inference sitting where a control belongs.
+
+⭐ **And run the control on the same host, in the same window.** Pre-fix daemons keep
+their accumulated pile until they exit — that is expected and is not a failed fix, but
+it is also the comparison that makes the zero mean something: 91 → 92 and 80 → 81 on two
+old daemons across the window in which a rolled one stayed at 0.
+
+⚠ **The `comm` of a zombie is a trap.** It reads as the PARENT's name, which looks like a
+fork that never exec'd; it is equally consistent with a child exec'ing the same binary,
+and that is what it is. And **a daemon whose binary was replaced under it answers
+`--version` from the FILE, not from the running code** — the 23-hour daemon carrying the
+pre-fix pile reports the version that was installed over it an hour ago.
+
+## A single red in the server suite is not automatically a flake (measured 2026-08-21)
+
+`cargo test -p yggterm-server --lib` runs ~1,220 tests in one binary on a loaded host,
+and it is not reliably green: **two of five full runs failed on a single test each, a
+DIFFERENT test each time, and both passed when run alone** (32-core host, load average
+~25, other lanes compiling). So "one failure, probably a flake, re-run it" is a
+tempting and mostly-correct reflex.
+
+⛔ **It is also how a real defect ships.** The reaping lock on the owner-notification
+path failed in exactly that shape — one test, red in the suite, green alone. It was not
+a flake: it counted zombie children of the whole test process against a baseline
+snapshot, so a thousand sibling tests spawning and reaping children of the same process
+put it permanently over. It reported *"3 zombie children against a baseline of 0"* for a
+function that spawns exactly ONE child, which is the tell.
+
+⇒ **Read the failure before deciding it is noise.** A flake's message is usually about
+timing; this one's arithmetic did not add up, and the arithmetic is free to check. Two
+questions separate them:
+
+- **Does the message describe more than the test could have caused?** More zombies than
+  children spawned, more rows than inserted, a count the test does not own at all ⇒ the
+  test is measuring a SHARED resource and will keep failing on its neighbours' work.
+- **Does it fail alone under `--test-threads=1`?** Green alone plus red in the suite is
+  consistent with both a flake and a shared-state bug, so this question alone settles
+  nothing — it only tells you which of the two to look for.
+
+⭐ The cure for the shared-resource shape is the same one the row plane already
+learned: **identify, do not count.** Have the code under test report the identity of
+what it created and assert on THAT, so no sibling can move the number.
 
 ## Counting incidents: three verbs, three different answers (measured 2026-08-21)
 
