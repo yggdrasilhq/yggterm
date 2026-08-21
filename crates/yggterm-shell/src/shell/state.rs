@@ -16122,6 +16122,15 @@ struct ShellState {
     /// the hand half of an arrangement; the seats supply the rest, derived, and
     /// this outranks them per row. Persisted beside the split groups.
     row_arrangement: yggterm_core::row_set_outline::RowArrangement,
+    /// How many CONSECUTIVE snapshots each arranged path has been absent from
+    /// the live set.
+    ///
+    /// ⛔ IN MEMORY, NEVER PERSISTED, AND THAT IS THE POINT. The arrangement
+    /// outlives daemons; this counter must not. A restart is exactly the moment
+    /// every row is briefly absent, so a count that survived one would prune the
+    /// user's whole arrangement on the first snapshot after a handover — which is
+    /// presumably why nothing was ever wired to `retain_live` at all.
+    row_arrangement_absent_sightings: HashMap<String, u8>,
     /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
     /// source of truth for splits: the compound sidebar row, the viewport pane
     /// layout, keep-alive, and persistence all derive from this list. No
@@ -18653,6 +18662,7 @@ impl ShellState {
             // Restored so a group the user built by dragging is still there
             // after a restart — the same promise the split groups make.
             row_arrangement: restored_row_arrangement,
+            row_arrangement_absent_sightings: HashMap::new(),
             // Restored from settings so a built split-view workspace reopens as
             // the intentional artifact the user shaped ([[campaign-split-view-groups]]).
             // Normalized on parse; a group whose members no longer exist is
@@ -27204,6 +27214,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.needs_initial_server_sync = false;
                 self.request_background_copy_scan_if_unscheduled();
@@ -27298,6 +27309,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -27368,6 +27380,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -29516,6 +29529,100 @@ impl ShellState {
         promoted.sort();
         promoted.dedup();
         promoted
+    }
+
+    /// How many consecutive snapshots a row must be absent from before its
+    /// arrangement entry is forgotten.
+    ///
+    /// Three, for the same reason the boot watchdog confirms an absence three
+    /// times before acting on it: one missing sighting is a snapshot arriving
+    /// mid-handover, and the cost of being wrong is asymmetric — pruning early
+    /// destroys work the user did by hand, while pruning late leaves a dead
+    /// entry nobody can see.
+    const ROW_ARRANGEMENT_GONE_SIGHTINGS: u8 = 3;
+
+    /// Forget the arrangement of rows that have CONFIRMABLY departed.
+    ///
+    /// ⛔ **THE DEPARTURE POINT IS WHY THIS TOOK SO LONG TO WIRE.**
+    /// `RowArrangement::retain_live` has existed, correct and tested, with no
+    /// production caller at all: the GUI's own close and remove paths dissolve
+    /// and detach the row being closed, but a head that dies daemon-side or
+    /// remotely leaves its entry behind forever, and the stored arrangement
+    /// accumulates rows that exist nowhere. The obvious fix — prune every frame
+    /// against the live set — is worse than the leak, because the live set
+    /// FLICKERS: it is briefly empty or partial during a daemon handover, and a
+    /// naive prune would delete the user's whole arrangement at every restart.
+    ///
+    /// ⇒ So absence is CONFIRMED before it is acted on, and the confirmation
+    /// lives in memory so a restart starts the count over rather than inheriting
+    /// one taken across the very gap it must not trust.
+    ///
+    /// ⛔ **AN EMPTY LIVE SET DECIDES NOTHING.** "No rows" and "I have not been
+    /// told about the rows yet" are indistinguishable here and only one of them
+    /// means everyone departed. Counting on it would let three quiet snapshots
+    /// during a handover wipe an arrangement built over weeks.
+    fn prune_departed_row_arrangement(&mut self) {
+        let live: HashSet<String> = self
+            .server
+            .live_sessions()
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .map(live_session_row_path)
+            .collect();
+        if live.is_empty() {
+            self.row_arrangement_absent_sightings.clear();
+            return;
+        }
+        let arranged: HashSet<String> = self
+            .row_arrangement
+            .sets
+            .heads()
+            .map(ToOwned::to_owned)
+            .chain(
+                self.row_arrangement
+                    .sets
+                    .heads()
+                    .flat_map(|head| self.row_arrangement.sets.members_of(head))
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .chain(self.row_arrangement.detached.iter().cloned())
+            .collect();
+        self.row_arrangement_absent_sightings
+            .retain(|path, _| arranged.contains(path));
+        let mut confirmed_gone: HashSet<String> = HashSet::new();
+        for path in &arranged {
+            if live.contains(path) {
+                self.row_arrangement_absent_sightings.remove(path);
+                continue;
+            }
+            let seen = self
+                .row_arrangement_absent_sightings
+                .entry(path.clone())
+                .or_insert(0);
+            *seen = seen.saturating_add(1);
+            if *seen >= Self::ROW_ARRANGEMENT_GONE_SIGHTINGS {
+                confirmed_gone.insert(path.clone());
+            }
+        }
+        if confirmed_gone.is_empty() {
+            return;
+        }
+        // `retain_live` keeps what it is GIVEN, so the set handed to it is every
+        // arranged path that is not confirmed gone — not the live set. An
+        // unconfirmed absence must survive untouched, and a live row obviously
+        // must too.
+        let keep: HashSet<String> = arranged
+            .iter()
+            .filter(|path| !confirmed_gone.contains(*path))
+            .cloned()
+            .collect();
+        if self.row_arrangement.retain_live(&keep) {
+            for path in &confirmed_gone {
+                self.row_arrangement_absent_sightings.remove(path);
+            }
+            self.sync_browser_settings();
+        }
     }
 
     /// The arrangement the sidebar is drawing right now.
