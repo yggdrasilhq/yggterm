@@ -858,6 +858,41 @@ activation** of its own.
 
 ⭐ Cost: **0.86% of records, 1.21% of trace bytes** in a switch-dense window.
 
+### ⭐ A SECOND CAPTURE, 2026-08-22 ON 3.1.39 — full payload, and a GEOMETRY LEAD
+
+Caught in the post-restart window of a routine roll, on a row nobody was driving. **Read the
+caveat first: a deploy re-resumes every live row, so this window is the one the deploy itself
+creates** — the standing warning against "deploying to measure" applies, and this is not evidence
+about the steady state. What it adds is a complete payload for the signature.
+
+```
+01:50:32  xterm_paint/mount_open   cols 80 · rows 24 · screen_in_host true · write_taps_installed true
+01:50:33  xterm_paint/settle       chars 23866 · rows 65 · rows_content_unpainted 28
+                                   frames 0 · rows_covered 0 · painted false
+                                   open_to_frame_ms null · document_hidden false · overshoot_ms 5
+01:50:35  xterm_paint/settle       recheck, deadline 4000 ms — identical: frames 0, rows_covered 0
+```
+
+⇒ **23,866 characters accepted, 28 rows holding content, zero frames, over at least four seconds,
+on a document that is not hidden.** `open_to_frame_ms: null` says no frame was ever produced
+rather than a slow one, and `blank_frames_before_write: 0` says it was not repainting an empty
+canvas either — it simply never ran.
+
+⭐ **AND THE MOUNT OPENED AT A DIFFERENT SIZE FROM THE ONE IT SETTLED AGAINST: `mount_open` reports
+80×24, `settle` reports 65 rows.** A coverage test asking whether 65 rows are covered on a surface
+built for 24 cannot complete by construction. ⚠ Stated as a LEAD, not a root: nothing here shows
+which of the two is stale, and 80×24 is also what an unsized terminal reports before its first
+resize, so the two readings may simply be the same surface a moment apart. **The falsifier is
+cheap** — join `mount_open` and `settle` on `host_id` across many mounts and ask whether the
+zero-frame ones are the ones whose geometry disagrees. ⛔ Segment by build first; a pooled trace
+spans several and the loud dead build wins.
+
+⚠ **It recovered.** By 01:52 the same host was flushing 6,613 and 7,089 characters and the app's
+own `screen_reconcile_skipped_working_surface` called it a working surface. ⇒ **A fault that
+stops on its own is not a fault that was fixed** — the same lesson the render loop taught — and a
+transient here is indistinguishable from the permanent case in every field except how long it
+lasts.
+
 ### ⛔⛔⛔ THE INSTRUMENT FOUND IT: A VISIBLE MOUNT HELD 41 ROWS OF TEXT AND RENDERED NOTHING
 
 *Measured on the live GUI host, 38.5 minutes of trace with `xterm_paint` running, 2026-08-21.
