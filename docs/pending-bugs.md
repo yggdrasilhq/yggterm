@@ -1881,6 +1881,13 @@ factually false post-adoption; those rows are owned locally). Lock:
 deaf REAL peer's first probe after each backoff expiry still pays the full 10 s under the lock
 — the probe wants a sub-second timeout or the fan-out wants to run off the lock.
 
+**VERIFIED IN PRODUCTION (daemon 3.1.26, rolled 14:57):** all 22 stale self-alias claims
+purged in one sweep at 14:58:25 (`proxied_owner_is_self_alias_purged` ×22), and the dam
+cadence — every ~5 m 14 s all afternoon — stops dead: zero `slow_peer` events since.
+`pre_select` flat at max 16 ms over 70,894 iterations. The echo bar (p95 ≤ 50 ms) now closes
+on: a clean TYPED window on ≥3.1.26, and the swap-residue drain (6.7's, still 7.5 GiB at
+15:3x).
+
 ## ⛔⛔⛔ [11.5] THE INPUT CHAIN PROVES DELIVERY TO THE PTY, NEVER CONSUMPTION BY THE PROGRAM — AND THAT IS THE GAP "I CANNOT TYPE" FALLS THROUGH
 
 **Status:** OPEN
