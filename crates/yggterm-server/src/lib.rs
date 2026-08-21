@@ -4100,10 +4100,119 @@ fn working_flag_differs(session: &ManagedSessionView, working: bool) -> bool {
     session.working != Some(working)
 }
 
+/// WHY the active row changed.
+///
+/// ⛔⛔ THE MEASUREMENT THE LEGENDARY MOUNT-CHURN ENTRY HAS BEEN ASKING FOR
+/// LONGEST, and the reason half of that entry cannot be settled. It can prove
+/// that rows nobody is looking at are re-mounted; it cannot prove whether the
+/// ACTIVE row changes on its own — because a person clicking between rows and
+/// the app switching by itself produced **exactly the same trace**. The entry
+/// says so in as many words: *"no instrument here separates his click from an
+/// app-driven switch"*.
+///
+/// ⇒ So the origin is not a log line, it is a REQUIRED ARGUMENT. There is one
+/// writer for `active_session_path`, it takes an origin, and the compiler asks
+/// every future call site the question. A path that changes the active row
+/// without saying why does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationOriginKind {
+    /// A hand. A click on a sidebar row or a start-page card, a key, a
+    /// notification card the person clicked. ⭐ This is the variant the whole
+    /// enum exists to isolate: everything else is the app moving on its own.
+    UserGesture,
+    /// The app-control plane — an agent, a script or another session asked for
+    /// this row. ⚠ NOT a user gesture, even though it is a deliberate request
+    /// by somebody: the question the entry asks is whether the person AT THE
+    /// MACHINE moved, and an orchestrator opening a row while they read is the
+    /// symptom, not the control.
+    AppControl,
+    /// Back or forward through the viewport history.
+    History,
+    /// A session being started or restarted took the screen.
+    Launch,
+    /// Startup restore, or adopting a snapshot from a daemon.
+    Restore,
+    /// The app repairing itself: the active row was removed or became
+    /// unresolvable and something had to take its place.
+    Recovery,
+    /// Anything else. ⛔ `site` is mandatory so this is never a dead end for a
+    /// reader — an unexplained switch must still name the line that made it.
+    Internal,
+}
+
+impl ActivationOriginKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserGesture => "user_gesture",
+            Self::AppControl => "app_control",
+            Self::History => "history",
+            Self::Launch => "launch",
+            Self::Restore => "restore",
+            Self::Recovery => "recovery",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// An origin kind plus the exact call site that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationOrigin {
+    pub kind: ActivationOriginKind,
+    /// ⚠ A `&'static str` on purpose: it names a LINE OF CODE, never a piece of
+    /// user data. A site that could carry a path or a title would put row names
+    /// on the trace plane, which the privacy rules forbid and which no reader of
+    /// this field needs — the row is already in `to`.
+    pub site: &'static str,
+}
+
+impl ActivationOrigin {
+    pub const fn new(kind: ActivationOriginKind, site: &'static str) -> Self {
+        Self { kind, site }
+    }
+    pub const fn user_gesture(site: &'static str) -> Self {
+        Self::new(ActivationOriginKind::UserGesture, site)
+    }
+    pub const fn app_control(site: &'static str) -> Self {
+        Self::new(ActivationOriginKind::AppControl, site)
+    }
+    pub const fn history(site: &'static str) -> Self {
+        Self::new(ActivationOriginKind::History, site)
+    }
+    pub const fn launch(site: &'static str) -> Self {
+        Self::new(ActivationOriginKind::Launch, site)
+    }
+    pub const fn restore(site: &'static str) -> Self {
+        Self::new(ActivationOriginKind::Restore, site)
+    }
+    pub const fn recovery(site: &'static str) -> Self {
+        Self::new(ActivationOriginKind::Recovery, site)
+    }
+    pub const fn internal(site: &'static str) -> Self {
+        Self::new(ActivationOriginKind::Internal, site)
+    }
+    pub fn is_user_gesture(self) -> bool {
+        matches!(self.kind, ActivationOriginKind::UserGesture)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct YggtermServer {
     sessions: BTreeMap<String, ManagedSessionView>,
+    /// ⛔ ONE WRITER: `set_active_session_path`. The field stays private and
+    /// every assignment goes through that funnel, because an origin recorded
+    /// at only some of the call sites answers "why did it change" with
+    /// "sometimes".
     active_session_path: Option<String>,
+    last_activation_at_ms: Option<u64>,
+    last_activation_origin: Option<ActivationOrigin>,
+    /// Activations that named a row already active, counted per origin kind
+    /// since the last real switch. ⭐ Carried ON the next switch record rather
+    /// than emitted per occurrence: a redundant re-activation is exactly what
+    /// an idempotent click and a repair loop both look like, so the count is
+    /// worth having — and at 13 launch-for-active requests per 1.3 min on the
+    /// GUI host, a record each would spend the trace budget restating that
+    /// nothing moved.
+    redundant_activations: BTreeMap<&'static str, u32>,
     active_view_mode: WorkspaceViewMode,
     backend: TerminalBackend,
     theme: UiTheme,
@@ -4207,6 +4316,9 @@ impl YggtermServer {
         let this = Self {
             sessions: BTreeMap::new(),
             active_session_path: None,
+            last_activation_at_ms: None,
+            last_activation_origin: None,
+            redundant_activations: BTreeMap::new(),
             active_view_mode: WorkspaceViewMode::Rendered,
             backend,
             theme,
@@ -4250,8 +4362,8 @@ impl YggtermServer {
         self.normalize_active_view_mode();
     }
 
-    pub fn show_start_page(&mut self) {
-        self.active_session_path = None;
+    pub fn show_start_page(&mut self, origin: ActivationOrigin) {
+        self.set_active_session_path(None, origin);
         self.active_view_mode = WorkspaceViewMode::Rendered;
     }
 
@@ -4338,6 +4450,10 @@ impl YggtermServer {
         }
     }
 
+    /// ⛔ `origin` is not optional and has no default. This is the door a
+    /// sidebar click, an app-control `open` and a notification card all share
+    /// — which is exactly why the trace could not tell them apart — so the
+    /// caller states which it is or the code does not build.
     pub fn open_or_focus_session(
         &mut self,
         kind: SessionKind,
@@ -4346,11 +4462,12 @@ impl YggtermServer {
         cwd: Option<&str>,
         title_hint: Option<&str>,
         document: Option<&WorkspaceDocument>,
+        origin: ActivationOrigin,
     ) {
         if kind != SessionKind::Document
             && let Some(existing_key) = self.resolve_hot_session_key(path, session_id, kind)
         {
-            self.active_session_path = Some(existing_key);
+            self.set_active_session_path(Some(existing_key), origin);
             return;
         }
         let was_missing = !self.sessions.contains_key(path);
@@ -4429,7 +4546,7 @@ impl YggtermServer {
             && entry.source == SessionSource::Stored
             && kind != SessionKind::Document
             && !entry.stored_preview_hydrated;
-        self.active_session_path = Some(path.to_string());
+        self.set_active_session_path(Some(path.to_string()), origin);
         if should_refresh_stored_preview {
             let existing = self.sessions.get(path).cloned();
             if let Some(existing) = existing.as_ref() {
@@ -4453,6 +4570,91 @@ impl YggtermServer {
 
     pub fn active_session_path(&self) -> Option<&str> {
         self.active_session_path.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn redundant_activations_for_test(&self) -> &BTreeMap<&'static str, u32> {
+        &self.redundant_activations
+    }
+
+    /// The ONE writer for the active row, and the only place an activation is
+    /// recorded.
+    ///
+    /// ⛔⛔ IT IS A FUNNEL RATHER THAN A LOG LINE FOR ONE REASON: the question
+    /// the mount-churn entry asks is whether the active row changes **on its
+    /// own**, and that question is answered by the events that were NOT
+    /// emitted as much as by the ones that were. An origin recorded at the
+    /// call sites somebody remembered would make an unexplained switch look
+    /// exactly like a switch nobody instrumented — the two failures this
+    /// project keeps paying for, wearing each other's clothes. With one writer
+    /// there is no third state: every change to this field is on the plane
+    /// with a reason attached.
+    ///
+    /// ⚠ A call that names the row already active is NOT a switch. It is
+    /// counted and carried on the next real one, so an idempotent click and a
+    /// repair loop are both visible without spending a record each.
+    fn set_active_session_path(&mut self, next: Option<String>, origin: ActivationOrigin) {
+        if self.active_session_path == next {
+            *self
+                .redundant_activations
+                .entry(origin.kind.as_str())
+                .or_insert(0) += 1;
+            return;
+        }
+        let now_ms = current_millis_u64();
+        let previous = self.active_session_path.take();
+        self.active_session_path = next;
+        let redundant = std::mem::take(&mut self.redundant_activations);
+        let previous_origin = self.last_activation_origin.replace(origin);
+        let since_ms = self
+            .last_activation_at_ms
+            .replace(now_ms)
+            .map(|previous_at| now_ms.saturating_sub(previous_at));
+        // ⛔⛔ A TEST MUST NOT WRITE A SWITCH ONTO THE PLANE EVERY LANE READS,
+        // and this was MEASURED before it shipped rather than reasoned about:
+        // one run of one activation test put two records into the real
+        // `event-trace.jsonl`, and a full suite run had already left 2087
+        // there. Three costs, and the first is the one that matters — a
+        // synthetic switch is **indistinguishable from a real one** to every
+        // reader of this plane, so a test run manufactures exactly the
+        // app-driven-switch evidence the probe exists to establish. Then it
+        // spends a retention budget measured in BYTES, and then it makes ~1200
+        // parallel tests contend on one file.
+        //
+        // ⚠ `cfg!(test)` covers this crate's own suite, which is where every
+        // activation test lives and where the volume is. It does NOT cover a
+        // dependent crate's tests — that build has no `test` cfg here — so the
+        // second guard is the home itself: a suite run with no `YGGTERM_HOME`
+        // set has nothing this probe should be appending to.
+        if cfg!(test) {
+            return;
+        }
+        let Ok(home) = resolve_yggterm_home() else {
+            return;
+        };
+        append_trace_event(
+            &home,
+            "server",
+            "session",
+            "activation",
+            serde_json::json!({
+                "from": previous,
+                "to": self.active_session_path,
+                "origin": origin.kind.as_str(),
+                "origin_site": origin.site,
+                // ⭐ THE ONE FIELD THE ENTRY NEEDS, stated rather than derived.
+                // A reader asking "did he switch, or did the app?" must not
+                // have to know which origin names are gestures.
+                "user_gesture": origin.is_user_gesture(),
+                "previous_origin": previous_origin.map(|o| o.kind.as_str()),
+                "previous_origin_site": previous_origin.map(|o| o.site),
+                "ms_since_previous_activation": since_ms,
+                "redundant_since_previous": redundant
+                    .into_iter()
+                    .map(|(kind, count)| (kind.to_string(), count))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            }),
+        );
     }
 
     // XTERM-BUG: squish-and-bottom-paint-on-reresume — persist the PTY grid in the
@@ -4522,7 +4724,10 @@ impl YggtermServer {
         if !managed_session_is_promoted_live_session(&resolved_key, &session) {
             return false;
         }
-        self.active_session_path = Some(resolved_key);
+        self.set_active_session_path(
+            Some(resolved_key),
+            ActivationOrigin::recovery("focus_live_session_without_launch_if_active_missing"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         true
     }
@@ -4578,9 +4783,15 @@ impl YggtermServer {
         };
 
         self.sessions.insert(path.to_string(), replacement);
-        self.active_session_path = Some(path.to_string());
+        self.set_active_session_path(
+            Some(path.to_string()),
+            ActivationOrigin::internal("switch_agent_session_mode"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
-        self.request_terminal_launch_for_path(path);
+        self.request_terminal_launch_for_path(
+            path,
+            ActivationOrigin::internal("request_terminal_launch_preserving_active"),
+        );
         Ok(())
     }
 
@@ -4591,12 +4802,15 @@ impl YggtermServer {
     /// No-op when the previous path no longer resolves.
     pub fn restore_active_session(&mut self, path: &str, view_mode: WorkspaceViewMode) {
         if self.resolve_session_storage_key(path).is_some() || self.sessions.contains_key(path) {
-            self.active_session_path = Some(path.to_string());
+            self.set_active_session_path(
+                Some(path.to_string()),
+                ActivationOrigin::restore("restore_active_session"),
+            );
             self.active_view_mode = view_mode;
         }
     }
 
-    pub fn request_terminal_launch_for_path(&mut self, path: &str) {
+    pub fn request_terminal_launch_for_path(&mut self, path: &str, origin: ActivationOrigin) {
         let resolved_key = self.resolve_session_storage_key(path).map(str::to_string);
         if let Ok(home) = resolve_yggterm_home() {
             append_trace_event(
@@ -4610,7 +4824,7 @@ impl YggtermServer {
                 }),
             );
         }
-        self.active_session_path = resolved_key.or_else(|| Some(path.to_string()));
+        self.set_active_session_path(resolved_key.or_else(|| Some(path.to_string())), origin);
         if self.active_session_supports_terminal() {
             self.active_view_mode = WorkspaceViewMode::Terminal;
         }
@@ -4622,15 +4836,25 @@ impl YggtermServer {
         let preserved_active_view_mode = self.active_view_mode;
         let preserved_live_session_order = self.live_session_order.clone();
 
-        self.request_terminal_launch_for_path(path);
+        self.request_terminal_launch_for_path(
+            path,
+            ActivationOrigin::internal("request_terminal_launch_preserving_active"),
+        );
 
         match preserved_active_path {
             Some(active_path) if self.resolve_session_storage_key(&active_path).is_some() => {
-                self.active_session_path = Some(active_path);
+                self.set_active_session_path(
+                    Some(active_path),
+                    ActivationOrigin::internal("launch_preserving_active_restore"),
+                );
                 self.active_view_mode = preserved_active_view_mode;
             }
             Some(_) => {
-                self.active_session_path = self.first_available_live_session_path();
+                let fallback = self.first_available_live_session_path();
+                self.set_active_session_path(
+                    fallback,
+                    ActivationOrigin::recovery("launch_preserving_active_lost_row"),
+                );
                 if self.active_session_path.is_none()
                     && self.active_view_mode == WorkspaceViewMode::Terminal
                 {
@@ -4638,7 +4862,10 @@ impl YggtermServer {
                 }
             }
             None => {
-                self.active_session_path = None;
+                self.set_active_session_path(
+                    None,
+                    ActivationOrigin::internal("launch_preserving_active_had_none"),
+                );
                 self.active_view_mode = preserved_active_view_mode;
             }
         }
@@ -5244,7 +5471,10 @@ impl YggtermServer {
             self.forget_preview_history_budget(&path);
             self.live_session_order.retain(|entry| entry != &path);
             if self.active_session_path.as_deref() == Some(path.as_str()) {
-                self.active_session_path = None;
+                self.set_active_session_path(
+                    None,
+                    ActivationOrigin::recovery("remove_ssh_targets_for_machine"),
+                );
             }
         }
 
@@ -5271,7 +5501,7 @@ impl YggtermServer {
         if self.active_session_path.as_deref() == Some(resolved_key.as_str())
             || self.active_session_path.as_deref() == Some(path)
         {
-            self.active_session_path = None;
+            self.set_active_session_path(None, ActivationOrigin::recovery("remove_live_session"));
             self.active_view_mode = WorkspaceViewMode::Rendered;
         }
         self.repair_active_session_path_after_live_session_change();
@@ -5292,7 +5522,10 @@ impl YggtermServer {
             || self.active_session_path.as_deref() == Some(path)
             || self.active_session_path.as_deref() == Some(session.session_path.as_str())
         {
-            self.active_session_path = None;
+            self.set_active_session_path(
+                None,
+                ActivationOrigin::recovery("detach_live_session_view"),
+            );
             self.active_view_mode = WorkspaceViewMode::Rendered;
         }
         Ok(true)
@@ -6798,7 +7031,10 @@ impl YggtermServer {
         );
         if !viewport_is_client_owned {
             self.active_view_mode = snapshot.active_view_mode;
-            self.active_session_path = snapshot.active_session_path.clone();
+            self.set_active_session_path(
+                snapshot.active_session_path.clone(),
+                ActivationOrigin::restore("apply_snapshot_adopt_daemon_view"),
+            );
         }
         self.remote_machines = snapshot.remote_machines;
         self.ssh_targets = snapshot.ssh_targets;
@@ -6871,7 +7107,11 @@ impl YggtermServer {
             .as_ref()
             .is_some_and(|path| !self.sessions.contains_key(path))
         {
-            self.active_session_path = self.live_session_order.first().cloned();
+            let fallback = self.live_session_order.first().cloned();
+            self.set_active_session_path(
+                fallback,
+                ActivationOrigin::recovery("apply_snapshot_active_row_absent"),
+            );
         }
         // ⛔ LAST, and after the rebuild: this apply just replaced every row's
         // `working` with whatever the ANSWERING daemon knew, which is `None` for
@@ -7373,7 +7613,10 @@ impl YggtermServer {
                 self.sessions.insert(active_path.clone(), session);
             }
             if self.sessions.contains_key(&active_path) {
-                self.active_session_path = Some(active_path.clone());
+                self.set_active_session_path(
+                    Some(active_path.clone()),
+                    ActivationOrigin::restore("restore_persisted_state"),
+                );
                 if let Some(existing) = self.sessions.get(&active_path).cloned()
                     && existing.source == SessionSource::Stored
                     && !existing.stored_preview_hydrated
@@ -7385,7 +7628,10 @@ impl YggtermServer {
                     && (parse_remote_scanned_session_path(&active_path).is_none()
                         || remote_scanned_session_path_is_live(&self.remote_machines, &active_path))
                 {
-                    self.request_terminal_launch_for_path(&active_path);
+                    self.request_terminal_launch_for_path(
+                        &active_path,
+                        ActivationOrigin::restore("restore_persisted_state_launch_active"),
+                    );
                 }
             }
         }
@@ -7399,10 +7645,10 @@ impl YggtermServer {
         }
     }
 
-    pub fn focus_live_session(&mut self, key: &str) {
+    pub fn focus_live_session(&mut self, key: &str, origin: ActivationOrigin) {
         let resolved_key = self.resolve_live_session_key(key);
         if let Some(resolved_key) = resolved_key {
-            self.active_session_path = Some(resolved_key);
+            self.set_active_session_path(Some(resolved_key), origin);
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
         } else if let Some((machine_key, session_id, kind)) =
@@ -7639,7 +7885,10 @@ impl YggtermServer {
         apply_birth_keep_alive(&mut session);
         self.sessions.insert(key.clone(), session);
         self.seat_new_live_session(&key);
-        self.active_session_path = Some(key.clone());
+        self.set_active_session_path(
+            Some(key.clone()),
+            ActivationOrigin::launch("start_remote_codex_session"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         self.request_terminal_launch_for_active();
         Ok(key)
@@ -7904,7 +8153,10 @@ impl YggtermServer {
         apply_birth_keep_alive(&mut session);
         self.sessions.insert(session_path.clone(), session);
         self.seat_new_live_session(&session_path);
-        self.active_session_path = Some(session_path.clone());
+        self.set_active_session_path(
+            Some(session_path.clone()),
+            ActivationOrigin::launch("start_remote_agent_session_with_launch_options"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Ok(session_path)
     }
@@ -8115,7 +8367,10 @@ impl YggtermServer {
                 .as_deref()
                 .is_some_and(|active| active == key || active == session_path)
             {
-                self.active_session_path = None;
+                self.set_active_session_path(
+                    None,
+                    ActivationOrigin::recovery("prune_stale_temporary_remote_live_sessions_after_scan"),
+                );
                 self.active_view_mode = WorkspaceViewMode::Rendered;
             }
         }
@@ -8794,7 +9049,10 @@ impl YggtermServer {
                             &target.ssh_target,
                         );
                     }
-                    self.active_session_path = Some(session_path.clone());
+                    self.set_active_session_path(
+                        Some(session_path.clone()),
+                        ActivationOrigin::internal("open_remote_scanned_session_reuse_live"),
+                    );
                     self.active_view_mode = WorkspaceViewMode::Terminal;
                     self.normalize_active_view_mode();
                     return Ok(session_path);
@@ -8823,7 +9081,10 @@ impl YggtermServer {
                     Some(machine.remote_deploy_state),
                 );
             }
-            self.active_session_path = Some(session_path.clone());
+            self.set_active_session_path(
+                Some(session_path.clone()),
+                ActivationOrigin::internal("open_remote_scanned_session_promote"),
+            );
             self.active_view_mode = WorkspaceViewMode::Rendered;
             return Ok(session_path);
         }
@@ -8910,9 +9171,15 @@ impl YggtermServer {
             }
             if launch_terminal {
                 self.seat_new_live_session(&session_path);
-                self.focus_live_session(&session_path);
+                self.focus_live_session(
+                    &session_path,
+                    ActivationOrigin::internal("open_remote_scanned_session_focus_live"),
+                );
             } else {
-                self.active_session_path = Some(session_path.clone());
+                self.set_active_session_path(
+                    Some(session_path.clone()),
+                    ActivationOrigin::internal("open_remote_scanned_session_existing"),
+                );
                 self.active_view_mode = WorkspaceViewMode::Rendered;
             }
             return Ok(session_path);
@@ -8966,9 +9233,15 @@ impl YggtermServer {
             );
         }
         if launch_terminal {
-            self.focus_live_session(&session_path);
+            self.focus_live_session(
+                &session_path,
+                ActivationOrigin::internal("open_remote_scanned_session_focus_live_promoted"),
+            );
         } else {
-            self.active_session_path = Some(session_path.clone());
+            self.set_active_session_path(
+                Some(session_path.clone()),
+                ActivationOrigin::internal("open_remote_scanned_session_new"),
+            );
             self.active_view_mode = WorkspaceViewMode::Rendered;
         }
         Ok(session_path)
@@ -9026,7 +9299,10 @@ impl YggtermServer {
             self.live_session_order
                 .retain(|existing| existing != &session_path);
         }
-        self.active_session_path = Some(session_path.clone());
+        self.set_active_session_path(
+            Some(session_path.clone()),
+            ActivationOrigin::internal("stage_remote_scanned_session_with_view"),
+        );
         self.active_view_mode = view_mode;
         Some(session_path)
     }
@@ -9087,7 +9363,10 @@ impl YggtermServer {
             self.live_session_order
                 .retain(|existing| existing != &session_path);
         }
-        self.active_session_path = Some(session_path.clone());
+        self.set_active_session_path(
+            Some(session_path.clone()),
+            ActivationOrigin::internal("stage_remote_scanned_session_with_cached_preview"),
+        );
         self.active_view_mode = view_mode;
         Some(session_path)
     }
@@ -9099,7 +9378,10 @@ impl YggtermServer {
             .map(str::to_string)
         {
             self.seat_new_live_session(&existing_key);
-            self.active_session_path = Some(existing_key.clone());
+            self.set_active_session_path(
+                Some(existing_key.clone()),
+                ActivationOrigin::internal("open_local_cc_session_existing"),
+            );
             self.active_view_mode = WorkspaceViewMode::Terminal;
             return Some(existing_key);
         }
@@ -9146,7 +9428,10 @@ impl YggtermServer {
         apply_birth_keep_alive(&mut session);
         self.sessions.insert(live_key.clone(), session);
         self.seat_new_live_session(&live_key);
-        self.active_session_path = Some(live_key.clone());
+        self.set_active_session_path(
+            Some(live_key.clone()),
+            ActivationOrigin::internal("open_local_cc_session_new"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Some(live_key)
     }
@@ -9257,7 +9542,10 @@ impl YggtermServer {
         if !self.live_session_order.iter().any(|p| p == &session_path) {
             self.seat_new_live_session(&session_path);
         }
-        self.active_session_path = Some(session_path.clone());
+        self.set_active_session_path(
+            Some(session_path.clone()),
+            ActivationOrigin::internal("open_remote_cc_session"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Ok(session_path)
     }
@@ -9381,7 +9669,10 @@ impl YggtermServer {
                 "Daemon PTY: request main viewport terminal stream".to_string(),
             ];
         }
-        self.request_terminal_launch_for_path(&key);
+        self.request_terminal_launch_for_path(
+            &key,
+            ActivationOrigin::launch("ensure_shell_runtime_session_launch"),
+        );
         key
     }
 
@@ -9635,7 +9926,10 @@ impl YggtermServer {
                 "Transport bridge: stdio attach to daemon PTY".to_string(),
             ];
         }
-        self.active_session_path = Some(key.clone());
+        self.set_active_session_path(
+            Some(key.clone()),
+            ActivationOrigin::internal("ensure_remote_runtime_agent_session"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Ok(key)
     }
@@ -9691,7 +9985,10 @@ impl YggtermServer {
             self.live_session_order
                 .retain(|existing| existing != &legacy_local_key);
             if self.active_session_path.as_deref() == Some(legacy_local_key.as_str()) {
-                self.active_session_path = Some(key.clone());
+                self.set_active_session_path(
+                    Some(key.clone()),
+                    ActivationOrigin::launch("start_remote_runtime_agent_session_existing"),
+                );
             }
         }
         let target = local_session_target(kind, cwd);
@@ -9820,7 +10117,10 @@ impl YggtermServer {
                 "Transport bridge: stdio attach to daemon PTY".to_string(),
             ];
         }
-        self.active_session_path = Some(key.clone());
+        self.set_active_session_path(
+            Some(key.clone()),
+            ActivationOrigin::launch("start_remote_runtime_agent_session_new"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Ok(key)
     }
@@ -9891,7 +10191,10 @@ impl YggtermServer {
             }
             upsert_session_metadata(&mut session.metadata, "Runtime Session", key.clone());
         }
-        self.active_session_path = Some(key.clone());
+        self.set_active_session_path(
+            Some(key.clone()),
+            ActivationOrigin::internal("ensure_shell_runtime_session"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Ok(key)
     }
@@ -10481,7 +10784,10 @@ impl YggtermServer {
             .map(str::to_string)
         {
             self.seat_new_live_session(&existing_key);
-            self.active_session_path = Some(existing_key.clone());
+            self.set_active_session_path(
+                Some(existing_key.clone()),
+                ActivationOrigin::internal("focus_or_create_live_runtime_existing"),
+            );
             self.active_view_mode = WorkspaceViewMode::Terminal;
             return Some(existing_key);
         }
@@ -10567,7 +10873,10 @@ impl YggtermServer {
 
         self.sessions.insert(key.clone(), live);
         self.seat_new_live_session(&key);
-        self.active_session_path = Some(key.clone());
+        self.set_active_session_path(
+            Some(key.clone()),
+            ActivationOrigin::launch("focus_or_create_live_runtime_new"),
+        );
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Some(key)
     }
@@ -11297,7 +11606,10 @@ impl YggtermServer {
         // re-imposed the new session on the very next snapshot. A viewport
         // decision has to be made where the viewport state lives.
         if launch_now && activate {
-            self.active_session_path = Some(key.to_string());
+            self.set_active_session_path(
+                Some(key.to_string()),
+                ActivationOrigin::launch("insert_live_session_with_launch_options"),
+            );
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
         }
@@ -11326,7 +11638,11 @@ impl YggtermServer {
         if self.resolve_session_storage_key(&active_path).is_some() {
             return;
         }
-        self.active_session_path = self.first_available_live_session_path();
+        let fallback = self.first_available_live_session_path();
+        self.set_active_session_path(
+            fallback,
+            ActivationOrigin::recovery("repair_active_path_after_live_session_change"),
+        );
     }
 
     pub(crate) fn resolve_live_session_entry(
@@ -11638,7 +11954,10 @@ impl YggtermServer {
                     remote_deploy_state,
                 );
             }
-            self.focus_live_session(&existing_key);
+            self.focus_live_session(
+                &existing_key,
+                ActivationOrigin::internal("focus_or_create_live_runtime_focus_existing"),
+            );
             return Ok((Some(existing_key), true));
         }
 
@@ -31688,7 +32007,150 @@ mod tests {
              other key silently finds no owner and falls through to CREATE"
         );
     }
+    use super::ActivationOrigin;
+    use super::ActivationOriginKind;
     use super::PreviewBlockKind;
+
+    /// ⛔⛔ THE PROPERTY THAT MAKES THE ORIGIN WORTH ANYTHING: there is exactly
+    /// ONE writer for the active row.
+    ///
+    /// The mount-churn entry cannot say whether the active session changes on
+    /// its own, and the reason is not that nobody looked — it is that a person
+    /// clicking and the app switching produce the same trace. An origin
+    /// recorded at the call sites somebody remembered would replace that with
+    /// something worse: an unexplained switch and an uninstrumented one would
+    /// look identical, and a reader would have no way to tell "the app did this
+    /// by itself" from "we forgot to say". A second assignment anywhere in this
+    /// file re-opens that hole silently, so the file is scanned for one.
+    ///
+    /// ⚠ A SOURCE scan and not a behavioural one, deliberately: the defect is
+    /// the EXISTENCE of a second write path, and a behavioural test can only
+    /// ever cover the paths its author already thought of — which is the same
+    /// blind spot restated.
+    #[test]
+    fn the_active_session_path_has_exactly_one_writer() {
+        let source = include_str!("lib.rs");
+        let assignments: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("self.active_session_path ="))
+            .collect();
+        assert_eq!(
+            assignments.len(),
+            1,
+            "`active_session_path` must be assigned in exactly one place \
+             (`set_active_session_path`); found {}: {assignments:?}. A second \
+             assignment is a switch that reaches the screen without reaching \
+             the trace, and it is indistinguishable from a switch nobody made.",
+            assignments.len()
+        );
+        // And that one assignment must be inside the funnel, not somewhere the
+        // scan happens to tolerate.
+        let funnel = source
+            .split_once("fn set_active_session_path(")
+            .expect("the funnel must exist")
+            .1;
+        assert!(
+            funnel
+                .split_once("\n    fn ")
+                .map(|(body, _)| body)
+                .unwrap_or(funnel)
+                .contains("self.active_session_path = next;"),
+            "the one assignment must be the funnel's own"
+        );
+    }
+
+    /// A switch is recorded; naming the row that is already active is not.
+    ///
+    /// ⚠ Both halves matter. Without the first the instrument is silent about
+    /// the thing it was built for. Without the second it would spend a record
+    /// per redundant re-activation — and `request_terminal_launch_for_active`
+    /// alone fired 13 times in 1.3 minutes on the GUI host, restating that
+    /// nothing moved, on a plane whose retention is a byte budget.
+    #[test]
+    fn a_redundant_activation_is_counted_and_a_real_one_is_recorded() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://one",
+            None,
+            None,
+            None,
+            None,
+            ActivationOrigin::user_gesture("test_click_one"),
+        );
+        assert_eq!(server.active_session_path(), Some("local://one"));
+        assert_eq!(
+            server.redundant_activations_for_test().values().sum::<u32>(),
+            0,
+            "the first activation of a row is a switch, not a repeat"
+        );
+        // The same row again, from a different origin: no switch happened, and
+        // the trace must not claim one.
+        server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://one",
+            None,
+            None,
+            None,
+            None,
+            ActivationOrigin::app_control("test_reopen_same"),
+        );
+        assert_eq!(
+            server
+                .redundant_activations_for_test()
+                .get("app_control")
+                .copied(),
+            Some(1),
+            "re-activating the row already active is counted, never recorded as a switch"
+        );
+        // A real switch clears the tally, because the counts describe the
+        // interval since the previous switch and nothing longer.
+        server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://two",
+            None,
+            None,
+            None,
+            None,
+            ActivationOrigin::user_gesture("test_click_two"),
+        );
+        assert_eq!(server.active_session_path(), Some("local://two"));
+        assert!(
+            server.redundant_activations_for_test().is_empty(),
+            "the tally is carried on the switch record and then reset"
+        );
+    }
+
+    /// ⛔ The vocabulary is fixed and it is what a reader filters on. A renamed
+    /// variant silently empties every query written against the old word —
+    /// including the one question this whole change exists to answer.
+    #[test]
+    fn the_origin_words_are_stable_and_only_a_gesture_is_a_gesture() {
+        for (kind, word) in [
+            (ActivationOriginKind::UserGesture, "user_gesture"),
+            (ActivationOriginKind::AppControl, "app_control"),
+            (ActivationOriginKind::History, "history"),
+            (ActivationOriginKind::Launch, "launch"),
+            (ActivationOriginKind::Restore, "restore"),
+            (ActivationOriginKind::Recovery, "recovery"),
+            (ActivationOriginKind::Internal, "internal"),
+        ] {
+            assert_eq!(kind.as_str(), word);
+        }
+        assert!(ActivationOrigin::user_gesture("x").is_user_gesture());
+        // ⚠ An orchestrator opening a row while somebody reads is the SYMPTOM,
+        // not the control. Counting app-control as a gesture would answer the
+        // entry's question with the wrong sign.
+        assert!(!ActivationOrigin::app_control("x").is_user_gesture());
+        assert!(!ActivationOrigin::recovery("x").is_user_gesture());
+        assert!(!ActivationOrigin::internal("x").is_user_gesture());
+    }
+
     use super::app_control_open_path_ready;
     use super::canonicalize_remote_machine_alias;
     use super::{parse_remote_agent_session_path, remote_scanned_row_path};
@@ -35967,6 +36429,7 @@ mod tests {
             Some("/home/user"),
             Some("Stored Codex"),
             None,
+            ActivationOrigin::internal("test"),
         );
         server.active_view_mode = WorkspaceViewMode::Terminal;
 
@@ -38961,7 +39424,7 @@ terminal_window_id: None,
             .clone();
 
         assert_eq!(session_path, key);
-        server.focus_live_session(&session_path);
+        server.focus_live_session(&session_path, ActivationOrigin::internal("test"));
 
         assert_eq!(server.active_session_path(), Some(key.as_str()));
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Terminal);
@@ -38987,7 +39450,7 @@ terminal_window_id: None,
         let manual_order = vec![second.clone(), first.clone(), third.clone()];
         assert!(server.replace_live_session_order(&manual_order).changed);
 
-        server.focus_live_session(&first);
+        server.focus_live_session(&first, ActivationOrigin::internal("test"));
 
         assert_eq!(server.active_session_path(), Some(first.as_str()));
         assert_eq!(
@@ -39687,7 +40150,7 @@ terminal_window_id: None,
             Some(SessionSource::Stored)
         );
 
-        server.request_terminal_launch_for_path(&session_path);
+        server.request_terminal_launch_for_path(&session_path, ActivationOrigin::internal("test"));
 
         let session = server.sessions.get(&session_path).expect("session");
         assert_eq!(session.source, SessionSource::LiveSsh);
@@ -40263,6 +40726,7 @@ terminal_window_id: None,
             Some("/home/user"),
             Some("Test Session"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         let payload = RemotePreviewPayload {
@@ -40338,6 +40802,7 @@ terminal_window_id: None,
             Some("/home/user"),
             Some("User Chosen Title"),
             None,
+            ActivationOrigin::internal("test"),
         );
         server.open_or_focus_session(
             SessionKind::Codex,
@@ -40346,6 +40811,7 @@ terminal_window_id: None,
             Some("/home/user"),
             Some("Preview Hydration Title"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         let session = server.sessions.get_mut(path).expect("session");
@@ -40382,6 +40848,7 @@ terminal_window_id: None,
             Some("/home/user"),
             Some("Install Yggterm Works"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         assert!(apply_remote_preview_payload_for_path(
@@ -40738,6 +41205,7 @@ terminal_window_id: None,
             Some("/home/user/gh/yggterm"),
             Some("Launch integrated yggterm campaign session"),
             None,
+            ActivationOrigin::internal("test"),
         );
         assert_eq!(
             next.sessions.get(&path).expect("restored row").title,
@@ -41093,6 +41561,7 @@ terminal_window_id: None,
             Some("/home/user"),
             Some("Terminal"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         assert!(server.set_session_title_hint_passive(path, "Useful Session Title"));
@@ -41117,6 +41586,7 @@ terminal_window_id: None,
             Some("/home/user"),
             Some("Test Scaffold"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         let payload = RemotePreviewPayload {
@@ -41184,6 +41654,7 @@ terminal_window_id: None,
             Some("/home/user"),
             Some("Test Rendered Sections"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         let payload = RemotePreviewPayload {
@@ -42519,7 +42990,7 @@ terminal_window_id: None,
         server
             .set_live_session_keep_alive(&kept_codex, true)
             .expect("mark codex keep-alive");
-        server.focus_live_session(&unkept_shell);
+        server.focus_live_session(&unkept_shell, ActivationOrigin::internal("test"));
         assert_eq!(server.active_session_path(), Some(unkept_shell.as_str()));
 
         let persisted = server.persisted_state();
@@ -42536,7 +43007,7 @@ terminal_window_id: None,
         server
             .set_live_session_keep_alive(&kept_codex, false)
             .expect("clear codex keep-alive");
-        server.focus_live_session(&unkept_shell);
+        server.focus_live_session(&unkept_shell, ActivationOrigin::internal("test"));
         let persisted = server.persisted_state();
         // Both rows still ride the routine persist: the codex as a local agent
         // and the shell as a first-class plain shell. The active pointer stays
@@ -42571,7 +43042,7 @@ terminal_window_id: None,
         server
             .set_live_session_keep_alive(&kept_codex, true)
             .expect("mark codex keep-alive");
-        server.focus_live_session(&unkept_shell);
+        server.focus_live_session(&unkept_shell, ActivationOrigin::internal("test"));
 
         let persisted = server.persisted_state_for_update_restart();
         assert_eq!(
@@ -42962,6 +43433,7 @@ terminal_window_id: None,
             Some("/tmp"),
             None,
             None,
+            ActivationOrigin::internal("test"),
         );
         let session = server.sessions.get(&key).expect("open births the row");
         assert!(
@@ -42997,6 +43469,7 @@ terminal_window_id: None,
             Some("/tmp"),
             None,
             None,
+            ActivationOrigin::internal("test"),
         );
         let session = server.sessions.get(&unkept).expect("row still present");
         assert!(
@@ -43707,6 +44180,7 @@ terminal_window_id: None,
             Some("/tmp/work"),
             Some("Stored Codex"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         assert!(server.live_sessions().is_empty());
@@ -43716,7 +44190,7 @@ terminal_window_id: None,
             Some(SessionSource::Stored)
         );
 
-        server.request_terminal_launch_for_path(path);
+        server.request_terminal_launch_for_path(path, ActivationOrigin::internal("test"));
 
         let live_sessions = server.live_sessions();
         assert_eq!(live_sessions.len(), 1);
@@ -43939,7 +44413,7 @@ terminal_window_id: None,
             title_is_explicit: false,
             outline_prefix: None,
         });
-        server.request_terminal_launch_for_path(runtime_key);
+        server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Terminal);
         assert!(server.apply_codex_runtime_identity_to_live_session(
@@ -44033,7 +44507,7 @@ terminal_window_id: None,
             title_is_explicit: false,
             outline_prefix: None,
         });
-        server.request_terminal_launch_for_path(&runtime_key);
+        server.request_terminal_launch_for_path(&runtime_key, ActivationOrigin::internal("test"));
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
             &runtime_key,
@@ -44430,7 +44904,7 @@ terminal_window_id: None,
             title_is_explicit: false,
             outline_prefix: None,
         });
-        server.request_terminal_launch_for_path(runtime_key);
+        server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert!(
             server.record_launch_death_for_path(runtime_key, "provisioner: command not found"),
@@ -44495,7 +44969,7 @@ terminal_window_id: None,
             title_is_explicit: false,
             outline_prefix: None,
         });
-        server.request_terminal_launch_for_path(runtime_key);
+        server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert!(
             server.apply_agent_runtime_session_id_to_live_session(runtime_key, minted),
@@ -44577,7 +45051,7 @@ terminal_window_id: None,
             title_is_explicit: false,
             outline_prefix: None,
         });
-        server.request_terminal_launch_for_path(runtime_key);
+        server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
             runtime_key,
@@ -45169,6 +45643,7 @@ terminal_window_id: None,
             Some("/tmp/work"),
             Some("Deferred"),
             None,
+            ActivationOrigin::internal("test"),
         );
 
         let after = server.sessions.get(&path).expect("after");
@@ -45877,7 +46352,7 @@ terminal_window_id: None,
                 .contains("resume-codex abc123 --require-existing")
         );
 
-        server.request_terminal_launch_for_path(&runtime_key);
+        server.request_terminal_launch_for_path(&runtime_key, ActivationOrigin::internal("test"));
         let (launch_command, cwd) = server.terminal_spec(&runtime_key).expect("terminal spec");
         assert_eq!(cwd.as_deref(), Some("/srv/app"));
         assert!(
@@ -45944,7 +46419,7 @@ terminal_window_id: None,
             session.launch_command
         );
 
-        server.request_terminal_launch_for_path(&runtime_key);
+        server.request_terminal_launch_for_path(&runtime_key, ActivationOrigin::internal("test"));
         let (launch_command, cwd) = server.terminal_spec(&runtime_key).expect("terminal spec");
         assert_eq!(cwd.as_deref(), Some("/srv/app"));
         assert!(

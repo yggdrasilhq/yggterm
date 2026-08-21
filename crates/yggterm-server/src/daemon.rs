@@ -6,7 +6,8 @@ use crate::hot_restart_repair;
 use crate::lock_holder_trace;
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
-    ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity, GhosttyHostSupport,
+    ActivationOrigin, ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity,
+    GhosttyHostSupport,
     ManagedSessionView, PersistedDaemonState,
     PersistedLiveSession, PersistedStoredSession, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SessionSource, SnapshotSessionView,
@@ -8116,7 +8117,10 @@ impl DaemonRuntime {
                 "request_terminal_launch",
             );
             if seed_remote_snapshot {
-                self.server.request_terminal_launch_for_path(path);
+                self.server.request_terminal_launch_for_path(
+                    path,
+                    ActivationOrigin::app_control("attach_seed_remote_snapshot"),
+                );
             } else {
                 self.server
                     .request_terminal_launch_for_path_preserving_active(path);
@@ -9662,6 +9666,7 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                     document.as_ref(),
+                    ActivationOrigin::app_control("request_open_session"),
                 );
                 let mut opened_in_terminal = false;
                 match view_mode.unwrap_or(WorkspaceViewMode::Rendered) {
@@ -10544,7 +10549,10 @@ impl DaemonRuntime {
                 ServerResponse::Ack { message: Some(key) }
             }
             ServerRequest::FocusLive { key, view_mode } => {
-                self.server.focus_live_session(&key);
+                self.server.focus_live_session(
+                    &key,
+                    ActivationOrigin::app_control("request_focus_live"),
+                );
                 let mut focused_in_terminal = false;
                 if let Some(mode) = view_mode {
                     if mode == WorkspaceViewMode::Terminal
@@ -10612,7 +10620,10 @@ impl DaemonRuntime {
                 self.snapshot_response(Some("requested terminal".to_string()))
             }
             ServerRequest::RequestTerminalLaunchForPath { path } => {
-                self.server.request_terminal_launch_for_path(&path);
+                self.server.request_terminal_launch_for_path(
+                    &path,
+                    ActivationOrigin::app_control("request_terminal_launch_for_path"),
+                );
                 self.ensure_terminal_for_active()?;
                 self.server.set_view_mode(WorkspaceViewMode::Terminal);
                 self.persist()?;
