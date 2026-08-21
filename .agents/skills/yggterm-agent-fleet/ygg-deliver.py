@@ -15,7 +15,12 @@ WRITE; only the transcript says the row read it, and it lags the submit by ~15 s
 
 USAGE
     ygg-deliver.py <row-uri-or-uuid> --message <file> [--ack TOKEN]
-                   [--wait-min 30] [--host <gui-host>]
+                   [--wait-min 30] [--host <gui-host>|local]
+
+⭐ **IT CAN BE AIMED AT A SANDBOX**, which for most of its life it could not —
+`YGGTERM_HOME=$SB YGG_HEADLESS_BIN=$SB/bin/yggterm-headless ygg-deliver.py …`
+drives an isolated row plane on this machine, no ssh and nobody's desktop. See
+`ygg_appctl`, which owns that question for every fleet verb.
 
 ⚠ **A LONG WAIT CAN OUTLIVE THE MESSAGE.** Measured 2026-08-21: a correction was
 armed for a working lane, waited the full 30 minutes, and by the time the wait
@@ -33,8 +38,8 @@ import argparse, glob, json, os, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from ygg_rowarg import row_host, row_session_id  # noqa: E402
+import ygg_appctl  # noqa: E402
 import ygg_transcript  # noqa: E402
-YGG = "~/.local/bin/yggterm-headless"
 POLL_S = 20
 
 
@@ -42,25 +47,21 @@ def log(m):
     print(f"{time.strftime('%H:%M:%S')} ygg-deliver {m}", file=sys.stderr)
 
 
-def gui_host():
-    r = subprocess.run([os.path.join(HERE, "..", "..", "..", "scripts", "ygg-live-host.sh"),
-                        "--quiet"], capture_output=True, text=True, timeout=60)
-    return (r.stdout or "").strip() or os.environ.get("YGG_GUI_HOST", "")
+def never_armed(uuid, plane=None):
+    """⛔ BOTH never-arm lists, the live plane's and the aimed one's.
 
-
-def app(host, argstr, stdin_path=None):
-    cmd = f"{YGG} server app {argstr}"
-    if stdin_path:
-        cmd += f" < {stdin_path}"
-    r = subprocess.run(["ssh", "-n", host, cmd], capture_output=True, text=True, timeout=180)
-    try:
-        return json.loads(r.stdout)
-    except Exception:
-        return {"error": (r.stderr or r.stdout or "unparseable").strip()[:200]}
-
-
-def never_armed(uuid):
-    for path in glob.glob(os.path.expanduser("~/.yggterm/relay/never-arm.tsv")):
+    The file lives in the yggterm home, so aiming this verb at a sandbox aims
+    the guard with it — and an empty sandbox list would then protect nobody.
+    That is correct for sandbox rows and catastrophic if the aim is ever wrong,
+    so the two lists are UNIONED: refusing too much costs a rerun, refusing too
+    little types over somebody's half-written turn.
+    """
+    paths = {os.path.expanduser("~/.yggterm/relay/never-arm.tsv")}
+    if plane is not None:
+        paths.add(os.path.join(plane.relay_dir(), "never-arm.tsv"))
+    for path in sorted(paths):
+        if not os.path.exists(path):
+            continue
         for line in open(path):
             if line.startswith("#") or not line.strip():
                 continue
@@ -69,8 +70,8 @@ def never_armed(uuid):
     return None
 
 
-def find_row(host, target):
-    rows = (app(host, "rows --json").get("data") or {}).get("rows") or []
+def find_row(plane, target):
+    rows = (plane.app_json("rows --json").get("data") or {}).get("rows") or []
     for r in rows:
         if target in (r.get("full_path") or ""):
             return r
@@ -168,12 +169,19 @@ def main():
     src.add_argument("--text", help="the message itself, inline")
     ap.add_argument("--ack", help="token to grep the transcript for; default: first word of line 1")
     ap.add_argument("--wait-min", type=float, default=30.0)
-    ap.add_argument("--host")
+    ap.add_argument("--host", help="the machine whose GUI answers; `local` for this "
+                                   "one (a sandbox). The HOME and the binary come from "
+                                   "$YGGTERM_HOME and $YGG_HEADLESS_BIN — see ygg_appctl.")
     a = ap.parse_args()
 
-    host = a.host or gui_host()
-    if not host:
-        log("⛔ no GUI host")
+    # ⛔ THE PLANE, NAMED OUT LOUD. Which machine answers, which YGGTERM_HOME it
+    #    answers about, and which binary asks — all three, because for the whole
+    #    life of this verb only the first was movable and every defect in it had
+    #    to be found on somebody's live desktop as a result.
+    plane = ygg_appctl.resolve(a.host)
+    if plane is None:
+        log("⛔ no row plane — app control did not answer anywhere. Nothing below "
+            "may be read as evidence about a row.")
         return 2
     if a.text is not None:
         body = a.text
@@ -186,7 +194,7 @@ def main():
     first = body.splitlines()[0].strip() if body.strip() else ""
     ack = a.ack or (first.split()[0] if first else "")
 
-    row = find_row(host, a.target)
+    row = find_row(plane, a.target)
     if not row:
         log(f"⛔ no row matches {a.target}")
         return 3
@@ -204,9 +212,9 @@ def main():
     # ⛔ WHICH MACHINE holds this row's work. A transcript check that asks the
     #    local filesystem about a row on another host reads "no transcript" and
     #    the reap destroys it — measured across 34 such rows on 2026-08-22.
-    row_machine = row_host(row, host)
+    row_machine = row_host(row, plane.host)
 
-    why = never_armed(uuid)
+    why = never_armed(uuid, plane)
     if why:
         log(f"⛔ REFUSED: {uuid[:8]} is on never-arm.tsv — {why}")
         return 4
@@ -226,11 +234,11 @@ def main():
     #   aimed well.
     deadline = time.time() + a.wait_min * 60
     while True:
-        row = find_row(host, uuid) or row
+        row = find_row(plane, uuid) or row
         if row.get("busy"):
             why = f"busy ({row.get('busy_reason')})"
         else:
-            v = app(host, f"terminal input-check '{uri}' --check-timeout-ms 20000")
+            v = plane.app_json(f"terminal input-check '{uri}' --check-timeout-ms 20000")
             if (v.get("data") or {}).get("consuming_input"):
                 break
             why = "not consuming input yet (still starting up?)"
@@ -248,12 +256,14 @@ def main():
     local = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
     local.write(body)
     local.close()
-    remote = f"/tmp/ygg-deliver-{uuid[:8]}.txt"
     try:
-        subprocess.run(["scp", "-q", local.name, f"{host}:{remote}"], timeout=120)
+        # ⛔ `put` IS A COPY ONLY WHEN THERE IS SOMEWHERE TO COPY TO. Aimed at
+        #    this machine it hands back the same path, so the unlink has to wait
+        #    for the submit to have read it — which is why both live in the try.
+        staged = plane.put(local.name, f"/tmp/ygg-deliver-{uuid[:8]}.txt")
+        reply = plane.app_json(f"terminal submit '{uri}' --stdin", stdin_path=staged)
     finally:
         os.unlink(local.name)
-    reply = app(host, f"terminal submit '{uri}' --stdin", stdin_path=remote)
     data = reply.get("data") or {}
     if not data.get("submitted"):
         # ⛔ NEVER RETRY. `submitted:false` means the row was mid-output, not that

@@ -65,12 +65,23 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ygg_appctl  # noqa: E402
 from ygg_host import resolve_gui_host  # noqa: E402
 from ygg_rowarg import add_row_argument, bare_uuid, resolve_row, row_session_id  # noqa: E402
 import ygg_transcript  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-STATE = Path.home() / ".yggterm" / "relay"
+#: ⛔ THE PLANE EVERY APP-CONTROL CALL HERE IS AIMED AT — machine, YGGTERM_HOME
+#: and binary. `main()` replaces it with the resolved one. Until this existed the
+#: binary was a literal in `ygg()` and the home was whatever the far end
+#: resolved, so this watchdog could only ever be rehearsed against live rows.
+PLANE = ygg_appctl.Plane(None, os.environ.get(ygg_appctl.ENV_BIN) or ygg_appctl.DEFAULT_BIN,
+                         os.environ.get(ygg_appctl.ENV_HOME) or None)
+
+#: The subscription store lives IN the yggterm home — `~/.yggterm/relay` was
+#: always this expression with the home left at its default. Saying so keeps a
+#: sandbox rehearsal's subscriptions out of the live plane's watch list.
+STATE = Path(PLANE.relay_dir())
 SUBS = STATE / "monitor"
 LOGPATH = STATE / "monitor.log"
 
@@ -148,12 +159,23 @@ UNREACHABLE = {"__unreachable__": True}
 
 
 def ygg(host, *args):
-    if not host:
+    """One app-control call, on the aimed plane, at the named machine.
+
+    ⛔ `host` is a MACHINE and `PLANE` is the aim — which binary asks and which
+    `YGGTERM_HOME` it asks about. They used to be one thing, welded: the binary
+    was a literal here and the home was whatever the far end happened to
+    resolve, so `--host` moved the machine and nothing moved the home.
+
+    ⚠ A falsy `host` still means UNREACHABLE rather than "run it here". That is
+    deliberate and it is this file's oldest safety rule: an unresolved GUI host
+    once had three supervisors reporting live rows as GONE. A LOCAL plane is
+    reached by resolving to one, never by failing to name a host.
+    """
+    if not host and not PLANE.local:
         return dict(UNREACHABLE)
-    cmd = ["ssh", "-n", host, "~/.local/bin/yggterm-headless " + " ".join(
-        f"'{a}'" if " " in str(a) else str(a) for a in args)]
+    argstr = " ".join(f"'{a}'" if " " in str(a) else str(a) for a in args)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        r = PLANE.at(host).run(argstr, timeout=90)
         out = r.stdout
         if "{" not in out:
             return dict(UNREACHABLE)
@@ -643,9 +665,11 @@ def escalate(host, sub, row, why, dry):
                 f"assume it is finished.")
         ygg(host, "server", "app", "terminal", "send", target, "--data", note)
         time.sleep(0.2)
-        subprocess.run(["ssh", host,
-                        f"~/.local/bin/yggterm-headless server app terminal send '{target}' --data $'\\r'"],
-                       capture_output=True, text=True, timeout=60)
+        # ⛔ THE ENTER KEY IS A SEPARATE WRITE OF `\r`, and it must go to the same
+        #    plane as the text did — a shell form is used only because `$'\r'` is
+        #    a shell quoting construct.
+        PLANE.at(host).run_shell(
+            PLANE.shell(f"server app terminal send '{target}' --data $'\\r'"), timeout=60)
         log(f"  escalated to orchestrator {to[:8]}")
     else:
         extra = (f". Its orchestrator {orphaned[:8]} is GONE — this row is unsupervised "
@@ -1585,7 +1609,7 @@ def fishy_audit(subs, dry):
         to = _bare_uuid(s.get("escalate_to") or "")
         if to:
             if live_row_set is None:
-                _rows, _ok = live_rows(resolve_gui_host())
+                _rows, _ok = live_rows(PLANE.host or resolve_gui_host())
                 # ⛔ Blind means blind. An unanswered row plane must not be
                 # allowed to say a live escalation target is dead — that would
                 # send the orchestrator to repoint a subscription that is fine.
@@ -1789,7 +1813,16 @@ def tick(a):
     bs = _babysit()
     # ⛔ Resolve ONCE, out loud. An unresolved host is not a quiet default —
     # it is a blind tick, and every verb below must know that before it runs.
-    a.gui_host = resolve_gui_host(a.gui_host)
+    # ⛔ AND THE AIM, NOT ONLY THE MACHINE. `resolve` states all three — host,
+    #    home, binary — so a tick against a sandbox is a rehearsal of THIS code
+    #    rather than of a copy of it.
+    global PLANE
+    plane = ygg_appctl.resolve(a.gui_host)
+    if plane is None:
+        log("⛔ no row plane — this tick is BLIND; nothing below is evidence about a row.")
+        return 2
+    PLANE = plane
+    a.gui_host = plane.host
     # ⛔⛔ REPAIR THE POINTERS HERE, BECAUSE THE TOOL FIX CANNOT REACH WHERE THEY
     # ARE MADE. A short `escalate_to` is produced in PROSE — an orchestrator
     # quotes eight characters into a brief because eight is what the board prints
