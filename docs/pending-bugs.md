@@ -537,21 +537,59 @@ second resume, which would corrupt the transcript. Waiting 24s so far.
 
 ⇒ **That is the deadlock, and (a) is what supplies it with victims.**
 
-⚠ **What is MEASURED and what is only INFERRED, kept apart on purpose.** Measured: the daemon is
-live, holds its masters, is bound to the inode that carried its versioned name, and that name is
-now a symlink to the newest daemon — so nothing can dial it. Also measured, by reading:
-`refresh_legacy_server_socket_aliases` runs `probe_socket_occupancy` before unlinking a real
-socket file, but its `versioned_socket_candidate_is_symlink` branch re-points a name with **no
-probe at all** — so once a name has become a symlink the daemon behind it can never reclaim it,
-even alive and answering.
+#### ⭐ SETTLED 2026-08-22, against the live instance — and the answer is NOT "the guard is missing"
 
-⛔ **NOT established: which path took the name the FIRST time.** The symlink branch perpetuates
-the loss; it is not proof of the theft, because a symlink is no longer anyone's bound socket by
-the time it is seen. The candidates are the non-symlink path (a probe that read
-`StructurallyAbsent` for a daemon that was merely slow — but that probe is exactly what
-`only_a_structurally_absent_socket_may_have_its_name_taken` guards), and a rename that happened
-before that guard shipped. **Whoever takes this half must settle that before building on it** —
-repeating an unmeasured root is how a lane spends itself on the wrong function.
+*An earlier revision of this section guessed that `refresh_legacy_server_socket_aliases` skips its
+occupancy probe on the symlink branch and that this is the theft. **That guess is wrong**, and it
+would have sent a lane at the wrong function. Dated instead:*
+
+| fact | when |
+|---|---|
+| the stranded daemon started, and bound its own versioned name | **2026-08-20 20:50:34** |
+| `probe_socket_occupancy` landed (`only_a_structurally_absent_socket_may_have_its_name_taken`) | **2026-08-21 20:37:51**, shipped in 3.1.30 |
+
+⇒ **A ~24-hour window in which the daemon was live and bound and every daemon that started simply
+unlinked-and-symlinked with no occupancy check at all.** The name was taken *before the guard
+existed*. The guard is correct and it works; it arrived a day too late for this daemon.
+
+⛔⛔ **THE REAL DEFECT IS THAT THERE IS NO WAY BACK.** A live daemon whose name has become a
+symlink can never reclaim it: the symlink branch re-points it on every new daemon (**measured:
+re-pointed at 01:48:07 to `server-3-1-39.sock`, 29 h into the stranded daemon's life**), and
+nothing anywhere ever asks *"is a live daemon still bound to the inode this name used to name?"*
+⇒ **The guard prevents new losses. What is missing is REPAIR.**
+
+**The live instance, proven with a sanctioned read-only verb:**
+
+```text
+$ yggterm-headless server status --endpoint <home>/server-<stranded-version>.sock
+  answered_for: {"server_pid": <newest>, "server_version": <newest>}   owned sessions: 0
+```
+
+⇒ **The wrong daemon answers, emptily** — while the daemon actually bound to that name holds 83
+PTY masters and has been alive 29 h. That empty answer is exactly why the GUI concludes the row
+has no session and launches a fresh resume, which the wrapper then correctly refuses.
+
+#### ⛔⛔ TWO VERBS, ONE HOST, CONTRADICTORY PICTURES — and the working one is already in-tree
+
+*An earlier revision of this section said "the instrument you would reach for is blind to it".
+That over-claims: **one** verb is blind and **another already sees it**, which is a far more
+useful fact because it means the mechanism does not need inventing.*
+
+| verb | what it reports on a host running two daemons |
+|---|---|
+| `server daemons --json` | **1 daemon** — it enumerates versioned socket NAMES and dials them, and a stranded daemon has no name left to enumerate |
+| `server rows drafts` | `daemon_processes_on_host: 2`, `daemons_seen: 1`, **`daemons_running_but_never_reached: [<stranded pid>]`**, and it downgrades its own verdict to `coverage: INCOMPLETE` |
+
+⇒ **`daemon_process_pids(home)` is the mechanism that sees it** — a `/proc` scan scoped by home,
+already correct, already carrying its own `⛔ None IS "COULD NOT ASK", NEVER "THERE ARE NONE"`
+warning. It has **exactly one caller**. ⇒ **The fix for the instrument half is to teach
+`server daemons` to consult it**, not to write anything new.
+
+**`scripts/daemon-name-census.py`** adds the one thing the process scan does not: the
+name-resolution check — *is the path this daemon is bound to still resolving to this daemon?* —
+and exits non-zero when any live daemon has lost its name. ⚠ **Both belong inside
+`server daemons`; fold them in and delete the script.** Two answers to one question is what this
+repo forbids, and right now there are three.
 
 ### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 
