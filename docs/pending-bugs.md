@@ -127,7 +127,6 @@ Owner: whoever next touches the web verb surface. The record side of this is
 already solved — media probe records carry a host-stamped `(row, tab)` — so this
 is specifically about the imperative verbs.
 
-## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
 ## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
 
 **Status:** OPEN
@@ -20377,7 +20376,7 @@ renders at NORMAL intensity (`❯\u{a0}THIS_IS_AN_UNSENT_DRAFT`, no `ESC[2m`), s
 faint really is chrome and the guard is correct.
 
 
-**Status:** OPEN
+**A second report of the same question, from a different seat.**
 
 Orchestrator, 2026-08-06, after telling the owner that delegates were working
 when **3 of ~33 processes** were actually mid-turn, and being corrected by him.
