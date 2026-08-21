@@ -663,7 +663,34 @@ daemon that has it on rather than showing in today's numbers.
 title generation must be attempted ONCE, not once per eligible pass — and must be attempted
 again the moment that transcript grows.
 
-### ⚠ STILL NOT FALSIFIABLE ON 3.1.18 — generation remains env-disabled on both daemons
+### ⭐ THE FALSIFIER HAS NOW BEEN RUN, BOTH HALVES, IN AN ISOLATED DAEMON
+
+*2026-08-21, a daemon built from this commit with generation ON, its own `YGGTERM_HOME`, an
+invented one-session corpus and an unreachable LLM endpoint so every generation fails — the
+arrangement no fleet daemon provides and the reason this sat unfalsifiable for two passes.*
+
+| what happened | generations |
+|---|---|
+| session appears, transcript static, chore ticks | **1** |
+| daemon killed and restarted, same static transcript, 2 more ticks | **0** |
+| one line appended to the transcript | **1**, on the very next scan |
+| 3 further ticks, transcript static again | **0** |
+
+⇒ Both halves hold, and the middle row is the stronger one: the ledger is in the store, not in
+process memory, so a restart does not hand a failed generation a fresh budget. Before this fix
+that same unchanged session re-paid a ~9.3s call on every eligible pass, forever.
+
+⚠ **The failing endpoint is the point, not a shortcut.** The defect only appears when generation
+FAILS — a success writes a real title and closes the gate by itself. Pointing the sandbox at an
+unreachable endpoint reproduces the exact condition and costs no tokens, where enabling
+generation against the real endpoint would have been both expensive and unable to show the bug.
+
+⛔ **A sandbox daemon is not free.** A fresh home has no managed-CLI sweep marker, so it reads as
+a never-swept machine and starts a full CLI install fan-out five minutes in — 1.6 GB before the
+measurement had even finished. Seed the marker. Recipe and the attribution mistake that nearly
+went into it: `docs/agent-field-guide.md` §"Prove a daemon gate in a sandbox home".
+
+### ⚠ NOT FALSIFIABLE ON THE FLEET ITSELF — generation remains env-disabled on both daemons
 
 Checked live 2026-08-21 on a build verified to contain the fix. `copy_generation/summary` shows
 7 spans in 2h (p50 10,027ms) and no title spans, consistent with generation being off in the
@@ -735,8 +762,27 @@ while `render/web_content` (16.6% of a core sustained) and `daemon_request/snaps
 10,081ms of lock-holding, 121 times in 2h) are the actual burn. Recorded so the next reader does
 not re-derive this.
 
+### ⭐ THE MEMO HAS NOW BEEN WATCHED HITTING, AND THE EARLIER ALL-MISS READING IS EXPLAINED
+
+*Observed 2026-08-21 in an isolated daemon on an invented one-session corpus, with generation
+enabled — the arrangement production never provides.*
+
+| scan | memo |
+|---|---|
+| first scan of the corpus in this process | `hits 0, misses 1` — correct, the memo starts empty |
+| second scan, corpus unchanged | **`hits 1, misses 0`** |
+| next scan, after one line was appended | `hits 0, misses 1`, row rebuilt |
+
+So the memo does work, and the live run that reported `hits: 0` everywhere was not measuring a
+broken memo. Two separate causes were stacked on it: in production no process ever reaches a
+second scan (already recorded above), and in the first isolated run a generation attempt landed
+between every pair of scans — **a title-store write drops the whole memo by design**, which the
+code says out loud and which is easy to misread as the memo failing. ⇒ **A memo whose
+invalidation is deliberate and wholesale cannot be judged by its hit rate alone; check what
+wrote to the store between the two scans first.**
+
 **What remains open:** only the cross-process half, and only if the corpus or the startup rate
-grows enough to matter. The in-process defect is fixed and unit-tested.
+grows enough to matter. The in-process defect is fixed, unit-tested, and now observed working.
 
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
