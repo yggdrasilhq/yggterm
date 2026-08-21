@@ -1279,6 +1279,15 @@ fn ThemeEditorOverlay(
     let brightness_percent = (snapshot.theme_editor_draft.brightness * 100.0).round() as i32;
     let accent = snapshot.theme_accent.clone();
     let preview_has_stops = !snapshot.theme_editor_draft.colors.is_empty();
+    // The stop positions the pad hit-tests a press against. Snapshotted here
+    // rather than read from the DOM, so the grab and the paint are answering
+    // from the same values in the same render.
+    let pad_stop_positions: Vec<(f32, f32)> = snapshot
+        .theme_editor_draft
+        .colors
+        .iter()
+        .map(|stop| (stop.x, stop.y))
+        .collect();
     let overlay_wash = match snapshot.settings.theme {
         UiTheme::ZedLight => "rgba(228,237,245,0.03)",
         UiTheme::ZedDark => "rgba(10,14,18,0.05)",
@@ -1401,6 +1410,22 @@ fn ThemeEditorOverlay(
                             // and a stop could only ever be eyeballed onto it.
                             // Holding Alt suspends the magnetism for the placement
                             // that genuinely wants to sit between two lines.
+                            onmousedown: move |evt| {
+                                // The handles are inert, so the grab is resolved HERE, in the pad's
+                                // own coordinates — the space every other pointer handler on this
+                                // element already speaks. A press within a handle's radius grabs
+                                // that stop; anywhere else is a press on bare pad and starts
+                                // nothing, exactly as before.
+                                let point = evt.element_coordinates();
+                                if let Some(index) = theme_editor_stop_at(
+                                    &pad_stop_positions,
+                                    point.x,
+                                    point.y,
+                                ) {
+                                    on_pick_stop.call(index);
+                                    on_begin_drag_stop.call(index);
+                                }
+                            },
                             onmousemove: move |evt| {
                                 let point = evt.element_coordinates();
                                 let snapping = !evt.modifiers().contains(Modifiers::ALT);
@@ -1456,7 +1481,7 @@ fn ThemeEditorOverlay(
                                     // as on one just dragged.
                                     style: format!(
                                         "position:absolute; left:calc({:.2}% - 11px); top:calc({:.2}% - 11px); width:22px; height:22px; \
-                                         border-radius:999px; border:{}; background:{}; box-shadow:{};",
+                                         border-radius:999px; border:{}; background:{}; box-shadow:{}; pointer-events:{};",
                                         stop.x * 100.0,
                                         stop.y * 100.0,
                                         if snapshot.theme_editor_selected_stop == Some(index) {
@@ -1474,13 +1499,28 @@ fn ThemeEditorOverlay(
                                             )
                                         } else {
                                             "0 10px 22px rgba(42,67,88,0.16)".to_string()
-                                        }
+                                        },
+                                        // ⛔⛔ A HANDLE IS NEVER A HIT-TEST TARGET. THE PAD OWNS THE
+                                        // POINTER, AND IT IS THE ONLY THING THAT MAY.
+                                        // The pad's pointer handlers read `element_coordinates()` =
+                                        // `offsetX/offsetY`, which is relative to the event's TARGET
+                                        // rather than to the element the handler is attached to. Let a
+                                        // 22px handle be a target and the coordinate space silently
+                                        // changes meaning whenever the cursor is over one: measured
+                                        // mid-drag, a single continuous gesture reported x = 60, 73,
+                                        // then -2, 11 (over a handle), then 110, 123 — so the stop
+                                        // being dragged teleports toward the pad's origin and back.
+                                        //
+                                        // Gating this on "a drag is in flight" fixes all of it except
+                                        // the FIRST frame, because the mousedown that begins the drag
+                                        // lands on the handle and the gate cannot apply until the next
+                                        // render — leaving a one-frame teleport at the start of every
+                                        // drag, which is the same bug at 16ms. So the handles are
+                                        // inert ALWAYS and the pad begins the drag itself, by
+                                        // hit-testing its own coordinates. One owner for "where is the
+                                        // pointer on the pad", and no event that could disagree.
+                                        "none"
                                     ),
-                                    onmousedown: move |evt| {
-                                        evt.stop_propagation();
-                                        on_begin_drag_stop.call(index);
-                                    },
-                                    onclick: move |_| on_pick_stop.call(index),
                                 }
                             }
                         }
@@ -1568,11 +1608,25 @@ fn ThemeEditorOverlay(
                                 }
                             }
                         }
+                        // ⭐ THE RECOLOUR TOOLS APPEAR WITH SOMETHING TO RECOLOUR.
+                        // Both controls below drive `update_selected_theme_color`,
+                        // which RETURNS EARLY when no stop is selected — so with an
+                        // empty selection the library and the colour well were not
+                        // merely redundant, they were INERT: a swatch you can click
+                        // that silently does nothing, which is worse than a control
+                        // that is not there. Disclosing them on the selection makes
+                        // the modal say what it can do, and DESIGN.md ▸ Theming asks
+                        // for a "lightweight color library" rather than a permanent
+                        // panel of dials.
+                        if let Some(selected_index) = snapshot.theme_editor_selected_stop {
                         div {
                             style: "display:flex; flex-direction:column; gap:8px;",
                             div {
                                 style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
-                                "Color Library"
+                                // Named for its TARGET. A library headed only
+                                // "Color Library" leaves the user to infer which of
+                                // several dots a swatch is about to repaint.
+                                "Color {selected_index + 1}"
                             }
                             div {
                                 // §12.4 clause 3 — the library is one group; no
@@ -1593,17 +1647,16 @@ fn ThemeEditorOverlay(
                                 }
                             }
                         }
-                        div {
-                            style: "display:flex; flex-direction:column; gap:8px;",
+                        input {
+                            r#type: "color",
+                            value: selected_stop.as_ref().map(|stop| stop.color.clone()).unwrap_or_else(|| accent.clone()),
+                            style: "width:100%; height:42px; border:none; border-radius:12px; background:transparent;",
+                            oninput: move |evt| on_update_stop_color.call(evt.value()),
+                        }
+                        } else if preview_has_stops {
                             div {
-                                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
-                                "Selected Color"
-                            }
-                            input {
-                                r#type: "color",
-                                value: selected_stop.as_ref().map(|stop| stop.color.clone()).unwrap_or_else(|| accent.clone()),
-                                style: "width:100%; height:42px; border:none; border-radius:12px; background:transparent;",
-                                oninput: move |evt| on_update_stop_color.call(evt.value()),
+                                style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
+                                "Pick a dot on the pad to recolour it."
                             }
                         }
                         div {
@@ -1762,6 +1815,28 @@ fn snap_theme_editor_axis_px(value: f64, snapping: bool) -> f64 {
     }
     best
 }
+/// The radius, in pad pixels, within which a press grabs a stop. It is the
+/// handle's own half-width, so the target the pointer can hit is exactly the
+/// circle the eye sees — no invisible margin, and no dead ring inside the dot.
+const THEME_EDITOR_HANDLE_GRAB_PX: f64 = 11.0;
+/// Which stop a press at these PAD coordinates grabs, if any.
+///
+/// Topmost wins, matching what the eye expects of overlapping dots: the handles
+/// paint in index order, so the LAST one drawn is the one on top, and it is the
+/// one a press must take. Iterating forwards would hand the press to whichever
+/// stop happens to be underneath.
+fn theme_editor_stop_at(positions: &[(f32, f32)], x: f64, y: f64) -> Option<usize> {
+    positions
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (sx, sy))| {
+            let dx = f64::from(*sx) * THEME_EDITOR_PAD_SIZE - x;
+            let dy = f64::from(*sy) * THEME_EDITOR_PAD_SIZE - y;
+            dx * dx + dy * dy <= THEME_EDITOR_HANDLE_GRAB_PX * THEME_EDITOR_HANDLE_GRAB_PX
+        })
+        .map(|(index, _)| index)
+}
 /// The snap halo's colour: the theme accent at low alpha.
 ///
 /// ⛔ AN ALPHA SUFFIX IS NOT UNIVERSALLY APPENDABLE. `#rrggbb` takes a two-digit
@@ -1771,6 +1846,13 @@ fn snap_theme_editor_axis_px(value: f64, snapping: bool) -> f64 {
 /// `box-shadow` declaration with it and leaving the snap state invisible with
 /// nothing in the log. Only the shape that can carry alpha gets it; anything else
 /// falls back to a neutral halo that always renders.
+///
+/// Today the hex branch is the live one and the fallback is a guard rather than a
+/// path: `dominant_accent` returns either a gradient stop's colour or a fallback,
+/// and `clamp_theme_spec` puts every stop through `normalize_hex_color`, which
+/// emits `#rrggbb` (libyggterm ▸ yggui/src/theme.rs). Checked rather than assumed,
+/// because the accent crosses a crate boundary and nothing here would notice the
+/// day it stops being hex — it would simply stop drawing.
 fn theme_editor_snap_halo(accent: &str) -> String {
     let hex = accent.trim();
     if hex.len() == 7
@@ -4942,6 +5024,58 @@ fn apply_linux_window_shape_reapply_sequence(
 }
 #[cfg(not(target_os = "linux"))]
 fn apply_linux_window_shape_reapply_sequence(
+    _desktop: &dioxus::desktop::DesktopContext,
+    _radius: u8,
+    _maximized: bool,
+) {
+}
+/// Hand the window's corner to DWM on Windows 11.
+///
+/// The page's `clip-path` already rounds this window on every platform, so this
+/// is not what makes the corner appear — it is what makes the corner REAL to the
+/// system. An attribute DWM knows about gets the matching drop shadow and the
+/// snap-layout affordance on the maximize button; a corner the compositor does
+/// not know about is a shape drawn inside a square window, and the shadow stays
+/// square around it.
+///
+/// ⚠ WINDOWS 10 HAS NO SUCH ATTRIBUTE and the call fails there. That is the
+/// designed outcome, not a gap to guard with a version probe: the CSD path is
+/// what rounds the window on 10, it is already in force, and a probe would only
+/// buy us the privilege of skipping a call whose failure costs nothing. The
+/// result is discarded deliberately.
+#[cfg(target_os = "windows")]
+fn apply_windows_window_corner_preference(
+    desktop: &dioxus::desktop::DesktopContext,
+    radius: u8,
+    maximized: bool,
+) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+        DWMWCP_ROUND, DwmSetWindowAttribute,
+    };
+
+    // A maximized window squares off — the same contract the shell radius keeps,
+    // stated once more here because DWM is a second painter and would otherwise
+    // round a corner the page has already squared.
+    let preference: DWM_WINDOW_CORNER_PREFERENCE = if maximized || radius == 0 {
+        DWMWCP_DONOTROUND
+    } else {
+        DWMWCP_ROUND
+    };
+    let hwnd = HWND(desktop.window.hwnd() as _);
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            std::ptr::from_ref(&preference).cast(),
+            u32::try_from(std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>()).unwrap_or(4),
+        );
+    }
+}
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_window_corner_preference(
     _desktop: &dioxus::desktop::DesktopContext,
     _radius: u8,
     _maximized: bool,

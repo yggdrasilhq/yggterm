@@ -1870,6 +1870,48 @@ this is the recurring shape here, not a one-off; see
 - Sampling a compositor grab at (0,0) reads the compositor's own titlebar and reports square
   on a perfectly rounded window — sample inside the window's own geometry.
 
+## OS-level cursor synthesis does not reach a webview surface (measured 2026-08-20)
+
+`swaymsg seat - cursor set/press/release` moves a real compositor pointer and is the right
+instrument for GTK widgets, and it drives NOTHING in the page. A synthesized double-click
+aimed at the theme editor's pad added no stop and raised no error — the events simply are not
+delivered, so the probe reads exactly like a feature that does not work.
+
+- Use `server app pointer <move|down|up|click|drag|scroll>` for anything inside the webview.
+  It was built for Wayland/KWin precisely because OS-level tools cannot be trusted there.
+- ⛔ `pointer down` / `pointer move` / `pointer up` as SEPARATE calls do not compose into a
+  drag — the press state is not carried between invocations, so the stop never moves and
+  nothing reports a problem. Use the composite `pointer drag --start-x … --end-x …`, which is
+  the only form that produces a gesture the page sees.
+- Aim at the CURRENT geometry, read fresh. Coordinates from an earlier probe go stale the
+  moment anything moves, and a drag aimed at where a handle used to be lands on bare
+  background and looks like a dead feature.
+
+## `element_coordinates()` is relative to the event TARGET, not to your handler's element
+
+Dioxus's `element_coordinates()` is `offsetX/offsetY`. On a bubbled event that is measured
+against whatever was hit, so a handler on a large surface silently receives coordinates in a
+small child's space whenever the pointer is over one. Measured mid-drag on the theme pad, one
+continuous gesture reported x = 60, 73, then -2, 11 (over a 22px handle), then 110, 123.
+
+- The tell is a value that is plausible but far too SMALL, and only sometimes.
+- Gating the children with `pointer-events:none` while a gesture is live fixes every frame
+  except the first, because the mousedown that starts the gesture lands on the child and CSS
+  cannot apply until the next render. If the first frame matters, make the children inert
+  permanently and hit-test in the parent's own coordinates.
+
+## `terminal submit` → `submitted:false` is not answered by `rows.busy`
+
+`server app rows` → `row.busy` read `False` immediately before three separate submits that all
+came back `submitted:false`. `busy` is not the gate the submit consults.
+
+⭐ **Read the submit's own `reason` field** — it says which of several unrelated conditions
+applied. The one that cost two silent failures here: *"no agent composer row appeared within
+the timeout — the row is mid-output, in a menu, or is not an agent CLI, so input readiness is
+unanswerable rather than false."* That is a THIRD state, neither ready nor busy, and treating
+it as "busy, try later" or as "unreachable" are both wrong. Deliver by file instead of
+retrying; the standing rule against retrying `submitted:false` still holds.
+
 ## `run_app_control_focus_window` answers "was the request delivered", not "did a window take focus"
 
 It returns `Ok(())` whenever the round trip completes, and never reads

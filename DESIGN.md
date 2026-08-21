@@ -115,6 +115,16 @@ Yggdrasil shells should support a reusable visual theme editor.
 - Reset should always return to the project’s base shell theme, not an empty placeholder state.
 - The active portable theme should be stored in `~/.yggterm/settings.json` under the `theme` object.
 - If no custom colors exist, the shell should fall back to the system gradient cleanly.
+- **A recolour tool appears when there is something to recolour.** The colour
+  library and the colour well both drive the selected stop, and their handler
+  returns early when nothing is selected — so on an empty selection they were not
+  merely redundant, they were inert: swatches that can be clicked and do nothing,
+  which is worse than controls that are not there. They are disclosed on the
+  selection, and the library is headed with the stop it will repaint ("Color 2")
+  rather than an anonymous "Color Library", so it is never ambiguous which of
+  several dots a swatch is about to change. Every route into having a stop —
+  starter, double-click, clicking a dot — selects it, so the tools are never
+  withheld from someone who has something to edit.
 - Stable Yggterm exposes brightness only as a scalar control. Alpha,
   translucency, grain, and blur controls are experimental and must not affect
   stable shell rendering.
@@ -1748,7 +1758,8 @@ are part of the product's shape, not a platform default it inherits.
 |---|---|---|
 | Linux / Wayland | Transparent (RGBA) surface + the page's `clip-path`. There is no Shape extension, so this is the only path. | Works on every compositor. |
 | Linux / X11 | `shape_combine_region` on the GDK window (the Shape extension), opaque surface. KDE/X11 takes the transparent path instead, for its compositor's blur. | Works. |
-| Windows | Transparent surface + the page's `clip-path`, same as Wayland. | Rounds. See the note below. |
+| Windows 11 | Transparent surface + the page's `clip-path`, **and** `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE)` so DWM knows the corner too. | Rounds, with the system shadow and snap-layout affordance. |
+| Windows 10 | Transparent surface + the page's `clip-path`. The DWM attribute does not exist and the call fails harmlessly. | Rounds. |
 | macOS | Native window rounding — the window is `decorated` with a hidden title and a full-size content view, so AppKit cuts the corner itself. | Free. |
 
 ⛔ **Never gate the corner on which desktop the session claims to be.** Alpha
@@ -1759,12 +1770,18 @@ square corners, and the one that *was* named was recognised from scraped
 environment that a daemon-launched GUI does not have, so the same machine
 rendered both ways on different launches. Key on the capability.
 
-⚠ **Windows 11 has a native corner preference** (`DwmSetWindowAttribute` with
-`DWMWA_WINDOW_CORNER_PREFERENCE`) that yggterm does **not** currently set. The
-CSD path above already rounds the window, so this is a polish gap rather than a
-break: the native attribute would additionally hand the corner to DWM for the
-system shadow and the snap-layout affordance, and Windows 10 has no equivalent
-and must stay on the CSD path regardless.
+⭐ **On Windows the corner is drawn twice, and both must agree.** The page's
+`clip-path` is what makes the corner visible; `DWMWA_WINDOW_CORNER_PREFERENCE` is
+what makes it real to the system, so the drop shadow follows the curve and the
+maximize button offers snap layouts. A corner DWM does not know about is a shape
+drawn inside a square window, with a square shadow around it. Because DWM is a
+second painter, it is told `DWMWCP_DONOTROUND` when the window is maximized —
+otherwise it would round a corner the page has already squared.
+
+⚠ **Windows 10 has no such attribute and the call fails there.** That is the
+designed outcome, not a gap to paper over with a version probe: the CSD path is
+what rounds the window on 10, it is already in force, and a probe would only buy
+the privilege of skipping a call whose failure costs nothing.
 
 **The corner is a tested contract, and it must stay one.** `scripts/corner-contract.sh`
 asserts it in pixels against a headless Wayland-native compositor. Do not

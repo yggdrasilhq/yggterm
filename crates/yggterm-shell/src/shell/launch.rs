@@ -2835,6 +2835,16 @@ fn app() -> Element {
             return;
         }
         last_linux_window_chrome_apply.set(Some(chrome_apply_signature));
+        // ⚠ ABOVE the native-decorations return, deliberately. That guard is a
+        // LINUX concept (`YGGTERM_FORCE_NATIVE_DECORATIONS`), and below it a
+        // Linux-only flag would silently decide whether Windows gets its corner.
+        // The signature this effect keys on already carries radius and maximized,
+        // so DWM is told again exactly when either changes.
+        apply_windows_window_corner_preference(
+            &shape_desktop,
+            effective_shell_radius,
+            maximized,
+        );
         if linux_native_decorations {
             return;
         }
