@@ -13,7 +13,7 @@ use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tracing::{info, warn};
 
-const TITLE_DB_FILENAME: &str = "session-titles.db";
+pub(crate) const TITLE_DB_FILENAME: &str = "session-titles.db";
 
 /// ⛔⛔ A QUOTA REFUSAL IS A FACT ABOUT THE ENDPOINT, NOT ABOUT THE SESSION —
 /// and recording it per session is how a title chore came to own a fifth of
@@ -357,6 +357,12 @@ impl SessionTitleStore {
                updated_at = excluded.updated_at",
             params![session_id, title, cwd, source, model, updated_at],
         )?;
+        // ⛔ The durable-session scan memoises rows that include this table's
+        // answer, so a title write must drop the memo in THIS process. The
+        // scan's file-stamp generation catches a peer process; it cannot catch
+        // a write and a re-read that happen closer together than the clock can
+        // resolve, and the titles sweep does exactly that to verify itself.
+        crate::startpage::invalidate_durable_scan_memo();
         Ok(())
     }
 
@@ -569,6 +575,12 @@ impl SessionTitleStore {
             "DELETE FROM session_titles WHERE session_id = ?1",
             params![session_id],
         )?;
+        // ⛔ The durable-session scan memoises rows that include this table's
+        // answer, so a title write must drop the memo in THIS process. The
+        // scan's file-stamp generation catches a peer process; it cannot catch
+        // a write and a re-read that happen closer together than the clock can
+        // resolve, and the titles sweep does exactly that to verify itself.
+        crate::startpage::invalidate_durable_scan_memo();
         Ok(())
     }
 
