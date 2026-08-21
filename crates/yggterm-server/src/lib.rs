@@ -20730,12 +20730,15 @@ fn trace_local_daemon_child_event(
 }
 
 fn reap_spawned_child_in_background(
-    mut child: std::process::Child,
+    child: std::process::Child,
     endpoint: ServerEndpoint,
     daemon_exe: PathBuf,
 ) {
     let child_pid = child.id();
-    std::thread::spawn(move || match child.wait() {
+    // ONE encoding of "wait on a background thread" — see
+    // `yggterm_core::child_reaper`. What is local to this caller is the
+    // TRACING of the outcome, not the reaping mechanism.
+    yggterm_core::child_reaper::reap_child_in_background(child, move |result| match result {
         Ok(status) => trace_local_daemon_child_event(
             &endpoint,
             "spawned_daemon_exit",
