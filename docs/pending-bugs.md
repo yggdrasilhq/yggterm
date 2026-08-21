@@ -1506,6 +1506,7 @@ GiB of swap residency**. Old logic: `7.57 >= 4.0` fires, every 60 s, forever. Ne
 **The observation still owed:** `heartbeat/panic` incidents must fall to zero on a GUI host
 carrying swap residue, once a build on this lock reaches it.
 
+
 ## ⚠ [11.0] SWAP RESIDUE MAKES EVERY FIRST TOUCH CRAWL, AND TWO INSTRUMENTS CALLED IT HEALTHY
 
 **Status:** OPEN
