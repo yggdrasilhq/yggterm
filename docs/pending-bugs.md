@@ -194,66 +194,6 @@ restore is refused, the surface disarms mouse tracking (and bracketed paste) bef
 the failure state. **Falsifier:** kill a remote session behind a row, move the mouse over its
 viewport — no bytes appear.
 
-## ⚠ [11.0] THE LIBYGGTERM CONTEXT MENU: CURATION — the registry and per-host halves are DONE
-
-**Status:** PARTLY OPEN. Re-measured against the tree 2026-08-21; two of the three
-halves were already built when this was filed, and the entry said otherwise.
-
-Owner spec, from a screenshot: (1) REMOVE Fleet-topology / booter / monitor style
-entries — terminal-invoked tools, meaningless as row spawns; (2) the list is
-REGISTRY-DRIVEN, written when an app registers on first launch; (3) PER-HOST
-filtering — an entry shows only if the app is available on the host of the
-right-clicked session.
-
-### ✅ (2) REGISTRY-DRIVEN — already true, and was when this was filed
-There is no hardcoded app anywhere in the launcher family. The list is whatever
-the host's `~/.yggterm/apps/*.json` manifests declare, scanned by
-`yggterm_core::scan_app_registry` (which also PRUNES a manifest whose binary no
-longer resolves, so an uninstall cleans itself up), flattened by the one owner
-`app_launcher_entries`, and rendered by all three surfaces — row menu, titlebar
-`+`, start page.
-
-### ✅ (3) PER-HOST — already true, with one owner
-`app_registry_for_row` resolves a row to its machine's registry
-(`RemoteMachineSnapshot::apps`), falling back to this host's only for a local
-row. `SnapshotView::apps` carries a comment naming the exact bug this fixed: a
-right-click on a remote row used to offer the GUI host's apps, with the GUI
-host's absolute binary paths, for execution on the other machine.
-
-### ✅ THE DUPLICATE LISTING — fixed
-The screenshot showed the same two verbs offered TWICE. A single manifest cannot
-do that (`is_usable` requires `name` == file stem, so one app is one file read
-once), so the list reaching the menu held the registration twice.
-`app_launcher_entries` now offers one app's verb once, keyed on (app, verb).
-⚠ Keyed there and NOT on the resolved command, which was the first attempt and
-over-reaches: two genuinely different apps may share a binary, and collapsing
-them deletes a real entry to fix a cosmetic one.
-⇒ **Still uncovered, deliberately:** one tool installed under two DIFFERENT names
-is a separate case. It needs a decision about which registration is real, not a
-silent pick in a menu builder.
-
-### ⛔ (1) CURATION — THE ONLY PART STILL OPEN, and it is a schema question
-The entries to remove are VERBS in an app's own manifest (a monitor declares its
-dashboard and booter verbs there). So yggterm cannot curate them without either
-hardcoding another app's name — the precise anti-pattern the libyggterm contract
-exists to prevent — or being TOLD.
-
-⇒ **Recommendation:** the manifest declares it. An `AppVerb` gains a flag
-(`row_spawn`, serde default `true`, so every existing manifest keeps working) and
-the ROW menu filters on it; the titlebar `+` and start page keep their own
-answer, since "open my dashboard" is a reasonable thing to offer there and a
-meaningless thing to spawn a ROW for.
-
-⚠ **The cost, stated because it decides the order of work:** the flag only takes
-effect once each app WRITES it, and an app rewrites its manifest on every launch,
-so a hand-edit of the JSON is not durable. The schema change is therefore
-worthless on its own — it has to land with, or before, the change in the app that
-declares it. That is why it is filed rather than half-shipped here.
-
-**Falsifier for the remaining half:** right-click a row on each host — exactly
-that host's installed apps, once each, and no terminal-invoked monitors or
-booters. The "once each" and "that host's" halves hold today.
-
 ## ⚠ [11.0] THE ROW CLI DEMANDS RITUAL THE DEFAULTS SHOULD OWN — the papercut backlog
 
 **Status:** OPEN

@@ -6238,7 +6238,7 @@ const NEW_AGENT_MENU_PREFIX: &str = "new-agent:";
 /// of its own here; the list is whatever the host's `~/.yggterm/apps/*.json`
 /// manifests declare.
 fn libyggterm_app_menu_items(apps: &[AppManifest], here: bool) -> Vec<RowMenuItem> {
-    app_launcher_entries(apps)
+    app_row_spawn_entries(apps)
         .into_iter()
         .map(|(app, verb)| {
             let label = if here {
@@ -6432,7 +6432,7 @@ fn row_menu_items(
             RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session", 's')
                 .submenu(agent_session_menu_items(false)),
         );
-        if !app_launcher_entries(apps).is_empty() {
+        if !app_row_spawn_entries(apps).is_empty() {
             items.push(
                 RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App", 'b')
                     .submenu(libyggterm_app_menu_items(apps, false)),
@@ -6474,7 +6474,7 @@ fn row_menu_items(
                 RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session Here", 's')
                     .submenu(agent_session_menu_items(true)),
             );
-            if !app_launcher_entries(apps).is_empty() {
+            if !app_row_spawn_entries(apps).is_empty() {
                 items.push(
                     RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App Here", 'b')
                         .submenu(libyggterm_app_menu_items(apps, true)),
