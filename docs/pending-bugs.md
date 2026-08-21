@@ -57,12 +57,43 @@ painted partially. Both are what "a mount begins with an empty surface" looks li
 rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
 filing three entries for one symptom chain is what made this look half-fixed once already.
 
-**The tracing the owner asked for is END TO END and it does not exist yet:** kernel call →
-daemon → client → **xterm.js layer** → pixel. The xterm.js half is the gap; every measurement
-in this entry stops at the Rust boundary, so "the mount began" and "the glyphs arrived" are
-currently the same event as far as any instrument here can tell. ⇒ Until a probe spans that
-boundary, a partially-painted frame and a fully-painted one are indistinguishable, and no
-amount of daemon-side tracing closes it.
+**The tracing the owner asked for is END TO END:** kernel call → daemon → client →
+**xterm.js layer** → pixel.
+
+⛔ **CORRECTED 2026-08-21 — THIS ENTRY SAID THE xterm.js HALF DID NOT EXIST, AND IT DOES.**
+Measured over 6 h on the GUI host: `xterm_render/frame_gap` carries **`rows_painted`
+against `rows`**, so a half-drawn frame is directly countable (2 partial of 4558 late
+frames); `xterm_render/frame_window` carries **`full_canvas_frames` against `count`** and,
+unlike `frame_gap`, is not threshold-gated, so it is the honest denominator; and
+`terminal_js/xterm_write_flush` carries `paint_repair` with its reason. The stale claim
+cost a lane a briefing before it was caught.
+
+⚠ **And `frame_gap` is a trap read as a frame-rate meter: its minimum IS its threshold**
+(250 ms), so it counts LATE frames only and any percentage taken from it is meaningless.
+What it says honestly is worth having — **median late-frame gap 499 ms, worst 999 ms.**
+Half a second is comfortably long enough to see the previous row's surface where the new
+one should be. **That is the ghost frame, measured.**
+
+⇒ **The real gap is one link further along.** Nothing carries a **frame id from the write
+that caused a paint to the paint that showed it**, so a frame that painted the WRONG BYTES
+and one that painted the right bytes are identical in the trace. That is a far smaller
+change than instrumenting a layer, and it is the one to ask for. ⇒ It also relocates this
+entry's broken-TUI symptom: at ~0.04% of late frames, "a frame drew half its rows" is
+probably not what is being seen. The candidates that remain are a paint from a STALE
+BUFFER, or a paint that never happened and left the previous surface up — the ghost, not a
+partial draw. Different bugs, different fixes.
+
+### ⭐⭐ THE LADDER SAYS THE BUG IS IN ATTACH, NOT IN MOUNT (measured 2026-08-21, ~2.2 h)
+
+Rung by rung: `begin` 17 → `ensure_begin` 17 → `bootstrap_spawn_scheduled` 17 →
+`js_eval_created` 17 → `js_ready` 16 → **`attach_ready` 9** → `first_meaningful_output` 9.
+
+⇒ **9 of 17 mounts reached meaningful output; 47% never showed anything but an empty
+surface** — and everything up to and including the JS terminal being created succeeds
+almost every time. The cliff is at **attach**. ⚠ `first_output` (15) exceeds `attach_ready`
+(9), so the ladder is NOT strictly nested and retries reach output by another path; do not
+subtract these rungs from each other. "A mount begins empty" is really **"an attach never
+happens"**, which is a much narrower target.
 
 ⭐ **This is what the `ytop` Legendary Bugs notebook is for** (seat 11.21): the Top shelf
 carrying the kernel/process half and the Dash shelf the yggterm half, so the chain is visible
@@ -125,7 +156,18 @@ The test this entry asked for and nobody had run: one `create_terminal` alone, o
 
 ⇒ **Adding a row costs a burst of remounts. Removing one costs nothing.** The entry
 above had it half right: it is not "the row SET changing", it is specifically an
-ADD. And the controls are strong — D carried the heaviest ambient app-control
+ADD.
+
+⚖ **AND THIS RESOLVES A DISAGREEMENT BETWEEN TWO MEASUREMENTS OF THE SAME THING.** Recomputed
+over ~2.2 **hours**, only **5 of 37 resets (14%)** fell within six seconds of a row-set change,
+against this entry's 9-of-11 over 2.2 **minutes** — and that recount offered three explanations:
+a second driver, a wrong window, or bursts that an hours-long average hides. The controlled
+result above settles it in favour of the third for the part it covers: one add produced five
+mounts inside twenty-one seconds while two quiet windows produced none, which is a burst by
+construction. ⇒ **It does not account for the other 32 resets**, so a second driver is still
+open, and the honest reading is that adds cause bursts AND something else produces a baseline.
+⛔ Neither measurement supersedes the other; a rate over hours and a controlled window answer
+different questions. And the controls are strong — D carried the heaviest ambient app-control
 traffic of all four windows (40 `request_stage` against A's 16) and still produced
 no mount at all, so the bursts are not a function of how busy the control plane is.
 
