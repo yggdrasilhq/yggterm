@@ -122,6 +122,51 @@ unresolved one.
 - ⛔ **Do not hand a lane over by standing by.** Spawn, then verify the row on the GUI host, and
   carry the standing order that the successor must spawn its own successor rather than defer.
 
+## ⛔⛔ [11.13] AN ABSENCE-LAPSE IS PERMANENT AND NEVER RE-CHECKED, SO ONE TRANSIENT LISTING GAP UNWATCHES A LIVE SESSION FOREVER
+
+**Status:** OPEN. Measured 2026-08-21 across the whole subscription set.
+
+A subscription that goes absent from the GUI host's row tree for `GONE_SIGHTINGS` consecutive
+readings is marked `lapsed`. The tick's very next act on that record is:
+
+```python
+if s.get("lapsed"):
+    # Already reported once; stay quiet but stay VISIBLE in `list`.
+    continue
+```
+
+⇒ **It is never looked at again.** Presence is not re-tested, so a row that comes BACK stays
+unwatched until a human re-subscribes it by hand — and nothing anywhere says the watchdog stopped
+watching a session that is plainly alive.
+
+### MEASURED, over all 12 lapsed subscriptions at one instant
+| bucket | count |
+|---|---|
+| genuinely gone — no process, no row, stale or missing transcript | 7 |
+| ⛔ **process ALIVE and the row is BACK in the GUI host's tree** | **5** |
+
+Two of those five lapsed specifically for **absence** and are now present again, transcripts 8 and
+26 minutes fresh. They are unwatched for no reason that is still true. (The other three lapsed on
+`max_hours`, which is a decision rather than an inference — see below.) A third case existed and
+was cleared by hand while measuring this.
+
+### ⚠ WHY THIS IS NOT THE RE-ARM HAZARD THE FILE ALREADY REFUSES
+`cmd_coverage` deliberately refuses to auto-arm, because *"an attestation-driven re-arm would
+resurrect rows that deliberately unsubscribed when their work finished."* **That reasoning does not
+reach this case, and the difference is the whole point.** An `unsubscribe` is a DECISION BY THE
+SUBSCRIBER. A lapse is an INFERENCE BY THE WATCHER — the subscription was never withdrawn, and the
+premise of the inference ("this row is not in the tree") is testable and currently false. Clearing
+it resurrects nobody's choice; it corrects the watcher's own stale reading.
+
+⇒ **Fix: on the tick, re-test presence for records lapsed by ABSENCE, and clear the lapse when the
+row resolves** — logging it as loudly as the lapse itself, since a silent re-arm is the other
+direction of the same failure. ⛔ Do **not** auto-clear a `max_hours` lapse: that one is an expiry
+someone chose, and the remedy for it is a deliberate re-subscribe.
+
+⚠ **The tell:** `list` shows `⛔ LAPSED … NOT WATCHED` beside a row whose transcript is growing.
+The two facts are printed by different instruments and nothing reconciles them, so the contradiction
+sits in plain sight and reads as two unrelated lines.
+
 ## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
 
 ⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
