@@ -358,6 +358,52 @@ fail once and stay failed.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔ [11.0] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-21 against a live Antigravity row still wearing its
+cwd-derived birth name. The registry-driven title fix landed and is real — it
+fixed ONE of the two chores.*
+
+**The gap is between two chores, and each one believes the other has it.**
+
+```rust
+// daemon.rs:11838  collect_live_store_title_syncs_in — the registry-driven one
+let is_local_row = session.session_path.starts_with("local://")
+    || descriptor.runtime_key_scheme
+        .is_some_and(|scheme| session.session_path.starts_with(scheme));
+if !is_local_row { continue; }        // "a remote-*:// row rides the OTHER chore"
+
+// daemon.rs:12042  remote_cc_title_poll_paths — the other chore
+if session.kind != SessionKind::ClaudeCode { continue; }
+```
+
+⇒ **A row keyed `remote-<slug>://` for any CLI other than Claude Code is skipped by
+the local chore for being remote, and refused by the remote chore for not being
+Claude Code.** It is titled by nothing, so it keeps whatever name it was born with.
+
+⚠ **"Local" here means the PATH SCHEME, not the machine.** A session running on
+this very host, opened through the remote path, carries a `remote-*://` key and
+falls in the gap. The observed row was on the daemon's own fleet.
+
+### ⛔⛔ AND THE INSTRUMENT BUILT TO CATCH THIS CANNOT SEE IT
+
+`cli/store_title_miss` was added precisely so a failed title pickup is
+distinguishable from an empty store. It is emitted **from the local chore only**,
+and the local chore never looks at these rows. Measured: **zero `store_title_miss`
+events in a 40,000-event trace window** while an untitled row sat in the sidebar.
+
+⇒ A probe that never fires and a system with nothing to report are the same
+reading. The miss counter must be emitted where the DECISION TO SKIP is made, not
+only where a lookup fails — a row skipped for its scheme is exactly the case
+nobody hears about.
+
+**The fix has the shape the local chore already took:** make the remote pickup
+registry-driven per descriptor instead of gated on one `SessionKind`. ⚠ It is not
+a one-line change — `read_live_store_title` is a local-file reader, and doing it
+per CLI over ssh is the actual work. Do not "fix" it by deleting the kind check.
+
 ## ⛔⛔ [11.23] A RESTART LANDS ON A WEB SURFACE OVER A LIVE TERMINAL ROW — STALE FIRST, THEN BLANK
 
 **Status:** OPEN

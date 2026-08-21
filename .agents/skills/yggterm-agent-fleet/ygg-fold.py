@@ -76,8 +76,26 @@ STALL_IDLE_MIN = 20.0
 #:
 #: A wake is only ever correct for a row that is still cheap to resume. Everything
 #: else is harvested and replaced by a fresh lane at the same seat.
+#: A spawn's transcript lags its creation by ~15 s, so a brand-new row legitimately
+#: has none. Past this it has not been briefed at all.
+BRIEFLESS_GRACE_MIN = 10.0
+
 WAKEABLE_MAX_TRANSCRIPT_BYTES = 400_000
 WAKEABLE_MAX_IDLE_MIN = 20.0
+
+
+def process_age_min(uuid):
+    """Minutes since the agent process for this uuid started, from /proc — the one
+    clock a row with no transcript still has."""
+    try:
+        out = subprocess.run(["bash", "-c",
+                              f"for p in $(pgrep -x claude); do "
+                              f"tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q {uuid} "
+                              f"&& stat -c %Y /proc/$p && break; done"],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        return (time.time() - int(out)) / 60 if out else None
+    except Exception:
+        return None
 
 
 def wakeable(transcript_bytes, idle_min):
@@ -361,7 +379,21 @@ def classify(row, live, protected):
     if uuid not in live:
         return "DEAD", "no agent process on this host"
     if tr is None:
-        return "WORKING", "process alive, no transcript to judge by"
+        # ⛔⛔ A LIVE PROCESS WITH NO TRANSCRIPT AT ALL IS THE EMPTIEST POSSIBLE ROW,
+        # AND THIS ARM CALLED IT THE BUSIEST VERDICT IT HAS. A CLI that started and
+        # was never given anything writes no transcript, so it can never be COLD,
+        # FINISHED or DEAD — it is unclassifiable forever and therefore unfoldable
+        # and unsucceedable. Measured 2026-08-21: one row sat in exactly this state
+        # for two hours while every sweep reported it WORKING.
+        #
+        # ⇒ The grace is real — a spawn's transcript lags creation by ~15 s — but it
+        #   is a GRACE, not a permanent exemption. Past it, a row that has never
+        #   written a word has never been briefed, and saying so is the whole point.
+        age = process_age_min(uuid)
+        if age is not None and age > BRIEFLESS_GRACE_MIN:
+            return "BRIEFLESS", (f"alive {age:.0f}m and has never written a transcript — "
+                                 f"it was started and never briefed")
+        return "WORKING", "process alive, no transcript to judge by (still starting?)"
     text = last_assistant_text(tr)
     row["last"] = text.replace("\n", " ")[:200]
     # ⚠ Both phrase tests read the OPENING, not the body. Whole-message matching
@@ -759,6 +791,15 @@ def main():
     sw.add_argument("--campaign", help="only rows whose seat starts with this, e.g. 11")
     sw.add_argument("--apply", action="store_true")
     sw.add_argument("--host")
+    sw.add_argument("--dead-only", action="store_true",
+                    help="classify everything, act ONLY on DEAD. ⛔ The scoping rule — an "
+                         "orchestrator folds its own spawns and nobody else's — protects a "
+                         "JUDGEMENT: whether a quiet lane is finished. A row with no process "
+                         "is not a judgement, so this pass may run unscoped and is the only "
+                         "thing watching campaigns that have no orchestrator of their own")
+    sw.add_argument("--max-respawns", type=int, default=0,
+                    help="0 = no cap. A cap exists because this loop runs unattended: a bad "
+                         "hour must not be able to spawn a lane per cold row across the fleet")
     sw.add_argument("--respawn", action="store_true",
                     help="replace each COLD row: spawn a successor at the same seat from a "
                          "brief distilled from artefacts, prove it holds the brief, and only "
@@ -833,7 +874,7 @@ def main():
             log(f"⛔ no seated row matches {a.target}")
             return 2
 
-    counts, folded, seen_rows = {}, 0, []
+    counts, folded, seen_rows, respawned = {}, 0, [], 0
     for row in sorted(rows, key=lambda r: r["seat"]):
         if a.cmd == "sweep" and a.campaign:
             head = row["seat"].split(".")[0]
@@ -843,9 +884,11 @@ def main():
         counts[verdict] = counts.get(verdict, 0) + 1
         if verdict != "PROTECTED":
             seen_rows.append(row)
-        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·",
+        mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·", "BRIEFLESS": "⚠",
                 "PROTECTED": "🔒", "STALLED": "⏸", "COLD": "❄"}[verdict]
         log(f"{mark} {row['seat']:<7} {row['uuid'][:8]} {verdict:<9} {why}")
+        if getattr(a, "dead_only", False) and verdict != "DEAD":
+            continue
         forced = getattr(a, "force", False) and verdict != "PROTECTED"
         # ⚠ A single-row call is an operator asking about ONE row, usually because
         # a sweep told them to. Declining in silence makes the two verbs look as
@@ -861,7 +904,12 @@ def main():
         elif verdict == "STALLED" and getattr(a, "wake", False):
             wake(row, host, a.apply)
         elif verdict == "COLD":
-            if getattr(a, "respawn", False):
+            cap = getattr(a, "max_respawns", 0) or 0
+            if getattr(a, "respawn", False) and cap and respawned >= cap:
+                log(f"  ⛔ respawn cap of {cap} reached this sweep — left cold, "
+                    f"its successor brief is written and the next sweep will take it")
+            elif getattr(a, "respawn", False):
+                respawned += 1
                 if respawn(row, why, host, a.apply):
                     folded += 1
             else:
