@@ -2482,6 +2482,59 @@ settled this bug had `remote_machines` EMPTY, which looked wrong until the live
 fixture assembled from what the code accepts tests the code's opinion of itself.
 
 
+## A SANDBOX GUI NEEDS A PRIVATE BUS AND COMPOSITING OFF, OR THE ROW PLANE IS UNTESTABLE (2026-08-22)
+
+`YGGTERM_HOME` gives an isolated DAEMON, and the recipe for that is above. It does
+not give a row plane: **`terminal new`, `terminal send`, `terminal submit`,
+`input-check` and `app rows` are all answered by a GUI client**, so with no GUI
+there is no way to birth an agent row, and every cross-CLI experiment has had to
+be run on somebody's desktop. `server attach` is not the substitute — it is the
+plain-shell path and hands back a shell whatever scheme you name.
+
+Under Xvfb the GUI registers with the launcher and then dies, leaving a **zero-byte
+launch log**, `registered:true`, and `app clients` = 0 — which reads as "it started
+and something is wrong with app-control" and is really "WebKit died before anything
+could be written". Two things fix it, and it needs BOTH:
+
+```sh
+Xvfb :77 -screen 0 1600x1000x24 &
+dbus-run-session -- env -u WAYLAND_DISPLAY DISPLAY=:77 GDK_BACKEND=x11 \
+  LIBGL_ALWAYS_SOFTWARE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+  WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+  YGGTERM_HOME="$SB" YGGTERM_GOVERNOR=0 "$SB/bin/yggterm" &
+# then: app clients -> count 1, and `terminal new --kind <cli>` works
+```
+
+⚠ `WEBKIT_DISABLE_COMPOSITING_MODE=1` is the one that is easy to leave out —
+software GL and the dmabuf flag alone are not enough, and the failure is silent.
+The daemon reports which arm it took as `YGGTERM_WEBKIT_GL_POLICY` in
+`app clients`: `webkit_compositing_disabled_by_env` is the working sandbox arm,
+`hardware_gl_probed` is the one that dies.
+
+⛔ **This is a SANDBOX arm and it stays in the sandbox.** The presentation policy
+is the law for the owner's machine and none of these variables may be set against
+it — see `docs/presentation-policy.md`. What is learned here about rendering does
+not travel to a Wayland desktop; what is learned about the DAEMON does, because it
+is the same binary.
+
+⚖ **And what a sandbox row costs is real.** Rows launch the actual CLI with the
+actual credentials, because `HOME` stays the real one — which is the point, since
+that is what makes the store layouts genuine. Cap the population and reap it.
+
+## A BRIEF IS A DOC, AND THIS ONE SAID A SECTION HERE DID NOT EXIST (2026-08-22)
+
+A relay brief warned that the field-guide section *"TEST A DAEMON RESTORE AGAINST
+A CRAFTED `YGGTERM_HOME`"* had been renamed or removed, and asked the next lane to
+re-establish the recipe and write it back. **The section exists, under exactly that
+name**, added by the commit that proved the remote restore, and present in `main`
+the whole time.
+
+⇒ Nothing was lost; a lane would simply have rewritten a page that was already
+there, and published a second copy of it — which is how the SSOT law gets broken
+by someone trying to be helpful. **An inherited "this is missing" is a claim, and
+it costs one `grep` to check.** The same rule the fabric skill states for an
+inherited `BLOCKED`.
+
 ## A BRANCH NOBODY TAKES CANNOT BE PROVEN BY RUNNING IT (2026-08-22)
 
 `ygg-deliver`'s reap interlock — the one that decides whether an un-briefed row is
