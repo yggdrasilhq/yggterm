@@ -19813,7 +19813,46 @@ confirmation on the erasing form. Wanted: the no-argument form should RETURN the
 value (or refuse), and clearing should be an explicit flag (`--clear`). Until then the only
 safe read-back is a listing instrument, not the verb itself.
 
-## [19.1] `server app session outline` REPORTS `error: null` WHILE `applied: false`, SO A SEAT SILENTLY DOES NOT LAND
+## [19.1] A ROW CAN BE DISPLAYED BUT UNBOUND — EVERY MUTATING VERB THEN NO-OPS, AND `rename` REPORTS SUCCESS
+
+**Status:** OPEN — reproduced repeatedly 2026-08-21 on build 3.1.17, client and daemon agreeing.
+
+⭐ **THE STATE, which is the part worth naming:** the row renders in the sidebar, the metadata panel
+populates from its rollout file, and the session is plainly alive and working — **while the daemon
+holds no live-session binding for it.** The panel shows `Status: bootstrapping · working`. In that
+state the row is **readable but not writable**, and nothing in the UI says so.
+
+**Both mutating verbs fail, and they fail differently — the second is the dangerous one:**
+
+| verb | returns | actually happens |
+|---|---|---|
+| `session outline` | `applied:false`, `daemon_message:"no live session for …"`, **`error:null`** | nothing |
+| `session rename` | ⛔ **`accepted:true`, `reason:null`** | ⛔ **nothing** |
+
+⛔ **`rename` reports success for a write that never lands.** `outline` at least sets `applied:false`
+— but puts the reason in `data`, leaving the documented error channel null. ⇒ **A caller written to
+the obvious contract concludes both succeeded.**
+
+⚠ **And a read-back immediately after can still agree with the caller**, which is what makes this
+expensive: the claim script's verification printed the NEW title, and the row reverted to the old one
+later. The write appears to reach a view that a subsequent daemon reload discards.
+
+**Suspected trigger — a daemon restart under an in-place update.** At the time of these runs the
+daemon reported `Uptime 7m 18s` with `✓ Update installed · Restart to apply` pending, and the
+binary had been replaced on disk earlier the same session. Sessions that predate the restart appear
+not to be re-bound, while `Sessions: 7 owned · 7 total · 0 preserved` reports no loss.
+
+**What would falsify it:** the same verbs landing on a row whose session started *after* the current
+daemon, or a rebind making the identical calls succeed on this row.
+
+**Fixes, in priority order:**
+1. ⛔ `rename` must not return `accepted:true` when there is no live session.
+2. Any `applied:false` should carry a non-null `error`.
+3. A displayed-but-unbound row should be visibly marked, since it silently ignores every write.
+4. Re-bind surviving sessions across an in-place daemon restart, or report them as lost rather than
+   counting them in `owned`/`total`.
+
+## [19.1b] `session outline` — THE ORIGINAL NARROWER REPORT, KEPT FOR THE SCHEME CENSUS
 
 **Status:** OPEN — observed 2026-08-21 against the current build.
 
