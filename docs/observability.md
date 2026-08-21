@@ -114,6 +114,50 @@ are distinguished by the record's `layer` field, **not** by `component` — both
 | `rust` | `session/activation` | point | **the active row changed, and WHY**: `from`, `to`, `origin`, `origin_site`, `user_gesture`, `previous_origin`, `ms_since_previous_activation`, `redundant_since_previous` |
 | `rust` | `trace_bridge/foreign_batch_faults` | point | what the boundary refused or repaired, and how far behind the emitter was running |
 
+### 2.3b The same-frame paint record — the one instrument that is NOT a probe
+
+⛔⛔ **WHY IT EXISTS: THE TWO SAMPLES WERE NEVER ONE MOMENT.** A faithful screenshot costs
+**~6.8 s**; a `terminal read-buffer` costs **~116 ms**. On a live agent row the two can never be
+sequenced into one frame, so every *"the buffer says X but the screen shows Y"* reading ever taken
+on a busy row compared two moments about seven seconds apart. One such pair returned
+`Nesting… 1m42s` from the buffer beside `Whirring… 29s` from the pixels — **two different turns of
+the same agent, presented as a contradiction.** Some unknown share of every historical divergence
+in this class was TIME, not a paint fault, and there was no way to tell which.
+
+**What it is.** `server app screenshot <out.png>` now writes `<out.png>.paint-frame.json` beside
+the PNG whenever the faithful path ran. The composite script reads the drawn host's xterm buffer in
+the **same synchronous JS turn** as the drawImage loop and `toDataURL`. xterm parses PTY bytes on
+its own task queue, which cannot interleave with synchronous script, so the text in the sidecar is
+exactly the text those pixels were composited from — **the two are one moment by construction, not
+by luck.** The screenshot response carries a `paint_frame` summary pointing at it.
+
+    scripts/paint-diff.py <out.png>              # per-cell verdicts
+    scripts/paint-diff.py <out.png> --all-rows   # every row, not just disagreements
+    scripts/paint-diff-selftest.py               # planted-fault proof of the analysis half
+
+⭐ **THE UNIT IS A CELL, NOT A LINE.** The buffer side is an ink mask built from the cells
+themselves, never from `translateToString` — that trims trailing runs and gives a wide glyph one
+char across two cells, so a column index taken from the string does not address the cell the
+renderer drew. Verdicts per row: `MISSING` (buffer holds glyphs, pixels hold none), `PARTIAL`
+(pixels hold far fewer), `GHOST` (pixels hold glyphs the buffer does not), `ok`, `blank`.
+
+⛔ **INK IS WITHIN-CELL CONTRAST, NOT DARKNESS, and that is not a detail.** A TUI's chrome — status
+bars, footers, selected rows — is mostly cells that are STYLED and EMPTY. A test asking "does this
+differ from the terminal background" calls every one of them a ghost and reports a screen full of
+faults on a perfectly painted terminal. A cell holding a glyph has internal contrast; a cell
+holding a flat colour has none, whatever colour it is.
+
+⚠ **What it cannot see, so that nothing is built on it:** it does not read the glyphs, so a cell
+painted with the WRONG character reads `ok` — it answers "was something drawn here", not "was it
+right". A native web surface draws above all DOM and is absent from the frame. And
+`capture_faithful: false` makes the whole frame canvas-blind, where every row reads `MISSING` and
+none of it means anything.
+
+⭐ **`png_space` is load-bearing.** The two faithful backends write different rectangles —
+`window` (the merged chrome snapshot, scale by `png_width / win_w`) and `frame` (the terminal-only
+composite, where the PNG *is* the frame rect). A row→pixel band computed against the wrong one
+lands on the wrong row and every verdict after it is confidently wrong.
+
 ⭐ **Reading `dioxus_render/component_window` — three numbers, in this order.**
 
 1. `root_renders` is the denominator. **A component whose `renders` equals it was memoized by
