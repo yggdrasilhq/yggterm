@@ -424,6 +424,16 @@ fn server_status_json(
         "endpoint": endpoint_json(endpoint),
         "server_version": daemon_status.server_version,
         "server_build_id": daemon_status.server_build_id,
+        // ⛔ The three fields that separate "which file is at that path" from
+        // "which code is this process running". `server_build_id` answers the
+        // FIRST — it is the on-disk binary's stamp read at status time — so
+        // after a deploy it describes the new file while the process keeps
+        // executing the old one. Reporting it alone is how a stale daemon read
+        // as freshly deployed.
+        "running_build_id": daemon_status.running_build_id,
+        "on_disk_build_id": daemon_status.on_disk_build_id,
+        "server_build_commit": daemon_status.server_build_commit,
+        "build_superseded_on_disk": daemon_status_build_is_superseded(daemon_status),
         "server_pid": daemon_status.server_pid,
         "host_kind": daemon_status.host_kind,
         "host_detail": daemon_status.host_detail,
@@ -655,6 +665,38 @@ fn resolve_hot_restart_daemon_exe(cfg: &Config) -> Result<PathBuf> {
     Ok(daemon_exe)
 }
 
+/// The daemon's own admission that it is executing code the binary on disk no
+/// longer contains.
+///
+/// ⚠ Read from the daemon rather than recomputed here. `hot_restart_pending` IS
+/// this comparison — the daemon holds the build id it started with and the one
+/// on disk now, and neither is derivable from outside once a deploy has
+/// replaced the file under a live process. A second encoding of the same
+/// three-clause test here is exactly the drift this repo forbids.
+fn daemon_status_build_is_superseded(
+    daemon_status: &yggterm_server::ServerRuntimeStatus,
+) -> bool {
+    daemon_status.hot_restart_pending
+}
+
+/// Whether this daemon is the one we expect to be running.
+///
+/// ⛔ **THE VERSION STRING IS NOT AN IDENTITY.** A rebuild at an unchanged
+/// version installs a different binary under the same name, and this gate used
+/// to answer `already_ready: true` for it — so the daemon went on running the
+/// old code while every instrument agreed the deploy had landed. Measured
+/// 2026-08-21: the gate said "target daemon already matches expected
+/// version/build" at the same moment `server daemons` showed the process as
+/// `(deleted) ⚠ REPLACED ON DISK` and its `/proc/<pid>/exe` hashed to something
+/// no file on the machine matched. Any lane shipping a fix without a version
+/// bump was then live-testing code that was not running, with green
+/// instruments — and because the same path both skipped the roll AND hid that
+/// it had skipped, nothing surfaced the gap.
+///
+/// ⇒ A daemon whose running build has been superseded on disk is NEVER the
+/// expected daemon, whatever its version string says. That holds for the
+/// short-circuit here and equally for the coverage checks that pick which
+/// daemon may adopt another's sessions: a stale daemon is not a safe owner.
 fn status_matches_expected(
     daemon_status: &yggterm_server::ServerRuntimeStatus,
     cfg: &Config,
@@ -667,6 +709,7 @@ fn status_matches_expected(
         && cfg
             .expected_build_id
             .is_none_or(|build_id| daemon_status.server_build_id == build_id)
+        && !daemon_status_build_is_superseded(daemon_status)
 }
 
 fn wait_for_daemon_status(endpoint: &ServerEndpoint, cfg: &Config) -> Result<serde_json::Value> {
@@ -1155,7 +1198,19 @@ fn run_scenario(
                             "hot_update_handoff": false,
                             "already_ready": true,
                             "fallback_shutdown_skipped": false,
-                            "message": "target daemon already matches expected version/build",
+                            // ⭐ NAME what was verified. "already ready" with
+                            // nothing behind it is unfalsifiable, and it was
+                            // wrong for a month without anyone being able to
+                            // see that from the output.
+                            "verified": {
+                                "server_version": daemon_status.server_version,
+                                "running_build_id": daemon_status.running_build_id,
+                                "on_disk_build_id": daemon_status.on_disk_build_id,
+                                "server_build_commit": daemon_status.server_build_commit,
+                                "expected_build_id": cfg.expected_build_id,
+                            },
+                            "message": "target daemon already matches expected version, and its \
+                                        running build is the one on disk",
                         }));
                         continue;
                     }
@@ -1207,7 +1262,13 @@ fn run_scenario(
                         cfg.reason
                             .as_deref()
                             .or(Some("yggterm-headless monitor hot restart")),
-                        cfg.force,
+                        // ⛔ Force past the daemon's own same-version refusal
+                        // when its running build has been superseded on disk.
+                        // Fixing the gate above without this would only move
+                        // the same wrong test one layer down: the daemon would
+                        // refuse the roll for having the version it already
+                        // has, which is precisely the case that must roll.
+                        cfg.force || daemon_status_build_is_superseded(daemon_status),
                     );
                     match hot_result {
                         Ok(HotRestartResult::Restarting { message }) => {
@@ -1780,6 +1841,136 @@ mod tests {
                 .and_then(|keys| keys.first())
                 .and_then(serde_json::Value::as_str),
             Some("codex-runtime://kept")
+        );
+    }
+
+    /// ⛔ THE SAME-VERSION TRAP. A rebuild installed at an unchanged version is
+    /// a different binary, and the gate used to call it "already ready" — so
+    /// the daemon kept running the old code with every instrument green.
+    #[test]
+    fn a_daemon_running_a_superseded_build_is_never_the_expected_daemon() {
+        let base = |running: u64, on_disk: u64, pending: bool| {
+            let status: yggterm_server::ServerRuntimeStatus =
+                serde_json::from_value(serde_json::json!({
+                    "server_version": env!("CARGO_PKG_VERSION"),
+                    "server_build_id": on_disk,
+                    "server_pid": 77,
+                    "host_kind": "local",
+                    "host_detail": "test",
+                    "embedded_surface_supported": true,
+                    "bridge_enabled": true,
+                    "restored_live_sessions": 0,
+                    "terminal_session_count": 0,
+                    "terminal_session_keys": [],
+                    "preserved_terminal_owner_count": 0,
+                    "preserved_terminal_owner_keys": [],
+                    "managed_session_count": 0,
+                    "running_build_id": running,
+                    "on_disk_build_id": on_disk,
+                    "hot_restart_pending": pending,
+                }))
+                .expect("status");
+            status
+        };
+        let cfg = parse_args(vec![
+            "--scenario".to_string(),
+            "hot-restart".to_string(),
+        ])
+        .expect("hot-restart config");
+
+        // The measured case: right version, but the process is executing code
+        // the deploy replaced.
+        let superseded = base(1_000, 2_000, true);
+        assert!(
+            daemon_status_build_is_superseded(&superseded),
+            "running != on-disk is the daemon's own admission that it is stale"
+        );
+        assert!(
+            !status_matches_expected(&superseded, &cfg),
+            "⛔ a same-version different-build install is a ROLL, not a no-op"
+        );
+
+        // The genuine no-op: the running build IS the one on disk.
+        let current = base(2_000, 2_000, false);
+        assert!(
+            status_matches_expected(&current, &cfg),
+            "a daemon running the binary that is on disk is still ready — the \
+             fix must not turn every check into a restart"
+        );
+
+        // A daemon too old to report the fields must not be forced into a
+        // restart loop by their absence: unknown reads as not-superseded, and
+        // the version check alone still governs, exactly as before.
+        let silent: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": env!("CARGO_PKG_VERSION"),
+                "server_build_id": 0,
+                "server_pid": 78,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "restored_live_sessions": 0,
+                "terminal_session_count": 0,
+                "terminal_session_keys": [],
+                "preserved_terminal_owner_count": 0,
+                "preserved_terminal_owner_keys": [],
+                "managed_session_count": 0,
+            }))
+            .expect("old status");
+        assert!(!daemon_status_build_is_superseded(&silent));
+        assert!(status_matches_expected(&silent, &cfg));
+    }
+
+    /// `already_ready` has to say what it checked. The claim was unfalsifiable
+    /// from the output for as long as it was wrong.
+    #[test]
+    fn the_status_report_names_the_running_build_not_just_the_file_on_disk() {
+        let status: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "3.1.16",
+                "server_build_id": 2_000,
+                "server_pid": 79,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "restored_live_sessions": 0,
+                "terminal_session_count": 0,
+                "terminal_session_keys": [],
+                "preserved_terminal_owner_count": 0,
+                "preserved_terminal_owner_keys": [],
+                "managed_session_count": 0,
+                "running_build_id": 1_000,
+                "on_disk_build_id": 2_000,
+                "server_build_commit": "abc1234",
+                "hot_restart_pending": true,
+            }))
+            .expect("status");
+        let endpoint = yggterm_server::default_endpoint(std::path::Path::new("/tmp/yggterm-test"));
+        let json = server_status_json(&endpoint, &status);
+
+        assert_eq!(
+            json.get("running_build_id").and_then(serde_json::Value::as_u64),
+            Some(1_000),
+            "the build the PROCESS is running has to be on the wire — nothing \
+             outside the process can derive it once the file was replaced"
+        );
+        assert_eq!(
+            json.get("on_disk_build_id").and_then(serde_json::Value::as_u64),
+            Some(2_000)
+        );
+        assert_eq!(
+            json.get("server_build_commit")
+                .and_then(serde_json::Value::as_str),
+            Some("abc1234")
+        );
+        assert_eq!(
+            json.get("build_superseded_on_disk")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "and the verdict itself, so a reader does not have to know that \
+             server_build_id describes the FILE rather than the process"
         );
     }
 
