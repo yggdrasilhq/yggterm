@@ -194,14 +194,38 @@ def main():
         time.sleep(3)
     log(f"transcript carries {ack}: {seen}")
 
-    # 7. ARM THE SUPERVISION PLANE. A lane nothing watches is a lane that stalls
-    #    unnoticed, which is how this campaign lost most of an afternoon.
+    # 7. ARM **BOTH** SUPERVISION PLANES, AND THEY ARE SEPARATE STORES.
+    #
+    # ⛔⛔ THE BOOTER WAKES; THE MONITOR ROUTES. Arming only the booter produces a
+    # row that something will nudge and whose escalations reach NOBODY — the
+    # monitor lists exactly that state as "armed on the booter but escalating to
+    # nobody: a stall would ring into an empty room". The first two lanes this
+    # verb spawned landed in it, because this step armed one plane and called the
+    # job done.
+    #
+    # ⚠ And the monitor subscription must name the ORCHESTRATOR, not a human. A
+    # subscription whose `escalate_to` points at a retired row swallows every cry
+    # for help and reports success: measured today with FIVE lanes all escalating
+    # to an orchestrator folded hours earlier, which is why the monitor appeared
+    # to fire only when everything had gone quiet. It was never firing at all.
     boot = os.path.join(HERE, "ygg-booter.py")
     if os.path.exists(boot):
         subprocess.run([sys.executable, boot, "subscribe", "--row", row,
                         "--campaign", a.seat.split(".")[0]],
                        capture_output=True, text=True, timeout=120)
         log("armed on the booter")
+    mon = os.path.join(HERE, "ygg-monitor.py")
+    me = (os.environ.get("YGGTERM_SESSION_ID") or "").rsplit("/", 1)[-1]
+    if os.path.exists(mon) and me:
+        subprocess.run([sys.executable, mon, "subscribe", uuid,
+                        "--machine", a.machine_key, "--role", "relay",
+                        "--escalate-to", me, "--escalate-host", a.machine_key,
+                        "--campaign", a.seat.split(".")[0], "--seat", a.seat],
+                       capture_output=True, text=True, timeout=120)
+        log(f"subscribed on the monitor, escalating to {me[:8]}")
+    elif not me:
+        log("⚠ no YGGTERM_SESSION_ID — the monitor subscription would escalate to nobody,")
+        log("  so it was SKIPPED rather than written pointing at a human card.")
 
     print(row)
     return 0 if seen else 6
