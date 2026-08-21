@@ -19752,7 +19752,22 @@ fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
             }
         }
         "web.tab.new" => {
-            open_web_surface_tab(state, &session, WebTabOpenRequest::blank());
+            // ⭐ Ctrl+T spawns AT the active row, not at the top — the header's
+            // "+" is the gesture that means "top". See `WebTabOrigin::Here`.
+            // With no active row to sit at (an empty surface), `blank_here`
+            // falls back to the top on its own, so there is no second answer
+            // to "where does a new tab go" written here.
+            let active = state.with(|shell| {
+                shell
+                    .web_surfaces
+                    .get(&session)
+                    .map(|surface| surface.active_tab)
+            });
+            let request = match active {
+                Some(active) => WebTabOpenRequest::blank_here(active),
+                None => WebTabOpenRequest::blank(),
+            };
+            open_web_surface_tab(state, &session, request);
         }
         "web.address" => {
             // Focus AND select, so the next keystroke replaces the URL rather

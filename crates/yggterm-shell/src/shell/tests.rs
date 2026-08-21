@@ -53852,6 +53852,108 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(web_omnibox_palette_target("go", "   "), None);
     }
 
+    /// ⛔⛔ A COMPLETE HOST IS A DESTINATION, NOT A PREFIX. Owner-reported:
+    /// *"when I type just youtube.com understand that I want to go to
+    /// youtube.com and not youtube.com/some-pat-url-i-visited"*.
+    ///
+    /// The inline completion requires a candidate strictly LONGER than what was
+    /// typed, so the bare host — the one candidate equal to it — is the single
+    /// thing it could never offer. Typing a full domain therefore always
+    /// completed to whichever deep URL scored highest, and Enter went there.
+    #[test]
+    fn a_typed_out_host_stops_the_inline_completion() {
+        let visited = [
+            "https://youtube.com/watch?v=abc",
+            "https://www.youtube.com/feed/subscriptions",
+            "https://example.org/a/deep/page",
+        ];
+        let seen = || visited.iter().copied();
+
+        assert!(
+            omnibox_typed_is_a_whole_host("youtube.com", seen()),
+            "the host is typed out in full — stop completing past it"
+        );
+        assert!(
+            omnibox_typed_is_a_whole_host("example.org", seen()),
+            "a host that only ever appears with a path still counts: the host \
+             is what was typed"
+        );
+        assert!(
+            !omnibox_typed_is_a_whole_host("youtu", seen()),
+            "a genuine PREFIX must still complete — this rule must not turn the \
+             omnibox off"
+        );
+        assert!(
+            !omnibox_typed_is_a_whole_host("youtube.com/", seen()),
+            "⛔ after a slash the user is navigating INTO the site, and \
+             completing the path is exactly what they want"
+        );
+        assert!(
+            !omnibox_typed_is_a_whole_host("youtube.com/wat", seen()),
+            "same, mid-path"
+        );
+        assert!(
+            !omnibox_typed_is_a_whole_host("localhost", seen()),
+            "no dot, so it is not a host being typed out — leave it alone"
+        );
+        assert!(
+            !omnibox_typed_is_a_whole_host("neverbeenhere.com", seen()),
+            "a host with no history behind it has nothing to complete from \
+             anyway, and must not be special-cased into silence"
+        );
+        // `www.` is the site, not a different one.
+        assert!(omnibox_typed_is_a_whole_host("YouTube.COM", seen()), "case");
+    }
+
+    /// ⛔⛔ THE PALETTE'S TRIGGER, NOT ITS DERIVATION. The test below already
+    /// proved that a draft raises the palette, and it was right — and the
+    /// palette still failed to open on a plain click, because the UI had a road
+    /// into the field that never reached the state at all. Owner-reported:
+    /// *"Not all omnibox highlight in vertical tab mode spawn the command
+    /// palette."*
+    ///
+    /// `web_surface_begin_address_edit` had exactly ONE non-test caller,
+    /// `focus_web_omnibox` — the path Ctrl+L and a new typing-ready tab take.
+    /// Clicking the input focused the DOM, selected its text (the "highlight"
+    /// the report names) and set no draft. One gesture, two outcomes, decided by
+    /// which code path happened to focus the field.
+    ///
+    /// ⇒ Asserted against the SOURCE, because the handler is RSX that no unit
+    /// test can dispatch a focus event into. A state-level assertion is exactly
+    /// what was already there and exactly what missed this.
+    #[test]
+    fn focusing_the_omnibox_begins_the_address_edit_however_it_was_focused() {
+        let source = include_str!("right_rail.rs");
+        let (_, after_focus) = source
+            .split_once("onfocus: {")
+            .expect("the omnibox input has a focus handler");
+        let handler = after_focus
+            .split_once("\n                },")
+            .expect("the handler closes")
+            .0;
+        // ⛔ CODE ONLY. The first version of this guard searched the handler
+        // verbatim and was satisfied by the COMMENT above the call, which names
+        // the function it is explaining — so it passed against a handler whose
+        // call had been deleted. That is the second source guard in one day to
+        // be answered by its own prose. Strip the comments and there is nothing
+        // left to fool it with.
+        let code: String = handler
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("web_surface_begin_address_edit"),
+            "focus must BEGIN THE EDIT, whoever caused it — otherwise a click \
+             highlights the text and raises no palette, while Ctrl+L does both"
+        );
+        assert!(
+            code.contains("address_draft.is_some()") || code.contains("has_draft"),
+            "and it must not reset a draft the user is already typing into: \
+             beginning the edit rewrites the draft from the tab's URL"
+        );
+    }
+
     /// ⛔ The palette is a `TopModal` or it is INVISIBLE: a native web surface
     /// draws above all DOM, so a palette raised over a browsing session is
     /// behind the page unless the reconciler stashes the surface first.
@@ -56891,6 +56993,98 @@ mod webtabs_menu_switcher_locks {
             .iter()
             .map(|tab| tab.id)
             .collect()
+    }
+
+    /// ⭐ CTRL+T LANDS WHERE THE USER IS; THE "+" LANDS AT THE TOP. Owner
+    /// requirement, 2026-08-21: *"When I am at say row 34 and press ctrl+t I
+    /// want the new row to spawn at 34 and the old one moved to 35, not the new
+    /// one at the top."* Both gestures used to be `Top`, so a keyboard user
+    /// working far down the rail was thrown back to row 1 every time.
+    #[test]
+    fn ctrl_t_takes_the_active_row_while_the_plus_button_still_takes_the_top() {
+        // app(0) and five pages; the user is on id 4, which is row 4.
+        let rows: Vec<_> = (0..6).map(|id| placement_row(id, None, None)).collect();
+
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Here(4)),
+            WebTabPlacement {
+                index: 4,
+                group_head: None,
+                opener: None
+            },
+            "the new tab takes the active row's slot and pushes it down one"
+        );
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Top),
+            WebTabPlacement {
+                index: 1,
+                group_head: None,
+                opener: None
+            },
+            "⛔ the header + is a DIFFERENT gesture and still means row 1 — if \
+             this ever equals the line above, the two have been re-unified and \
+             the owner asked for them to differ"
+        );
+
+        // ⛔ The app tab can never be displaced, whatever is active.
+        assert_eq!(web_tab_placement(&rows, &WebTabOrigin::Here(0)).index, 1);
+
+        // An active row that has gone away between the keystroke and the mint
+        // falls back to the top rather than inventing a slot.
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Here(99)),
+            WebTabPlacement {
+                index: 1,
+                group_head: None,
+                opener: None
+            }
+        );
+    }
+
+    /// Ctrl+T inside a group stays in that group, and never unseats its head.
+    #[test]
+    fn ctrl_t_in_a_group_fills_the_group_and_leaves_the_head_alone() {
+        // app(0), head(1), member(2) under it, loose(3).
+        let rows = vec![
+            placement_row(0, None, None),
+            placement_row(1, None, None),
+            placement_row(2, None, Some(1)),
+            placement_row(3, None, None),
+        ];
+
+        // Active row is the HEAD: sit directly under it, inside the group.
+        // Taking the head's own slot would put the new tab outside the group it
+        // was born into AND leave the group headless in one stroke — the same
+        // refusal `Group` already documents.
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Here(1)),
+            WebTabPlacement {
+                index: 2,
+                group_head: Some(1),
+                opener: None
+            }
+        );
+
+        // Active row is a MEMBER: take its slot, and stay in the group rather
+        // than escaping to root.
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Here(2)),
+            WebTabPlacement {
+                index: 2,
+                group_head: Some(1),
+                opener: None
+            }
+        );
+
+        // Active row is loose: take its slot, at root.
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Here(3)),
+            WebTabPlacement {
+                index: 3,
+                group_head: None,
+                opener: None
+            }
+        );
     }
 
     /// The CASCADE, as arithmetic, and it runs UPWARD. Two links opened from one
