@@ -18,41 +18,79 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
+## ⛔ [99.1] A ROW MID-RELAUNCH REPORTS `idle`, WHICH IS THE GREEN LIGHT FOR A SUBMIT
 
 **Status:** OPEN
 
-Two agent rows lost their process during a cross-CLI greeting run. Neither death was
-recorded anywhere, and every instrument that a fleet verb consults kept describing them
-as healthy:
+⚠ **This entry replaces one that claimed the rows were DEAD. They were not, and the
+correction is the useful part.** A codex row lost its process three times during the
+greeting run; each time `owned_terminal_session_count` and `live_terminal_sessions`
+disagreed by one, `server screen` answered *"no session here matches … may have
+gone"*, and `server rows departed` recorded nothing. That reads as a corpse. It was a
+**relaunch**: the daemon brings the CLI back, and minutes later the row was `ready`
+with a live process. **Two readings taken at different moments, and the gap was TIME
+rather than disagreement** — the law this project already carries, walked into anyway.
 
-    owned_terminal_session_count      4      ← the daemon knows
-    live_terminal_sessions          5 entries ← the list does not
-    server rows departed              0      ← the ONE owner of "where did it go and why"
-    server app rows                 live_member:true, presence:live_rail,
-                                    wedge_suspected:false, busy_reason:"idle"
-    server screen                   "no session here matches …"
+What survives the correction, and is a real defect:
 
-⛔ **`busy_reason:"idle"` is the specific danger.** Idle is the green light every
-delivery verb waits for, so a brief aimed at a dead row passes the readiness gate,
-writes into nothing, and the row then has no transcript — which routes it straight to
-the reap. `ygg-fold` decides DEAD by *"uuid not in live"*, and the uuid IS in live, so
-the seat is never reclaimed either: it is held forever by a process that does not exist.
+- **Through the whole relaunch window `server app rows` reports `live_member:true`,
+  `presence:live_rail`, `busy_reason:"idle"`.** Idle is what every delivery verb waits
+  for, so a brief aimed at a row that is mid-relaunch passes the readiness gate and is
+  written into a PTY that is being replaced. Nothing reports a failure.
+- **`server screen`'s wording invites the wrong conclusion.** *"may have gone"* is the
+  blind-instrument answer, and a watchdog that treats it as *"it is gone"* stands down
+  on a live row — the exact confusion `ygg_host`'s header exists to end.
+- **The departure ledger stays silent**, which is correct for a relaunch and leaves a
+  caller no way to tell a relaunch from a departure.
 
-⚖ **The count is its own witness**, and that is what makes this cheap to detect: owned
-and live disagreed by exactly the number of dead rows, both times. Whatever removes a
-PTY from the owned set already knows; nothing tells the live list or the ledger.
+⇒ Recommended: give a relaunching row a state of its own, distinct from idle, so the
+readiness gate refuses it; and let the ledger record a relaunch as such, so the
+distinction between "coming back" and "gone" is answerable rather than inferred from
+two counts.
 
-⇒ Recommended: make the departure ledger the single place a row's disappearance is
-recorded, and derive `live_member` from PTY ownership rather than from a list that is
-only ever appended to. Until then a sweep cannot distinguish a working lane from a
-corpse, which is the assumption every watchdog in the fleet is built on.
+## ⛔ [99.1] NINE CLIs DECLARE NO STARTUP GATE, SO THEIR TRUST PROMPT READS AS TYPEABLE
 
-⚠ Observed in a headless sandbox (`YGGTERM_HOME` + Xvfb, recipe in the field guide).
-The rendering half of that environment does not travel to a desktop; the daemon half is
-the same binary the fleet runs everywhere, and the ledger and the owned/live split are
-both daemon-side. **Reproduce on a desktop before assuming the scope is wider than the
-evidence.**
+**Status:** OPEN
+
+`startup_gate_screen_phrases` was declared for **one** CLI of ten. Codex's has now been
+measured and filled in, and the chain it was causing was watched end to end:
+
+    unrecognised gate  ->  `state: ready`, `may_type: true`
+    delivery verb submits into it
+    a picker consumes navigation keys; one option is `No, quit`
+    the CLI exits; the daemon relaunches it
+    the fresh process comes up at the SAME gate, reporting `idle` again
+
+So every brief aimed at that row is eaten, the row looks healthy throughout, and the
+loop can repeat indefinitely. ⛔ The registry's own doctrine already says an empty list
+means UNMEASURED and warns that a picker *"EATS TYPED INPUT … a sentence typed at it
+produces nothing visible anywhere"*. The mechanism was built; eight of the values were
+never filled.
+
+⇒ Remaining unmeasured: `codex-litellm`, `pi`, `opencode`, `qwen-code`, `kimi`, `muse`,
+`antigravity`, `grok-build`. ⛔ **Do not copy codex's phrases across** — codex-litellm
+plausibly shares them and "plausibly" is what this doctrine exists to refuse. Each is
+now cheap to measure: spawn a row of that CLI into a directory it has never opened, in
+a sandbox (recipe in the field guide), and read the rendered grid.
+
+## ⛔ [99.1] SEVEN CLIs DECLARE THE SAME COMPOSER MARKER, AND AT LEAST ONE WAS A GUESS
+
+**Status:** OPEN
+
+muse draws its composer prompt as U+27E9 `⟩`. The registry declared U+276F `❯`, which
+seven of the ten descriptors carry. Declared wrongly, the readiness probe never finds
+the composer at all: every muse row reports `consuming_input:false` forever, and
+`ygg-deliver` waits out its entire timeout and never sends — measured, four minutes,
+no error anywhere. Corrected for muse; codex and claude-code verified against their
+real composer lines.
+
+⚠ **This is the second occurrence of one defect.** The field's own doc records the
+first: a hardcoded `›` did exactly this to Claude Code on 2026-08-06, and the fix was
+to make the value per-CLI. The mechanism became per-CLI; the values stayed guesses, and
+a default shared by seven entries is where a guess hides among measurements.
+
+⇒ Recommended: measure the remaining seven the same cheap way, and treat a marker
+shared by most of the table as unproven until something has rendered it.
 
 ## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
 

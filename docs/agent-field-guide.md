@@ -2482,6 +2482,55 @@ settled this bug had `remote_machines` EMPTY, which looked wrong until the live
 fixture assembled from what the code accepts tests the code's opinion of itself.
 
 
+## A ROW THAT KEEPS "DYING" MAY BE ANSWERING A QUESTION YOU CANNOT SEE (2026-08-22)
+
+A codex row vanished three times during a cross-CLI greeting run: process gone,
+`server screen` answering *"no session here matches … may have gone"*, and the
+daemon's `owned` count one below its `live` list. It read exactly like a corpse, and
+an entry was filed saying so. **It was wrong.**
+
+The row was sitting at codex's directory-trust gate — a numbered picker whose second
+option is `No, quit`. Codex declared no `startup_gate_screen_phrases`, so the
+classifier answered `state: ready`, `remedy: write to it`, `may_type: true`. A picker
+consumes navigation keys, so the brief written into it was eaten, `quit` was among the
+things it could resolve to, and the CLI exited. **The daemon then relaunched it — back
+to the same gate, reporting `idle` again.** Every brief aimed at that row was eaten,
+the row looked healthy throughout, and nothing anywhere reported a failure.
+
+⇒ Three instruments, three different lies, and the honest one is the GRID:
+
+    server screen --state-only   "ready"        ← classified from an empty vocabulary
+    server app rows              busy_reason:"idle", live_member:true
+    server screen  (the grid)    the actual question, with its options
+
+⛔ **`--state-only` is a classification, not an observation.** It is exactly as good as
+the phrases its CLI declares, and for nine of ten CLIs that list is EMPTY. Read the
+grid before believing `ready` on a row you have not seen do anything.
+
+⚠ **And the counts recover.** `owned` vs `live` disagree only for the relaunch window,
+so a disagreement seen once and re-checked later reads as having healed. Two readings
+at different moments differ by TIME before they differ by anything else — the law this
+guide already carries, walked into while writing this entry.
+
+## A DEFAULT SHARED BY MOST OF A TABLE IS WHERE A GUESS HIDES (2026-08-22)
+
+`composer_marker` is per-CLI data, added after a hardcoded `›` made every Claude Code
+row read as never-ready. **Seven of the ten descriptors then declared the same `❯`.**
+At least one was never measured: muse draws U+27E9 `⟩`, so the readiness probe found no
+composer at all, every muse row reported `consuming_input:false` forever, and
+`ygg-deliver` waited out a full four-minute timeout without ever sending — no error, no
+trace, nothing to notice.
+
+⇒ **The mechanism was made per-CLI and the values stayed guesses.** That is the same
+defect one level up from the one being fixed, and it is invisible precisely because the
+majority value looks like a convention rather than a copy. ⚖ The registry already knows
+the cure and states it for other fields: *EMPTY means UNMEASURED*. A field with no empty
+state needs the equivalent — a record of what has actually been rendered — or the
+default silently becomes an assertion about CLIs nobody has opened.
+
+⭐ Both are now cheap to check: spawn a row of the CLI into a directory it has never
+opened, in the sandbox above, and read the grid.
+
 ## A SANDBOX GUI NEEDS A PRIVATE BUS AND COMPOSITING OFF, OR THE ROW PLANE IS UNTESTABLE (2026-08-22)
 
 `YGGTERM_HOME` gives an isolated DAEMON, and the recipe for that is above. It does
