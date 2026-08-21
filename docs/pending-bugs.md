@@ -58,44 +58,6 @@ this entry wants, because without it nobody can ever tell these two apart.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
-## ⛔⛔ [11.0] THE FLEET'S OWN PROBES ARE A TOP-TWO SOURCE OF THE OWNER'S INPUT BLOCKS
-
-**Status:** OPEN
-
-*Measured 2026-08-21 on the GUI host. Nobody had asked this question: the campaign has
-spent weeks optimising what the product costs him and never once measured what WATCHING
-it costs him.*
-
-**The traffic.** In one 1.3-minute window the GUI served **89 `describe_state` and 26
-`describe_rows`** app-control requests — about **88 agent probes per minute**, roughly
-one and a half per second, none of them from the person using the machine.
-
-**The cost.** Over a 30-minute window, 92 `ui/block` faults: p50 585 ms, p90 1092 ms,
-max 6207 ms, **62.5 seconds of blocked UI thread out of 1788 — 3.5% of wall time**. By
-attribution:
-
-| subject | blocks |
-|---|---|
-| `app_control/request_begin` + `request_end` | **22 (24%)** |
-| `dioxus_render/component_window` | 14 |
-| `terminal_io/dispatch` | 9 |
-| `ui_telemetry/preview_debug` | 7 |
-| `app_declare/daemon_declare_absent` | 6 |
-
-⇒ **A quarter of his input blocks are agents asking his GUI how it is doing.** Every
-supervision instrument this campaign built — the monitor, the booter, the board, the
-watchers, and every orchestrator sampling loop — pays for its readings in his typing
-latency. That is the cheapest large win left in the input lane, and it needs no product
-change at all: it is a question about how often we ask, and whether a read has to cross
-the UI thread.
-
-⚠ **This entry is partly self-inflicted and says so.** Scans that read every seated row
-one request at a time are the worst shape available, and this seat ran two of them today.
-
-**Falsifier:** quiet every fleet probe for ten minutes and re-measure. If
-`app_control/*` attribution does not fall to near zero, the requests are not the cause
-and this entry is wrong.
-
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
 **Status:** OPEN
@@ -1800,8 +1762,39 @@ that produced no incidents now names itself.
 
 ⚠ **`app_control/request_begin` is the agent control plane.** If agent probes are stalling the
 owner's UI thread, then every agent that measures this host is also degrading it — the instrument
-and the load are the same traffic. That needs confirming with more samples before it is treated as
-established; n=2 is a lead, not a verdict.
+and the load are the same traffic. That needed confirming with more samples before being treated as
+established; n=2 was a lead, not a verdict.
+
+### ⭐ CONFIRMED 2026-08-21 AT n=92, AND THE PROBE RATE IS NOW MEASURED TOO
+
+The lead above is established. Over a 30-minute window on the GUI host at 3.1.26, 92 `ui/block`
+faults: p50 585 ms, p90 1092 ms, max 6207 ms, **62.5 s of blocked UI thread out of 1788 — 3.5% of
+wall time.** By attribution:
+
+| subject | blocks | share |
+|---|---:|---:|
+| `app_control/request_begin` + `request_end` | **22** | **24%** |
+| `dioxus_render/component_window` | 14 | 15% |
+| `terminal_io/dispatch` | 9 | 10% |
+| `ui_telemetry/preview_debug` | 7 | 8% |
+| `app_declare/daemon_declare_absent` | 6 | 7% |
+
+**And the traffic that produces it had never been counted.** In one 1.3-minute window the GUI
+served **89 `describe_state` and 26 `describe_rows`** app-control requests — about **88 agent
+probes per minute, roughly one and a half per second**, none of them from the person using the
+machine.
+
+⇒ **A quarter of his input blocks are agents asking his GUI how it is doing.** Every supervision
+instrument this campaign built — the monitor, the booter, the board, the watchers, every
+orchestrator sampling loop — pays for its readings in his typing latency. This is the cheapest
+large win left in the input lane and it needs no product change: it is a question of how often we
+ask, and whether a read has to cross the UI thread at all.
+
+⚠ **Partly self-inflicted, and it must be said.** A scan that reads every seated row one request
+at a time is the worst available shape, and one seat ran two of them the day this was measured.
+
+**Falsifier:** quiet every fleet probe for ten minutes and re-measure. If `app_control/*`
+attribution does not fall to near zero, the requests are not the cause and this is wrong.
 
 ⛔ **What this entry does NOT claim:** that the title chore is innocent. Over the same window
 `copy_generation/title` ran ~1/min at p50 8.7 s with a 20.6 s worst case, and a `background/copy_scan`
