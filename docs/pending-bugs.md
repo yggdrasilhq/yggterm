@@ -1336,6 +1336,38 @@ falsified and was not testable there:** that host's GUI is parented to pid 1, so
 supervised pair to lose. Re-test the supervisor claim where the GUI actually runs under one
 before treating this entry as closed.
 
+## ⛔ [6.7] THE ONE FUNCTION THAT KNOWS WHAT A ZOMBIE IS EXISTS TO FILTER THEM OUT
+
+**Status:** OPEN
+
+*Split out of the 11.15 leak entry below, which is closing: the leak is fixed and proven,
+this half is not, and it belongs to the seat that owns MEMORY > CPU > SPACE rather than to
+the lane that tripped over it.*
+
+The codebase's only zombie awareness is `render_probe::process_still_running`, which
+**excludes state `Z`** so that a corpse is never reported as a survivor. That is CORRECT
+for the question it answers — *did this process really go away* — and it is precisely why a
+daemon accumulating one zombie every fifteen minutes was invisible for the daemons' whole
+uptime. **The one function that knows what a zombie is exists to filter them out, and
+nothing anywhere counts them as a resource.**
+
+**Why it is worth a census and not just a note.** A zombie costs no CPU and almost no
+memory, so nothing complains until the parent has exhausted a pid range — on a daemon
+designed to be version-coexisting and long-lived, that is a real horizon rather than a
+theoretical one. And the failure is silent in the flattering direction: the fleet held
+**233** of them across five daemons before anyone counted, and the count only happened
+because a lane went looking at the process table for an unrelated reason.
+
+**The shape of the fix:** a process-table census in the resource watch — zombie children
+per watched process, beside the existing memory and CPU lines — so that "a long-lived
+process is leaking table entries" is a thing the watch plane reports rather than a thing
+somebody notices. ⛔ Enumerate daemons by their `server daemon` argument, never by binary
+name: a name-based sweep under-reported that 233 as 164. Method:
+`docs/agent-field-guide.md` §"Counting a daemon's zombies".
+
+**Falsified by:** any surface that answers "how many zombie children does this process
+hold" without an agent hand-writing an `awk` over `ps`.
+
 ## ⛔ [11.15] EVERY DAEMON LEAKS A ZOMBIE EVERY FIFTEEN MINUTES, AND NOTHING COUNTS THEM
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -1541,14 +1573,10 @@ accumulates to a file rather than recounting from the trace, because the trace i
 budget and a count re-derived from it can go DOWN — evidence that can evaporate is not
 evidence.
 
-**What remains open — and it is sharper than "nobody looked":** the codebase's only
-zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
-that a corpse is never reported as a survivor. That is CORRECT for a teardown question
-("did this process really go away") and it is precisely why the leak was invisible:
-the one function that knows what a zombie is exists to filter them out, and nothing
-anywhere COUNTS them as a resource. A process-table census in the resource watch is
-not built here — routed to the 6.7 usability/resource-watch seat, which owns
-MEMORY > CPU > SPACE, rather than fixed by this lane.
+⇒ **The other half of this entry's title — "and nothing counts them" — now has its own
+entry**, because it belongs to the resource-watch seat and must not vanish when this one
+closes. See "[6.7] THE ONE FUNCTION THAT KNOWS WHAT A ZOMBIE IS EXISTS TO FILTER THEM
+OUT" above.
 
 ## ⛔⛔ [11.15] A GATE THAT JUDGES THE STORED ANSWER REOPENS ITSELF WHEN THE ANSWER IS BAD
 
