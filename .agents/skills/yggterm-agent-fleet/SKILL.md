@@ -1799,6 +1799,33 @@ demotion mid-turn.
 ⇒ **That state is recoverable by a single `continue`.** A monitor that only
 *detects* stalls and tells a human is doing half the job.
 
+#### ⛔⛔⛔ BUT ONLY WHILE THE ROW IS STILL CHEAP TO RESUME — **NEVER KICK A COLD SESSION**
+
+**This paragraph exists because the two halves of this skill contradicted each
+other and a tool believed the nearer one.** §6 says a cold session is succeeded by
+HARVESTING its transcript and never by prompting it. This section said a stopped
+session is one word from resuming, *with no qualification at all* — so a sweep
+built from this section sent `continue` to rows carrying multi-megabyte
+transcripts, which is exactly what §6 forbids.
+
+⇒ **A `continue` IS an ask.** It does not feel like one, which is the whole
+problem: cold cache × large context multiply, **the prompt is the expense**, and
+it makes the row warm, so replacing it afterwards wastes precisely what the prompt
+just bought.
+
+| the row | the remedy |
+|---|---|
+| small transcript, idle minutes | **one `continue`** — cheap, correct, this section |
+| large transcript, or long cold | ⛔ **harvest → despawn → respawn at the same seat** (§6) |
+
+⭐ **The fork has no middle.** Touch nothing and succeed it from artefacts, or,
+having touched it, keep it. `ygg-fold.py` encodes the split — a cold stall
+classifies as `COLD`, never `STALLED`, and its remedy is a successor brief
+distilled from the row's title, its last written words and its lane branch, with
+nothing asked of the session. The thresholds are `wakeable()` in that file and
+they are an AND: an OR has the strength of the weaker test, which is how a 5 MB
+row gets prompted for being recently idle.
+
 ⛔ Three guards, or the cure is worse than the disease:
 - **Once per stall, never per poll.** A watcher that re-nudges every tick is
   worse than one that never nudges.
