@@ -51,12 +51,55 @@ def lane_branches():
 
 
 def ahead_behind(branch):
+    """⛔⛔ A COMMIT COUNT ANSWERS "HOW MANY SHAs", NOT "WHAT IS UNLANDED".
+
+    `rev-list --count` compares refs. A lane that rebased, or whose patches were
+    landed by cherry-pick, leaves a branch whose commits are all *already in main
+    under different SHAs* — and the count reports it as carrying unlanded work
+    forever. Measured 2026-08-21: `lane/dev/11.9-cli-practice` read ahead=3 with
+    all three commits equivalent to main's. It had nothing to land.
+
+    ⚠ And believing the count is not merely cosmetic: merging such a branch takes
+    its OLD version of every file it touched, so the "land" silently reverts
+    whatever main did to those files since — the pre-rebase-branch-is-a-revert
+    trap. `git cherry` is the instrument that knows the difference, because it
+    compares PATCHES.
+    """
     r = git("rev-list", "--left-right", "--count", f"origin/main...{branch}")
     try:
-        behind, ahead = (int(x) for x in r.stdout.split())
+        behind, refs_ahead = (int(x) for x in r.stdout.split())
     except Exception:
         return None, None
-    return ahead, behind
+    c = git("cherry", "origin/main", branch)
+    if c.returncode != 0:
+        return refs_ahead, behind
+    unlanded = [l for l in c.stdout.splitlines() if l.startswith("+")]
+    return len(unlanded), behind
+
+
+def refs_ahead(branch):
+    """The raw SHA count, kept only so status can SHOW the gap rather than hide it."""
+    r = git("rev-list", "--count", f"origin/main..{branch}")
+    try:
+        return int(r.stdout.strip())
+    except Exception:
+        return 0
+
+
+def stale_base(branch):
+    """Days since the branch left main, and how much of its footprint main has since
+    rewritten. Both together say whether a merge is a landing or a partial revert."""
+    mb = git("merge-base", "origin/main", branch).stdout.strip()
+    if not mb:
+        return None, 0, 0
+    age = git("log", "-1", "--format=%ct", mb).stdout.strip()
+    try:
+        days = (time.time() - int(age)) / 86400
+    except Exception:
+        days = 0
+    mine = set(git("diff", "--name-only", f"{mb}..{branch}").stdout.split())
+    theirs = set(git("diff", "--name-only", f"{mb}..origin/main").stdout.split())
+    return days, len(mine), len(mine & theirs)
 
 
 def cmd_status(_a):
@@ -70,16 +113,29 @@ def cmd_status(_a):
     if not rows:
         log("no lane branches")
         return 0
+    phantom = 0
     for b, ahead, behind in sorted(rows, key=lambda r: -r[1]):
         state = "READY  " if ahead else "landed "
-        log(f"{state} {b:<40} ahead={ahead:<4} behind={behind}")
+        note = ""
+        raw = refs_ahead(b)
+        if raw > ahead:
+            note = f"  ({raw - ahead} commit(s) already in main under other SHAs)"
+            phantom += 1
+        log(f"{state} {b:<40} ahead={ahead:<4} behind={behind}{note}")
     log(f"— {sum(1 for r in rows if r[1])} branch(es) carrying unlanded work")
+    if phantom:
+        log(f"  {phantom} branch(es) look ahead by SHA and are not: their patches are in main.")
     return 0
 
 
 #: Paths whose change cannot alter a build product. Used ONLY to decide whether a
 #: re-merge needs another `cargo check`, never to skip a guard.
 INERT = ("docs/", "CHANGELOG.md", "README.md", ".agents/", "scripts/")
+
+#: A branch whose base is older than this, and whose files main has since changed,
+#: is a revert wearing a merge. Landing it needs an operator to say so out loud.
+STALE_BASE_DAYS = 5
+STALE_OK = False
 
 
 def touches_build(from_ref, to_ref):
@@ -124,8 +180,22 @@ def _land_once(branch, apply_it, attempt, attempts, needs_check=True):
         log(f"⚠ {branch}: cannot compare — skipped")
         return False
     if ahead == 0:
-        log(f"· {branch}: already landed")
+        raw = refs_ahead(branch)
+        if raw:
+            log(f"· {branch}: nothing to land — its {raw} commit(s) are already in main "
+                f"under other SHAs. ⛔ Merging it would restore its older copies of every "
+                f"file it touched. Reset the ref instead: git branch -f {branch} origin/main")
+        else:
+            log(f"· {branch}: already landed")
         return False
+    days, foot, overlap = stale_base(branch)
+    if days and days > STALE_BASE_DAYS and overlap:
+        log(f"⛔ {branch}: left main {days:.0f} days ago and main has since rewritten "
+            f"{overlap} of the {foot} file(s) it touches. A merge here restores its older "
+            f"copies. Cherry-pick the {ahead} commit(s), or rebase the lane, or pass --stale-ok.")
+        if not STALE_OK:
+            return False
+        log(f"  --stale-ok: proceeding over the {days:.0f}-day-old base on an operator's say-so")
     log(f"landing {branch} ({ahead} commit(s), {behind} behind) attempt {attempt}/{attempts}")
     if not apply_it:
         log("  (dry run: nothing merged)")
@@ -198,7 +268,30 @@ def _land_once(branch, apply_it, attempt, attempts, needs_check=True):
         git("worktree", "remove", "--force", wt)
 
 
+def prune_scratch():
+    """⚠ THE `finally` THAT REMOVES THE SCRATCH WORKTREE DOES NOT RUN ON A KILL.
+
+    A land that is interrupted — and on this fleet they are, main moves and
+    operators change their minds — leaves /tmp/ygg-land-<pid> registered forever.
+    Found 2026-08-21: one from a land killed hours earlier, still listed.
+    """
+    out = git("worktree", "list", "--porcelain").stdout
+    for line in out.splitlines():
+        if not line.startswith("worktree /tmp/ygg-land-"):
+            continue
+        path = line.split(" ", 1)[1]
+        try:
+            pid = int(path.rsplit("-", 1)[1])
+        except Exception:
+            continue
+        if os.path.exists(f"/proc/{pid}"):
+            continue
+        git("worktree", "remove", "--force", path)
+        log(f"  pruned scratch worktree of dead land {pid}")
+
+
 def cmd_land(a):
+    prune_scratch()
     targets = lane_branches() if a.all else [a.branch]
     if not a.all and not a.branch:
         log("⛔ name a branch, or pass --all")
@@ -221,7 +314,12 @@ def main():
     ld.add_argument("branch", nargs="?")
     ld.add_argument("--all", action="store_true")
     ld.add_argument("--apply", action="store_true")
+    ld.add_argument("--stale-ok", action="store_true",
+                    help="land over a base older than %d days even though main has since "
+                         "rewritten the files this branch touches" % STALE_BASE_DAYS)
     a = ap.parse_args()
+    global STALE_OK
+    STALE_OK = getattr(a, "stale_ok", False)
     return cmd_status(a) if a.cmd == "status" else cmd_land(a)
 
 
