@@ -18,6 +18,155 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [99.1] A ROW MID-RELAUNCH REPORTS `idle`, WHICH IS THE GREEN LIGHT FOR A SUBMIT
+
+**Status:** OPEN
+
+⚠ **This entry replaces one that claimed the rows were DEAD. They were not, and the
+correction is the useful part.** A codex row lost its process three times during the
+greeting run; each time `owned_terminal_session_count` and `live_terminal_sessions`
+disagreed by one, `server screen` answered *"no session here matches … may have
+gone"*, and `server rows departed` recorded nothing. That reads as a corpse. It was a
+**relaunch**: the daemon brings the CLI back, and minutes later the row was `ready`
+with a live process. **Two readings taken at different moments, and the gap was TIME
+rather than disagreement** — the law this project already carries, walked into anyway.
+
+What survives the correction, and is a real defect:
+
+- **Through the whole relaunch window `server app rows` reports `live_member:true`,
+  `presence:live_rail`, `busy_reason:"idle"`.** Idle is what every delivery verb waits
+  for, so a brief aimed at a row that is mid-relaunch passes the readiness gate and is
+  written into a PTY that is being replaced. Nothing reports a failure.
+- **`server screen`'s wording invites the wrong conclusion.** *"may have gone"* is the
+  blind-instrument answer, and a watchdog that treats it as *"it is gone"* stands down
+  on a live row — the exact confusion `ygg_host`'s header exists to end.
+- **The departure ledger stays silent**, which is correct for a relaunch and leaves a
+  caller no way to tell a relaunch from a departure.
+
+⇒ Recommended: give a relaunching row a state of its own, distinct from idle, so the
+readiness gate refuses it; and let the ledger record a relaunch as such, so the
+distinction between "coming back" and "gone" is answerable rather than inferred from
+two counts.
+
+## ⛔ [99.1] NINE CLIs DECLARE NO STARTUP GATE, SO THEIR TRUST PROMPT READS AS TYPEABLE
+
+**Status:** OPEN
+
+`startup_gate_screen_phrases` was declared for **one** CLI of ten. Codex's has now been
+measured and filled in, and the chain it was causing was watched end to end:
+
+    unrecognised gate  ->  `state: ready`, `may_type: true`
+    delivery verb submits into it
+    a picker consumes navigation keys; one option is `No, quit`
+    the CLI exits; the daemon relaunches it
+    the fresh process comes up at the SAME gate, reporting `idle` again
+
+So every brief aimed at that row is eaten, the row looks healthy throughout, and the
+loop can repeat indefinitely. ⛔ The registry's own doctrine already says an empty list
+means UNMEASURED and warns that a picker *"EATS TYPED INPUT … a sentence typed at it
+produces nothing visible anywhere"*. The mechanism was built; eight of the values were
+never filled.
+
+⇒ Remaining unmeasured: `codex-litellm`, `pi`, `opencode`, `qwen-code`, `kimi`, `muse`,
+`antigravity`, `grok-build`. ⛔ **Do not copy codex's phrases across** — codex-litellm
+plausibly shares them and "plausibly" is what this doctrine exists to refuse. Each is
+now cheap to measure: spawn a row of that CLI into a directory it has never opened, in
+a sandbox (recipe in the field guide), and read the rendered grid.
+
+## ⛔ [99.1] SEVEN CLIs DECLARE THE SAME COMPOSER MARKER, AND AT LEAST ONE WAS A GUESS
+
+**Status:** OPEN
+
+muse draws its composer prompt as U+27E9 `⟩`. The registry declared U+276F `❯`, which
+seven of the ten descriptors carry. Declared wrongly, the readiness probe never finds
+the composer at all: every muse row reports `consuming_input:false` forever, and
+`ygg-deliver` waits out its entire timeout and never sends — measured, four minutes,
+no error anywhere. Corrected for muse; codex and claude-code verified against their
+real composer lines.
+
+⚠ **This is the second occurrence of one defect.** The field's own doc records the
+first: a hardcoded `›` did exactly this to Claude Code on 2026-08-06, and the fix was
+to make the value per-CLI. The mechanism became per-CLI; the values stayed guesses, and
+a default shared by seven entries is where a guess hides among measurements.
+
+⇒ Recommended: measure the remaining seven the same cheap way, and treat a marker
+shared by most of the table as unproven until something has rendered it.
+
+## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
+
+**Status:** OPEN
+
+`ygg-deliver`'s reap destroys a row whose transcript is ABSENT, on the stated premise
+that such a row *"has never written a word, so it was never briefed and cannot become
+anything"*. Measured during the greeting run: a codex row that had been briefed, had
+run a shell command, and had reported its result **had written no transcript at all**
+— no store file existed for it twenty minutes after birth.
+
+⚖ The premise is calibrated on one CLI. `ygg-spawn` allows 90 s of transcript lag from
+a measurement taken on a CLI that accepts a caller-supplied session id, so its row id
+IS its transcript id from the first byte. Four registered CLIs declare
+`id_assigned_at_birth: false`; they mint their own id and write on their own schedule,
+and until then the row's id addresses nothing. ABSENT is literally true for them and
+the inference drawn from it is false.
+
+⛔ **Not fixed by the FOUND/ABSENT/UNMEASURABLE split**, deliberately — that separated
+"we did not look" from "we looked", and this is a case where we looked in the right
+place and the answer is still not evidence.
+
+⇒ Recommended, and NOT taken here because it needs a measurement this lane does not
+have: find out how long after birth each `id_assigned_at_birth:false` CLI first writes
+a store file, and treat ABSENT inside that window as UNMEASURABLE. **Do not guess the
+threshold** — too short destroys working lanes, too long lets briefless debris hold
+seats, and both failures are silent. A cheaper interim that needs no timing at all:
+ask whether the row has a live agent PROCESS before destroying it, since a row with one
+has manifestly not failed to be born.
+
+## ⛔ [99.1] A FRESHLY BORN AGENT ROW REPORTS AN UNSENT DRAFT NOBODY TYPED
+
+**Status:** OPEN
+
+Both agent rows created during the greeting run were reported as holding a composer
+draft, on a daemon where nothing had ever been typed into either. `terminal submit`
+therefore refused the FIRST message a row is ever sent — its brief — with
+`submitted:false` and *"the composer holds an unsent draft — refusing to probe, because
+the probe types a marker and clears the line with Ctrl+U and would destroy it"*.
+
+The rendered grid disagrees. `server screen` on that row shows an empty composer: the
+placeholder hint and the status line, nothing typed. Two instruments, one row, opposite
+answers, seconds apart.
+
+⛔ **The refusal is correct behaviour on a wrong reading, which is why it is dangerous.**
+The law forbids retrying `submitted:false`, so a spawner that hits this has no way to
+brief the row it just created, and the row then routes to the reap as never-briefed.
+`send` plus a lone carriage return delivers past it, but that path has no draft guard at
+all — it is the workaround, not the fix.
+
+⚠ On the live plane the same census reported 4 drafts across 36 owned sessions, which is
+plausible and not a mass false positive. So the trigger is something about a NEW row, not
+the detector in general. ⚠ Sandbox caveat as above.
+
+⇒ Recommended: find what the detector reads on a composer that has never been typed into,
+and give it a state for "no composer has appeared yet" distinct from "a draft is held" —
+the same distinction `input-check` already draws when it answers *"input readiness is
+unanswerable rather than false"*. A single boolean cannot carry three answers, which is
+the shape of every other defect this run surfaced.
+
+## ⛔ [99.1] THE FLEET VERBS CANNOT BE AIMED AT A SANDBOX, SO THEY ARE NEVER TESTED AGAINST ONE
+
+**Status:** OPEN
+
+`ygg-deliver`, `ygg-spawn`, `ygg-monitor` and `ygg-fold` all reach the row plane as
+`ssh <gui-host> ~/.local/bin/yggterm-headless server app …`. The binary path is a module
+constant and the home it resolves is the real one, so there is no way to point any of
+them at an isolated `YGGTERM_HOME` — `--host` moves which machine answers, never which
+home. A sandbox row plane is now reachable (recipe in the field guide), and these verbs
+still cannot be run against it.
+
+⇒ That is why every defect in them has been found on somebody's live desktop, including
+the three fixed in this lane. Recommended: let the binary and the home come from the
+environment the caller already has to set anyway, so the verbs can be exercised in a
+sandbox before they are trusted with a destructive decision on a real row.
+
 ## ⛔⛔ [11.0] THE CWD TREE'S SELECTION NEVER REACHES THE START PAGE, BECAUSE THE ACTIVE SESSION OVERWRITES IT
 
 **Status:** OPEN

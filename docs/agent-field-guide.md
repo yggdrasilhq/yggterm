@@ -2482,6 +2482,158 @@ settled this bug had `remote_machines` EMPTY, which looked wrong until the live
 fixture assembled from what the code accepts tests the code's opinion of itself.
 
 
+## A ROW THAT KEEPS "DYING" MAY BE ANSWERING A QUESTION YOU CANNOT SEE (2026-08-22)
+
+A codex row vanished three times during a cross-CLI greeting run: process gone,
+`server screen` answering *"no session here matches … may have gone"*, and the
+daemon's `owned` count one below its `live` list. It read exactly like a corpse, and
+an entry was filed saying so. **It was wrong.**
+
+The row was sitting at codex's directory-trust gate — a numbered picker whose second
+option is `No, quit`. Codex declared no `startup_gate_screen_phrases`, so the
+classifier answered `state: ready`, `remedy: write to it`, `may_type: true`. A picker
+consumes navigation keys, so the brief written into it was eaten, `quit` was among the
+things it could resolve to, and the CLI exited. **The daemon then relaunched it — back
+to the same gate, reporting `idle` again.** Every brief aimed at that row was eaten,
+the row looked healthy throughout, and nothing anywhere reported a failure.
+
+⇒ Three instruments, three different lies, and the honest one is the GRID:
+
+    server screen --state-only   "ready"        ← classified from an empty vocabulary
+    server app rows              busy_reason:"idle", live_member:true
+    server screen  (the grid)    the actual question, with its options
+
+⛔ **`--state-only` is a classification, not an observation.** It is exactly as good as
+the phrases its CLI declares, and for nine of ten CLIs that list is EMPTY. Read the
+grid before believing `ready` on a row you have not seen do anything.
+
+⚠ **And the counts recover.** `owned` vs `live` disagree only for the relaunch window,
+so a disagreement seen once and re-checked later reads as having healed. Two readings
+at different moments differ by TIME before they differ by anything else — the law this
+guide already carries, walked into while writing this entry.
+
+## THE SOCKET NAME IS HOW A REBASE TELLS YOU THE BINARY IS STALE (2026-08-22)
+
+A sandbox daemon was built to live-prove a fix after rebasing onto a `3.1.40` main.
+`Cargo.toml` said `3.1.40`; the binary answered `--version 3.1.39` and bound
+**`server-3-1-39.sock`**. The protocol version is `env!("CARGO_PKG_VERSION")` baked at
+compile time, and `yggterm-server` was still cached from before the rebase — the §4.1
+rule *"cargo clean -p yggterm-server before ANY release build after a bump"* applies to
+a REBASE exactly as it does to a bump, which is the case that is easy to miss because
+nobody typed a new version number.
+
+⛔ **A GUI and a daemon that disagree here never meet.** The socket name derives from
+that constant, so the mismatched pair simply binds two different sockets and each
+reports itself healthy — there is no error to notice, and the experiment silently
+measures nothing. ⇒ `grep -o 'server-[0-9-]*\.sock' "$SB/daemon.log"` **before**
+trusting a sandbox daemon; it is the same one-line stamp check §4.1 already recommends,
+and here it is the difference between a live proof and a fiction.
+
+## A DEFAULT SHARED BY MOST OF A TABLE IS WHERE A GUESS HIDES (2026-08-22)
+
+`composer_marker` is per-CLI data, added after a hardcoded `›` made every Claude Code
+row read as never-ready. **Seven of the ten descriptors then declared the same `❯`.**
+At least one was never measured: muse draws U+27E9 `⟩`, so the readiness probe found no
+composer at all, every muse row reported `consuming_input:false` forever, and
+`ygg-deliver` waited out a full four-minute timeout without ever sending — no error, no
+trace, nothing to notice.
+
+⇒ **The mechanism was made per-CLI and the values stayed guesses.** That is the same
+defect one level up from the one being fixed, and it is invisible precisely because the
+majority value looks like a convention rather than a copy. ⚖ The registry already knows
+the cure and states it for other fields: *EMPTY means UNMEASURED*. A field with no empty
+state needs the equivalent — a record of what has actually been rendered — or the
+default silently becomes an assertion about CLIs nobody has opened.
+
+⭐ Both are now cheap to check: spawn a row of the CLI into a directory it has never
+opened, in the sandbox above, and read the grid.
+
+## A SANDBOX GUI NEEDS A PRIVATE BUS AND COMPOSITING OFF, OR THE ROW PLANE IS UNTESTABLE (2026-08-22)
+
+`YGGTERM_HOME` gives an isolated DAEMON, and the recipe for that is above. It does
+not give a row plane: **`terminal new`, `terminal send`, `terminal submit`,
+`input-check` and `app rows` are all answered by a GUI client**, so with no GUI
+there is no way to birth an agent row, and every cross-CLI experiment has had to
+be run on somebody's desktop. `server attach` is not the substitute — it is the
+plain-shell path and hands back a shell whatever scheme you name.
+
+Under Xvfb the GUI registers with the launcher and then dies, leaving a **zero-byte
+launch log**, `registered:true`, and `app clients` = 0 — which reads as "it started
+and something is wrong with app-control" and is really "WebKit died before anything
+could be written". Two things fix it, and it needs BOTH:
+
+```sh
+Xvfb :77 -screen 0 1600x1000x24 &
+dbus-run-session -- env -u WAYLAND_DISPLAY DISPLAY=:77 GDK_BACKEND=x11 \
+  LIBGL_ALWAYS_SOFTWARE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+  WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+  YGGTERM_HOME="$SB" YGGTERM_GOVERNOR=0 "$SB/bin/yggterm" &
+# then: app clients -> count 1, and `terminal new --kind <cli>` works
+```
+
+⚠ `WEBKIT_DISABLE_COMPOSITING_MODE=1` is the one that is easy to leave out —
+software GL and the dmabuf flag alone are not enough, and the failure is silent.
+The daemon reports which arm it took as `YGGTERM_WEBKIT_GL_POLICY` in
+`app clients`: `webkit_compositing_disabled_by_env` is the working sandbox arm,
+`hardware_gl_probed` is the one that dies.
+
+⛔ **This is a SANDBOX arm and it stays in the sandbox.** The presentation policy
+is the law for the owner's machine and none of these variables may be set against
+it — see `docs/presentation-policy.md`. What is learned here about rendering does
+not travel to a Wayland desktop; what is learned about the DAEMON does, because it
+is the same binary.
+
+⚖ **And what a sandbox row costs is real.** Rows launch the actual CLI with the
+actual credentials, because `HOME` stays the real one — which is the point, since
+that is what makes the store layouts genuine. Cap the population and reap it.
+
+## A BRIEF IS A DOC, AND THIS ONE SAID A SECTION HERE DID NOT EXIST (2026-08-22)
+
+A relay brief warned that the field-guide section *"TEST A DAEMON RESTORE AGAINST
+A CRAFTED `YGGTERM_HOME`"* had been renamed or removed, and asked the next lane to
+re-establish the recipe and write it back. **The section exists, under exactly that
+name**, added by the commit that proved the remote restore, and present in `main`
+the whole time.
+
+⇒ Nothing was lost; a lane would simply have rewritten a page that was already
+there, and published a second copy of it — which is how the SSOT law gets broken
+by someone trying to be helpful. **An inherited "this is missing" is a claim, and
+it costs one `grep` to check.** The same rule the fabric skill states for an
+inherited `BLOCKED`.
+
+## A BRANCH NOBODY TAKES CANNOT BE PROVEN BY RUNNING IT (2026-08-22)
+
+`ygg-deliver`'s reap interlock — the one that decides whether an un-briefed row is
+destroyed — read `row_kind` as a free name. It is a local of `main()`, and a
+module-level function cannot see another function's locals, so **every call raised
+`NameError`**: the interlock was unreachable, and the caller got a traceback and
+exit 1 where the contract promises 6.
+
+⚠ **It shipped through a green suite, and that is the useful part.** Its two
+callsites are the two delivery-FAILURE paths — the timeout and the refused submit.
+Nothing routine goes down them, so no test, no run and no live use had ever
+executed the line. **Python resolves a global at CALL time, so an unbound name in
+a branch nobody takes is indistinguishable from correct code right up until the
+day something is already going wrong** — which is the day it runs.
+
+⇒ **The branches that most need to work are the ones hardest to reach, so their
+correctness has to be established WITHOUT executing them.** That is a scan, not
+another unit test: `tests/test_no_verb_reads_a_name_nothing_binds.py` in the fleet
+skill walks every verb's AST and reports a name read where nothing in scope binds
+it. ~90 lines of stdlib `ast`, deliberately not `pyflakes` — that is not installed
+on these hosts and PEP 668 refuses the install, so the gate would silently not run.
+
+⛔ **The signature was the tell, and it is the cheaper thing to look for.** The
+function took `uri`, `host` and `a`, none of which its body has ever used, and
+omitted the one value it did. **An unused parameter is where a missing one hides.**
+
+⚠ **Writing the scanner reproduced the same class twice, both times QUIETLY.**
+Collecting module-level names with `ast.walk` descends into function bodies, so
+every local reads as a global and the scan reported CLEAN over the very defect it
+was written for. Then, tracking no scope chain, it called all 30 legitimate
+closures findings — and 30 false alarms teach a reader to stop believing a gate as
+surely as one missed finding does. Both polarities are pinned in the test.
+
 ## A UUID'S TAIL IS TWELVE DIGITS, AND THE LEAK GUARD READ IT AS AN ID NUMBER (2026-08-22)
 
 `ygg-privacy-guard` refused a push carrying a GENERATED upstream adblock rule, on
