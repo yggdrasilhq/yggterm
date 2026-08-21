@@ -62782,6 +62782,125 @@ mod terminal_loop_input_starvation_locks {
 }
 
 #[cfg(test)]
+mod preview_refresh_render_loop_locks {
+    use super::*;
+
+    // ⛔⛔ THE BRANCH THAT FOUND NOTHING TO DO RE-RENDERED THE WHOLE APP, AND
+    // THEN ASKED ITSELF AGAIN.
+    //
+    // Measured on the GUI host 2026-08-21: 23,456 root `app` renders in nine
+    // minutes — 43.9/s sustained, 141 s of CPU — with the render instrument
+    // attributing 95.9% of every write in the window to one call site in the
+    // preview-refresh effect. It ran for the first ten minutes after launch
+    // and then stopped by itself, so it presents as "startup feels janky".
+    //
+    // Two independent halves made the loop, and REPAIRING EITHER ALONE LEAVES
+    // IT SPINNING, which is why both are locked here:
+    //
+    //   · the branch stored `None` as its refresh marker while every sibling
+    //     stored `Some(refresh_marker)`, so the effect's dedup guard — which
+    //     compares incoming against stored — could never match, and
+    //   · it took `with_mut_counted` in order to CALL a scheduler whose two
+    //     refusals are read-only, so a debounced no-op still marked the signal
+    //     dirty, re-ran the effect, and re-entered the branch.
+    //
+    // These are source scans because no pure test can see them: both defects
+    // are about whether the shell still ASKS before it writes.
+
+    fn product(source: &str) -> String {
+        yggterm_core::agent_cli::product_lines(source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn scanned() -> String {
+        product(SHELL_SOURCE)
+    }
+
+    #[test]
+    fn the_scan_is_not_reading_this_test_module() {
+        assert!(
+            !scanned().contains("preview_refresh_render_loop_canary_needle"),
+            "product_lines stopped skipping this module — every scan below \
+             would self-satisfy from its own assertions"
+        );
+    }
+
+    /// HALF ONE: the branch must leave a marker the dedup guard can match.
+    #[test]
+    fn the_no_target_preview_branch_stores_a_marker_it_can_be_deduped_by() {
+        let source = scanned();
+        assert!(
+            source.contains(
+                "            last_preview_refresh_marker.set(Some(refresh_marker));\n        } else {"
+            ),
+            "the no-target preview branch no longer stores its refresh marker — \
+             the effect's dedup guard cannot match a marker that was never \
+             written, so the branch re-enters on every pass"
+        );
+        assert!(
+            !source.contains("set_signal_if_changed(last_preview_refresh_marker, None);\n        } else {"),
+            "the no-target preview branch erases its marker again. That is half \
+             of the 43.9/s render loop: a stored `None` can never equal an \
+             incoming `Some`, so the guard above it is inert"
+        );
+    }
+
+    /// HALF TWO: no mutable borrow may be taken merely to be refused.
+    #[test]
+    fn the_preview_scheduler_is_asked_before_the_state_is_marked_dirty() {
+        let source = scanned();
+        let takers = source.matches("state.with_mut_counted(|shell| {\n                    shell.record_preview_issue_telemetry").count();
+        let guards = source.matches("can_schedule_remote_preview_sync(&shell, &session.session_path)").count();
+        assert_eq!(
+            takers, 2,
+            "the preview-refresh effect's mutable-borrow sites changed shape; \
+             re-read the loop this module documents before moving the lock"
+        );
+        assert_eq!(
+            guards, takers,
+            "a preview-refresh branch takes `with_mut_counted` without the \
+             read-only precheck in front of it. `with_mut` marks the signal \
+             dirty unconditionally, so a refused schedule still costs a whole-app \
+             render — and that render re-runs the effect that asked"
+        );
+    }
+
+    /// THE CONTROL. Both locks above can be satisfied by a precheck that has
+    /// been hollowed out, so the precheck must still refuse for both reasons
+    /// and must still be the single decision the scheduler itself makes.
+    #[test]
+    fn the_precheck_still_refuses_and_is_still_the_one_decision() {
+        let source = scanned();
+        let body = {
+            let from = source
+                .find("fn can_schedule_remote_preview_sync(")
+                .expect("the precheck is gone — the locks above now guard nothing");
+            let rest = &source[from..];
+            let to = rest.find("\nfn ").expect("the precheck has no following item");
+            &rest[..to]
+        };
+        assert!(
+            body.contains("remote_preview_sync_in_flight_for_session(shell, session_path)"),
+            "the precheck stopped refusing a sync that is already in flight"
+        );
+        assert!(
+            body.contains("remote_preview_sync_after_ms"),
+            "the precheck stopped refusing an unexpired debounce — it now says \
+             yes to everything, which restores the storm while both locks pass"
+        );
+        assert!(
+            source.contains("if !can_schedule_remote_preview_sync(shell, session_path) {"),
+            "`schedule_remote_preview_sync` no longer routes its refusals \
+             through the precheck, so the two can drift apart and the caller's \
+             read stops predicting the write"
+        );
+    }
+}
+
+#[cfg(test)]
 mod web_surface_immersion_locks {
     use super::*;
 

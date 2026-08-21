@@ -2005,14 +2005,26 @@ fn app() -> Element {
         let has_fetch_target =
             remote_preview_fetch_target(&state.read().server, &session).is_some();
         if has_fetch_target {
-            let scheduled = state.with_mut_counted(|shell| {
-                shell.record_preview_issue_telemetry(if needs_refresh {
-                    "preview_refresh_request_placeholder"
-                } else {
-                    "preview_refresh_request_active"
+            // Same read-before-write as the `needs_refresh` branch below. This
+            // one self-dedups (it stores `Some(refresh_marker)`) so it never
+            // stormed, but the shape is identical and an unfixed copy of a loop
+            // is where the next one comes from.
+            // ⚠ The read borrow MUST end before `with_mut_counted` takes the
+            // write borrow. Left inline in the `&&`, the temporary `Ref` lives
+            // to the end of the statement and the mutable borrow panics.
+            let will_schedule = {
+                let shell = state.read();
+                can_schedule_remote_preview_sync(&shell, &session.session_path)
+            };
+            let scheduled = will_schedule
+                && state.with_mut_counted(|shell| {
+                    shell.record_preview_issue_telemetry(if needs_refresh {
+                        "preview_refresh_request_placeholder"
+                    } else {
+                        "preview_refresh_request_active"
+                    });
+                    schedule_remote_preview_sync(shell, &session.session_path, 0)
                 });
-                schedule_remote_preview_sync(shell, &session.session_path, 0)
-            });
             last_preview_refresh_marker.set(Some(refresh_marker));
             if scheduled {
                 spawn_remote_preview_payload_sync(
@@ -2026,14 +2038,52 @@ fn app() -> Element {
                 );
             }
         } else if needs_refresh {
-            let scheduled = state.with_mut_counted(|shell| {
-                shell.record_preview_issue_telemetry("preview_refresh_no_target");
-                schedule_remote_preview_sync(
-                    shell,
-                    &session.session_path,
-                    REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
-                )
-            });
+            // ⛔⛔ THIS BRANCH WAS A SELF-SUSTAINING RENDER LOOP, AND EACH HALF OF
+            // IT LOOKED REASONABLE ALONE.
+            //
+            // Measured on the GUI host 2026-08-21: `app` re-rendered 23,456 times
+            // in nine minutes — 43.9/s sustained, 141 s of CPU — and the render
+            // instrument attributed 95.9% of every write in the window to this
+            // one call site. It ran for the first ten minutes after launch and
+            // then stopped on its own, which is why it reads as "startup is
+            // janky" rather than as a bug.
+            //
+            // The loop, both halves required:
+            //
+            //  1. It stored `None` as its refresh marker while every sibling
+            //     branch stores `Some(refresh_marker)`. The dedup guard at the
+            //     top of this effect compares the incoming marker against the
+            //     stored one, so a stored `None` can never match a `Some` — the
+            //     branch re-entered on every single pass, forever.
+            //  2. It took `with_mut_counted` to CALL the scheduler, and the
+            //     scheduler's two refusals are read-only. So a debounced no-op
+            //     still marked the state signal dirty, which re-ran this effect,
+            //     which took the branch again.
+            //
+            // Half 1 guaranteed re-entry; half 2 guaranteed the re-entry was
+            // free to fire immediately. Fixing either alone leaves a loop.
+            //
+            // ⚠ Storing the marker does NOT strand a session whose target
+            // appears later: `schedule_remote_preview_retry_tick` writes
+            // `remote_preview_dirty_epoch`, the epoch is a field of
+            // `refresh_marker`, and a changed epoch makes a new marker that the
+            // guard lets through. The retry chain re-opens this branch; erasing
+            // the marker was never what re-armed it.
+            // ⚠ Scoped so the read borrow is released before the write borrow
+            // below; inline in the `&&` the temporary outlives it and panics.
+            let will_schedule = {
+                let shell = state.read();
+                can_schedule_remote_preview_sync(&shell, &session.session_path)
+            };
+            let scheduled = will_schedule
+                && state.with_mut_counted(|shell| {
+                    shell.record_preview_issue_telemetry("preview_refresh_no_target");
+                    schedule_remote_preview_sync(
+                        shell,
+                        &session.session_path,
+                        REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
+                    )
+                });
             if scheduled {
                 schedule_remote_preview_retry_tick(
                     state,
@@ -2041,7 +2091,7 @@ fn app() -> Element {
                     REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
                 );
             }
-            set_signal_if_changed(last_preview_refresh_marker, None);
+            last_preview_refresh_marker.set(Some(refresh_marker));
         } else {
             last_preview_refresh_marker.set(Some(refresh_marker));
         }
