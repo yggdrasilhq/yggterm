@@ -19776,10 +19776,27 @@ purpose**. It was wired, the suite objected, and the objection was right twice o
 
 ⚠ **This is why it is filed rather than half-shipped.** A migration that is merely present
 is inert; a migration that is called one commit too early is unrecoverable, and it fails on
-the user's real profile at launch rather than in a test. The persistence rule also needs
-re-deciding as part of the same change: today "filed in a folder = saved organization, root
-= browsing session" (`web_tab_is_saved`). The faithful translation is "part of a group =
-organization", and nothing else preserves the old promise.
+the user's real profile at launch rather than in a test.
+
+⛔ **THE GATE IS `tabs_to_open`, NOT `web_tab_is_saved`** — checked against the tree, because
+the obvious-sounding one is the wrong one. `web_tab_is_saved` no longer consults `folder` at
+all: every non-app tab with a URL is saved. What the folder actually governs is what comes
+BACK on a fresh start — `restore || tab.folder.is_some() || (reattach && app_tab)`.
+
+⛔⛔ **AND THE NAIVE TRANSLATION SILENTLY DELETES EVERY GROUP HEAD.** Under folders, a
+group's head row was itself IN the folder, so `folder.is_some()` covered it. Under row
+groups a head at root has **`group_head: None`** — it points at nothing, because nothing
+contains it. So `tab.group_head.is_some()` as the new rule keeps a group's MEMBERS across a
+fresh start and drops the row that NAMES the group, leaving the user's organization headless
+and its label gone. ⇒ The rule has to be *"has a head **or** is one"*: `tab.group_head
+.is_some() || tabs.iter().any(|other| other.group_head == Some(tab.id))`.
+⚠ It fails in the reassuring direction — most tabs survive, so it reads as working.
+
+⛔ **Ids are per-run, so the filter and the pointer interact.** `tabs_to_open` FILTERS, which
+renumbers positions; a persisted head index must be remapped after filtering, and a member
+whose head was filtered out becomes a dangling pointer. `order_web_tabs_by_group` already
+draws a dangling head at root rather than dropping the tab, so that case is survivable — but
+only if the remap happens at all.
 
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
