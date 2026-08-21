@@ -6295,6 +6295,28 @@ act on.
 ⭐ **The discriminator that worked, and it needs no new verb:** **transcript ROW-COUNT growth.** A busy
 row grows; an unreachable one is frozen. Sample twice a few seconds apart.
 
+⛔⛔ **THERE IS A THIRD STATE, AND IT IS THE ONE THE ROW LISTING CANNOT SEE: the session is DEAD.**
+Measured 2026-08-21 against a live orchestrator row. Its transcript had been frozen for 95 minutes,
+NO process on the host carried its uuid — and `server app rows` still listed it as
+`busy: false, busy_reason: "idle"`. So the refusal is correct and unavoidable (there is no composer
+because there is no CLI), while every surface an agent would consult to check first says the row is
+healthy and available.
+
+⇒ The two-state framing above is not enough: **busy** (drains at its turn boundary), **superseded
+socket** (never drains, restart the terminal), **dead** (never drains, and the row is a corpse the
+listing renders as idle). The transcript-growth probe cannot separate the last two — both are frozen
+— so the join to the PROCESS TABLE is what settles it.
+
+⚠ **And `terminal_process_id` is NOT the tell**, though it looks like one. Measured on the same
+listing: it is `None` on **all 120 live agent rows**, including the 8 reading
+`busy_reason: agent_working_daemon` — so it does not discriminate anything on this surface, and a
+reader who reached for it would conclude every row is dead.
+
+⇒ **What this costs:** an agent addressing a dead row pays a 30-second timeout per attempt and gets
+a message describing the wrong cause. Four of six reports from one lane were lost this way before
+the row was checked out-of-band. **`busy_reason: "idle"` currently conflates "waiting for input"
+with "no longer exists".**
+
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
 
