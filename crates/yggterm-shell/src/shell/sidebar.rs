@@ -1046,10 +1046,16 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         return SidebarBusyState::busy("optimistic_terminal_input");
     }
     let sidebar_sample = session_sample_text_for_sidebar_icon(session);
-    if matches!(
-        session.kind,
-        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-    ) {
+    // ⛔ EVERY AGENT CLI, DERIVED FROM THE REGISTRY. This was a hand-written
+    // `Codex | CodexLiteLlm | ClaudeCode`, and the seven CLIs registered after
+    // it fell straight past into the screen-text heuristics below — so an
+    // Antigravity row sat still while its own metadata rail read
+    // `running · working` and its CLI printed `esc to cancel`. The daemon has
+    // computed `working` from THIS descriptor's phrases for every agent kind
+    // since the arm above it was derived (`session.kind.is_agent()` in
+    // `overlay_terminal_runtime_snapshot_session`); only the reader was still
+    // a list. Owner-reported 2026-08-21.
+    if session.kind.is_agent() {
         // Agent CLI sessions: working has exactly ONE source of truth — the
         // DAEMON-authoritative `working` flag, computed from the session's LIVE
         // vt100 screen at snapshot time (esc-to-interrupt SSOT, shared codex/CC

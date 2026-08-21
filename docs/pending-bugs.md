@@ -813,49 +813,129 @@ naming nodes that no longer exist — the JS applies batches inside a try/catch 
 rebuild that follows re-creates the tree, so it should be self-correcting, but "should" is
 the word doing the work.
 
-## ⛔⛔ [11.10] A CLI OTHER THAN CLAUDE CODE IS A SECOND-CLASS CITIZEN IN THE ROW PLANE
+## ⛔⛔ [11.19] AN AGENT CLI'S ROW DOT IS BLIND TO EVERY CLI BUT THREE
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Owner-reported 2026-08-21 with a screenshot, as three separate symptoms he then joined
+*Owner-reported 2026-08-21 with a screenshot, as one of three symptoms he joined
 himself: "since agy's issues are caught it makes me wonder all other CLI except claude code
-might have this title issue." That join is the hypothesis to test, not a settled fact.*
+might have this title issue." The join was right; the three roots are different, so they are
+three entries. The others are [11.19] BORN WITH A PATH and [11.19] A STORE-TITLED CLI.*
 
-**1. The working indicator does not animate.** An Antigravity session was demonstrably
-working — the metadata rail read `running · working`, the CLI showed `Running command…` and
-`esc to cancel` — and the row's indicator did not blink. Claude Code rows do. ⇒ Is the
-animation driven by a signal only Claude Code produces, or by a shared state this
-descriptor never sets?
+**Symptom.** An Antigravity session was demonstrably working — its own metadata rail read
+`running · working`, the CLI showed `Running command…` and `esc to cancel` — and the row's
+indicator did not blink. Claude Code rows do.
 
-**2. A row is not born with the name the spec requires.** The rule: a new agent-CLI or
-libyggterm app row is named `New {machine} {app}`, and a new terminal `New {machine}
-Terminal`. Observed: a `ytop` row launched from a terminal is named after its working
-directory, as a raw absolute path. `New Yedit` also exists today with no machine name, so this is wider than
-terminals.
+**Root.** `sidebar_row_busy_state` (`crates/yggterm-shell/src/shell/sidebar.rs`) reached the
+daemon-authoritative `working` flag through a hand-written
+`matches!(kind, Codex | CodexLiteLlm | ClaudeCode)`. The seven CLIs registered after that line
+fell past it into the screen-text heuristics below, where an ACTIVE agent row whose last frame
+reads like a quiet prompt resolves to idle. The daemon was never wrong: it has computed
+`working` from each descriptor's own measured phrases for every agent kind since the arm that
+writes it was derived from the registry (`overlay_terminal_runtime_snapshot_session`,
+`crates/yggterm-server/src/daemon.rs`). Only the READER was still a list. The same three arms
+also carry `awaiting_user_choice` and `limit_wait`, so seven CLIs had no owner-question dot and
+no limit-wait dot either.
 
-⭐ **Root located, so it need not be re-found.** `live_session_default_title`
-(`crates/yggterm-server/src/lib.rs`) titles a Shell/SshShell **by its cwd** and hands every
-other kind the caller's fallback; the agent-CLI fallback is
-`AgentCliDescriptor::new_session_label` (`crates/yggterm-core/src/agent_cli.rs`), which is
-`New {display_name} Session` and carries **no machine name**. ⚠ One rule, one owner, at least
-six callers — and that function's doc comment states the old intent, so the comment moves
-with the code or it becomes the next wrong signpost.
+**Fix.** The arm is `session.kind.is_agent()`, which `SessionKind::is_agent` derives from the
+descriptor registry — so an eleventh CLI cannot be added into silence.
+`every_agent_cli_blinks_off_the_daemon_working_flag` drives all ten registered CLIs through
+`Some(true)`/`Some(false)`/`None` and fails the build on a reader that stops asking the daemon.
 
-**3. The generated title never arrives.** The row still read `New Antigravity Session` after
-a long working turn. ⚠ **Do not assume the chore simply skips non-Claude CLIs.** A title that
-was generated and never written back is indistinguishable on screen from one never requested,
-and this repo has already recorded both a title livelock and a wrong-decoder-returns-empty
-failure. Establish which of *never asked* / *asked and failed* / *asked, generated, never
-stored* is happening before changing anything.
+**Falsifier (owed on the roll).** Start one row of a non-Codex, non-CC CLI, give it a turn:
+the row's dot must blink while the CLI is working and go steady when the turn ends.
 
-**Why one entry.** All three are the same shape: the per-CLI descriptor is the single owner
-of what a CLI is called and how its state is shown, and each symptom is a place where only
-Claude Code was wired through. ⇒ Fix by the descriptor for every registered CLI at once, and
-apply it across sidebar row, start page card, metadata rail and the `ls` verbs together.
+## ⛔⛔ [11.19] A ROW IS BORN WEARING A PATH, OR A NAME WITH NO MACHINE IN IT
 
-**Falsifier:** spawn one row of every registered CLI kind and one terminal; every row must be
-born `New {machine} {app}` / `New {machine} Terminal`, must animate while its CLI is working,
-and must carry a generated title once its first turn ends.
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Symptom.** The rule the owner stated: a new agent-CLI or libyggterm app row is named
+`New {machine} {app}`, and a new terminal `New {machine} Terminal`. Observed instead, on one
+screen at once: a `ytop` started from a terminal named after its working directory as a raw
+absolute path; an agent row named `New Antigravity Session`; and a `New Yedit` row. None of the
+three said which of three machines it was on.
+
+**Root — one rule that had four owners, and no two agreed.**
+
+1. `live_session_default_title` (`crates/yggterm-server/src/lib.rs`) titled a Shell/SshShell by
+   its **cwd** and handed every other kind whatever fallback the caller had to hand — and those
+   fallbacks were a machine label at one site and a lowercase kind slug at another.
+2. `AgentCliDescriptor::new_session_label` is `New {display_name} Session`, a MENU string by its
+   own contract, doubling as a row name.
+3. A libyggterm app row was titled from `AppVerb::label` — "what the menu item says" — so the
+   row wore the name of the action that made it, identically on every host.
+4. The shell composed its own hints for terminals: `format!("{} terminal", row.label)` and
+   `format!("{} ssh", …)`, i.e. the row the launch came FROM. That is the
+   spawner-names-the-spawned defect `new_session_birth_title` was written to end, fixed for the
+   group menu and still live on the titlebar path.
+
+**Fix.** ONE rule, in core beside the registry that knows every CLI's display name:
+`new_session_birth_title(kind, machine)` → `New {machine} {noun}`, with the noun table driven by
+`SessionKind::ALL` and the agent arm reading `display_name`. The server keeps a thin resolver for
+the one thing core cannot know — which machine the row is landing on — and the shell composes
+nothing at all: every launch surface now passes no hint, so the daemon's rule is the only one.
+An app row is composed where the `Source` stamp is (`start_command_session`), the only point in
+the birth path that knows the row is an app row. `yggterm_core::local_machine_name` is the one
+owner of "what is this machine called", replacing five private `hostname()` copies' worth of the
+same question being asked in the birth path.
+
+⚠ **KNOWN CONSEQUENCE, stated rather than papered over.** An app with several verbs now births
+several rows that read alike (`New box Ytop` three times), because the rule names the APP and
+yggterm never renames an app row afterwards. That is the rule as specified. The honest fix is a
+`row_title` field in the manifest, per verb — a field of its own, not a third borrowing of the
+menu label. Recommended, not taken here: it is new manifest surface and the owner asked for the
+naming rule, not for a manifest change.
+
+**Falsifier (owed on the roll).** Spawn one row of every registered CLI kind, one plain terminal
+and one libyggterm app: every row must be born `New {machine} {app}` / `New {machine} Terminal`,
+and none may contain a `/`.
+
+## ⛔⛔ [11.19] A STORE-TITLED CLI CAN NEVER BE TITLED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Symptom.** An Antigravity row still read `New Antigravity Session` after a long working turn.
+
+**Which of "never asked" / "asked and failed" / "asked and never stored" — measured, not
+assumed.** ytrace on the GUI host, 2026-08-21: **96 `agy_title` events in 91 minutes, all
+`reason: no_title_in_store`, all for one row.** So the chore asked, every tick, and the store
+answered nothing. It was **asked and failed**.
+
+**Root.** `collect_live_antigravity_title_syncs` resolved its home with
+`resolve_yggterm_home()` and then looked for `<home>/.gemini/antigravity-cli/…` — that is
+`~/.yggterm/.gemini/…`, a directory that has never existed. Every lookup missed. Nothing failed
+loudly, because a wrong home is not an error: it is an empty directory, and an empty directory
+answers "this session has no title" in a voice indistinguishable from the truth. The fallback
+that was meant to catch it, `.or_else(|_| dirs::home_dir())`, could not — `resolve_yggterm_home()`
+does not fail, so the correct home lived behind a branch that never ran. Verified live: the
+conversation's title was in the CLI's own `history.jsonl` the whole time.
+
+**The wider half, and why it is the same entry.** There were exactly TWO live title-pickup arms,
+hand-written per CLI — one for Claude Code, one for Antigravity. Seven of the ten registered CLIs
+were in neither. Two of those seven are `TitleAuthority::Store`, which means
+`session_accepts_generated_copy` refuses to generate a title for them ON PURPOSE — so nothing
+asked their store and nothing was allowed to invent one, and their rows could never be titled at
+all.
+
+**Fix.** A descriptor field, `read_live_store_title`, and ONE chore
+(`collect_live_store_title_syncs`) driven by it. The home is
+`startpage::agent_store_home`, isolated into `live_store_title_home()` so
+`the_store_title_home_is_the_agent_store_home` can assert on it rather than a reviewer having to
+notice it. The collapsed chore also picks up the guard the Antigravity arm never had —
+`title_is_owner_set()`, so a row the owner named is not re-read from disk on every tick for ever
+(the livelock shape). The `store_title_miss` trace event now names the id it asked about: a miss
+against a row's BIRTH uuid means the identity rebind failed, which is a different repair from a
+store that is genuinely empty.
+
+**What is still owed, and by whom.** `qwen-code` and `kimi` are store-authoritative with
+`read_live_store_title: None`, so they still cannot be titled.
+`a_store_titled_cli_without_a_live_reader_can_never_be_titled` names exactly those two and fails
+the build if the set changes. Each owes a MEASURED store layout on a real machine: neither had a
+session on the host this was written from, and `kimi`'s `session_store_globs` are **empty** — its
+store is not wired at all, so that one is a scan gap before it is a title gap.
+
+**Falsifier (owed on the roll).** Give a live Antigravity row a turn; within a tick or two the
+row must wear the title its own store holds, and `store_title_miss` must stop repeating for it.
 
 ## ⛔⛔ [11.0] A CLIENT RESTART LEAVES A THIRD OF THE ROWS BLANK, AND THE RESTART IS NOW AUTOMATIC
 
@@ -1719,6 +1799,27 @@ noting on its own, since the instrument that was supposed to identify the flake 
 its name). **Cheap next step for whoever takes this:** run the suite under `--test-threads=1`
 beside a heavy build; if it survives, the population is timing, and an isolation harness is
 aimed at the wrong thing.
+
+**⭐⭐ ONE INSTANCE NOW HAS ITS SHARED STATE NAMED — 2026-08-21 (11.19), and it is SHARED STATE,
+not timing.** `agent_arm_matrix::locality_does_not_fork_the_invocation` failed once in a
+full-suite run and passed in isolation. The assertion diff names the culprit outright: the two
+launch commands it compares differ in `YGGTERM_HOME`, `NPM_CONFIG_PREFIX`, `npm_config_prefix`
+and `PATH`, one side reading `/home/user/.yggterm` and the other a
+`yggterm-persist-drop-<pid>-<nanos>` temp directory. That directory is minted by
+`a_row_dropped_from_the_state_file_leaves_a_record_saying_so` (`lib.rs`), which sets the
+**process-wide** `ENV_YGGTERM_HOME` with `std::env::set_var`, runs, and restores it — while
+every other test in the same binary is running on other threads, and the launch-command builder
+reads that variable to compose its exports. ⇒ **Same-binary thread parallelism over a process-
+global env var.** No second test process and no compiler is needed to reproduce the shape.
+
+⚖ This does not overturn the 11.14 narrowing, which was about two *different* observations with
+a compiler as the only companion; it does mean the population has at least two causes, so
+`--test-threads=1` surviving would NOT prove "the population is timing". **The targeted fix for
+this one is small and worth taking first:** the env-mutating test wants an env mutex (or the
+`YGGTERM_HOME` seam threaded as an argument the way `local_agent_store_vouches_for_session_in`
+and `collect_live_store_title_syncs_in` are), so it stops reaching into a variable other
+threads are reading. Any test that calls `std::env::set_var` in this workspace is a candidate —
+grep for it before assuming this is the only one.
 
 ## ⚠ [11.10] A STANDING BOOT REFUSAL IS INVISIBLE IN EVERY STATE FILE — ONLY THE LOG KNOWS
 
