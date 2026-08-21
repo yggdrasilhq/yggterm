@@ -66,6 +66,41 @@ mkdir -p "$STATE"
 
 say() { printf '%s ygg-roll-watch %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 
+# ⛔⛔ ASK THE DAEMON TABLE BY FIELD NAME. NEVER BY COLUMN POSITION.
+#
+# Both readers here used `awk '{print $4}'` over the human table, and $4 is the
+# BUILD column only while the FIRST listed daemon is the starred one. It is not,
+# during the exact window this loop exists to manage: right after a swap the
+# outgoing daemon lists first WITHOUT a star, the star moves to the newcomer, and
+# every column shifts by one — so $4 returns the outgoing daemon's UPTIME.
+#
+# Caught 2026-08-21 in this file's own log, which read
+#   `after deploy: live daemon runs 0.8h (disk is at 3.1.32)`
+# and nothing failed. That is the dangerous half: the value is compared against a
+# commit sha, an uptime string never equals one, so the "is the fleet already
+# current" gate answers NO forever — and this loop's answer to NO is to roll,
+# which RESTARTS THE OWNER'S GUI. An hourly timer over that reading is an hourly
+# unnecessary restart of the machine he is working on, each one looking
+# deliberate.
+#
+# ⇒ `server daemons --json` has named fields — `build_commit`, and
+#   `is_default_endpoint` for the one this CLI actually talks to — and has all
+#   along. A positional parse of a table meant for a human was never necessary.
+daemon_build() {
+  ssh -n "$1" '~/.local/bin/yggterm-headless server daemons --json 2>/dev/null' \
+    | python3 -c '
+import json,sys
+try: ds = (json.load(sys.stdin) or {}).get("daemons") or []
+except Exception: sys.exit(0)
+# The default endpoint is the one every verb reaches; fall back to the first
+# listed only when nothing claims to be default, and never to a column index.
+for d in ds:
+    if d.get("is_default_endpoint"):
+        print(d.get("build_commit") or ""); sys.exit(0)
+if ds: print(ds[0].get("build_commit") or "")
+'
+}
+
 tick() {
   # ⛔ ASK THE BUILD HOST, NOT THIS ONE. The deploy tree lives where the fleet
   # builds; running this from the desktop must not turn into a desktop build.
@@ -82,8 +117,7 @@ tick() {
   local main_sha; main_sha="$(ssh -n "$build_host" "cd $DEPLOY_TREE && git fetch -q origin && git rev-parse --short=12 origin/main" 2>/dev/null)"
   if [ -z "$main_sha" ]; then say "⛔ could not read origin/main from $build_host — skipping"; return 0; fi
 
-  local running; running="$(ssh -n "$live_host" '~/.local/bin/yggterm-headless server daemons 2>/dev/null' \
-                            | awk '/^ *\*?[ ]*[0-9]+ /{print $4; exit}')"
+  local running; running="$(daemon_build "$live_host")"
   if [ -z "$running" ]; then say "⛔ no daemon answered on $live_host — skipping"; return 0; fi
 
   if [ "$running" = "$main_sha" ]; then
@@ -184,8 +218,7 @@ tick() {
   # ⚠ THE DAEMON ADOPTS ON ITS OWN TERMS AND THAT IS NOT A FAILURE. It defers
   # while its own sessions are active, which on a machine that is always active
   # can be a long time. Report the gap; never force it, and never wait for it.
-  local after; after="$(ssh -n "$live_host" '~/.local/bin/yggterm-headless server daemons 2>/dev/null' \
-                        | awk '/^ *\*?[ ]*[0-9]+ /{print $4; exit}')"
+  local after; after="$(daemon_build "$live_host")"
   say "after deploy: live daemon runs $after (disk is at $ver)"
 
   # ⛔⛔ NOTIFY, THEN RESTART THE CLIENT. THIS FILE USED TO REFUSE, AND THAT WAS
