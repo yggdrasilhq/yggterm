@@ -53,6 +53,7 @@ and the why decides the action. This plane adds the judgement:
 """
 import argparse
 import collections
+import hashlib
 import importlib.util
 import json
 import os
@@ -82,6 +83,12 @@ CPU_SAMPLE_SECS = 3
 # worth a human's or an orchestrator's attention at all.
 IDLE_ESCALATE_SECS = 900
 EPISODES = STATE / "monitor-episodes"
+# Two screen reads this far apart. Long enough that a painting row differs, short
+# enough that the check is affordable on every subscriber every tick.
+SCREEN_FREEZE_SAMPLE_SECS = 6
+# Three samples, so a thinking agent that happens to render two identical frames
+# is not mistaken for a frozen one.
+SCREEN_FREEZE_SAMPLES = 3
 
 
 def log(m):
@@ -368,6 +375,89 @@ def _busy_descendant(pid, host=None, younger_than=None):
             continue
         return f"{cmd[:110]} ({age}s old)"
     return None
+
+
+def screen_sha(gui_host, row):
+    """A stable digest of what the daemon currently holds as this row's SCREEN.
+
+    Returns None when the read fails, which is BLIND and must never be read as
+    "unchanged" — two Nones would compare equal and manufacture the very verdict
+    this function exists to support."""
+    reply = ygg(gui_host, "server", "app", "terminal", "read-buffer", row, "--mode", "screen")
+    if reply.get("__unreachable__"):
+        return None
+    text = ((reply.get("data") or {}).get("text"))
+    if text is None:
+        return None
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+
+
+def invisible_worker(gui_host, row, uuid, host=None):
+    """⛔⛔ THE ROW IS WORKING AND ITS SCREEN IS FROZEN — so it looks DEAD and is not.
+
+    **Owner-reported 2026-08-21 as "I cannot work if I cannot see it".** A row was
+    spawned for him, he clicked it, and got a viewport that never changed. Measured
+    over 18 s, sampled three times:
+
+    | plane | reading |
+    |---|---|
+    | daemon screen | BYTE-IDENTICAL, `running: None`, `client_host: None` |
+    | transcript | 84 -> 121 records, 297 KB, mtime 7 s ago |
+
+    The agent was working hard the entire time. Nothing in the fleet could say so:
+    every liveness instrument we own reads ONE of those planes. A screen reader
+    calls it dead; a transcript reader calls it healthy; **both are right about
+    what they measured and neither describes what the human sees.**
+
+    ⭐ **THE DISCRIMINATOR IS THE DISAGREEMENT ITSELF**, and it is cheap: two screen
+    reads a few seconds apart plus one stat of the transcript. Neither plane alone
+    can detect it, which is exactly why it went unnamed for so long.
+
+    ⚠ **The remedy TYPES NOTHING.** `sessions restore` re-attaches the row and the
+    screen starts updating again — verified live on the row that produced this
+    entry (digest changed on the very next read, and kept changing). That makes
+    this the safest possible automatic action in the whole supervision plane: it
+    cannot land in anybody's composer, so it needs none of the guards that make
+    waking a row dangerous.
+
+    Returns (is_invisible, why)."""
+    # ⛔⛔ THE FIRST CUT OF THIS FIRED ON A HEALTHY ROW, CAUGHT ON ITS FIRST LIVE
+    # TEST, and the reason is worth more than the fix. It accepted EITHER "the
+    # transcript grew during the sample" OR "the transcript was written recently".
+    # The second arm is not evidence of anything: a row that finished a turn 20 s
+    # ago has a fresh transcript and a legitimately static screen, which is the
+    # single most common state on the board. An OR between a strong signal and a
+    # weak one is only ever as strong as the WEAK one.
+    #
+    # ⚠ And a 6 s window was too short by itself: a thinking agent repaints its
+    # spinner about once a second, but two samples can still land on identical
+    # frames. ⇒ Three samples across a longer window, ALL identical, AND the
+    # transcript must have GROWN BETWEEN THE FIRST AND LAST READ. Both halves are
+    # now positive evidence taken over the same interval, which is the only way
+    # the disagreement between the two planes means anything.
+    t0 = _transcript_for(uuid, host)
+    digests = []
+    for i in range(SCREEN_FREEZE_SAMPLES):
+        d = screen_sha(gui_host, row)
+        if d is None:
+            return False, "screen unreadable — blind is not frozen"
+        digests.append(d)
+        if i + 1 < SCREEN_FREEZE_SAMPLES:
+            time.sleep(SCREEN_FREEZE_SAMPLE_SECS)
+    if len(set(digests)) > 1:
+        return False, ""                      # painting; nothing to see here
+    t1 = _transcript_for(uuid, host)
+    if not t0 or not t1:
+        return False, "no transcript to compare against"
+    if t1[1] <= t0[1]:
+        # Frozen screen AND a transcript that did not move: the row is simply
+        # idle, which is a different verdict with a different remedy. Leave it to
+        # the classifier below rather than re-attaching a row nobody is using.
+        return False, ""
+    window = SCREEN_FREEZE_SAMPLE_SECS * (SCREEN_FREEZE_SAMPLES - 1)
+    return True, (f"screen digest identical across {window}s ({SCREEN_FREEZE_SAMPLES} samples) "
+                  f"while the transcript grew {t1[1] - t0[1]} bytes in the same window — "
+                  f"the row is WORKING and INVISIBLE")
 
 
 def refine(state, uuid, host=None):
@@ -1697,6 +1787,33 @@ def tick(a):
         raw = bs.classify(uuid, rhost)
         state, why = refine(raw, uuid, rhost)
         row = bs.resolve_row_path(a.gui_host, uuid) or f"remote-cc://{_host_of(s, 'host')}/{uuid}"
+
+        # ⛔⛔ BEFORE ANY VERDICT: is this row WORKING AND INVISIBLE? A frozen
+        # screen over a growing transcript is the one fault where every other
+        # instrument here is confidently wrong — a screen reader calls it dead,
+        # a transcript reader calls it healthy, and the human sees a viewport
+        # that never changes. It is checked FIRST because acting on any other
+        # verdict while the row is invisible treats a display fault as a
+        # behavioural one, and the remedy for those two could not be more
+        # different: this one types NOTHING.
+        invisible, invisible_why = invisible_worker(a.gui_host, row, uuid, rhost)
+        if invisible:
+            log(f"{uuid[:8]} INVISIBLE     {invisible_why}")
+            if a.dry_run:
+                log(f"  DRY would re-attach {row}")
+            else:
+                reply = ygg(a.gui_host, "server", "app", "sessions", "restore", row)
+                restored = (reply.get("data") or {}).get("restored") or []
+                # ⛔ Read the EFFECT, not the request. The verb answers about what
+                # it was asked to do; the digest answers whether the screen moved.
+                after = screen_sha(a.gui_host, row)
+                moved = after is not None and after != screen_sha(a.gui_host, row)
+                log(f"  ⇒ re-attached ({len(restored)} row(s)); screen "
+                    + ("is painting again" if moved else "has not moved yet — watch it"))
+            # A display fault is not a behavioural one. Do not also escalate it as
+            # idle/stuck this tick; the next tick judges the row on a live screen.
+            _ep_save(uuid, {"escalated": None, "last_age": raw.get("age", 0)})
+            continue
         log(f"{uuid[:8]} {state:<12} {raw['age']//60:>3}m  {why or raw.get('tail','')[:60]}")
 
         # ⛔ ESCALATE ONCE PER EPISODE, NOT ONCE PER TICK.
