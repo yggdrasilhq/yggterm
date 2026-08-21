@@ -574,11 +574,13 @@ differing** (`scripts/underglass-sandbox.sh`, Wayland-native, no XWayland):
 ⚠ `11.9` before `11.10` means the ten-before-two trap is now pinned on the render path in
 pixels, not only in the comparator's own suite.
 
-**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image, so his
-sidebar draws the old order until it restarts — and that restart is deliberately not taken
-here (he is using the machine, and `ygg-roll-watch.sh` will not restart a GUI on a timer by
-design). **Falsifier:** after his GUI comes up on an image containing `10711945`, one
-screenshot of the live sidebar shows `11.0`'s members in ascending order with no verb run.
+**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image
+(`139c6a39`, checked after the land), so his sidebar draws the old order until it restarts.
+That restart is not taken by this lane — he is using the machine. ⚠ It does not need a human
+any more either: an owner ruling reversed the roll's old refusal and `ygg-roll-watch.sh` now
+notifies, waits out a grace window and restarts the client, so the next roll carries this.
+**Falsifier:** once the GUI is up on an image containing `f9626a58`, one screenshot of the
+live sidebar shows `11.0`'s members in ascending order with no verb run.
 
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
