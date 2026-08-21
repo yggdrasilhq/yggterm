@@ -218,6 +218,43 @@ remedy is the same either way — do not put it first — but the distinction de
 **Falsifier:** spawn two lanes with identical briefs, one told to claim first and one seated
 by the orchestrator and told to start on the work. Count turns before the first stall.
 
+## ⛔⛔ [11.10] `sessions sort` REPORTS `changed: true` AND THE TREE DOES NOT MOVE — IT IS BLIND TO ROW SETS
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-21, twice, as rows not being in ascending order — and it is not the
+comparator, which is correct and has a test for exactly this.*
+
+**The comparator is right.** `sort_by_outline` in `yggterm-core::session_outline` parses a seat
+into `Vec<u64>` and sorts numerically; its test suite already pins the trap
+(`a_tenth_lobe_does_not_sort_before_the_second`). Nothing about `11.9` vs `11.10` is wrong there.
+
+**Two things are wrong around it.**
+
+1. **The sort only runs when a verb asks for it.** `sort_by_outline` is called from exactly two
+   places, and the sidebar's continuous rendering is neither of them — the shell calls it only
+   inside `AppControlCommand::SortSessions`. So the rendered order is whatever order rows
+   happened to arrive in, and correct order is a manual repair somebody has to remember. Every
+   spawn, fold and re-group therefore leaves the sidebar wrong until a human notices.
+
+2. **⛔ And running the verb does not fix a nested row.** `sessions sort` orders the flat
+   `live_sessions` list. The sidebar draws ROW SETS, and a set's children render in membership
+   order, so a sorted flat list changes nothing a reader can see. Measured: after the verb
+   returned `changed: true` with an applied order placing `11.9` immediately after `11.0`, the
+   tree still rendered `11.20, 11.21, 11.10, 11.13, 11.15, 11.9, 11.16, 11.19`.
+
+⚠ **`changed: true` is the instrument lying.** It describes the flat list it rewrote, not the
+tree the person is looking at — so the one verb that exists to fix this reports success while
+the symptom stays on screen, which is why it survived being run.
+
+**What is wanted.** Outline order is a property of the seats, not of arrival: the tree should
+render it continuously, including inside a row set, and `sessions sort` should either reach set
+members or say plainly that it cannot. ⇒ Until then an orchestrator must re-sort after every
+row-set change, and that is a workaround, not the fix.
+
+**Falsifier:** nest three rows seated `11.9`, `11.10` and `11.20` into one set in that reverse
+order, then read the rendered tree. They must draw `11.9, 11.10, 11.20` with no verb run at all.
+
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
 **Status:** OPEN
