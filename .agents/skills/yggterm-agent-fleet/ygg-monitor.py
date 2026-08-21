@@ -275,6 +275,37 @@ def _run(host, argv, timeout=25):
         return None
 
 
+#: The same veto `ygg-fold` reads, in the same window: a row states its status in
+#: its first line and then writes about everything else, so searching the BODY
+#: finds it talking ABOUT finishing rather than saying it has.
+STAYING_RE = re.compile(
+    r"\b(holding as|still holding|watch continues|not unsubscribing|"
+    r"staying subscribed|remain subscribed|continuing to watch|"
+    r"i will keep|monitor is never finished)\b",
+    re.I,
+)
+
+
+def _last_prose(uuid):
+    """The row's last assistant text, read from its transcript. ⛔ Never ASK the
+    row — that is a wake, and this runs on a timer."""
+    import glob as _g
+    hits = _g.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
+    if not hits:
+        return ""
+    try:
+        recs = [json.loads(l) for l in open(hits[0], errors="replace") if l.strip()]
+    except Exception:
+        return ""
+    for rec in reversed(recs):
+        if rec.get("type") != "assistant":
+            continue
+        for blk in (rec.get("message") or {}).get("content") or []:
+            if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text", "").strip():
+                return blk["text"].strip()
+    return ""
+
+
 def cli_process(uuid, host=None):
     """The agent CLI process for this session, on the host that owns it.
 
@@ -1946,6 +1977,19 @@ def tick(a):
                 once("dead", f"NO AGENT PROCESS — its transcript has been still for "
                              f"{raw['age']//60}m because the process is GONE, not because "
                              f"it is thinking. Reap it; there is nothing to give work to")
+                continue
+            # ⛔ AND THE ROW'S OWN OPENING WORDS. `ygg-fold` has vetoed on this for
+            # weeks — a row that opens "staying subscribed" / "holding as monitor"
+            # is declaring itself live — and the monitor, which sends the message
+            # a person actually reads, had no such veto. Measured 2026-08-21: a
+            # working lane whose last turn opened *"Staying subscribed — the thing
+            # this lane watches is live"* was escalated fifteen minutes later as
+            # "most likely FINISHED its scope". Two classifiers, one question, and
+            # only one of them consulted the row.
+            last = _last_prose(uuid) if "_last_prose" in globals() else ""
+            if last and STAYING_RE.search(last[:240]):
+                log(f"  ⏳ idle {raw['age']//60}m but its opening declares it is STAYING — "
+                    f"no verdict offered")
                 continue
             until = _deferred_until(uuid)
             if until:
