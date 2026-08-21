@@ -11925,6 +11925,44 @@ fn collect_remote_cc_title_syncs(
     updates
 }
 
+/// The source state a generation ran against, as the ledger stores it.
+///
+/// `None` when the candidate carries no source timestamp at all — an unknown
+/// source must read as "may have changed", never as "unchanged", or a row with
+/// no timestamp would be locked out of generation for good.
+fn copy_generation_source_stamp(source_updated_at: Option<OffsetDateTime>) -> Option<String> {
+    source_updated_at.map(|at| at.unix_timestamp_nanos().to_string())
+}
+
+/// Whether re-running generation for this session can produce a different
+/// answer than the last run did.
+///
+/// ⛔ **The treadmill this closes.** Both copy gates ask whether what is STORED
+/// is any good: a title counts as missing while the stored one is a generated
+/// fallback, and a summary needs refreshing while the stored one reads as
+/// low-signal. So a generation that fails — and honestly records `untitled
+/// session`, which is itself a fallback — reopens its own gate, and the same
+/// unchanged session re-pays a ~9.3 s LLM call on every eligible pass, forever.
+/// The comment at the failure site said so outright ("next tick will retry
+/// because untitled session is itself a fallback") and treated it as the
+/// design. Measured 2026-08-21: 6.4 hours of title generation and 1.9 hours of
+/// summary generation in one retention window.
+///
+/// ⚠ Deliberately NOT a retry timer. A timer says "try again later"; this says
+/// the only true thing available — the input has not changed, so the output
+/// cannot. A session that grows gets a fresh attempt immediately, which is the
+/// behaviour a backoff would have delayed for nothing.
+fn copy_generation_can_differ_from_last_attempt(
+    last_attempt_stamp: Option<&str>,
+    source_stamp: Option<&str>,
+) -> bool {
+    match (last_attempt_stamp, source_stamp) {
+        (Some(last), Some(current)) => last != current,
+        // Never attempted, or nothing to compare against: let it run.
+        _ => true,
+    }
+}
+
 /// Whether the background copy chore should (re)generate a title.
 /// Live local agent sessions (user bug 5) carry a cwd-derived launch-hint
 /// title the fallback recognizer can't enumerate, so for them the resolver
@@ -12074,10 +12112,58 @@ fn build_background_copy_updates(
             continue;
         }
 
+        // ⛔ The unchanged-source gate. Everything above asks whether what is
+        // STORED is good enough; nothing above asks whether re-running could
+        // possibly help. For a session whose transcript has not moved since the
+        // last attempt, it cannot — so an attempt that produced a rejected
+        // answer is not repeated until the source itself changes.
+        let source_stamp = copy_generation_source_stamp(candidate.source_updated_at);
+        let title_missing = title_missing
+            && copy_generation_can_differ_from_last_attempt(
+                resolver
+                    .generation_attempt_stamp(&candidate.session_id, "title")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+                source_stamp.as_deref(),
+            );
+        let summary_missing = summary_missing
+            && copy_generation_can_differ_from_last_attempt(
+                resolver
+                    .generation_attempt_stamp(&candidate.session_id, "summary")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+                source_stamp.as_deref(),
+            );
+        if !title_missing && !summary_missing {
+            continue;
+        }
+
         if rate_limited_this_tick
             || llm_generations_this_tick >= BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK
         {
             continue;
+        }
+        // ⚠ Recorded HERE, past the rate-limit and budget guards, because a
+        // call that was never made is not an attempt. Recording it earlier
+        // would let a 429 storm mark every session as tried and freeze
+        // generation until each one next changed.
+        if let Some(stamp) = source_stamp.as_deref() {
+            if title_missing {
+                let _ = resolver.record_generation_attempt(
+                    &candidate.session_id,
+                    "title",
+                    stamp,
+                );
+            }
+            if summary_missing {
+                let _ = resolver.record_generation_attempt(
+                    &candidate.session_id,
+                    "summary",
+                    stamp,
+                );
+            }
         }
         llm_generations_this_tick += 1;
         if let Ok(home) = crate::resolve_yggterm_home() {
@@ -28027,6 +28113,51 @@ mod tests {
         let picked = super::remote_cc_title_poll_paths(&explicit_but_blank, &working, &confirmed);
         let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
         assert_eq!(paths, vec!["remote-cc://practice/aaaa"]);
+    }
+
+    /// The unchanged-source gate, which is what stops an unchanged session
+    /// re-paying a ~9.3s LLM call on every pass.
+    #[test]
+    fn generation_repeats_only_when_the_source_moved() {
+        assert!(
+            super::copy_generation_can_differ_from_last_attempt(None, Some("100")),
+            "a session nobody has tried gets its attempt"
+        );
+        assert!(
+            super::copy_generation_can_differ_from_last_attempt(Some("100"), Some("200")),
+            "a transcript that grew can produce a different answer — and gets \
+             its attempt IMMEDIATELY, which a retry timer would have delayed"
+        );
+        assert!(
+            !super::copy_generation_can_differ_from_last_attempt(Some("100"), Some("100")),
+            "⛔ the treadmill: the same source cannot produce a different \
+             answer, however unsatisfying the stored one looks"
+        );
+        // Unknown source state must read as "may have changed". The opposite
+        // default would lock a row with no timestamp out of generation for good.
+        assert!(super::copy_generation_can_differ_from_last_attempt(
+            Some("100"),
+            None
+        ));
+        assert!(super::copy_generation_can_differ_from_last_attempt(None, None));
+    }
+
+    /// The stamp is the source's identity, and two different source times must
+    /// not collide into one.
+    #[test]
+    fn the_source_stamp_names_the_source_state() {
+        use time::OffsetDateTime;
+        let earlier = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let later = OffsetDateTime::from_unix_timestamp(1_700_000_600).unwrap();
+        assert_ne!(
+            super::copy_generation_source_stamp(Some(earlier)),
+            super::copy_generation_source_stamp(Some(later))
+        );
+        assert_eq!(
+            super::copy_generation_source_stamp(Some(earlier)),
+            super::copy_generation_source_stamp(Some(earlier))
+        );
+        assert_eq!(super::copy_generation_source_stamp(None), None);
     }
 
     /// The writer's own half of the same law: a refusal and a no-op both
