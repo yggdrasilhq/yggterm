@@ -273,6 +273,42 @@ impl CliTitleOutcome {
     }
 }
 
+/// One row's title outcome for one chore tick.
+fn title_payload(
+    session_path: &str,
+    kind: SessionKind,
+    session_id: &str,
+    chore: CliTitleChore,
+    outcome: CliTitleOutcome,
+    detail: Value,
+) -> Value {
+    let mut payload = json!({
+        "session_path": session_path,
+        "slug": slug_of(kind),
+        "session_id": session_id,
+        "chore": chore.label(),
+        "outcome": outcome.label(),
+    });
+    merge(&mut payload, CliKeyScheme::of(kind, session_path).payload());
+    merge(&mut payload, detail);
+    payload
+}
+
+/// The tick summary one chore emits.
+fn sweep_payload(
+    chore: CliTitleChore,
+    considered: usize,
+    untitled: usize,
+    counts: &BTreeMap<&'static str, usize>,
+) -> Value {
+    json!({
+        "chore": chore.label(),
+        "considered": considered,
+        "left_untitled": untitled,
+        "by_outcome": counts,
+    })
+}
+
 /// The edge-trigger memory: the last signature emitted per (chore, row).
 ///
 /// ⚖ A `Mutex<HashMap>` and not a lock-free structure because it is touched
@@ -305,14 +341,13 @@ fn sweep_state() -> &'static Mutex<HashMap<CliTitleChore, (BTreeMap<&'static str
 /// descriptor drove this row and how is it keyed", is emitted only for agent
 /// kinds, and derives every field from the registry rather than from the
 /// callsite. Neither can be reconstructed from the other.
-pub fn emit_birth(
-    component: &str,
+fn birth_payload(
     session_path: &str,
     kind: SessionKind,
     session_id: &str,
     machine: Option<&str>,
     cwd_present: bool,
-) {
+) -> Value {
     let scheme = CliKeyScheme::of(kind, session_path);
     let mut payload = json!({
         "session_path": session_path,
@@ -329,6 +364,19 @@ pub fn emit_birth(
             .is_some_and(|descriptor| descriptor.read_live_store_title.is_some()),
     });
     merge(&mut payload, scheme.payload());
+    payload
+}
+
+/// A row was created for an agent CLI.
+pub fn emit_birth(
+    component: &str,
+    session_path: &str,
+    kind: SessionKind,
+    session_id: &str,
+    machine: Option<&str>,
+    cwd_present: bool,
+) {
+    let payload = birth_payload(session_path, kind, session_id, machine, cwd_present);
     crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "birth", payload);
 }
 
@@ -368,7 +416,12 @@ pub fn emit_launch(component: &str, kind: SessionKind, shape: CliInvocationShape
         component,
         CLI_PLANE_CATEGORY,
         "launch",
-        json!({
+        launch_payload(kind, shape),
+    );
+}
+
+fn launch_payload(kind: SessionKind, shape: CliInvocationShape<'_>) -> Value {
+    json!({
             "slug": slug_of(kind),
             "kind": format!("{kind:?}"),
             "action": shape.action,
@@ -378,8 +431,7 @@ pub fn emit_launch(component: &str, kind: SessionKind, shape: CliInvocationShape
             "extra_arg_tokens": shape.extra_arg_tokens,
             "persistent": shape.persistent,
             "id_origin": CliIdOrigin::declared_for(kind).label(),
-        }),
-    );
+    })
 }
 
 /// One chore tick's pass over the live rows: it records an outcome per row and
@@ -448,15 +500,14 @@ impl CliTitleSweep {
             return;
         }
 
-        let mut payload = json!({
-            "session_path": session_path,
-            "slug": slug_of(kind),
-            "session_id": session_id,
-            "chore": self.chore.label(),
-            "outcome": outcome.label(),
-        });
-        merge(&mut payload, CliKeyScheme::of(kind, session_path).payload());
-        merge(&mut payload, detail);
+        let payload = title_payload(
+            session_path,
+            kind,
+            session_id,
+            self.chore,
+            outcome,
+            detail,
+        );
         crate::perf::ytrace_emit_event(self.component, CLI_PLANE_CATEGORY, "title", payload);
     }
 
@@ -495,12 +546,7 @@ impl CliTitleSweep {
             self.component,
             CLI_PLANE_CATEGORY,
             "title_sweep",
-            json!({
-                "chore": self.chore.label(),
-                "considered": considered,
-                "left_untitled": self.untitled,
-                "by_outcome": self.counts,
-            }),
+            sweep_payload(self.chore, considered, self.untitled, &self.counts),
         );
     }
 }
@@ -596,5 +642,89 @@ mod tests {
         let mut base = json!({"a": 1});
         merge(&mut base, json!({"b": 2}));
         assert_eq!(base, json!({"a": 1, "b": 2}));
+    }
+
+    /// The bytes a written trace line costs beyond its payload — `ts_ms`, `pid`,
+    /// `component`, `category`, `name` and the JSON punctuation around them.
+    /// Measured off a live trace file, where a 195-byte line carried an 81-byte
+    /// payload.
+    const LINE_ENVELOPE_BYTES: usize = 114;
+
+    /// ⛔⛔ STATE THE PROBE'S SHARE OF THE PLANE, AND KEEP STATING IT.
+    ///
+    /// Trace retention is a BYTE budget shared by every lane, so a probe's cost
+    /// is taken out of everyone else's window. One lane's span-per-flush turned
+    /// out to be 48.7% of all trace bytes and halved every other lane's
+    /// retention — measured only after it had shipped.
+    ///
+    /// ⇒ The share is asserted here rather than written in a commit message,
+    /// because a number in a commit message describes the day it was written
+    /// and this one has to stay true. The live plane it is measured against
+    /// carried **86.9 KiB/min over a 99.9-minute, 40,248-event window**.
+    ///
+    /// The steady state is what matters: birth and launch are per-session
+    /// events (a person opening a row), while the two title chores tick
+    /// continuously forever. With every row's outcome unchanged — the normal
+    /// case, since a title is picked up once and then stays — an edge-triggered
+    /// chore emits nothing per row, and the whole recurring cost of this module
+    /// is one heartbeat sweep per chore.
+    #[test]
+    fn the_cli_plane_states_its_share_of_the_trace_byte_budget() {
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        // A deliberately unkind sweep: every outcome present at once, which is
+        // the widest `by_outcome` map the payload can carry.
+        for outcome in CliTitleOutcome::ALL {
+            counts.insert(outcome.label(), 7);
+        }
+        let sweep = sweep_payload(CliTitleChore::Remote, 49, 21, &counts);
+        let sweep_bytes = serde_json::to_string(&sweep).expect("payload serialises").len()
+            + LINE_ENVELOPE_BYTES;
+
+        let sweeps_per_hour = 2 * (3600 / SWEEP_HEARTBEAT.as_secs() as usize);
+        let steady_bytes_per_hour = sweeps_per_hour * sweep_bytes;
+
+        // The measured plane, over the window this was calibrated against.
+        const PLANE_KIB_PER_MIN: usize = 87;
+        let plane_bytes_per_hour = PLANE_KIB_PER_MIN * 1024 * 60;
+        let share_per_mille = 1000 * steady_bytes_per_hour / plane_bytes_per_hour;
+
+        assert!(
+            share_per_mille <= 10,
+            "the CLI plane's steady-state cost is {steady_bytes_per_hour} bytes/hour, \
+             {}.{}% of a {PLANE_KIB_PER_MIN} KiB/min plane — state the new share and \
+             justify it before raising this ceiling",
+            share_per_mille / 10,
+            share_per_mille % 10
+        );
+
+        // The per-event half, bounded so a field added to birth or launch is a
+        // decision rather than a drift.
+        let birth = birth_payload(
+            "remote-example://build-box/6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            SessionKind::ClaudeCode,
+            "6f1c0d84-2a7b-4e59-9c30-8d51b2a4e7f6",
+            Some("build-box"),
+            true,
+        );
+        let launch = launch_payload(
+            SessionKind::ClaudeCode,
+            CliInvocationShape {
+                action: "resume",
+                selector: "--resume",
+                carries_id: true,
+                re_roots_with_cwd: false,
+                extra_arg_tokens: 2,
+                persistent: true,
+            },
+        );
+        for (name, payload) in [("birth", &birth), ("launch", &launch)] {
+            let bytes =
+                serde_json::to_string(payload).expect("payload serialises").len() + LINE_ENVELOPE_BYTES;
+            assert!(
+                bytes <= 600,
+                "the {name} event costs {bytes} bytes; it fires once per session event, \
+                 so it is affordable, but a field was added without anyone saying so"
+            );
+        }
     }
 }
