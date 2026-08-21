@@ -349,11 +349,11 @@ fn WebOmniboxBar(
     let address_text = overlay.address_text.clone();
     let address_editing = overlay.address_editing;
     let suggestions = overlay.address_suggestions.clone();
-    let suggestion_index = overlay.address_suggestion_index;
-    // Dropdown rows: 0 = the synthesized go/search row (what plain Enter does),
-    // 1.. = history matches.
-    let dropdown_rows = if address_editing && !address_text.trim().is_empty() {
-        1 + suggestions.len()
+    // How many rows the PALETTE is offering, which is what the inline field's
+    // arrow keys have to step through — the palette and this field are two views
+    // of one selection, so the count must be the palette's, not a second tally.
+    let dropdown_rows = if address_editing {
+        web_omnibox_palette_items(&address_text, &suggestions).len()
     } else {
         0
     };
@@ -660,93 +660,13 @@ fn WebOmniboxBar(
                 "🕘"
             }
         }
-        // Omnibox dropdown: normal flow below the bar. Over the page this
-        // flow-push shrinks the [data-ws-page] rect (the native surface follows);
-        // in the rail it is just the top rows.
-        if dropdown_rows > 0 {
-            div {
-                style: format!(
-                    "display:flex; flex-direction:column; padding:2px 10px 8px; background:{background}; \
-                     border-bottom:1px solid rgba(127,127,127,0.25); user-select:none;",
-                ),
-                {
-                    let draft = address_text.trim().to_string();
-                    let go_label = match web_surface_address_to_url(&draft) {
-                        Some(url) if !url.contains("{q}")
-                            && (url == draft
-                                || url == format!("https://{draft}")
-                                || url == format!("http://{draft}")) => {
-                            format!("Go to {url}")
-                        }
-                        _ => format!("Search for \"{draft}\""),
-                    };
-                    let row_style = |selected: bool| {
-                        format!(
-                            "display:flex; align-items:center; gap:8px; padding:5px 12px; border-radius:8px; \
-                             cursor:pointer; font-size:12.5px; color:{}; background:{};",
-                            foreground,
-                            if selected { "rgba(127,127,127,0.22)".to_string() } else { "transparent".to_string() },
-                        )
-                    };
-                    let go_row_style = row_style(suggestion_index == Some(0));
-                    let commit_path = nav_path.clone();
-                    let commit_ssh = nav_ssh.clone();
-                    rsx! {
-                        div {
-                            style: "{go_row_style}",
-                            onclick: {
-                                let draft = draft.clone();
-                                move |_| {
-                                    let tab_id = state.with(|shell| {
-                                        shell.web_surfaces.get(&commit_path).map(|surface| surface.active_tab)
-                                    });
-                                    if let Some(tab_id) = tab_id
-                                        && let Some(url) = web_surface_address_to_url(&draft)
-                                    {
-                                        navigate_web_surface_tab(state, commit_path.clone(), tab_id, url, commit_ssh.clone(), None);
-                                    }
-                                }
-                            },
-                            span { style: "opacity:0.6; flex:0 0 auto;", "→" }
-                            span {
-                                style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                "{go_label}"
-                            }
-                        }
-                        for (row, (sug_url, sug_title)) in suggestions.iter().enumerate() {
-                            div {
-                                key: "ws-sug-{row}",
-                                style: row_style(suggestion_index == Some(row + 1)),
-                                onclick: {
-                                    let nav_path = nav_path.clone();
-                                    let nav_ssh = nav_ssh.clone();
-                                    let sug_url = sug_url.clone();
-                                    move |_| {
-                                        let tab_id = state.with(|shell| {
-                                            shell.web_surfaces.get(&nav_path).map(|surface| surface.active_tab)
-                                        });
-                                        if let Some(tab_id) = tab_id {
-                                            navigate_web_surface_tab(state, nav_path.clone(), tab_id, sug_url.clone(), nav_ssh.clone(), None);
-                                        }
-                                    }
-                                },
-                                span { style: "opacity:0.6; flex:0 0 auto;", "🕘" }
-                                if !sug_title.is_empty() {
-                                    span {
-                                        style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:0 1 auto;",
-                                        "{sug_title}"
-                                    }
-                                }
-                                span {
-                                    style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.55; flex:0 1 auto;",
-                                    "{sug_url}"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // ⛔ NO INLINE DROPDOWN. The results are the CENTRED PALETTE's
+        // (`TopModal::CommandPalette`, mounted with the other over-viewport
+        // modals), which is the owner requirement and DESIGN.md ▸ Search in
+        // chrome both: the result surface wraps the field itself into one
+        // continuous shell rather than hanging a popover under a small input.
+        // A second list drawn here would be that popover, back beside the thing
+        // that replaced it.
     }
 }
 /// The find bar's input. One bar at a time — only the ACTIVE session's surface
@@ -1142,41 +1062,30 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
     // renders the active session, so this is that session's profile.
     let overlay_profile = snapshot.active_web_surface_profile.clone();
 
-    // THE MODEL — one ordered list, folders above tabs, a collapsed folder's
-    // tabs present but not visible. `row_tree` is that same list as the shared
-    // reorder engine sees it and is what a drop resolves against, which is why
-    // a folded-away tab survives a reorder elsewhere in the rail.
-    let rail_rows = web_tab_rail_rows(&overlay.folders, &overlay.tabs);
+    // THE MODEL — one ordered list of TABS, a group's members one level under
+    // their head, a collapsed group's members present but not visible.
+    // `row_tree` is that same list as the shared reorder engine sees it and is
+    // what a drop resolves against, which is why a folded-away tab survives a
+    // reorder elsewhere in the rail.
+    let rail_rows = web_tab_rail_rows(&overlay.tabs);
     let row_tree = web_tab_rail_row_tree(&rail_rows);
-    let folders: HashMap<String, WebTabFolder> = overlay
-        .folders
-        .iter()
-        .map(|folder| (folder.id.clone(), folder.clone()))
-        .collect();
-    let mut folder_counts: HashMap<String, usize> = HashMap::new();
-    for tab in &overlay.tabs {
-        if let Some(folder) = tab.folder.clone() {
-            *folder_counts.entry(folder).or_default() += 1;
-        }
-    }
     let tabs: HashMap<u64, WebSurfaceOverlayTabView> = overlay
         .tabs
         .iter()
         .map(|tab| (tab.id, tab.clone()))
         .collect();
 
-    // ONE row renderer for every rail row — a folder and a tab are the same
-    // kind of thing here, differing only in their leading slot, their trailing
-    // verbs and what a click means. TWO renderers is how the two drifted apart
-    // in the first place: the folder header was a bespoke `div` sharing nothing
-    // with the rows under it.
+    // ⭐ ONE row renderer, and now literally one ARM. Under folders this was a
+    // match with two arms that had drifted apart; a group is headed by a TAB, so
+    // there is no second kind of row left to render. A head differs from any
+    // other row by three optional slots — a chevron, a glyph and a count — and
+    // by one extra verb.
     let row_view = {
         let session_path = session_path.clone();
         let rename = rename.clone();
         move |row: &WebTabRailRow| -> Element {
             let row_id = row.id();
             let depth = row.depth;
-            let is_folder = row.is_folder();
             let is_app_tab = row.row == WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID);
             let (drop_edge, row_is_dragging) = state.with(|shell| {
                 (
@@ -1247,227 +1156,154 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             }
 
             // The row's own vocabulary, resolved once so the rsx below has one
-            // shape for both kinds.
-            let (label, selected, badge, expanded, dot, icon, expander, actions, on_activate) = match &row.row {
-                WebTabMenuTarget::Folder(folder_id) => {
-                    let name = folders
-                        .get(folder_id)
-                        .map(|folder| folder.name.clone())
-                        .unwrap_or_default();
-                    let expanded = folders
-                        .get(folder_id)
-                        .is_none_or(|folder| !folder.collapsed);
-                    let count = folder_counts.get(folder_id).copied().unwrap_or(0);
-                    let (toggle_path, toggle_id) = (session_path.clone(), folder_id.clone());
-                    let (add_path, add_id) = (session_path.clone(), folder_id.clone());
-                    let (sub_path, sub_id) = (session_path.clone(), folder_id.clone());
-                    let (delete_path, delete_id) = (session_path.clone(), folder_id.clone());
-                    let (chevron_path, chevron_id) = (session_path.clone(), folder_id.clone());
-                    (
-                        name,
-                        false,
-                        Some(count.to_string()),
-                        Some(expanded),
-                        // No dot on a folder. `None`, not an empty element: the
-                        // mark COLUMN is laid out by the shared row either way
-                        // (so a folder and the rows under it start their titles
-                        // at one x), but a slot handed `rsx!{}` reserves a box
-                        // for nothing.
-                        None,
-                        // THE folder glyph, from its one owner: filled when the
-                        // folder is open, outline when it is shut, exactly as
-                        // the cwd tree three pixels away draws it.
-                        Some(rsx! { RowFolderIcon { expanded } }),
-                        Some(rsx! {
-                            button {
-                                "data-web-tab-folder-expand": "{folder_id}",
-                                style: row_disclosure_button_style(palette.muted),
-                                title: if expanded { "Collapse folder" } else { "Expand folder" },
-                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                                onclick: move |evt: MouseEvent| {
-                                    evt.stop_propagation();
-                                    let (path, id) = (chevron_path.clone(), chevron_id.clone());
-                                    state.with_mut_counted(|shell| shell.web_tab_toggle_folder(&path, &id));
-                                },
-                                RowDisclosureChevron { expanded }
-                            }
-                        }),
-                        Some(rsx! {
-                            button {
-                                "data-web-tab-folder-new-folder": "{folder_id}",
-                                style: session_row_action_button_style(palette.text),
-                                // A folder holds folders. Without a way to MAKE
-                                // one inside another, nesting would exist only
-                                // for folders that already happened to be there.
-                                title: "New folder inside this folder",
-                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                                onclick: move |evt: MouseEvent| {
-                                    evt.stop_propagation();
-                                    let (path, id) = (sub_path.clone(), sub_id.clone());
-                                    state.with_mut_counted(|shell| {
-                                        shell.web_tab_new_folder_in(&path, Some(id))
-                                    });
-                                },
-                                svg {
-                                    width: "12",
-                                    height: "12",
-                                    view_box: "0 0 14 14",
-                                    fill: "none",
-                                    path {
-                                        d: "M1.9 4.05a1 1 0 0 1 1-1h2.35l1.2 1.4h4.65a1 1 0 0 1 1 1v4.5a1 1 0 0 1-1 1H2.9a1 1 0 0 1-1-1V4.05Z",
-                                        stroke: "currentColor",
-                                        stroke_width: "1.2",
-                                        stroke_linejoin: "round",
-                                    }
-                                }
-                            }
-                            button {
-                                "data-web-tab-folder-add": "{folder_id}",
-                                style: session_row_action_button_style(palette.text),
-                                title: "New tab in this folder",
-                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                                // Same opener as every other "+", so a tab born
-                                // in a folder is typing-ready too.
-                                onclick: move |evt: MouseEvent| {
-                                    evt.stop_propagation();
-                                    let (path, id) = (add_path.clone(), add_id.clone());
-                                    open_web_surface_tab(
-                                        state,
-                                        &path,
-                                        WebTabOpenRequest::blank_in_folder(id),
-                                    );
-                                },
-                                "+"
-                            }
-                            button {
-                                "data-web-tab-folder-delete": "{folder_id}",
-                                style: session_row_action_button_style(palette.text),
-                                // Says what it does: the folder goes, what it
-                                // held moves up one level. Deleting
-                                // organization must never delete content.
-                                title: "Delete folder (its contents move up one level)",
-                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                                onclick: move |evt: MouseEvent| {
-                                    evt.stop_propagation();
-                                    let (path, id) = (delete_path.clone(), delete_id.clone());
-                                    state.with_mut_counted(|shell| shell.web_tab_delete_folder(&path, &id));
-                                },
-                                "🗑"
-                            }
-                        }),
-                        EventHandler::new(move |_| {
-                            let (path, id) = (toggle_path.clone(), toggle_id.clone());
-                            state.with_mut_counted(|shell| {
-                                // The release that commits a drag is also a
-                                // click. One drag must not also toggle the
-                                // folder it landed on.
-                                if shell.consume_suppressed_row_click() {
-                                    return;
-                                }
-                                shell.web_tab_toggle_folder(&path, &id);
-                            });
-                        }),
-                    )
+            // shape whether or not this row heads a group.
+            let WebTabMenuTarget::Tab(tab_id) = row.row;
+            let tab = tabs.get(&tab_id).cloned();
+            let heads_group = row.heads_group;
+            let group_size = tab.as_ref().map(|tab| tab.group_size).unwrap_or(0);
+            let expanded =
+                heads_group.then(|| tab.as_ref().is_none_or(|tab| !tab.group_collapsed));
+            let loading = tab.as_ref().is_some_and(|tab| tab.loading);
+            // BACKGROUND-only, and the view already resolved that — see
+            // `WebSurfaceOverlayTabView::media_playing`. The rail asks
+            // no question about it here, so the rail and the classic
+            // strip cannot answer it differently.
+            let media_playing = tab.as_ref().is_some_and(|tab| tab.media_playing);
+            let (select_path, close_path) = (session_path.clone(), session_path.clone());
+            let (add_path, chevron_path) = (session_path.clone(), session_path.clone());
+            // The app tab's ✕ is shown only while it holds a saved page;
+            // when closable it despawns like any tab (user request: first
+            // tab must despawn, not navigate home to Brave).
+            let app_tab_can_go_home = tab.as_ref().is_some_and(|tab| tab.holds_saved_page);
+            let label = tab.as_ref().map(|tab| tab.label.clone()).unwrap_or_default();
+            let selected = tab.as_ref().is_some_and(|tab| tab.active);
+            // How many rows this one heads — the folder header's count, on the
+            // row that replaced it. `None` on a row that heads nothing, so an
+            // ordinary tab spends no badge box on a "0".
+            let badge = heads_group.then(|| group_size.to_string());
+            // A tab's ONE leading mark is its activity dot; a head carries it
+            // too, because a head is a real page that can be loading or making
+            // noise. Two causes light it — the page is loading, or the engine
+            // says this background tab is playing media — and each gets its own
+            // attribute so a probe (and the falsifier screenshot's companion
+            // read) can tell which.
+            let dot = Some(rsx! {
+                span {
+                    "data-web-tab-loading": if loading { "true" } else { "false" },
+                    "data-web-tab-media": if media_playing { "true" } else { "false" },
+                    title: web_tab_activity_dot_title(loading, media_playing).unwrap_or_default(),
+                    style: web_tab_activity_dot_style(loading, media_playing),
                 }
-                WebTabMenuTarget::Tab(tab_id) => {
-                    let tab_id = *tab_id;
-                    let tab = tabs.get(&tab_id).cloned();
-                    let loading = tab.as_ref().is_some_and(|tab| tab.loading);
-                    // BACKGROUND-only, and the view already resolved that — see
-                    // `WebSurfaceOverlayTabView::media_playing`. The rail asks
-                    // no question about it here, so the rail and the classic
-                    // strip cannot answer it differently.
-                    let media_playing = tab.as_ref().is_some_and(|tab| tab.media_playing);
-                    let (select_path, close_path) = (session_path.clone(), session_path.clone());
-                    // The app tab's ✕ is shown only while it holds a saved page;
-                    // when closable it despawns like any tab (user request: first
-                    // tab must despawn, not navigate home to Brave).
-                    let app_tab_can_go_home =
-                        tab.as_ref().is_some_and(|tab| tab.holds_saved_page);
-
-                    (
-                        tab.as_ref().map(|tab| tab.label.clone()).unwrap_or_default(),
-                        tab.as_ref().is_some_and(|tab| tab.active),
-                        None,
-                        None,
-                        // A tab's ONE leading mark is its activity dot; it
-                        // rides the mark column the folder's glyph sits in, so
-                        // both row kinds start their titles at one x on ONE
-                        // column. Two causes light it — the page is loading, or
-                        // the engine says this background tab is playing media —
-                        // and each gets its own attribute so a probe (and the
-                        // falsifier screenshot's companion read) can tell which.
-                        Some(rsx! {
-                            span {
-                                "data-web-tab-loading": if loading { "true" } else { "false" },
-                                "data-web-tab-media": if media_playing { "true" } else { "false" },
-                                title: web_tab_activity_dot_title(loading, media_playing).unwrap_or_default(),
-                                style: web_tab_activity_dot_style(loading, media_playing),
-                            }
-                        }),
-                        // No glyph, no chevron — and `None`, not `rsx!{}`. An
-                        // EMPTY element is not an absent slot: it reserved a
-                        // 20px icon box plus its gap on every tab row in the
-                        // rail, and a 6px gap for a chevron that was never
-                        // drawn (user report 2026-07-31).
-                        None,
-                        None,
-                        // The app tab's ✕ once QUIT ychrome (a Ctrl+C to the
-                        // app) while this same row's menu refused to close it
-                        // and said why — two affordances on one row
-                        // disagreeing. So it lost the ✕ entirely, and the user
-                        // then had a first tab with no close button at all
-                        // (report + screenshot, 2026-08-01).
-                        //
-                        // Both are avoidable, because the app tab has TWO
-                        // states and only one of them is "the app". While it
-                        // shows a real page it is a real tab — it gets a ✕ that
-                        // despawns the row (user request: first tab must close
-                        // and despawn, not just navigate home to Brave). The
-                        // surface keeps its home via the next heartbeat if
-                        // needed; the closed entry goes to the undo stack.
-                        // Quitting the app still lives where quitting an app
-                        // lives.
-                        (!is_app_tab || app_tab_can_go_home).then(|| rsx! {
-                            button {
-                                "data-web-tab-close": "{tab_id}",
-                                style: session_row_action_button_style(palette.text),
-                                title: "Close tab",
-                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                                onclick: move |evt: MouseEvent| {
-                                    evt.stop_propagation();
-                                    let close_path = close_path.clone();
-                                    state.with_mut_counted(|shell| {
-                                        shell.web_surface_close_tab(&close_path, tab_id);
-                                        shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
-                                    });
-                                },
-                                "✕"
-                            }
-                        }),
-                        EventHandler::new(move |_| {
-                            // A drag's own release is also a click: moving a
-                            // tab must not also switch to it.
-                            if state.with_mut_counted(|shell| shell.consume_suppressed_row_click()) {
-                                return;
-                            }
-                            select_web_surface_tab(
+            });
+            // THE group glyph, from its one owner — filled when the group is
+            // open, outline when it is shut, exactly as the cwd tree three
+            // pixels away draws it. ⛔ `None`, not `rsx!{}`, on every other row:
+            // an EMPTY element is not an absent slot, and it reserved a 20px
+            // icon box plus its gap on every tab row in the rail (user report
+            // 2026-07-31).
+            let icon = expanded.map(|expanded| rsx! { RowFolderIcon { expanded } });
+            let expander = expanded.map(|expanded| rsx! {
+                button {
+                    "data-web-tab-group-expand": "{tab_id}",
+                    style: row_disclosure_button_style(palette.muted),
+                    title: if expanded { "Collapse group" } else { "Expand group" },
+                    onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                    onclick: move |evt: MouseEvent| {
+                        evt.stop_propagation();
+                        let path = chevron_path.clone();
+                        state.with_mut_counted(|shell| shell.web_tab_toggle_group(&path, tab_id));
+                    },
+                    RowDisclosureChevron { expanded }
+                }
+            });
+            // ⛔ AN ABSENT SLOT, not an empty element. A row with neither verb
+            // must hand the shared row `None`: `Some(rsx!{})` draws nothing and
+            // still reserves the box plus its gap on every row in the rail
+            // (DESIGN.md, 2026-07-31).
+            let shows_close = !is_app_tab || app_tab_can_go_home;
+            let actions = (heads_group || shows_close).then(|| rsx! {
+                // The head row's "+", which is what replaced the folder
+                // header's: it fills the GROUP, not the window, and it is
+                // typing-ready like every other "+".
+                if heads_group {
+                    button {
+                        "data-web-tab-group-add": "{tab_id}",
+                        style: session_row_action_button_style(palette.text),
+                        title: "New tab in this group",
+                        onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            let path = add_path.clone();
+                            open_web_surface_tab(
                                 state,
-                                select_path.clone(),
-                                tab_id,
-                                WebTabSelect::User,
+                                &path,
+                                WebTabOpenRequest::blank_in_group(tab_id),
                             );
-                        }),
-                    )
+                        },
+                        "+"
+                    }
                 }
-            };
+                // The app tab's ✕ once QUIT ychrome (a Ctrl+C to the
+                // app) while this same row's menu refused to close it
+                // and said why — two affordances on one row
+                // disagreeing. So it lost the ✕ entirely, and the user
+                // then had a first tab with no close button at all
+                // (report + screenshot, 2026-08-01).
+                //
+                // Both are avoidable, because the app tab has TWO
+                // states and only one of them is "the app". While it
+                // shows a real page it is a real tab — it gets a ✕ that
+                // despawns the row (user request: first tab must close
+                // and despawn, not just navigate home to Brave). The
+                // surface keeps its home via the next heartbeat if
+                // needed; the closed entry goes to the undo stack.
+                // Quitting the app still lives where quitting an app
+                // lives.
+                if shows_close {
+                    button {
+                        "data-web-tab-close": "{tab_id}",
+                        style: session_row_action_button_style(palette.text),
+                        // ⛔ Says what it does NOT do. Closing a head must
+                        // never read as closing the group: its members move up
+                        // one level, exactly as Ungroup would leave them.
+                        title: if heads_group {
+                            "Close tab (its group's tabs move up one level)"
+                        } else {
+                            "Close tab"
+                        },
+                        onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            let close_path = close_path.clone();
+                            state.with_mut_counted(|shell| {
+                                shell.web_surface_close_tab(&close_path, tab_id);
+                                shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
+                            });
+                        },
+                        "✕"
+                    }
+                }
+            });
+            let on_activate = EventHandler::new(move |_| {
+                // A drag's own release is also a click: moving a
+                // tab must not also switch to it.
+                if state.with_mut_counted(|shell| shell.consume_suppressed_row_click()) {
+                    return;
+                }
+                select_web_surface_tab(
+                    state,
+                    select_path.clone(),
+                    tab_id,
+                    WebTabSelect::User,
+                );
+            });
 
             let menu_path = session_path.clone();
             let menu_target = row.row.clone();
             let rename_target = row_id.clone();
             let (down_row, move_row) = (row_id.clone(), row_id.clone());
             let (down_label, move_label) = (label.clone(), label.clone());
-            // A SHUT folder is what spring-load opens under a hovering drag.
+            // A SHUT group is what spring-load opens under a hovering drag.
             let row_collapsed = expanded == Some(false);
             let spring_path = session_path.clone();
             rsx! {
@@ -1479,7 +1315,10 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     // is not clipped by the row's own border radius, the same
                     // reason the contributed rail draws it here.
                     "data-web-tab-row-id": "{row_id}",
-                    "data-web-tab-row-kind": if is_folder { "folder" } else { "tab" },
+                    // ONE kind of row now. The attribute survives — probes and
+                    // the falsifier screenshots key on it — and says whether this
+                    // tab HEADS a group, which is the only distinction left.
+                    "data-web-tab-row-kind": if heads_group { "group" } else { "tab" },
                     "data-web-tab-row-depth": "{depth}",
                     "data-web-tab-row-active": if selected { "true" } else { "false" },
                     "data-web-tab-row-expanded": match expanded {
@@ -1516,11 +1355,13 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             return;
                         }
                         let pointer = evt.client_coordinates();
-                        // Before / inside / after, from the ONE band rule: a
-                        // FOLDER has an inside, a tab does not.
+                        // Before / inside / after, from the ONE band rule.
+                        // ⭐ EVERY row has an inside now, not only the ones that
+                        // already head a group — dropping onto a plain tab is
+                        // how a group is made at all.
                         let placement = row_drop_placement_for_offset(
                             evt.element_coordinates().y,
-                            is_folder,
+                            true,
                         );
                         let (move_row, spring_path) = (move_row.clone(), spring_path.clone());
                         state.with_mut_counted(|shell| {
@@ -1528,8 +1369,8 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 return;
                             }
                             // SPRING-LOAD, from the shared engine's dwell: rest
-                            // inside a shut folder and it opens under the drag,
-                            // so filing a tab two levels down is one gesture
+                            // on a shut group and it opens under the drag, so
+                            // filing a tab two levels down is one gesture
                             // instead of drop-open-drag-again per level.
                             if let Some(sprung) = shell.hover_web_tab_row_drop(
                                 &move_row,
@@ -1537,10 +1378,10 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 placement,
                                 row_collapsed,
                             )
-                                && let Some(WebTabMenuTarget::Folder(folder_id)) =
+                                && let Some(WebTabMenuTarget::Tab(head)) =
                                     web_tab_row_target(&sprung)
                             {
-                                shell.web_tab_toggle_folder(&spring_path, &folder_id);
+                                shell.web_tab_toggle_group(&spring_path, head);
                             }
                         });
                     },
@@ -1592,7 +1433,6 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
     };
 
     let new_tab_path = session_path.clone();
-    let new_folder_path = session_path.clone();
     let end_drag_tree = row_tree.clone();
     rsx! {
         // The tab loading dot blinks with the same keyframes the live-session
@@ -1704,31 +1544,6 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 stroke: "currentColor",
                                 stroke_width: "1.8",
                                 stroke_linecap: "round",
-                            }
-                        }
-                    }
-                    button {
-                        "data-web-tab-new-folder": "1",
-                        style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; \
-                             border:1px solid rgba(127,127,127,0.35); border-radius:7px; background:transparent; \
-                             color:{}; cursor:pointer; padding:0;",
-                            palette.text,
-                        ),
-                        title: "New folder",
-                        onclick: move |_| {
-                            state.with_mut_counted(|shell| shell.web_tab_new_folder(&new_folder_path));
-                        },
-                        svg {
-                            width: "13",
-                            height: "13",
-                            view_box: "0 0 14 14",
-                            fill: "none",
-                            path {
-                                d: "M1.9 4.05a1 1 0 0 1 1-1h2.35l1.2 1.4h4.65a1 1 0 0 1 1 1v4.5a1 1 0 0 1-1 1H2.9a1 1 0 0 1-1-1V4.05Z",
-                                stroke: "currentColor",
-                                stroke_width: "1.2",
-                                stroke_linejoin: "round",
                             }
                         }
                     }
@@ -5561,24 +5376,22 @@ fn viewport_menu_title(kind: ViewportMenuKind) -> String {
 /// to this: the render path from the overlay view, the dispatch path from
 /// `ShellState`'s own tabs. One shape, so "which tabs does this act on" has one
 /// answer no matter who asks.
-type WebTabScopeRow = (u64, Option<String>);
+type WebTabScopeRow = (u64, Option<u64>);
 
 /// The app tab. `tabs[0]` belongs to the APP, not to the tree: it cannot be
 /// closed by a tab verb (quitting the app is the strip's ⏻ / the row's ✕, which
-/// sends a real Ctrl+C) and it cannot be filed into a folder.
+/// sends a real Ctrl+C) and it can neither join a group nor head one.
 const WEB_TAB_APP_TAB_ID: u64 = 0;
 
 fn web_tab_scope_rows(tabs: &[WebSurfaceOverlayTabView]) -> Vec<WebTabScopeRow> {
-    tabs.iter()
-        .map(|tab| (tab.id, tab.folder.clone()))
-        .collect()
+    tabs.iter().map(|tab| (tab.id, tab.group_head)).collect()
 }
 
 /// The tabs a "Close other tabs" on `keep` closes.
 ///
-/// FOLDER-SCOPED, and the label says the number this returns: "other tabs"
-/// means the ones beside it WHERE IT LIVES — a tab filed in "Work" does not
-/// speak for the root, and a root tab does not reach into anyone's folder.
+/// GROUP-SCOPED, and the label says the number this returns: "other tabs" means
+/// the ones beside it WHERE IT LIVES — a tab inside a group does not speak for
+/// the root, and a root tab does not reach into anyone's group.
 /// Never `keep` itself, and never the app tab.
 ///
 /// One owner: the menu label counts this, and the action closes exactly this.
@@ -5588,44 +5401,42 @@ fn web_tab_close_others_targets(tabs: &[WebTabScopeRow], keep: u64) -> Vec<u64> 
     let Some(scope) = tabs
         .iter()
         .find(|(id, _)| *id == keep)
-        .map(|(_, folder)| folder.clone())
+        .map(|(_, head)| *head)
     else {
         return Vec::new();
     };
     tabs.iter()
-        .filter(|(id, folder)| {
-            *id != keep && *id != WEB_TAB_APP_TAB_ID && folder.as_deref() == scope.as_deref()
-        })
+        .filter(|(id, head)| *id != keep && *id != WEB_TAB_APP_TAB_ID && *head == scope)
         .map(|(id, _)| *id)
         .collect()
 }
 
-/// The tabs a folder row's "Close N tabs" closes: everything filed in it, and
-/// nothing else. The folder itself survives — closing its contents is not
-/// deleting the organization.
-fn web_tab_folder_close_targets(tabs: &[WebTabScopeRow], folder_id: &str) -> Vec<u64> {
+/// The tabs a group head's "Close N tabs" closes: its MEMBERS, and nothing
+/// else. ⛔ Never the head itself — the head is a page the user is reading, not
+/// a container, and closing the row you right-clicked when you asked to close
+/// what is under it is exactly the bulk-close dishonesty the label must not
+/// commit.
+fn web_tab_group_close_targets(tabs: &[WebTabScopeRow], head: u64) -> Vec<u64> {
     tabs.iter()
-        .filter(|(id, folder)| {
-            *id != WEB_TAB_APP_TAB_ID && folder.as_deref() == Some(folder_id)
+        .filter(|(id, member_of)| {
+            *id != WEB_TAB_APP_TAB_ID && *id != head && *member_of == Some(head)
         })
         .map(|(id, _)| *id)
         .collect()
 }
 
 /// The tabs a "Close tabs below" on `from` closes: the ones AFTER it in its own
-/// scope. Folder-scoped for the same reason
-/// [`web_tab_close_others_targets`] is — a tab filed in "Work" does not speak
+/// scope. Group-scoped for the same reason
+/// [`web_tab_close_others_targets`] is — a tab inside a group does not speak
 /// for the root, and "below" in a tree means below within your own group.
 fn web_tab_close_below_targets(tabs: &[WebTabScopeRow], from: u64) -> Vec<u64> {
     let Some(at) = tabs.iter().position(|(id, _)| *id == from) else {
         return Vec::new();
     };
-    let scope = tabs[at].1.clone();
+    let scope = tabs[at].1;
     tabs.iter()
         .skip(at + 1)
-        .filter(|(id, folder)| {
-            *id != WEB_TAB_APP_TAB_ID && folder.as_deref() == scope.as_deref()
-        })
+        .filter(|(id, head)| *id != WEB_TAB_APP_TAB_ID && *head == scope)
         .map(|(id, _)| *id)
         .collect()
 }
@@ -5652,18 +5463,22 @@ fn web_tab_count_phrase(count: usize, noun: &str) -> String {
 ///
 ///   create      New tab · New tab above this one · Reopen closed tabs
 ///   page        Reload · Copy URL · Duplicate tab · Split with active tab
-///   arrange     Move to folder ▸
+///   arrange     Move to group ▸ · (on a head) Expand/Collapse · Ungroup
 ///   destroy     Close tab · Close N other tabs · Close N tabs below
 ///
-/// "Move to folder ▸" turns the menu to its own PAGE rather than flattening one
-/// sibling row per folder into this list. The flat form pushed the tab's own
-/// verbs off the bottom as soon as a user had more than a few folders, and it
+/// "Move to group ▸" turns the menu to its own PAGE rather than flattening one
+/// sibling row per group into this list. The flat form pushed the tab's own
+/// verbs off the bottom as soon as a user had more than a few groups, and it
 /// scaled linearly with something the user controls. The page is the same
 /// [`ContextMenuOverlay`] at the same anchor — one menu component, per the reuse
 /// doctrine — showing a different list.
+///
+/// ⭐ ONE menu, because there is one kind of row. A row that HEADS a group
+/// grows three more items in the arrange band; it does not get a menu of its
+/// own, because it is not a different kind of thing — it is a tab that other
+/// tabs point at.
 fn web_tab_menu_items(
     tabs: &[WebSurfaceOverlayTabView],
-    folders: &[WebTabFolder],
     active_tab_id: u64,
     target: &WebTabMenuTarget,
     page: WebTabMenuPage,
@@ -5677,13 +5492,21 @@ fn web_tab_menu_items(
             let Some(tab) = tabs.iter().find(|tab| tab.id == tab_id) else {
                 return items;
             };
-            if page == WebTabMenuPage::MoveToFolder {
-                return web_tab_move_page_items(tab, folders);
+            if page == WebTabMenuPage::MoveToGroup {
+                return web_tab_move_page_items(tab, tabs);
             }
             // ---- create -----------------------------------------------------
             items.push(
                 RowMenuItem::new("webtab-new", "New tab", 't').icon(ShellIcon::Plus),
             );
+            // The head row's "+", which is what replaced the folder header's:
+            // "+" fills the group, not the window.
+            if tab.group_size > 0 {
+                items.push(
+                    RowMenuItem::new("webgroup-new-tab", "New tab in this group", 'g')
+                        .icon(ShellIcon::Plus),
+                );
+            }
             // Meaningful only because placement has an owner: "above this one"
             // is a real destination now, and the tab it opens joins this tab's
             // opener group so the next one cascades above it.
@@ -5760,13 +5583,37 @@ fn web_tab_menu_items(
             } else {
                 rename
             });
-            let move_to = RowMenuItem::new("webtab-move", "Move to folder ▸", 'm')
+            let move_to = RowMenuItem::new("webtab-move", "Move to group ▸", 'm')
                 .icon(ShellIcon::Folder);
             items.push(if tab.is_app_tab {
                 move_to.disabled("the app's tab belongs to the app, not to the tree")
             } else {
                 move_to
             });
+            // A head's own group verbs, in the ARRANGE band where they belong —
+            // they arrange the tree, they do not destroy anything.
+            if tab.group_size > 0 {
+                items.push(
+                    RowMenuItem::new(
+                        "webgroup-toggle",
+                        if tab.group_collapsed { "Expand group" } else { "Collapse group" },
+                        'e',
+                    )
+                    .icon(if tab.group_collapsed {
+                        ShellIcon::Expand
+                    } else {
+                        ShellIcon::Collapse
+                    }),
+                );
+                // ⛔ The note is load-bearing: "Ungroup" beside a list of close
+                // verbs reads as a destructive one, and it is the opposite —
+                // nothing closes, the members move up one level.
+                items.push(
+                    RowMenuItem::new("webgroup-disband", "Ungroup", 'u')
+                        .icon(ShellIcon::Collapse)
+                        .note("its tabs move up one level; nothing closes"),
+                );
+            }
             items.push(RowMenuItem::divider());
             // ---- destroy, last ----------------------------------------------
             let close = RowMenuItem::new("webtab-close", "Close tab", 'c')
@@ -5786,8 +5633,8 @@ fn web_tab_menu_items(
             .icon(ShellIcon::Close)
             .destructive();
             items.push(if others.is_empty() {
-                close_others.disabled(if tab.folder.is_some() {
-                    "nothing else is filed here"
+                close_others.disabled(if tab.group_head.is_some() {
+                    "nothing else is in this group"
                 } else {
                     "nothing else is open at the root"
                 })
@@ -5807,103 +5654,93 @@ fn web_tab_menu_items(
             } else {
                 close_below
             });
-        }
-        WebTabMenuTarget::Folder(folder_id) => {
-            let Some(folder) = folders.iter().find(|folder| &folder.id == folder_id) else {
-                return items;
-            };
-            // Same intent grouping as a tab's menu: create, arrange, destroy.
-            items.push(
-                RowMenuItem::new("webfolder-new-tab", "New tab in this folder", 't')
-                    .icon(ShellIcon::Plus),
-            );
-            items.push(RowMenuItem::divider());
-            items.push(
-                RowMenuItem::new("webfolder-rename", "Rename", 'r').icon(ShellIcon::Rename),
-            );
-            items.push(
-                RowMenuItem::new(
-                    "webfolder-toggle",
-                    if folder.collapsed {
-                        "Expand"
-                    } else {
-                        "Collapse"
-                    },
-                    'e',
+            // A head can close what it heads — its MEMBERS, never itself.
+            if tab.group_size > 0 {
+                let inside = web_tab_group_close_targets(&scope, tab_id);
+                // ⛔ "Close N tabs in this group" is 25 chars and the rail's
+                // menu draws about 23 — the label would be ellipsized into
+                // "Close 1 tab in this…", which is a destructive verb the user
+                // cannot read. The scope moves into the note, where the whole
+                // sentence lives.
+                let close_group = RowMenuItem::new(
+                    "webgroup-close-tabs",
+                    format!("Close {} inside", web_tab_count_phrase(inside.len(), "tab")),
+                    'i',
                 )
-                .icon(if folder.collapsed {
-                    ShellIcon::Expand
+                .icon(ShellIcon::Close)
+                .destructive()
+                .note("the rows in this group; this row stays");
+                items.push(if inside.is_empty() {
+                    close_group.disabled("this group is empty")
                 } else {
-                    ShellIcon::Collapse
-                }),
-            );
-            items.push(RowMenuItem::divider());
-            let filed = web_tab_folder_close_targets(&scope, folder_id);
-            let close = RowMenuItem::new(
-                "webfolder-close-tabs",
-                format!("Close {}", web_tab_count_phrase(filed.len(), "tab")),
-                'c',
-            )
-            .icon(ShellIcon::Close)
-            .destructive();
-            items.push(if filed.is_empty() {
-                close.disabled("this folder is empty")
-            } else {
-                close
-            });
-            // The row's hover 🗑 had no keyboard or menu route at all. The
-            // consequence rides the TOOLTIP, where the reasons live: deleting
-            // organization must never read as deleting content, and it must not
-            // say so in a name four times too wide for the box.
-            items.push(
-                RowMenuItem::new("webfolder-delete", "Delete folder", 'd')
-                    .icon(ShellIcon::Trash)
-                    .destructive()
-                    .note("its tabs return to the root"),
-            );
+                    close_group
+                });
+            }
         }
     }
     items
 }
 
-/// The "Move to folder ▸" PAGE: back out, then one row per destination.
+/// The "Move to group ▸" PAGE: back out, then one row per destination.
 ///
-/// The same one-row-per-folder list the root menu used to carry inline — but on
-/// its own page, so the tab's verbs are never pushed off the bottom by how many
-/// folders the user happens to have. A tab already in a folder still sees that
-/// folder, inert and saying so, because the current home being mysteriously
+/// One row per existing GROUP — that is, per row something already points at —
+/// on its own page, so the tab's verbs are never pushed off the bottom by how
+/// many groups the user happens to have. A tab already in a group still sees
+/// that group, inert and saying so, because the current home being mysteriously
 /// absent is worse than it being unclickable.
+///
+/// ⛔ There is no "New group…" item and there must not be one. A group is
+/// created by dropping one row onto another — the head has to be a real tab, so
+/// a verb here could only invent an empty container, which is the folder model
+/// coming back through the menu.
+///
+/// The destinations exclude the tab itself, the app tab, and anything INSIDE
+/// the tab's own group: each of those would make a cycle, and a cycle takes
+/// every row under it out of the draw walk.
 fn web_tab_move_page_items(
     tab: &WebSurfaceOverlayTabView,
-    folders: &[WebTabFolder],
+    tabs: &[WebSurfaceOverlayTabView],
 ) -> Vec<RowMenuItem> {
     let mut items = vec![
         RowMenuItem::new("webtab-move-back", "Back", 'b').icon(ShellIcon::Back),
         RowMenuItem::divider(),
     ];
     let root = RowMenuItem::new("webtab-move-root", "Root", 'r').icon(ShellIcon::Folder);
-    items.push(if tab.folder.is_none() {
+    items.push(if tab.group_head.is_none() {
         root.disabled("already here")
     } else {
         root
     });
-    for folder in folders {
+    let descends = |mut candidate: Option<u64>| {
+        for _ in 0..tabs.len() {
+            match candidate {
+                Some(id) if id == tab.id => return true,
+                Some(id) => {
+                    candidate = tabs.iter().find(|row| row.id == id).and_then(|row| row.group_head)
+                }
+                None => return false,
+            }
+        }
+        false
+    };
+    for head in tabs.iter().filter(|row| {
+        row.group_size > 0
+            && row.id != tab.id
+            && !row.is_app_tab
+            && !descends(Some(row.id))
+    }) {
         let item = RowMenuItem::hinted(
-            format!("webtab-move:{}", folder.id),
-            folder.name.clone(),
-            folder.name.chars().next(),
+            format!("webtab-move:{}", head.id),
+            head.label.clone(),
+            head.label.chars().next(),
         )
         .icon(ShellIcon::Folder);
-        items.push(if tab.folder.as_deref() == Some(folder.id.as_str()) {
+        items.push(if tab.group_head == Some(head.id) {
             item.disabled("already here")
         } else {
             item
         });
     }
-    items.push(RowMenuItem::divider());
-    items.push(
-        RowMenuItem::new("webtab-move-new-folder", "New folder…", 'n').icon(ShellIcon::Plus),
-    );
     items
 }
 
@@ -5911,13 +5748,12 @@ fn web_tab_move_page_items(
 /// page, what that page is for.
 fn web_tab_menu_title(
     _tabs: &[WebSurfaceOverlayTabView],
-    _folders: &[WebTabFolder],
     _target: &WebTabMenuTarget,
     page: WebTabMenuPage,
 ) -> String {
     match page {
         // Which PAGE you are on — something no row on screen says.
-        WebTabMenuPage::MoveToFolder => "Move to folder".to_string(),
+        WebTabMenuPage::MoveToGroup => "Move to group".to_string(),
         // The row's own name, which the row is saying directly above the menu,
         // highlighted. Repeating it stacked the same words twice and spent a
         // line of a 216px box on nothing (the user's screenshot).
@@ -5933,7 +5769,7 @@ fn web_tab_menu_title(
 /// inside the dispatch closure.
 fn web_tab_menu_page_turn(id: &str) -> Option<WebTabMenuPage> {
     match id {
-        "webtab-move" => Some(WebTabMenuPage::MoveToFolder),
+        "webtab-move" => Some(WebTabMenuPage::MoveToGroup),
         "webtab-move-back" => Some(WebTabMenuPage::Root),
         _ => None,
     }
@@ -5943,8 +5779,7 @@ fn web_tab_menu_page_turn(id: &str) -> Option<WebTabMenuPage> {
 ///
 /// Pure, and the ONLY router: the mouse path dispatches this and nothing else,
 /// so a test can prove "the split item drives the split verb" without a live
-/// webview. An id the target does not own resolves to `None` — a folder id
-/// cannot reach a tab verb by spelling.
+/// webview. An id the row does not own resolves to `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebTabMenuAction {
     NewTab,
@@ -5956,17 +5791,23 @@ enum WebTabMenuAction {
     CloseOtherTabs(u64),
     CloseTabsBelow(u64),
     DuplicateTab(u64),
-    MoveToFolder(u64, Option<String>),
-    MoveToNewFolder(u64),
+    /// File this tab into the group headed by that tab, or back to the root
+    /// with `None`.
+    MoveToGroup(u64, Option<u64>),
     SplitWithActiveTab(u64),
-    NewTabInFolder(String),
-    /// Rename THIS ROW — a folder or a tab. One verb, because the rail has one
-    /// rename ([`ShellState::web_tab_begin_rename`]) and a second action for
-    /// the second row kind would be a second answer to "what is being renamed".
+    /// A blank tab INSIDE the group this row heads — the head row's "+", which
+    /// is what replaced the folder header's.
+    NewTabInGroup(u64),
+    /// Rename THIS ROW. One verb, because the rail has one rename
+    /// ([`ShellState::web_tab_begin_rename`]).
     RenameRow(WebTabMenuTarget),
-    ToggleFolder(String),
-    CloseFolderTabs(String),
-    DeleteFolder(String),
+    ToggleGroup(u64),
+    /// Close every row in the group this one heads — not the head itself, which
+    /// is a page the user is reading.
+    CloseGroupTabs(u64),
+    /// Take the group apart without closing anything: the members move up one
+    /// level and the head stays a tab.
+    DisbandGroup(u64),
 }
 
 fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenuAction> {
@@ -5974,6 +5815,10 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
         WebTabMenuTarget::Tab(tab) => {
             let tab = *tab;
             match id {
+                "webgroup-new-tab" => Some(WebTabMenuAction::NewTabInGroup(tab)),
+                "webgroup-toggle" => Some(WebTabMenuAction::ToggleGroup(tab)),
+                "webgroup-close-tabs" => Some(WebTabMenuAction::CloseGroupTabs(tab)),
+                "webgroup-disband" => Some(WebTabMenuAction::DisbandGroup(tab)),
                 "webtab-new" => Some(WebTabMenuAction::NewTab),
                 "webtab-new-above" => Some(WebTabMenuAction::NewTabAbove(tab)),
                 "webtab-reopen" => Some(WebTabMenuAction::ReopenClosedTabs),
@@ -5985,26 +5830,13 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
                 "webtab-duplicate" => Some(WebTabMenuAction::DuplicateTab(tab)),
                 "webtab-rename" => Some(WebTabMenuAction::RenameRow(WebTabMenuTarget::Tab(tab))),
                 "webtab-split" => Some(WebTabMenuAction::SplitWithActiveTab(tab)),
-                "webtab-move-root" => Some(WebTabMenuAction::MoveToFolder(tab, None)),
-                "webtab-move-new-folder" => Some(WebTabMenuAction::MoveToNewFolder(tab)),
+                "webtab-move-root" => Some(WebTabMenuAction::MoveToGroup(tab, None)),
                 _ => id
                     .strip_prefix("webtab-move:")
-                    .filter(|folder| !folder.is_empty())
-                    .map(|folder| {
-                        WebTabMenuAction::MoveToFolder(tab, Some(folder.to_string()))
-                    }),
+                    .and_then(|head| head.parse::<u64>().ok())
+                    .map(|head| WebTabMenuAction::MoveToGroup(tab, Some(head))),
             }
         }
-        WebTabMenuTarget::Folder(folder) => match id {
-            "webfolder-new-tab" => Some(WebTabMenuAction::NewTabInFolder(folder.clone())),
-            "webfolder-rename" => Some(WebTabMenuAction::RenameRow(WebTabMenuTarget::Folder(
-                folder.clone(),
-            ))),
-            "webfolder-toggle" => Some(WebTabMenuAction::ToggleFolder(folder.clone())),
-            "webfolder-close-tabs" => Some(WebTabMenuAction::CloseFolderTabs(folder.clone())),
-            "webfolder-delete" => Some(WebTabMenuAction::DeleteFolder(folder.clone())),
-            _ => None,
-        },
     }
 }
 
@@ -6028,27 +5860,24 @@ fn web_tab_menu_close_plan(tabs: &[WebTabScopeRow], action: &WebTabMenuAction) -
             .collect(),
         WebTabMenuAction::CloseOtherTabs(tab_id) => web_tab_close_others_targets(tabs, *tab_id),
         WebTabMenuAction::CloseTabsBelow(tab_id) => web_tab_close_below_targets(tabs, *tab_id),
-        WebTabMenuAction::CloseFolderTabs(folder_id) => {
-            web_tab_folder_close_targets(tabs, folder_id)
-        }
+        WebTabMenuAction::CloseGroupTabs(head) => web_tab_group_close_targets(tabs, *head),
         // Not a close verb. An empty plan is the honest answer, and the arm
-        // that runs it never asks. `DeleteFolder` is listed HERE deliberately:
-        // deleting a folder returns its tabs to the root, it does not close
+        // that runs it never asks. `DisbandGroup` is listed HERE deliberately:
+        // taking a group apart moves its members up a level, it does not close
         // them, and a close plan is the one place that could quietly turn
-        // "delete the organization" into "delete the content".
+        // "remove the organization" into "delete the content".
         WebTabMenuAction::NewTab
         | WebTabMenuAction::NewTabAbove(_)
         | WebTabMenuAction::ReopenClosedTabs
         | WebTabMenuAction::ReloadTab(_)
         | WebTabMenuAction::CopyTabUrl(_)
         | WebTabMenuAction::DuplicateTab(_)
-        | WebTabMenuAction::MoveToFolder(_, _)
-        | WebTabMenuAction::MoveToNewFolder(_)
+        | WebTabMenuAction::MoveToGroup(_, _)
         | WebTabMenuAction::SplitWithActiveTab(_)
-        | WebTabMenuAction::NewTabInFolder(_)
+        | WebTabMenuAction::NewTabInGroup(_)
         | WebTabMenuAction::RenameRow(_)
-        | WebTabMenuAction::ToggleFolder(_)
-        | WebTabMenuAction::DeleteFolder(_) => Vec::new(),
+        | WebTabMenuAction::ToggleGroup(_)
+        | WebTabMenuAction::DisbandGroup(_) => Vec::new(),
     }
 }
 
@@ -6415,7 +6244,7 @@ const NEW_AGENT_MENU_PREFIX: &str = "new-agent:";
 /// of its own here; the list is whatever the host's `~/.yggterm/apps/*.json`
 /// manifests declare.
 fn libyggterm_app_menu_items(apps: &[AppManifest], here: bool) -> Vec<RowMenuItem> {
-    app_launcher_entries(apps)
+    app_row_spawn_entries(apps)
         .into_iter()
         .map(|(app, verb)| {
             let label = if here {
@@ -6609,7 +6438,7 @@ fn row_menu_items(
             RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session", 's')
                 .submenu(agent_session_menu_items(false)),
         );
-        if !app_launcher_entries(apps).is_empty() {
+        if !app_row_spawn_entries(apps).is_empty() {
             items.push(
                 RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App", 'b')
                     .submenu(libyggterm_app_menu_items(apps, false)),
@@ -6651,7 +6480,7 @@ fn row_menu_items(
                 RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session Here", 's')
                     .submenu(agent_session_menu_items(true)),
             );
-            if !app_launcher_entries(apps).is_empty() {
+            if !app_row_spawn_entries(apps).is_empty() {
                 items.push(
                     RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App Here", 'b')
                         .submenu(libyggterm_app_menu_items(apps, true)),

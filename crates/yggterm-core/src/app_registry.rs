@@ -35,7 +35,7 @@ pub const APP_REGISTRY_DIRNAME: &str = "apps";
 /// comes from wherever the user invoked the verb (a cwd-tree row, the active
 /// session), never from the manifest — a launcher entry describes the app, not
 /// the place.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppVerb {
     /// Stable id, unique within the app. Rides menu callbacks.
     pub id: String,
@@ -48,6 +48,50 @@ pub struct AppVerb {
     /// folded into a numbered group). Empty/absent = let the ladder choose.
     #[serde(default)]
     pub keytip: String,
+    /// ⭐ Does this verb make sense as a SESSION ROW?
+    ///
+    /// The row context menu spawns a session and puts a row in the sidebar for
+    /// it. That is right for "New Ychrome" and wrong for a terminal-invoked
+    /// dashboard or a fleet booter: the user gets a row for something that was
+    /// never a session, and the owner asked for those to go.
+    ///
+    /// ⛔ **The APP declares it, because yggterm cannot know.** The verbs to
+    /// leave out belong to other apps' manifests, so the only alternatives were
+    /// for yggterm to hardcode another app's name — the precise anti-pattern the
+    /// libyggterm contract exists to prevent — or to be told. This is being
+    /// told.
+    ///
+    /// Defaults to TRUE, so every manifest written before this field existed
+    /// keeps every verb it had. An opt-out cannot silently empty a menu; an
+    /// opt-in would have emptied every menu at once.
+    ///
+    /// ⚠ It governs the ROW menu only. The titlebar `+` and the start page keep
+    /// offering everything: "open my dashboard" is a reasonable thing to offer
+    /// there and a meaningless thing to spawn a row for, and that difference is
+    /// the whole point of the flag.
+    #[serde(default = "default_row_spawn")]
+    pub row_spawn: bool,
+}
+
+/// A verb is a row spawn unless it says otherwise — see [`AppVerb::row_spawn`].
+fn default_row_spawn() -> bool {
+    true
+}
+
+/// ⛔ HAND-WRITTEN, and it must stay that way. `#[derive(Default)]` would make
+/// `row_spawn` FALSE while `#[serde(default)]` makes it true, so a verb built in
+/// code and the same verb read from disk would disagree about whether it belongs
+/// in the row menu — and the code-built one would silently vanish from it.
+impl Default for AppVerb {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            args: Vec::new(),
+            keytip: String::new(),
+            row_spawn: default_row_spawn(),
+        }
+    }
 }
 
 /// One installed libyggterm app, as its manifest declares it.

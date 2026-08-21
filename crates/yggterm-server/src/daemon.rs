@@ -2205,6 +2205,72 @@ pub fn draft_sweep_verdict(drafts_present: usize, unable_to_answer: usize) -> &'
     }
 }
 
+/// Is this process argv a yggterm daemon? Pure, so the rule can be tested
+/// without a host that happens to be running the right processes.
+///
+/// ⛔ ARGV[0] DECIDES, NEVER A SUBSTRING OF THE WHOLE LINE. A search for
+/// "yggterm-headless server daemon" matches the search itself, the shell that
+/// spawned it, and the `ssh` carrying it — this project has already published a
+/// process count inflated by exactly that. Only the executable's own name may
+/// nominate a process as a daemon; the verb pair merely confirms it.
+pub fn cmdline_names_a_yggterm_daemon(args: &[String]) -> bool {
+    let Some(program) = args.first() else {
+        return false;
+    };
+    let stem = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !stem.starts_with("yggterm") {
+        return false;
+    }
+    // `server daemon`, adjacent and in that order — `server status` and
+    // `server rows drafts` are the same binary asking a question, not one
+    // answering.
+    args.windows(2)
+        .any(|pair| pair[0] == "server" && pair[1] == "daemon")
+}
+
+/// Every yggterm daemon PROCESS on this host, or `None` when the process table
+/// could not be read.
+///
+/// ⛔⛔ `None` IS "COULD NOT ASK", NEVER "THERE ARE NONE". This exists to
+/// falsify a coverage claim, so a failure to read must never look like a
+/// confirmation.
+#[cfg(target_os = "linux")]
+pub fn daemon_process_pids() -> Option<Vec<u32>> {
+    let dir = std::fs::read_dir("/proc").ok()?;
+    let mut pids = Vec::new();
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // A process can exit between the readdir and the read. That is one
+        // fewer daemon, not an unreadable process table.
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).to_string())
+            .collect();
+        if cmdline_names_a_yggterm_daemon(&args) {
+            pids.push(pid);
+        }
+    }
+    Some(pids)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn daemon_process_pids() -> Option<Vec<u32>> {
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerRuntimeStatus {
     pub server_version: String,
@@ -4918,7 +4984,14 @@ impl DaemonRuntime {
                 .iter()
                 .map(|key| SessionDraftState {
                     session_key: key.clone(),
-                    has_pending_draft: self.terminals.session_has_pending_input_draft(key),
+                    // ⛔⛔ THE UNION, NOT THE KEYSTROKE COUNTER. The counter has
+                    // one construction site and it is always `false`, so a
+                    // session ADOPTED by a newer daemon reads CLEAN while the
+                    // person's sentence is still standing in its composer — and
+                    // the roll takes a handover every hour. This verb exists to
+                    // answer "may a bump be taken", so the one window it was
+                    // blind in is the one a bump happens in.
+                    has_pending_draft: self.terminals.session_composer_holds_draft(key),
                 })
                 .collect::<Vec<_>>(),
         );
@@ -5245,7 +5318,10 @@ impl DaemonRuntime {
     fn session_migratable_signals(&self, runtime_key: &str) -> MigratableSignals {
         MigratableSignals {
             activity_idle_ms: self.terminals.session_idle_for_ms(runtime_key),
-            has_pending_draft: self.terminals.session_has_pending_input_draft(runtime_key),
+            // ⛔ The union: migratability decides whether a release may destroy
+            // this row's composer, and the keystroke arm is zeroed by the very
+            // handover it is being consulted about.
+            has_pending_draft: self.terminals.session_composer_holds_draft(runtime_key),
             foreground_command_running: self
                 .terminals
                 .session_foreground_process_active(runtime_key),
@@ -10755,7 +10831,7 @@ impl DaemonRuntime {
                 // "unknown" would make every proxied row unbootable, which on
                 // the GUI host is all of them.
                 if refuse_if_draft
-                    && self.terminals.session_has_pending_input_draft(&runtime_path) == Some(true)
+                    && self.terminals.session_composer_holds_draft(&runtime_path) == Some(true)
                 {
                     return Ok(ServerResponse::Ack {
                         message: Some(format!(
@@ -18434,6 +18510,12 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                         // §5's repair is the LAST thing that may stomp a human:
                         // it fires on a just-re-resumed row, which is exactly
                         // when someone is most likely to be typing at it.
+                        // ⛔ The keystroke arm, not the union — same reason as
+                        //    `submit_prompt_echo_verified`: this closure is
+                        //    re-asked after the repair has typed its own probe,
+                        //    and the rendered-grid arm would see that probe and
+                        //    read it as a human typing. Everywhere that does NOT
+                        //    write first now uses `session_composer_holds_draft`.
                         move || {
                             lock_daemon_runtime(&draft_runtime, "hot_restart_repair_draft")
                                 .terminals
@@ -19342,7 +19424,30 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             home_dir.clone(),
             crate::host_panic::local_host_label(),
             std::sync::Arc::new(move |incident: &ytrace::diagnosis::Incident| {
-                crate::host_panic::notify_owner(&panic_home, incident);
+                // ⭐ The notification's own pid, on the record. The panic event
+                // above says an incident was DIAGNOSED; only this says a process
+                // was actually started, and the difference is what a reaping
+                // audit needs. Deriving it instead — replaying the panic events
+                // through the fifteen-minute cooldown — is inference, and it was
+                // the weakest link in the falsifier for the zombie leak this
+                // path used to produce. One event per cooldown at most, so it
+                // costs the trace budget nothing.
+                let pid = crate::host_panic::notify_owner(&panic_home, incident);
+                append_trace_event(
+                    &panic_home,
+                    "daemon",
+                    "heartbeat",
+                    "notify_spawned",
+                    serde_json::json!({
+                        "incident_id": incident.id,
+                        // ⚠ `pid` is null when the spawn FAILED, and this event
+                        // is still written — so a reader counting these events
+                        // would count attempts, not launches. `spawned` is the
+                        // one a count may filter on.
+                        "pid": pid,
+                        "spawned": pid.is_some(),
+                    }),
+                );
             }),
         );
     }
@@ -25145,6 +25250,121 @@ mod tests {
         // mid-sentence" that permits the bump.
         assert_eq!(draft_sweep_verdict(1, 0), DRAFT_SWEEP_DRAFTS_PRESENT);
         assert_eq!(draft_sweep_verdict(1, 9), DRAFT_SWEEP_DRAFTS_PRESENT);
+    }
+
+    /// ⛔⛔ THE DRAFT GUARDS THAT DO NOT WRITE FIRST MUST READ THE UNION.
+    ///
+    /// `pending_input_draft` is reconstructed from bytes forwarded through ONE
+    /// daemon's `write`. It has a single construction site and it is always
+    /// `false`, so a session adopted by a newer daemon reads CLEAN while the
+    /// person's sentence is still standing in its composer — and the roll takes
+    /// a handover every hour. It is a guard that goes quiet on a schedule, and
+    /// it fails in the direction that spends somebody's line.
+    ///
+    /// ⚖ THE TWO EXCEPTIONS ARE NOT OVERSIGHTS. `submit_prompt_echo_verified`
+    /// and the §5 hot-restart repair re-ask their draft closure AFTER typing a
+    /// probe marker into the composer, so the rendered-grid arm would read
+    /// their own probe as a human mid-sentence and abort. There the counter is
+    /// the right instrument, because a daemon-originated write is invisible to
+    /// it. This test states the split so that "finish the migration" cannot
+    /// silently break the probe.
+    #[test]
+    fn a_draft_guard_that_does_not_write_first_reads_the_union() {
+        let source = include_str!("daemon.rs");
+        let terminal_source = include_str!("terminal.rs");
+
+        for (name, needle) in [
+            ("the drafts sweep", "has_pending_draft: self.terminals.session_composer_holds_draft(key)"),
+            (
+                "the migratability signals",
+                "has_pending_draft: self.terminals.session_composer_holds_draft(runtime_key)",
+            ),
+            (
+                "--refuse-if-draft on server terminal write",
+                "session_composer_holds_draft(&runtime_path) == Some(true)",
+            ),
+        ] {
+            assert!(
+                source.contains(needle),
+                "{name} must read the UNION — the keystroke counter alone is \
+                 zeroed by every daemon handover, which is exactly the window \
+                 each of these three is consulted in"
+            );
+        }
+
+        // The control. Without it this test passes just as well against a file
+        // where every reader was switched, including the two that must not be.
+        assert!(
+            terminal_source.contains("|| self.session_has_pending_input_draft(key),"),
+            "`submit_prompt_echo_verified` must keep the KEYSTROKE arm: it is \
+             re-asked after it has typed its own probe into the composer, and \
+             the grid arm would read that probe as a person typing and abort \
+             the submit"
+        );
+        assert!(
+            source.contains(".session_has_pending_input_draft(&draft_path)"),
+            "the hot-restart repair keeps the keystroke arm for the same reason"
+        );
+    }
+
+    /// ⛔⛔ A COVERAGE COUNT IS NOT COVERAGE, and the denominator has to come
+    /// from somewhere that cannot be fooled by the same thing the numerator was.
+    ///
+    /// `server rows drafts` fans out over SOCKETS and answered "I asked
+    /// everybody" on a host running four daemons, because a version bump
+    /// replaces older sockets with symlinks to the newest and several daemons
+    /// collapse onto one reachable path. The process table is the independent
+    /// witness — but only if the rule that reads it cannot count the reader.
+    #[test]
+    fn only_argv_zero_may_nominate_a_process_as_a_daemon() {
+        use super::cmdline_names_a_yggterm_daemon;
+        let argv = |line: &str| {
+            line.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(cmdline_names_a_yggterm_daemon(&argv(
+            "/opt/example/bin/yggterm-headless server daemon"
+        )));
+        // A repo build, a differently-named binary, extra flags around the pair.
+        assert!(cmdline_names_a_yggterm_daemon(&argv(
+            "target/release/yggterm server daemon --foreground"
+        )));
+
+        // ⛔ THE FALSE POSITIVES THAT MATTER, and they are the habitual ones.
+        // A search for the daemon matches the search, the shell that ran it, and
+        // the ssh that carried it — this project has already published a process
+        // count inflated by exactly that family.
+        assert!(!cmdline_names_a_yggterm_daemon(&argv(
+            "grep -f yggterm-headless server daemon"
+        )));
+        assert!(!cmdline_names_a_yggterm_daemon(&argv(
+            "/bin/bash -c yggterm-headless server daemon"
+        )));
+        assert!(!cmdline_names_a_yggterm_daemon(&argv(
+            "ssh otherhost yggterm-headless server daemon"
+        )));
+
+        // ⛔ AND THE SAME BINARY ASKING A QUESTION IS NOT ONE ANSWERING. Every
+        // one of these is the daemon executable and none of them is a daemon;
+        // counting them would inflate the denominator and report a permanent
+        // false shortfall, which is the failure that teaches people to ignore
+        // the field.
+        assert!(!cmdline_names_a_yggterm_daemon(&argv(
+            "/opt/example/bin/yggterm-headless server status"
+        )));
+        assert!(!cmdline_names_a_yggterm_daemon(&argv(
+            "/opt/example/bin/yggterm-headless server rows drafts"
+        )));
+        // The two words must be ADJACENT and in order.
+        assert!(!cmdline_names_a_yggterm_daemon(&argv(
+            "/opt/example/bin/yggterm-headless daemon server"
+        )));
+        assert!(!cmdline_names_a_yggterm_daemon(&argv(
+            "/opt/example/bin/yggterm-headless server rows daemon"
+        )));
+        assert!(!cmdline_names_a_yggterm_daemon(&[]));
     }
 
     // Per [[bug-class-old-daemon-never-retires]]: the guihost 2.8.87 lingering

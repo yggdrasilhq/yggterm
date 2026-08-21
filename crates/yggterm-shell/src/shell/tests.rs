@@ -863,16 +863,36 @@ mod tests {
         println!("wrote history page to {path}");
     }
 
-    fn saved_tab(url: &str, folder: Option<&str>) -> SavedWebTab {
+    /// A saved row, optionally INSIDE a group named by key. The legacy `folder`
+    /// vocabulary has its own builder (`saved_folder_tab`) so a test says which
+    /// era of store it is describing.
+    pub(super) fn saved_tab(url: &str, group: Option<&str>) -> SavedWebTab {
         SavedWebTab {
             url: url.to_string(),
             title: String::new(),
             name: String::new(),
-            folder: folder.map(str::to_string),
+            folder: None,
+            group: group.map(str::to_string),
+            group_key: None,
+            group_collapsed: false,
             active: false,
             app_tab: false,
             history: vec![url.to_string()],
             history_index: 0,
+        }
+    }
+    /// A saved row that HEADS a group, so the fresh-start gate sees "is one".
+    pub(super) fn saved_head_tab(url: &str, key: &str) -> SavedWebTab {
+        SavedWebTab {
+            group_key: Some(key.to_string()),
+            ..saved_tab(url, None)
+        }
+    }
+    /// A row from a store written BEFORE row groups — the migration's input.
+    fn saved_folder_tab(url: &str, folder: Option<&str>) -> SavedWebTab {
+        SavedWebTab {
+            folder: folder.map(str::to_string),
+            ..saved_tab(url, None)
         }
     }
     fn saved_active_tab(url: &str, folder: Option<&str>) -> SavedWebTab {
@@ -974,7 +994,7 @@ mod tests {
     // would quietly pull it out of the folder the user filed it in — so it is
     // selected where it sits instead, start page and all.
     #[test]
-    fn continuing_onto_a_filed_tab_selects_it_in_place_rather_than_unfiling_it() {
+    fn continuing_onto_a_grouped_tab_selects_it_in_place_rather_than_ungrouping_it() {
         let plan = plan_web_tab_restore(
             vec![
                 saved_tab("https://a.example/", None),
@@ -984,16 +1004,16 @@ mod tests {
             true,
             WebSurfaceOpenKind::Launch,
         );
-        assert_eq!(plan.adopt, None, "a filed tab is never adopted");
+        assert_eq!(plan.adopt, None, "an organized tab is never adopted");
         assert_eq!(
             plan.land_on,
             Some(1),
             "it is selected where it sits (index 1 -> tab id 2)"
         );
         assert_eq!(
-            plan.tabs[1].folder.as_deref(),
+            plan.tabs[1].group.as_deref(),
             Some("f1"),
-            "and it is still in its folder"
+            "and it is still in its group"
         );
     }
 
@@ -1125,7 +1145,7 @@ mod tests {
             tabs: vec![
                 saved_app_tab("https://x.example/page", true),
                 saved_tab("https://loose.example/", None),
-                saved_tab("https://filed.example/", Some("f1")),
+                saved_folder_tab("https://filed.example/", Some("f1")),
             ],
         };
         assert_eq!(
@@ -1178,13 +1198,13 @@ mod tests {
         assert_eq!(
             plan.tabs
                 .iter()
-                .map(|tab| (tab.url.as_str(), tab.folder.as_deref()))
+                .map(|tab| (tab.url.as_str(), tab.group.as_deref()))
                 .collect::<Vec<_>>(),
             vec![
                 ("https://other.example/", None),
                 ("https://x.example/page", Some("f1")),
             ],
-            "the loose copies collapse; a different page and a FILED copy stay"
+            "the loose copies collapse; a different page and a GROUPED copy stay"
         );
 
         // A store written before the mark existed holds the same accumulation;
@@ -1426,6 +1446,8 @@ mod tests {
                     reload_nonce: 0,
                     profile: "default".to_string(),
                     folder: None,
+                    group_head: None,
+                    group_collapsed: false,
                     custom_title: None,
                     loading: false,
                     loading_since_ms: 0,
@@ -1434,7 +1456,6 @@ mod tests {
                     script_opened: false,
                     opener: None,
                 }],
-                folders: Vec::new(),
                 active_tab: 0,
                 next_tab_id: 1,
                 opened_at_ms: 1_000,
@@ -1452,27 +1473,25 @@ mod tests {
         );
     }
 
-    /// …plus a folder with one tab FILED into it, which is what makes the
-    /// classic strip draw its folder-overflow affordance at all. Built by hand
-    /// rather than through `web_surface_new_tab` / `web_tab_move_to_folder`,
-    /// because those persist — and this surface is on the "default" profile,
-    /// i.e. the developer's real tab store.
+    /// …plus a ROW GROUP: a head and one member, which is what makes the classic
+    /// strip draw its overflow affordance at all. Built by hand rather than
+    /// through `web_surface_new_tab` / `web_tab_move_to_group`, because those
+    /// persist — and this surface is on the "default" profile, i.e. the
+    /// developer's real tab store.
     fn seed_web_surface_with_filed_tab(shell: &mut ShellState, session_path: &str) {
         seed_web_surface(shell, session_path);
         let Some(surface) = shell.web_surfaces.get_mut(session_path) else {
             return;
         };
-        surface.folders.push(WebTabFolder {
-            id: "f1".to_string(),
-            name: "Work".to_string(),
-            collapsed: false,
-            parent: None,
-        });
-        let mut filed = surface.tabs[0].clone();
-        filed.id = 1;
-        filed.folder = Some("f1".to_string());
-        surface.tabs.push(filed);
-        surface.next_tab_id = 2;
+        let mut head = surface.tabs[0].clone();
+        head.id = 1;
+        head.custom_title = Some("Work".to_string());
+        surface.tabs.push(head);
+        let mut member = surface.tabs[0].clone();
+        member.id = 2;
+        member.group_head = Some(1);
+        surface.tabs.push(member);
+        surface.next_tab_id = 3;
     }
 
     // Phase 5 §5: the ping URL widens with the routing session + the batch ack,
@@ -6302,9 +6321,10 @@ mod tests {
     // back, the loose session does not, and the purge of the loose ones still
     // reaches disk whenever anything survives it.
     #[test]
-    fn a_fresh_start_still_opens_the_filed_tabs_only() {
+    fn a_fresh_start_still_opens_the_organized_tabs_only() {
         let root = ScratchProfilesRoot::new("restore-off");
         let profile = "research";
+        // A store from BEFORE row groups — the migration's real input.
         let seeded = WebTabStore {
             folders: vec![WebTabFolder {
                 id: "f1".to_string(),
@@ -6313,8 +6333,9 @@ mod tests {
                 parent: None,
             }],
             tabs: vec![
-                saved_tab("https://loose.example/", None),
-                saved_tab("https://filed.example/", Some("f1")),
+                saved_folder_tab("https://loose.example/", None),
+                saved_folder_tab("https://filed-a.example/", Some("f1")),
+                saved_folder_tab("https://filed-b.example/", Some("f1")),
             ],
         };
         save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
@@ -6326,21 +6347,128 @@ mod tests {
             surface_tab_urls(&shell),
             vec![
                 "https://search.brave.com/".to_string(),
-                "https://filed.example/".to_string()
+                "https://filed-a.example/".to_string(),
+                "https://filed-b.example/".to_string(),
             ],
-            "a fresh start opens the app tab and the FILED tabs"
+            "a fresh start opens the app tab and the ORGANIZED tabs"
         );
+
+        // …AND THE MIGRATION RAN ON THE WAY IN. The folder's first tab heads the
+        // group, the folder's LABEL is on that head, and the second tab points
+        // at it.
+        let surface = &shell.web_surfaces["local://ws"];
+        let head = surface.tabs.iter().find(|tab| tab.url == "https://filed-a.example/").expect("head");
+        let member = surface.tabs.iter().find(|tab| tab.url == "https://filed-b.example/").expect("member");
+        assert_eq!(
+            head.custom_title.as_deref(),
+            Some("Work"),
+            "the folder's name is not lost — it lands on the head row"
+        );
+        assert_eq!(member.group_head, Some(head.id));
+        assert_eq!(head.group_head, None, "the head sits at root");
+        assert!(
+            surface.tabs.iter().all(|tab| tab.folder.is_none()),
+            "the retired vocabulary is consumed, not carried"
+        );
+
         assert_eq!(
             saved_urls(root.path(), profile),
-            vec!["https://filed.example/".to_string()],
+            vec![
+                "https://filed-a.example/".to_string(),
+                "https://filed-b.example/".to_string(),
+            ],
             "the loose session should have been purged from disk by the write \
-             that kept the filed tab"
+             that kept the organized tabs"
+        );
+        let back = load_web_tab_store_in(root.path(), profile);
+        assert!(
+            back.folders.is_empty(),
+            "⛔ folders are never written back out — a store that still carried \
+             them would migrate itself a second time on the next load"
         );
         assert_eq!(
-            load_web_tab_store_in(root.path(), profile).folders.len(),
-            1,
-            "the folder is saved organization and never goes with the session"
+            back.tabs[0].group_key.as_deref(),
+            Some("g0"),
+            "…and the group is on disk as a durable KEY, because tab ids are \
+             per-run: {back:?}"
         );
+        assert_eq!(back.tabs[1].group.as_deref(), Some("g0"));
+
+        // ⭐ THE SECOND LAUNCH — the one that used to be the data loss. Nothing
+        // migrates now (the store is already in the group vocabulary), and the
+        // organization has to come back from the KEY alone.
+        let mut again = shell_on_scratch_profiles_root(root.path());
+        again.settings.web_surface_restore_tabs = false;
+        open_ychrome_surface(&mut again, profile, 1_000);
+        let surface = &again.web_surfaces["local://ws"];
+        assert_eq!(
+            surface_tab_urls(&again),
+            vec![
+                "https://search.brave.com/".to_string(),
+                "https://filed-a.example/".to_string(),
+                "https://filed-b.example/".to_string(),
+            ],
+            "the group survives a restart with no folder left on disk to rescue it"
+        );
+        let head = surface.tabs.iter().find(|tab| tab.url == "https://filed-a.example/").expect("head");
+        let member = surface.tabs.iter().find(|tab| tab.url == "https://filed-b.example/").expect("member");
+        assert_eq!(
+            member.group_head,
+            Some(head.id),
+            "the KEY was remapped onto THIS run's ids"
+        );
+        assert_eq!(head.custom_title.as_deref(), Some("Work"), "and the label with it");
+    }
+
+    /// ⛔⛔ THE SECOND-LAUNCH LOSS, in the shape that is easy to miss: a folder
+    /// holding ONE tab flattens to a head with NO members, and a head with no
+    /// members is not a group — nothing points at it, so it mints no key.
+    ///
+    /// The launch that migrates it keeps it (the store still said `folder`). The
+    /// NEXT one is where a gate reading only the group fields would drop a page
+    /// the user deliberately filed. What survives the flattening is the NAME,
+    /// and that is what the gate has to honour.
+    #[test]
+    fn a_one_tab_folder_survives_the_second_launch_too() {
+        let root = ScratchProfilesRoot::new("one-tab-folder");
+        let profile = "research";
+        save_web_tab_store_in(
+            root.path(),
+            profile,
+            &WebTabStore {
+                folders: vec![WebTabFolder {
+                    id: "f1".to_string(),
+                    name: "Reading".to_string(),
+                    collapsed: false,
+                    parent: None,
+                }],
+                tabs: vec![
+                    saved_folder_tab("https://loose.example/", None),
+                    saved_folder_tab("https://only.example/", Some("f1")),
+                ],
+            },
+            WebTabSave::TreeEdit,
+        );
+
+        for launch in 1..=3 {
+            let mut shell = shell_on_scratch_profiles_root(root.path());
+            shell.settings.web_surface_restore_tabs = false;
+            open_ychrome_surface(&mut shell, profile, 1_000);
+            assert!(
+                surface_tab_urls(&shell).contains(&"https://only.example/".to_string()),
+                "launch {launch}: the page the user filed is gone"
+            );
+            assert_eq!(
+                shell.web_surfaces["local://ws"]
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.url == "https://only.example/")
+                    .and_then(|tab| tab.custom_title.clone())
+                    .as_deref(),
+                Some("Reading"),
+                "launch {launch}: …and the folder's label with it"
+            );
+        }
     }
 
     // ⚠ LOCK — SERDE COMPAT for the app-tab mark. Saved-tabs files already on
@@ -6626,7 +6754,7 @@ mod tests {
             }],
             tabs: vec![
                 saved_app_tab(page, true),
-                saved_tab("https://filed.example/", Some("f1")),
+                saved_folder_tab("https://filed.example/", Some("f1")),
             ],
         };
         save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
@@ -6675,7 +6803,7 @@ mod tests {
             }],
             tabs: vec![
                 saved_app_tab("https://x.example/page", true),
-                saved_tab("https://filed.example/", Some("f1")),
+                saved_folder_tab("https://filed.example/", Some("f1")),
             ],
         };
         save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
@@ -10326,7 +10454,7 @@ console.log('ok');
     #[test]
     fn the_cli_install_modal_owns_the_keys_when_it_is_the_only_one_up() {
         assert_eq!(
-            top_modal_of(false, false, false, true, false, false, false, false, false, false),
+            top_modal_of(false, false, false, true, false, false, false, false, false, false, false),
             Some(TopModal::CliInstall)
         );
         assert_eq!(TopModal::CliInstall.kind(), "cli-install");
@@ -10339,7 +10467,7 @@ console.log('ok');
     #[test]
     fn launch_flags_outranks_cli_install_when_both_are_flagged() {
         assert_eq!(
-            top_modal_of(false, false, true, true, false, false, false, false, false, false),
+            top_modal_of(false, false, true, true, false, false, false, false, false, false, false),
             Some(TopModal::LaunchFlags),
             "the deeper modal keeps the keys until it is dismissed"
         );
@@ -10375,46 +10503,46 @@ console.log('ok');
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, false),
+            top_modal_of(false, false, false, false, false, false, false, false, false, false, false),
             None
         );
         // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false, false, false, false, false, false),
+            top_modal_of(true, false, false, false, false, false, false, false, false, false, false),
             Some(TopModal::KeymapEditor)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false, false, false, false, false, false),
+            top_modal_of(false, true, false, false, false, false, false, false, false, false, false),
             Some(TopModal::ThemeEditor)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, false, false, false, false),
+            top_modal_of(false, false, false, false, true, false, false, false, false, false, false),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, false, false, false, false),
+            top_modal_of(false, false, false, false, false, true, false, false, false, false, false),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, false, false, false),
+            top_modal_of(false, false, false, false, false, false, true, false, false, false, false),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true, false, false),
+            top_modal_of(false, false, false, false, false, false, false, true, false, false, false),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true, false),
+            top_modal_of(false, false, false, false, false, false, false, false, true, false, false),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, true),
+            top_modal_of(false, false, false, false, false, false, false, false, false, false, true),
             Some(TopModal::StripDropdown)
         );
         // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
         // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, false, true, true, true, true, true, true),
+            top_modal_of(true, true, true, false, true, true, true, true, true, false, true),
             Some(TopModal::KeymapEditor)
         );
         // ⛔ A capture prompt outranks every dialog below the two editors. Both
@@ -10423,21 +10551,21 @@ console.log('ok');
         // keyboard reaches, or Escape would dismiss the wrong dialog and leave
         // the engine blocked on this one.
         assert_eq!(
-            top_modal_of(false, false, false, false, true, true, true, true, true, true),
+            top_modal_of(false, false, false, false, true, true, true, true, true, false, true),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, true, true, true, true),
+            top_modal_of(false, false, false, false, false, true, true, true, true, false, true),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, true, true, true),
+            top_modal_of(false, false, false, false, false, false, true, true, true, false, true),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true, true),
+            top_modal_of(false, false, false, false, false, false, false, false, true, false, true),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -28453,6 +28581,7 @@ console.log('ok');
                 label: "New yRDP".to_string(),
                 args: Vec::new(),
                 keytip: String::new(),
+                row_spawn: true,
             }],
             keytip: String::new(),
         };
@@ -28466,6 +28595,7 @@ console.log('ok');
                 label: "New Yggdrasil Maker".to_string(),
                 args: Vec::new(),
                 keytip: String::new(),
+                row_spawn: true,
             }],
             keytip: String::new(),
         };
@@ -42848,6 +42978,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -43200,6 +43331,53 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             !body.contains("guard_draft"),
             "refusing to type over a human is not a caller's option — the flag \
              that let `SubmitTerminalPrompt` opt out is what caused the incident"
+        );
+    }
+
+    /// ⛔⛔ A BLIND READING MAY NOT LICENSE A RESTART. `input-check` reports
+    /// `wedged`, which is a POSITIVE claim, and hangs a remedy off it that
+    /// restarts a live agent row. That verdict used to be computed from a
+    /// `bool` built with `unwrap_or(false)` — so a composer NOBODY COULD READ
+    /// arrived as "holds no draft" and the row was declared wedged on the
+    /// strength of a reading that never happened.
+    ///
+    /// ⭐ The write-permission logic beside it always kept the distinction
+    /// (`probe_write_is_permitted` demands `Some(false)`); it was only the
+    /// REPORT that threw it away, which is why nothing failed and the field
+    /// looked healthy. A source scan is the instrument because the defect is
+    /// a collapsed type, not a wrong branch.
+    #[test]
+    fn a_composer_nobody_could_read_is_not_reported_as_wedged() {
+        let source = SHELL_SOURCE;
+        let start = source
+            .find("\"composer_held_draft\": verdict.composer_held_draft,")
+            .expect("input-check must still report the composer reading");
+        let window = &source[start.saturating_sub(1200)..start + 1200];
+
+        assert!(
+            !window.contains("verdict.composer_held_draft.unwrap_or"),
+            "the wire field must stay TRI-STATE — true, false, or null. \
+             `unwrap_or(false)` here is the defect: it tells a caller \
+             `composer_held_draft: false` about a composer that was never read, \
+             and `false` is what every reader takes as permission to type."
+        );
+        assert!(
+            window.contains("verdict.composer_held_draft == Some(false)"),
+            "`wedged` and its restart remedy must both require a POSITIVE \
+             reading that the composer is empty. `!composer_held_draft` over a \
+             tri-state collapses `nobody could say` into `it is clear`, which is \
+             how a row nobody could read gets a restart recommended for it."
+        );
+        let wedged_at = window
+            .find("\"wedged\":")
+            .expect("the wedged verdict must still be reported");
+        let remedy_at = window.find("\"remedy\":").unwrap_or(window.len());
+        assert_eq!(
+            window[wedged_at..].matches("== Some(false)").count(),
+            window[remedy_at..].matches("== Some(false)").count() + 1,
+            "the remedy and the verdict must be computed from the SAME \
+             condition — a remedy that restarts a row on looser terms than the \
+             claim that justifies it is the worse half of the two"
         );
     }
 
@@ -43963,6 +44141,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44169,6 +44348,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44375,6 +44555,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44584,6 +44765,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44797,6 +44979,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -45002,6 +45185,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -45207,6 +45391,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -45453,6 +45638,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -45661,6 +45847,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -45908,6 +46095,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -46432,6 +46620,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -53626,7 +53815,6 @@ mod webtabs_menu_switcher_locks {
             view.holds_saved_page = holds_saved_page;
             let items = web_tab_menu_items(
                 &[view],
-                &[],
                 WEB_TAB_APP_TAB_ID,
                 &WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID),
                 WebTabMenuPage::Root,
@@ -53648,7 +53836,7 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    fn tab(id: u64, label: &str, folder: Option<&str>, active: bool) -> WebSurfaceOverlayTabView {
+    fn tab(id: u64, label: &str, group_head: Option<u64>, active: bool) -> WebSurfaceOverlayTabView {
         WebSurfaceOverlayTabView {
             // The rail fixture builds SILENT tabs; the media cases say so
             // explicitly, so a row that blinks in a layout assertion is a bug
@@ -53664,53 +53852,360 @@ mod webtabs_menu_switcher_locks {
             is_app_tab: id == WEB_TAB_APP_TAB_ID,
             effective_url: format!("https://example.com/{id}"),
             active,
-            folder: folder.map(str::to_string),
+            group_head,
+            group_collapsed: false,
+            // Derived by `views` below, never by hand: a head and its membership
+            // are one fact, and a fixture that states both can state them
+            // inconsistently.
+            group_size: 0,
             loading: false,
         }
     }
 
-    /// The ROOT page of a tab/folder menu, with nothing on the undo stack —
-    /// what a right-click shows. The two extra arguments are spelled here once
-    /// so a test that cares about neither does not restate them.
+    /// A tab list with `group_size` DERIVED, which is how the render path builds
+    /// it. Any fixture describing a group must go through this, or the rail sees
+    /// a head that nothing points at and draws it as an ordinary row.
+    fn views(mut tabs: Vec<WebSurfaceOverlayTabView>) -> Vec<WebSurfaceOverlayTabView> {
+        let sizes: Vec<usize> = tabs
+            .iter()
+            .map(|tab| {
+                tabs.iter()
+                    .filter(|other| other.group_head == Some(tab.id) && other.id != tab.id)
+                    .count()
+            })
+            .collect();
+        for (tab, size) in tabs.iter_mut().zip(sizes) {
+            tab.group_size = size;
+        }
+        tabs
+    }
+
+    // ======================================================================
+    // CURATION: A ROW MENU OFFERS ONLY WHAT IS A ROW (item 7)
+    // ======================================================================
+
+    fn app_with_verbs(name: &str, verbs: &[(&str, &str, bool)]) -> AppManifest {
+        AppManifest {
+            name: name.to_string(),
+            label: name.to_string(),
+            icon: String::new(),
+            binary: format!("/opt/{name}/bin/{name}"),
+            verbs: verbs
+                .iter()
+                .map(|(id, label, row_spawn)| AppVerb {
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                    args: Vec::new(),
+                    keytip: String::new(),
+                    row_spawn: *row_spawn,
+                })
+                .collect(),
+            keytip: String::new(),
+        }
+    }
+
+    /// The owner's ask, from a screenshot: terminal-invoked dashboards and
+    /// booters are meaningless as row spawns and must not be offered there.
+    /// ⚠ …and must STILL be offered by the surfaces where opening one is a
+    /// reasonable thing to do.
+    #[test]
+    fn the_row_menu_drops_verbs_that_are_not_rows_and_the_other_surfaces_keep_them() {
+        let apps = vec![
+            app_with_verbs("browser", &[("new", "New Browser", true)]),
+            app_with_verbs(
+                "monitor",
+                &[
+                    ("open", "Fleet overview", false),
+                    ("boot", "Fleet booter", false),
+                    ("session", "New Monitor Session", true),
+                ],
+            ),
+        ];
+
+        let rows: Vec<String> = app_row_spawn_entries(&apps)
+            .into_iter()
+            .map(|(_, verb)| verb.label)
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["New Browser".to_string(), "New Monitor Session".to_string()],
+            "a row menu offers what would BE a row, and nothing else"
+        );
+
+        // ⛔ The shared owner is untouched, so the titlebar `+` and the start
+        // page still offer everything. Filtering there instead would have
+        // removed these verbs from every surface at once.
+        let everywhere: Vec<String> = app_launcher_entries(&apps)
+            .into_iter()
+            .map(|(_, verb)| verb.label)
+            .collect();
+        assert!(everywhere.contains(&"Fleet overview".to_string()));
+        assert!(everywhere.contains(&"Fleet booter".to_string()));
+        assert_eq!(everywhere.len(), 4);
+    }
+
+    /// ⛔ AN OPT-OUT, NEVER AN OPT-IN. Every manifest written before the field
+    /// existed keeps every verb it had — an opt-in would have emptied every row
+    /// menu in the fleet at once, silently.
+    #[test]
+    fn a_manifest_written_before_the_flag_keeps_all_its_verbs() {
+        let manifest: AppManifest = serde_json::from_str(
+            r#"{"name":"browser","label":"Browser","binary":"/opt/browser/bin/browser",
+                "verbs":[{"id":"new","label":"New Browser"}]}"#,
+        )
+        .expect("an old manifest still parses");
+        assert!(
+            manifest.verbs[0].row_spawn,
+            "a verb that says nothing is a row spawn"
+        );
+        assert_eq!(app_row_spawn_entries(&[manifest]).len(), 1);
+
+        // ⛔ …and a verb built in CODE agrees with the same verb read from
+        // disk. A derived `Default` would make this false, so the one built in
+        // code would silently vanish from the row menu.
+        assert!(AppVerb::default().row_spawn);
+    }
+
+    /// An app whose verbs are ALL non-rows must not leave an empty submenu
+    /// behind: the gate that decides whether to draw "Open libyggterm App" has
+    /// to ask the same question the submenu's contents do.
+    #[test]
+    fn an_app_with_no_row_verbs_leaves_no_empty_submenu() {
+        let apps = vec![app_with_verbs(
+            "monitor",
+            &[("open", "Fleet overview", false)],
+        )];
+        assert!(app_row_spawn_entries(&apps).is_empty());
+        assert!(libyggterm_app_menu_items(&apps, false).is_empty());
+        assert!(
+            !app_launcher_entries(&apps).is_empty(),
+            "…while the surfaces that should still offer it are unaffected"
+        );
+        let gate = function_body(&product_source(), "fn row_menu_items(");
+        assert!(
+            !gate.contains("app_launcher_entries(apps).is_empty()"),
+            "the submenu gate must ask what the submenu will CONTAIN, or an \\
+             app with no row verbs draws an empty menu:\\n{gate}"
+        );
+    }
+
+    // ======================================================================
+    // BIRTH TITLES: THE MACHINE, AND THE APP SPAWN THAT BYPASSED THE BUILDER
+    // ======================================================================
+
+    /// ⛔ THE HALF THAT WAS OPEN. `spawn_launch_app_verb` took its title
+    /// straight from the manifest verb's own label, so the ONE builder governed
+    /// agent spawns and nothing else — and a machine name added to the builder
+    /// would have reached agent rows and silently missed every app row.
+    ///
+    /// A source lock, because the bypass is invisible in behaviour: a title
+    /// composed the old way still looks like a title.
+    #[test]
+    fn an_app_spawn_composes_its_title_through_the_one_builder() {
+        let spawn = function_body(&product_source(), "fn spawn_launch_app_verb(");
+        assert!(
+            !spawn.contains("let title_hint = verb.label.clone();"),
+            "the app spawn is naming rows from the manifest verb again, which \
+             puts app rows outside the convention:\n{spawn}"
+        );
+        assert!(
+            spawn.contains("yggterm_core::birth_title::birth_title("),
+            "…and it must compose through the shared builder:\n{spawn}"
+        );
+        assert!(
+            spawn.contains("birth_title_machine_word(&launch_context)"),
+            "…with the machine of the launch it is actually part of — a remote \
+             app spawn titled with THIS host's name is worse than an unnamed \
+             one:\n{spawn}"
+        );
+    }
+
+    /// The convention end to end, over the shapes a real manifest has: the
+    /// primary verb reads exactly `New {Machine} {App}`, and a second verb of
+    /// the same app on the same machine stays tellable apart.
+    #[test]
+    fn the_convention_names_the_machine_and_keeps_two_verbs_apart() {
+        use yggterm_core::birth_title::{app_verb_title_qualifier, birth_title};
+        let machine = Some("Atlas");
+        let primary = birth_title(machine, "Ychrome", None);
+        assert_eq!(primary, "New Atlas Ychrome");
+
+        let second = birth_title(
+            machine,
+            "Ychrome",
+            app_verb_title_qualifier("Ychrome", "New Ychrome (Incognito)").as_deref(),
+        );
+        assert_ne!(
+            primary, second,
+            "two launches landing on one title is the near-duplicate-rows \
+             defect the slug fix removed"
+        );
+
+        // An AGENT spawn reaches the same convention through the same builder,
+        // so the two planes cannot drift apart.
+        assert_eq!(
+            yggterm_core::agent_cli::new_session_birth_title_on(machine, SessionKind::Shell),
+            "New Atlas Terminal",
+        );
+        // …and a host with no name worth saying leaves every title exactly as
+        // it read before the machine existed.
+        assert_eq!(
+            yggterm_core::agent_cli::new_session_birth_title_on(None, SessionKind::Shell),
+            yggterm_core::agent_cli::new_session_birth_title(SessionKind::Shell),
+        );
+    }
+
+    // ======================================================================
+    // THE OMNIBOX, RAISED AS A PALETTE (item 6)
+    // ======================================================================
+
+    /// Row 0 is ALWAYS what plain Enter does, so the palette never opens with
+    /// nothing selectable and the user's own typing is always the first answer.
+    #[test]
+    fn the_palettes_first_row_is_what_plain_enter_would_do() {
+        let rows = web_omnibox_palette_items("example.com", &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "go");
+        assert_eq!(
+            rows[0].label, "Go to https://example.com",
+            "an address is a place to GO"
+        );
+        // ⛔ Text that is not an address is a SEARCH, and the label must say so.
+        // `web_surface_address_to_url` will turn any text into a search URL, so
+        // a label that read "Go to …" for a phrase would promise navigation for
+        // something that is about to run a query.
+        let phrase = web_omnibox_palette_items("how tall is a giraffe", &[]);
+        assert_eq!(phrase[0].label, "Search for \"how tall is a giraffe\"");
+    }
+
+    /// A history row leads with the page's NAME, because that is what the user
+    /// recognizes; the URL is the quieter half beside it.
+    #[test]
+    fn a_history_row_leads_with_its_title_and_falls_back_to_its_url() {
+        let rows = web_omnibox_palette_items(
+            "rel",
+            &[
+                (
+                    "https://example.invalid/notes".to_string(),
+                    "Release notes".to_string(),
+                ),
+                ("https://example.invalid/bare".to_string(), String::new()),
+            ],
+        );
+        assert_eq!(rows.len(), 3, "the go row plus both matches");
+        assert_eq!(rows[1].label, "Release notes");
+        assert_eq!(rows[1].detail, "https://example.invalid/notes");
+        // No title, so the URL leads rather than the row drawing an empty label.
+        assert_eq!(rows[2].label, "https://example.invalid/bare");
+        assert!(rows[2].detail.is_empty());
+    }
+
+    /// The rows the palette DRAWS and the target an accept RESOLVES are two
+    /// derivations of one input, so a row must resolve to the URL its own id
+    /// names — and to nothing at all when the id is stale or the draft is empty.
+    #[test]
+    fn accepting_a_row_resolves_to_exactly_what_that_row_named() {
+        let rows = web_omnibox_palette_items(
+            "example.com",
+            &[(
+                "https://example.invalid/notes".to_string(),
+                "Release notes".to_string(),
+            )],
+        );
+        assert_eq!(
+            web_omnibox_palette_target(&rows[0].id, "example.com").as_deref(),
+            Some("https://example.com"),
+        );
+        assert_eq!(
+            web_omnibox_palette_target(&rows[1].id, "example.com").as_deref(),
+            Some("https://example.invalid/notes"),
+            "a history row goes to ITS url, not to whatever is in the field"
+        );
+        // Stale or empty resolves to nothing, and the caller does nothing —
+        // rather than navigating somewhere it invented.
+        assert_eq!(web_omnibox_palette_target("nonsense", "example.com"), None);
+        assert_eq!(web_omnibox_palette_target("url:", "example.com"), None);
+        assert_eq!(web_omnibox_palette_target("go", "   "), None);
+    }
+
+    /// ⛔ The palette is a `TopModal` or it is INVISIBLE: a native web surface
+    /// draws above all DOM, so a palette raised over a browsing session is
+    /// behind the page unless the reconciler stashes the surface first.
+    #[test]
+    fn the_raised_palette_is_a_modal_over_the_viewport() {
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        assert!(!shell.has_modal_over_viewport(), "nothing is up yet");
+
+        // Owner requirement: ANY route that focuses the input raises it — the
+        // raise keys on the DRAFT existing, not on which gesture made one.
+        shell.web_surface_begin_address_edit("local://ws");
+        assert_eq!(shell.top_modal(), Some(TopModal::CommandPalette));
+        assert!(
+            chrome_transient_over_viewport(&shell.snapshot()),
+            "an over-viewport modal MUST open the transient cover, or it is a \
+             click-through modal under glass"
+        );
+        assert_eq!(
+            render_top_modal(&shell.snapshot()),
+            shell.top_modal(),
+            "the render pass and the live state must not disagree about what is \
+             on top"
+        );
+
+        // Clearing the draft is what SHUTS it — one fact, not a second flag.
+        shell.web_surface_set_address_draft("local://ws", None);
+        assert_eq!(shell.top_modal(), None);
+    }
+
+    /// Escape dismisses through the shared modal dispatcher, like every other
+    /// dialog — and Enter is deliberately NOT acted on there, because the
+    /// palette's own field owns it and acting twice would run the row twice.
+    #[test]
+    fn the_modal_dispatcher_closes_the_palette_and_leaves_enter_to_the_field() {
+        let hints = modal_key_hints(TopModal::CommandPalette);
+        assert!(hints.iter().any(|(key, _)| *key == "Esc"));
+        let dispatch = function_body(&product_source(), "fn modal_key_dispatch(");
+        let arm = dispatch
+            .split("TopModal::CommandPalette => {")
+            .nth(1)
+            .expect("the palette has a dispatch arm");
+        let arm = &arm[..arm.find("TopModal::StripDropdown").unwrap_or(arm.len())];
+        assert!(
+            arm.contains("if dismiss {") && !arm.contains("} else {"),
+            "Enter must fall through to the palette's own field, not be acted \
+             on here as well:\n{arm}"
+        );
+    }
+
+    /// ⛔ ONE result surface. The inline dropdown under the small field is the
+    /// detached popover the palette replaced, and a rail that still drew it
+    /// would put both on screen at once.
+    #[test]
+    fn the_rail_no_longer_draws_a_second_result_list() {
+        let rail = function_body(&product_source(), "fn WebOmniboxBar(");
+        assert!(
+            !rail.contains("ws-sug-"),
+            "the rail is drawing suggestion rows of its own again:\n{rail}"
+        );
+    }
+
+    /// The ROOT page of a row menu, with nothing on the undo stack — what a
+    /// right-click shows. The extra arguments are spelled here once so a test
+    /// that cares about neither does not restate them.
     fn menu_items(
         tabs: &[WebSurfaceOverlayTabView],
-        folders: &[WebTabFolder],
         active_tab_id: u64,
         target: &WebTabMenuTarget,
     ) -> Vec<RowMenuItem> {
-        web_tab_menu_items(
-            tabs,
-            folders,
-            active_tab_id,
-            target,
-            WebTabMenuPage::Root,
-            0,
-        )
+        web_tab_menu_items(tabs, active_tab_id, target, WebTabMenuPage::Root, 0)
     }
 
-    /// The "Move to folder ▸" PAGE of a tab's menu.
+    /// The "Move to group ▸" PAGE of a tab's menu.
     fn move_page_items(
         tabs: &[WebSurfaceOverlayTabView],
-        folders: &[WebTabFolder],
         target: &WebTabMenuTarget,
     ) -> Vec<RowMenuItem> {
-        web_tab_menu_items(
-            tabs,
-            folders,
-            1,
-            target,
-            WebTabMenuPage::MoveToFolder,
-            0,
-        )
-    }
-
-    fn folder(id: &str, name: &str, collapsed: bool) -> WebTabFolder {
-        WebTabFolder {
-            id: id.to_string(),
-            name: name.to_string(),
-            collapsed,
-            parent: None,
-        }
+        web_tab_menu_items(tabs, 1, target, WebTabMenuPage::MoveToGroup, 0)
     }
 
     /// A profile name no human has a jar for. The switch tests leave a surface
@@ -53722,7 +54217,7 @@ mod webtabs_menu_switcher_locks {
     /// A live web surface on the EPHEMERAL profile, so nothing in this module
     /// reads or writes the user's real tab store. Each `(url, folder)` becomes a
     /// user tab, in order, after the app tab.
-    pub(super) fn shell_with_surface(tabs: &[(&str, Option<&str>)]) -> ShellState {
+    pub(super) fn shell_with_surface(tabs: &[(&str, Option<u64>)]) -> ShellState {
         let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://ws");
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
@@ -53744,14 +54239,14 @@ mod webtabs_menu_switcher_locks {
         // would put each new one on TOP (the browser's direction, see
         // [`web_tab_placement`]) and every layout assertion built on this
         // fixture would silently read backwards.
-        for (url, folder_id) in tabs {
+        for (url, head) in tabs {
             let at = shell.web_surfaces["local://ws"].tabs.len();
             shell.web_surface_open_tab(
                 "local://ws",
                 &WebTabOpenRequest {
                     origin: WebTabOrigin::Restore {
                         index: at,
-                        folder: folder_id.map(|id| id.to_string()),
+                        group_head: *head,
                     },
                     destination: WebTabDestination::Blank,
                     foreground: true,
@@ -53769,7 +54264,19 @@ mod webtabs_menu_switcher_locks {
                 .expect("the new tab is the active one");
             tab.url = (*url).to_string();
             tab.history = vec![(*url).to_string()];
-            tab.folder = folder_id.map(|id| id.to_string());
+            tab.group_head = *head;
+        }
+        // ⛔ AND NO ADDRESS DRAFT. Every open above went through the blank,
+        // typing-ready path, which leaves the omnibox in EDIT mode — and an
+        // omnibox in edit mode raises the centred palette, which is a
+        // `TopModal`. This fixture describes a surface that already holds these
+        // tabs and is sitting still, not one the user is mid-address-edit in, so
+        // a palette standing over it would make every modal-precedence
+        // assertion in this module answer about the palette instead.
+        if let Some(surface) = shell.web_surfaces.get_mut("local://ws") {
+            surface.address_draft = None;
+            surface.address_typed_len = None;
+            surface.address_suggestion_index = None;
         }
         shell
     }
@@ -53970,14 +54477,14 @@ mod webtabs_menu_switcher_locks {
     // ONE reorder engine (`yggui::reorder_row_tree`), ONE row component.
     // ======================================================================
 
-    /// The rail's rows in draw order. Folders FIRST, each with its tabs, then
-    /// the loose tabs. Every other assertion in this section reads this.
+    /// The rail's rows in draw order: a group's HEAD followed by its members one
+    /// level deeper. Every other assertion in this section reads this.
     fn rail_rows_of(shell: &ShellState) -> Vec<(String, u32, bool)> {
         let overlay = shell
             .snapshot()
             .active_web_surface_overlay
             .expect("the surface is live");
-        web_tab_rail_rows(&overlay.folders, &overlay.tabs)
+        web_tab_rail_rows(&overlay.tabs)
             .into_iter()
             .map(|row| (row.id(), row.depth, row.visible))
             .collect()
@@ -53988,68 +54495,56 @@ mod webtabs_menu_switcher_locks {
             .snapshot()
             .active_web_surface_overlay
             .expect("the surface is live");
-        web_tab_rail_row_tree(&web_tab_rail_rows(&overlay.folders, &overlay.tabs))
+        web_tab_rail_row_tree(&web_tab_rail_rows(&overlay.tabs))
     }
 
-    /// A surface with one folder holding two tabs, plus two loose tabs. The app
-    /// tab is `tab:0` and is always root, so the rail reads:
-    /// `folder:f1, tab:1, tab:2, tab:0, tab:3, tab:4`.
-    fn shell_with_folder() -> ShellState {
-        let mut shell = shell_with_surface(&[
-            ("https://filed-a/", Some("f1")),
-            ("https://filed-b/", Some("f1")),
+    /// A surface with one GROUP — `tab:1` heading `tab:2` — plus two loose tabs.
+    /// The app tab is `tab:0` and is always root, so the rail reads:
+    /// `tab:0, tab:1, tab:2, tab:3, tab:4`.
+    fn shell_with_group() -> ShellState {
+        shell_with_surface(&[
+            ("https://head/", None),
+            ("https://filed-b/", Some(1)),
             ("https://loose-a/", None),
             ("https://loose-b/", None),
-        ]);
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface")
-            .folders
-            .push(WebTabFolder {
-                id: "f1".to_string(),
-                name: "Work".to_string(),
-                collapsed: false,
-                parent: None,
-            });
-        shell
+        ])
     }
 
     #[test]
-    fn the_rail_puts_folders_above_tabs_and_indents_what_is_filed() {
-        let shell = shell_with_folder();
+    fn the_rail_indents_a_groups_members_under_their_head() {
+        let shell = shell_with_group();
         assert_eq!(
             rail_rows_of(&shell),
             vec![
-                ("folder:f1".to_string(), 0, true),
-                ("tab:1".to_string(), 1, true),
-                ("tab:2".to_string(), 1, true),
                 ("tab:0".to_string(), 0, true),
+                ("tab:1".to_string(), 0, true),
+                ("tab:2".to_string(), 1, true),
                 ("tab:3".to_string(), 0, true),
                 ("tab:4".to_string(), 0, true),
             ],
-            "organization above the working set, and a filed tab is INDENTED — \
-             the depth the shared row engine draws, not a hand-written padding"
+            "a member is INDENTED under its head — the depth the shared row \
+             engine draws, not a hand-written padding — and the head is the \
+             first row OF the group rather than a container above it"
         );
     }
 
     /// A folded-away tab leaves the VIEW and stays in the MODEL. Feeding the
     /// reorder engine only the visible rows would delete it on the next drop.
     #[test]
-    fn a_collapsed_folders_tabs_leave_the_view_but_not_the_model() {
-        let mut shell = shell_with_folder();
-        shell.web_tab_toggle_folder("local://ws", "f1");
+    fn a_collapsed_groups_tabs_leave_the_view_but_not_the_model() {
+        let mut shell = shell_with_group();
+        shell.web_tab_toggle_group("local://ws", 1);
         let rows = rail_rows_of(&shell);
         assert_eq!(
-            rows.iter().find(|(id, _, _)| id == "tab:1"),
-            Some(&("tab:1".to_string(), 1, false)),
+            rows.iter().find(|(id, _, _)| id == "tab:2"),
+            Some(&("tab:2".to_string(), 1, false)),
             "present, not drawn"
         );
-        assert_eq!(rows.len(), 6, "nothing left the model");
+        assert_eq!(rows.len(), 5, "nothing left the model");
         assert_eq!(
             rows.iter().filter(|(_, _, visible)| *visible).count(),
             4,
-            "…and the folded rows are the two that left the view"
+            "…and the folded row is the one that left the view"
         );
     }
 
@@ -54078,307 +54573,178 @@ mod webtabs_menu_switcher_locks {
     fn a_rail_drag_reorders_as_well_as_re_parents() {
         // REORDER among the loose tabs — no parent changes, and the old rail
         // had no way to express this at all.
-        let mut shell = shell_with_folder();
+        let mut shell = shell_with_group();
         drag_rail_row(&mut shell, "tab:4", "tab:3", DragDropPlacement::Before);
         assert_eq!(
             rail_order(&shell),
-            vec!["folder:f1", "tab:1", "tab:2", "tab:0", "tab:4", "tab:3"],
+            vec!["tab:0", "tab:1", "tab:2", "tab:4", "tab:3"],
             "the row MOVED"
         );
 
-        // REORDER INSIDE a folder — same gesture, and the tab stays filed.
-        let mut shell = shell_with_folder();
-        drag_rail_row(&mut shell, "tab:1", "tab:2", DragDropPlacement::After);
+        // ⭐ THE CREATION GESTURE: a loose tab dropped ONTO another tab makes
+        // that tab a head. Under folders a container had to be made first, and
+        // only it could receive.
+        let mut shell = shell_with_group();
+        drag_rail_row(&mut shell, "tab:4", "tab:3", DragDropPlacement::Into);
         assert_eq!(
-            rail_order(&shell),
-            vec!["folder:f1", "tab:2", "tab:1", "tab:0", "tab:3", "tab:4"],
+            group_head_of(&shell, 4),
+            Some(3),
+            "dropping one row onto another IS how a group is made"
         );
-        assert_eq!(
-            shell.web_surfaces["local://ws"]
-                .tabs
-                .iter()
-                .find(|tab| tab.id == 1)
-                .and_then(|tab| tab.folder.clone()),
-            Some("f1".to_string()),
-            "reordering inside a folder must not unfile the row"
-        );
-
-        // RE-PARENT — a loose tab dropped on the folder is filed at its TOP,
-        // which is where the ring was drawn.
-        let mut shell = shell_with_folder();
-        drag_rail_row(&mut shell, "tab:3", "folder:f1", DragDropPlacement::Into);
         assert_eq!(
             rail_rows_of(&shell)
                 .into_iter()
                 .map(|(id, depth, _)| (id, depth))
                 .collect::<Vec<_>>(),
             vec![
-                ("folder:f1".to_string(), 0),
-                ("tab:3".to_string(), 1),
-                ("tab:1".to_string(), 1),
-                ("tab:2".to_string(), 1),
                 ("tab:0".to_string(), 0),
-                ("tab:4".to_string(), 0),
+                ("tab:1".to_string(), 0),
+                ("tab:2".to_string(), 1),
+                ("tab:3".to_string(), 0),
+                ("tab:4".to_string(), 1),
             ],
         );
+
+        // RE-PARENT — a loose tab dropped on an existing head joins its group.
+        let mut shell = shell_with_group();
+        drag_rail_row(&mut shell, "tab:3", "tab:1", DragDropPlacement::Into);
+        assert_eq!(group_head_of(&shell, 3), Some(1));
 
         // UN-FILE — dropped beside a root row it comes back out, and the app
         // tab is always a root row, so the gesture is always available.
-        let mut shell = shell_with_folder();
-        drag_rail_row(&mut shell, "tab:1", "tab:3", DragDropPlacement::After);
+        let mut shell = shell_with_group();
+        drag_rail_row(&mut shell, "tab:2", "tab:3", DragDropPlacement::After);
         assert_eq!(
-            rail_order(&shell),
-            vec!["folder:f1", "tab:2", "tab:0", "tab:3", "tab:1", "tab:4"],
-        );
-        assert_eq!(
-            shell.web_surfaces["local://ws"]
-                .tabs
-                .iter()
-                .find(|tab| tab.id == 1)
-                .and_then(|tab| tab.folder.clone()),
+            group_head_of(&shell, 2),
             None,
-            "dropping beside a loose tab un-files the row"
+            "dropping beside a loose tab takes the row out of its group"
         );
     }
 
-    /// The rail is TWO BANDS — folders above, loose tabs below — so a drop that
-    /// crosses them has exactly one honest meaning, and the mark drawn is the
-    /// landing (DESIGN.md: the final placement must match the visible
-    /// indicator). A tab "before a folder" would have landed after every folder
-    /// anyway, which is the lie this coercion removes.
-    #[test]
-    fn a_cross_band_drop_means_the_one_thing_it_can_mean() {
-        let mut shell = shell_with_folder();
-
-        // A TAB anywhere on a folder row: INSIDE.
-        shell.arm_web_tab_row_drag("tab:3".to_string(), "tab:3".to_string(), (0.0, 0.0));
-        assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
-        for band in [
-            DragDropPlacement::Before,
-            DragDropPlacement::Into,
-            DragDropPlacement::After,
-        ] {
-            shell.hover_web_tab_row_drop("folder:f1", "Work", band, false);
-            assert_eq!(
-                shell.web_tab_row_drop_edge("folder:f1"),
-                Some(DragDropPlacement::Into),
-                "a tab cannot come to rest between two folders"
-            );
-        }
-        shell.clear_web_tab_row_drag();
-
-        // A FOLDER over a TAB row: no target at all, rather than a landing the
-        // model cannot hold.
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface")
-            .folders
-            .push(WebTabFolder {
-                id: "f2".to_string(),
-                name: "Later".to_string(),
-                collapsed: false,
-                parent: None,
-            });
-        shell.arm_web_tab_row_drag("folder:f2".to_string(), "Later".to_string(), (0.0, 0.0));
-        assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
-        shell.hover_web_tab_row_drop("tab:3", "loose", DragDropPlacement::After, false);
-        assert_eq!(shell.web_tab_row_drop_edge("tab:3"), None);
-        let before = rail_order(&shell);
-        let tree = rail_tree_of(&shell);
-        shell.end_web_tab_row_drag(&tree);
-        assert_eq!(rail_order(&shell), before, "and the release moves nothing");
+    fn group_head_of(shell: &ShellState, tab_id: u64) -> Option<u64> {
+        shell.web_surfaces["local://ws"]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.group_head)
     }
 
-    /// A drag is a click until it travels, and the app tab is nobody's to move.
+    /// ⛔ THE REFUSAL, and it is the one that erases data when it is missing:
+    /// a head dropped inside its own group would make a cycle, and a cycle takes
+    /// every row under it out of the draw walk. `row_tree_descends_from` is
+    /// consulted on the RAIL path, not only in the engine's own tests.
     #[test]
-    fn the_rail_shares_the_windows_one_drag_grammar() {
-        let mut shell = shell_with_folder();
-        let tree = rail_tree_of(&shell);
-
-        shell.arm_web_tab_row_drag("tab:3".to_string(), "loose".to_string(), (100.0, 100.0));
-        assert!(!shell.maybe_begin_web_tab_row_drag((101.0, 100.0)), "jitter is a click");
-        assert!(!shell.web_tab_row_is_dragging("tab:3"), "an armed press does not dim");
-        shell.hover_web_tab_row_drop("folder:f1", "Work", DragDropPlacement::Into, false);
-        assert_eq!(
-            shell.web_tab_row_drop_edge("folder:f1"),
-            None,
-            "an armed press accepts no drop target"
-        );
+    fn a_row_cannot_be_dropped_into_its_own_group() {
+        let mut shell = shell_with_group();
+        // tab:1 heads tab:2. Dropping tab:1 INSIDE tab:2 would make it its own
+        // grandchild.
         let before = rail_rows_of(&shell);
-        shell.end_web_tab_row_drag(&tree);
-        assert_eq!(rail_rows_of(&shell), before, "releasing a click moves nothing");
-
-        // The app tab is `tabs[0]` and stays there.
-        shell.arm_web_tab_row_drag("tab:0".to_string(), "ychrome".to_string(), (0.0, 0.0));
-        assert!(shell.row_drag.is_none(), "the app tab is not a drag source");
+        drag_rail_row(&mut shell, "tab:1", "tab:2", DragDropPlacement::Into);
+        assert_eq!(
+            group_head_of(&shell, 1),
+            None,
+            "the head stays at the root — a row is never its own descendant"
+        );
+        assert_eq!(rail_rows_of(&shell), before, "nothing moved at all");
+        // …and the same refusal on the direct verb, which has no engine in
+        // front of it.
+        shell.web_tab_move_to_group("local://ws", 1, Some(2));
+        assert_eq!(group_head_of(&shell, 1), None);
+        shell.web_tab_move_to_group("local://ws", 1, Some(1));
+        assert_eq!(group_head_of(&shell, 1), None, "nor its own head");
     }
 
-    /// NESTED FOLDERS (user-reported 2026-07-31: "Folders can have nested
-    /// folders too"). A folder holds folders, arbitrarily deep — and the ONE
-    /// move that must never be allowed is a folder into its own descendant,
-    /// which would erase the whole subtree from the draw walk.
+    /// GROUPS NEST, arbitrarily deep — the cwd tree's own rule, carried over
+    /// from folders (user-reported 2026-07-31).
     #[test]
-    fn a_folder_can_be_filed_inside_another_folder() {
-        let mut shell = shell_with_folder();
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface")
-            .folders
-            .push(WebTabFolder {
-                id: "f2".to_string(),
-                name: "Later".to_string(),
-                collapsed: false,
-                parent: None,
-            });
-
-        drag_rail_row(&mut shell, "folder:f2", "folder:f1", DragDropPlacement::Into);
-        assert_eq!(
-            shell.web_surfaces["local://ws"]
-                .folders
-                .iter()
-                .find(|folder| folder.id == "f2")
-                .and_then(|folder| folder.parent.clone())
-                .as_deref(),
-            Some("f1"),
-            "a folder dropped inside a folder IS inside it"
-        );
+    fn a_group_can_sit_inside_another_group() {
+        let mut shell = shell_with_group();
+        // tab:3 becomes a head of its own…
+        drag_rail_row(&mut shell, "tab:4", "tab:3", DragDropPlacement::Into);
+        // …and then joins tab:1's group, taking tab:4 with it.
+        drag_rail_row(&mut shell, "tab:3", "tab:1", DragDropPlacement::Into);
         assert_eq!(
             rail_rows_of(&shell)
                 .into_iter()
                 .map(|(id, depth, _)| (id, depth))
                 .collect::<Vec<_>>(),
             vec![
-                ("folder:f1".to_string(), 0),
-                // Folders above tabs AT EVERY LEVEL: the sub-folder precedes
-                // its parent's own tabs.
-                ("folder:f2".to_string(), 1),
-                ("tab:1".to_string(), 1),
-                ("tab:2".to_string(), 1),
                 ("tab:0".to_string(), 0),
-                ("tab:3".to_string(), 0),
-                ("tab:4".to_string(), 0),
+                ("tab:1".to_string(), 0),
+                ("tab:3".to_string(), 1),
+                ("tab:4".to_string(), 2),
+                ("tab:2".to_string(), 1),
             ],
-            "the nested folder is drawn one level in"
-        );
-
-        // …and a tab filed into the NESTED folder sits two levels deep.
-        drag_rail_row(&mut shell, "tab:3", "folder:f2", DragDropPlacement::Into);
-        assert_eq!(
-            rail_rows_of(&shell)
-                .into_iter()
-                .find(|(id, _, _)| id == "tab:3")
-                .map(|(_, depth, _)| depth),
-            Some(2),
-            "depth is unbounded, not capped at one"
+            "depth is unbounded, not capped at one, and a head's own members \
+             follow it wherever it goes"
         );
     }
 
-    /// The refusal. `row_tree_descends_from` is consulted on the RAIL path, not
-    /// only in the engine's own tests: a folder dropped onto something inside
-    /// itself must move nothing at all.
+    /// Taking a group apart must never take its contents with it — its members
+    /// rise to where the group was, and the head stays a tab.
     #[test]
-    fn a_folder_cannot_be_dropped_into_its_own_descendant() {
-        let mut shell = shell_with_folder();
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface")
-            .folders
-            .push(WebTabFolder {
-                id: "f2".to_string(),
-                name: "Later".to_string(),
-                collapsed: false,
-                parent: Some("f1".to_string()),
-            });
-        let before = rail_rows_of(&shell);
-
-        // f1 holds f2. Dropping f1 INSIDE f2 would make f1 its own grandchild.
-        drag_rail_row(&mut shell, "folder:f1", "folder:f2", DragDropPlacement::Into);
-        assert_eq!(
-            shell.web_surfaces["local://ws"]
-                .folders
-                .iter()
-                .find(|folder| folder.id == "f1")
-                .and_then(|folder| folder.parent.clone()),
-            None,
-            "f1 stays at the root — a folder is never its own descendant"
-        );
-        // …and the deeper case: f1 onto a TAB filed inside f2's parent.
-        drag_rail_row(&mut shell, "folder:f1", "tab:1", DragDropPlacement::Before);
-        assert_eq!(rail_rows_of(&shell), before, "nothing moved at all");
-    }
-
-    /// Deleting a folder must never take its contents with it — and with
-    /// nesting that includes its SUB-folders, which would otherwise point at a
-    /// parent that no longer exists and vanish from the draw walk.
-    #[test]
-    fn deleting_a_folder_lifts_its_contents_one_level() {
-        let mut shell = shell_with_folder();
-        {
-            let surface = shell.web_surfaces.get_mut("local://ws").expect("surface");
-            surface.folders.push(WebTabFolder {
-                id: "f2".to_string(),
-                name: "Later".to_string(),
-                collapsed: false,
-                parent: Some("f1".to_string()),
-            });
-        }
-        shell.web_tab_delete_folder("local://ws", "f1");
+    fn ungrouping_lifts_the_members_one_level_and_closes_nothing() {
+        let mut shell = shell_with_group();
+        drag_rail_row(&mut shell, "tab:3", "tab:1", DragDropPlacement::Into);
+        shell.web_tab_disband_group("local://ws", 1);
         let surface = &shell.web_surfaces["local://ws"];
-        assert_eq!(
-            surface
-                .folders
-                .iter()
-                .find(|folder| folder.id == "f2")
-                .and_then(|folder| folder.parent.clone()),
-            None,
-            "the sub-folder rises to where its parent was, never orphaned"
-        );
         assert!(
-            surface
-                .tabs
-                .iter()
-                .all(|tab| tab.folder.as_deref() != Some("f1")),
-            "and the tabs come with it"
+            surface.tabs.iter().all(|tab| tab.group_head.is_none()),
+            "the members rise to the root, where their group was"
         );
         assert_eq!(surface.tabs.len(), 5, "no tab was closed");
+        assert!(
+            surface.tabs.iter().any(|tab| tab.id == 1),
+            "…and the head is still a tab, because it always was one"
+        );
     }
 
-    /// Nesting has to SURVIVE. A folder tree that forgets its shape on restart
-    /// is not organization.
+    /// A NESTED group's members rise to the OUTER group, not to the root: they
+    /// go where the group was, which is one level up and no further.
     #[test]
-    fn folder_nesting_round_trips_through_the_store() {
+    fn ungrouping_a_nested_group_lifts_its_members_into_the_outer_one() {
+        let mut shell = shell_with_group();
+        drag_rail_row(&mut shell, "tab:4", "tab:3", DragDropPlacement::Into);
+        drag_rail_row(&mut shell, "tab:3", "tab:1", DragDropPlacement::Into);
+        shell.web_tab_disband_group("local://ws", 3);
+        assert_eq!(
+            group_head_of(&shell, 4),
+            Some(1),
+            "one level up, not all the way out"
+        );
+    }
+
+    /// Organization has to SURVIVE, and a per-run tab id cannot carry it. The
+    /// store speaks a durable KEY; the restore maps it back to whatever ids
+    /// this run minted.
+    #[test]
+    fn a_group_round_trips_through_the_store_despite_per_run_ids() {
         let store = WebTabStore {
-            folders: vec![
-                folder("f1", "Work", false),
-                WebTabFolder {
-                    id: "f2".to_string(),
-                    name: "Later".to_string(),
-                    collapsed: true,
-                    parent: Some("f1".to_string()),
-                },
+            folders: Vec::new(),
+            tabs: vec![
+                super::tests::saved_head_tab("https://head/", "g0"),
+                super::tests::saved_tab("https://member/", Some("g0")),
             ],
-            tabs: Vec::new(),
         };
         let json = serde_json::to_string(&store).expect("encode");
         let back: WebTabStore = serde_json::from_str(&json).expect("decode");
-        assert_eq!(back.folders[1].parent.as_deref(), Some("f1"));
-        // …and a store written BEFORE nesting existed reads back flat, which is
-        // exactly what it meant.
+        assert_eq!(back.tabs[0].group_key.as_deref(), Some("g0"));
+        assert_eq!(back.tabs[1].group.as_deref(), Some("g0"));
+        // …and a store written BEFORE row groups reads back with no group at
+        // all, which is what the migration is for.
         let legacy: WebTabStore = serde_json::from_str(
-            r#"{"folders":[{"id":"f1","name":"Work"}],"tabs":[]}"#,
+            r#"{"folders":[{"id":"f1","name":"Work"}],"tabs":[{"url":"https://a/","folder":"f1"}]}"#,
         )
         .expect("decode legacy");
-        assert_eq!(legacy.folders[0].parent, None);
+        assert_eq!(legacy.tabs[0].group, None);
+        assert_eq!(legacy.tabs[0].folder.as_deref(), Some("f1"));
     }
 
     /// The app tab owns `tabs[0]` at every depth: nothing lands above it, and
     /// no reorder can displace it.
     #[test]
     fn the_app_tab_stays_first_whatever_the_order_says() {
-        let mut shell = shell_with_folder();
+        let mut shell = shell_with_group();
         shell.arm_web_tab_row_drag("tab:3".to_string(), "loose".to_string(), (0.0, 0.0));
         assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
         shell.hover_web_tab_row_drop("tab:0", "ychrome", DragDropPlacement::Before, false);
@@ -54396,43 +54762,20 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// "New folder" reaches INSIDE a folder, or nesting would exist only for
-    /// folders that already happened to be there.
+    /// ⛔ The app tab can never join a group, by any route. Every close verb in
+    /// the product is written on the premise that `tabs[0]` is the app's.
     #[test]
-    fn a_new_folder_can_be_born_inside_a_folder() {
-        let mut shell = shell_with_folder();
-        shell.web_tab_toggle_folder("local://ws", "f1");
-        assert!(
-            shell.web_surfaces["local://ws"].folders[0].collapsed,
-            "the parent starts SHUT"
-        );
-        shell.web_tab_new_folder_in("local://ws", Some("f1".to_string()));
-        let surface = &shell.web_surfaces["local://ws"];
-        let born = surface.folders.last().expect("the new folder");
-        assert_eq!(born.parent.as_deref(), Some("f1"));
-        assert!(
-            !surface.folders[0].collapsed,
-            "…and its parent opened, or the new row and its rename field would \
-             be invisible"
-        );
-        assert_eq!(
-            shell.web_tab_rename.as_ref().map(|(id, _)| id.clone()),
-            Some(web_tab_row_id(&WebTabMenuTarget::Folder(born.id.clone()))),
-            "it opens straight into rename, like every folder born in this tree"
-        );
-        // A parent the surface does not hold is not a parent. (A fresh shell:
-        // folder ids are minted from the clock, so two folders born in the
-        // same millisecond would collide.)
-        let mut other = shell_with_folder();
-        other.web_tab_new_folder_in("local://ws", Some("nope".to_string()));
-        assert_eq!(
-            other.web_surfaces["local://ws"]
-                .folders
-                .last()
-                .and_then(|folder| folder.parent.clone()),
-            None,
-            "a dangling parent would hide the folder from the draw walk"
-        );
+    fn the_app_tab_can_never_join_a_group() {
+        let mut shell = shell_with_group();
+        shell.web_tab_move_to_group("local://ws", WEB_TAB_APP_TAB_ID, Some(1));
+        assert_eq!(group_head_of(&shell, WEB_TAB_APP_TAB_ID), None);
+        // …and the drag never even ARMS: the app tab is not a drag source
+        // while it sits on the app's own page, so there is no gesture to refuse
+        // further down.
+        shell.arm_web_tab_row_drag("tab:0".to_string(), "ychrome".to_string(), (0.0, 0.0));
+        assert!(shell.row_drag.is_none(), "the app tab is not a drag source");
+        assert_eq!(group_head_of(&shell, WEB_TAB_APP_TAB_ID), None);
+        assert_eq!(shell.web_surfaces["local://ws"].tabs[0].id, WEB_TAB_APP_TAB_ID);
     }
 
     /// Renamable tab rows — the second half of the report. A user-given name
@@ -54476,15 +54819,24 @@ mod webtabs_menu_switcher_locks {
         assert!(shell.web_tab_rename.is_none(), "a commit always clears the field");
     }
 
-    /// "New folder" is born INTO a rename whose text is SELECTED — the first
-    /// keystroke replaces the placeholder instead of appending to it.
+    /// A rename opens on the row's CURRENT name, SELECTED — the first keystroke
+    /// replaces it instead of appending to it.
+    ///
+    /// ⚠ This used to be a "New folder" test, and the placeholder it asserted on
+    /// was a folder born unnamed. There is no such row any more: a group is
+    /// headed by a real tab that already has a name, so the thing worth locking
+    /// is that the field opens over that name and selects it.
     #[test]
-    fn a_new_folder_opens_its_rename_on_a_selected_placeholder() {
-        let mut shell = shell_with_surface(&[]);
-        shell.web_tab_new_folder("local://ws");
-        let (row_id, draft) = shell.web_tab_rename.clone().expect("born into a rename");
-        assert!(row_id.starts_with("folder:"), "{row_id}");
-        assert_eq!(draft, WEB_TAB_NEW_FOLDER_NAME);
+    fn a_rename_opens_on_the_rows_current_name_and_selects_it() {
+        let mut shell = shell_with_surface(&[("https://example.com/", None)]);
+        shell.web_tab_begin_rename("tab:1");
+        let (row_id, draft) = shell.web_tab_rename.clone().expect("the field opened");
+        assert_eq!(row_id, "tab:1");
+        assert!(
+            !draft.is_empty(),
+            "a field that opened EMPTY over a titled row would read as \
+             'this row has no name'"
+        );
 
         // …and the field that draws it selects, not merely focuses.
         let product = product_source();
@@ -54518,17 +54870,18 @@ mod webtabs_menu_switcher_locks {
         // …and the slots that DO draw are named here, so this cannot pass by
         // the rail simply having stopped drawing folders.
         assert!(
-            rail.contains("Some(rsx! { RowFolderIcon { expanded } })"),
-            "the folder row still fills the mark column with the shared glyph:\n{rail}"
+            rail.contains("expanded.map(|expanded| rsx! { RowFolderIcon { expanded } })"),
+            "a group HEAD still fills the mark column with the shared glyph — \
+             and only a head, because `expanded` is None on every other row:\n{rail}"
         );
-        // The app tab's ✕ is CONDITIONAL (it appears once the tab holds a real
-        // page), and when it is absent it must be an absent SLOT — `.then(…)`
-        // yielding None — not an empty element, which would still reserve its
-        // gap on every row.
+        // The trailing verbs are CONDITIONAL (the "+" only on a head, the ✕ only
+        // once the app tab holds a real page), and when neither is there the
+        // slot must be ABSENT — `.then(…)` yielding None — not an empty element,
+        // which would still reserve its gap on every row.
         assert!(
-            rail.contains("(!is_app_tab || app_tab_can_go_home).then(|| rsx! {"),
-            "the app tab's conditional ✕ must be an absent slot when absent, \
-             never an empty one"
+            rail.contains("let actions = (heads_group || shows_close).then(|| rsx! {"),
+            "the row's conditional verbs must be an absent slot when absent, \
+             never an empty one:\n{rail}"
         );
     }
 
@@ -54631,19 +54984,21 @@ mod webtabs_menu_switcher_locks {
     // ======================================================================
 
     #[test]
-    fn close_other_tabs_spares_the_clicked_tab_the_app_tab_and_other_folders() {
-        let tabs = vec![
+    fn close_other_tabs_spares_the_clicked_tab_the_app_tab_and_other_groups() {
+        // `tab:3` heads a group holding 4 and 5.
+        let tabs = views(vec![
             tab(0, "app", None, false),
             tab(1, "root-a", None, true),
             tab(2, "root-b", None, false),
-            tab(3, "root-c", None, false),
-            tab(4, "filed-a", Some("f1"), false),
-            tab(5, "filed-b", Some("f1"), false),
-        ];
+            tab(3, "Work", None, false),
+            tab(4, "filed-a", Some(3), false),
+            tab(5, "filed-b", Some(3), false),
+        ]);
         let scope = web_tab_scope_rows(&tabs);
 
-        // A ROOT tab: the other two root tabs, never itself, never the app tab,
-        // and never anything filed in a folder.
+        // A ROOT tab: the other root tabs, never itself, never the app tab, and
+        // never anything inside a group. ⚠ The HEAD is at root, so it is in
+        // scope — it is an ordinary tab that other tabs happen to point at.
         let others = web_tab_close_others_targets(&scope, 1);
         assert_eq!(
             others,
@@ -54656,25 +55011,24 @@ mod webtabs_menu_switcher_locks {
             "the app's own tab is not a tab verb's to close"
         );
 
-        // A FILED tab: only its folder-mates. Folder-scoped honesty.
+        // A GROUPED tab: only its group-mates. Group-scoped honesty.
         assert_eq!(
             web_tab_close_others_targets(&scope, 4),
             vec![5],
-            "a tab filed in a folder does not speak for the root"
+            "a tab inside a group does not speak for the root"
         );
 
         // The label counts EXACTLY what the action closes — one planner, one
         // number, no room for a lie.
-        let folders = vec![folder("f1", "Work", false)];
         assert_eq!(
-            menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(1))
+            menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1))
                 .iter()
                 .find(|item| item.id == "webtab-close-others")
                 .map(|item| item.label.clone()),
             Some("Close 2 other tabs".to_string()),
         );
         assert_eq!(
-            menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(4))
+            menu_items(&tabs, 1, &WebTabMenuTarget::Tab(4))
                 .iter()
                 .find(|item| item.id == "webtab-close-others")
                 .map(|item| item.label.clone()),
@@ -54691,7 +55045,7 @@ mod webtabs_menu_switcher_locks {
             ("https://a/", None),
             ("https://b/", None),
             ("https://c/", None),
-            ("https://filed/", Some("f1")),
+            ("https://filed/", Some(1)),
         ]);
         assert_eq!(
             shell.web_surfaces["local://ws"].tabs.len(),
@@ -54721,31 +55075,26 @@ mod webtabs_menu_switcher_locks {
         );
         assert!(
             surviving.contains(&4),
-            "a tab filed in a folder is out of the root's scope and must survive"
+            "a tab inside a group is out of the root's scope and must survive"
         );
         assert_eq!(surviving, vec![0, 1, 4]);
     }
 
-    /// A folder's "Close N tabs" names its count and takes exactly those tabs —
-    /// the folder itself stays, because closing contents is not deleting
-    /// organization.
+    /// A group head's "Close N tabs in this group" names its count and takes
+    /// exactly those tabs. ⛔ The HEAD survives: it is a page the user is
+    /// reading, and closing the row you right-clicked when you asked to close
+    /// what is under it is the bulk-close dishonesty the label must not commit.
     #[test]
-    fn a_folders_close_names_its_count_and_leaves_the_folder_standing() {
+    fn a_groups_close_names_its_count_and_leaves_the_head_standing() {
         let mut shell = shell_with_surface(&[
-            ("https://root/", None),
-            ("https://f1-a/", Some("f1")),
-            ("https://f1-b/", Some("f1")),
+            ("https://head/", None),
+            ("https://g-a/", Some(1)),
+            ("https://g-b/", Some(1)),
         ]);
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface")
-            .folders
-            .push(folder("f1", "Work", false));
 
         shell.open_web_tab_context_menu(
             "local://ws",
-            WebTabMenuTarget::Folder("f1".to_string()),
+            WebTabMenuTarget::Tab(1),
             (0.0, 0.0),
             WebSurfaceChromeAnchor::Rail,
         );
@@ -54754,26 +55103,22 @@ mod webtabs_menu_switcher_locks {
                 .snapshot()
                 .web_tab_menu_items
                 .iter()
-                .find(|item| item.id == "webfolder-close-tabs")
+                .find(|item| item.id == "webgroup-close-tabs")
                 .map(|item| item.label.clone()),
-            Some("Close 2 tabs".to_string()),
-            "a destructive folder verb must NAME what it takes"
+            Some("Close 2 tabs inside".to_string()),
+            "a destructive group verb must NAME what it takes"
         );
 
         let scope = shell.web_tab_scope_rows_for_session("local://ws");
-        let targets = web_tab_folder_close_targets(&scope, "f1");
+        let targets = web_tab_group_close_targets(&scope, 1);
         assert_eq!(targets.len(), 2);
+        assert!(!targets.contains(&1), "⛔ never the head itself");
         assert_eq!(shell.web_surface_close_tabs("local://ws", &targets), 2);
         let surface = &shell.web_surfaces["local://ws"];
         assert_eq!(
             surface.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
             vec![0, 1],
-            "the root tab and the app tab are untouched"
-        );
-        assert_eq!(
-            surface.folders.len(),
-            1,
-            "the folder survives its tabs — closing contents is not deleting organization"
+            "the head and the app tab are untouched"
         );
     }
 
@@ -54791,8 +55136,9 @@ mod webtabs_menu_switcher_locks {
             ("https://a/", None),
             ("https://b/", None),
             ("https://c/", None),
-            ("https://filed-a/", Some("f1")),
-            ("https://filed-b/", Some("f1")),
+            // 4 and 5 sit inside the group headed by tab 3.
+            ("https://filed-a/", Some(3)),
+            ("https://filed-b/", Some(3)),
         ]);
         assert_eq!(
             shell.web_surfaces["local://ws"]
@@ -54818,6 +55164,8 @@ mod webtabs_menu_switcher_locks {
                 .iter()
                 .find(|item| item.id == "webtab-close-others")
                 .map(|item| item.label.clone()),
+            // ⚠ TWO, not three: tab 3 is at root and in scope, but 4 and 5 are
+            // inside its group and are not.
             Some("Close 2 other tabs".to_string()),
         );
 
@@ -54836,34 +55184,30 @@ mod webtabs_menu_switcher_locks {
                 .collect::<Vec<_>>(),
             vec![0, 1, 4, 5],
             "exactly the two the label counted went — the app tab, the clicked \
-             tab and the folder's tabs all survive"
+             tab and the group's tabs all survive"
         );
 
-        // A FOLDER's "Close N tabs", same rule.
+        // A GROUP HEAD's "Close N tabs in this group", same rule. Tab 3 went
+        // with the close above, so 4 and 5 are now headless at root; re-form the
+        // group under tab 4 to exercise the verb.
+        shell.web_tab_move_to_group("local://ws", 5, Some(4));
         shell.open_web_tab_context_menu(
             "local://ws",
-            WebTabMenuTarget::Folder("f1".to_string()),
+            WebTabMenuTarget::Tab(4),
             (0.0, 0.0),
             WebSurfaceChromeAnchor::Rail,
         );
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface")
-            .folders
-            .push(folder("f1", "Work", false));
         assert_eq!(
             shell
                 .snapshot()
                 .web_tab_menu_items
                 .iter()
-                .find(|item| item.id == "webfolder-close-tabs")
+                .find(|item| item.id == "webgroup-close-tabs")
                 .map(|item| item.label.clone()),
-            Some("Close 2 tabs".to_string()),
+            Some("Close 1 tab inside".to_string()),
         );
-        let action =
-            web_tab_menu_action(&WebTabMenuTarget::Folder("f1".to_string()), "webfolder-close-tabs")
-                .expect("the folder item routes");
+        let action = web_tab_menu_action(&WebTabMenuTarget::Tab(4), "webgroup-close-tabs")
+            .expect("the group item routes");
         assert!(shell.apply_web_tab_menu_action("local://ws", &action));
         assert_eq!(
             shell.web_surfaces["local://ws"]
@@ -54871,9 +55215,10 @@ mod webtabs_menu_switcher_locks {
                 .iter()
                 .map(|tab| tab.id)
                 .collect::<Vec<_>>(),
-            vec![0, 1],
-            "a folder's close takes its filed tabs and nothing else"
+            vec![0, 1, 4],
+            "a group's close takes its members and never its head"
         );
+        assert!(shell.apply_web_tab_menu_action("local://ws", &WebTabMenuAction::CloseTab(4)));
 
         // "Close tab" is the same one planner: the app tab is never in a plan,
         // so the greyed item could not close it even if a click reached it.
@@ -54936,7 +55281,7 @@ mod webtabs_menu_switcher_locks {
         // And the planner IS the label's: one function, both readers.
         let items = function_body(&product, "fn web_tab_menu_items(");
         assert!(items.contains("web_tab_close_others_targets(&scope, tab_id)"));
-        assert!(items.contains("web_tab_folder_close_targets(&scope, folder_id)"));
+        assert!(items.contains("web_tab_group_close_targets(&scope, tab_id)"));
         let apply = function_body(&product, "fn apply_web_tab_menu_action(");
         assert_eq!(
             apply.matches("web_tab_menu_close_plan(&scope, action)").count(),
@@ -54957,18 +55302,16 @@ mod webtabs_menu_switcher_locks {
             web_tab_menu_action(&WebTabMenuTarget::Tab(7), "webtab-split"),
             Some(WebTabMenuAction::SplitWithActiveTab(7)),
         );
-        // A folder row cannot reach a tab verb by spelling.
-        assert_eq!(
-            web_tab_menu_action(&WebTabMenuTarget::Folder("f1".to_string()), "webtab-split"),
-            None,
-        );
+        // An id no row owns resolves to nothing, rather than to the nearest
+        // verb that happens to parse.
+        assert_eq!(web_tab_menu_action(&WebTabMenuTarget::Tab(7), "webtab-nonsense"), None);
 
         let tabs = vec![
             tab(0, "app", None, false),
             tab(1, "here", None, true),
             tab(2, "other", None, false),
         ];
-        let split = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))
+        let split = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1))
             .into_iter()
             .find(|item| item.id == "webtab-split")
             .expect("the split item is offered");
@@ -54987,7 +55330,7 @@ mod webtabs_menu_switcher_locks {
             "a chord must never reach a verb the mouse cannot"
         );
 
-        let split = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(2))
+        let split = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(2))
             .into_iter()
             .find(|item| item.id == "webtab-split")
             .expect("the split item is offered");
@@ -55184,13 +55527,13 @@ mod webtabs_menu_switcher_locks {
     fn a_switch_retargets_every_tab_and_forces_a_fresh_context_on_the_new_jar() {
         let mut shell = shell_with_surface(&[
             ("https://a/", None),
-            ("https://b/", Some("f1")),
+            ("https://b/", Some(1)),
             ("https://c/", None),
         ]);
-        let before: Vec<(u64, String, Option<String>)> = shell.web_surfaces["local://ws"]
+        let before: Vec<(u64, String, Option<u64>)> = shell.web_surfaces["local://ws"]
             .tabs
             .iter()
-            .map(|tab| (tab.id, tab.url.clone(), tab.folder.clone()))
+            .map(|tab| (tab.id, tab.url.clone(), tab.group_head))
             .collect();
 
         let retargeted = shell
@@ -55208,12 +55551,12 @@ mod webtabs_menu_switcher_locks {
             Some(LOCK_FIXTURE_PROFILE),
         );
 
-        // TAB SET RULE: the tabs are KEPT — same ids, same URLs, same folders,
+        // TAB SET RULE: the tabs are KEPT — same ids, same URLs, same groups,
         // same order — and reload under the new identity.
-        let after: Vec<(u64, String, Option<String>)> = shell.web_surfaces["local://ws"]
+        let after: Vec<(u64, String, Option<u64>)> = shell.web_surfaces["local://ws"]
             .tabs
             .iter()
-            .map(|tab| (tab.id, tab.url.clone(), tab.folder.clone()))
+            .map(|tab| (tab.id, tab.url.clone(), tab.group_head))
             .collect();
         assert_eq!(before, after, "the switch keeps the session's open tabs");
 
@@ -55624,16 +55967,19 @@ mod webtabs_menu_switcher_locks {
     /// same ids, same routing, same "already here" honesty — so this test tracks
     /// them onto the page they now live on.
     #[test]
-    fn move_to_folder_is_a_page_of_the_same_menu_not_n_rows_in_it() {
-        let tabs = vec![
+    fn move_to_group_is_a_page_of_the_same_menu_not_n_rows_in_it() {
+        // `tab:2` heads a group holding `tab:3`; `tab:4` heads another.
+        let tabs = views(vec![
             tab(0, "app", None, false),
             tab(1, "loose", None, true),
-            tab(2, "filed", Some("f1"), false),
-        ];
-        let folders = vec![folder("f1", "Work", false), folder("f2", "Play", false)];
+            tab(2, "Work", None, false),
+            tab(3, "filed", Some(2), false),
+            tab(4, "Play", None, false),
+            tab(5, "filed-2", Some(4), false),
+        ]);
 
-        // The ROOT page carries ONE filing row, whatever the folder count.
-        let root = menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(1));
+        // The ROOT page carries ONE filing row, whatever the group count.
+        let root = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1));
         let ids: Vec<&str> = root.iter().map(|item| item.id.as_str()).collect();
         assert!(ids.contains(&"webtab-move"), "the entry into the page");
         assert!(
@@ -55643,7 +55989,7 @@ mod webtabs_menu_switcher_locks {
         // …and it is a page TURN, not a verb, so it must leave the menu open.
         assert_eq!(
             web_tab_menu_page_turn("webtab-move"),
-            Some(WebTabMenuPage::MoveToFolder),
+            Some(WebTabMenuPage::MoveToGroup),
         );
         assert_eq!(
             web_tab_menu_page_turn("webtab-move-back"),
@@ -55655,13 +56001,23 @@ mod webtabs_menu_switcher_locks {
             "every other id runs a verb and closes the menu"
         );
 
-        // The PAGE: a way back, every destination, and New folder….
-        let page = move_page_items(&tabs, &folders, &WebTabMenuTarget::Tab(1));
+        // The PAGE: a way back and every destination.
+        let page = move_page_items(&tabs, &WebTabMenuTarget::Tab(1));
         let ids: Vec<&str> = page.iter().map(|item| item.id.as_str()).collect();
         assert!(ids.contains(&"webtab-move-back"), "{ids:?}");
-        assert!(ids.contains(&"webtab-move:f1"));
-        assert!(ids.contains(&"webtab-move:f2"));
-        assert!(ids.contains(&"webtab-move-new-folder"));
+        assert!(ids.contains(&"webtab-move:2"), "{ids:?}");
+        assert!(ids.contains(&"webtab-move:4"), "{ids:?}");
+        // ⛔ NO "New group…". A group's head must be a real tab, so a verb here
+        // could only invent an empty container — the folder model coming back
+        // through the menu.
+        assert!(
+            !ids.iter().any(|id| id.contains("new-folder") || id.contains("new-group")),
+            "{ids:?}"
+        );
+        // A row that heads NOTHING is not a destination: there is no group to
+        // join, and pointing at it would silently create one the user did not ask
+        // for.
+        assert!(!ids.contains(&"webtab-move:3"), "{ids:?}");
         // A ROOT tab sees Root, inert: the current home must be visible rather
         // than mysteriously absent.
         let home = page
@@ -55682,13 +56038,13 @@ mod webtabs_menu_switcher_locks {
             "{ids:?}"
         );
         assert_eq!(
-            web_tab_menu_title(&tabs, &folders, &WebTabMenuTarget::Tab(1), WebTabMenuPage::MoveToFolder),
-            "Move to folder",
+            web_tab_menu_title(&tabs, &WebTabMenuTarget::Tab(1), WebTabMenuPage::MoveToGroup),
+            "Move to group",
             "the heading says which page you are on"
         );
 
-        // A FILED tab: Root is live, and its OWN folder is the inert one.
-        let filed = move_page_items(&tabs, &folders, &WebTabMenuTarget::Tab(2));
+        // A GROUPED tab: Root is live, and its OWN group is the inert one.
+        let filed = move_page_items(&tabs, &WebTabMenuTarget::Tab(3));
         assert!(
             filed
                 .iter()
@@ -55696,8 +56052,8 @@ mod webtabs_menu_switcher_locks {
         );
         let home = filed
             .iter()
-            .find(|item| item.id == "webtab-move:f1")
-            .expect("its own folder is listed");
+            .find(|item| item.id == "webtab-move:2")
+            .expect("its own group is listed");
         assert!(
             home.disabled
                 && home.label == "Work"
@@ -55705,9 +56061,20 @@ mod webtabs_menu_switcher_locks {
             "{home:?}"
         );
 
+        // ⛔ A HEAD is never offered its own group, nor anything inside it: both
+        // would make a cycle, and a cycle takes every row under it out of the
+        // draw walk.
+        let head_page = move_page_items(&tabs, &WebTabMenuTarget::Tab(2));
+        let head_ids: Vec<&str> = head_page.iter().map(|item| item.id.as_str()).collect();
+        assert!(!head_ids.contains(&"webtab-move:2"), "not itself: {head_ids:?}");
+        assert!(
+            head_ids.contains(&"webtab-move:4"),
+            "…but an unrelated group is a real destination: {head_ids:?}"
+        );
+
         // The APP tab is the app's: it cannot be closed or filed, and the menu
         // SAYS so rather than silently omitting the verbs.
-        let app = menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(0));
+        let app = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(0));
         assert!(
             app.iter()
                 .find(|item| item.id == "webtab-close")
@@ -55722,19 +56089,26 @@ mod webtabs_menu_switcher_locks {
                 .disabled,
         );
 
-        // Routing for the destination rows is unchanged.
+        // Routing for the destination rows is unchanged in shape: the id names
+        // the destination HEAD, now a tab id rather than a folder id.
         assert_eq!(
-            web_tab_menu_action(&WebTabMenuTarget::Tab(2), "webtab-move:f2"),
-            Some(WebTabMenuAction::MoveToFolder(2, Some("f2".to_string()))),
+            web_tab_menu_action(&WebTabMenuTarget::Tab(3), "webtab-move:4"),
+            Some(WebTabMenuAction::MoveToGroup(3, Some(4))),
         );
         assert_eq!(
             web_tab_menu_action(&WebTabMenuTarget::Tab(2), "webtab-move-root"),
-            Some(WebTabMenuAction::MoveToFolder(2, None)),
+            Some(WebTabMenuAction::MoveToGroup(2, None)),
         );
         assert_eq!(
             web_tab_menu_action(&WebTabMenuTarget::Tab(2), "webtab-move:"),
             None,
-            "an empty folder id is not a destination"
+            "an empty destination is not a destination"
+        );
+        assert_eq!(
+            web_tab_menu_action(&WebTabMenuTarget::Tab(2), "webtab-move:f1"),
+            None,
+            "…and neither is a FOLDER id — the retired vocabulary must not \
+             resolve to a live verb by accident"
         );
     }
 
@@ -55766,7 +56140,7 @@ mod webtabs_menu_switcher_locks {
             tab(2, "two", None, false),
         ];
         assert_eq!(
-            menu_shape(&menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))),
+            menu_shape(&menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1))),
             vec![
                 "webtab-new",
                 "webtab-new-above",
@@ -55788,7 +56162,7 @@ mod webtabs_menu_switcher_locks {
             ],
         );
 
-        let items = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1));
+        let items = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1));
         // Everything destructive is in the LAST group and nothing before it is.
         let first_destructive = items
             .iter()
@@ -55860,7 +56234,7 @@ mod webtabs_menu_switcher_locks {
         let mut blank = tab(1, "new tab", None, true);
         blank.effective_url = String::new();
         let tabs = vec![tab(0, "app", None, false), blank];
-        let items = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1));
+        let items = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1));
         for id in ["webtab-reload", "webtab-copy-url"] {
             let item = items
                 .iter()
@@ -55880,7 +56254,7 @@ mod webtabs_menu_switcher_locks {
 
         // …and live once it has one.
         let visited = vec![tab(0, "app", None, false), tab(1, "a", None, true)];
-        let items = menu_items(&visited, &[], 1, &WebTabMenuTarget::Tab(1));
+        let items = menu_items(&visited, 1, &WebTabMenuTarget::Tab(1));
         assert!(
             items
                 .iter()
@@ -55904,17 +56278,18 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// "Close N tabs below" is FOLDER-SCOPED, exactly like "Close N other tabs":
-    /// a tab filed in Work does not speak for the root, and "below" in a tree
+    /// "Close N tabs below" is GROUP-SCOPED, exactly like "Close N other tabs":
+    /// a tab inside a group does not speak for the root, and "below" in a tree
     /// means below within your own group.
     #[test]
     fn close_tabs_below_is_scoped_to_the_row_it_was_raised_on() {
+        // Rows 2 and 4 sit inside the group headed by row 1.
         let scope: Vec<WebTabScopeRow> = vec![
             (0, None),
             (1, None),
-            (2, Some("f1".to_string())),
+            (2, Some(1)),
             (3, None),
-            (4, Some("f1".to_string())),
+            (4, Some(1)),
         ];
         assert_eq!(
             web_tab_close_below_targets(&scope, 1),
@@ -55924,7 +56299,7 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(
             web_tab_close_below_targets(&scope, 2),
             vec![4],
-            "a filed tab reaches its own folder"
+            "a grouped tab reaches its own group"
         );
         assert_eq!(web_tab_close_below_targets(&scope, 4), Vec::<u64>::new());
         assert_eq!(web_tab_close_below_targets(&scope, 99), Vec::<u64>::new());
@@ -55937,7 +56312,7 @@ mod webtabs_menu_switcher_locks {
             tab(2, "two", None, false),
             tab(3, "three", None, false),
         ];
-        let label = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))
+        let label = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1))
             .into_iter()
             .find(|item| item.id == "webtab-close-below")
             .map(|item| item.label)
@@ -55951,7 +56326,7 @@ mod webtabs_menu_switcher_locks {
             vec![2, 3],
         );
         // Nothing below ⇒ drawn, inert, and saying so.
-        let last = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(3))
+        let last = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(3))
             .into_iter()
             .find(|item| item.id == "webtab-close-below")
             .expect("the verb is still drawn");
@@ -55997,7 +56372,6 @@ mod webtabs_menu_switcher_locks {
         let tabs = vec![tab(0, "app", None, false), tab(1, "kept", None, true)];
         let label = web_tab_menu_items(
             &tabs,
-            &[],
             1,
             &WebTabMenuTarget::Tab(1),
             WebTabMenuPage::Root,
@@ -56068,69 +56442,77 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// The FOLDER menu gained the two verbs its row already had as hover
-    /// buttons and its menu did not — the mouse could reach them and the
-    /// keyboard could not.
+    /// A GROUP HEAD's row menu carries the group verbs — the ones the folder
+    /// header's hover buttons used to own, on the row that replaced it. ⭐ They
+    /// are EXTRA ITEMS in the one tab menu, not a menu of their own: a head is a
+    /// tab that other tabs point at, not a different kind of row.
     #[test]
-    fn the_folder_menu_offers_the_verbs_its_hover_buttons_had() {
-        let tabs = vec![tab(0, "app", None, true), tab(1, "filed", Some("f1"), false)];
-        let folders = vec![folder("f1", "Work", false)];
-        assert_eq!(
-            menu_shape(&menu_items(&tabs, &folders, 0, &WebTabMenuTarget::Folder("f1".to_string()))),
-            vec![
-                "webfolder-new-tab",
-                "--",
-                "webfolder-rename",
-                "webfolder-toggle",
-                "--",
-                "webfolder-close-tabs",
-                "webfolder-delete",
-            ],
-        );
-        assert_eq!(
-            web_tab_menu_action(&WebTabMenuTarget::Folder("f1".to_string()), "webfolder-new-tab"),
-            Some(WebTabMenuAction::NewTabInFolder("f1".to_string())),
+    fn a_group_heads_menu_grows_the_group_verbs_and_an_ordinary_tabs_does_not() {
+        let tabs = views(vec![
+            tab(0, "app", None, true),
+            tab(1, "Work", None, false),
+            tab(2, "filed", Some(1), false),
+            tab(3, "loose", None, false),
+        ]);
+        let head_items = menu_items(&tabs, 0, &WebTabMenuTarget::Tab(1));
+        let head = menu_shape(&head_items);
+        for id in [
+            "webgroup-new-tab",
+            "webgroup-toggle",
+            "webgroup-disband",
+            "webgroup-close-tabs",
+        ] {
+            assert!(head.contains(&id), "a head offers {id}: {head:?}");
+        }
+        let loose_items = menu_items(&tabs, 0, &WebTabMenuTarget::Tab(3));
+        let loose = menu_shape(&loose_items);
+        assert!(
+            !loose.iter().any(|id| id.starts_with("webgroup-")),
+            "a row that heads nothing offers no group verb: {loose:?}"
         );
 
-        // DELETING ORGANIZATION IS NOT DELETING CONTENT. The folder goes; its
-        // tabs come back to the root, and the close plan for the verb is empty
-        // so no path can quietly turn one into the other.
+        assert_eq!(
+            web_tab_menu_action(&WebTabMenuTarget::Tab(1), "webgroup-new-tab"),
+            Some(WebTabMenuAction::NewTabInGroup(1)),
+        );
+
+        // ⛔ UNGROUPING IS NOT CLOSING. The group goes; its members move up one
+        // level, and the close plan for the verb is EMPTY so no path can quietly
+        // turn one into the other.
         assert_eq!(
             web_tab_menu_close_plan(
                 &web_tab_scope_rows(&tabs),
-                &WebTabMenuAction::DeleteFolder("f1".to_string())
+                &WebTabMenuAction::DisbandGroup(1)
             ),
             Vec::<u64>::new(),
         );
-        let mut shell = shell_with_surface(&[("https://a/", Some("f1"))]);
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface")
-            .folders
-            .push(folder("f1", "Work", false));
-        assert!(shell.apply_web_tab_menu_action(
-            "local://ws",
-            &WebTabMenuAction::DeleteFolder("f1".to_string())
-        ));
+        let mut shell = shell_with_surface(&[("https://head/", None), ("https://a/", Some(1))]);
+        assert!(shell.apply_web_tab_menu_action("local://ws", &WebTabMenuAction::DisbandGroup(1)));
         let surface = &shell.web_surfaces["local://ws"];
-        assert!(surface.folders.is_empty(), "the folder went");
-        assert_eq!(surface.tabs.len(), 2, "…and its tab did NOT");
-        assert_eq!(surface.tabs[1].folder, None, "it came back to the root");
+        assert_eq!(surface.tabs.len(), 3, "no tab was closed");
+        assert_eq!(surface.tabs[2].group_head, None, "it came back to the root");
 
-        // A folder's "+" verb files its tab in that folder, through the same
-        // placement owner as every other open.
-        assert!(shell.apply_web_tab_menu_action(
-            "local://ws",
-            &WebTabMenuAction::NewTabInFolder("f2".to_string())
-        ));
+        // A head's "+" opens its tab INSIDE that group, through the same
+        // placement owner as every other open — and directly UNDER the head,
+        // because a head is the first row of its own run.
+        let mut shell = shell_with_surface(&[("https://head/", None), ("https://a/", Some(1))]);
+        assert!(shell.apply_web_tab_menu_action("local://ws", &WebTabMenuAction::NewTabInGroup(1)));
+        let surface = &shell.web_surfaces["local://ws"];
+        let born = surface.tabs[2].id;
         assert_eq!(
-            shell.web_surfaces["local://ws"]
-                .tabs
-                .get(1)
-                .and_then(|tab| tab.folder.clone()),
-            Some("f2".to_string()),
-            "the folder's + opens at the TOP of the list, directly under the app tab"
+            surface.tabs[2].group_head,
+            Some(1),
+            "the group's + fills the GROUP, not the window"
+        );
+        assert_eq!(
+            surface.tabs.iter().position(|tab| tab.id == 1),
+            Some(1),
+            "…and the head is still the first row of its own run — a new member \
+             must never displace the row that names the group"
+        );
+        assert!(
+            surface.tabs.iter().position(|tab| tab.id == born) == Some(2),
+            "the newest member is at the TOP of the run, under the head"
         );
     }
 
@@ -56140,7 +56522,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn the_icon_column_is_opt_in_and_only_the_tab_menus_opted_in() {
         let tabs = vec![tab(0, "app", None, false), tab(1, "one", None, true)];
-        let tab_menu = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1));
+        let tab_menu = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1));
         assert!(context_menu_has_icons(&tab_menu));
         assert!(
             tab_menu
@@ -56151,7 +56533,6 @@ mod webtabs_menu_switcher_locks {
         );
         assert!(context_menu_has_icons(&move_page_items(
             &tabs,
-            &[folder("f1", "Work", false)],
             &WebTabMenuTarget::Tab(1)
         )));
 
@@ -56221,27 +56602,29 @@ mod webtabs_menu_switcher_locks {
     fn a_menu_label_never_carries_its_own_reason_and_never_outgrows_the_box() {
         // Every shape of every tab menu, including the app tab, whose four
         // dimmed verbs are the ones in the screenshot.
-        let tabs = vec![
+        // Row 1 heads a group, so the sweep covers the group verbs too — they
+        // are the longest labels this menu authors.
+        let tabs = views(vec![
             tab(0, "app", None, false),
             tab(1, "one", None, true),
-            tab(2, "filed", Some("f1"), false),
-        ];
-        let folders = vec![folder("f1", "Work", false), folder("f2", "Play", true)];
+            tab(2, "filed", Some(1), false),
+            tab(3, "Play", None, false),
+            tab(4, "filed-2", Some(3), false),
+        ]);
         let mut every: Vec<RowMenuItem> = Vec::new();
         for target in [
             WebTabMenuTarget::Tab(0),
             WebTabMenuTarget::Tab(1),
             WebTabMenuTarget::Tab(2),
-            WebTabMenuTarget::Folder("f1".to_string()),
-            WebTabMenuTarget::Folder("f2".to_string()),
+            WebTabMenuTarget::Tab(3),
+            WebTabMenuTarget::Tab(4),
         ] {
-            every.extend(menu_items(&tabs, &folders, 1, &target));
+            every.extend(menu_items(&tabs, 1, &target));
             every.extend(web_tab_menu_items(
                 &tabs,
-                &folders,
                 1,
                 &target,
-                WebTabMenuPage::MoveToFolder,
+                WebTabMenuPage::MoveToGroup,
                 3,
             ));
         }
@@ -56281,9 +56664,10 @@ mod webtabs_menu_switcher_locks {
 
         // AND IT FITS. The narrowest menu the app draws is the one banded to the
         // rail; everything the SHELL authors must fit inside it, or we are back
-        // to a name the user cannot read. Labels carrying USER text — a folder's
-        // name on the move page — are exempt: their length is not ours to
-        // choose, which is exactly what the ellipsis and the tooltip are for.
+        // to a name the user cannot read. Labels carrying USER text — a group
+        // head's own name on the move page — are exempt: their length is not
+        // ours to choose, which is exactly what the ellipsis and the tooltip are
+        // for.
         let drawable = context_menu_width(Some(rail_context_menu_band(
             SidebarEdge::Right,
             1920.0,
@@ -56313,15 +56697,18 @@ mod webtabs_menu_switcher_locks {
     /// A menu drawn ON a row must not repeat that row's name.
     #[test]
     fn a_menu_heading_says_only_what_the_row_underneath_it_cannot() {
-        let tabs = vec![tab(0, "app", None, false), tab(1, "one", None, true)];
-        let folders = vec![folder("f1", "Work", false)];
+        let tabs = views(vec![
+            tab(0, "app", None, false),
+            tab(1, "one", None, true),
+            tab(2, "filed", Some(1), false),
+        ]);
         for target in [
             WebTabMenuTarget::Tab(0),
             WebTabMenuTarget::Tab(1),
-            WebTabMenuTarget::Folder("f1".to_string()),
+            WebTabMenuTarget::Tab(2),
         ] {
             assert_eq!(
-                web_tab_menu_title(&tabs, &folders, &target, WebTabMenuPage::Root),
+                web_tab_menu_title(&tabs, &target, WebTabMenuPage::Root),
                 "",
                 "the row is directly above the menu, selected, saying this already"
             );
@@ -56329,13 +56716,8 @@ mod webtabs_menu_switcher_locks {
         // A PAGE label is not a repeat — no row on screen says which page you
         // walked into.
         assert_eq!(
-            web_tab_menu_title(
-                &tabs,
-                &folders,
-                &WebTabMenuTarget::Tab(1),
-                WebTabMenuPage::MoveToFolder
-            ),
-            "Move to folder",
+            web_tab_menu_title(&tabs, &WebTabMenuTarget::Tab(1), WebTabMenuPage::MoveToGroup),
+            "Move to group",
         );
         // Nor is a SURFACE's name: the terminal canvas has no labelled row.
         assert_eq!(viewport_menu_title(ViewportMenuKind::Terminal), "Terminal");
@@ -56413,17 +56795,18 @@ mod webtabs_menu_switcher_locks {
     }
 
     #[test]
-    fn duplicate_opens_a_second_tab_on_the_same_url_in_the_same_folder() {
-        let mut shell = shell_with_surface(&[("https://a/", Some("f1"))]);
+    fn duplicate_opens_a_second_tab_on_the_same_url_in_the_same_group() {
+        let mut shell =
+            shell_with_surface(&[("https://head/", None), ("https://a/", Some(1))]);
         let new_id = shell
-            .web_surface_duplicate_tab("local://ws", 1)
+            .web_surface_duplicate_tab("local://ws", 2)
             .expect("the tab was duplicated");
-        assert_ne!(new_id, 1);
+        assert_ne!(new_id, 2);
         let surface = &shell.web_surfaces["local://ws"];
         let source = surface
             .tabs
             .iter()
-            .find(|tab| tab.id == 1)
+            .find(|tab| tab.id == 2)
             .expect("original");
         let copy = surface
             .tabs
@@ -56431,7 +56814,7 @@ mod webtabs_menu_switcher_locks {
             .find(|tab| tab.id == new_id)
             .expect("duplicate");
         assert_eq!(copy.url, source.url);
-        assert_eq!(copy.folder, source.folder);
+        assert_eq!(copy.group_head, source.group_head);
         assert_eq!(copy.profile, source.profile);
         assert_eq!(
             copy.history,
@@ -56469,11 +56852,310 @@ mod webtabs_menu_switcher_locks {
     // from the top of the rail appeared at the bottom of it.
     // ======================================================================
 
-    fn placement_row(id: u64, opener: Option<u64>, folder: Option<&str>) -> WebTabPlacementRow {
+    /// A plain tab, every field at rest, so a test can state ONLY the thing it
+    /// is about.
+    fn web_surface_test_tab(id: u64) -> WebSurfaceTab {
+        WebSurfaceTab {
+            media_playing: false,
+            media_seen_ms: 0,
+            id,
+            url: format!("https://example.invalid/{id}"),
+            effective_url: format!("https://example.invalid/{id}"),
+            socks_port: None,
+            title: None,
+            forward_child: None,
+            history: Vec::new(),
+            history_index: 0,
+            engine_nav: None,
+            reload_nonce: 0,
+            profile: "default".to_string(),
+            folder: None,
+            group_head: None,
+            group_collapsed: false,
+            custom_title: None,
+            loading: false,
+            loading_since_ms: 0,
+            theme_color: None,
+            lease_until_ms: None,
+            script_opened: false,
+            opener: None,
+        }
+    }
+
+    /// A tab as the FOLDER era wrote it: an id, the folder it was filed in, and
+    /// optionally a name the user gave it.
+    fn folder_era_tab(id: u64, folder: Option<&str>, custom_title: Option<&str>) -> WebSurfaceTab {
+        let mut tab = web_surface_test_tab(id);
+        tab.folder = folder.map(str::to_string);
+        tab.custom_title = custom_title.map(str::to_string);
+        tab
+    }
+
+    fn folder_era_folder(id: &str, name: &str, parent: Option<&str>, collapsed: bool) -> WebTabFolder {
+        WebTabFolder {
+            id: id.to_string(),
+            name: name.to_string(),
+            collapsed,
+            parent: parent.map(str::to_string),
+        }
+    }
+
+    fn group_shape(tabs: &[WebSurfaceTab]) -> Vec<(u64, Option<u64>)> {
+        tabs.iter().map(|tab| (tab.id, tab.group_head)).collect()
+    }
+
+    /// THE MIGRATION, as the owner stated it: a folder's FIRST tab becomes the
+    /// group's HEAD, the rest point at it, and the head joins the group its
+    /// folder sat inside — "row headers belong to the OUTSIDE group, or to root
+    /// when there is none".
+    #[test]
+    fn folders_flatten_into_row_groups_headed_by_their_first_tab() {
+        // app(0); "Work" holds 1,2,3; "Deep" is nested in Work and holds 4,5.
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("work"), None),
+            folder_era_tab(2, Some("work"), None),
+            folder_era_tab(4, Some("deep"), None),
+            folder_era_tab(5, Some("deep"), None),
+            folder_era_tab(3, Some("work"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("work", "Work", None, false),
+            folder_era_folder("deep", "Deep", Some("work"), false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(report.groups_formed, 2);
+        assert_eq!(report.empty_folders_dropped, 0);
+        assert_eq!(
+            group_shape(&tabs),
+            vec![
+                (0, None),       // the app tab, always root
+                (1, None),       // Work's head — its folder was at root
+                (2, Some(1)),    // …and Work's other members point at it
+                (4, Some(1)),    // Deep's HEAD joins the OUTSIDE group, Work
+                (5, Some(4)),    // …and Deep's member points at Deep's head
+                (3, Some(1)),
+            ],
+            "the nesting survives as nesting, and every group is contiguous"
+        );
+        // ⭐ Note the ORDER: 4 and 5 stay BETWEEN 2 and 3, exactly where the
+        // user had them. Contiguity is about each group being an unbroken block,
+        // NOT about sorting — a migration that tidied these into id order would
+        // rearrange every profile in the fleet the first time it ran, and the
+        // user would have no way to put it back.
+    }
+
+    /// ⭐ WHERE THE FOLDER'S NAME GOES — the half that decides whether this
+    /// migration is lossless. A folder called "Reading" must not become whatever
+    /// its first page happens to be titled.
+    #[test]
+    fn a_head_adopts_its_folders_name_unless_the_user_already_named_it() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("reading"), None),
+            folder_era_tab(2, Some("reading"), None),
+            // This head ALREADY carries a name the user typed.
+            folder_era_tab(3, Some("named"), Some("My own name")),
+            folder_era_tab(4, Some("named"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("reading", "Reading", None, false),
+            folder_era_folder("named", "Folder label", None, false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        let title_of = |id: u64| {
+            tabs.iter()
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.custom_title.clone())
+        };
+        assert_eq!(
+            title_of(1),
+            Some("Reading".to_string()),
+            "the folder's label survives on the head that took its place"
+        );
+        assert_eq!(
+            title_of(3),
+            Some("My own name".to_string()),
+            "a name the USER typed outranks the folder's label — the more \
+             specific statement of the same intent"
+        );
+        assert_eq!(report.names_adopted, 1);
+        assert_eq!(
+            report.names_yielded_to_custom_title, 1,
+            "the one genuinely lossy case is COUNTED, not passed over in silence"
+        );
+        // The label lands where every drawing of the row already looks for it.
+        assert_eq!(title_of(2), None, "a plain member is not renamed");
+    }
+
+    /// ⛔ THE APP TAB IS UNTOUCHABLE. Every close verb in the product is written
+    /// on the premise that `tabs[0]` is the app's — a migration that filed it
+    /// into a group would break all of them at once, on load, on data the user
+    /// cannot get back.
+    #[test]
+    fn the_migration_never_files_the_app_tab_into_a_group() {
+        // A store that (wrongly, or from an older bug) has the app tab filed.
+        let mut tabs = vec![
+            folder_era_tab(0, Some("work"), None),
+            folder_era_tab(1, Some("work"), None),
+            folder_era_tab(2, Some("work"), None),
+        ];
+        let folders = vec![folder_era_folder("work", "Work", None, false)];
+
+        migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(tabs[0].id, 0, "the app tab keeps its seat");
+        assert_eq!(tabs[0].group_head, None, "and it is never a member");
+        assert_eq!(
+            tabs[0].custom_title, None,
+            "nor does it adopt a folder's name — it would have been the first \
+             tab in that folder, and heading the group is exactly what it must \
+             not do"
+        );
+        assert_eq!(
+            group_shape(&tabs),
+            vec![(0, None), (1, None), (2, Some(1))],
+            "tab 1 heads the group instead, being the first tab that MAY"
+        );
+    }
+
+    /// An empty folder held nothing, so it migrates to nothing — and its
+    /// children re-parent to the nearest ancestor that DID form a group rather
+    /// than being stranded at root.
+    #[test]
+    fn an_empty_folder_drops_out_without_stranding_what_was_nested_inside_it() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("outer"), None),
+            folder_era_tab(2, Some("inner"), None),
+            folder_era_tab(3, Some("inner"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("outer", "Outer", None, false),
+            // Holds no tabs of its own, and sits between outer and inner.
+            folder_era_folder("hollow", "Hollow", Some("outer"), false),
+            folder_era_folder("inner", "Inner", Some("hollow"), false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(report.groups_formed, 2);
+        assert_eq!(report.empty_folders_dropped, 1);
+        assert_eq!(
+            group_shape(&tabs),
+            vec![(0, None), (1, None), (2, Some(1)), (3, Some(2))],
+            "inner's head skips the hollow folder and joins outer's group — \
+             \"or to root when there is none\" generalizes to the nearest \
+             ancestor that exists"
+        );
+    }
+
+    /// ⛔ `parent` is DATA OFF DISK. A cycle in it must not hang the app on load,
+    /// before there is any UI to say why — and every tab must still be drawn.
+    #[test]
+    fn a_cycle_in_the_stored_folder_parents_terminates_and_loses_no_tab() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("a"), None),
+            folder_era_tab(2, Some("b"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("a", "A", Some("b"), false),
+            folder_era_folder("b", "B", Some("a"), false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(report.groups_formed, 2);
+        assert_eq!(tabs.len(), 3, "no tab is dropped by a malformed store");
+        assert!(
+            tabs.iter().all(|tab| tab.folder.is_none()),
+            "and none is left holding a retired folder id"
+        );
+    }
+
+    /// The collapsed state is part of what the user arranged, so it moves onto
+    /// the head that now stands for the folder.
+    #[test]
+    fn a_collapsed_folder_migrates_to_a_collapsed_group() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("shut"), None),
+            folder_era_tab(2, Some("shut"), None),
+            folder_era_tab(3, Some("open"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("shut", "Shut", None, true),
+            folder_era_folder("open", "Open", None, false),
+        ];
+
+        migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        let collapsed_of = |id: u64| {
+            tabs.iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| tab.group_collapsed)
+        };
+        assert_eq!(collapsed_of(1), Some(true));
+        assert_eq!(collapsed_of(3), Some(false));
+    }
+
+    /// NOTHING TO DO is its own case: a surface that never had a folder must
+    /// come out byte-identical, not merely equivalent. A migration that reorders
+    /// or renames on a no-op would rearrange every profile in the fleet the
+    /// first time it ran.
+    #[test]
+    fn a_surface_with_no_folders_is_left_exactly_as_it_was() {
+        let before = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(7, None, Some("kept")),
+            folder_era_tab(3, None, None),
+        ];
+        let mut after = before.clone();
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut after, &[]);
+
+        assert_eq!(report, WebTabGroupMigration::default());
+        assert_eq!(group_shape(&after), group_shape(&before));
+        assert_eq!(
+            after.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![0, 7, 3],
+            "the order is untouched — note 7 before 3, which a sort would fix \
+             and a migration must not"
+        );
+        assert_eq!(after[1].custom_title.as_deref(), Some("kept"));
+    }
+
+    /// ⛔ A `group_head` pointing at a tab that is GONE must not delete the tab
+    /// from the walk. It would vanish from the rail while still existing in
+    /// state — the worst of both, and unrecoverable by the user.
+    #[test]
+    fn a_dangling_group_head_is_drawn_at_root_rather_than_disappearing() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, None, None),
+            folder_era_tab(2, None, None),
+        ];
+        tabs[2].group_head = Some(404);
+
+        order_web_tabs_by_group(&mut tabs);
+
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the orphan is still drawn"
+        );
+    }
+
+    fn placement_row(id: u64, opener: Option<u64>, group_head: Option<u64>) -> WebTabPlacementRow {
         WebTabPlacementRow {
             id,
             opener,
-            folder: folder.map(str::to_string),
+            group_head,
         }
     }
 
@@ -56498,7 +57180,7 @@ mod webtabs_menu_switcher_locks {
             web_tab_placement(&rows, &WebTabOrigin::Opener(1)),
             WebTabPlacement {
                 index: 1,
-                folder: None,
+                group_head: None,
                 opener: Some(1)
             },
             "the first link opened from page 1 sits directly above it"
@@ -56560,40 +57242,47 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// `Top` takes the top, a folder's "+" fills its folder from the top, and NO
-    /// branch can displace the app tab — `tabs[0]` is the app's, and every close
-    /// verb in the product is written on that premise.
+    /// `Top` takes the top, a group head's "+" fills its group from the top, and
+    /// NO branch can displace the app tab — `tabs[0]` is the app's, and every
+    /// close verb in the product is written on that premise.
     #[test]
-    fn placement_opens_from_the_top_fills_folders_and_never_displaces_the_app_tab() {
+    fn placement_opens_from_the_top_fills_groups_and_never_displaces_the_app_tab() {
+        // Tab 1 heads a group holding tab 3; tab 2 is loose.
         let rows = vec![
             placement_row(0, None, None),
-            placement_row(1, None, Some("f1")),
+            placement_row(1, None, None),
+            placement_row(3, None, Some(1)),
             placement_row(2, None, None),
-            placement_row(3, None, Some("f1")),
         ];
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Top),
             WebTabPlacement {
                 index: 1,
-                folder: None,
+                group_head: None,
                 opener: None
             },
             "directly under the app tab — new tabs open from the top"
         );
         assert_eq!(
-            web_tab_placement(&rows, &WebTabOrigin::Folder("f1".to_string())),
+            web_tab_placement(&rows, &WebTabOrigin::Group(1)),
             WebTabPlacement {
-                index: 1,
-                folder: Some("f1".to_string()),
+                index: 2,
+                group_head: Some(1),
                 opener: None
             },
-            "at the FIRST tab already filed in f1, so a folder's + fills the \
-             folder rather than the window"
+            "⛔ directly UNDER the head, never onto its slot: a group's + fills \
+             the group rather than the window, and displacing the head would \
+             leave the group headless in the same stroke"
         );
         assert_eq!(
-            web_tab_placement(&rows, &WebTabOrigin::Folder("empty".to_string())).index,
-            1,
-            "a folder with nothing in it yet takes the top"
+            web_tab_placement(&rows, &WebTabOrigin::Group(404)),
+            WebTabPlacement {
+                index: 1,
+                group_head: None,
+                opener: None
+            },
+            "a head that went away leaves no group to fill, and the placement \
+             carries NO pointer rather than a dangling one"
         );
 
         // An opener that has already gone is an ordinary top open, and — the
@@ -56603,7 +57292,7 @@ mod webtabs_menu_switcher_locks {
             web_tab_placement(&rows, &WebTabOrigin::Opener(99)),
             WebTabPlacement {
                 index: 1,
-                folder: None,
+                group_head: None,
                 opener: None
             },
         );
@@ -56611,11 +57300,13 @@ mod webtabs_menu_switcher_locks {
         // Nothing returns 0. Every origin, against every shape of list.
         for origin in [
             WebTabOrigin::Top,
-            WebTabOrigin::Folder("f1".to_string()),
-            WebTabOrigin::Folder("nope".to_string()),
+            WebTabOrigin::Group(1),
+            WebTabOrigin::Group(404),
             WebTabOrigin::Opener(0),
             WebTabOrigin::Opener(3),
             WebTabOrigin::Opener(404),
+            WebTabOrigin::Restore { index: 0, group_head: None },
+            WebTabOrigin::Restore { index: 99, group_head: Some(1) },
         ] {
             assert!(
                 web_tab_placement(&rows, &origin).index >= 1,
@@ -56624,17 +57315,36 @@ mod webtabs_menu_switcher_locks {
         }
     }
 
-    /// A child is born where its parent lives — opening a link from a filed tab
-    /// must not scatter the folder it was filed in.
+    /// ⭐ THE OWNER'S GROUP RULE, as arithmetic: a spawn from a row IN a group
+    /// stays in that group, and a spawn from the row that HEADS one goes INSIDE
+    /// it. Opening a link from a grouped tab must not scatter the group.
     #[test]
-    fn a_child_inherits_its_openers_folder() {
+    fn a_child_is_born_inside_its_openers_group() {
+        // Tab 1 heads a group; tab 2 is a member.
         let rows = vec![
             placement_row(0, None, None),
-            placement_row(1, None, Some("work")),
+            placement_row(1, None, None),
+            placement_row(2, None, Some(1)),
         ];
-        let placement = web_tab_placement(&rows, &WebTabOrigin::Opener(1));
-        assert_eq!(placement.folder.as_deref(), Some("work"));
-        assert_eq!(placement.index, 1);
+
+        // From a MEMBER: the same group, and the ordinary upward cascade.
+        let from_member = web_tab_placement(&rows, &WebTabOrigin::Opener(2));
+        assert_eq!(from_member.group_head, Some(1), "beside its opener, not outside");
+
+        // From the HEAD: INSIDE the group it heads — the folder header's "+"
+        // semantics, on the row that replaced it.
+        let from_head = web_tab_placement(&rows, &WebTabOrigin::Opener(1));
+        assert_eq!(from_head.group_head, Some(1));
+        assert_eq!(
+            from_head.index, 2,
+            "⛔ BELOW the head, never above it: a head must stay the first row \
+             of its own run or the group loses the row that names it"
+        );
+
+        // From a LOOSE tab: no group is invented. Browsing must not silently
+        // create organization the user did not ask for.
+        let rows = vec![placement_row(0, None, None), placement_row(1, None, None)];
+        assert_eq!(web_tab_placement(&rows, &WebTabOrigin::Opener(1)).group_head, None);
     }
 
     /// The direction is a PRODUCT decision that differs per app, so it is locked
@@ -56650,7 +57360,7 @@ mod webtabs_menu_switcher_locks {
         ];
         for origin in [
             WebTabOrigin::Top,
-            WebTabOrigin::Folder("nope".to_string()),
+            WebTabOrigin::Group(404),
             WebTabOrigin::Opener(2),
             WebTabOrigin::Opener(404),
         ] {
@@ -56820,7 +57530,7 @@ mod webtabs_menu_switcher_locks {
     fn only_a_blank_foreground_open_is_typing_ready() {
         assert!(web_tab_opens_typing_ready(&WebTabOpenRequest::blank()));
         assert!(web_tab_opens_typing_ready(
-            &WebTabOpenRequest::blank_in_folder("f1")
+            &WebTabOpenRequest::blank_in_group(1)
         ));
         assert!(web_tab_opens_typing_ready(&WebTabOpenRequest::blank_above(
             1
@@ -56906,59 +57616,56 @@ mod webtabs_menu_switcher_locks {
     }
 
     #[test]
-    fn a_folder_menu_offers_rename_the_right_toggle_word_and_a_named_close() {
-        let tabs = vec![tab(0, "app", None, true)];
-        let open = menu_items(
-            &tabs,
-            &[folder("f1", "Work", false)],
-            0,
-            &WebTabMenuTarget::Folder("f1".to_string()),
-        );
-        assert!(open.iter().any(|item| item.id == "webfolder-rename"));
+    fn a_group_heads_menu_offers_the_right_toggle_word_and_a_named_close() {
+        let open = views(vec![
+            tab(0, "app", None, true),
+            tab(1, "Work", None, false),
+            tab(2, "filed", Some(1), false),
+        ]);
+        let items = menu_items(&open, 0, &WebTabMenuTarget::Tab(1));
+        assert!(items.iter().any(|item| item.id == "webtab-rename"));
         assert_eq!(
-            open.iter()
-                .find(|item| item.id == "webfolder-toggle")
-                .map(|item| item.label.clone()),
-            Some("Collapse".to_string()),
-        );
-        let collapsed = menu_items(
-            &tabs,
-            &[folder("f1", "Work", true)],
-            0,
-            &WebTabMenuTarget::Folder("f1".to_string()),
-        );
-        assert_eq!(
-            collapsed
+            items
                 .iter()
-                .find(|item| item.id == "webfolder-toggle")
+                .find(|item| item.id == "webgroup-toggle")
                 .map(|item| item.label.clone()),
-            Some("Expand".to_string()),
+            Some("Collapse group".to_string()),
         );
-        // An empty folder still shows its close verb — inert, and saying why.
-        let empty = collapsed
-            .iter()
-            .find(|item| item.id == "webfolder-close-tabs")
-            .expect("the close verb is drawn");
-        assert!(empty.disabled);
-        assert_eq!(empty.label, "Close 0 tabs", "the count is the NAME's job");
+        let mut shut = open.clone();
+        shut[1].group_collapsed = true;
         assert_eq!(
-            empty.reason.as_deref(),
-            Some("this folder is empty"),
-            "…and the reason is the tooltip's"
-        );
-        assert_eq!(
-            empty.tooltip(),
-            "Close 0 tabs — this folder is empty",
-            "the two meet in the hover text, which is where the user reads the \
-             whole sentence"
+            menu_items(&shut, 0, &WebTabMenuTarget::Tab(1))
+                .iter()
+                .find(|item| item.id == "webgroup-toggle")
+                .map(|item| item.label.clone()),
+            Some("Expand group".to_string()),
         );
 
-        // A folder the tree does not have gets no menu at all.
+        // A head whose last member has gone is not a head at all: `group_size`
+        // is derived, so there is no empty group to draw a verb for.
+        let emptied = views(vec![tab(0, "app", None, true), tab(1, "Work", None, false)]);
+        let none = menu_items(&emptied, 0, &WebTabMenuTarget::Tab(1));
         assert!(
-            menu_items(&tabs, &[], 0, &WebTabMenuTarget::Folder("gone".to_string()))
-                .is_empty()
+            !none.iter().any(|item| item.id.starts_with("webgroup-")),
+            "an empty group is not organization, so it offers no group verbs"
         );
-        // Routing is target-scoped: a tab row cannot reach a folder verb.
+
+        // ⛔ UNGROUP must not read as a close. Its note is the whole reason it
+        // is safe to put beside the destructive band.
+        let ungroup = items
+            .iter()
+            .find(|item| item.id == "webgroup-disband")
+            .expect("the ungroup verb is drawn");
+        assert!(!ungroup.destructive, "it closes nothing");
+        assert_eq!(
+            ungroup.tooltip(),
+            "Ungroup — its tabs move up one level; nothing closes",
+            "the hover text is where the user reads the whole sentence"
+        );
+
+        // A row the tree does not have gets no menu at all.
+        assert!(menu_items(&open, 0, &WebTabMenuTarget::Tab(404)).is_empty());
+        // Routing is scoped to ids this menu actually draws.
         assert_eq!(
             web_tab_menu_action(&WebTabMenuTarget::Tab(1), "webfolder-rename"),
             None,
@@ -57134,7 +57841,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn the_app_tab_cannot_be_duplicated() {
         let tabs = vec![tab(0, "app", None, true), tab(1, "page", None, false)];
-        let duplicate = menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(0))
+        let duplicate = menu_items(&tabs, 0, &WebTabMenuTarget::Tab(0))
             .into_iter()
             .find(|item| item.id == "webtab-duplicate")
             .expect("the duplicate item is drawn, inert");
@@ -57156,7 +57863,7 @@ mod webtabs_menu_switcher_locks {
             "a chord must never reach a verb the mouse cannot"
         );
         assert!(
-            !menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(1))
+            !menu_items(&tabs, 0, &WebTabMenuTarget::Tab(1))
                 .into_iter()
                 .find(|item| item.id == "webtab-duplicate")
                 .expect("a user tab CAN be duplicated")
@@ -57901,10 +58608,10 @@ mod webtabs_menu_switcher_locks {
         //
         // TWO gate spellings, because the two surfaces hang the ✕ differently
         // and both are the same predicate: the strip draws it as a conditional
-        // CHILD (`if !is_app_tab {`), while the rail hands the shared row an
-        // absent `actions` SLOT (`(!is_app_tab).then(|| …)`) — an EMPTY element
-        // there would still have reserved its gap (DESIGN.md, 2026-07-31). A
-        // gate written any OTHER way, or none at all, still fails here.
+        // CHILD (`if !is_app_tab {`), while the rail's row menu now also carries
+        // the group verbs, so its ✕ hangs off a NAMED binding (`if shows_close`)
+        // whose definition is asserted below. A gate written any OTHER way, or
+        // none at all, still fails here.
         for (guard, what) in [
             ("\"data-web-tab-close\": \"{tab_id}\",", "the rail row's ✕"),
             ("title: \"Close tab\",", "the strip chip's ✕"),
@@ -57918,11 +58625,20 @@ mod webtabs_menu_switcher_locks {
                 before.contains("if !is_app_tab {")
                     || before.contains("if !is_app_tab || holds_saved_page {")
                     || before.contains("(!is_app_tab).then(|| rsx! {")
-                    || before.contains("(!is_app_tab || app_tab_can_go_home).then(|| rsx! {"),
+                    || before.contains("(!is_app_tab || app_tab_can_go_home).then(|| rsx! {")
+                    || before.contains("if shows_close {"),
                 "{what} must be gated on the app tab's STATE, never drawn \
                  unconditionally:\n{before}"
             );
         }
+        // ⛔ …and the named binding IS the predicate. Without this the needle
+        // above would pass for `let shows_close = true;`.
+        let rail = function_body(&product, "fn WebTabsRailBody(");
+        assert!(
+            rail.contains("let shows_close = !is_app_tab || app_tab_can_go_home;"),
+            "the rail's ✕ gate must be the app tab's STATE, not a name that \
+             merely looks like one:\n{rail}"
+        );
         // The tab-row spelling is GONE outright.
         assert!(
             !product
@@ -58286,17 +59002,11 @@ mod webtabs_menu_switcher_locks {
     /// nothing.
     #[test]
     fn a_strip_dropdown_stashes_the_legacy_page_and_a_rail_menu_does_not() {
-        // One loose tab and one FILED tab: the overflow dropdown's affordance
-        // exists only while something is in a folder, and the flag that opens it
-        // is gated on exactly that (see
-        // `a_folder_overflow_dropdown_cannot_outlive_its_affordance`).
-        let mut shell = shell_with_surface(&[("https://a/", None), ("https://b/", Some("f1"))]);
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface is live")
-            .folders
-            .push(folder("f1", "Work", false));
+        // One loose tab and one GROUPED tab: the overflow dropdown's affordance
+        // exists only while something is inside a group, and the flag that opens
+        // it is gated on exactly that (see
+        // `a_group_overflow_dropdown_cannot_outlive_its_affordance`).
+        let mut shell = shell_with_surface(&[("https://a/", None), ("https://b/", Some(1))]);
         assert!(!shell.has_modal_over_viewport());
 
         shell.open_web_profile_switcher(
@@ -58412,21 +59122,14 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// A surface with one FILED tab, i.e. the only state in which the classic
-    /// strip draws its folder-overflow affordance. `f1` is a real folder because
-    /// the rest of the tab tree's vocabulary needs one to exist.
+    /// A surface with one GROUPED tab, i.e. the only state in which the classic
+    /// strip draws its overflow affordance: `tab:1` heads the group and `tab:2`
+    /// sits inside it.
     fn shell_with_filed_tab() -> ShellState {
-        let mut shell = shell_with_surface(&[("https://filed/", Some("f1"))]);
-        shell
-            .web_surfaces
-            .get_mut("local://ws")
-            .expect("surface is live")
-            .folders
-            .push(folder("f1", "Work", false));
-        shell
+        shell_with_surface(&[("https://head/", None), ("https://filed/", Some(1))])
     }
 
-    /// The folder-overflow flag is a `top_modal`, so while it is true EVERY web
+    /// The group-overflow flag is a `top_modal`, so while it is true EVERY web
     /// surface is unmapped. Its affordance — the `🗂 n ⌄` button AND the menu —
     /// renders only inside `(!filed.is_empty())` on the ACTIVE session's surface
     /// in the classic strip. A flag that outlives that is a browsing area gone
@@ -58436,7 +59139,7 @@ mod webtabs_menu_switcher_locks {
     /// Every way the affordance can leave the screen, through the production
     /// verb that takes it away.
     #[test]
-    fn a_folder_overflow_dropdown_cannot_outlive_its_affordance() {
+    fn a_group_overflow_dropdown_cannot_outlive_its_affordance() {
         // Sanity: with the affordance on screen the flag means what it says.
         let mut shell = shell_with_filed_tab();
         shell.toggle_web_tab_overflow();
@@ -58449,29 +59152,29 @@ mod webtabs_menu_switcher_locks {
             .expect("surface is live")
             .tabs
             .iter()
-            .find(|tab| tab.folder.is_some())
-            .expect("one filed tab")
+            .find(|tab| tab.group_head.is_some())
+            .expect("one grouped tab")
             .id;
 
         let cases: Vec<(&str, Box<dyn Fn(&mut ShellState)>)> = vec![
             // The filed set empties — the button and the menu both vanish with
             // it, because they only ever rendered inside `!filed.is_empty()`.
             (
-                "the last filed tab is moved back to the root",
+                "the last grouped tab is moved back to the root",
                 Box::new(move |shell: &mut ShellState| {
-                    shell.web_tab_move_to_folder("local://ws", filed_tab_id, None);
+                    shell.web_tab_move_to_group("local://ws", filed_tab_id, None);
                 }),
             ),
             (
-                "the last filed tab is closed",
+                "the last grouped tab is closed",
                 Box::new(move |shell: &mut ShellState| {
                     shell.web_surface_close_tab("local://ws", filed_tab_id);
                 }),
             ),
             (
-                "the folder holding it is deleted",
+                "the group holding it is taken apart",
                 Box::new(|shell: &mut ShellState| {
-                    shell.web_tab_delete_folder("local://ws", "f1");
+                    shell.web_tab_disband_group("local://ws", 1);
                 }),
             ),
             // The strip itself leaves: vertical mode collapses it to
@@ -58533,7 +59236,7 @@ mod webtabs_menu_switcher_locks {
     /// `pointer-events:none` at its root, i.e. not hit-testable, so it would
     /// have bought nothing.
     #[test]
-    fn the_folder_overflow_dropdown_can_be_dismissed_by_clicking_away() {
+    fn the_group_overflow_dropdown_can_be_dismissed_by_clicking_away() {
         // The MECHANISM the backdrop drives, run: the strip-anchored closer
         // gives the page back.
         let mut shell = shell_with_filed_tab();
