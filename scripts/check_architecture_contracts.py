@@ -598,6 +598,98 @@ def check_gui_binary_resolution_contract() -> None:
         )
 
 
+# ⚖ Value slices with a genuine length budget, each with its reason. A STRING
+# never belongs here: "it happens to be ASCII today" is a property of a table
+# other people edit, not of the code doing the cut.
+LITERAL_BUDGET_EXEMPTIONS: set[tuple[str, str]] = set()
+
+# Below this, a literal offset is STRUCTURAL — skip a sigil, read a two-character
+# hex pair, check a four-byte magic number — and the bytes it crosses are proven
+# ASCII a line or two above. At or above it, a literal is a BUDGET: a cap on how
+# much to keep, chosen by a person, with no relationship to where characters end.
+# Both defects this rule closes were budgets (240 and 15); every structural cut
+# in the tree is smaller than this.
+LITERAL_BUDGET_FLOOR = 8
+
+
+def check_no_literal_byte_budget_into_a_string() -> None:
+    """A number chosen as a length cap cannot know where a character ends.
+
+    The defect this closes, twice over: `&trimmed[..240]` quoted an unparseable
+    daemon response back for diagnosis, and `&name[..15]` compared a binary name
+    against the kernel's truncated `comm`. Both are byte indexes into text, so
+    both abort the process the moment a multi-byte character straddles the cut.
+
+    ⚠ What makes this worth a static rule rather than a review habit is WHERE
+    the first one sat: inside an error handler. A recoverable failure became a
+    crash, and the message that would have explained it was what killed the
+    process — so the louder the failure, the less of it survives to be read.
+    The likeliest input made it likelier still: the line is built with
+    `from_utf8_lossy`, so binary noise arrives as a dense run of three-byte
+    replacement characters and a fixed cut lands inside one about two times in
+    three.
+
+    ⛔ THE SCOPE IS NARROW ON PURPOSE, AND THE TWO WIDER RULES WERE MEASURED
+    BEFORE BEING REJECTED — a gate that must be silenced to be used teaches
+    people to silence it.
+
+    * `clippy::string_slice` reports every string index: 38 in `yggterm-core`
+      alone. Almost all are correct, because an offset from `find()` or
+      `char_indices()` IS a character boundary and the lint cannot see where the
+      number came from.
+    * Widening this rule to both ends and every literal found 39 sites, of which
+      two were the defects. The rest were `&args[1..]` over a vector, `&wav[0..4]`
+      over bytes, and hex-colour pairs sitting behind an `is_ascii_hexdigit`
+      check — an exemption list of 37 entries, which is a list nobody reads.
+
+    ⇒ The repair is not one shape, which is why no shared helper is owed.
+    Display truncation goes to characters (`chars().take(n)`); a cut matching an
+    external byte budget stays in bytes but through `get(..n)`, which answers
+    `None` instead of aborting. The `comm` comparison needed BYTES — the kernel
+    cuts at fifteen of them — so a shared "safe truncate" helper would have made
+    that site wrong rather than safe. Deciding which unit applies is the work.
+    """
+    pattern = re.compile(r"&\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*\.\.\s*(\d+)\s*\]")
+    scanned = 0
+    for root in ("crates", "apps"):
+        for source in sorted((ROOT / root).rglob("*.rs")):
+            posix = source.as_posix()
+            if "/vendor/" in posix or "/target/" in posix:
+                continue
+            try:
+                text = source.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            scanned += 1
+            rel = source.relative_to(ROOT).as_posix()
+            for line in text.splitlines():
+                if line.lstrip().startswith("//"):
+                    continue
+                for match in pattern.finditer(line):
+                    if int(match.group(2)) < LITERAL_BUDGET_FLOOR:
+                        continue
+                    snippet = f"&{match.group(1)}[..{match.group(2)}]"
+                    if (rel, snippet) in LITERAL_BUDGET_EXEMPTIONS:
+                        continue
+                    fail(
+                        f"{rel}: {snippet} cuts text at a literal byte budget. "
+                        "It aborts the process whenever a multi-byte character "
+                        "straddles the cut — and the input likeliest to reach a "
+                        "truncation is the one likeliest to contain one. Use "
+                        "`chars().take(n)` when the budget is what a reader "
+                        "sees, or `get(..n)` when it must match an external byte "
+                        "limit. If this is a slice of values and cannot panic, "
+                        "add it to LITERAL_BUDGET_EXEMPTIONS with the reason."
+                    )
+    # ⛔ Coverage floor: a walk that found nothing proves nothing, and a broken
+    # walk reports a clean tree in exactly the same words as a clean tree.
+    if scanned < 50:
+        fail(
+            f"the literal-byte-budget sweep scanned only {scanned} Rust files — "
+            "the walk is broken, so its silence means nothing."
+        )
+
+
 def main() -> int:
     check_doc_cross_links()
     check_agents_operating_law()
@@ -612,6 +704,7 @@ def main() -> int:
     check_the_preview_excerpt_is_the_last_context_source()
     check_terminal_retained_replay_policy_contract()
     check_gui_binary_resolution_contract()
+    check_no_literal_byte_budget_into_a_string()
     if FAILURES:
         for failure in FAILURES:
             print(f"ARCHITECTURE CONTRACT FAILED: {failure}", file=sys.stderr)
