@@ -3785,6 +3785,14 @@ fn TerminalCanvas(
             "bootstrap_reset",
             json!({
                 "session_path": session_path.clone(),
+                // ⛔ THE JOIN KEY, AND IT WAS MISSING. This is the most-cited
+                // event in the mount-churn entry, and without `host_id` it
+                // could not be lined up against the canvas's own records —
+                // every reader had to re-derive the id from the path and the
+                // epoch, i.e. keep a second copy of a rule that lives in
+                // `terminal_mount_host_id`. Carrying it makes the chain read
+                // from the native mount straight through to the glyphs.
+                "host_id": host_id.clone(),
                 "mount_epoch": mount_epoch,
                 "mount_identity": mount_identity.clone(),
             }),
