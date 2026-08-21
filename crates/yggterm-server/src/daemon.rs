@@ -3,6 +3,7 @@ use crate::codex_cli::{
 };
 use crate::hot_restart_queue;
 use crate::hot_restart_repair;
+use crate::lock_holder_trace;
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity, GhosttyHostSupport,
@@ -4716,6 +4717,16 @@ impl DaemonRuntime {
             let call_started = std::time::Instant::now();
             let outcome = working_flags(&owner);
             let cost_ms = call_started.elapsed().as_millis();
+            // M2: Record if this blocking remote call happened inside the lock.
+            // Any peer call should be fast (~1-5ms), so > 50ms is worth tracing.
+            if cost_ms > 50 {
+                lock_holder_trace::record_blocking_call_inside_lock(
+                    self.store.home_dir(),
+                    "working_flags",
+                    cost_ms,
+                    Some(&owner_endpoint_label(&owner)),
+                );
+            }
             match outcome {
                 Ok(owner_flags) => {
                     merge_proxied_working_flags(&mut flags, &mut answered, &wanted, owner_flags)
@@ -20015,7 +20026,10 @@ fn lock_daemon_runtime_for_request<'a>(
     request_name: &'static str,
 ) -> MutexGuard<'a, DaemonRuntime> {
     match runtime.try_lock() {
-        Ok(guard) => return guard,
+        Ok(guard) => {
+            lock_holder_trace::enter_lock_holder(request_name);
+            return guard;
+        }
         // Poison is handled identically to the blocking path; fall through so
         // there is exactly one recovery site.
         Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -20034,6 +20048,7 @@ fn lock_daemon_runtime_for_request<'a>(
     // which was true and beside the point: it is the SLOW path that is hot.
     let guard = lock_daemon_runtime(runtime, "handle_request");
     let waited = started.elapsed();
+    lock_holder_trace::enter_lock_holder(request_name);
     let Some(home) = home.as_deref() else {
         return guard;
     };
@@ -20543,7 +20558,7 @@ fn daemon_request_response(
     }
     let mut runtime = lock_daemon_runtime_for_request(runtime, request_name);
     let home_dir = runtime.store.home_dir().to_path_buf();
-    match panic::catch_unwind(AssertUnwindSafe(|| {
+    let response = match panic::catch_unwind(AssertUnwindSafe(|| {
         runtime.handle_request(request, identity)
     })) {
         Ok(Ok(response)) => response,
@@ -20575,7 +20590,10 @@ fn daemon_request_response(
                 message: format!("daemon request {request_name} panicked: {panic_message}"),
             }
         }
-    }
+    };
+    // M1: Record that we're releasing the lock after handling the request.
+    lock_holder_trace::exit_lock_holder(&home_dir);
+    response
 }
 
 #[cfg(unix)]
