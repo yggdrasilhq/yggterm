@@ -105,8 +105,41 @@ fi
 # 2 — the GUI is on this machine. Recipes ssh to whatever we print, so an alias
 # beats a kernel hostname: the two differ on this fleet, and that difference has
 # already made a deploy report ⛔ for the very host doing the deploying.
+#
+# ⛔⛔ BUT THE CACHE MAY NAME A DIFFERENT MACHINE, AND THIS STEP USED TO PRINT IT
+# ANYWAY — a self-confirming wrong answer on the one host that cannot be wrong.
+# `has_gui ""` has just PROVED the GUI is local; the cache holds whatever host
+# was last DISCOVERED, which after any period of running headless is a peer. So
+# on the desktop host the resolver answered with the name of a machine that has
+# no GUI at all, and every recipe that asks it — deploy, screenshot, verify —
+# was aimed one host sideways.
+#
+# ⇒ Measured 2026-08-21 on the GUI host: the resolver answered `dev` while the
+#   GUI ran locally, and the fleet booter had been started `--host dev` from that
+#   answer, so every boot it issued drove app-control on a machine with no GUI
+#   and reached nobody. Rows it believed it was waking sat untouched.
+#
+# The alias is still preferred over the kernel hostname — that part was right.
+# It simply has to be an alias for THIS machine, and that is one cheap check.
 if has_gui ""; then
-  if [ -r "$CACHE_FILE" ]; then head -1 "$CACHE_FILE"; else hostname -s; fi
+  ME="$(hostname -s)"
+  CACHED_LOCAL=""
+  [ -r "$CACHE_FILE" ] && CACHED_LOCAL="$(head -1 "$CACHE_FILE" | tr -d '[:space:]')"
+  if [ -z "$CACHED_LOCAL" ] || [ "$CACHED_LOCAL" = "$ME" ]; then
+    echo "$ME"
+  elif [ "$(ssh -o BatchMode=yes -o ConnectTimeout=6 \
+              -o StrictHostKeyChecking=accept-new \
+              "$CACHED_LOCAL" hostname -s 2>/dev/null)" = "$ME" ]; then
+    # The cached name is an ALIAS for this machine — the case the comment above
+    # is about. Prefer it: it is what the rest of the fleet can ssh to.
+    echo "$CACHED_LOCAL"
+  else
+    # It names somebody else. The GUI is HERE, so that answer is simply wrong;
+    # say so and repair the cache rather than handing out a sideways host.
+    note "cached live-host '$CACHED_LOCAL' is NOT this machine, but the GUI is running HERE — answering '$ME' and repairing the cache"
+    remember "$ME"
+    echo "$ME"
+  fi
   exit 0
 fi
 

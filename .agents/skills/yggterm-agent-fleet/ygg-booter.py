@@ -2410,8 +2410,19 @@ def _screen_text(host, row):
     return body if body.strip() else None
 
 
-def _pty_type_and_enter(host, row):
-    """Type the boot text, pause, then press Enter — as TWO writes.
+def _pty_type_and_enter(host, row, text=None):
+    """Type `text` (default: the boot text), pause, then press Enter — TWO writes.
+
+    ⭐ `text` IS A PARAMETER BECAUSE THIS IS THE FLEET'S ONLY GUARDED WRITER, AND
+    THE OTHER WATCHDOG HAD NONE. The monitor's `wake()` typed with a bare
+    `terminal send` plus a lone `\\r`: no screen read, no choice-prompt refusal,
+    no `--refuse-if-draft`, no verify-before-Enter. So the two watchdogs typed
+    into the SAME rows with opposite levels of care, and the careless one is the
+    one aimed at orchestrators. Owner-reported 2026-08-21: a monitor wake landed
+    in the middle of his orchestrator's turn.
+    ⇒ One guarded path, parameterised, rather than a second copy of five guards
+      that would drift. Every guard below is text-agnostic — they are about the
+      COMPOSER's state, not about what we intend to say.
 
     The 80 ms mirrors `shell.rs`'s own submit path exactly; see `boot`'s §3 for
     why a concatenated Enter reads as pasted content rather than a submit.
@@ -2425,6 +2436,7 @@ def _pty_type_and_enter(host, row):
     ⚠ A pre-3.0.83 owner ignores the flag, so acceptance is not proof the guard
     ran. That is the honest limit and it is why the return distinguishes a
     refusal rather than folding it into failure."""
+    text = BOOT_TEXT if text is None else text
     # ⛔⛔ SCREEN FIRST. The Enter below SELECTS a highlighted option, so a row
     # parked on a choice prompt must never be typed into. Refuse on doubt.
     choice = _screen_shows_a_choice(host, row)
@@ -2444,7 +2456,7 @@ def _pty_type_and_enter(host, row):
     # ⇒ If the composer ALREADY shows the boot head: never type again. Complete
     # with a lone Enter when the residue is the boot text alone; otherwise
     # capture whatever else is there to the durable draft store and refuse.
-    head = BOOT_TEXT[:27]                       # "continue, the booter booted"
+    head = text[:27]            # default: "continue, the booter booted"
     pre = _plain_screen(_screen_text(host, row) or "")
     pidx = pre.rfind(head)
     if pidx >= 0:
@@ -2455,7 +2467,7 @@ def _pty_type_and_enter(host, row):
                 f"a lone Enter instead of typing a second copy.")
             enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
             return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
-        _capture_draft(row, pre, head)
+        _capture_draft(row, pre, head, text)
         # ⭐ MULTI-COPY RESIDUE CLEANER — measured 2026-08-20 12:28: three aborted
         # boots left three (glyph-mangled) copies, the LAST copy's prefix is the
         # END of the previous one, so this branch refused forever and the row was
@@ -2464,7 +2476,7 @@ def _pty_type_and_enter(host, row):
         # lost), clear it with ONE Ctrl+C and boot clean. A real owner draft —
         # text before the first copy, or a substantial tail after the last —
         # still refuses untouched.
-        if _composer_is_boot_residue_only(pre, head):
+        if _composer_is_boot_residue_only(pre, head, text):
             log(f"⭐ RESIDUE CLEANER {row.rsplit('/', 1)[-1][:8]} — composer is "
                 f"boot-material only (captured first); clearing with one Ctrl+C "
                 f"and booting clean.")
@@ -2480,9 +2492,9 @@ def _pty_type_and_enter(host, row):
                 f"residue PLUS other content; captured to the draft store, typing nothing.")
             return "refused-draft-race"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
-                        "--refuse-if-draft"], BOOT_TEXT)
+                        "--refuse-if-draft"], text)
     if _field(typed.stdout or "", "refused_for_draft") is True:
-        _capture_draft(row, pre, head)
+        _capture_draft(row, pre, head, text)
         return "refused-draft"
     if _field(typed.stdout or "", "accepted") is not True:
         return ""
@@ -2515,7 +2527,7 @@ def _pty_type_and_enter(host, row):
         why = ("a foreign draft precedes it" if verdict == "foreign"
                else "boot text never appeared on screen after 6 s")
         if verdict == "foreign":
-            _capture_draft(row, plain, head)
+            _capture_draft(row, plain, head, text)
         log(f"⛔ ABORTING BOOT of {row.rsplit('/', 1)[-1][:8]} between write and "
             f"Enter — {why}. Enter NOT sent; residue self-heals next tick.")
         target = resolve(host, row)
@@ -2530,7 +2542,7 @@ def _pty_type_and_enter(host, row):
     return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
 
 
-def _composer_is_boot_residue_only(plain_screen, boot_head):
+def _composer_is_boot_residue_only(plain_screen, boot_head, full_text=None):
     """True iff the composer segment is boot-text copies (possibly glyph-mangled
     by the render defect) and nothing of the owner's. Conservative both ways:
     - owner text BEFORE the first copy (the original splice shape) ⇒ False;
@@ -2538,6 +2550,13 @@ def _composer_is_boot_residue_only(plain_screen, boot_head):
       glyph drops only SHORTEN a copy, so length is a safe one-sided test.
     The caller has ALREADY captured the full content durably, so a wrong True
     loses nothing that cannot be re-delivered."""
+    # ⛔ THE TOKEN SET BELOW IS SPECIFIC TO THE BOOT TEXT. When this writer is
+    # driving some OTHER message (a monitor steer), we cannot recognise its
+    # copies, and a wrong True would CLEAR A COMPOSER we did not understand.
+    # ⇒ Refuse. The caller then captures the content durably and types nothing,
+    #   which is the correct outcome for every text except the one we can parse.
+    if full_text is not None and full_text != BOOT_TEXT:
+        return False
     m = plain_screen.rfind("❯")
     if m < 0:
         return False
@@ -2559,7 +2578,7 @@ def _composer_is_boot_residue_only(plain_screen, boot_head):
     return len(seg) <= limit
 
 
-def _capture_draft(row, plain_screen, boot_head):
+def _capture_draft(row, plain_screen, boot_head, full_text=None):
     """Owner design 2026-08-20: a draft the booter meets is NEVER lost — store it
     durably so the boot (or a handover) can re-deliver it. 'If I type something
     the booter should store it … and in a handover my prompt must be handed to
@@ -2575,7 +2594,7 @@ def _capture_draft(row, plain_screen, boot_head):
         m = max(seg.rfind("❯"), seg.rfind("> "))
         if m >= 0:
             seg = seg[m + 1:]
-        for chunk in (BOOT_TEXT, boot_head):
+        for chunk in (full_text or BOOT_TEXT, BOOT_TEXT, boot_head):
             seg = seg.replace(_plain_screen(chunk), " ").replace(chunk, " ")
         seg = re.sub(r"\s+", " ", seg).strip()
         if not seg:

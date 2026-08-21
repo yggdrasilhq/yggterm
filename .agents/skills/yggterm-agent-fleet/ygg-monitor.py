@@ -307,6 +307,69 @@ def cpu_pct(pid, host=None):
         return None
 
 
+def _busy_descendant(pid, host=None, younger_than=None):
+    """The command line of a live descendant that STARTED INSIDE THIS TURN, or None.
+
+    ⛔⛔ CPU IS NOT THE TEST FOR "IS THIS TURN STILL ALIVE", AND THE OWNER PAID
+    FOR THAT 2026-08-21. An agent CLI mid-tool-call — waiting on ssh, a build, a
+    remote probe, a sleep — burns essentially NO cpu in the parent while being
+    entirely mid-turn. `cpu_pct` reads that as "at rest", `ABANDONED_SECS`
+    elapses, and the supervisor types `continue` into a session that was in the
+    middle of a sentence. That is precisely what happened to an orchestrator
+    driving a fleet deploy: every one of its long steps is a subprocess it is
+    blocked on, so the busier it was, the more abandoned it looked.
+
+    ⇒ ASK WHAT THE TURN IS WAITING ON, NOT WHAT THE PARENT IS BURNING. A live
+      descendant that is not just the CLI's idle shell is positive evidence of
+      an unfinished tool call, and positive evidence beats an absence.
+
+    ⛔⛔ AGE IS THE WHOLE DISCRIMINATOR, AND THE FIRST CUT OF THIS FUNCTION GOT
+    IT WRONG — caught on its own author's row before it shipped. "Has a live
+    child" is TRUE for every CLI that runs an MCP server: those are launched
+    with the session and outlive every turn, so the test returned WORKING
+    unconditionally and would have disabled waking altogether. A supervisor that
+    can never act is worse than the false wake it was fixing, and it would have
+    failed SILENTLY, looking like a quiet fleet.
+
+    ⇒ A sidecar is as old as the session; a tool call is YOUNGER THAN THE STALL.
+      `younger_than` is the row's idle age: a descendant that started after the
+      row went quiet is the thing the row is waiting on. One older than the
+      stall was already there when it stalled and proves nothing.
+
+    ⚠ One-sided on purpose: finding such a descendant proves WORKING; finding
+    none proves nothing on its own, so the caller falls through to the cpu
+    reading rather than upgrading "no child" into a verdict."""
+    # etimes = seconds since that process started, from the host that owns it.
+    script = (f"for c in $(pgrep -P {pid} 2>/dev/null); do "
+              f"  e=$(ps -o etimes= -p $c 2>/dev/null | tr -d ' '); "
+              f"  printf '%s ' \"${{e:-999999}}\"; "
+              f"  tr '\\0' ' ' < /proc/$c/cmdline 2>/dev/null; echo; done")
+    r = _run(host, ["bash", "-c", script])
+    if r is None:
+        return None
+    # A stall of N seconds is explained only by work started within it. The 30 s
+    # floor covers a row that has only just gone quiet.
+    horizon = max(int(younger_than or 0), 30)
+    for line in r.stdout.splitlines():
+        age_s, _, cmd = line.strip().partition(" ")
+        cmd = cmd.strip()
+        if not cmd:
+            continue
+        try:
+            age = int(age_s)
+        except ValueError:
+            continue
+        if age > horizon:
+            continue                      # a sidecar, not this turn's work
+        # A bare login shell parked at a prompt is what an IDLE agent keeps
+        # around; anything else is work in flight.
+        head = cmd.split()[0].rsplit("/", 1)[-1]
+        if head in ("bash", "sh", "zsh", "dash") and len(cmd.split()) <= 1:
+            continue
+        return f"{cmd[:110]} ({age}s old)"
+    return None
+
+
 def refine(state, uuid, host=None):
     """Split the old catch-all STUCK into what it was always hiding.
 
@@ -318,6 +381,10 @@ def refine(state, uuid, host=None):
     proc = cli_process(uuid, host)
     if proc is None:
         return "STUCK", "mid-turn, no CLI process on this host — cannot judge from here"
+    # ⛔ BEFORE the cpu sample, because a blocked turn is the case cpu gets wrong.
+    child = _busy_descendant(proc["pid"], host, state.get("age"))
+    if child:
+        return "WORKING", f"mid-turn, blocked on a live tool call ({child[:60]}) — leave it alone"
     pct = cpu_pct(proc["pid"], host)
     if pct is None:
         return "STUCK", f"mid-turn, pid {proc['pid']} vanished while sampling"
@@ -334,12 +401,26 @@ def refine(state, uuid, host=None):
 # Actions
 # ---------------------------------------------------------------------------
 def wake(host, row, why, dry):
-    """PTY first, and the Enter is a SEPARATE write of \\r.
+    """Wake a row through the BOOTER'S GUARDED WRITER — never a raw send.
 
-    ⛔ Not `submit` — it drives the GUI's mounted terminal host and stalls 30 s
-    answering submitted:false for any row with nothing mounted.
-    ⛔ Not `text + "\\r"` in one write — an agent CLI reads that as a pasted
-    newline (composer content), not a submit. Text, pause, then a lone CR."""
+    ⛔⛔ THIS FUNCTION USED TO TYPE WITH NO GUARDS AT ALL, AND IT IS THE ONE
+    AIMED AT ORCHESTRATORS. It sent `terminal send <msg>` followed by a lone
+    `\\r`, with no screen read, no choice-prompt refusal, no `--refuse-if-draft`
+    and no verify-before-Enter — every one of which the booter had, for the same
+    act, on the same rows. Two watchdogs, two write paths, and the careless one
+    pointed at the sessions that coordinate everything else.
+
+    ⇒ Owner-reported 2026-08-21: a wake from here landed IN THE MIDDLE OF his
+      orchestrator's turn. Two things were wrong at once and only one is fixed
+      here — the write is now guarded (this change), and the CLASSIFIER must
+      stop calling a row "at rest" while it waits on a slow subprocess (its own
+      entry). A guarded write cannot rescue a wrong verdict; it can only stop
+      that verdict from landing in somebody's half-typed sentence.
+
+    ⚠ The guarded path REFUSES rather than types when it cannot prove the
+    composer is clear, and returns a reason string. A refusal is a real outcome,
+    not a failure to retry: `False` here means the row was deliberately left
+    alone, and the caller must not fall back to an unguarded send."""
     msg = ("ORCHESTRATOR/MONITOR — continue. Your turn was cut off mid-flight "
            "(likely a restart re-resuming your session on a fresh PTY); your process "
            "and your work are intact. Check git status/log on your tree to see what "
@@ -347,12 +428,12 @@ def wake(host, row, why, dry):
     if dry:
         log(f"  DRY would wake {row}: {why}")
         return True
-    ygg(host, "server", "app", "terminal", "send", row, "--data", msg)
-    time.sleep(0.2)
-    subprocess.run(["ssh", host,
-                    f"~/.local/bin/yggterm-headless server app terminal send '{row}' --data $'\\r'"],
-                   capture_output=True, text=True, timeout=60)
-    return True
+    outcome = _booter()._pty_type_and_enter(host, row, msg)
+    if outcome in ("pty-write",):
+        return True
+    log(f"  ⛔ wake REFUSED for {row.rsplit('/', 1)[-1][:8]}: {outcome or 'write not accepted'} "
+        f"— typing nothing. The row is left exactly as it was.")
+    return False
 
 
 def escalate(host, sub, row, why, dry):
@@ -1624,9 +1705,18 @@ def tick(a):
             st["escalated"] = kind
 
         if state == "ABANDONED":
-            wake(a.gui_host, row, why, a.dry_run)
-            log(f"  ⇒ woke {uuid[:8]} on the PTY")
-            st["escalated"] = None
+            # ⛔ The guarded writer REFUSES on a draft, a choice prompt or an
+            # unreadable screen. This used to log "woke" either way, so a refusal
+            # and a delivery were indistinguishable in the one record anybody
+            # reads afterwards — and the refusals are the interesting half.
+            if wake(a.gui_host, row, why, a.dry_run):
+                log(f"  ⇒ woke {uuid[:8]} on the PTY")
+                st["escalated"] = None
+            else:
+                log(f"  ⇒ {uuid[:8]} NOT woken — the guarded writer refused; "
+                    f"escalating instead of typing")
+                once("wake-refused", f"{why} — and a guarded wake was refused, "
+                                     f"so this row needs a human or its orchestrator")
         elif state == "CONTEXT_DEAD":
             once("dead", "context exhausted — booting cannot help, it must be RELAYED")
         elif state == "IDLE":
