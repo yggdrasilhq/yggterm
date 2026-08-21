@@ -33,6 +33,12 @@ pub const FIND_OPTIONS_CASE_INSENSITIVE: u32 = 1;
 
 /// `WEBKIT_FIND_OPTIONS_BACKWARDS`. Deliberately NEVER in the mask — see
 /// [`find_options_for`].
+///
+/// ⚠ Kept unused ON PURPOSE, and the allow says so rather than leaving a warning
+/// that reads like an oversight. The engine number is the documentation: without
+/// it, "backwards is not in the mask" is a claim with nothing to check it
+/// against, and the next reader has to go and find the constant themselves.
+#[allow(dead_code)]
 pub const FIND_OPTIONS_BACKWARDS: u32 = 8;
 
 /// `WEBKIT_FIND_OPTIONS_WRAP_AROUND`. Without it the engine stops dead at the
@@ -317,6 +323,12 @@ impl FindTraceEvent {
     /// focus or delivered it a key? This is the predicate the focus lock reads;
     /// naming it here (rather than pattern-matching in the test) is what keeps
     /// the lock honest when the event set grows.
+    ///
+    /// ⚠ `#[cfg(test)]`: nothing that ships calls it, and that is not an
+    /// oversight — the doc above says outright that it exists so the lock does
+    /// not hand-roll the match. Saying so in the attribute stops it reading as
+    /// dead code, which is what it looked like among sixty other warnings.
+    #[cfg(test)]
     pub fn touches_terminal(&self) -> bool {
         match self {
             FindTraceEvent::FocusMoved { to, .. } => matches!(to, FindFocusTarget::Terminal(_)),
@@ -325,6 +337,7 @@ impl FindTraceEvent {
     }
 
     /// Does it mean the find bar let a key through to somebody else?
+    #[cfg(test)]
     pub fn released_a_key(&self) -> bool {
         matches!(self, FindTraceEvent::KeyReleased { .. })
     }
@@ -423,10 +436,6 @@ pub fn trace_snapshot() -> Vec<FindTraceEvent> {
     FIND_TRACE.with(|ring| ring.borrow().iter().cloned().collect())
 }
 
-/// Drop the ring. Used when a burst window is being measured.
-pub fn trace_clear() {
-    FIND_TRACE.with(|ring| ring.borrow_mut().clear());
-}
 
 // ---------------------------------------------------------------------------
 // The bar's state
@@ -1358,4 +1367,19 @@ mod tests {
         }
         assert_eq!(trace_snapshot().len(), FIND_TRACE_CAPACITY);
     }
+}
+
+// ── TEST AFFORDANCES ─────────────────────────────────────────────────────
+// ⛔ Nothing that SHIPS calls these; the test suite does, to assert on
+// behaviour that is still live. They were `dead_code` warnings for exactly
+// that reason, and a warning nobody can act on is how the other 60 in this
+// crate went unread. `#[cfg(test)]` is the accurate statement: not dead,
+// not shipped, and now it cannot drown a real one.
+// ⚠ If a test below is the LAST caller of one of these, the behaviour it
+// characterises may already be gone — check the product path before
+// trusting the green tick.
+#[cfg(test)]
+/// Drop the ring. Used when a burst window is being measured.
+pub fn trace_clear() {
+    FIND_TRACE.with(|ring| ring.borrow_mut().clear());
 }

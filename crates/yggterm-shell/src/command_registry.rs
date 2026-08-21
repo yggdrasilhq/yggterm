@@ -241,13 +241,6 @@ pub fn spec_for_id(id: &str) -> Option<&'static CommandSpec> {
     SHELL_COMMANDS.iter().find(|spec| spec.id == id)
 }
 
-/// Look up a command's spec by variant.
-pub fn spec_for_command(command: ShellCommand) -> &'static CommandSpec {
-    SHELL_COMMANDS
-        .iter()
-        .find(|spec| spec.command == command)
-        .expect("every ShellCommand variant has a CommandSpec")
-}
 
 /// An effective keymap: the Excel-familiar defaults with the user's per-command
 /// overrides applied. The registry is the SSOT for structure; a keymap is the
@@ -290,11 +283,12 @@ impl Keymap {
         &self.overrides
     }
 
+
+    #[cfg(test)]
     /// True if `id` has a user override (not just the default).
     pub fn is_overridden(&self, id: &str) -> bool {
         self.overrides.contains_key(id)
     }
-
     /// The keytip letter in force for a command id (override, else default),
     /// or `None` when the command has no accelerator.
     pub fn keytip_for_id(&self, id: &str) -> Option<char> {
@@ -304,11 +298,12 @@ impl Keymap {
         spec_for_id(id).and_then(|spec| spec.default_keytip)
     }
 
+
+    #[cfg(test)]
     /// The keytip letter in force for a command variant.
     pub fn keytip_for(&self, command: ShellCommand) -> Option<char> {
         self.keytip_for_id(spec_for_command(command).id)
     }
-
     /// The full chord string that reaches a command (e.g. `"is"` for New
     /// session, whose parent is the insert menu on `i`). `None` if the command
     /// or any ancestor lacks a keytip.
@@ -410,4 +405,22 @@ mod tests {
         // Session nav has no accelerator.
         assert_eq!(keymap.chord_for_id("session.next"), None);
     }
+}
+
+// ── TEST AFFORDANCES ─────────────────────────────────────────────────────
+// ⛔ Nothing that SHIPS calls these; the test suite does, to assert on
+// behaviour that is still live. They were `dead_code` warnings for exactly
+// that reason, and a warning nobody can act on is how the other 60 in this
+// crate went unread. `#[cfg(test)]` is the accurate statement: not dead,
+// not shipped, and now it cannot drown a real one.
+// ⚠ If a test below is the LAST caller of one of these, the behaviour it
+// characterises may already be gone — check the product path before
+// trusting the green tick.
+#[cfg(test)]
+/// Look up a command's spec by variant.
+pub fn spec_for_command(command: ShellCommand) -> &'static CommandSpec {
+    SHELL_COMMANDS
+        .iter()
+        .find(|spec| spec.command == command)
+        .expect("every ShellCommand variant has a CommandSpec")
 }

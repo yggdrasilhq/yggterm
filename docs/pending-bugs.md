@@ -109,6 +109,50 @@ every sub-index names at least as many doors as it does today. ⇒ **Audit by th
 comparing parent against parent shows a fake door deficit**, which the index also warns
 about and which has already misled once.
 
+## ⛔ [11.0] THE 1.x/2.x DEAD CODE IS OUT OF THE WEBVIEW CRATE, AND STILL IN THE SERVER CRATE
+
+**Status:** OPEN
+
+*Owner-directed 2026-08-21: "we must remove all the dead code from 1.x or 2.x era."*
+
+`yggterm-shell` — the crate that draws the webview — is done: **66 compiler warnings down to
+17**, with the whole `dead_code` class gone. `yggterm-server` still carries **30 dead items**,
+and they were deliberately left, not missed.
+
+**Why they were left.** Lane 11.25 is working in `crates/yggterm-server/src/lib.rs` right now,
+where 17 of the 30 live. Sweeping a file under a lane's hands is how one session's tidying
+becomes another's merge conflict, and the lane owns that file until it lands.
+
+**The inventory, so nobody re-derives it** (`cargo check --workspace --message-format=json`,
+filter `code.code == "dead_code"` — ⚠ and **touch the crate roots first**: a cached crate emits
+no warnings and reads exactly like a clean one):
+
+| file | dead items |
+|---|---|
+| `yggterm-server/src/lib.rs` | 17 |
+| `yggterm-server/src/daemon.rs` | 4 |
+| `yggterm-server/src/managed_cli/mod.rs` | 3 |
+| `yggterm-server/src/lock_holder_trace.rs` | 2 |
+| one each: `automation.rs`, `app_control_cli.rs`, `browser_import_cli.rs`, `titles_sweep.rs`, `terminal.rs`, `yggterm-core/src/titles.rs` | 6 |
+
+⚠ **`vendor/dioxus-desktop` has one and is out of scope** — it is vendored third-party code and
+editing it makes the next vendor update a conflict.
+
+**The method that worked, and its two traps.** Delete the item, rebuild, repeat: removing a
+caller makes its callees newly dead, so the count falls further than the first scan predicts.
+
+- ⛔ **A symbol with no product caller is not automatically deletable.** Half of the shell's were
+  consumed only by the TEST suite, asserting on behaviour that is still live — deleting those and
+  their tests would have taken real coverage with it. They are `#[cfg(test)]` now, which is the
+  accurate statement and stops them drowning a real warning.
+- ⛔ **Never `cargo fix --broken-code`.** It corrupted six sites in one pass, splicing two source
+  lines into one — `"focused": focusedcwd: _  "window":` — and four of the six were inside
+  comments, so they compiled fine and only the prose was destroyed. **The scan that finds them:
+  diff the identifier set of each changed file against `HEAD`'s and look at the newcomers.**
+
+**Falsifier:** `cargo check --workspace` after touching every crate root reports zero `dead_code`
+in `crates/`, and `cargo test -p yggterm-server` is green.
+
 ## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
 
 **Status:** OPEN

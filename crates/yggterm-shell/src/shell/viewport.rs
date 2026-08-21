@@ -323,24 +323,51 @@ fn MainSurface(
             let rendered_rows =
                 visible_rows[preview_window.start_index..preview_window.end_index].to_vec();
             let grouped_runs = group_preview_runs(&rendered_rows);
+            // ⛔⛔ THE THREE BLANK-PAGE PREDICATES ASK ABOUT THE TRANSCRIPT, SO
+            // THEY MUST NOT BE HANDED THE WINDOW.
+            //
+            // `grouped_runs` above is `visible_rows[window.start..window.end]` —
+            // whatever the reader happens to be scrolled over. Every one of these
+            // three used to be fed it, and each makes a statement about the whole
+            // session: "could not load this", "loading this", "this web view has
+            // no written turns". Scroll onto a stretch of pure tool calls and the
+            // surface announces the session has nothing to read WHILE DRAWING THE
+            // CONTENT UNDERNEATH IT — reported from the live GUI 2026-08-21, the
+            // notice sitting directly above a `WORK · 2` group and a "Show 2 more"
+            // control, on a session whose own metadata panel counted six
+            // assistant turns beside it.
+            //
+            // ⚠ Every unit test of these three passed throughout, and still does:
+            // they build their own runs and assert on the function, so they test
+            // the predicate while the defect is in the ARGUMENT. That is the
+            // shape to remember — a contract test that constructs its input
+            // cannot see a caller passing the wrong thing.
+            //
+            // The two facts they actually want are cheap over the full rows, with
+            // no grouping and no clone, so there is no reason to have narrowed
+            // them in the first place.
+            let transcript_is_empty = visible_rows.is_empty();
+            let transcript_has_written_turn = visible_rows
+                .iter()
+                .any(|(_, block)| !preview_block_is_activity(block));
             let effective_preview_layer_style = preview_layer_style.clone();
             let show_failure_placeholder = preview_should_show_blocking_failure_placeholder(
                 preview_failure.is_some(),
-                grouped_runs.is_empty(),
+                transcript_is_empty,
                 rendered_sections.is_empty(),
                 false,
             );
             let show_loading_placeholder = preview_should_show_blocking_loading_placeholder(
                 snapshot.preview_loading,
                 show_failure_placeholder,
-                grouped_runs.is_empty(),
+                transcript_is_empty,
                 rendered_sections.is_empty(),
                 false,
             );
             // ⛔ Say which of the two blank pages this is. See
             // `preview_surface_has_nothing_to_read`.
             let show_nothing_to_read_notice = preview_surface_has_nothing_to_read(
-                &grouped_runs,
+                transcript_has_written_turn,
                 rendered_sections.is_empty(),
                 show_loading_placeholder,
                 show_failure_placeholder,
@@ -2827,23 +2854,7 @@ impl TerminalScrollControlAction {
         }
     }
 
-    fn title(self) -> &'static str {
-        match self {
-            Self::Top => "Scroll to top",
-            Self::PageUp => "Scroll one page up",
-            Self::PageDown => "Scroll one page down",
-            Self::Bottom => "Scroll to prompt",
-        }
-    }
 
-    fn glyph(self) -> &'static str {
-        match self {
-            Self::Top => "↑",
-            Self::PageUp => "←",
-            Self::PageDown => "→",
-            Self::Bottom => "↓",
-        }
-    }
 }
 /// The reading surface's page pad — the terminal's four-way control, for a
 /// transcript.
@@ -3065,33 +3076,6 @@ fn preview_dpad_watch_script(session_path: &str) -> String {
   sync();
 }})();"#
     )
-}
-/// Whether the reading surface's D-pad has earned its place on screen.
-///
-/// The same rule the terminal applies to its own pad, in the unit a transcript
-/// has: reveal once the reader is more than half a viewport from the end. Below
-/// that they are already looking at the newest turn and a floating control is
-/// just something covering it.
-///
-/// ⚠ Distance from the BOTTOM, not scroll position. A transcript grows while it
-/// is being read, so "how far down am I" answers a different question every few
-/// seconds, while "how far from the end" is stable — and it is the one the
-/// reader actually feels.
-fn preview_dpad_should_reveal(
-    scroll_top_px: f64,
-    viewport_height_px: f64,
-    scroll_height_px: f64,
-) -> bool {
-    // ⚠ NOT clamped to `PREVIEW_MIN_VIEWPORT_HEIGHT_PX`. That floor exists so
-    // the virtual window's arithmetic stays sane on a viewport it has not
-    // measured yet; borrowing it here would tell a genuinely short surface that
-    // it is 680px tall and leave the pad permanently hidden on it.
-    let viewport = viewport_height_px.max(1.0);
-    let distance_from_bottom = scroll_height_px - (scroll_top_px + viewport);
-    // A floor as well as a ratio: on a short viewport half of it is a few
-    // lines, and a pad that flickers on every wheel notch is worse than one
-    // that never appears.
-    distance_from_bottom > (viewport * 0.5).max(240.0)
 }
 fn preview_scroll_control_script(session_path: &str, action: TerminalScrollControlAction) -> String {
     let session_path_literal =
@@ -3629,8 +3613,6 @@ fn TerminalCanvas(
     // `retained_rehydrate_retry_budget`.
     let daemon_retained_replay_retry_budget =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new((String::new(), 0u32)))).clone();
-    let server_snapshot_replay_identity =
-        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let recovery_snapshot_probe_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let wait_trace_identity =
@@ -7228,7 +7210,7 @@ fn TerminalCanvas(
                                         // refused" forever). The stale entry
                                         // is torn down (its forward killed)
                                         // and the declare re-creates it.
-                                        let mut refetch = apply_sidebar_declare(
+                                        let refetch = apply_sidebar_declare(
                                             state,
                                             trace_home.clone(),
                                             contribution_session_path.clone(),
@@ -14088,7 +14070,7 @@ fn WebSurfacePickerView(
             let _ = task::spawn_blocking(move || web_surface_picker_control_get(&get_url)).await;
         });
     };
-    let mut choose_profile = choose.clone();
+    let choose_profile = choose.clone();
     let mut choose_temp = choose.clone();
     let mut choose_new = choose;
     let mut create_new_profile = move |name: String| {
@@ -16977,15 +16959,6 @@ async fn terminal_retained_snapshot_async(
     })
     .await
 }
-async fn daemon_snapshot_async(
-    endpoint: ServerEndpoint,
-    trace_home: &Path,
-) -> Result<ServerUiSnapshot> {
-    run_dedicated_terminal_io("daemon_snapshot", trace_home, move || {
-        daemon_snapshot(&endpoint).map(|(snapshot, _)| snapshot)
-    })
-    .await
-}
 async fn terminal_write_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -19566,7 +19539,7 @@ fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
 
 /// THE capture path. One region, one optional crop, one PNG, one report.
 async fn capture_web_page(
-    state: Signal<ShellState>,
+    _state: Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
     kind: &str,
@@ -20009,4 +19982,42 @@ fn right_panel_allows_terminal_input(right_panel_mode: &RightPanelMode) -> bool 
 fn terminal_input_override_for_right_panel_mode(right_panel_mode: &RightPanelMode) -> bool {
     let _ = right_panel_mode;
     false
+}
+
+// ── TEST AFFORDANCES ─────────────────────────────────────────────────────
+// ⛔ Nothing that SHIPS calls these; the test suite does, to assert on
+// behaviour that is still live. They were `dead_code` warnings for exactly
+// that reason, and a warning nobody can act on is how the other 60 in this
+// crate went unread. `#[cfg(test)]` is the accurate statement: not dead,
+// not shipped, and now it cannot drown a real one.
+// ⚠ If a test below is the LAST caller of one of these, the behaviour it
+// characterises may already be gone — check the product path before
+// trusting the green tick.
+#[cfg(test)]
+/// Whether the reading surface's D-pad has earned its place on screen.
+///
+/// The same rule the terminal applies to its own pad, in the unit a transcript
+/// has: reveal once the reader is more than half a viewport from the end. Below
+/// that they are already looking at the newest turn and a floating control is
+/// just something covering it.
+///
+/// ⚠ Distance from the BOTTOM, not scroll position. A transcript grows while it
+/// is being read, so "how far down am I" answers a different question every few
+/// seconds, while "how far from the end" is stable — and it is the one the
+/// reader actually feels.
+fn preview_dpad_should_reveal(
+    scroll_top_px: f64,
+    viewport_height_px: f64,
+    scroll_height_px: f64,
+) -> bool {
+    // ⚠ NOT clamped to `PREVIEW_MIN_VIEWPORT_HEIGHT_PX`. That floor exists so
+    // the virtual window's arithmetic stays sane on a viewport it has not
+    // measured yet; borrowing it here would tell a genuinely short surface that
+    // it is 680px tall and leave the pad permanently hidden on it.
+    let viewport = viewport_height_px.max(1.0);
+    let distance_from_bottom = scroll_height_px - (scroll_top_px + viewport);
+    // A floor as well as a ratio: on a short viewport half of it is a few
+    // lines, and a pad that flickers on every wheel notch is worse than one
+    // that never appears.
+    distance_from_bottom > (viewport * 0.5).max(240.0)
 }

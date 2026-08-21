@@ -1458,7 +1458,6 @@ mod tests {
                 }],
                 active_tab: 0,
                 next_tab_id: 1,
-                opened_at_ms: 1_000,
                 last_seen_ms: 1_000,
                 address_draft: None,
                 address_typed_len: None,
@@ -12964,76 +12963,67 @@ console.log('ok');
     /// were looking at.
     #[test]
     fn a_surface_holding_only_machine_work_says_it_has_nothing_to_read() {
-        let entry = |ix: usize, kind: PreviewBlockKind| PreviewRunEntry {
-            block_ix: ix,
-            display_timestamp: String::new(),
-            block: SessionPreviewBlock {
-                role: "ASSISTANT",
-                timestamp: "now".to_string(),
-                tone: PreviewTone::Assistant,
-                folded: kind != PreviewBlockKind::Message,
-                lines: vec!["x".to_string()],
-                kind,
-                activity: (kind != PreviewBlockKind::Message)
-                    .then(yggterm_server::PreviewActivity::default),
-            },
-        };
-        let run = |kinds: Vec<PreviewBlockKind>| {
-            vec![PreviewRun {
-                tone: PreviewTone::Assistant,
-                entries: kinds
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, kind)| entry(ix, kind))
-                    .collect(),
-            }]
-        };
-
-        // The reported frame: two tool calls, no answer.
-        assert!(preview_surface_has_nothing_to_read(
-            &run(vec![PreviewBlockKind::ToolCall, PreviewBlockKind::ToolCall]),
-            true,
-            false,
-            false,
-        ));
-        // Thinking is not reading matter either.
-        assert!(preview_surface_has_nothing_to_read(
-            &run(vec![PreviewBlockKind::Reasoning]),
-            true,
-            false,
-            false,
-        ));
-        // A transcript with nothing in it at all is still nothing to read.
-        assert!(preview_surface_has_nothing_to_read(&[], true, false, false));
+        // The reported frame: work blocks, no answer. And a transcript with
+        // nothing in it at all is still nothing to read.
+        assert!(preview_surface_has_nothing_to_read(false, true, false, false));
 
         // ⚠ Deliberately narrow. ONE prose block, or ANY rendered section, and
         // the notice stands down — it must never hide something worth reading.
-        assert!(!preview_surface_has_nothing_to_read(
-            &run(vec![PreviewBlockKind::ToolCall, PreviewBlockKind::Message]),
-            true,
-            false,
-            false,
-        ));
-        assert!(!preview_surface_has_nothing_to_read(
-            &run(vec![PreviewBlockKind::ToolCall]),
-            false,
-            false,
-            false,
-        ));
+        assert!(!preview_surface_has_nothing_to_read(true, true, false, false));
+        assert!(!preview_surface_has_nothing_to_read(false, false, false, false));
         // And it never stacks on top of a placeholder that already owns the
         // page: three notices where one is due is its own kind of silence.
-        assert!(!preview_surface_has_nothing_to_read(
-            &run(vec![PreviewBlockKind::ToolCall]),
-            true,
-            true,
-            false,
-        ));
-        assert!(!preview_surface_has_nothing_to_read(
-            &run(vec![PreviewBlockKind::ToolCall]),
-            true,
-            false,
-            true,
-        ));
+        assert!(!preview_surface_has_nothing_to_read(false, true, true, false));
+        assert!(!preview_surface_has_nothing_to_read(false, true, false, true));
+    }
+
+    /// ⛔⛔ THE CALLER IS WHERE THIS BROKE, AND THE TEST ABOVE COULD NOT SEE IT.
+    ///
+    /// Every assertion above passed on the day the notice appeared over a
+    /// transcript it was drawing — because those assertions build their own
+    /// input and check the predicate, while the defect was the ARGUMENT: the
+    /// render body passed the runs of the VIRTUAL WINDOW, so "this web view has
+    /// no written turns" was a statement about wherever the reader was
+    /// scrolled. Reported from the live GUI 2026-08-21, the notice sitting
+    /// directly above a `WORK · 2` group with a "Show 2 more" control under it.
+    ///
+    /// ⇒ So this lock is over the CALL SITE, and asserts the two facts are
+    /// derived from `visible_rows` — the whole transcript — rather than from
+    /// anything the window narrowed.
+    #[test]
+    fn the_blank_page_predicates_are_asked_about_the_transcript_not_the_window() {
+        let product = shell_product_source();
+
+        for needle in [
+            "let transcript_is_empty = visible_rows.is_empty();",
+            "let transcript_has_written_turn = visible_rows",
+        ] {
+            assert!(
+                product.contains(needle),
+                "the blank-page facts are no longer derived from `visible_rows`; \
+                 anything narrower is a window, and it makes each of these three \
+                 predicates lie about the session — missing: {needle}",
+            );
+        }
+
+        // ⛔ The material itself must be gone from the argument lists. A window
+        // cannot be substituted for a `bool`, and that is the whole reason these
+        // predicates now take the answer rather than the collection.
+        assert!(
+            !product.contains("preview_surface_has_nothing_to_read(\n                &grouped_runs"),
+            "the nothing-to-read notice is being fed the virtual window again",
+        );
+
+        // The control: `grouped_runs` must still exist and still be windowed, or
+        // this lock passes by the window having been deleted — which would
+        // un-virtualise the surface and satisfy every assertion above.
+        assert!(
+            product.contains(
+                "visible_rows[preview_window.start_index..preview_window.end_index].to_vec()"
+            ),
+            "the virtual window is gone — this lock now proves nothing, and a \
+             surface that renders every block is its own defect",
+        );
     }
 
     #[test]
