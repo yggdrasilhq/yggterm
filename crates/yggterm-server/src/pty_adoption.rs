@@ -21,9 +21,18 @@
 //!   `UnixMasterPty` and `PtyFd` are private and `openpty()` is the only
 //!   construction path, so there is no `from_raw_fd` for a master.
 //!
-//! **Nothing here is wired to the daemon's handoff yet** — that is increment 2
-//! and is integrator-gated. Every existing construction site stays `Owned`, so
-//! current behaviour is unchanged.
+//! ⚠ **This paragraph used to say "nothing here is wired to the daemon's
+//! handoff yet — that is increment 2 and is integrator-gated". IT IS WIRED, AND
+//! IT RUNS.** [`crate::pty_handoff_wire`] moves the descriptor,
+//! [`crate::pty_handoff`] is the protocol around it, and the daemon's handoff
+//! listener seats received masters through `TerminalManager::adopt_session`.
+//! Measured on the build host in a single night: 135 successful adoptions and
+//! four retirement sweeps reporting `AllMoved`.
+//!
+//! The correction is recorded rather than merely applied, because the stale
+//! line was load-bearing in the wrong direction: it is cited as evidence that a
+//! new daemon has *no way* to take over an orphaned PTY, and a reader who
+//! believes that goes looking for a mechanism that already exists.
 //!
 //! ## Adoption is Linux-only, and says so in the type system
 //!
