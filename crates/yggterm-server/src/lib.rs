@@ -28115,6 +28115,25 @@ pub fn run_remote_apps() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Will a session yggterm launches on THIS machine resolve `binary_name`?
+///
+/// ⛔ **The one answer to that question, for every surface that asks it.** It is
+/// deliberately the same resolver the launch itself uses — managed CLI bin dir,
+/// then the login-shell dirs the launch prepends, then the inherited `PATH` —
+/// so a matrix cell can no longer disagree with what happens when the user
+/// clicks the row it describes.
+///
+/// ⚠ The tempting alternative is a `PATH` walk in whatever process happens to
+/// be asking, and it is wrong by a wide margin rather than a narrow one: the
+/// non-login `PATH` an `ssh` command inherits carried ONE of ten registered
+/// CLIs on a fleet machine that a launch resolves all ten on. Wrapping the
+/// probe in a login shell — the obvious half-fix — recovers seven of the ten
+/// and still misses the managed bin dir, which is why the resolver and not the
+/// shell is the thing to share.
+pub fn cli_present_for_launch(binary_name: &str) -> bool {
+    managed_cli::resolve_binary_for_launch_parity(binary_name).is_some()
+}
+
 /// `server remote cli-presence` — this machine reporting its own agent-CLI `PATH`.
 ///
 /// ⛔ A `PATH` lookup, never an execution. Running each CLI's `--version` to decide
@@ -28124,7 +28143,7 @@ pub fn run_remote_apps() -> anyhow::Result<()> {
 pub fn run_remote_cli_presence() -> anyhow::Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for row in yggterm_core::cli_install::local_presence_report() {
+    for row in yggterm_core::cli_install::presence_report_with(cli_present_for_launch) {
         writeln!(out, "{}", serde_json::to_string(&row)?)?;
     }
     out.flush()?;
@@ -37366,6 +37385,38 @@ mod tests {
         assert!(!command.contains("export YGGTERM_HOME"));
         assert!(command.contains("ControlMaster"));
         assert!(command.contains("ControlPath"));
+    }
+
+    #[test]
+    fn the_cli_presence_report_resolves_the_way_a_launch_will() {
+        // ⛔ THE DEFECT: this report was built from the calling process's own
+        // `PATH`. Run over a non-login `ssh`, that `PATH` is missing both the
+        // user's bin dir and the managed CLI bin dir a launch prepends, so a
+        // machine running nine agent CLIs reported one — and the matrix offered
+        // to install the eight it already had.
+        //
+        // The wiring, not the numbers, is what is pinned here: the report must
+        // be produced by the SAME resolver the launch path consults, so the two
+        // can never drift into separate answers again. The numbers depend on
+        // what the test machine has installed and are proven live instead.
+        let report = yggterm_core::cli_install::presence_report_with(super::cli_present_for_launch);
+        let expected = yggterm_core::cli_install::presence_report_with(|binary| {
+            super::managed_cli::resolve_binary_for_launch_parity(binary).is_some()
+        });
+        assert_eq!(report, expected);
+        for row in &report {
+            let descriptor = yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .find(|d| d.slug == row.slug)
+                .expect("every reported slug is a registered CLI");
+            assert_eq!(
+                row.present,
+                super::managed_cli::resolve_binary_for_launch_parity(descriptor.binary_name)
+                    .is_some(),
+                "{} must report what a launch would resolve",
+                row.slug
+            );
+        }
     }
 
     #[test]

@@ -1952,8 +1952,8 @@ fn launch_flags_rail_summary(stored: &std::collections::BTreeMap<String, String>
 /// averaged several machines would hide the exact fault this surface exists to
 /// show, where one host carries every CLI and the host beside it carries none.
 fn cli_install_rail_summary(stored_consent: &str) -> String {
-    use yggterm_core::cli_install::{local_machine_status, InstallConsent};
-    let status = local_machine_status("this machine");
+    use yggterm_core::cli_install::{binary_on_process_path, machine_status_with, InstallConsent};
+    let status = machine_status_with("this machine", binary_on_process_path);
     let total = status.rows.len();
     let present = status.present_count();
     match InstallConsent::from_wire(stored_consent) {
@@ -2049,9 +2049,19 @@ fn LaunchFlagsSettingsSection(
 /// The machine list the CLI-installation modal draws, local first.
 ///
 /// The local machine is probed here, directly against this process's `PATH`.
-/// Every remote machine reports its OWN `PATH` back over the existing ssh scan
-/// (`server remote cli-presence`), so both columns are produced by the same core
-/// probe — the remote one just runs on the remote.
+/// Every remote machine reports its own standing back over the existing ssh scan
+/// (`server remote cli-presence`), where the report is built against LAUNCH
+/// resolution — managed CLI bin dir plus the login-shell dirs a launch prepends.
+///
+/// ⚠ **The two columns therefore answer slightly different questions, and the
+/// local one is the weaker.** This process's `PATH` is whatever the desktop
+/// session handed the GUI; it is neither deterministic nor what a launch will
+/// search. The remote side was moved to launch parity because it was wrong by a
+/// factor of ten; the local side is not moved WITH it here because the parity
+/// resolver consults the login shell, and this function runs on the render
+/// path, where a subprocess is the one cost this product cannot pay. Tracked as
+/// its own queue entry — the fix is for the daemon to report the local machine
+/// on the same wire the remotes already use, so nothing is probed during render.
 ///
 /// ⛔ **A machine with an EMPTY report is `Unknown`, never `Absent`.** That is
 /// what an unreachable host, a host never yet refreshed, and a host whose
@@ -2060,8 +2070,10 @@ fn LaunchFlagsSettingsSection(
 fn cli_install_machines(
     snapshot: &SharedSnapshot,
 ) -> Vec<yggterm_core::cli_install::MachineCliStatus> {
-    use yggterm_core::cli_install::{local_machine_status, machine_status_from_report};
-    let mut machines = vec![local_machine_status("This machine")];
+    use yggterm_core::cli_install::{
+        binary_on_process_path, machine_status_from_report, machine_status_with,
+    };
+    let mut machines = vec![machine_status_with("This machine", binary_on_process_path)];
     machines.extend(snapshot.remote_machines.iter().map(|machine| {
         machine_status_from_report(
             machine.machine_key.clone(),

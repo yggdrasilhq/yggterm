@@ -21179,3 +21179,36 @@ sandbox and a promotion step, never a seat at a shared table.**
 "external lane" row carrying pid, log path and progress file would make items 1 and 3 tractable —
 or whether foreign CLIs stay file-supervised by design. **Both are defensible; the current state
 is neither, and it is undocumented.**
+
+## [11.9] THE MATRIX'S LOCAL COLUMN PROBES THE GUI PROCESS'S OWN `PATH`, DURING RENDER
+
+**Status:** OPEN
+
+Every REMOTE machine in the Agent CLI installation matrix now reports what a launch there
+would resolve — managed CLI bin dir, then the login-shell dirs the launch prepends. The
+`This machine` row did not move with them: it still walks the GUI process's `PATH`, which
+is whatever the desktop session happened to hand that process.
+
+**Two separate costs, and the second is the one that matters more.**
+
+**1. Two columns, two questions.** A machine that appears as `This machine` in one GUI and
+as a remote row in another can now be described two different ways at the same instant,
+and only one of them is the question the user is actually asking — *will the CLI start if
+I click this row.* The process `PATH` is not derived from anything the launch consults, so
+where the two agree it is coincidence, not agreement.
+
+**2. It is filesystem work on the render path.** The walk stats one candidate per directory
+per registered CLI, every time the settings rail or the modal renders. That is cheap until
+it is not, and it sits on the exact thread whose latency is this project's standing
+priority. Routing it through the launch-parity resolver instead would be worse: that
+resolver consults a login shell, and a failed consult is deliberately not cached, so a
+machine where the probe fails would spawn a subprocess per render.
+
+**The shape of the fix.** The daemon already produces a presence report for every machine
+it can reach. Have it produce one for the machine it runs on, carry that in the snapshot
+beside the remote ones, and let the GUI render a report rather than take a measurement. The
+render path then does no I/O and both columns answer the same question by construction.
+
+**Falsified by:** starting the GUI from an environment whose `PATH` omits the managed CLI
+bin dir, then comparing its `This machine` count against what another host's matrix reports
+for that same machine over ssh. Equal counts falsify the divergence; unequal counts are it.
