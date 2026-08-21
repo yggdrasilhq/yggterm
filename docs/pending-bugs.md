@@ -110,6 +110,64 @@ would settle it is an activation event carrying its ORIGIN (user gesture vs inte
 which the trace does not currently record. Adding that origin is the first piece of work
 this entry wants, because without it nobody can ever tell these two apart.
 
+### ⭐⭐ ISOLATED 2026-08-21 — A CREATE COSTS FIVE MOUNTS, A REMOVE COSTS NONE, AND THE MOUNTS ALL FAIL
+
+The test this entry asked for and nobody had run: one `create_terminal` alone, one
+`session remove` alone, quiet windows either side as controls. Both mutations used
+`--no-activate`, so nothing took the screen and nothing was clicked.
+
+| window | what happened in it | `terminal_mount/*` | `bootstrap_reset` |
+|---|---|---|---|
+| A · 45 s | nothing touched the row set | **0** | 0 |
+| B · 21 s | **one** `terminal new --no-activate` | **5 mounts** | **4** |
+| C · 40 s | nothing touched the row set | **0** | 0 |
+| D · 21 s | **one** `session remove` | **0** | 0 |
+
+⇒ **Adding a row costs a burst of remounts. Removing one costs nothing.** The entry
+above had it half right: it is not "the row SET changing", it is specifically an
+ADD. And the controls are strong — D carried the heaviest ambient app-control
+traffic of all four windows (40 `request_stage` against A's 16) and still produced
+no mount at all, so the bursts are not a function of how busy the control plane is.
+
+**⭐ WHAT THE MOUNTS WERE DOING, WHICH IS THE ACTUAL ROOT.** Every mount in window B
+targeted the same row — **the ACTIVE one, not the row just created.** The new row
+took `bootstrap_spawn_skipped_inactive_retained_host` and was otherwise left alone.
+The active row instead ran the full mount path five times, and each attempt ended:
+
+```
+terminal_mount/ensure_error
+  "saved Codex session <uuid> is no longer available on this machine,
+   so this row cannot be restored as a live terminal."
+```
+
+with `mount_epoch` climbing 0 → 1 as it re-armed
+(`retained_fault_recovery_rearm_watch_scheduled`) for the next attempt.
+
+**⭐ AND WHY THAT ROW CANNOT MOUNT.** One session in the tree — **1 of 235** — is
+present under **two schemes at once**: a `remote-cc://` row carrying the agent kind
+and the seat, and a `remote-session://` row with no seat and the generic session
+kind. Both wear the same label, so they are indistinguishable in the sidebar. The
+`remote-session://` twin is the one marked `selected`, i.e. **the GUI's active row
+is the copy that cannot be restored**, and the restore path treats it as a saved
+session that no longer exists. It fails, re-arms, and fails again on the next add.
+
+⇒ **The churn needs two things at once: an add, and an active row that cannot
+mount.** That reframes the whole entry. "A row nobody is looking at is re-mounted
+every twenty seconds" is a create-driven retry loop against one broken active row,
+and the twenty-second cadence was the spawn rate of the sessions doing the adding.
+
+⛔ **WHAT IS NOT ESTABLISHED, and must not be asserted.** Whether a create against a
+*healthy* active row is free. The decisive test is to make a mountable row active and
+repeat window B — but activating a row takes the screen from whoever is at it, so it
+waits for a moment when that is acceptable, or for the duplicate to be removed. Until
+then the honest statement is the conjunction above, not "creates are expensive".
+
+⚠ **The two follow-ups this hands over.** (1) Whatever mints a `remote-session://`
+row for a session that already has a `remote-cc://` one is a row-identity defect and
+owns the duplicate. (2) The mount path retries an error that can never succeed —
+a row whose backing session is gone will never restore, so re-arming after
+`ensure_error` buys nothing and pays a full mount each time.
+
 **Falsifier:** leave the GUI untouched for ten minutes with several agent rows producing
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
