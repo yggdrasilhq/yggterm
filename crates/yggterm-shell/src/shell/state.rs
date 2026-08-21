@@ -250,6 +250,10 @@ use yggui::prose::{ProseInk, ProseTokens};
 use yggui::dpad::{DPAD_CSS, DpadAction, DpadPalette, DpadPlacement, ScrollDpad};
 // The floating bar that replaced the docked header — find, the match stepper
 // and the light switch, costing no layout.
+use yggui::command_palette::{
+    CommandPalette, CommandPaletteItem, CommandPalettePalette, PaletteMove,
+    YGGUI_COMMAND_PALETTE_CSS, palette_index_after,
+};
 use yggui::pill_toolbar::{PILL_TOOLBAR_CSS, PillStep, PillToolbar, PillToolbarPalette};
 use yggui::split_button::{
     SPLIT_BUTTON_CSS, SplitButton, SplitButtonItem, SplitButtonPalette,
@@ -1755,11 +1759,11 @@ struct WebSurfaceUiState {
     /// Browser tabs. `tabs[0]` is the app tab — owned by the OSC stream (its
     /// URL follows the app's open payload; it has no per-tab close button).
     /// Later tabs are user-opened from the tab strip.
+    ///
+    /// In DRAW ORDER: every group is contiguous, its head first.
+    /// The rail walks this list to draw the tree, so the parent pointer alone is
+    /// not enough — see [`order_web_tabs_by_group`], which owns the invariant.
     tabs: Vec<WebSurfaceTab>,
-    /// The user's virtual folders, in display order — the cwd tree's grammar
-    /// applied to tabs. A tab names one by id; a folder holds no tab list, so a
-    /// tab can never be in two folders, and there is nothing to keep in sync.
-    folders: Vec<WebTabFolder>,
     /// Id (not index) of the visible tab, stable across tab closes.
     active_tab: u64,
     next_tab_id: u64,
@@ -1840,7 +1844,9 @@ const MAX_CLOSED_WEB_TAB_BATCHES: usize = 10;
 struct ClosedWebTab {
     url: String,
     title: Option<String>,
-    folder: Option<String>,
+    /// The group it was closed out of, as a per-run head id. Live-only: the
+    /// reopen stack undoes a close within one run, and does not outlive it.
+    group_head: Option<u64>,
     /// The index it sat at. A reopen that appended would answer "undo" with
     /// "open this URL again somewhere", which is not the same promise.
     index: usize,
@@ -1850,9 +1856,18 @@ struct WebSurfacePickerState {
     control_url: String,
     forward_child: Option<Arc<Mutex<std::process::Child>>>,
 }
-/// A virtual folder in the tab tree. Purely organizational, exactly like a cwd
-/// tree folder: it has an identity, a name the user can rename, and a collapsed
-/// state. It owns no tabs — the TABS name the folder.
+/// ⛔ RETIRED CONCEPT, KEPT ONLY TO BE MIGRATED AWAY FROM.
+///
+/// A virtual folder in the tab tree: an identity, a name, a collapsed state, and
+/// a parent. It owned no tabs — the TABS named the folder.
+///
+/// Folders were replaced by ROW GROUPS, whose head is a TAB
+/// ([`WebSurfaceTab::group_head`]). This type survives so that a profile written
+/// before the change can be read and flattened by
+/// [`migrate_web_tab_folders_into_row_groups`]. ⛔ Do not give it new callers,
+/// and do not write it back out — a retired concept with one live writer is not
+/// retired.
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct WebTabFolder {
     id: String,
@@ -1866,6 +1881,243 @@ struct WebTabFolder {
     /// existed, which reads back as the flat single level those stores meant.
     #[serde(default)]
     parent: Option<String>,
+}
+
+/// What a folder→row-group migration did, so a caller can log it and a test can
+/// assert on it without re-deriving the answer from the tabs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct WebTabGroupMigration {
+    /// Folders that became a group (they had at least one tab).
+    groups_formed: usize,
+    /// Folders that held no tabs at all. They carry no content, so nothing is
+    /// created for them — but they ARE counted, because "3 folders in, 2 groups
+    /// out" is the shape of a lossy migration and the count is how anyone
+    /// notices.
+    empty_folders_dropped: usize,
+    /// Heads that took their folder's NAME because they had no name of their
+    /// own. This is where the folder's label survives.
+    names_adopted: usize,
+    /// Heads that already carried a user-given name, so the folder's label was
+    /// dropped in favour of it. ⚠ The one genuinely lossy case, and it is
+    /// counted rather than hidden.
+    names_yielded_to_custom_title: usize,
+}
+
+/// Flatten virtual folders into ROW GROUPS, in place, losslessly.
+///
+/// **The rule, which is the owner's:** a folder's FIRST tab in display order
+/// becomes the group's HEAD; every other member points at that head. The head
+/// itself joins the group its folder sat inside, or root when there is none —
+/// so nesting survives as nesting.
+///
+/// **Where the folder's NAME goes.** A group has one label and it is the head
+/// row's. `custom_title` is exactly the right vessel: it already exists, and it
+/// already outranks the engine-written `title` everywhere a row is drawn, so a
+/// folder called "Reading" stays called "Reading" instead of becoming whatever
+/// its first page happens to be titled. ⚠ Where the head ALREADY carries a
+/// user-given name, that name wins and the folder's label is dropped — the more
+/// specific statement of the same user's intent — and the case is COUNTED in
+/// `names_yielded_to_custom_title` rather than passed over in silence.
+///
+/// **An empty folder migrates to nothing**, because it held nothing. Its
+/// children, if any, re-parent to the nearest ancestor that DID form a group,
+/// or to root: "or to root when there is none" generalizes to "the nearest
+/// ancestor that exists", and an empty folder does not.
+///
+/// ⛔ The app tab (id 0) is untouchable: never a head, never a member. Every
+/// close verb in the product is written on the premise that `tabs[0]` is the
+/// app's, and a migration that filed it into a group would break all of them at
+/// once, on load, on someone else's data.
+///
+/// Tabs are REORDERED so each group is contiguous with its head first. The rail
+/// draws a tree by walking the list, so a group whose members are scattered is
+/// not a group that renders — the pointer and the order have to agree.
+fn migrate_web_tab_folders_into_row_groups(
+    tabs: &mut Vec<WebSurfaceTab>,
+    folders: &[WebTabFolder],
+) -> WebTabGroupMigration {
+    let mut report = WebTabGroupMigration::default();
+    if folders.is_empty() {
+        return report;
+    }
+    // `tabs[0]` is the app's — the product's one convention for saying so, and
+    // it is POSITIONAL. Resolve it to an ID once, here, because this function
+    // REORDERS: after the first sort an index no longer answers the question,
+    // and a second convention for "which one is the app tab" is how the two
+    // drift apart.
+    let app_tab_id = tabs.first().map(|tab| tab.id);
+
+    // The head each folder formed, if it formed one. Resolved in display order
+    // so "first tab" means what the user sees, not what the store happens to
+    // list first.
+    let mut head_of_folder: HashMap<String, u64> = HashMap::new();
+    for folder in folders {
+        let first = tabs
+            .iter()
+            .find(|tab| {
+                Some(tab.id) != app_tab_id && tab.folder.as_deref() == Some(folder.id.as_str())
+            });
+        match first {
+            Some(tab) => {
+                head_of_folder.insert(folder.id.clone(), tab.id);
+                report.groups_formed += 1;
+            }
+            None => report.empty_folders_dropped += 1,
+        }
+    }
+
+    let parent_of: HashMap<&str, Option<&str>> = folders
+        .iter()
+        .map(|folder| (folder.id.as_str(), folder.parent.as_deref()))
+        .collect();
+
+    // The group a HEAD joins: the nearest ancestor folder that actually formed
+    // one. Walks rather than reading `parent` once, so an empty folder in the
+    // middle of a chain does not strand everything below it at root.
+    //
+    // The `seen` set is not defensive dressing: `parent` is data off disk, and a
+    // cycle there would hang the app on load, before any UI exists to say why.
+    let nearest_group_ancestor = |folder_id: &str| -> Option<u64> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cursor = *parent_of.get(folder_id)?;
+        while let Some(id) = cursor {
+            if !seen.insert(id) {
+                return None;
+            }
+            if let Some(head) = head_of_folder.get(id) {
+                return Some(*head);
+            }
+            cursor = parent_of.get(id).copied().flatten();
+        }
+        None
+    };
+
+    let name_of: HashMap<&str, &str> = folders
+        .iter()
+        .map(|folder| (folder.id.as_str(), folder.name.as_str()))
+        .collect();
+    let collapsed_of: HashMap<&str, bool> = folders
+        .iter()
+        .map(|folder| (folder.id.as_str(), folder.collapsed))
+        .collect();
+
+    for tab in tabs.iter_mut() {
+        if Some(tab.id) == app_tab_id {
+            tab.group_head = None;
+            tab.folder = None;
+            continue;
+        }
+        let Some(folder_id) = tab.folder.clone() else {
+            continue;
+        };
+        let head = head_of_folder.get(folder_id.as_str()).copied();
+        if head == Some(tab.id) {
+            // This tab IS the head: it joins the OUTSIDE group, and it takes the
+            // folder's identity.
+            tab.group_head = nearest_group_ancestor(&folder_id);
+            tab.group_collapsed = collapsed_of
+                .get(folder_id.as_str())
+                .copied()
+                .unwrap_or(false);
+            match tab.custom_title.as_deref() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    let _ = existing;
+                    report.names_yielded_to_custom_title += 1;
+                }
+                _ => {
+                    if let Some(name) = name_of.get(folder_id.as_str()) {
+                        tab.custom_title = Some((*name).to_string());
+                        report.names_adopted += 1;
+                    }
+                }
+            }
+        } else {
+            tab.group_head = head;
+        }
+        tab.folder = None;
+    }
+
+    order_web_tabs_by_group(tabs);
+    report
+}
+
+/// Reorder tabs so every group is contiguous: a head is immediately followed by
+/// its own subtree, and relative order is otherwise preserved.
+///
+/// The rail draws the tree by walking this list, so the parent pointer alone is
+/// not enough — a member sitting three unrelated tabs away from its head reads
+/// as a break in the group, not as membership. ⛔ The app tab keeps index 0
+/// regardless: it is not part of the user's tree and every close verb assumes
+/// its seat.
+fn order_web_tabs_by_group(tabs: &mut Vec<WebSurfaceTab>) {
+    // Positional convention, resolved to an id BEFORE the sort — see
+    // [`migrate_web_tab_folders_into_row_groups`] for why an index cannot be
+    // asked this question here.
+    let app_tab_id = tabs.first().map(|tab| tab.id);
+    let mut children: HashMap<Option<u64>, Vec<u64>> = HashMap::new();
+    for tab in tabs.iter() {
+        if Some(tab.id) == app_tab_id {
+            continue;
+        }
+        children.entry(tab.group_head).or_default().push(tab.id);
+    }
+
+    // A `group_head` pointing at a tab that is gone would otherwise drop that
+    // tab from the walk entirely — it would vanish from the rail while still
+    // existing in state, which is the worst of both. Treat a dangling pointer as
+    // root, the same way the placement owner treats a dangling opener.
+    let live: HashSet<u64> = tabs.iter().map(|tab| tab.id).collect();
+    let mut roots: Vec<u64> = Vec::new();
+    for tab in tabs.iter() {
+        if Some(tab.id) == app_tab_id {
+            continue;
+        }
+        let rooted = match tab.group_head {
+            None => true,
+            Some(head) => !live.contains(&head) || head == tab.id,
+        };
+        if rooted {
+            roots.push(tab.id);
+        }
+    }
+
+    let mut order: Vec<u64> = Vec::with_capacity(tabs.len());
+    let mut emitted: HashSet<u64> = HashSet::new();
+    // Explicit stack, not recursion: depth is user data (folders nested
+    // arbitrarily), and a deep tree must not blow the stack on load.
+    let mut stack: Vec<u64> = roots.into_iter().rev().collect();
+    while let Some(id) = stack.pop() {
+        if !emitted.insert(id) {
+            continue;
+        }
+        order.push(id);
+        if let Some(kids) = children.get(&Some(id)) {
+            for kid in kids.iter().rev() {
+                if !emitted.contains(kid) {
+                    stack.push(*kid);
+                }
+            }
+        }
+    }
+    // Anything a cycle kept out of the walk still has to be drawn.
+    for tab in tabs.iter() {
+        if Some(tab.id) != app_tab_id && emitted.insert(tab.id) {
+            order.push(tab.id);
+        }
+    }
+
+    let rank: HashMap<u64, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, index))
+        .collect();
+    tabs.sort_by_key(|tab| {
+        if Some(tab.id) == app_tab_id {
+            (0usize, 0usize)
+        } else {
+            (1usize, rank.get(&tab.id).copied().unwrap_or(usize::MAX))
+        }
+    });
 }
 #[derive(Debug, Clone)]
 struct WebSurfaceTab {
@@ -1929,10 +2181,33 @@ struct WebSurfaceTab {
     /// (`~/.yggterm/web-profiles/<profile>/`). A change recreates the webview
     /// (storage is fixed per WebContext). All tabs of one surface share it.
     profile: String,
-    /// The virtual folder this tab is filed in (`WebTabFolder::id`), or `None`
-    /// for a root tab. Filed = saved organization; root = the browsing session.
-    /// The app tab (id 0) is always root: it belongs to the app, not the tree.
+    /// ⛔ LEGACY, read on load and never written. The virtual folder this tab was
+    /// filed in (`WebTabFolder::id`). Folders were replaced by ROW GROUPS —
+    /// `group_head` below — and this field survives only so a store written
+    /// before the change can be migrated by
+    /// [`migrate_web_tab_folders_into_row_groups`]. Nothing else may read it: a
+    /// second reader is how a retired concept comes back to life.
     folder: Option<String>,
+    /// The id of the TAB that heads this tab's group, or `None` for a root tab.
+    ///
+    /// This is the whole of the group model, and it is deliberately the same
+    /// shape yggterm live-session rows use: a group is headed by a ROW, not by a
+    /// separate folder object that owns a list. A parent pointer cannot describe
+    /// a tab in two groups and has no member list to keep in sync — the two bugs
+    /// the folder model was one refactor away from at all times.
+    ///
+    /// A head's OWN `group_head` names the head of the group it sits inside, or
+    /// `None` at root. That is the owner's definition stated as arithmetic: row
+    /// headers belong to the OUTSIDE group, or to root when there is none.
+    ///
+    /// ⛔ The app tab (id 0) is always root and can never head or join a group.
+    /// It belongs to the app, not to the user's organization.
+    group_head: Option<u64>,
+    /// Is the group this tab HEADS drawn collapsed? Meaningless on a tab that
+    /// heads nothing, which is why it is a plain bool rather than an Option: a
+    /// non-head's value is simply never read, and carrying `Some(false)` for
+    /// every ordinary tab would invite a caller to believe it meant something.
+    group_collapsed: bool,
     /// A name the USER gave this row, which outranks `title` wherever the tab
     /// is drawn. It has to be its own field: `title` is written from the engine
     /// on every reconcile poll, so a rename stored there would last about a
@@ -2095,10 +2370,13 @@ enum WebTabOrigin {
     /// open from the top*. Do not "unify" the two directions; see
     /// [`web_tab_placement`].
     Top,
-    /// Born filed, with no opener: a folder row's "+". It joins the TOP of THAT
-    /// FOLDER's run, so it appears under the header that minted it rather than
-    /// at the far end of the window.
-    Folder(String),
+    /// Born inside a group, with no opener: a group HEAD row's "+". It joins the
+    /// top of that group's run — directly under the head that minted it —
+    /// rather than at the far end of the window.
+    ///
+    /// The head row replaces the folder header the gesture used to hang off, and
+    /// it keeps the header's meaning: "+" fills the group, not the window.
+    Group(u64),
     /// A TAB opened it: the row menu's "New tab above this one", a middle- or
     /// ctrl-clicked link, a duplicate, a `window.open` / `target="_blank"`.
     /// It lands immediately ABOVE its opener and CASCADES above the children
@@ -2111,7 +2389,10 @@ enum WebTabOrigin {
     /// a reopen that lands somewhere plausible beats one that refuses.
     Restore {
         index: usize,
-        folder: Option<String>,
+        /// The group the tab was closed OUT of, as a per-run head id. Live-only
+        /// by nature: a reopen undoes a close within one run, and there is no
+        /// reopen stack across a restart.
+        group_head: Option<u64>,
     },
 }
 
@@ -2158,10 +2439,10 @@ impl WebTabOpenRequest {
             foreground: true,
         }
     }
-    /// A folder row's "+": a blank tab filed in that folder, typing-ready.
-    fn blank_in_folder(folder_id: impl Into<String>) -> Self {
+    /// A group head row's "+": a blank tab inside that group, typing-ready.
+    fn blank_in_group(head: u64) -> Self {
         Self {
-            origin: WebTabOrigin::Folder(folder_id.into()),
+            origin: WebTabOrigin::Group(head),
             destination: WebTabDestination::Blank,
             foreground: true,
         }
@@ -2204,9 +2485,9 @@ impl WebTabOpenRequest {
     /// One tab of a reopened batch. Background, deliberately: reopening twelve
     /// tabs must not flash the user through twelve fronts, so the dispatch
     /// selects ONE of them when the batch is back.
-    fn restore(index: usize, folder: Option<String>) -> Self {
+    fn restore(index: usize, group_head: Option<u64>) -> Self {
         Self {
-            origin: WebTabOrigin::Restore { index, folder },
+            origin: WebTabOrigin::Restore { index, group_head },
             destination: WebTabDestination::Bound,
             foreground: false,
         }
@@ -2230,15 +2511,15 @@ fn web_tab_opens_typing_ready(request: &WebTabOpenRequest) -> bool {
 struct WebTabPlacementRow {
     id: u64,
     opener: Option<u64>,
-    folder: Option<String>,
+    group_head: Option<u64>,
 }
 
-/// Where a new tab goes: its index in `WebSurfaceUiState::tabs`, the folder it
-/// is born into, and the opener it will remember.
+/// Where a new tab goes: its index in `WebSurfaceUiState::tabs`, the group it is
+/// born into, and the opener it will remember.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebTabPlacement {
     index: usize,
-    folder: Option<String>,
+    group_head: Option<u64>,
     opener: Option<u64>,
 }
 
@@ -2247,9 +2528,38 @@ fn web_tab_placement_rows(tabs: &[WebSurfaceTab]) -> Vec<WebTabPlacementRow> {
         .map(|tab| WebTabPlacementRow {
             id: tab.id,
             opener: tab.opener,
-            folder: tab.folder.clone(),
+            group_head: tab.group_head,
         })
         .collect()
+}
+
+/// Is `candidate` inside `ancestor`'s group — a member, a member of a member, or
+/// deeper?
+///
+/// THE refusal behind every re-file: a head dropped inside its own group makes a
+/// cycle, and a cycle takes every row under it out of the draw walk. Bounded by
+/// the row count, so a pointer set that is already cyclic (hand-edited store,
+/// future version) answers rather than hangs the UI thread.
+fn web_tab_group_descends_from(tabs: &[WebSurfaceTab], candidate: u64, ancestor: u64) -> bool {
+    let mut cursor = Some(candidate);
+    for _ in 0..tabs.len() {
+        match cursor {
+            Some(id) if id == ancestor => return true,
+            Some(id) => cursor = tabs.iter().find(|tab| tab.id == id).and_then(|tab| tab.group_head),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Does this row HEAD a group — does anything point at it?
+///
+/// The question the placement owner and the rail both ask, and it is derived
+/// rather than stored: a stored "is a head" flag and a set of parent pointers
+/// are two statements of one fact, and they drift the first time a member is
+/// closed.
+fn web_tab_rows_head_group(rows: &[WebTabPlacementRow], id: u64) -> bool {
+    rows.iter().any(|row| row.group_head == Some(id))
 }
 
 /// Is the tab at `index` inside `ancestor`'s opener group — a child, a
@@ -2306,22 +2616,37 @@ fn web_tab_placement(rows: &[WebTabPlacementRow], origin: &WebTabOrigin) -> WebT
     match origin {
         WebTabOrigin::Top => WebTabPlacement {
             index: top,
-            folder: None,
+            group_head: None,
             opener: None,
         },
-        WebTabOrigin::Folder(folder_id) => WebTabPlacement {
-            index: rows
-                .iter()
-                .position(|row| row.folder.as_deref() == Some(folder_id.as_str()))
-                .map(|first| first.max(top))
-                .unwrap_or(top),
-            folder: Some(folder_id.clone()),
-            opener: None,
+        // The top of the group's RUN, which is the slot directly under the head
+        // — not the head's own slot. A group is drawn head-first
+        // ([`order_web_tabs_by_group`]), so displacing the head would put the
+        // new tab outside the group it was born into and leave the group
+        // headless in the same stroke.
+        WebTabOrigin::Group(head) => match rows.iter().position(|row| row.id == *head) {
+            Some(at) => WebTabPlacement {
+                index: (at + 1).clamp(top, rows.len()),
+                group_head: Some(*head),
+                opener: None,
+            },
+            // The head went away between the gesture and the mint. There is no
+            // group left to fill, so this is an ordinary top open — and it
+            // carries NO head, because a dangling pointer would draw the tab at
+            // root anyway while claiming otherwise.
+            None => WebTabPlacement {
+                index: top,
+                group_head: None,
+                opener: None,
+            },
         },
-        WebTabOrigin::Restore { index, folder } => WebTabPlacement {
+        WebTabOrigin::Restore { index, group_head } => WebTabPlacement {
             // Never onto the app tab's slot, never past the end.
             index: (*index).clamp(top, rows.len()),
-            folder: folder.clone(),
+            // A group that was emptied and closed while the tab sat on the
+            // reopen stack is gone; the tab comes back at root rather than
+            // pointing at nothing.
+            group_head: group_head.filter(|head| rows.iter().any(|row| row.id == *head)),
             opener: None,
         },
         WebTabOrigin::Opener(opener) => {
@@ -2332,28 +2657,45 @@ fn web_tab_placement(rows: &[WebTabPlacementRow], origin: &WebTabOrigin) -> WebT
                 // turn every later open in this group into a plain one too.
                 return WebTabPlacement {
                     index: top,
-                    folder: None,
+                    group_head: None,
                     opener: None,
                 };
             };
-            // Walk UP through the descendants this opener already has, so the
-            // new child lands above all of them rather than between the opener
-            // and its first child.
+            // ⭐ THE OWNER'S GROUP RULE: a spawn from a row IN a group stays in
+            // that group, and a spawn from the row that HEADS one goes INSIDE
+            // it. The head row is what replaced the folder header, and the
+            // header's "+" filled the folder — so a link opened from the head
+            // page belongs in the group the head names, not beside it.
+            let opener_heads_a_group = web_tab_rows_head_group(rows, *opener);
+            let group_head = if opener_heads_a_group {
+                Some(*opener)
+            } else {
+                rows[at].group_head
+            };
+            // ⛔ A head must stay the first row of its own run, so a child of a
+            // head starts BELOW it and the cascade grows upward from there —
+            // never past the head, which would leave the group headless.
+            // Everywhere else the walk is item 2's: UP through the descendants
+            // this opener already has, so the new child lands above all of them
+            // rather than between the opener and its first child.
             //
             // ⛔ `max(top)` is load-bearing: the APP TAB can open a tab too (a
             // link in the app's own page), and it sits at index 0 with nothing
             // above it. Without the clamp, its children would be minted onto
             // `tabs[0]` — the one slot every close verb in the product assumes
             // is the app's.
-            let mut index = at.max(top);
-            while index > top && web_tab_descends_from(rows, index - 1, *opener) {
+            let floor = if opener_heads_a_group {
+                (at + 1).max(top)
+            } else {
+                top
+            };
+            let mut index = at.max(floor);
+            while index > floor && web_tab_descends_from(rows, index - 1, *opener) {
                 index -= 1;
             }
             WebTabPlacement {
-                index,
-                // A child is born where its parent lives, so opening a link from
-                // a filed tab does not scatter the folder it was filed in.
-                folder: rows[at].folder.clone(),
+                index: index.min(rows.len()),
+                group_head,
                 opener: Some(*opener),
             }
         }
@@ -4004,12 +4346,17 @@ impl AppPaneContextMenu {
     }
 }
 
-/// Which WebTabs-rail row a right-click landed on. The rail was the ONE row
-/// surface in the product with no context menu; this says what the menu acts on.
+/// Which WebTabs-rail row a right-click landed on.
+///
+/// ⭐ ONE variant, and that IS the row-group model: every rail row is a TAB now.
+/// A group is headed by a tab rather than by a separate folder object, so there
+/// is no second kind of row to name — which is why the rail can offer one row
+/// component, one rename, one drag source and one menu router instead of two of
+/// each. The enum survives as a newtype so the shared row-id vocabulary
+/// ([`web_tab_row_id`]) keeps its one decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebTabMenuTarget {
     Tab(u64),
-    Folder(String),
 }
 
 /// Which PAGE of the tab menu is showing.
@@ -4027,7 +4374,7 @@ enum WebTabMenuTarget {
 enum WebTabMenuPage {
     #[default]
     Root,
-    MoveToFolder,
+    MoveToGroup,
 }
 
 /// An open right-click menu over a tab row — the WebTabs rail's, or the classic
@@ -5500,9 +5847,6 @@ struct WebSurfaceOverlayView {
     /// (`AppSettings::web_surface_vertical_tabs`), flipped from the app's own
     /// settings pane.
     vertical_tabs: bool,
-    /// The user's virtual folders, in display order. Drawn by the rail in
-    /// vertical mode and by the classic strip's overflow menu otherwise.
-    folders: Vec<WebTabFolder>,
     /// The effective chrome appearance for the ACTIVE tab's host (the app's
     /// per-site override, else its default, else Light). The render paints the
     /// tab strip, address bar and page frame in it — this is what stops a dark
@@ -5558,10 +5902,17 @@ struct WebSurfaceOverlayTabView {
     app_home_url: Option<String>,
     effective_url: String,
     active: bool,
-    /// The virtual folder it is filed in. The classic tab bar shows only the
-    /// tabs with `None` (the root path); the filed ones live in its overflow
-    /// menu, because a strip has nowhere to draw a folder.
-    folder: Option<String>,
+    /// The head of the group it sits in, or `None` for a root row. The classic
+    /// tab bar shows only the rows at root; a grouped row lives in its overflow
+    /// menu, because a strip has nowhere to draw a group.
+    group_head: Option<u64>,
+    /// Is the group this row HEADS drawn shut? Never read on a row that heads
+    /// nothing.
+    group_collapsed: bool,
+    /// How many rows name this one as their head — 0 for a row that heads
+    /// nothing. Derived, so a head and its membership cannot disagree, and it is
+    /// what tells the rail to draw this row as a group.
+    group_size: usize,
     /// The page is loading right now — drawn as the blinking dot, in BOTH tab
     /// homes (the rail rows and the classic strip's chips).
     loading: bool,
@@ -5596,29 +5947,25 @@ fn web_surface_tab_label(tab: &WebSurfaceTab, index: usize) -> String {
         })
 }
 
-/// The name a folder is BORN with. It is a placeholder, which is why the rename
-/// field opens with it SELECTED — the first keystroke replaces it.
-const WEB_TAB_NEW_FOLDER_NAME: &str = "New folder";
-
-/// A rail row's id in the SHARED row-tree vocabulary — `folder:<id>` for a
-/// folder, `tab:<id>` for a tab. ONE id space because the rail is ONE ordered
-/// list: a folder and a tab sit side by side in it, and
-/// [`yggui::reorder_row_tree`] orders ids, not two parallel collections.
+/// A rail row's id in the SHARED row-tree vocabulary — `tab:<id>`, and only
+/// that: every rail row is a tab, because a group is headed by one.
+/// [`yggui::reorder_row_tree`] orders ids, and there is a single id space to
+/// order.
 ///
 /// [`WebTabMenuTarget`] is the decoded form. It was already the "which rail row"
 /// vocabulary (a right-click names a row); naming rows for the reorder engine
 /// too keeps that one answer instead of minting a second row enum beside it.
+///
+/// ⚠ The `folder:` prefix a pre-row-group store or a stale probe might carry no
+/// longer decodes, which is the intended answer: it names a row that cannot
+/// exist, and resolving it to the nearest tab would act on the wrong one.
 fn web_tab_row_id(target: &WebTabMenuTarget) -> String {
     match target {
-        WebTabMenuTarget::Folder(id) => format!("folder:{id}"),
         WebTabMenuTarget::Tab(id) => format!("tab:{id}"),
     }
 }
 
 fn web_tab_row_target(row_id: &str) -> Option<WebTabMenuTarget> {
-    if let Some(folder) = row_id.strip_prefix("folder:") {
-        return (!folder.is_empty()).then(|| WebTabMenuTarget::Folder(folder.to_string()));
-    }
     row_id
         .strip_prefix("tab:")
         .and_then(|tab| tab.parse::<u64>().ok())
@@ -5627,90 +5974,115 @@ fn web_tab_row_target(row_id: &str) -> Option<WebTabMenuTarget> {
 
 /// One row of the tab tree, in DRAW ORDER — the rail's whole model.
 ///
-/// Folders come FIRST at every level: a folder is followed by its own
-/// sub-folders (recursively) and then by the tabs filed in it, and the loose
-/// tabs follow them all (user-reported 2026-07-30: "folders above tabs"). A
-/// row inside a COLLAPSED folder — at any depth — is in here with
-/// `visible: false`: it must not be drawn, but it must still be in the model,
-/// or a reorder elsewhere in the rail would silently drop every tab the user
-/// had folded away.
+/// Every row is a TAB. A group is a HEAD row followed by its members one level
+/// deeper, recursively — the head is not a container above the content, it is
+/// the first row OF the content, which is what makes "the group's label is the
+/// head row's name" true rather than a convention.
+///
+/// A row inside a COLLAPSED group — at any depth — is in here with
+/// `visible: false`: it must not be drawn, but it must still be in the model, or
+/// a reorder elsewhere in the rail would silently drop every tab the user had
+/// folded away.
 #[derive(Debug, Clone, PartialEq)]
 struct WebTabRailRow {
     row: WebTabMenuTarget,
     depth: u32,
     visible: bool,
+    /// Does this row HEAD a group? It then wears the group glyph and the
+    /// collapse chevron, and it is a drop TARGET rather than a leaf.
+    heads_group: bool,
 }
 
 impl WebTabRailRow {
     fn id(&self) -> String {
         web_tab_row_id(&self.row)
     }
-    fn is_folder(&self) -> bool {
-        matches!(self.row, WebTabMenuTarget::Folder(_))
+    fn tab_id(&self) -> u64 {
+        match self.row {
+            WebTabMenuTarget::Tab(id) => id,
+        }
     }
 }
 
 /// The tab tree as one ordered row list. Pure over the overlay view, so the
 /// ordering rule is unit-tested without a webview.
 ///
-/// Depth is unbounded: a folder holds folders. The walk is bounded by the
-/// folder count so a store whose `parent` links form a cycle (hand-edited, or
-/// written by a future version) renders the reachable rows and stops, rather
-/// than hanging the render thread.
-fn web_tab_rail_rows(
-    folders: &[WebTabFolder],
-    tabs: &[WebSurfaceOverlayTabView],
-) -> Vec<WebTabRailRow> {
-    fn push_level(
-        parent: Option<&str>,
-        depth: u32,
-        visible: bool,
-        folders: &[WebTabFolder],
-        tabs: &[WebSurfaceOverlayTabView],
-        rows: &mut Vec<WebTabRailRow>,
-        emitted: &mut HashSet<String>,
-    ) {
-        for folder in folders
-            .iter()
-            .filter(|folder| folder.parent.as_deref() == parent)
-        {
-            if !emitted.insert(folder.id.clone()) {
-                continue;
-            }
-            rows.push(WebTabRailRow {
-                row: WebTabMenuTarget::Folder(folder.id.clone()),
-                depth,
-                visible,
-            });
-            push_level(
-                Some(folder.id.as_str()),
-                depth + 1,
-                visible && !folder.collapsed,
-                folders,
-                tabs,
-                rows,
-                emitted,
-            );
+/// ⛔ The walk goes by PARENT POINTER, not by the list order, even though
+/// [`order_web_tabs_by_group`] promises the two agree. A rail that trusted the
+/// order would draw a wrong tree — silently, and looking plausible — the first
+/// time any path reordered tabs without re-imposing the invariant; walking the
+/// pointers makes the rail correct by construction and leaves the ordering rule
+/// responsible only for keeping the list pleasant to read.
+///
+/// Depth is unbounded: a group holds groups. The walk is bounded by the row
+/// count, and a pointer set that is cyclic (hand-edited store, a future version)
+/// draws its rows at root rather than hanging the render thread.
+fn web_tab_rail_rows(tabs: &[WebSurfaceOverlayTabView]) -> Vec<WebTabRailRow> {
+    let live: HashSet<u64> = tabs.iter().map(|tab| tab.id).collect();
+    let mut rows: Vec<WebTabRailRow> = Vec::with_capacity(tabs.len());
+    let mut emitted: HashSet<u64> = HashSet::new();
+    // Explicit stack, not recursion: depth is user data, and a deep tree must
+    // not blow the render thread's stack.
+    //
+    // A row whose head is GONE is drawn at root rather than dropped — the same
+    // rule `order_web_tabs_by_group` applies, and for the same reason: a row
+    // that exists in state and nowhere on screen is the worst of both.
+    let rooted = |tab: &WebSurfaceOverlayTabView| match tab.group_head {
+        None => true,
+        Some(head) => head == tab.id || !live.contains(&head),
+    };
+    let mut stack: Vec<(u64, u32, bool)> = tabs
+        .iter()
+        .filter(|tab| rooted(tab))
+        .rev()
+        .map(|tab| (tab.id, 0, true))
+        .collect();
+    while let Some((id, depth, visible)) = stack.pop() {
+        if !emitted.insert(id) {
+            continue;
         }
-        for tab in tabs.iter().filter(|tab| tab.folder.as_deref() == parent) {
+        let Some(tab) = tabs.iter().find(|tab| tab.id == id) else {
+            continue;
+        };
+        rows.push(WebTabRailRow {
+            row: WebTabMenuTarget::Tab(id),
+            depth,
+            visible,
+            heads_group: tab.group_size > 0,
+        });
+        let inner = visible && !tab.group_collapsed;
+        for member in tabs
+            .iter()
+            .filter(|member| member.group_head == Some(id) && member.id != id)
+            .rev()
+        {
+            if !emitted.contains(&member.id) {
+                stack.push((member.id, depth + 1, inner));
+            }
+        }
+    }
+    // Anything a cycle kept out of the walk still has to be drawn.
+    for tab in tabs {
+        if emitted.insert(tab.id) {
             rows.push(WebTabRailRow {
                 row: WebTabMenuTarget::Tab(tab.id),
-                depth,
-                visible,
+                depth: 0,
+                visible: true,
+                heads_group: tab.group_size > 0,
             });
         }
     }
-    let mut rows = Vec::with_capacity(folders.len() + tabs.len());
-    let mut emitted = HashSet::new();
-    push_level(None, 0, true, folders, tabs, &mut rows, &mut emitted);
     rows
 }
 
 /// The rail's rows as the SHARED reorder engine sees them: DEPTH IN DRAW ORDER
 /// becomes the parent link — a row's parent is the nearest preceding row of
 /// smaller depth — exactly as a contributed pane's `list-row`s are read
-/// ([`app_pane_row_tree`]). A folder is a GROUP (something dropped inside it
-/// becomes its child); a tab is a leaf.
+/// ([`app_pane_row_tree`]).
+///
+/// ⭐ EVERY row is a drop GROUP, not only the ones that already head one — that
+/// is what makes a group creatable at all. Dropping B onto A makes A a head;
+/// under folders a container had to be made first, and only it could receive.
 ///
 /// One rule for both surfaces, so the rail cannot come to disagree with a
 /// contributed pane about what nesting means.
@@ -5730,7 +6102,7 @@ fn web_tab_rail_row_tree(rows: &[WebTabRailRow]) -> Vec<RowTreeRow> {
             RowTreeRow {
                 id,
                 parent,
-                group: row.is_folder(),
+                group: true,
             }
         })
         .collect()
@@ -10046,12 +10418,44 @@ struct SavedWebTab {
     /// before rows could be renamed) = named by its page.
     #[serde(default)]
     name: String,
-    /// The folder this tab is filed in; `None` = a root tab.
-    ///
-    /// This is the whole persistence rule: a FILED tab is organization and
-    /// survives a fresh start, a ROOT tab is the browsing session and does not.
+    /// ⛔ LEGACY, read on load and never written again. The virtual folder this
+    /// tab was filed in. Folders were replaced by ROW GROUPS — `group` and
+    /// `group_key` below — and this field survives only so a store written
+    /// before the change still says what the user organized. Its ONE remaining
+    /// reader is the load path: [`WebTabStore::tabs_to_open`] (an unmigrated
+    /// store still spells organization this way) and
+    /// [`migrate_web_tab_folders_into_row_groups`], which consumes it.
     #[serde(default)]
     folder: Option<String>,
+    /// The KEY of the group this row sits in; `None` = a root row.
+    ///
+    /// ⛔ **A KEY, not an id, and that is the whole point.** In the live model a
+    /// group is a parent pointer to a TAB id ([`WebSurfaceTab::group_head`]) —
+    /// but `next_tab_id` re-mints ids on every restore, so an id written to disk
+    /// names a DIFFERENT tab next launch. What survives a restart is a surrogate
+    /// stamped on the head row ([`SavedWebTab::group_key`]) and named here.
+    ///
+    /// ⚠ An INDEX would not do either: the load path FILTERS
+    /// ([`WebTabStore::tabs_to_open`]), ADOPTS a row into tab 0
+    /// ([`plan_web_tab_restore`]) and COLLAPSES duplicates, and each of the
+    /// three renumbers positions. A key is indifferent to all of them; a member
+    /// whose head did not survive simply finds no key and draws at root, which
+    /// [`order_web_tabs_by_group`] already handles.
+    #[serde(default)]
+    group: Option<String>,
+    /// This row's OWN group key, present iff it HEADS a group — that is, iff at
+    /// least one other saved row names it in [`SavedWebTab::group`].
+    ///
+    /// Stamped only on a head that actually has members, so "is a head" and "is
+    /// organization" are the same question: an empty group is not organization,
+    /// and a key left behind by the last member's close would keep a lone tab
+    /// alive across a fresh start for no reason the user could see.
+    #[serde(default)]
+    group_key: Option<String>,
+    /// Is the group this row heads drawn shut? Meaningless on a row that heads
+    /// nothing, and never read there.
+    #[serde(default)]
+    group_collapsed: bool,
     /// Was this the tab in FRONT when the surface was last saved? "Continue
     /// where you left off" is not just the tab SET — it is the place the user
     /// was standing. Without this, a restored session came back with every tab
@@ -10133,6 +10537,71 @@ struct WebTabStore {
     #[serde(default)]
     tabs: Vec<SavedWebTab>,
 }
+/// The durable KEY for every group that survives this save, by head tab id.
+///
+/// Pure over the rows that are actually being written, which is the whole
+/// subtlety: a member the save DROPS (an empty URL, the app tab still on the
+/// app's own page) must not mint a key for its head, or a lone tab would come
+/// back across a fresh start carrying a group with nothing in it.
+///
+/// The key is derived from the head's POSITION in the saved list, not from a
+/// clock. A persistence path that stamped `current_millis` would make every
+/// save differ from the last one even when nothing changed, and the no-op
+/// round-trip — save, load, save — could never be asserted byte-identical.
+fn web_tab_group_keys(saved: &[&WebSurfaceTab]) -> HashMap<u64, String> {
+    let present: HashSet<u64> = saved.iter().map(|tab| tab.id).collect();
+    let headed: HashSet<u64> = saved
+        .iter()
+        .filter_map(|tab| tab.group_head)
+        .filter(|head| present.contains(head))
+        .collect();
+    saved
+        .iter()
+        .enumerate()
+        .filter(|(_, tab)| headed.contains(&tab.id))
+        .map(|(index, tab)| (tab.id, format!("g{index}")))
+        .collect()
+}
+
+/// Is this saved row ORGANIZATION — the thing that survives a fresh start —
+/// rather than a loose page from the browsing session?
+///
+/// ⛔⛔ **The rule is "has a head OR IS one", and the second clause is the one
+/// that is easy to lose.** Under folders a group's head row was ITSELF in the
+/// folder, so `folder.is_some()` covered it in a single test. Under row groups a
+/// head at root has `group: None` — it points at nothing, because nothing
+/// contains it. A gate written as `group.is_some()` alone therefore keeps a
+/// group's MEMBERS across a fresh start and drops the row that NAMES the group,
+/// leaving the user's organization headless and its label gone.
+///
+/// ⚠ It fails in the reassuring direction: most tabs survive, so it reads as
+/// working. Locked by `a_group_head_at_root_survives_a_fresh_start`.
+///
+/// ⛔⛔ **A ROW THE USER NAMED IS ORGANIZATION TOO, and leaving that clause out
+/// loses data on the SECOND launch, not the first — which is why it is easy to
+/// miss.** A folder holding ONE tab migrates to a head with no members, and a
+/// head with no members is not a group: nothing points at it, so it mints no
+/// key. Without this clause that tab is organization on the launch that migrates
+/// it and a loose browsing row on the next one, and a fresh start silently drops
+/// a page the user deliberately filed.
+///
+/// What survives the flattening is the NAME — the migration puts the folder's
+/// label on the head's `custom_title` precisely so the label is not lost — so
+/// the name is the durable evidence of intent, and a rename is a deliberate act
+/// on any row whether or not a group ever formed around it.
+/// Locked by `a_one_tab_folder_survives_the_second_launch_too`.
+///
+/// The `folder` clause is the MIGRATION's own reader: a store written before row
+/// groups existed still spells organization that way, and dropping the clause
+/// would discard every filed tab on the first launch of the new binary —
+/// before the migration that would have rescued them ever sees them.
+fn saved_web_tab_is_organized(tab: &SavedWebTab) -> bool {
+    tab.group.is_some()
+        || tab.group_key.is_some()
+        || !tab.name.trim().is_empty()
+        || tab.folder.is_some()
+}
+
 impl WebTabStore {
     /// What to reopen on the next visit. `restore` is the user's "continue where
     /// you left off": OFF (the default) keeps only the filed tabs, so the folders
@@ -10148,27 +10617,71 @@ impl WebTabStore {
             .iter()
             .filter(|tab| {
                 restore
-                    || tab.folder.is_some()
+                    || saved_web_tab_is_organized(tab)
                     || (open == WebSurfaceOpenKind::Reattach && tab.app_tab)
             })
             .filter(|tab| !tab.url.trim().is_empty())
             .cloned()
             .collect()
     }
-    /// Drop folder references that name a folder that no longer exists, so a
-    /// hand-edited or half-written file cannot strand a tab in a folder the tree
-    /// never draws.
+    /// Drop references that name something the tree no longer draws, so a
+    /// hand-edited or half-written file cannot strand a row in a container that
+    /// does not exist.
+    ///
+    /// Both vocabularies are reconciled because both can be on disk: a legacy
+    /// store speaks `folder`, a current one speaks `group`, and a store written
+    /// across an interrupted migration can hold a little of each.
     fn reconcile(&mut self) {
-        let known: std::collections::HashSet<String> = self
-            .folders
+        let folders: std::collections::HashSet<&str> =
+            self.folders.iter().map(|folder| folder.id.as_str()).collect();
+        let heads: std::collections::HashSet<&str> = self
+            .tabs
             .iter()
-            .map(|folder| folder.id.clone())
+            .filter_map(|tab| tab.group_key.as_deref())
+            .collect();
+        let stranded_folders: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.folder
+                    .as_deref()
+                    .is_some_and(|folder| !folders.contains(folder))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let stranded_groups: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.group.as_deref().is_some_and(|key| !heads.contains(key))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in stranded_folders {
+            self.tabs[index].folder = None;
+        }
+        for index in stranded_groups {
+            self.tabs[index].group = None;
+        }
+        // A key on a row nobody points at is not a group — see
+        // [`SavedWebTab::group_key`]. Strip it so "is a head" cannot answer yes
+        // for a lone row, which would keep it across a fresh start for a reason
+        // the user could not see on screen.
+        let named: std::collections::HashSet<String> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.group.clone())
             .collect();
         for tab in &mut self.tabs {
-            if let Some(folder) = &tab.folder
-                && !known.contains(folder)
+            if tab
+                .group_key
+                .as_deref()
+                .is_some_and(|key| !named.contains(key))
             {
-                tab.folder = None;
+                tab.group_key = None;
+                tab.group_collapsed = false;
             }
         }
     }
@@ -10196,7 +10709,7 @@ struct WebTabRestorePlan {
 /// different url is a different page, so any row that differs in any way
 /// stays.
 fn collapse_adopted_app_tab_duplicates(saved: &mut Vec<SavedWebTab>, adopted: &SavedWebTab) {
-    saved.retain(|tab| tab.folder.is_some() || tab.url != adopted.url);
+    saved.retain(|tab| saved_web_tab_is_organized(tab) || tab.url != adopted.url);
 }
 /// The restore rule, in one place.
 ///
@@ -10253,7 +10766,12 @@ fn plan_web_tab_restore(
     }
     let active = saved.iter().position(|tab| tab.active);
     match active {
-        Some(index) if saved[index].folder.is_none() => {
+        // ⛔ `is_organized`, not `group.is_none()`: a row that HEADS a group is
+        // organization too, and adopting it into tab 0 would destroy the group
+        // outright — tab 0 can never head one. Under folders this read
+        // `folder.is_none()`, which covered the head because the head was itself
+        // in the folder.
+        Some(index) if !saved_web_tab_is_organized(&saved[index]) => {
             let adopted = saved.remove(index);
             // A pre-mark store holds the accumulated copies too; the adopted
             // active root row is the page the user was on, so the same
@@ -15683,6 +16201,71 @@ async fn materialize_declared_web_surface(
 /// prefix bare hosts with a scheme (http for loopback dev servers, https
 /// otherwise), and send anything that doesn't look like a host to a web
 /// search. Returns None for empty or non-http-scheme input.
+/// The id the palette's first row carries: the thing plain Enter on the draft
+/// would do. A reserved word rather than a URL, because what it resolves to
+/// depends on the draft and is decided at accept time, not at render time.
+const WEB_OMNIBOX_PALETTE_GO_ID: &str = "go";
+
+/// The rows the omnibox palette offers, in order.
+///
+/// Row 0 is always what plain Enter does — go to a URL, or search for the text —
+/// so the palette never opens with nothing selectable and the user's own typing
+/// is always the first answer. History matches follow.
+///
+/// Pure over (draft, suggestions), so the rows the palette DRAWS and the target
+/// [`web_omnibox_palette_target`] resolves are derived from one input by two
+/// functions that cannot come to disagree about what row 3 was.
+fn web_omnibox_palette_items(
+    draft: &str,
+    suggestions: &[(String, String)],
+) -> Vec<CommandPaletteItem> {
+    let trimmed = draft.trim();
+    // "Go to X" only when the draft really is an address: `web_surface_address_to_url`
+    // will happily turn any text into a search URL, and labelling that "Go to"
+    // would promise navigation for what is actually a search.
+    let go_label = match web_surface_address_to_url(trimmed) {
+        Some(url)
+            if !url.contains("{q}")
+                && (url == trimmed
+                    || url == format!("https://{trimmed}")
+                    || url == format!("http://{trimmed}")) =>
+        {
+            format!("Go to {url}")
+        }
+        _ => format!("Search for \"{trimmed}\""),
+    };
+    let mut items = vec![CommandPaletteItem::new(WEB_OMNIBOX_PALETTE_GO_ID, go_label).hint("Enter")];
+    items.extend(suggestions.iter().map(|(url, title)| {
+        // The TITLE leads and the URL is the quieter half — a history row the
+        // user recognizes by its page name, not by its query string. A row with
+        // no title has only its URL, so the URL leads there instead of leaving
+        // the label empty.
+        if title.trim().is_empty() {
+            CommandPaletteItem::new(format!("url:{url}"), url.clone()).hint("History")
+        } else {
+            CommandPaletteItem::new(format!("url:{url}"), title.clone())
+                .detail(url.clone())
+                .hint("History")
+        }
+    }));
+    items
+}
+
+/// What accepting a palette row NAVIGATES to.
+///
+/// `None` means the row named nothing reachable — an empty draft on the go row,
+/// or an id from a stale render — and the caller does nothing rather than
+/// navigating somewhere it invented.
+fn web_omnibox_palette_target(id: &str, draft: &str) -> Option<String> {
+    if let Some(url) = id.strip_prefix("url:") {
+        return (!url.is_empty()).then(|| url.to_string());
+    }
+    if id == WEB_OMNIBOX_PALETTE_GO_ID {
+        return web_surface_address_to_url(draft.trim());
+    }
+    None
+}
+
 fn web_surface_address_to_url(input: &str) -> Option<String> {
     let input = input.trim();
     if input.is_empty() {
@@ -16374,10 +16957,15 @@ struct ShellState {
     suppress_sidebar_autoscroll_until_ms: u64,
     pending_delete: Option<PendingDeleteDialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
-    /// The user asked to leave vertical tabs while folders exist. The classic tab
-    /// bar cannot draw a folder, so the modal says what will happen before the
-    /// organization disappears behind an overflow menu.
+    /// The user asked to leave vertical tabs while ROW GROUPS exist. The classic
+    /// tab bar is a single strip and cannot draw a tree, so the modal says what
+    /// will happen before the organization disappears behind an overflow menu.
     pending_classic_tabs_switch: bool,
+    /// The omnibox is raised as the centred palette. The GATED reader
+    /// ([`ShellState::web_command_palette_open`]), never a second flag: the
+    /// render pass, the modal precedence and the transient cover all take this
+    /// one field, so they cannot come to disagree about whether it is up.
+    web_command_palette_open: bool,
     /// `(rail row id, draft name)` while a tab-tree row is being renamed —
     /// [`web_tab_row_id`], so a FOLDER and a TAB rename through one field. A
     /// second `Option<u64>` beside it for tabs would be a second answer to
@@ -17211,6 +17799,7 @@ struct RenderSnapshot {
     pending_media_capture: Option<PendingMediaCaptureDialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
     pending_classic_tabs_switch: bool,
+    web_command_palette_open: bool,
     web_tab_rename: Option<(String, String)>,
     row_drag: Option<RowDragGesture>,
     web_tab_overflow_open: bool,
@@ -18825,6 +19414,7 @@ impl ShellState {
             pending_media_capture: None,
             copy_edit_dialog: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             row_drag_click_suppressed_until_ms: 0,
@@ -19833,6 +20423,7 @@ impl ShellState {
             pending_media_capture: self.pending_media_capture.clone(),
             copy_edit_dialog: self.copy_edit_dialog.clone(),
             pending_classic_tabs_switch: self.pending_classic_tabs_switch,
+            web_command_palette_open: self.web_command_palette_open(),
             web_tab_rename: self.web_tab_rename.clone(),
             row_drag: self.row_drag.clone(),
             // The GATED reader, never the raw toggle: the render pass, the modal
@@ -20027,6 +20618,8 @@ impl ShellState {
             reload_nonce: 0,
             profile: profile.clone(),
             folder: None,
+            group_head: None,
+            group_collapsed: false,
             custom_title: None,
             loading: true,
             loading_since_ms: current_millis(),
@@ -20089,9 +20682,23 @@ impl ShellState {
             .land_on
             .map(|index| index as u64 + 1)
             .unwrap_or(0);
+        // Resolve the store's durable keys back to THIS run's tab ids. Ids
+        // follow the plan's order (the app tab is 0, the first restored tab is
+        // 1), so the map can be built before the rows are, and a member whose
+        // head did not survive the filter simply finds nothing — it draws at
+        // root, which `order_web_tabs_by_group` already guarantees.
+        let head_ids: HashMap<&str, u64> = plan
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, saved)| {
+                saved.group_key.as_deref().map(|key| (key, index as u64 + 1))
+            })
+            .collect();
         let mut tabs = vec![app_tab];
         let mut next_tab_id = 1;
-        for saved in plan.tabs {
+        for saved in &plan.tabs {
+            let saved = saved.clone();
             tabs.push(WebSurfaceTab {
                 id: next_tab_id,
                 url: saved.url.clone(),
@@ -20114,7 +20721,15 @@ impl ShellState {
             engine_nav: None,
                 reload_nonce: 0,
                 profile: profile.clone(),
+                // Carried only so the migration below can consume it; cleared
+                // by that call. A store already in the group vocabulary has
+                // none.
                 folder: saved.folder,
+                group_head: saved
+                    .group
+                    .as_deref()
+                    .and_then(|key| head_ids.get(key).copied()),
+                group_collapsed: saved.group_collapsed,
                 // The name the user gave the row, restored with it. Empty in a
                 // store written before rows could be renamed.
                 custom_title: Some(saved.name).filter(|name| !name.is_empty()),
@@ -20133,6 +20748,45 @@ impl ShellState {
             });
             next_tab_id += 1;
         }
+        // ⛔ THE MIGRATION CALL. It belongs HERE — after the rows exist and
+        // before the surface is inserted — and it may not be separated from the
+        // group persistence above or the rail's group rendering, because each of
+        // the three alone destroys what the other two protect:
+        //
+        // - called without the persistence, it empties `folder` and writes a
+        //   store saying "no folders, no groups": the whole organization gone on
+        //   the first launch of the new binary, with no way back;
+        // - called without the rail drawing groups, every group renders as loose
+        //   tabs and the user sees their folders DELETED, indistinguishable from
+        //   the bug this is fixing.
+        //
+        // It is a NO-OP on a store already in the group vocabulary (`folders` is
+        // empty there and it returns immediately), so it costs a already-migrated
+        // profile nothing but the check.
+        let migration = migrate_web_tab_folders_into_row_groups(&mut tabs, &store.folders);
+        if migration != WebTabGroupMigration::default() {
+            append_trace_event(
+                &perf_home_dir(&self.bootstrap.settings_path),
+                "ui",
+                "web_surface",
+                "tab_folders_migrated_to_row_groups",
+                json!({
+                    "profile": profile,
+                    "groups_formed": migration.groups_formed,
+                    "empty_folders_dropped": migration.empty_folders_dropped,
+                    "names_adopted": migration.names_adopted,
+                    "names_yielded_to_custom_title": migration.names_yielded_to_custom_title,
+                }),
+            );
+        }
+        // Contiguity is the rail's premise whichever vocabulary the store spoke:
+        // the migration orders what it migrated, and this orders what came back
+        // already grouped. Order-preserving within a level, so it is idempotent
+        // and the no-op case stays byte-identical.
+        order_web_tabs_by_group(&mut tabs);
+        // ⚠ `restore_active_tab` survives the reorder because it is an ID, not a
+        // position: the plan's index named the id the row was BUILT with, and a
+        // reorder moves rows without renaming them.
         // The surface is live again: forget any prior deliberate-close record so
         // it neither lingers nor blocks a future heartbeat rebuild.
         self.web_surface_deliberate_close_ms.remove(session_path);
@@ -20140,7 +20794,6 @@ impl ShellState {
             session_path.to_string(),
             WebSurfaceUiState {
                 tabs,
-                folders: store.folders,
                 // Where the user was standing. `restore_active_tab` is the app tab
                 // (0) unless "continue where you left off" is on AND the app had no
                 // URL of its own to show — a launch that names a URL was asked for,
@@ -20241,6 +20894,8 @@ impl ShellState {
             reload_nonce: 0,
             profile: "default".to_string(),
             folder: None,
+            group_head: None,
+            group_collapsed: false,
             custom_title: None,
             loading: false,
             loading_since_ms: 0,
@@ -20257,9 +20912,6 @@ impl ShellState {
             session_path.to_string(),
             WebSurfaceUiState {
                 tabs: vec![app_tab],
-                // The picker has no profile yet, so it has no tree to show. The
-                // real `open` that follows the choice loads the chosen profile's.
-                folders: Vec::new(),
                 active_tab: 0,
                 next_tab_id: 1,
                 opened_at_ms: now_ms,
@@ -21467,6 +22119,7 @@ impl ShellState {
             // browsing session is invisible unless the reconciler stashes the
             // surface first. This one is ALWAYS raised over a web surface.
             self.pending_classic_tabs_switch,
+            self.web_command_palette_open(),
             // …and so are the classic strip's two dropdowns, for the same
             // reason and with no geometry available to dodge it.
             strip_dropdown_over_viewport(
@@ -21554,7 +22207,11 @@ impl ShellState {
                 engine_nav: None,
                 reload_nonce: 0,
                 profile,
-                folder: placement.folder.clone(),
+                // The retired vocabulary. A tab minted in this run is never in
+                // a folder — only a store read off disk can still say one.
+                folder: None,
+                group_head: placement.group_head,
+                group_collapsed: false,
                 custom_title: None,
                 loading: false,
                 loading_since_ms: 0,
@@ -21577,10 +22234,11 @@ impl ShellState {
                 WebTabDestination::Bound => None,
             };
         }
-        // A tab born FILED changes the saved tree, so it is written through. A
-        // root tab with an empty URL has nothing to save (`web_tab_is_saved`),
-        // so the write would be a no-op — this is the one case that is not.
-        if placement.folder.is_some() {
+        // A tab born INSIDE A GROUP changes the saved tree, so it is written
+        // through. A root tab with an empty URL has nothing to save
+        // (`web_tab_is_saved`), so the write would be a no-op — this is the one
+        // case that is not.
+        if placement.group_head.is_some() {
             self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
         }
         Some(id)
@@ -21657,7 +22315,9 @@ impl ShellState {
                 engine_nav: None,
                 reload_nonce: 0,
                 profile: profile.clone(),
-                folder: placement.folder.clone(),
+                folder: None,
+                group_head: placement.group_head,
+                group_collapsed: false,
                 custom_title: None,
                 // WebKit began the load the moment it made the view.
                 loading: true,
@@ -21803,7 +22463,7 @@ impl ShellState {
                     surface.closed_tabs.push(vec![ClosedWebTab {
                         url: removed.url.clone(),
                         title: removed.title.clone(),
-                        folder: removed.folder.clone(),
+                        group_head: removed.group_head,
                         index,
                     }]);
                     while surface.closed_tabs.len() > MAX_CLOSED_WEB_TAB_BATCHES {
@@ -21842,7 +22502,7 @@ impl ShellState {
                     surface.closed_tabs.push(vec![ClosedWebTab {
                         url: removed.url.clone(),
                         title: removed.title.clone(),
-                        folder: removed.folder.clone(),
+                        group_head: removed.group_head,
                         index,
                     }]);
                     while surface.closed_tabs.len() > MAX_CLOSED_WEB_TAB_BATCHES {
@@ -22189,6 +22849,19 @@ impl ShellState {
             surface.address_suggestion_index = Some(next as usize);
         }
     }
+    /// Select a suggestion row by INDEX.
+    ///
+    /// The absolute form, for a caller that has already worked out where the
+    /// selection lands — the palette does, through `yggui::palette_index_after`,
+    /// which is the ONE owner of the wraparound rule for every libyggterm app.
+    /// [`ShellState::web_surface_move_address_suggestion`] stays the delta form
+    /// the inline handlers use; both write the same field, and neither invents a
+    /// second answer to "what does Down do at the bottom".
+    fn web_surface_set_address_suggestion(&mut self, session_path: &str, index: usize) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            surface.address_suggestion_index = Some(index);
+        }
+    }
     /// Commit a resolved navigation onto a tab. `history_index` Some = a
     /// back/forward step to that stack position; None = a new navigation
     /// pushed after the current position (dropping any forward entries).
@@ -22369,7 +23042,15 @@ impl ShellState {
                 app_home_url: (index == 0).then(|| surface.osc_url.clone()),
                 effective_url: tab.effective_url.clone(),
                 active: tab.id == active_tab_id,
-                folder: tab.folder.clone(),
+                group_head: tab.group_head,
+                group_collapsed: tab.group_collapsed,
+                // Derived here, once, from the pointers themselves — a head and
+                // its membership cannot disagree if nobody stores the answer.
+                group_size: surface
+                    .tabs
+                    .iter()
+                    .filter(|member| member.group_head == Some(tab.id) && member.id != tab.id)
+                    .count(),
                 loading: tab.loading,
                 // FOREGROUND IS NOT THE INTERESTING CASE — the user is already
                 // looking at it, and a dot beside the page they are watching
@@ -22426,7 +23107,6 @@ impl ShellState {
             address_suggestion_index: surface.address_suggestion_index,
             profile: active.profile.clone(),
             vertical_tabs: self.settings.web_surface_vertical_tabs,
-            folders: surface.folders.clone(),
             // Follows the ACTIVE tab's host, so navigating between a light and a
             // dark-overridden site repaints the chrome. Same host the pane's
             // per-site row and the zoom map key on.
@@ -22520,7 +23200,7 @@ impl ShellState {
     fn request_web_surface_vertical_tabs(&mut self, vertical: bool) {
         if !vertical
             && self.settings.web_surface_vertical_tabs
-            && self.active_web_surface_has_folders()
+            && self.active_web_surface_has_groups()
         {
             self.pending_classic_tabs_switch = true;
             return;
@@ -22574,10 +23254,11 @@ impl ShellState {
             && self.active_web_surface().is_some_and(|surface| {
                 // A surface still in its profile picker draws no tab strip: its
                 // viewport is the GUI-native chooser.
-                surface.picker.is_none() && surface.tabs.iter().any(|tab| tab.folder.is_some())
+                surface.picker.is_none()
+                    && surface.tabs.iter().any(|tab| tab.group_head.is_some())
             })
     }
-    /// THE reader of "is the folder-overflow dropdown open". One owner, because
+    /// THE reader of "is the group-overflow dropdown open". One owner, because
     /// this flag is a `top_modal`: every reader that disagreed with the strip
     /// about it would be unmapping the user's browsing area for a menu that is
     /// not on screen.
@@ -22682,9 +23363,26 @@ impl ShellState {
             .active_session_path()
             .is_some_and(|session| self.has_live_web_surface(session, now_ms))
     }
-    fn active_web_surface_has_folders(&self) -> bool {
+    /// Is the omnibox raised as the centred palette?
+    ///
+    /// Derived from the ONE fact that means "the user is editing the address"
+    /// — the active surface holds a draft — rather than from a second open/shut
+    /// flag beside it. A flag would be a separate answer to a question
+    /// `address_draft` already answers, and the two would drift the first time
+    /// something cleared the draft without clearing the flag, leaving a palette
+    /// on screen with nothing in it.
+    fn web_command_palette_open(&self) -> bool {
         self.active_web_surface()
-            .is_some_and(|surface| !surface.folders.is_empty())
+            .is_some_and(|surface| surface.picker.is_none() && surface.address_draft.is_some())
+    }
+    /// Does the active surface hold any ROW GROUP at all?
+    ///
+    /// Derived from the parent pointers rather than from a container count,
+    /// because there is no container: a group exists exactly when some tab names
+    /// a head.
+    fn active_web_surface_has_groups(&self) -> bool {
+        self.active_web_surface()
+            .is_some_and(|surface| surface.tabs.iter().any(|tab| tab.group_head.is_some()))
     }
     /// The page theme colour of the tab the user is looking at, if a web
     /// surface is what the active session is showing and its page has declared
@@ -22737,17 +23435,28 @@ impl ShellState {
         };
         let active_tab = surface.active_tab;
         let app_url = surface.osc_url.clone();
+        let saved: Vec<&WebSurfaceTab> = surface
+            .tabs
+            .iter()
+            .filter(|tab| web_tab_is_saved(tab.id, &tab.url, &app_url))
+            .collect();
+        let keys = web_tab_group_keys(&saved);
         let store = WebTabStore {
-            folders: surface.folders.clone(),
-            tabs: surface
-                .tabs
+            // ⛔ Never written again. Folders are a retired concept: the live
+            // model has no folder to write, and a store that still carried them
+            // would migrate itself a second time on the next load.
+            folders: Vec::new(),
+            tabs: saved
                 .iter()
-                .filter(|tab| web_tab_is_saved(tab.id, &tab.url, &app_url))
                 .map(|tab| SavedWebTab {
                     url: tab.url.clone(),
                     title: tab.title.clone().unwrap_or_default(),
                     name: tab.custom_title.clone().unwrap_or_default(),
-                    folder: tab.folder.clone(),
+                    // The retired vocabulary is never written back out.
+                    folder: None,
+                    group: tab.group_head.and_then(|head| keys.get(&head).cloned()),
+                    group_key: keys.get(&tab.id).cloned(),
+                    group_collapsed: tab.group_collapsed && keys.contains_key(&tab.id),
                     // Where the user was standing, not just what was open.
                     active: tab.id == active_tab,
                     // Which row IS tab 0, so a rebuild can hand the page back
@@ -22764,52 +23473,7 @@ impl ShellState {
         };
         save_web_tab_store_in(&root, &profile, &store, save);
     }
-    /// A new virtual folder, opened straight into rename — a folder with no name
-    /// is not organization, so the tree asks for one at birth (the cwd tree's
-    /// grammar).
-    fn web_tab_new_folder(&mut self, session_path: &str) {
-        self.web_tab_new_folder_in(session_path, None);
-    }
-
-    /// …and the nesting form: a new folder INSIDE `parent`. A folder holds
-    /// folders, so "New folder" has to be reachable from a folder row too, or
-    /// nesting would exist only for rows the user could already drag.
-    fn web_tab_new_folder_in(&mut self, session_path: &str, parent: Option<String>) {
-        let id = format!("f{}", current_millis());
-        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
-            if surface.folders.iter().any(|folder| folder.id == id) {
-                return;
-            }
-            let parent = parent.filter(|parent_id| {
-                surface.folders.iter().any(|folder| &folder.id == parent_id)
-            });
-            // A folder born inside a SHUT folder would be invisible, and its
-            // rename field with it. Opening the parent is what the gesture
-            // meant.
-            if let Some(parent_id) = parent.as_deref()
-                && let Some(parent_folder) = surface
-                    .folders
-                    .iter_mut()
-                    .find(|folder| folder.id == parent_id)
-            {
-                parent_folder.collapsed = false;
-            }
-            surface.folders.push(WebTabFolder {
-                id: id.clone(),
-                name: WEB_TAB_NEW_FOLDER_NAME.to_string(),
-                collapsed: false,
-                parent,
-            });
-        } else {
-            return;
-        }
-        self.web_tab_rename = Some((
-            web_tab_row_id(&WebTabMenuTarget::Folder(id)),
-            WEB_TAB_NEW_FOLDER_NAME.to_string(),
-        ));
-        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
-    }
-    /// Open a rail ROW's in-place rename — a folder or a tab, keyed by
+    /// Open a rail ROW's in-place rename — keyed by
     /// [`web_tab_row_id`]. A tab's current name is what the row currently
     /// SHOWS (its own name if it has one, else the page title, else the host):
     /// a rename field that opened empty over a titled row would read as "this
@@ -22818,19 +23482,15 @@ impl ShellState {
         let Some(target) = web_tab_row_target(row_id) else {
             return;
         };
+        let WebTabMenuTarget::Tab(tab_id) = target;
         let name = self
             .active_web_surface()
-            .and_then(|surface| match &target {
-                WebTabMenuTarget::Folder(folder_id) => surface
-                    .folders
-                    .iter()
-                    .find(|folder| &folder.id == folder_id)
-                    .map(|folder| folder.name.clone()),
-                WebTabMenuTarget::Tab(tab_id) => surface
+            .and_then(|surface| {
+                surface
                     .tabs
                     .iter()
-                    .position(|tab| tab.id == *tab_id)
-                    .map(|index| web_surface_tab_label(&surface.tabs[index], index)),
+                    .position(|tab| tab.id == tab_id)
+                    .map(|index| web_surface_tab_label(&surface.tabs[index], index))
             })
             .unwrap_or_default();
         self.web_tab_rename = Some((row_id.to_string(), name));
@@ -22853,13 +23513,6 @@ impl ShellState {
         }
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
             match target {
-                WebTabMenuTarget::Folder(folder_id) => {
-                    if let Some(folder) =
-                        surface.folders.iter_mut().find(|f| f.id == folder_id)
-                    {
-                        folder.name = name;
-                    }
-                }
                 WebTabMenuTarget::Tab(tab_id) => {
                     if let Some(tab) = surface.tabs.iter_mut().find(|t| t.id == tab_id) {
                         // A user-given name OUTRANKS the page title and is not
@@ -22876,61 +23529,48 @@ impl ShellState {
     fn web_tab_cancel_rename(&mut self) {
         self.web_tab_rename = None;
     }
-    /// Delete a folder. Its tabs are NOT closed — they return to the root, the
-    /// same as removing a cwd-tree group. Deleting organization must never
-    /// destroy content.
-    fn web_tab_delete_folder(&mut self, session_path: &str, folder_id: &str) {
+    /// DISBAND the group `head` heads. Nothing is closed and the head itself
+    /// stays: its members move up to whatever group the head sits in, exactly
+    /// where the group was. Removing organization must never destroy content.
+    ///
+    /// ⚠ The head keeps its `custom_title`. It is a real tab the user named (a
+    /// folder's label landed there in the migration), and silently unnaming a
+    /// row because its last member left would delete something the user typed.
+    fn web_tab_disband_group(&mut self, session_path: &str, head: u64) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
-            // What the folder HELD moves up one level, exactly where the
-            // folder itself was. Deleting organization must never destroy
-            // content, and with nesting that includes sub-folders: orphaning
-            // them to a dangling parent id would hide their tabs from the
-            // draw walk, which reads as data loss.
-            let grandparent = surface
-                .folders
+            let outer = surface
+                .tabs
                 .iter()
-                .find(|folder| folder.id == folder_id)
-                .and_then(|folder| folder.parent.clone());
-            surface.folders.retain(|folder| folder.id != folder_id);
-            for folder in &mut surface.folders {
-                if folder.parent.as_deref() == Some(folder_id) {
-                    folder.parent = grandparent.clone();
-                }
-            }
+                .find(|tab| tab.id == head)
+                .and_then(|tab| tab.group_head);
             for tab in &mut surface.tabs {
-                if tab.folder.as_deref() == Some(folder_id) {
-                    tab.folder = grandparent.clone();
+                if tab.group_head == Some(head) {
+                    tab.group_head = outer;
                 }
             }
-        }
-        let renaming_this_folder = web_tab_row_id(&WebTabMenuTarget::Folder(folder_id.to_string()));
-        if self
-            .web_tab_rename
-            .as_ref()
-            .is_some_and(|(id, _)| id == &renaming_this_folder)
-        {
-            self.web_tab_rename = None;
+            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == head) {
+                tab.group_collapsed = false;
+            }
+            order_web_tabs_by_group(&mut surface.tabs);
         }
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
-    fn web_tab_toggle_folder(&mut self, session_path: &str, folder_id: &str) {
+    /// Open or shut the group `head` heads.
+    fn web_tab_toggle_group(&mut self, session_path: &str, head: u64) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
-            && let Some(folder) = surface
-                .folders
-                .iter_mut()
-                .find(|folder| folder.id == folder_id)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == head)
         {
-            folder.collapsed = !folder.collapsed;
+            tab.group_collapsed = !tab.group_collapsed;
         }
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
-    /// File a tab into a folder, or back to the root with `None`. The app tab
+    /// File a tab into a group, or back to the root with `None`. The app tab
     /// cannot be filed: it is the app's, and it is gone when the app is.
-    fn web_tab_move_to_folder(
+    fn web_tab_move_to_group(
         &mut self,
         session_path: &str,
         tab_id: u64,
-        folder_id: Option<String>,
+        head: Option<u64>,
     ) {
         if tab_id == WEB_TAB_APP_TAB_ID {
             let holds_page = self
@@ -22953,15 +23593,31 @@ impl ShellState {
             }
         }
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
-            let exists = folder_id
-                .as_ref()
-                .is_none_or(|id| surface.folders.iter().any(|folder| &folder.id == id));
-            if !exists {
+            // ⛔ Refuse the moves that would erase a subtree or make a cycle: a
+            // row cannot head itself, and a head cannot move INSIDE the group it
+            // heads (nor into any group below it) — both would strand every row
+            // under it outside the draw walk, which reads as data loss.
+            let head = match head {
+                Some(head)
+                    if head != tab_id
+                        && surface.tabs.iter().any(|tab| tab.id == head)
+                        && !web_tab_group_descends_from(&surface.tabs, head, tab_id) =>
+                {
+                    Some(head)
+                }
+                Some(_) => return,
+                None => None,
+            };
+            if tab_id == WEB_TAB_APP_TAB_ID && head.is_some() {
                 return;
             }
             if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                tab.folder = folder_id;
+                tab.group_head = head;
             }
+            // A group is drawn head-first and contiguous, so a re-file is also a
+            // re-ORDER; the pointer and the order have to agree or the row lands
+            // visually outside the group it just joined.
+            order_web_tabs_by_group(&mut surface.tabs);
         }
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
@@ -23000,19 +23656,16 @@ impl ShellState {
 
     /// Hover `row_id` at `placement` while a drag is live.
     ///
-    /// The coercions keep the promise that the mark drawn is the landing, and
-    /// they follow from the rail's ONE ordering rule — folders above tabs, at
-    /// every level:
+    /// The coercions keep the promise that the mark drawn is the landing:
     ///
-    /// - a FOLDER may now go INSIDE another folder (`WebTabFolder::parent`
-    ///   makes the tree arbitrarily deep; the shared engine already refuses a
-    ///   folder into its own descendant) — but it still has no resting place
-    ///   among the loose tabs, so a folder over a TAB row finds no target;
-    /// - a TAB dropped anywhere on a FOLDER row goes INSIDE it;
+    /// - a row dropped INTO another row joins that row's group, making it a
+    ///   head if it was not one already — every row can receive, which is the
+    ///   whole creation gesture (the shared engine already refuses a row into
+    ///   its own descendant);
     /// - nothing lands above the app tab, which owns `tabs[0]`.
     ///
-    /// `collapsed` says the hovered row is a SHUT folder, which is what the
-    /// shared engine springs open after a dwell. Returns the folder to open.
+    /// `collapsed` says the hovered row is a SHUT group head, which is what the
+    /// shared engine springs open after a dwell. Returns the row to open.
     fn hover_web_tab_row_drop(
         &mut self,
         row_id: &str,
@@ -23020,23 +23673,8 @@ impl ShellState {
         placement: DragDropPlacement,
         collapsed: bool,
     ) -> Option<String> {
-        let dragging_folder = self.row_drag.as_ref().is_some_and(|drag| {
-            drag.scope == WEB_TAB_RAIL_DRAG_SCOPE
-                && matches!(
-                    web_tab_row_target(&drag.row_id),
-                    Some(WebTabMenuTarget::Folder(_))
-                )
-        });
-        let placement = match (dragging_folder, web_tab_row_target(row_id)) {
-            (true, Some(WebTabMenuTarget::Folder(_))) => placement,
-            (true, _) => {
-                if let Some(drag) = self.row_drag.as_mut() {
-                    drag.target = None;
-                }
-                return None;
-            }
-            (false, Some(WebTabMenuTarget::Folder(_))) => DragDropPlacement::Into,
-            (false, Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID))) => {
+        let placement = match web_tab_row_target(row_id) {
+            Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID)) => {
                 let app_is_saved = self.web_surfaces.values().any(|surface| {
                     surface
                         .tabs
@@ -23050,7 +23688,7 @@ impl ShellState {
                     DragDropPlacement::After
                 }
             }
-            (false, _) => placement,
+            _ => placement,
         };
         self.hover_row_drag(WEB_TAB_RAIL_DRAG_SCOPE, row_id, label, placement, collapsed)
     }
@@ -23108,35 +23746,32 @@ impl ShellState {
         let Some(surface) = self.web_surfaces.get_mut(session_path) else {
             return;
         };
-        let new_folder = match drop.parent.as_deref().and_then(web_tab_row_target) {
-            Some(WebTabMenuTarget::Folder(folder_id)) => Some(folder_id),
-            _ => None,
+        // ⭐ THE CREATION GESTURE. Any tab can receive a drop, so dropping B
+        // onto A makes A the head of a group — there is no "New group" verb and
+        // there does not need to be one, which is exactly the yggterm live-row
+        // grammar this model was taken from. Under folders only a folder row
+        // could receive, and a folder had to be made first.
+        let new_head = match drop.parent.as_deref().and_then(web_tab_row_target) {
+            Some(WebTabMenuTarget::Tab(head)) => Some(head),
+            None => None,
         };
-        match web_tab_row_target(moved) {
-            Some(WebTabMenuTarget::Tab(tab_id)) if tab_id != WEB_TAB_APP_TAB_ID => {
-                if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                    tab.folder = new_folder;
-                }
+        if let Some(WebTabMenuTarget::Tab(tab_id)) = web_tab_row_target(moved)
+            && tab_id != WEB_TAB_APP_TAB_ID
+        {
+            // ⛔ The engine already refuses a row into its own descendant, and
+            // this refuses the rest: a row cannot head itself, and the APP TAB
+            // can never head or join a group — `tabs[0]` is the app's, and every
+            // close verb in the product is written on that premise.
+            let head = new_head.filter(|head| {
+                *head != tab_id
+                    && *head != WEB_TAB_APP_TAB_ID
+                    && !web_tab_group_descends_from(&surface.tabs, *head, tab_id)
+            });
+            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.group_head = head;
             }
-            // A FOLDER re-files into another folder — that is nesting. The
-            // engine has already refused the one move that would erase a
-            // subtree (a folder into its own descendant), so by the time a
-            // parent arrives here it is a real one.
-            Some(WebTabMenuTarget::Folder(folder_id)) => {
-                if let Some(folder) = surface
-                    .folders
-                    .iter_mut()
-                    .find(|folder| folder.id == folder_id)
-                {
-                    folder.parent = new_folder;
-                }
-            }
-            _ => {}
         }
         let rank = |row_id: &str| drop.order.iter().position(|id| id == row_id);
-        surface.folders.sort_by_key(|folder| {
-            rank(&web_tab_row_id(&WebTabMenuTarget::Folder(folder.id.clone()))).unwrap_or(usize::MAX)
-        });
         surface.tabs.sort_by_key(|tab| {
             if tab.id == WEB_TAB_APP_TAB_ID
                 && !web_tab_is_saved(tab.id, &tab.url, &surface.osc_url)
@@ -23147,6 +23782,10 @@ impl ShellState {
                 .map(|index| index + 1)
                 .unwrap_or(usize::MAX)
         });
+        // The engine ordered the rows the user SEES; this re-imposes the model's
+        // own invariant on top, so a head is still the first row of its run even
+        // if the drop landed a member above it.
+        order_web_tabs_by_group(&mut surface.tabs);
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     fn set_window_focused(&mut self, focused: bool) {
@@ -24024,13 +24663,12 @@ impl ShellState {
         (
             web_tab_menu_items(
                 &overlay.tabs,
-                &overlay.folders,
                 overlay.active_tab_id,
                 &menu.target,
                 menu.page,
                 self.web_surface_reopen_plan(&menu.session_path).len(),
             ),
-            web_tab_menu_title(&overlay.tabs, &overlay.folders, &menu.target, menu.page),
+            web_tab_menu_title(&overlay.tabs, &menu.target, menu.page),
         )
     }
     /// The batch a "Reopen closed tabs" would put back — the WHOLE answer, and
@@ -24054,7 +24692,7 @@ impl ShellState {
                 surface
                     .tabs
                     .iter()
-                    .map(|tab| (tab.id, tab.folder.clone()))
+                    .map(|tab| (tab.id, tab.group_head))
                     .collect()
             })
             .unwrap_or_default()
@@ -24140,7 +24778,7 @@ impl ShellState {
         for closed in plan.iter().rev() {
             let Some(new_id) = self.web_surface_open_tab(
                 session_path,
-                &WebTabOpenRequest::restore(closed.index, closed.folder.clone()),
+                &WebTabOpenRequest::restore(closed.index, closed.group_head),
             ) else {
                 continue;
             };
@@ -24247,7 +24885,7 @@ impl ShellState {
             }
             WebTabMenuAction::CloseOtherTabs(_)
             | WebTabMenuAction::CloseTabsBelow(_)
-            | WebTabMenuAction::CloseFolderTabs(_) => {
+            | WebTabMenuAction::CloseGroupTabs(_) => {
                 let scope = self.web_tab_scope_rows_for_session(session_path);
                 let closed = self
                     .web_surface_close_tabs(session_path, &web_tab_menu_close_plan(&scope, action));
@@ -24270,17 +24908,17 @@ impl ShellState {
             WebTabMenuAction::ReloadTab(tab_id) => {
                 self.web_surface_reload_tab(session_path, *tab_id);
             }
-            WebTabMenuAction::NewTabInFolder(folder_id) => {
+            WebTabMenuAction::NewTabInGroup(head) => {
                 self.web_surface_open_tab(
                     session_path,
-                    &WebTabOpenRequest::blank_in_folder(folder_id.clone()),
+                    &WebTabOpenRequest::blank_in_group(*head),
                 );
             }
-            WebTabMenuAction::DeleteFolder(folder_id) => {
-                // Deleting ORGANIZATION, never content: the folder goes and its
-                // tabs come back to the root — the same verb the row's 🗑 runs,
-                // which until now had no menu or keyboard route at all.
-                self.web_tab_delete_folder(session_path, folder_id);
+            WebTabMenuAction::DisbandGroup(head) => {
+                // Removing ORGANIZATION, never content: the group goes and its
+                // members come back up one level. The head row stays — it is a
+                // page the user was reading, not a container.
+                self.web_tab_disband_group(session_path, *head);
             }
             // Finished by the DISPATCH, which owns the Signal: opening a tab
             // must be able to put the keyboard in the omnibox
@@ -24307,25 +24945,12 @@ impl ShellState {
                 // split lives there.
                 return false;
             }
-            WebTabMenuAction::MoveToFolder(tab_id, folder) => {
-                self.web_tab_move_to_folder(session_path, *tab_id, folder.clone());
-            }
-            WebTabMenuAction::MoveToNewFolder(tab_id) => {
-                // Born named: `web_tab_new_folder` opens the rename inline, the
-                // cwd tree's grammar for a folder that does not exist yet.
-                self.web_tab_new_folder(session_path);
-                let folder = self
-                    .web_surfaces
-                    .get(session_path)
-                    .and_then(|surface| surface.folders.last())
-                    .map(|folder| folder.id.clone());
-                if let Some(folder) = folder {
-                    self.web_tab_move_to_folder(session_path, *tab_id, Some(folder));
-                }
+            WebTabMenuAction::MoveToGroup(tab_id, head) => {
+                self.web_tab_move_to_group(session_path, *tab_id, *head);
             }
             WebTabMenuAction::RenameRow(row) => self.web_tab_begin_rename(&web_tab_row_id(row)),
-            WebTabMenuAction::ToggleFolder(folder_id) => {
-                self.web_tab_toggle_folder(session_path, folder_id)
+            WebTabMenuAction::ToggleGroup(head) => {
+                self.web_tab_toggle_group(session_path, *head)
             }
             // Not this shell's to run: a split opens a PANE, which needs the
             // signal and a spawn. The dispatcher takes it from here.
@@ -40378,6 +41003,30 @@ fn app_launcher_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
         .filter(|(app, verb)| seen.insert((app.name.clone(), verb.id.clone())))
         .collect()
 }
+/// The launcher entries a ROW MENU may offer: the ones whose verbs are session
+/// ROWS.
+///
+/// ⭐ The row menu spawns a session and puts a row in the sidebar for it. That
+/// is right for "New Ychrome" and wrong for a terminal-invoked dashboard or a
+/// fleet booter — the user gets a row for something that was never a session,
+/// which is what the owner asked to have removed.
+///
+/// ⛔ The APP decides, through [`AppVerb::row_spawn`]. yggterm cannot: the verbs
+/// to leave out live in other apps' manifests, so the only alternative was to
+/// hardcode another app's name, which is the anti-pattern the libyggterm
+/// contract exists to prevent.
+///
+/// ⚠ ONLY the row menu asks this. The titlebar `+` and the start page keep
+/// calling [`app_launcher_entries`], because "open my dashboard" is a reasonable
+/// thing to offer there and a meaningless thing to spawn a row for. A filter
+/// applied to the shared owner instead would have removed those verbs from every
+/// surface at once, which is a different (and unasked-for) change.
+fn app_row_spawn_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
+    app_launcher_entries(apps)
+        .into_iter()
+        .filter(|(_, verb)| verb.row_spawn)
+        .collect()
+}
 /// Launch a libyggterm app's verb: open a terminal session wherever the user
 /// asked, then type the app's command into it.
 ///
@@ -43539,6 +44188,11 @@ fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
         TopModal::Fido2 => &[("Esc", "dismiss")],
         TopModal::Delete => &[("Enter", "delete"), ("Esc", "cancel")],
         TopModal::ClassicTabsSwitch => &[("Enter", "switch"), ("Esc", "cancel")],
+        // ⛔ Enter and the arrows are NOT advertised, and are not dispatched
+        // here either: the palette's own field owns them, and it is focused for
+        // as long as the palette is up. Advertising a key this dispatcher does
+        // not act on is the species of lie the ALT layer exists to end.
+        TopModal::CommandPalette => &[("↑↓", "choose"), ("Enter", "go"), ("Esc", "close")],
         TopModal::StripDropdown => &[("Esc", "close")],
     }
 }
@@ -43642,6 +44296,22 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
                     shell.confirm_classic_tabs_switch();
                 }
             });
+            true
+        }
+        TopModal::CommandPalette => {
+            // ⛔ Escape only. Enter belongs to the palette's own field, which
+            // holds the keyboard the whole time the palette is up — acting on
+            // it HERE too would run the selected row twice, once per owner.
+            // Returning true still swallows it, so the page beneath never sees
+            // a key the user aimed at the palette.
+            if dismiss {
+                let session = state.with(|shell| shell.active_web_surface_session());
+                if let Some(session) = session {
+                    state.with_mut_counted(|shell| {
+                        shell.web_surface_set_address_draft(&session, None)
+                    });
+                }
+            }
             true
         }
         TopModal::StripDropdown => {
@@ -45430,6 +46100,17 @@ enum TopModal {
     Fido2,
     Delete,
     CopyEdit,
+    /// The OMNIBOX raised as a centred command palette. Raised BY THE USER from
+    /// a rail they were already in, so it sits with the other user-raised
+    /// surfaces — under anything a PAGE can raise (a passkey ceremony, a camera
+    /// ask), because those arrive at a moment the user did not choose and the
+    /// keys must belong to the thing granting hardware.
+    ///
+    /// ⛔ It has to be in this list at all because a native web surface draws
+    /// above ALL DOM: a palette raised over a browsing session is invisible
+    /// unless the reconciler stashes the surface first, which is the same reason
+    /// the classic-tabs dialog and the strip dropdowns are here.
+    CommandPalette,
     ClassicTabsSwitch,
     /// A dropdown anchored on the CLASSIC STRIP — the strip's profile badge and
     /// the folder-overflow menu. Bottom of the precedence: any real dialog
@@ -45486,9 +46167,12 @@ impl TopModal {
         match self {
             // Editing surfaces: fields to type in, chips to pick, a slider to
             // nudge. Landing on the control is the beginning of the work.
+            // …and the palette is one: it opens ON a field, already focused,
+            // and typing is the whole interaction.
             TopModal::ThemeEditor
             | TopModal::CopyEdit
             | TopModal::LaunchFlags
+            | TopModal::CommandPalette
             | TopModal::CliInstall => ModalKeyboardMode::Form,
             // Command surfaces: pick one of a few actions and be done.
             TopModal::KeymapEditor
@@ -45516,6 +46200,7 @@ impl TopModal {
             TopModal::Delete => "delete",
             TopModal::CopyEdit => "copy-edit",
             TopModal::ClassicTabsSwitch => "classic-tabs-switch",
+            TopModal::CommandPalette => "command-palette",
             TopModal::StripDropdown => "strip-dropdown",
         }
     }
@@ -45534,6 +46219,7 @@ impl TopModal {
             TopModal::Delete => "Confirm",
             TopModal::CopyEdit => "Edit",
             TopModal::ClassicTabsSwitch => "Tabs",
+            TopModal::CommandPalette => "Palette",
             TopModal::StripDropdown => "Menu",
         }
     }
@@ -45569,6 +46255,7 @@ fn top_modal_of(
     delete: bool,
     copy_edit: bool,
     classic_tabs_switch: bool,
+    command_palette: bool,
     strip_dropdown: bool,
 ) -> Option<TopModal> {
     // The two editors are raised ABOVE the dialogs (z-index 500 / 98 against
@@ -45603,6 +46290,9 @@ fn top_modal_of(
     if classic_tabs_switch {
         return Some(TopModal::ClassicTabsSwitch);
     }
+    if command_palette {
+        return Some(TopModal::CommandPalette);
+    }
     if strip_dropdown {
         return Some(TopModal::StripDropdown);
     }
@@ -45621,6 +46311,7 @@ fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
         snapshot.pending_delete.is_some(),
         snapshot.copy_edit_dialog.is_some(),
         snapshot.pending_classic_tabs_switch,
+        snapshot.web_command_palette_open,
         strip_dropdown_over_viewport(
             snapshot.web_tab_overflow_open,
             snapshot
@@ -45713,6 +46404,10 @@ fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
         // now counts as a `top_modal` — every modal must open the cover or it
         // becomes a click-through window under glass (F.1 T10).
         || snapshot.web_tab_overflow_open
+        // …and so is the raised omnibox palette, for exactly the same reason.
+        // It is the one modal that is ALWAYS over a web surface, so leaving it
+        // out would make it a click-through window under glass every time.
+        || snapshot.web_command_palette_open
         || snapshot.pending_delete.is_some()
         || snapshot.pending_classic_tabs_switch
         || snapshot.copy_edit_dialog.is_some()
@@ -56835,15 +57530,25 @@ fn group_session_launch_context(
     // URI, not a directory — so `group_session_cwd` alone would hand
     // `local://<uuid>` to the local launcher and error. See [[spec-unify-local-remote]].
     let cwd = sidebar_row_launch_cwd(shell, row).or_else(|| group_session_cwd(row));
+    // ⚠ The title is composed AFTER the machine is known, not before: it names
+    // the machine the session is about to be born on, and for a remote launch
+    // that is the ssh target rather than this host.
     if let Some(machine) = remote_machine_for_sidebar_row(shell, row) {
+        let word = yggterm_core::birth_title::machine_title_word(&machine.ssh_target);
         return TerminalLaunchContext::Remote {
             ssh_target: machine.ssh_target.clone(),
             prefix: machine.prefix.clone(),
             cwd,
-            title_hint,
+            // ⛔ NO HINT. The daemon composes `New {machine} {noun}` and only it
+            // knows which machine the row lands on; a hint composed here is a
+            // second answer to a question that has an owner.
+            title_hint: group_session_title_hint(kind),
         };
     }
-    TerminalLaunchContext::Local { cwd, title_hint }
+    TerminalLaunchContext::Local {
+        cwd,
+        title_hint: group_session_title_hint(kind),
+    }
 }
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
     let normalize_legacy_parent = |path: String| {
@@ -58512,7 +59217,6 @@ fn describe_app_state_snapshot(
                     "session_path": menu.session_path,
                     "target": match &menu.target {
                         WebTabMenuTarget::Tab(tab) => json!({ "tab": tab }),
-                        WebTabMenuTarget::Folder(folder) => json!({ "folder": folder }),
                     },
                     "position": { "x": menu.position.0, "y": menu.position.1 },
                     "items": snapshot
@@ -80977,10 +81681,18 @@ async fn process_pending_app_control_requests(
                     // first half a busy row mid-output would be called wedged,
                     // which is the false positive that would justify a reaper
                     // killing live work.
+                    // ⛔ AND THE THIRD HALF: the composer must have been READ.
+                    // `composer_held_draft` is tri-state, and an unreadable one
+                    // used to arrive here as `false` — so a row nobody could
+                    // read was called WEDGED, a positive claim, carrying a
+                    // remedy that RESTARTS it. A blind reading may not license a
+                    // restart of a live agent row.
                     "wedged": !verdict.consuming_input
                         && verdict.composer_shown
-                        && !verdict.composer_held_draft,
+                        && verdict.composer_held_draft == Some(false),
                     "composer_shown": verdict.composer_shown,
+                    // true · false · null — null is "nobody could say", which is
+                    // NOT permission and never was.
                     "composer_held_draft": verdict.composer_held_draft,
                     "waited_ms": verdict.waited_ms,
                     // ⛔ LIVENESS IS NOT PROGRESS, and this field exists because
@@ -80991,7 +81703,9 @@ async fn process_pending_app_control_requests(
                     "activity": verdict.activity.wire_name(),
                     "answers": "whether bytes reach this row, and what its CLI chrome says it is doing — NOT whether its work is finished or correct",
                     "reason": verdict.reason,
-                    "remedy": if !verdict.consuming_input && verdict.composer_shown && !verdict.composer_held_draft {
+                    "remedy": if !verdict.consuming_input
+                        && verdict.composer_shown
+                        && verdict.composer_held_draft == Some(false) {
                         Some("server terminal restart '<session>' clears the wedge with the transcript intact")
                     } else {
                         None
