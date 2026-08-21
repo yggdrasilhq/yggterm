@@ -72,7 +72,21 @@ const DAEMON_LONG_REQUEST_IO_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 // Negative-cache window for dead preserved-owner sockets (post-swap shadow fix).
-const PRESERVED_OWNER_UNREACHABLE_CACHE_MS: u64 = 60_000;
+/// How long a peer that timed out (or merely cost too much) is not re-probed.
+///
+/// ⛔⛔ THIS WAS 60_000 AND THAT MADE IT A NO-OP. The caller that pays the probe
+/// is the snapshot's proxied-working-flags refresh, and snapshots arrive about
+/// once a minute — so the entry expired exactly in time for every single
+/// snapshot to pay the full 10 s client timeout again. Measured 2026-08-21:
+/// `daemon_request/snapshot` n=128 over 2 h, p50 10,060 ms, p95 10,239 ms, i.e.
+/// ~21 minutes of daemon deafness, while this negative cache elided nothing.
+///
+/// ⇒ **A BACKOFF SHORTER THAN ITS CALLER'S PERIOD IS NOT A BACKOFF**, and it is
+/// invisible in review because the code reads as correct in isolation — the bug
+/// only exists in the relationship between two numbers that live in different
+/// files. Sized well clear of the snapshot cadence so a repeat is actually
+/// elided; a peer that comes back fast clears it by answering.
+const PRESERVED_OWNER_UNREACHABLE_CACHE_MS: u64 = 300_000;
 const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
 const CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS: u64 = 60 * 60;
 const EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS: u64 = 2;
@@ -4651,12 +4665,76 @@ impl DaemonRuntime {
         }
 
         let wanted: HashSet<String> = unanswered.into_iter().collect();
+        // ⛔⛔ THIS FAN-OUT RUNS UNDER THE RUNTIME LOCK AND EACH CALL CARRIES THE
+        // FULL 10 s CLIENT IO TIMEOUT. Measured on the live host 2026-08-21:
+        // `daemon_request/snapshot` n=128 over 2 h with p50 10,060 ms AND p95
+        // 10,239 ms — a p50 and a p95 pinned together at the timeout is not a
+        // workload, it is every call exhausting the same budget. That is ~21
+        // MINUTES of daemon deafness in two hours, with every other request
+        // queued behind it; the lock-wait window shows `working_flags` waiting
+        // 10.15 s. The user-visible name for this is that typing stops.
+        //
+        // ⛔ AND THE NEGATIVE CACHE THAT WAS SUPPOSED TO PREVENT IT SAVED
+        // NOTHING, FOR A REASON WORTH REMEMBERING: the backoff is 60 s and the
+        // snapshot that triggers this runs about once a minute, so the entry
+        // expired exactly in time for every single snapshot to pay the full
+        // timeout again. **A backoff shorter than its caller's period is not a
+        // backoff.** It read as present and correct in every review.
+        //
+        // ⚠ It also only ever marked a peer that ERRORED. A peer that answers
+        // slowly is never backed off at all, so the expensive case was the one
+        // case the guard could not see.
+        //
+        // ⇒ Three bounds, none of which change what a reachable peer returns:
+        //   1. a wall budget for the whole pass — this is the DOT's answer for
+        //      rows another daemon owns, cosmetic, and nothing about it is worth
+        //      a second of the lock, let alone ten;
+        //   2. any peer that costs more than a blink is backed off, answered or
+        //      not, because cost is the property that matters here;
+        //   3. the backoff is longer than the caller's period so it can actually
+        //      elide a repeat.
+        // The remaining rows keep their previously cached flag, which is exactly
+        // what `working_flags_from_local_and_cache` already serves everywhere
+        // else. A stale dot is a cosmetic error; a deaf daemon is not.
+        const PROXY_FANOUT_BUDGET_MS: u128 = 750;
+        const PROXY_SLOW_PEER_MS: u128 = 250;
+        let fanout_started = std::time::Instant::now();
         for owner in owners {
-            match working_flags(&owner) {
+            if fanout_started.elapsed().as_millis() >= PROXY_FANOUT_BUDGET_MS {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "perf",
+                    "proxied_working_flags_budget_spent",
+                    serde_json::json!({
+                        "budget_ms": PROXY_FANOUT_BUDGET_MS as u64,
+                        "skipped_owner": owner_endpoint_label(&owner),
+                    }),
+                );
+                break;
+            }
+            let call_started = std::time::Instant::now();
+            let outcome = working_flags(&owner);
+            let cost_ms = call_started.elapsed().as_millis();
+            match outcome {
                 Ok(owner_flags) => {
                     merge_proxied_working_flags(&mut flags, &mut answered, &wanted, owner_flags)
                 }
                 Err(_) => self.mark_preserved_owner_unreachable(&owner),
+            }
+            if cost_ms >= PROXY_SLOW_PEER_MS {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "perf",
+                    "proxied_working_flags_slow_peer",
+                    serde_json::json!({
+                        "owner": owner_endpoint_label(&owner),
+                        "cost_ms": cost_ms as u64,
+                        "backoff_ms": PRESERVED_OWNER_UNREACHABLE_CACHE_MS,
+                    }),
+                );
+                self.mark_preserved_owner_unreachable(&owner);
             }
         }
         flags
