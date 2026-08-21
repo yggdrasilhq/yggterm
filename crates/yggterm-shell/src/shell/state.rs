@@ -40195,7 +40195,13 @@ fn spawn_launch_app_verb(
     insert_after: Option<String>,
 ) {
     let command = app.command_for(&verb);
-    let title_hint = verb.label.clone();
+    // ⛔ NO TITLE HINT. `AppVerb::label` is, by its own contract, "what the menu
+    // item says" — and handing a menu label to the daemon as a row NAME is what
+    // put `New Yedit` on rows across three machines with nothing to tell them
+    // apart. The daemon composes `New {machine} {app}` from the `Source` stamp
+    // below, which is the only place in the birth path that knows the row is an
+    // app row at all.
+    let title_hint: Option<String> = None;
     // The row's `Source` metadata — the one place a row says WHICH app it is,
     // and the SAME `app:<name>:<verb>` token every launcher menu speaks
     // (`app_verb_token_parts` is its one parser). Registry key, not display
@@ -40232,7 +40238,7 @@ fn spawn_launch_app_verb(
                 start_command_session_placed(
                     &endpoint,
                     cwd.as_deref(),
-                    Some(&title_hint),
+                    title_hint.as_deref(),
                     &local_app_verb_launch_command(&command),
                     Some(&source_label),
                     Some(&terminal_appearance),
@@ -40252,7 +40258,7 @@ fn spawn_launch_app_verb(
                     &ssh_target,
                     prefix.as_deref(),
                     cwd.as_deref(),
-                    Some(&title_hint),
+                    title_hint.as_deref(),
                     Some(&terminal_appearance),
                     insert_after.as_deref(),
                 )?;
@@ -53351,9 +53357,24 @@ fn remote_scanned_session_label_with_saved_title(
         .or_else(|| {
             (session.user_message_count == 0)
                 .then(|| {
-                    yggterm_core::agent_scheme::session_kind_for_path(&session.session_path)
-                        .and_then(yggterm_core::agent_cli::agent_cli_descriptor)
-                        .map(|descriptor| descriptor.new_session_label())
+                    yggterm_core::agent_scheme::session_kind_for_path(&session.session_path).map(
+                        |kind| {
+                            // The SAME birth rule the daemon mints a live row
+                            // with, so a row that has said nothing yet reads
+                            // identically whichever surface is showing it. The
+                            // machine comes off the row's own path for a remote
+                            // row and is this host otherwise.
+                            let machine = yggterm_core::agent_scheme::remote_row_machine_key(
+                                &session.session_path,
+                            )
+                            .map(ToOwned::to_owned)
+                            .or_else(yggterm_core::local_machine_name_opt);
+                            yggterm_core::agent_cli::new_session_birth_title(
+                                kind,
+                                machine.as_deref(),
+                            )
+                        },
+                    )
                 })
                 .flatten()
         })
@@ -56560,23 +56581,25 @@ fn ensure_home_scoped_workspace_dir(path: &str) -> Result<bool> {
         .with_context(|| format!("failed to create workspace cwd {}", path.display()))?;
     Ok(true)
 }
-/// The placeholder title a session is BORN with.
+/// The title hint a launch carries — and for a NEW row there is none.
 ///
-/// ⛔ **It names the new row's own kind, never the row the menu was opened
-/// on.** This used to be `format!("{} {}", row.label, slug)`, so spawning from
-/// a session's context menu minted a near-duplicate of THAT session's title —
-/// two sidebar entries reading almost identically until the CLI self-titled.
-/// The naming rule is [`new_session_birth_title`], in core, beside the registry
-/// that knows every CLI's display name.
-fn group_session_title_hint(kind: SessionKind) -> String {
-    yggterm_core::agent_cli::new_session_birth_title(kind)
+/// ⛔ **THE BIRTH NAME IS THE DAEMON'S, and the shell must not compose one.**
+/// The rule is `New {machine} {what it is}` and only the daemon knows which
+/// machine the row is landing on, so a hint composed here is a second answer to
+/// a question that has an owner. This function used to compose one — and before
+/// that composed `format!("{} {}", row.label, slug)`, the label of whichever row
+/// the menu was opened on, which names the SPAWNER rather than the spawned.
+/// Returning `None` is what lets the one rule in
+/// `yggterm_core::agent_cli::new_session_birth_title` apply to every surface.
+fn group_session_title_hint(_kind: SessionKind) -> Option<String> {
+    None
 }
 fn group_session_launch_context(
     shell: &ShellState,
     row: &BrowserRow,
     kind: SessionKind,
 ) -> TerminalLaunchContext {
-    let title_hint = Some(group_session_title_hint(kind));
+    let title_hint = group_session_title_hint(kind);
     // Single source of truth for the launch cwd, local and remote alike:
     // `sidebar_row_launch_cwd` (the row's own `session_cwd`, else the remote
     // folder's path, else the live/active session's `Cwd` metadata), falling back
@@ -57173,17 +57196,17 @@ fn terminal_launch_context(shell: &ShellState) -> TerminalLaunchContext {
                 ssh_target: machine.ssh_target.clone(),
                 prefix: machine.prefix.clone(),
                 cwd: (!cwd.trim().is_empty()).then_some(cwd),
-                title_hint: Some(format!("{} ssh", machine.machine_key)),
+                // ⛔ `format!("{} ssh", …)` stood here: the new row named after
+                // the machine, or after the row the launch came FROM. Both are
+                // the spawner-names-the-spawned defect, and both defeat the one
+                // birth rule. The daemon composes `New {machine} Terminal`.
+                title_hint: None,
             };
         }
         let cwd = metadata_value(active, "Cwd");
         return TerminalLaunchContext::Local {
             cwd: (!cwd.trim().is_empty()).then_some(cwd),
-            title_hint: if active.title.trim().is_empty() {
-                None
-            } else {
-                Some(format!("{} terminal", active.title))
-            },
+            title_hint: None,
         };
     }
     TerminalLaunchContext::Local {
@@ -57194,28 +57217,26 @@ fn terminal_launch_context(shell: &ShellState) -> TerminalLaunchContext {
 fn terminal_launch_context_for_row(shell: &ShellState, row: &BrowserRow) -> TerminalLaunchContext {
     if let Some(machine) = remote_machine_for_sidebar_row(shell, row) {
         let cwd = sidebar_row_launch_cwd(shell, row);
-        let title_hint = Some(match row.kind {
-            BrowserRowKind::Session => format!("{} ssh", row.label),
-            _ => format!("{} ssh", machine.machine_key),
-        });
         return TerminalLaunchContext::Remote {
             ssh_target: machine.ssh_target.clone(),
             prefix: machine.prefix.clone(),
             cwd,
-            title_hint,
+            // See the twin above: the row that LAUNCHED a terminal is not its
+            // name. The daemon owns `New {machine} Terminal`.
+            title_hint: None,
         };
     }
     if row.kind == BrowserRowKind::Session {
         return TerminalLaunchContext::Local {
             cwd: row.session_cwd.clone(),
-            title_hint: Some(format!("{} terminal", row.label)),
+            title_hint: None,
         };
     }
     let snapshot = shell.snapshot();
     let context_row = resolve_creation_context_row(&snapshot.rows, row);
     TerminalLaunchContext::Local {
         cwd: group_session_cwd(&context_row),
-        title_hint: Some(group_session_title_hint(SessionKind::Shell)),
+        title_hint: group_session_title_hint(SessionKind::Shell),
     }
 }
 fn workspace_view_mode_from_app_control(mode: AppControlViewMode) -> WorkspaceViewMode {

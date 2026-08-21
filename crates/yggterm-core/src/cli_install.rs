@@ -242,37 +242,67 @@ impl MachineCliStatus {
     }
 }
 
-/// Is this CLI's binary resolvable on THIS machine's `PATH`?
+/// Is this CLI's binary resolvable the way a LAUNCH on this machine will
+/// resolve it?
+///
+/// ⛔ **The resolver is injected because the answer is not this crate's to
+/// give.** A `PATH` lookup in the calling process answers "what can THIS
+/// process exec", and that is a different question from "what will a session
+/// yggterm starts here exec" — the launch prepends the managed CLI bin dir and
+/// the login shell's dirs, neither of which a daemon or a GUI necessarily
+/// carries. Measured on one fleet machine, the two answers were 1/10 and 10/10
+/// at the same instant. The owner of launch resolution lives in the server
+/// crate beside the launch itself; core takes it as an argument so there can
+/// never be a second, quieter copy here.
 ///
 /// ⛔ **This answers for the machine the caller is running on, and nothing
 /// else.** The GUI host and the hosts it shows rows for are different machines
-/// with different `PATH`s — the fault this whole module exists to surface was
-/// exactly that difference — so calling this and labelling the result with a
-/// remote machine's name would manufacture the lie it is meant to expose.
+/// with different resolution — the fault this whole module exists to surface
+/// was exactly that difference — so calling this and labelling the result with
+/// a remote machine's name would manufacture the lie it is meant to expose.
 ///
-/// ⚠ Deliberately a PATH lookup and not an execution. Running `--version` to
-/// decide presence costs a process per CLI per repaint, and for at least one
-/// vendor CLI the first invocation unpacks a payload and writes over a hundred
+/// ⚠ Deliberately a lookup and not an execution. Running `--version` to decide
+/// presence costs a process per CLI per repaint, and for at least one vendor
+/// CLI the first invocation unpacks a payload and writes over a hundred
 /// megabytes — a probe that expensive changes the machine it is measuring.
-pub fn probe_local_presence(descriptor: &AgentCliDescriptor) -> CliPresence {
-    match resolve_on_path(descriptor.binary_name) {
-        Some(_) => CliPresence::Present { version: None },
-        None => CliPresence::Absent,
+pub fn probe_presence_with(
+    descriptor: &AgentCliDescriptor,
+    mut resolves: impl FnMut(&str) -> bool,
+) -> CliPresence {
+    if resolves(descriptor.binary_name) {
+        CliPresence::Present { version: None }
+    } else {
+        CliPresence::Absent
     }
 }
 
-/// The whole local matrix, one row per registered agent CLI.
-pub fn local_machine_status(display_label: impl Into<String>) -> MachineCliStatus {
-    MachineCliStatus::build("", display_label, probe_local_presence)
-}
-
-fn resolve_on_path(binary: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(binary);
-        is_executable_file(&candidate).then_some(candidate)
+/// The whole matrix for the machine this process runs on, one row per
+/// registered agent CLI, against the caller's resolver.
+pub fn machine_status_with(
+    display_label: impl Into<String>,
+    mut resolves: impl FnMut(&str) -> bool,
+) -> MachineCliStatus {
+    MachineCliStatus::build("", display_label, |descriptor| {
+        probe_presence_with(descriptor, &mut resolves)
     })
 }
+
+/// Can the CALLING PROCESS exec `binary` — a plain walk of its own `PATH`.
+///
+/// ⛔ **NOT launch parity, and never an answer to "can yggterm start this
+/// here".** A daemon's `PATH` is whatever started it and a GUI's is whatever
+/// the desktop session had; neither carries the managed CLI bin dir, and a
+/// login shell's dirs reach both only by accident. Anything reporting what a
+/// session will resolve must take the server crate's launch-parity resolver
+/// instead. Kept public only so a caller that genuinely means "this process"
+/// has to say so in the name.
+pub fn binary_on_process_path(binary: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join(binary)))
+}
+
 
 #[cfg(unix)]
 fn is_executable_file(path: &std::path::Path) -> bool {
@@ -304,13 +334,19 @@ pub struct CliPresenceReport {
 }
 
 /// Probe every registered CLI on THIS machine and return the wire report.
-/// Run on the remote host, by the remote host, against its own `PATH`.
-pub fn local_presence_report() -> Vec<CliPresenceReport> {
+///
+/// Run on the remote host, by the remote host, against the resolution a LAUNCH
+/// there would perform — not against whatever `PATH` the invoking `ssh` handed
+/// the process. Those differ by more than a directory: a non-login `ssh` drops
+/// the user's own bin dir, and no `ssh` at all carries the managed CLI bin dir
+/// the launch prepends. Reporting the invoking `PATH` made the matrix advertise
+/// installs for CLIs the machine already had and was already running.
+pub fn presence_report_with(mut resolves: impl FnMut(&str) -> bool) -> Vec<CliPresenceReport> {
     AGENT_CLIS
         .iter()
         .filter(|descriptor| descriptor.slug != "shell")
         .map(|descriptor| {
-            let presence = probe_local_presence(descriptor);
+            let presence = probe_presence_with(descriptor, &mut resolves);
             CliPresenceReport {
                 slug: descriptor.slug.to_string(),
                 present: presence.is_present(),
@@ -519,31 +555,46 @@ mod tests {
     }
 
     #[test]
-    fn the_local_probe_reports_absent_rather_than_present_for_a_binary_that_is_not_there() {
-        // The registry's own binary names are used, so this asserts the shape
-        // of the answer rather than what happens to be installed on the box
-        // running the test.
-        let status = local_machine_status("this machine");
+    fn a_probe_reaches_a_verdict_for_every_registered_cli() {
+        let status = machine_status_with("this machine", |binary| binary == "claude");
         assert_eq!(status.rows.len(), AGENT_CLIS.iter().filter(|d| d.slug != "shell").count());
         for row in &status.rows {
             assert!(
                 matches!(row.presence, CliPresence::Present { .. } | CliPresence::Absent),
-                "a local probe always reaches a verdict; it never returns Unknown"
+                "a probe always reaches a verdict; it never returns Unknown"
             );
         }
+        assert_eq!(status.present_count(), 1, "only the resolvable binary is present");
     }
 
     #[test]
-    fn a_local_probe_never_claims_a_machine_key() {
+    fn the_injected_resolver_is_the_only_thing_consulted() {
+        // ⛔ THE REGRESSION THIS EXISTS FOR. The probe used to walk the calling
+        // process's own `PATH`, which made every remote machine report the
+        // `PATH` its `ssh` happened to inherit rather than the one a launch
+        // there will search — one CLI of ten on a machine that resolves all
+        // ten. A resolver that says "nothing is here" must produce a report
+        // that says nothing is here, no matter what the test machine has
+        // installed, or the ambient answer has crept back in.
+        let none = presence_report_with(|_| false);
+        assert!(none.iter().all(|row| !row.present), "no ambient fallback");
+        let all = presence_report_with(|_| true);
+        assert!(all.iter().all(|row| row.present));
+        assert_eq!(none.len(), all.len());
+    }
+
+    #[test]
+    fn a_probe_never_claims_a_machine_key() {
         // The local status uses the empty machine key by convention. A local
         // probe labelled with a remote machine's key is the exact confusion
         // this module was written to prevent.
-        assert_eq!(local_machine_status("here").machine_key, "");
+        assert_eq!(machine_status_with("here", |_| true).machine_key, "");
     }
 
     #[test]
     fn a_report_round_trips_into_the_same_matrix() {
-        let report = local_presence_report();
+        let resolves = |binary: &str| binary.starts_with('c');
+        let report = presence_report_with(resolves);
         assert_eq!(report.len(), AGENT_CLIS.iter().filter(|d| d.slug != "shell").count());
         let json: Vec<String> = report
             .iter()
@@ -554,7 +605,7 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("round-trips"))
             .collect();
         assert_eq!(report, back);
-        let direct = local_machine_status("box");
+        let direct = machine_status_with("box", resolves);
         let rebuilt = machine_status_from_report("box", "box", &back);
         assert_eq!(
             direct.rows.iter().map(|r| (r.slug, r.presence.is_present())).collect::<Vec<_>>(),

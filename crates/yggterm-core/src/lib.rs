@@ -1776,6 +1776,51 @@ pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
     input_line_after(prev, &[], data).draft
 }
 
+/// What THIS machine is called, for the one purpose a row plane has for it:
+/// saying which host a row lives on.
+///
+/// ⛔ ONE OWNER, because "what is this machine called" is one question and it
+/// had five private answers — a `hostname()` helper copied into each of the
+/// `ls` verbs, each stamping its own report. That is survivable while the
+/// answer is only ever printed; it stops being survivable the moment a row is
+/// NAMED after it, because a row born on one spelling and re-titled on another
+/// is two rows to every title probe.
+///
+/// Memoised: a machine does not rename itself inside a daemon's life, and the
+/// birth path runs once per row created.
+pub fn local_machine_name() -> String {
+    static LOCAL_MACHINE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LOCAL_MACHINE_NAME
+        .get_or_init(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                // The SHORT name, never the FQDN. `hostname` answers whichever
+                // the host is configured for, and `box.example.test` in a
+                // sidebar row is a column of noise that says nothing the first
+                // segment did not.
+                .map(|name| {
+                    name.split('.')
+                        .next()
+                        .unwrap_or(name.as_str())
+                        .trim()
+                        .to_string()
+                })
+                .filter(|name| !name.is_empty())
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
+/// [`local_machine_name`] as the birth rule wants it — `None` when this host
+/// cannot name itself, so a row degrades to `New Terminal` instead of wearing
+/// an empty gap or the word "unknown".
+pub fn local_machine_name_opt() -> Option<String> {
+    let name = local_machine_name();
+    (!name.is_empty()).then_some(name)
+}
+
 pub fn resolve_yggterm_home() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os(ENV_YGGTERM_HOME) {
         let p = PathBuf::from(value);
