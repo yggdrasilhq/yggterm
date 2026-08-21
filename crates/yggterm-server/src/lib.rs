@@ -11652,6 +11652,22 @@ impl YggtermServer {
                 }),
             );
         }
+        // The CLI plane's own birth record. ⚖ NOT a duplicate of the event
+        // above: that one answers "a row appeared, what was active before it"
+        // and covers plain shells; this one answers "which CLI descriptor drove
+        // this row, how is it keyed, and where does its session id come from",
+        // is emitted only for agent kinds, and derives every field from the
+        // registry rather than from this callsite. See `cli_plane`.
+        if kind.is_agent() {
+            yggterm_core::cli_plane::emit_birth(
+                "server",
+                key,
+                kind,
+                session_id,
+                (!target.ssh_target.trim().is_empty()).then_some(target.ssh_target.as_str()),
+                target.cwd.as_ref().is_some_and(|cwd| !cwd.trim().is_empty()),
+            );
+        }
         self.sessions.insert(key.to_string(), session);
         self.seat_new_live_session(key);
         // TWO DECISIONS, NOT ONE. `launch_now` means "start this session's PTY

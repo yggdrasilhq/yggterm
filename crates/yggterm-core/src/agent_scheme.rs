@@ -472,6 +472,32 @@ pub fn remote_agent_session_path(kind: SessionKind, machine_key: &str, session_i
     format!("{prefix}{machine_key}/{session_id}")
 }
 
+/// Split a remote agent ROW path into the CLI it names, the machine it lives
+/// on, and the session id — the full inverse of [`remote_agent_session_path`].
+///
+/// ⚖ **Registry-driven, and that is the whole point.** The server carried a
+/// `parse_remote_cc_session_path` that stripped one hardcoded prefix, so every
+/// caller written against it served exactly one CLI and answered `None` for the
+/// other nine — silently, because "not a remote CC row" and "not a remote agent
+/// row at all" are the same `None`. A title chore built on it refused every
+/// non-Claude-Code remote row for a reason that never appeared anywhere.
+///
+/// `None` ⇒ the path is not a remote agent row (a local row, a plain `ssh://`
+/// shell, or a scheme nobody registered). Callers must not read that as "local".
+pub fn parse_remote_agent_session_path(path: &str) -> Option<(SessionKind, &str, &str)> {
+    let trimmed = path.trim_start();
+    let (scheme, rest) = remote_agent_row_schemes()
+        .find_map(|scheme| trimmed.strip_prefix(scheme.prefix).map(|rest| (scheme, rest)))?;
+    let kind = scheme.kind?;
+    let (machine_key, session_id) = rest.split_once('/')?;
+    let machine_key = machine_key.trim();
+    let session_id = session_id.trim();
+    if machine_key.is_empty() || session_id.is_empty() {
+        return None;
+    }
+    Some((kind, machine_key, session_id))
+}
+
 /// Returns true if the path begins with any registered remote agent row scheme
 /// (e.g. `remote-session://`, `remote-cc://`, `remote-agy://`, `remote-muse://`, etc.).
 pub fn is_remote_agent_session_path(path: &str) -> bool {
