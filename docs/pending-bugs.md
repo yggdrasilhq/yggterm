@@ -442,6 +442,80 @@ client — the scrollback comes back, the row drives, and nothing reports a wait
 control: the CLI's pid must be the SAME one before and after, or something started a second
 resume.
 
+## ⛔⛔⛔ [11.28] A ROW RESUMES INTO A BLANK SESSION AND KEEPS ITS OLD TITLE — 91% OF ONE CLI'S ROWS
+
+**Status:** OPEN
+
+*Filed 2026-08-22 from a screenshot, then measured. Not the socket-alias lane's work; it is a
+different defect that produces a very similar-looking symptom, which is exactly why it wants its
+own entry.*
+
+**What it looks like.** Click a row that has been idle a few days. The viewport prints
+
+```
+warning: conversation "<id>" not found
+```
+
+then the CLI's fresh-start banner, and a bare prompt. The Session Metadata panel still shows the
+old title, the old session id, `Persistence: keep-alive`, `Status: running`, and a `Connect`
+line offering `resume-<cli> <id> --require-existing`. **History: 0 user · 0 assistant.** Nothing
+errored. The row simply became a new, empty session wearing the old one's name.
+
+### ⛔ TWO STORES, AND THE ROW IS LISTED FROM THE WRONG ONE
+
+This CLI keeps a session's **transcript** and its **resumable conversation** in different places,
+with different lifetimes:
+
+| artefact | lifetime, measured on one host |
+|---|---|
+| `…/brain/<id>/.system_generated/logs/transcript_full.jsonl` | oldest **28.7 days** — 543 of them |
+| `…/conversation_summaries.db` (title, preview, step count) | 999 rows |
+| `…/conversations/<id>.db` — **what the CLI resumes from** | oldest **1.6 days** — 46 of them |
+
+Every transcript touched in the last three days has a conversation db; **every conversation db is
+under two days old.** So the CLI keeps what it can re-open for about two days and what it can
+show for a month, and the scan globs list rows from the month-long artefact.
+
+⇒ **497 of 543 rows — 91% — are listed, titled, and offer a Connect line, and cannot be
+resumed.**
+
+### ⛔⛔ AND `--require-existing` CANNOT REFUSE THEM, BY CONSTRUCTION
+
+`remote_saved_agent_session_exists` returns `Ok(true)` unconditionally for this CLI when the
+local index misses. That is a deliberate, documented choice — a remote id names a session on
+another host, so a local miss is not proof of absence, and the comment says a bad id will *"fail
+loudly at `<cli> --conversation` time"*.
+
+**It does not fail loudly.** It prints one `warning:` line above a fresh prompt and starts a new
+conversation. The refusal path (`remote_resume_missing_saved_session_error`) is therefore
+unreachable for this CLI, and the guard that exists to stop a resume landing on a session that
+is not there never fires. ⇒ The blanket `true` was right about the remote case and wrong about
+the local one, and nothing separates them.
+
+### ⚠ WHAT WAS AND WAS NOT MEASURED
+
+- ✅ The transcript on disk was **not** appended to by the blank session (mtime unchanged six
+  days later), so no transcript was corrupted in the observed case.
+- ⛔ **NOT established:** what happens if a person now types into that blank row, which shares
+  the old id and therefore the old brain directory. That is the exact hazard the second-resume
+  guard exists to prevent, reached through a door the guard does not cover.
+- ⛔ **NOT established:** whether the CLI prunes conversation dbs on a timer or on a count. The
+  two-day figure is one host's population, not a documented policy.
+
+### WHAT IT WANTS
+
+1. ⭐ **The existence check must ask the store the CLI actually resumes from**, per CLI, and a
+   LOCAL id must be answerable locally — the blanket `true` may keep protecting remote ids only.
+2. **A row that cannot be resumed must not offer a Connect line that silently starts a new
+   session.** Either the row says so before it is opened, or the resume refuses.
+3. ⚠ **A CLI's own warning is not an error, and must not be treated as one.** The comment relied
+   on a loud failure that the CLI never had; the only thing that can be trusted here is
+   yggterm's own read of the store.
+
+**Falsifier:** open a row whose CLI-resumable artefact is absent and see either a refusal or a
+row that never offered the resume — and, on a row that IS resumable, a normal attach with its
+history intact.
+
 ## ⛔⛔ [11.26] THE SANDBOX HARNESS FILLS A RAM DISK AND THEN REPORTS CLEAN RESULTS IT NEVER RENDERED
 
 **Status:** OPEN
