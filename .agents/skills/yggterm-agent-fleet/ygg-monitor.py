@@ -1930,6 +1930,23 @@ def tick(a):
             # supervisor acting on it in good faith would undo their fix.
             # ⇒ A row with no terminal state cannot answer "am I done". Do not
             #   ask it, and do not answer for it.
+            # ⛔⛔ AND FIRST: IS THERE STILL A PROCESS? An IDLE verdict is derived
+            # from transcript age, and a transcript's mtime is when the row DIED,
+            # not when it last worked — so a corpse reads as the quietest possible
+            # working row and its idle clock counts time since death. Measured
+            # 2026-08-21: a lane whose process had been gone for 52 minutes was
+            # escalated as *"idle 52.0m — it has most likely FINISHED its scope.
+            # Read its last prose turn: give it more work, relay it, or reap it"*,
+            # offering an orchestrator three choices of which only one was real.
+            #
+            # ⇒ Liveness is CHEAPER than the verdict it corrects and this file
+            #   already has it. Ask before offering a decision that assumes a
+            #   process exists to receive it.
+            if cli_process(uuid, rhost) is None:
+                once("dead", f"NO AGENT PROCESS — its transcript has been still for "
+                             f"{raw['age']//60}m because the process is GONE, not because "
+                             f"it is thinking. Reap it; there is nothing to give work to")
+                continue
             until = _deferred_until(uuid)
             if until:
                 log(f"  ⏳ idle {raw['age']//60}m but ARMED until "

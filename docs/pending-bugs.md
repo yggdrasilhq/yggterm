@@ -358,6 +358,52 @@ fail once and stay failed.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔ [11.0] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-21 against a live Antigravity row still wearing its
+cwd-derived birth name. The registry-driven title fix landed and is real — it
+fixed ONE of the two chores.*
+
+**The gap is between two chores, and each one believes the other has it.**
+
+```rust
+// daemon.rs:11838  collect_live_store_title_syncs_in — the registry-driven one
+let is_local_row = session.session_path.starts_with("local://")
+    || descriptor.runtime_key_scheme
+        .is_some_and(|scheme| session.session_path.starts_with(scheme));
+if !is_local_row { continue; }        // "a remote-*:// row rides the OTHER chore"
+
+// daemon.rs:12042  remote_cc_title_poll_paths — the other chore
+if session.kind != SessionKind::ClaudeCode { continue; }
+```
+
+⇒ **A row keyed `remote-<slug>://` for any CLI other than Claude Code is skipped by
+the local chore for being remote, and refused by the remote chore for not being
+Claude Code.** It is titled by nothing, so it keeps whatever name it was born with.
+
+⚠ **"Local" here means the PATH SCHEME, not the machine.** A session running on
+this very host, opened through the remote path, carries a `remote-*://` key and
+falls in the gap. The observed row was on the daemon's own fleet.
+
+### ⛔⛔ AND THE INSTRUMENT BUILT TO CATCH THIS CANNOT SEE IT
+
+`cli/store_title_miss` was added precisely so a failed title pickup is
+distinguishable from an empty store. It is emitted **from the local chore only**,
+and the local chore never looks at these rows. Measured: **zero `store_title_miss`
+events in a 40,000-event trace window** while an untitled row sat in the sidebar.
+
+⇒ A probe that never fires and a system with nothing to report are the same
+reading. The miss counter must be emitted where the DECISION TO SKIP is made, not
+only where a lookup fails — a row skipped for its scheme is exactly the case
+nobody hears about.
+
+**The fix has the shape the local chore already took:** make the remote pickup
+registry-driven per descriptor instead of gated on one `SessionKind`. ⚠ It is not
+a one-line change — `read_live_store_title` is a local-file reader, and doing it
+per CLI over ssh is the actual work. Do not "fix" it by deleting the kind check.
+
 ## ⛔ [11.23] A DELIBERATELY DISMISSED WEB SURFACE CAN BE REBUILT BY THE HEARTBEAT THAT RACES IT
 
 **Status:** OPEN
@@ -534,7 +580,7 @@ reads that through `list | grep <uuid>`, which throws the header away. A sibling
 
 ## ⛔⛔ [11.20] THE DRAFT FLAG IS RESET BY EVERY DAEMON HANDOVER, AND IT FAILS OPEN
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *Found 2026-08-21 while confirming the composer-draft entry below. It is the reason
 that entry's replacement is a UNION of two readings rather than one clean owner.*
@@ -559,30 +605,46 @@ consults the same flag, so the release that destroys a draft is also cleared by 
 **Falsifier:** type into a row, confirm `server rows drafts` names it, roll the daemon,
 and ask again without touching the row. It must still name it.
 
-**Not fixed here.** The seeding this wants — reconstruct the line from the rendered
-composer row at adoption, then let keystrokes maintain it as they already do — is a
-change to the adopt path, and this lane could not prove it without a daemon bump it was
-told not to take. What shipped instead is the union in
-`TerminalManager::session_composer_holds_draft`, where the rendered grid covers exactly
-the window the counter is blind in.
+**Fixed by making every reader that does not write first consult the UNION**, rather
+than by seeding the counter at adoption. `session_composer_holds_draft` already existed
+and already covered exactly the window the counter is blind in; it was simply not what
+the guards were reading. Three of them were still on the keystroke arm alone — the
+drafts sweep, the migratability signals, and `--refuse-if-draft` on `server terminal
+write` — which is to say the three places the answer decides whether somebody's line
+survives. They read the union now.
 
-## ⛔ [11.20] `server rows drafts` REPORTS FULL COVERAGE WHILE SEEING ONE DAEMON IN FOUR
+⚖ **Two readers deliberately keep the keystroke arm, and a test states the split.**
+`submit_prompt_echo_verified` and the §5 hot-restart repair re-ask their draft closure
+AFTER typing a probe marker into the composer, so the rendered-grid arm would read their
+own probe as a person mid-sentence and abort the submit they were asked to make. There
+the counter is the correct instrument precisely because a daemon-originated write is
+invisible to it. Without that test, "finish the migration" is a one-line change that
+silently breaks the probe.
 
-**Status:** OPEN
+⛔ **Adopt-path seeding is still the better answer and is NOT done.** The union refuses
+correctly, but it cannot tell a caller *what* the line is, and a row whose CLI has not
+yet redrawn its composer is invisible to both arms at once.
 
-Measured 2026-08-21 on the build host: four `yggterm-headless server daemon` processes
-were running, and `server rows drafts` answered `daemons_seen: 1` with
-`daemons_or_rows_unable_to_answer: 0` — i.e. it declared it had asked everybody.
+**LIVE-PROVEN 2026-08-21 on the deployed 3.1.30 daemon, both halves.** Four sessions it
+owns, every composer read EMPTY off the rendered grid and the sweep naming none of them;
+then ONE character typed into one of those composers and the sweep names that row. The
+negative control is not a fixture: a sibling row acquired a draft between the two reads
+on its own, so the sweep was discriminating rather than answering true to everything.
 
-The verb's own contract is right and is quoted in its docstring: *a daemon that cannot
-answer is counted apart, never as clean; blind is not clear*. That protects a daemon
-that ANSWERS "I am too old to say". It does nothing for a daemon that is never
-enumerated, because there is then nobody to be blind — and the fan-out enumerates by
-socket, while a version bump replaces older sockets with symlinks to the newest one.
+⚠ **The `input-check` RELAY of the same field is still owed**, and it is not a code gap:
+the field is rendered by the GUI, and the GUI on the owner's machine predates this
+change (it only picks one up on a restart, which this lane does not take). Asked on a
+row mid-output it answered `composer_shown: false` and, correctly, **typed nothing** —
+so the refusal path holds; what is unproven is the tri-state rendering.
 
-⇒ **A coverage count is not coverage.** The verb should compare the daemons it reached
-against the daemon PROCESSES on the host and report the difference, or its `verdict:
-"clear"` means "clear among the ones I happened to find".
+⛔ **AND THE ATOMIC SUBMIT SHARES THE BLIND SPOT — measured, and it is why boot-text
+residue cannot clear itself.** `--submit-iff-line-equals` compares against the same
+daemon-built input line, so across a handover it compares 0 bytes against 458 and can
+never fire. On a live jammed row the rendered screen held all 458 bytes and the daemon
+answered `holds 0 bytes, expected 458`. ⇒ The ledger's "COMPLETE it next tick" path is
+guaranteed to fail on any write that predates a handover, which makes such a row
+permanently unrecoverable by the safe path. `ygg-booter.py unjam` is the floor under
+that; adopt-path seeding would remove the need for it.
 
 ## ⛔⛔⛔ [11.20] `composer_held_draft` HAD NO DISCRIMINATOR LEFT — CONFIRMED, AND FIXED
 
@@ -921,6 +983,203 @@ safe boundary, never mid-turn.
 **Falsifier:** start a daemon from inside an agent session, spawn a row through it,
 and read the row's `/proc/<pid>/environ` — no agent-session marker may appear, and the
 row's JSONL must exist and grow from turn one.
+## ⛔⛔ [11.13] THE FLEET WAKE PATH IS EFFECTIVELY DEAD — 196 BOOTS ABORTED, 2 ROWS EVER WOKEN
+
+**Status:** OPEN
+
+Counted from one day of `booter.log`: **196 `⛔ ABORTING BOOT … boot text never appeared on
+screen after 6 s. Enter NOT sent`**, against exactly **two rows in the entire fleet that have
+ever recorded a boot** (`boots: 3` and `boots: 1`). Every other subscription, across every
+campaign, sits at `boots: 0`.
+
+**Two distinct failure modes, and both end with a row that does not wake.**
+1. **Abort before Enter.** The booter writes the boot text, then re-reads the rendered grid to
+   confirm it landed before sending Enter. The text never appears, so it refuses. ⭐ The GUARD
+   is working exactly as designed (`7d2fa0ea` — refuse rather than type blind); what it is
+   telling us is that **the write is not reaching the screen**.
+2. **Enter sent, no wake.** The one row with `boots: 3` was ESCALATED anyway —
+   *"did not wake after 3 boots"* — so even a completed boot did not resume it.
+
+⚠ **For the ABORT mode it is not the remote plane and not row visibility.** Booted and aborting
+rows have the identical `remote-cc://<machine>/<uuid>` shape, the same watcher host, and all read
+`hidden_by_collapse: None, expanded: True` in the listing. Whatever separates *those two* is not
+structural, and a fix aimed at the remote proxy would be aimed at nothing.
+
+⛔ **NARROWED 2026-08-21 — this sentence used to read "it is not row visibility" without
+qualification, and that generalisation is false.** It was drawn from rows that were all present in
+the GUI host's tree, which is the one population in which visibility cannot be the variable. A
+third mode was then measured directly: **a live, working session that is absent from the GUI host's
+tree entirely**, so nothing ever reaches the boot code at all — see the entry below. ⇒ The abort
+counts here are evidence about rows that ARE listed. They say nothing about rows that are not, and
+the fleet-wide `boots: 0` figure mixes both populations.
+
+**Why this outranks every individual stalled row.** The relay is built on the assumption that a
+session may land, defer, and be resumed. That assumption is currently false, so **any lane that
+hands over by standing by is a lane that stops** — with a brief written, a subscription live,
+and no error anywhere. Rows then escalate for being idle, which reads as a row problem and is
+not one.
+
+⇒ **Until this is fixed, a handover must SPAWN its successor, never defer to the booter**, and
+a brief must say so. ⇒ **The tell:** read `boots:` on the subscription. `0` after hours of
+quiet is this, not a quiet campaign. ⚠ Do not read "the row woke up" as evidence a boot
+landed — a human typing into a row looks identical from every instrument the fleet has.
+
+## ⛔⛔ [11.13] A LIVE, WORKING SESSION CAN BE ABSENT FROM THE GUI HOST'S ROW TREE — SO THE WATCHER LAPSES IT AND NOTHING CAN REACH IT
+
+**Status:** OPEN
+
+⛔ **THIS ENTRY REPLACES A FALSIFIED MECHANISM. Re-measured 2026-08-21 16:45-16:50 against a
+session that was alive and writing while it was measured.** The previous text said a spawned row
+is auto-subscribed by BARE UUID, that the bare uuid "matches nothing" in the GUI host's listing,
+and — explicitly — that *"the row is visible in the listing the whole time; this is a key-matching
+failure, not a visibility one."* **All three are wrong.** What follows is what the instruments
+actually say. The lapse it described is real; the cause it named is not.
+
+### THE MEASUREMENT
+A delegate spawned onto a worker host was alive throughout: its process was up, and its transcript
+was growing to the second at every reading. In the same instant:
+
+| probe | answer |
+|---|---|
+| the **GUI host's** row tree (640 rows, 234 sessions, non-empty ⇒ it *did* answer) | the uuid appears **0 times in 878 KB** |
+| the **worker host's** own row tree | present, **9 hits**, path `remote-cc://<worker>/<uuid>` — the correct addressable form |
+| the OS | process alive, transcript age 0.0m, still growing |
+
+Of the **8** `remote-cc://<worker>/` sessions in the worker host's tree, **exactly one — this one —
+is missing from the GUI host's tree.** The other seven propagated. 22 of the 23 live sessions on
+that worker were listed on the GUI host; this was the twenty-third.
+
+⇒ **The row was created, with the right path, on the worker's plane, and never reached the GUI
+host's tree.** Intermittent propagation, not a systematic gap and not a naming gap.
+
+### WHY THE OLD MECHANISM CANNOT BE RIGHT — from the code, not from a guess
+1. **The presence check never sees the stored string.** The tick calls
+   `row_presence(host, uuid)` with the **uuid**, and `resolve_row_path` reduces any identifier with
+   `ident.rstrip("/").split("/")[-1]` — so a bare uuid and `scheme://host/<uuid>` **normalize to the
+   same key**. The stored form cannot decide presence.
+2. **It was subscribed with the FULL addressable path FIRST, and that failed too.** The log shows
+   the full `remote-cc://<worker>/<uuid>` form at the first subscribe, answered by
+   *"does not resolve to a live row on <gui-host> — subscribing anyway"*. A second subscribe 26 s
+   later stored the bare uuid. Both were absent for the same reason: the row was not there.
+3. The lapse then proceeded correctly — absent 1/3, 2/3, LAPSED — and `row_presence` behaved
+   exactly as designed. **The watchdog is not the defect here; it is the only thing that reported it.**
+
+### ⚠ THE BARE UUID IS STILL A REAL DEFECT — one layer down, and it is the SEND, not the check
+`boot()` passes the **raw stored `row` string** to `server terminal write '<row>'` and
+`server app terminal submit '<row>'` with no `resolve_row_path` in between. So a subscription
+holding a bare uuid addresses nothing **when a boot is finally attempted**, while every presence
+reading above it looks fine. ⇒ Worse, **re-subscribing DOWNGRADES a good record**: the first
+subscribe here stored the addressable path, the second overwrote it with the bare uuid. The
+documented "workaround" of re-subscribing can therefore make the send target worse while printing
+success.
+⇒ **Fix: resolve at subscribe time AND at send time**, and never overwrite a resolved path with an
+unresolved one.
+
+### WHY THIS BREAKS THE RELAY, SILENTLY
+1. ⛔ **The handover looks complete.** The spawn returns, the delegate reads its brief, ACKs, and
+   works — the initial prompt rides the spawn, so nothing about the first turn reveals the problem.
+2. ⛔ **The delegate is unreachable and unbootable from the moment it lands.** No row on the GUI
+   host means no steer, no correction, no boot, and **no seat in the sidebar** — the owner cannot
+   see that the work is running at all.
+3. ⛔ **It ends at the end of its first turn.** Whatever is not committed by then is stranded, and
+   the chain stops with every artefact present and no error anywhere.
+4. ⚠ **Invisible from inside the row:** a session cannot tell a watched subscription from an
+   unwatched one, nor a propagated row from an orphaned one. Both look like "I landed and stood by".
+
+### THE TELLS, AND THE ONLY SAFE HANDOVER UNTIL THIS IS FIXED
+- ⭐ **After spawning, read the GUI host's row tree for the new uuid — do not read the spawn's own
+  return value.** The spawn verb reports that it started a process, which is true and is not the
+  question. If the uuid is absent from the GUI host's tree, **the delegate is orphaned**: it will
+  work one turn and then be gone.
+- ⚠ `boots: 0` plus `LAPSED — absent from N consecutive row listings` on a session whose transcript
+  is still GROWING is this bug, and it is the opposite of what it reads like. A lapsed record is
+  evidence about the ROW TREE, never about whether the work is happening.
+- ⛔ **Do not hand a lane over by standing by.** Spawn, then verify the row on the GUI host, and
+  carry the standing order that the successor must spawn its own successor rather than defer.
+
+## ⛔⛔ [11.13] AN ABSENCE-LAPSE IS PERMANENT AND NEVER RE-CHECKED, SO ONE TRANSIENT LISTING GAP UNWATCHES A LIVE SESSION FOREVER
+
+**Status:** OPEN
+
+Measured 2026-08-21 across the whole subscription set.
+
+A subscription that goes absent from the GUI host's row tree for `GONE_SIGHTINGS` consecutive
+readings is marked `lapsed`. The tick's very next act on that record is:
+
+```python
+if s.get("lapsed"):
+    # Already reported once; stay quiet but stay VISIBLE in `list`.
+    continue
+```
+
+⇒ **It is never looked at again.** Presence is not re-tested, so a row that comes BACK stays
+unwatched until a human re-subscribes it by hand — and nothing anywhere says the watchdog stopped
+watching a session that is plainly alive.
+
+### MEASURED, over all 12 lapsed subscriptions at one instant
+| bucket | count |
+|---|---|
+| genuinely gone — no process, no row, stale or missing transcript | 7 |
+| ⛔ **process ALIVE and the row is BACK in the GUI host's tree** | **5** |
+
+Two of those five lapsed specifically for **absence** and are now present again, transcripts 8 and
+26 minutes fresh. They are unwatched for no reason that is still true. (The other three lapsed on
+`max_hours`, which is a decision rather than an inference — see below.) A third case existed and
+was cleared by hand while measuring this.
+
+### ⚠ WHY THIS IS NOT THE RE-ARM HAZARD THE FILE ALREADY REFUSES
+`cmd_coverage` deliberately refuses to auto-arm, because *"an attestation-driven re-arm would
+resurrect rows that deliberately unsubscribed when their work finished."* **That reasoning does not
+reach this case, and the difference is the whole point.** An `unsubscribe` is a DECISION BY THE
+SUBSCRIBER. A lapse is an INFERENCE BY THE WATCHER — the subscription was never withdrawn, and the
+premise of the inference ("this row is not in the tree") is testable and currently false. Clearing
+it resurrects nobody's choice; it corrects the watcher's own stale reading.
+
+⇒ **Fix: on the tick, re-test presence for records lapsed by ABSENCE, and clear the lapse when the
+row resolves** — logging it as loudly as the lapse itself, since a silent re-arm is the other
+direction of the same failure. ⛔ Do **not** auto-clear a `max_hours` lapse: that one is an expiry
+someone chose, and the remedy for it is a deliberate re-subscribe.
+
+⚠ **The tell:** `list` shows `⛔ LAPSED … NOT WATCHED` beside a row whose transcript is growing.
+The two facts are printed by different instruments and nothing reconciles them, so the contradiction
+sits in plain sight and reads as two unrelated lines.
+
+## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
+
+**Status:** OPEN
+
+⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
+mentions it — collateral loss in a file rewrite, not a fix. This file's own rule is that an
+entry is deleted in the same commit as its VERIFIED FIX. Re-measured 2026-08-21 and still real.
+
+The fleet scripts live at `.agents/skills/yggterm-agent-fleet/*.py`, INSIDE the repo, so every
+git worktree has its own copy — and both the watcher and any agent invoking a verb resolve them
+by **RELATIVE** path. The live watcher's command line is literally
+`python3 .agents/skills/yggterm-agent-fleet/ygg-booter.py watch --host … --interval …`.
+
+⇒ **Which copy runs is decided by the process CWD**, which nobody chose. Measured: the running
+watcher sat in a worktree missing `7d2fa0ea` (*"the resolver named the wrong host, and the
+watchdog that types had no guards"*) — so the fleet's live watchdog was running the UNGUARDED
+version of the code that TYPES INTO ROWS.
+
+These scripts are the fleet's INSTRUMENTS: a lane on a stale copy gets stale answers ABOUT
+OTHER LANES and cannot tell, because the script reports success in its own terms either way.
+⚠ Same shape as the split install the daemon audit reports for the BINARIES — which is why the
+audit now also checks the scripts, and why that check took three tries to get right (see below).
+
+**Wanted:** either the audit check becomes shared tooling rather than one host's private hook,
+or the scripts stop being resolved relatively — one installed copy on PATH, in-repo tree as its
+source. ⛔ Never fix an instance by copying the file into another worktree: those are live
+checkouts holding other lanes' uncommitted work.
+
+⭐ **THREE WAYS A CHECKER IS CONFIDENTLY WRONG**, all hit while writing that check, all shipped
+looking fine: `sha1sum` of EMPTY input is a valid hash (guard the CONTENT, not the hash);
+`$( )` STRIPS TRAILING NEWLINES so a captured blob never matches the file it came from — which
+flagged every host, and *looked* right because the fleet genuinely carries drift; and
+`origin/main` is a LOCAL CACHE until fetched. ⛔ And the fourth, worst one: **"differs from
+main" is NOT "behind main"** — a watcher in a lane worktree legitimately carries unmerged work,
+so a hash comparison flags it every session for being AHEAD, which is how an audit teaches
+people to ignore it. The right question is `git log origin/main --not HEAD -- <path>`.
 
 ## [11.11] A COMPOSITOR-DRIVEN FULLSCREEN KEEPS ITS ROUNDED CORNERS, SO THEY COMPOSITE ONTO BLACK
 
@@ -1177,11 +1436,23 @@ the codebase at once by turning them into `ECHILD`.
 
 ### The locks, and what each one can and cannot see
 
-⭐ **The daemon call site is a proven lock, not an assumed one.**
-`notify_owner_reaps_the_notification_child` drives the real production function
-against a stub binary in a fake home and counts zombie children of the test process.
-It was falsified by reverting `notify_owner` to `let _ = cmd.spawn()`, and it failed
-with *"left a zombie behind: 1 zombie children against a baseline of 0"*.
+⭐ **The daemon call site is a proven lock — but its first version was flaky in the
+one place that matters, and the reason is a law.** It drove the real production
+function against a stub binary in a fake home, then **counted zombie children of the
+whole test process against a baseline snapshot**. That passes when the test is run
+alone, which is how it was verified, and FAILS in the suite: *"left a zombie behind: 3
+zombie children against a baseline of 0"* — while `notify_owner` spawns exactly ONE
+child. The other two belonged to sibling tests, because 1,200 tests in one binary
+spawn and reap children of that same process throughout the fifteen-second window.
+
+⛔ **A lock that goes red on its neighbours' work is worse than no lock; it teaches
+people to re-run.** The cure is the campaign's own rule — **identify, do not count.**
+`notify_owner` now returns the pid it launched (useful in its own right: the function
+previously swallowed what it started), and the lock watches THAT pid until it is gone
+or fails it if it sits in `Z`. It asserts the pid was reported at all before it starts,
+so it cannot pass by nothing having been launched. Falsified by restoring the dropped
+`Child` while still reporting a pid: *"left pid 3725640 as a zombie child for 15s"*.
+Green in the full 1,223-test suite afterwards.
 
 ⭐ **The GUI call sites are locked structurally, because behaviourally they cannot
 be.** They shell out to `notify-send` and `ghostty` by name, so exercising them means
@@ -1198,9 +1469,18 @@ now assembled rather than written out.
 
 ⛔ **"The new daemon holds zero zombies" proves nothing on its own.** A daemon that
 never notified also holds zero, and the fifth daemon in the table above is exactly
-that case. The control is the daemon's own trace: replay its
-`daemon/heartbeat/panic` events at severity `error` through the fifteen-minute
-cooldown, and that count is how many notifications it really spawned.
+that case. The control has to establish that notifications actually happened.
+
+⭐ **The daemon now says so directly, which it did not before.** `notify_owner`
+returns the pid it launched and the watcher writes `daemon/heartbeat/notify_spawned`
+with that pid — so the count of real launches is READ, not inferred. Until this
+landed the only way to get it was to replay the `panic` events through the
+fifteen-minute cooldown in your head, which is inference, and inference was the
+weakest link in this very falsifier. ⚠ The event is written on the failure path too,
+with a null pid; **filter on `spawned`, not on the event's existence.**
+
+⇒ On a daemon that predates that event, the replay is still the fallback: take its
+`daemon/heartbeat/panic` events at severity `error` and apply the cooldown.
 
 ⇒ **On a daemon built from this commit:** notifications-spawned must be at least 3
 (so, past 46 minutes of uptime on a host under load) AND
@@ -1209,11 +1489,55 @@ probe against an older daemon on the same host still counts its accumulated pile
 Old daemons keep their zombies until they exit; that is expected and is not a failed
 fix.
 
-**Run green on an isolated daemon 2026-08-21** — a daemon built from this commit,
-started with its own `YGGTERM_HOME` so it could not touch the fleet, observed
-continuously through `/proc/<pid>/task/*/children` (an observer that spawns nothing,
-so it cannot contribute to the table it measures). RESULT PENDING IN THIS ENTRY UNTIL
-THE OBSERVATION WINDOW CLOSES — see the relay note if this line is still here.
+**RUN GREEN ON AN ISOLATED DAEMON 2026-08-21.** A daemon built from this commit,
+started with its own `YGGTERM_HOME` so it could not touch the fleet, watched
+continuously through `/proc/<pid>/task/*/children` — an observer that spawns nothing of
+its own, so it cannot contribute to the table it is measuring.
+
+| | |
+|---|---|
+| daemon uptime at the end of the window | **47.7 min** |
+| notifications it really spawned | **4** (15-minute spacing, first one at start) |
+| notification children caught in the act | **3** (the first predates the observer) |
+| longest any of them was seen in state `Z` | **never observed in `Z` at all** |
+| zombies the daemon holds | **0** |
+| other children observed in the same window | 41, of which 6 passed transiently through `Z` and every one cleared |
+
+Each notification child appeared at the same second its notification was decided
+(17:56:48.680, 18:11:50.067, 18:26:51.491), lived about seven tenths of a second, and
+disappeared. The four pre-fix daemons on the same host went on accumulating throughout
+the same window: 233 zombies between them at 17:47, 242 at 18:13.
+
+⭐ **The middle column is what makes this a proof rather than a quiet machine.** Each
+notification child was seen at the same second its notification was decided, lived
+under a second in state `S`, and disappeared — never once observed in `Z`, where the
+old code would have parked it forever. Against that, the four pre-fix daemons on the
+same host went on accumulating throughout.
+
+### The rolled fleet daemon — run, and ONE notification short of this entry's own bar
+
+*The fleet rolled to 3.1.29 at 19:18 on its own, so the probe this entry was waiting for
+became available without anyone forcing a deploy. Measured against the INSTALLED daemon.*
+
+| | |
+|---|---|
+| rolled daemon uptime | **63.8 min** |
+| notifications it really spawned | **2** (19:49:09, 20:04:19) |
+| zombies held, across 82 samples | **0** |
+| the two pre-fix daemons beside it, same window | **91 → 92** and **80 → 81** |
+
+⚠ **This entry asked for three notifications and got two, and the reason is worth more
+than the missing one.** The notifier only fires while the host is genuinely under load.
+The host cooled at 20:09 — partly because this lane's own sandbox daemons stopped
+consuming tmpfs — and the third cooldown expiry had nothing to report. ⇒ **This
+falsifier cannot be run on demand: it needs the machine to be unhealthy, and tidying up
+removes the condition it depends on.** Expect to wait for weather, not for uptime.
+
+⇒ **Still owed: the third notification, and nothing else.** A monitor is armed against
+the rolled daemon and will record it whenever the host next heats up. Its tally
+accumulates to a file rather than recounting from the trace, because the trace is a byte
+budget and a count re-derived from it can go DOWN — evidence that can evaporate is not
+evidence.
 
 **What remains open — and it is sharper than "nobody looked":** the codebase's only
 zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
@@ -1258,7 +1582,34 @@ daemon that has it on rather than showing in today's numbers.
 title generation must be attempted ONCE, not once per eligible pass — and must be attempted
 again the moment that transcript grows.
 
-### ⚠ STILL NOT FALSIFIABLE ON 3.1.18 — generation remains env-disabled on both daemons
+### ⭐ THE FALSIFIER HAS NOW BEEN RUN, BOTH HALVES, IN AN ISOLATED DAEMON
+
+*2026-08-21, a daemon built from this commit with generation ON, its own `YGGTERM_HOME`, an
+invented one-session corpus and an unreachable LLM endpoint so every generation fails — the
+arrangement no fleet daemon provides and the reason this sat unfalsifiable for two passes.*
+
+| what happened | generations |
+|---|---|
+| session appears, transcript static, chore ticks | **1** |
+| daemon killed and restarted, same static transcript, 2 more ticks | **0** |
+| one line appended to the transcript | **1**, on the very next scan |
+| 3 further ticks, transcript static again | **0** |
+
+⇒ Both halves hold, and the middle row is the stronger one: the ledger is in the store, not in
+process memory, so a restart does not hand a failed generation a fresh budget. Before this fix
+that same unchanged session re-paid a ~9.3s call on every eligible pass, forever.
+
+⚠ **The failing endpoint is the point, not a shortcut.** The defect only appears when generation
+FAILS — a success writes a real title and closes the gate by itself. Pointing the sandbox at an
+unreachable endpoint reproduces the exact condition and costs no tokens, where enabling
+generation against the real endpoint would have been both expensive and unable to show the bug.
+
+⛔ **A sandbox daemon is not free.** A fresh home has no managed-CLI sweep marker, so it reads as
+a never-swept machine and starts a full CLI install fan-out five minutes in — 1.6 GB before the
+measurement had even finished. Seed the marker. Recipe and the attribution mistake that nearly
+went into it: `docs/agent-field-guide.md` §"Prove a daemon gate in a sandbox home".
+
+### ⚠ NOT FALSIFIABLE ON THE FLEET ITSELF — generation remains env-disabled on both daemons
 
 Checked live 2026-08-21 on a build verified to contain the fix. `copy_generation/summary` shows
 7 spans in 2h (p50 10,027ms) and no title spans, consistent with generation being off in the
@@ -1330,8 +1681,27 @@ while `render/web_content` (16.6% of a core sustained) and `daemon_request/snaps
 10,081ms of lock-holding, 121 times in 2h) are the actual burn. Recorded so the next reader does
 not re-derive this.
 
+### ⭐ THE MEMO HAS NOW BEEN WATCHED HITTING, AND THE EARLIER ALL-MISS READING IS EXPLAINED
+
+*Observed 2026-08-21 in an isolated daemon on an invented one-session corpus, with generation
+enabled — the arrangement production never provides.*
+
+| scan | memo |
+|---|---|
+| first scan of the corpus in this process | `hits 0, misses 1` — correct, the memo starts empty |
+| second scan, corpus unchanged | **`hits 1, misses 0`** |
+| next scan, after one line was appended | `hits 0, misses 1`, row rebuilt |
+
+So the memo does work, and the live run that reported `hits: 0` everywhere was not measuring a
+broken memo. Two separate causes were stacked on it: in production no process ever reaches a
+second scan (already recorded above), and in the first isolated run a generation attempt landed
+between every pair of scans — **a title-store write drops the whole memo by design**, which the
+code says out loud and which is easy to misread as the memo failing. ⇒ **A memo whose
+invalidation is deliberate and wholesale cannot be judged by its hit rate alone; check what
+wrote to the store between the two scans first.**
+
 **What remains open:** only the cross-process half, and only if the corpus or the startup rate
-grows enough to matter. The in-process defect is fixed and unit-tested.
+grows enough to matter. The in-process defect is fixed, unit-tested, and now observed working.
 
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
@@ -1972,6 +2342,7 @@ declares it. That is why it is filed rather than half-shipped here.
 **Falsifier for the remaining half:** right-click a row on each host — exactly
 that host's installed apps, once each, and no terminal-invoked monitors or
 booters. The "once each" and "that host's" halves hold today.
+
 
 ## ⚠ [11.0] THE ROW CLI DEMANDS RITUAL THE DEFAULTS SHOULD OWN — the papercut backlog
 
@@ -21959,6 +22330,35 @@ reader knows the instrument's reach ended before the answer did.
 
 ---
 
+## ⚠ [11.1] TWO INSTRUMENTS THAT ANSWER A DIFFERENT QUESTION THAN THEIR NAME, FOUND FALSIFYING ROW GROUPS
+
+**Status:** OPEN
+
+Both hit 2026-08-21 in `scripts/underglass-sandbox.sh`.
+
+Neither is a defect in the feature under test; both are traps for the NEXT lane
+that tries to falsify anything in the tab rail, which is why they are filed
+rather than left in a proof note.
+
+1. ⛔ **`server app state ▸ web_surface_tabs.rows` is ID-ORDERED, not
+   draw-ordered.** Read as "the tab order" — which its shape invites — it
+   reported two freshly opened tabs as APPENDED to the end of the list. The rail
+   was drawing them at the TOP at that exact moment, which is the opposite
+   answer and the one the product promises. It is a per-tab webview/lease
+   diagnostic and the id order is fine for that; the name is what misleads.
+   ⇒ Judge placement from the rail or the tabs vector, never from this listing.
+   Wanted: either draw order, or a field saying which order this is.
+
+2. ⚠ **Synthetic BUTTON events do not reach the rail in the sandbox, though
+   pointer MOTION does.** `underglass-sandbox.sh click` and the app-control
+   `pointer click` verb both moved the cursor (the hovered row revealed its
+   verbs, so motion arrives and the DOM reacts) and neither selected a row nor
+   fired a row's disclosure control. Both report success. ⇒ Anything needing a
+   real click cannot currently be falsified on this rack; the collapsed-group
+   case was proven by SEEDING the state instead of clicking into it. Wanted:
+   either working button delivery, or a refusal, rather than an accepted call
+   that lands nowhere.
+
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
 **Status:** OPEN
@@ -22028,7 +22428,48 @@ confirmation on the erasing form. Wanted: the no-argument form should RETURN the
 value (or refuse), and clearing should be an explicit flag (`--clear`). Until then the only
 safe read-back is a listing instrument, not the verb itself.
 
-## [19.1] `server app session outline` REPORTS `error: null` WHILE `applied: false`, SO A SEAT SILENTLY DOES NOT LAND
+## [19.1] A ROW CAN BE DISPLAYED BUT UNBOUND — EVERY MUTATING VERB THEN NO-OPS, AND `rename` REPORTS SUCCESS
+
+**Status:** OPEN
+
+reproduced repeatedly 2026-08-21 on build 3.1.17, client and daemon agreeing.
+
+⭐ **THE STATE, which is the part worth naming:** the row renders in the sidebar, the metadata panel
+populates from its rollout file, and the session is plainly alive and working — **while the daemon
+holds no live-session binding for it.** The panel shows `Status: bootstrapping · working`. In that
+state the row is **readable but not writable**, and nothing in the UI says so.
+
+**Both mutating verbs fail, and they fail differently — the second is the dangerous one:**
+
+| verb | returns | actually happens |
+|---|---|---|
+| `session outline` | `applied:false`, `daemon_message:"no live session for …"`, **`error:null`** | nothing |
+| `session rename` | ⛔ **`accepted:true`, `reason:null`** | ⛔ **nothing** |
+
+⛔ **`rename` reports success for a write that never lands.** `outline` at least sets `applied:false`
+— but puts the reason in `data`, leaving the documented error channel null. ⇒ **A caller written to
+the obvious contract concludes both succeeded.**
+
+⚠ **And a read-back immediately after can still agree with the caller**, which is what makes this
+expensive: the claim script's verification printed the NEW title, and the row reverted to the old one
+later. The write appears to reach a view that a subsequent daemon reload discards.
+
+**Suspected trigger — a daemon restart under an in-place update.** At the time of these runs the
+daemon reported `Uptime 7m 18s` with `✓ Update installed · Restart to apply` pending, and the
+binary had been replaced on disk earlier the same session. Sessions that predate the restart appear
+not to be re-bound, while `Sessions: 7 owned · 7 total · 0 preserved` reports no loss.
+
+**What would falsify it:** the same verbs landing on a row whose session started *after* the current
+daemon, or a rebind making the identical calls succeed on this row.
+
+**Fixes, in priority order:**
+1. ⛔ `rename` must not return `accepted:true` when there is no live session.
+2. Any `applied:false` should carry a non-null `error`.
+3. A displayed-but-unbound row should be visibly marked, since it silently ignores every write.
+4. Re-bind surviving sessions across an in-place daemon restart, or report them as lost rather than
+   counting them in `owned`/`total`.
+
+## [19.1b] `session outline` — THE ORIGINAL NARROWER REPORT, KEPT FOR THE SCHEME CENSUS
 
 **Status:** OPEN
 
@@ -22070,11 +22511,34 @@ or neither does.
 after actually launching a third-party agent CLI as a work lane on 2026-08-21. It worked, but
 none of the fleet machinery reached it.
 
-**1. A third-party CLI session is invisible to the row plane.** It runs as an ordinary background
-process. It cannot be claimed, titled, seated, monitored for stalls, or messaged by any existing
-verb, and it does not appear in `server app rows`. ⇒ **Today the only way to supervise one is to
-poll files it writes.** Anything built on rows — the stall detector, the booter, succession —
-simply does not apply.
+**1. ⛔ CORRECTED 2026-08-21, SAME DAY — THE FIRST VERSION OF THIS ITEM WAS WRONG AND THE TRUE
+FINDING IS SHARPER.** It claimed a third-party CLI session "is invisible to the row plane… does not
+appear in `server app rows`". **False, and asserted without checking.** The listing carries a
+`remote-agy://` scheme with 11 rows and a `remote-muse://` scheme with 2. The plane models them.
+
+⭐ **What is actually broken is SEATING, and it splits perfectly by scheme.** Census of the live
+listing, 710 rows:
+
+| scheme | rows | seated (`outline_prefix` set) |
+|---|---:|---:|
+| `cc-runtime` | 13 | **8** |
+| `remote-cc` | 52 | 0 |
+| `remote-session` | 112 | 0 |
+| `local` | 87 | 0 |
+| `remote-agy` | 11 | **0** |
+| `remote-muse` | 2 | 0 |
+| (no scheme) | 433 | 0 |
+
+⇒ ⛔ **8 of 13 on one scheme; 0 of 697 on every other.** Seating is in practice a `cc-runtime`-only
+capability. A correctly-spawned foreign-CLI row would still take no seat, so the numbering scheme
+the fleet organises itself by **cannot address any non-native lane at all.**
+
+⚠ **And the second-order effect is what makes it deep rather than cosmetic:** an operator scanning
+the sidebar for "which lane is doing what" sees numbers only on native rows, so **foreign lanes are
+invisible to the very convention used to find work** — present in the data, absent from the map.
+
+⚠ Separately and still true: launching a foreign CLI as a bare background process creates **no row
+at all**. The scheme exists; nothing routes an ad-hoc launch into it.
 
 **2. Argument order silently changes what runs.** On the CLI tested, putting the print/non-
 interactive flag *before* the model selector caused **both** the model choice and the prompt
@@ -22136,6 +22600,39 @@ render path then does no I/O and both columns answer the same question by constr
 bin dir, then comparing its `This machine` count against what another host's matrix reports
 for that same machine over ssh. Equal counts falsify the divergence; unequal counts are it.
 
+## ⛔ NOTHING RUNS `ygg-land`, SO A LANE EITHER SITS UNLANDED OR BREAKS THE SPLIT ITSELF
+
+**Status:** OPEN
+
+⚠ **This is one layer ABOVE the roll gap below it, not a duplicate of it.** That entry owns
+`main` → the machine someone is using. This one owns a lane branch → `main`. Both are absent;
+either alone strands work, and they fail in the same silent direction.
+
+`ygg-land.py`'s own header states the split it enforces: *"a LANE pushes its own branch and
+says it is ready. The ORCHESTRATOR lands it and is the only thing that rolls."* The lane half
+works — branches are pushed. **The orchestrator half is nobody.** No process anywhere runs the
+verb, on any interval, and the seat the split names has been dead since the afternoon.
+
+**Measured 2026-08-21 19:56:** `ygg-land.py status` reports **9 branches carrying unlanded
+work**. One of them had been pushed, tested and green for two hours while its author believed
+the mechanism would take it, because the mechanism took two other branches in that window —
+which is the tell. A queue that empties sometimes reads as a queue that is being served.
+
+⛔ **And the lane is left with only bad options.** Wait, and the work never reaches the roll
+that builds from `main`. Or land itself, which is exactly what the split forbids, and which
+this lane then did — deliberately and recorded here, because landing without rolling touches
+neither of the two hazards the split names (divergence, which landing *removes*, and two
+agents allocating two versions, which only rolling can cause). ⚠ **That reasoning is sound for
+one branch and does not generalise:** the moment two lanes reach it at once it is the
+divergence the split exists to prevent, arrived at by the same argument.
+
+**The shape of the fix:** supervise `ygg-land.py land --all` the way the other recurring jobs
+are supervised, so its lifetime does not depend on a session; and give "when did a land last
+run" a surface, so its absence is reported rather than inferred from a branch that sat.
+
+**Falsified by:** a supervisor that runs the verb after its launching session exits, or any
+surface answering how long it has been since a land completed.
+
 ## [11.9] THE JOB THAT LANDS EVERY LANE'S WORK IS ITSELF A LOOP NOBODY RESTARTS
 
 **Status:** OPEN
@@ -22167,5 +22664,50 @@ automating it further: the loop notifies and then RESTARTS the client, by an own
 reversed its original refusal to do so — so a supervisor is a decision about when someone's
 window may be restarted, not merely about uptime.
 
+**Re-measured four hours later, and the entry survives it.** The deployed version has since
+moved forward and now carries the fixes that were stranded — but **the roller did not do it**:
+no process carries the loop, and its log has not gained a line since the cycle that stopped it.
+Some other hand rolled the build. The gap it describes had already begun to reopen at the time
+of the re-measurement, with `main` sitting five commits past the deployed release.
+
+⚠ **That is the failure mode, not a reprieve from it.** A deploy that happens because somebody
+happened to do one is the same absent mechanism as a deploy that does not happen; it merely
+fails silently in the direction that looks fine. Reading "the fix arrived" as evidence the
+lane is healthy is the specific mistake this entry exists to prevent, and it is available to
+be made every time the gap is small.
+
 **Falsified by:** finding a supervisor that brings it back after its launching session exits,
 or any surface that reports how long it has been since a roll completed.
+
+## [11.9] THE PRESENCE MATRIX HAS NO READ-ONLY SURFACE, SO VERIFYING IT TAKES SOMEONE'S SCREEN
+
+**Status:** OPEN
+
+Every remote machine's `cli_presence` report is carried on `RemoteMachineSnapshot` and is
+what the "Agent CLI installation" modal renders. **It is not projected into `server app
+state`**, the read-only describe verb an agent uses to ask the running GUI what it holds.
+The projection carries each machine's `label`, `health`, `session_count`,
+`remote_deploy_state` and `ssh_target`, and drops the presence report entirely — a grep for
+`cli_presence` over a full describe payload returns zero hits.
+
+**What that costs.** The only way to read the matrix the user actually sees is to open the
+Settings modal on the running GUI, and the screenshot does not composite a modal while a
+terminal view is active, so the main area has to be swapped to the start page first. On a
+machine somebody is working on, verifying this one field means taking their viewport. That
+is why a fix to the matrix that was proven correct at the CLI on four machines still could
+not be confirmed as *rendered* without interrupting someone.
+
+**Why the CLI proof is not a substitute.** Per-machine `server remote cli-presence` answers
+what each machine reports about itself. It cannot show that the GUI asked, that the answer
+survived the wire, or that the row rendered against the right machine — which is precisely
+the class of fault this matrix exists to surface, and one that has already shipped once as a
+column labelled with the wrong host's answer.
+
+**The shape of the fix.** Project the presence report into the describe payload beside the
+machine entries that are already there. The field is serialized on the snapshot type
+already; only the projection drops it. A read-only verb that returns per-machine
+present/total makes this matrix verifiable by any seat, at any time, without touching a
+running window.
+
+**Falsified by:** any read-only verb or describe field that returns the per-machine
+present/total counts the modal renders.

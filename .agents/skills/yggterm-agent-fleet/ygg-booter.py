@@ -580,6 +580,30 @@ def rate_limit_hold():
     #    next read — the failure would look exactly like "no hold was ever set".
     if d.get("indefinite"):
         return d
+    # ⛔⛔ A HOLD WHOSE OWN EVIDENCE THIS CODE RECLASSIFIES IS RELEASED, NOT
+    #    WAITED OUT. Measured 2026-08-21, minutes after the balance/window split
+    #    shipped: the watcher was restarted, recognised the refusal as an
+    #    exhausted BALANCE on its first tick, suspended that one row exactly as
+    #    designed — and 18 other rows stayed unwakeable for another 16 minutes
+    #    behind a hold the previous code had armed from the very same tail.
+    #
+    #    ⇒ The fix corrected the DECISION and left the ARTEFACT in force. That is
+    #    the shape this file already knows from `note_rate_limit`: a frozen tail
+    #    read as a live signal. Here it is worse, because the tail is one this
+    #    code has just decided was never fleet-wide in the first place — so the
+    #    hold is not merely stale, it is unsupported by its own record.
+    #
+    #    ⚖ A DECLARED hold is untouched. That one is an instruction from a human
+    #    who could see the account, and a reclassification of the automatic path
+    #    does not get to overrule it.
+    if (not d.get("declared_until")
+            and refusal_is_a_balance_not_a_window(d.get("tail"))):
+        log("⭐ RELEASING the fleet quota hold — its own recorded refusal is an "
+            "exhausted CREDIT BALANCE, which this code holds PER ROW rather "
+            "than fleet-wide. The row that hit it is suspended; nobody else "
+            "should have been waiting on it.")
+        RLHOLDFILE.unlink(missing_ok=True)
+        return None
     if time.time() >= (d.get("until") or 0):
         RLHOLDFILE.unlink(missing_ok=True)
         return None
@@ -1596,7 +1620,30 @@ def cmd_defer(args):
         log(f"deferral cleared for {uuid[:8]} — back to the {BOOT_AFTER_SECS}s default")
         return 0
 
-    asked = int(args.secs)
+    # ⛔ `--hours` belongs to `disarm`, but nothing stopped it being passed HERE,
+    # and `--secs` defaults to 0 — so `defer --hours 3` read zero seconds,
+    # clamped up to the 60s floor, wrote a clean read-back and reported success.
+    # A request to go quiet for three hours became a boot in one minute, and the
+    # reply said it worked. Reported 2026-08-21 by a long-running row that had
+    # asked for hours and was woken in 60s.
+    #
+    # Honour the flag rather than rejecting it: an agent reaching for `--hours`
+    # on a "how long to wait" verb has guessed the right thing, and a tool that
+    # punishes the natural guess is the defect. `--secs` still wins if both are
+    # given, being the more specific.
+    if args.secs:
+        asked = int(args.secs)
+    elif args.hours:
+        asked = int(float(args.hours) * 3600)
+    else:
+        # ⛔ Never silently mean "60 seconds". A bare `defer` is someone asking
+        # for a long wait without saying how long — the one reading under which
+        # the old behaviour was catastrophic rather than merely wrong.
+        log("⛔ defer needs a duration: pass --secs <n> or --hours <n> "
+            f"(clamped to {MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s). "
+            "Refusing rather than deferring for the 60s floor, which is what a "
+            "bare defer used to do while reporting success.")
+        return 2
     secs = max(MIN_BOOT_AFTER_SECS, min(asked, MAX_BOOT_AFTER_SECS))
     if secs != asked:
         log(f"⚠ clamped {asked}s to {secs}s — the {MAX_BOOT_AFTER_SECS}s ceiling is the "
@@ -3447,8 +3494,11 @@ def tick(args):
                                    f"correct and is NOT being relaxed; the standing "
                                    f"condition is the defect. Nothing clears this by "
                                    f"itself: the row is alive, is not being woken, and no "
-                                   f"counter rises to say so. For boot-text residue try "
-                                   f"`ygg-unwedge.sh`.")
+                                   f"counter rises to say so. If the composer holds "
+                                   f"exactly our own boot text, `ygg-booter.py unjam "
+                                   f"<row>` delivers or clears it; it refuses "
+                                   f"anything that is not character-for-character "
+                                   f"ours.")
                         escalate(host, row, why + " The row is NOT being woken by anything.")
                         rec["escalated"] = True
                         action = f"{action}→ESCALATED"
@@ -3549,6 +3599,75 @@ def _source_is_current():
         return (None, f"could not compare: {exc}")
 
 
+def _source_digest():
+    """sha256 of the file this process is EXECUTING, or None if it cannot be read.
+
+    ⛔ `None` is "cannot tell", never "unchanged" — a branch switch can take the
+    file out from under a running watcher, and a missing file must not read as
+    a match."""
+    try:
+        return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _reexec_if_source_changed(baseline):
+    """Re-exec into the current source when this file changes under us.
+
+    ⛔⛔ THE WATCHER IS A LOOP NOBODY RESTARTS, AND `_warn_if_stale_source` ONLY
+    EVER FIRES AT STARTUP — i.e. at the one moment it is least likely to be true.
+    A watcher that starts current and is superseded twenty minutes later reports
+    a clean source in its log forever, and every fix shipped to this file is
+    inert until a human happens to notice.
+
+    ⇒ Measured 2026-08-21. The watcher came up at 17:52 from a checkout that was
+    current. The balance/window split landed at 18:12. At 19:45 the fleet was
+    still fully blacked out behind one row's exhausted credit balance, 23
+    subscribers unwakeable, because the process was running code from twenty
+    minutes before the fix — with `source:` printed in its own log and the
+    startup staleness check reporting nothing wrong. Restarting it by hand fixed
+    the fleet in one tick, which is the whole argument: the fix existed, on disk,
+    in the right checkout, and nothing carried it into the running process.
+
+    ⭐ `os.execv` KEEPS THE PID, so the pidfile, the heartbeat's `pid`, and every
+    `watcher_alive()` reader stay correct across the swap. There is deliberately
+    no handover dance: all of this loop's state is on disk (subscriptions, write
+    ledger, holds), which is what makes replacing the code between ticks safe.
+
+    ⛔ It compiles the new source before exec-ing into it. Fourteen checkouts of
+    this repo share one host and a `git pull` is not the only way this file
+    changes; exec-ing into a half-written file would take the fleet's watchdog
+    down with a SyntaxError nobody is watching for. A file that does not compile
+    is left alone and retried next tick.
+    """
+    current = _source_digest()
+    if current is None or current == baseline:
+        return
+    src = Path(__file__).resolve()
+    try:
+        compile(src.read_bytes(), str(src), "exec")
+    except (SyntaxError, ValueError, OSError) as exc:
+        log(f"⚠ this booter's source changed ({baseline[:12]} -> {current[:12]}) "
+            f"but the new copy does not compile ({exc}) — staying on the old "
+            f"code and retrying next tick. Somebody may be mid-edit.")
+        return
+    log(f"⭐ SOURCE CHANGED UNDER THIS WATCHER ({baseline[:12]} -> "
+        f"{current[:12]}) — re-exec-ing into it now, same pid {os.getpid()}. "
+        f"A fix shipped to {src} is live from the next tick; nobody has to "
+        f"remember to restart the loop.")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable,
+             [sys.executable, str(src), "watch",
+              "--host", _REEXEC_ARGS["host"],
+              "--interval", str(_REEXEC_ARGS["interval"])])
+
+
+# The argv the loop must come back up with after a re-exec. Written once by
+# `cmd_watch` so the swap cannot silently drop a flag it was started with.
+_REEXEC_ARGS = {"host": None, "interval": None}
+
+
 def _warn_if_stale_source(where):
     ok, detail = _source_is_current()
     if ok is False:
@@ -3604,6 +3723,13 @@ def cmd_watch(args):
     #    sessions an afternoon.
     _warn_if_stale_source(f"this watcher (pid {os.getpid()})")
     log(f"  source: {Path(__file__).resolve()}")
+    # ⛔ The startup check above answers "was this copy current when I started".
+    #    This one answers "is the code I am RUNNING still the code on disk",
+    #    which is the question that actually costs the fleet — see
+    #    `_reexec_if_source_changed`.
+    _REEXEC_ARGS["host"] = args.host
+    _REEXEC_ARGS["interval"] = args.interval
+    source_baseline = _source_digest()
     try:
         while True:
             # ⛔ THE HEARTBEAT ASSERTS THE LOG IS BREATHING, NOT ONLY THAT WE ARE.
@@ -3625,6 +3751,11 @@ def cmd_watch(args):
             if not load_subs():
                 log("no subscribers left — retiring")
                 break
+            # ⛔ BETWEEN TICKS, never inside one: a tick holds the write ledger's
+            #    invariant across a boot, and swapping the code mid-boot is the
+            #    one moment where "all state is on disk" stops being true.
+            if source_baseline is not None:
+                _reexec_if_source_changed(source_baseline)
             tick(args)
             time.sleep(args.interval)
     finally:
@@ -3694,12 +3825,117 @@ def cmd_status(args):
     return 0 if (alive and not mute) else 1
 
 
+# The one control byte this file may send into a composer, named once.
+COMPOSER_CLEAR_LINE = "\u0015"          # Ctrl+U — clears the composer line
+
+
+def cmd_unjam(args):
+    """Recover a row jammed by OUR OWN unsent boot text. Refuses anything else.
+
+    ⛔⛔ THE HOLE THIS FILLS HAD TWO SIGNPOSTS AND NO FLOOR. The escalation for a
+    standing `refused-draft` said *"for boot-text residue try `ygg-unwedge.sh`"*;
+    that script's own header says it is NOT for an unbootable row and points back
+    here, at `_composer_is_boot_residue_only` — a function this file no longer
+    has, because the residue cleaner was deleted (correctly: it was firing a
+    Ctrl+C into a live campaign session every five and a half minutes for three
+    hours). So each signpost pointed at the other, the thing they both named was
+    gone, and an operator following either arrived nowhere. A row jammed this way
+    sat refused and escalated with a remedy that could not have worked.
+
+    ⛔⛔ AND IT CANNOT CLEAR ITSELF, FOR A REASON WORTH KNOWING. The ledger's
+    "COMPLETE it next tick" path is `--submit-iff-line-equals`, which compares
+    against the input line the DAEMON built from bytes it forwarded. That line is
+    reconstructed from zero when a newer daemon adopts the session — so across a
+    handover the comparison is 0 bytes against 458 and the submit can never fire.
+    Measured 2026-08-21 on a live row: the rendered screen held all 458 bytes and
+    the daemon answered `holds 0 bytes, expected 458`. The atomic submit and the
+    draft flag share one blind spot, so the guard that made the writer safe is
+    also what makes these rows permanently unrecoverable.
+
+    ⭐ WHAT MAKES TYPING HERE PERMISSIBLE AT ALL IS AN EXACT MATCH, and nothing
+    weaker. The composer reconstructed from the rendered grid must equal
+    `BOOT_TEXT` CHARACTER FOR CHARACTER — not contain it, not start with it.
+    Verified byte-exact against a live jammed row before this was written. A
+    prefix or a substring test would fire on a row where somebody had typed after
+    our text, and that is somebody's sentence.
+
+    ⚖ It is a VERB, not a tick action. Every guard in this file exists to stop a
+    timer typing into a row; the answer to one of them being unrecoverable is a
+    person asking for it, not the loop deciding on its own.
+    """
+    row = resolve(args.host, args.row) or args.row
+    if not row:
+        log("⛔ unjam: name a row")
+        return 64
+    short = row.rsplit("/", 1)[-1][:8]
+    # The same state guards a boot takes, in the same order and for the same
+    # reasons — a modal reads single keys, and blind is not clear.
+    choice = _screen_shows_a_choice(args.host, row)
+    if choice is not False:
+        log(f"⛔ NOT UNJAMMING {short} — " + ("its screen shows a prompt awaiting a "
+            "choice" if choice else "its screen could not be read, so a waiting "
+            "prompt cannot be ruled out") + ". Blind is not clear.")
+        return 1
+    readable, composer = _composer_row_content(args.host, row)
+    if not readable or composer is None:
+        log(f"⛔ NOT UNJAMMING {short} — its composer row could not be read.")
+        return 1
+    if composer == "":
+        log(f"⭐ {short} has an EMPTY composer — nothing is jamming it. "
+            f"If it is still not being woken, the reason is elsewhere.")
+        return 0
+    pending = _pending_write(row) or {}
+    ours = {BOOT_TEXT, pending.get("text") or BOOT_TEXT}
+    if composer not in ours:
+        log(f"⛔ REFUSING to touch {short} — its composer holds {len(composer)} "
+            f"character(s) that are NOT exactly our own boot text. This may be a "
+            f"person's unsent sentence, and nothing here gets to decide it is not. "
+            f"Read it with `server screen` and clear it by hand if it is yours.")
+        return 1
+    if args.dry_run:
+        log(f"⭐ {short} holds EXACTLY our own boot text ({len(composer)} chars) "
+            f"and nothing else. --dry-run: not touching it.")
+        return 0
+    # 1. THE BOOT WAS INTENDED, SO TRY TO DELIVER IT FIRST. If the daemon's line
+    #    survived, this presses Enter on our own text under its lock and the row
+    #    gets the wake it was owed — strictly better than throwing it away.
+    if _atomic_submit(args.host, row, composer) is True:
+        _clear_pending_write(row)
+        log(f"⭐ UNJAMMED {short} by DELIVERING it — the daemon's line still held "
+            f"exactly our text, so the Enter it never got has now been pressed.")
+        return 0
+    # 2. The daemon cannot vouch for the line (a handover zeroed it), so the
+    #    atomic path can never fire on this row again. Clear it and let the next
+    #    tick write once, from a composer that is provably empty.
+    log(f"⚠ {short}: the daemon cannot confirm the line (a handover reconstructs "
+        f"it from zero), so the atomic submit can never fire here. Clearing our "
+        f"own text instead — the next tick writes once into an empty composer.")
+    _run(BB.row_host(row, args.host) or args.host,
+         ["server", "terminal", "write", f"cc-runtime://{row.rsplit('/', 1)[-1]}",
+          "--stdin"], COMPOSER_CLEAR_LINE,
+         remote_binary="$HOME/.local/bin/yggterm-headless")
+    time.sleep(1.0)
+    # ⛔ READ IT BACK. Every verb in this file reports the REQUEST unless it is
+    #    made to report the EFFECT, and "I sent a Ctrl+U" is not "the line is
+    #    gone" — a composer that did not clear must not be reported as recovered.
+    readable, after = _composer_row_content(args.host, row)
+    if readable and after == "":
+        _clear_pending_write(row)
+        log(f"⭐ UNJAMMED {short} — read back EMPTY. It boots normally from here.")
+        return 0
+    log(f"⛔ {short} did NOT clear: it still holds "
+        f"{'an unreadable composer' if not readable else str(len(after or '')) + ' character(s)'}. "
+        f"Nothing further is attempted — the next step is an interrupt, and that "
+        f"ends a turn, which is a person's call and not this verb's.")
+    return 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="boot a stalled session that subscribed")
     ap.add_argument("action",
                     choices=["subscribe", "unsubscribe", "defer", "list", "tick",
                              "watch", "status", "disarm", "arm", "coverage", "retire",
-                             "never-arm", "optout", "hold"])
+                             "never-arm", "optout", "hold", "unjam"])
     ap.add_argument("--secs", type=int, default=0,
                     help=f"defer: boot window for one long wait, clamped to "
                          f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
@@ -3804,6 +4040,7 @@ def main():
         "disarm": cmd_disarm,
         "arm": cmd_arm,
         "hold": cmd_hold,
+        "unjam": cmd_unjam,
     }[args.action](args)
 
 
