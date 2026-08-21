@@ -339,6 +339,36 @@ mod tests {
         include_str!("web_surface.rs")
     }
 
+    /// The shim with its `//` comments stripped — i.e. **what actually runs**.
+    ///
+    /// ⛔ Every banned-identifier guard below scans THIS and not the raw
+    /// constant, and the distinction is not pedantry: the first version of
+    /// these tests scanned the raw text and went red because the shim's own
+    /// comment explaining *why* `getVideoPlaybackQuality` is forbidden
+    /// contains the word `getVideoPlaybackQuality`.
+    ///
+    /// That is the same defect, mirrored, as a guard satisfied by the
+    /// explanatory comment above the call it was meant to guard — a source
+    /// scan that cannot tell code from prose is measuring the wrong document.
+    /// The two ways it fails are a false red (delete the comment and the guard
+    /// goes green having tested nothing) and a false green, and the second is
+    /// the one nobody notices.
+    ///
+    /// ⇒ Strip the prose, keep the documentation, assert on the code.
+    fn shim_code() -> String {
+        MEDIA_TRACE_SHIM_JS
+            .lines()
+            .map(|line| match line.find("//") {
+                // A `//` inside a string literal would be mangled by this, so
+                // the shim deliberately contains no such literal — the one
+                // scheme-ish string it needs is "blob:" (see `srcKind`).
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// ⛔⛔ THE PRIVACY GUARD, and the reason it is a source scan rather than a
     /// review note.
     ///
@@ -375,14 +405,14 @@ mod tests {
             ".name",
         ] {
             assert!(
-                !MEDIA_TRACE_SHIM_JS.contains(banned),
+                !shim_code().contains(banned),
                 "`{banned}` is page-authored content and must never be reachable from the \
                  media probe — the trace file outlives the page and is quoted into reports"
             );
         }
         // The one accessor that IS read, and the shape that makes it safe.
         assert_eq!(
-            MEDIA_TRACE_SHIM_JS.matches("currentSrc").count(),
+            shim_code().matches("currentSrc").count(),
             1,
             "`currentSrc` may be read in exactly one place — the `srcKind` classifier"
         );
@@ -502,11 +532,11 @@ mod tests {
     #[test]
     fn frames_are_counted_with_rvfc_and_never_with_the_resetting_counter() {
         assert!(
-            MEDIA_TRACE_SHIM_JS.contains("requestVideoFrameCallback"),
+            shim_code().contains("requestVideoFrameCallback"),
             "presented frames must come from rVFC"
         );
         assert!(
-            !MEDIA_TRACE_SHIM_JS.contains("getVideoPlaybackQuality"),
+            !shim_code().contains("getVideoPlaybackQuality"),
             "getVideoPlaybackQuality() is windowed on this engine and resets; a record \
              built from it reports 0 dropped frames through a visible shortfall"
         );
