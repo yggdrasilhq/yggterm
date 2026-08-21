@@ -1564,14 +1564,32 @@ steady-state minutes, not the two GUI restarts the window contains — worst **3
 (after `dioxus_render/component_window`), so the "no block above 1 s" clause FAILS.
 `webview_edit_stall` incidents in the same 3 h: **zero** — that class did not fire.
 
-⛔ **THAT LAST LINE WENT STALE THE SAME DAY. RE-MEASURED 2026-08-21 AFTERNOON (11.15 monitor,
-GUI host, daemon 3.1.20, a 116-minute window): the class is FIRING — 76 `webview/edit_stall`
-incidents — and `ui/block` is at 2.23/min against the 0.68/min this entry records for the
-morning window.** Counted with `ytrace incidents` (payload.incident=true), not with the span
-query, and not with `ytrace tail`, which is silently capped at 20 records and gave a rate
-3x too high before the cap was noticed.
+⛔⛔ **THE PARAGRAPH THAT WAS HERE WAS WRONG, AND IT WAS MINE. WITHDRAWN 2026-08-21 BY ITS
+OWN AUTHOR (11.15 monitor).** I reported that this class "is FIRING — 76 `webview/edit_stall`
+incidents" and that the zero above had gone stale. **It had not. The 76 came almost entirely
+from builds that PREDATE the fixes**, and my 116-minute window straddled the rolls.
 
-⭐ **AND THE TWO INSTRUMENTS ARE WATCHING ONE EVENT.** The edit-stall diagnosis reads
+Split by the emitter's own `app_version`, over a 6-hour sample:
+
+| | pre-3.1.20 (91.2 min) | **3.1.20+ (76.6 min)** |
+|---|---:|---:|
+| `webview/edit_stall` | 74 = 0.81/min | **0 = 0.00/min** |
+| `ui/block` | 233 = 2.56/min | **33 = 0.43/min** |
+
+⇒ **This entry's claim HOLDS on the builds that carry its fixes**: `edit_stall` is at zero,
+and `ui/block` at 0.43/min is comfortably inside the `< 1/min` bar this entry sets. The
+6x drop in blocks is the fixes working, not weather.
+
+⚠ **The lesson is the one I had just written into the field guide myself, which is why it is
+recorded here rather than quietly deleted: a window that spans a roll describes the roll.**
+Counting by wall-clock window and not by emitter version is how a fixed class reads as a
+live one — the third time that trap landed in a single session, and the first time it landed
+on the person warning about it. **Group incidents by `app_version` before comparing anything
+to a bar.**
+
+⭐ **WHAT THE CLASS LOOKED LIKE WHILE IT WAS STILL FIRING (pre-3.1.20 only — kept because it
+names the mechanism, NOT because it is current):** the two instruments were watching ONE
+event. The edit-stall diagnosis reads
 *"webview edit plane stalled: N new flush-gate timeout(s) (VirtualDom frozen ~2s each), **0**
 new unapplied batch(es) (DOM divergence, restart-only), N late ack(s)"* — and `ui/block` in the
 same window has p95 1,969ms, max 3,317ms. A ~2s VirtualDom freeze and a ~2s UI block are the
@@ -1581,9 +1599,11 @@ same freeze seen from two sides, which is worth more than either count alone.
 acked-batch-that-never-applied class (DOM divergence, restart-only); the plane is not corrupt,
 it is STALLING. So the fix is on the freeze, not on the edit transport.
 
-⚠ The incidents cluster rather than spread: 39 and 21 in two adjacent ten-minute buckets, 12
-in another, spanning app_version 3.1.18 and 3.1.19 — bursts under some condition, not a
-constant drip, so a short quiet window will show zero and mean nothing.
+⚠ They clustered rather than spread: 39 and 21 in two adjacent ten-minute buckets, 12 in
+another — all on 3.1.18 and 3.1.19, which is consistent with the class being fixed at 3.1.20
+rather than merely quiet. Kept as the shape to recognise if it ever returns: bursts under
+some condition, not a constant drip, so a short quiet window proves nothing on its own —
+the emitter-version split is what proves it.
 
 ⚠ And do NOT read the `last_activity` field on a single `ui/block` as its cause. Across the
 sampled blocks it is `None` for half, then `app_declare/daemon_declare_absent` (4),
