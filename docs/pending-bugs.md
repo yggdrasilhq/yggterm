@@ -266,6 +266,66 @@ question. **Status here is about which surface is chosen and whether the launch 
 `YGGTERM_HOME` on the shipped binary, with its own trace plane, in about a minute, without
 touching the desktop. Reach for it before parking a restore-path claim on "the next restart".
 
+## ⛔⛔⛔ [11.26] LEGENDARY — THE TUI PAINTS WRONG WHILE THE BUFFER IS CORRECT, AND EACH CLI BREAKS IN A DIFFERENT REGION
+
+**Status:** OPEN
+
+*Owner, 2026-08-21, from his own seat: "Look at the top line and the prompt area where the TUI
+rendering is broken but typing has no issues. There is frame mixing and the top comment should
+not be there at all. CLIs have middle TUI rendering broken, or top or bottom. **Each CLI has its
+own TUI breakage part.** Yours is bottom."*
+
+⭐ **THE PER-CLI REGIONALITY IS THE CLUE, AND IT IS HIS.** One CLI's top breaks, another's
+middle, another's bottom. A renderer that were simply "slow" or "lossy" would not partition by
+CLI — so the differing region is a function of what each CLI's TUI *does* to that region
+(re-address the cursor, repaint in place, park a status line), and the bug is in how our client
+handles one class of those operations.
+
+### What is measured, and it is the useful half
+
+**1. ⛔ THE TERMINAL BUFFER IS CORRECT WHILE THE PIXELS ARE NOT.** `terminal read-buffer --mode
+screen` on the reported row returned 65 well-formed rows — footer intact with its opening paren
+(`✶ Nesting… (1m 42s · ↓ 3.9k tokens · thought for 12s)`), separator, `❯` prompt, hint line —
+at a moment the owner's screen showed a truncated footer with a dangling `)` and no prompt box.
+⇒ **This is not a content bug. Nothing needs to fail for the screen to be wrong.**
+
+**2. ⛔ THE TOP BANNER IS NOT TERMINAL CONTENT AT ALL.** *"Claude Code session rooted at …; the
+daemon owns the PTY so the conversation can survive sidebar navigation and GUI restarts."* is
+**ours** — `live_session_default_summary`, surfaced through `preview_summary_text`, which is the
+**RENDERED** surface's summary line. Repeated buffer reads confirm it: `banner in buffer: false`.
+⇒ **The rendered surface and the terminal surface were painting at the same time.** That is
+exactly the "frame mixing" he named, and it puts this in the same compositing family as the
+mount-churn entry below — `preview_layer_style` and `terminal_layer_style` both visible.
+
+**3. ⚠ A BLOCK CURSOR ERASES THE GLYPH UNDER IT.** In a faithful frame the placeholder read
+`❭ ▌ress up to edit queued messages` — the `P` gone, not inverted. The buffer holds `❯ ` plus
+dim placeholder text positioned by a cursor-address escape. A real terminal draws the cell and
+inverts it; ours drew the block instead of the cell.
+
+### ⛔⛔ THE INSTRUMENT GAP THAT HAS KEPT THIS UNSOLVED — MEASURED, NOT GUESSED
+
+**A faithful screenshot takes 6,824 ms. A buffer read takes 116 ms.**
+
+⇒ **On a live agent row the two can never be sequenced into one frame.** Every "the buffer says
+X but the screen shows Y" comparison ever made on a busy row has compared two moments seven
+seconds apart — which is why this class keeps producing readings that look like a contradiction
+and are partly just TIME. Caught red-handed doing it in this very investigation: a "simultaneous"
+pair came back `Nesting… 1m42s` in the buffer and `Whirring… 29s` in the pixels, two different
+turns.
+
+⭐ **THEREFORE THE FIRST DELIVERABLE IS AN INSTRUMENT, NOT A FIX: capture the buffer INSIDE the
+webview, in the same frame as the composite.** The screenshot path already runs in the webview
+(`capture_backend: xterm_canvas_composite_over_dom`); having it emit the xterm buffer it
+composited from turns "the pixels disagree with the buffer" from an argument into a diff. Until
+that exists, every claim here is two samples and a hope.
+
+⇒ Then, and only then, the per-region question becomes answerable: for each CLI, which escape
+sequence in its breaking region is the one the client mis-renders.
+
+⚠ **Do NOT reason from the daemon's screen for this.** The daemon's vt100 grid is the source of
+truth for CONTENT and says nothing about what the client painted — that confusion is already a
+standing law in the field guide, and this bug lives entirely in the gap it names.
+
 ## ⛔⛔⛔ [11.14] LEGENDARY — THE MOUNT CHURN: ROWS NOBODY IS LOOKING AT ARE RE-MOUNTED, AND A MOUNT STARTS EMPTY
 
 **Status:** OPEN
