@@ -23,6 +23,10 @@
 # silently is one nobody has to supervise.
 set -uo pipefail
 
+#: ⛔ CAPTURED BEFORE THE PARSER EATS THEM: the re-exec below must relaunch with
+#: the same arguments this process was given.
+ORIG_ARGS=("$@")
+
 INTERVAL=3600
 #: How many times ONE tick will re-sync and build again when the deploy refuses
 #: because main moved under it. Two: a third attempt losing the same race means
@@ -266,11 +270,35 @@ restart_gui() {  # host expected_md5
   fi
 }
 
-say "roll-watch up (interval ${INTERVAL}s, dry=$DRY)"
+# ⛔⛔ RE-EXEC WHEN THIS FILE CHANGES, AND FOR BASH IT IS NOT MERELY A FRESHNESS
+# QUESTION — IT IS A CORRECTNESS ONE. Bash reads a script lazily, by byte offset,
+# so editing the file under a running instance does not leave it uniformly old:
+# it resumes at an offset that now points into different text, which is how a
+# long-lived shell loop starts executing fragments of two versions. This watcher
+# lives in a checkout that other lanes land into every few minutes.
+#
+# ⇒ It is also the fourth instance of one class in a single day — a stale daemon,
+#   a stale GUI, a stale monitor watchdog, and this. Every one of them a
+#   long-lived process reading code from a checkout that moved under it, and
+#   nothing anywhere saying how far behind it was. The monitor's cure (re-exec on
+#   its own mtime) is the right shape and this is the same cure in shell.
+#
+# ⚠ Checked AFTER the sleep and never mid-tick: a tick holds a build and a deploy,
+#   and re-execing through those would abandon a half-deployed fleet.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+self_mtime() { stat -c %Y "$SELF" 2>/dev/null || echo 0; }
+OWN_MTIME="$(self_mtime)"
+
+say "roll-watch up (interval ${INTERVAL}s, dry=$DRY, source $(date -d "@$OWN_MTIME" +%H:%M:%S 2>/dev/null))"
 while :; do
   tick
   [ "$ONCE" = 1 ] && break
   sleep "$INTERVAL"
+  NOW_MTIME="$(self_mtime)"
+  if [ "$NOW_MTIME" != "$OWN_MTIME" ]; then
+    say "⭐ source changed on disk — re-execing so this loop runs one version of itself"
+    exec bash "$SELF" "${ORIG_ARGS[@]}"
+  fi
 done
 
 #: ⛔⛔ A CLIENT RESTART RE-MOUNTS EVERY ROW, AND SOME COME UP BLANK.
