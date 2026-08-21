@@ -2096,6 +2096,35 @@ result.
 Cleanup: kill by EXE, not by pattern — `pgrep -f <path>` matches the shell that holds
 the path in its own command line, so it reports a stray that is your own probe.
 
+## A single red in the server suite is not automatically a flake (measured 2026-08-21)
+
+`cargo test -p yggterm-server --lib` runs ~1,220 tests in one binary on a loaded host,
+and it is not reliably green: **two of the first four full runs failed on a single test
+each, a DIFFERENT test each time, and both passed when run alone.** So "one failure,
+probably a flake, re-run it" is a tempting and mostly-correct reflex.
+
+⛔ **It is also how a real defect ships.** The reaping lock on the owner-notification
+path failed in exactly that shape — one test, red in the suite, green alone. It was not
+a flake: it counted zombie children of the whole test process against a baseline
+snapshot, so a thousand sibling tests spawning and reaping children of the same process
+put it permanently over. It reported *"3 zombie children against a baseline of 0"* for a
+function that spawns exactly ONE child, which is the tell.
+
+⇒ **Read the failure before deciding it is noise.** A flake's message is usually about
+timing; this one's arithmetic did not add up, and the arithmetic is free to check. Two
+questions separate them:
+
+- **Does the message describe more than the test could have caused?** More zombies than
+  children spawned, more rows than inserted, a count the test does not own at all ⇒ the
+  test is measuring a SHARED resource and will keep failing on its neighbours' work.
+- **Does it fail alone under `--test-threads=1`?** Green alone plus red in the suite is
+  consistent with both a flake and a shared-state bug, so this question alone settles
+  nothing — it only tells you which of the two to look for.
+
+⭐ The cure for the shared-resource shape is the same one the row plane already
+learned: **identify, do not count.** Have the code under test report the identity of
+what it created and assert on THAT, so no sibling can move the number.
+
 ## Counting incidents: three verbs, three different answers (measured 2026-08-21)
 
 Asking "how often does this fire" has a right instrument and two wrong ones, and the

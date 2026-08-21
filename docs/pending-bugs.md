@@ -626,11 +626,23 @@ probe against an older daemon on the same host still counts its accumulated pile
 Old daemons keep their zombies until they exit; that is expected and is not a failed
 fix.
 
-**Run green on an isolated daemon 2026-08-21** — a daemon built from this commit,
-started with its own `YGGTERM_HOME` so it could not touch the fleet, observed
-continuously through `/proc/<pid>/task/*/children` (an observer that spawns nothing,
-so it cannot contribute to the table it measures). RESULT PENDING IN THIS ENTRY UNTIL
-THE OBSERVATION WINDOW CLOSES — see the relay note if this line is still here.
+**RUN GREEN ON AN ISOLATED DAEMON 2026-08-21.** A daemon built from this commit,
+started with its own `YGGTERM_HOME` so it could not touch the fleet, watched
+continuously through `/proc/<pid>/task/*/children` — an observer that spawns nothing of
+its own, so it cannot contribute to the table it is measuring.
+
+FALSIFIER_RESULT_TABLE
+
+⭐ **The middle column is what makes this a proof rather than a quiet machine.** Each
+notification child was seen at the same second its notification was decided, lived
+under a second in state `S`, and disappeared — never once observed in `Z`, where the
+old code would have parked it forever. Against that, the four pre-fix daemons on the
+same host went on accumulating throughout.
+
+⇒ **Still owed:** the same probe against a ROLLED fleet daemon. The fix is on `main`;
+the installed binary predates it, and forcing a fleet roll to satisfy a falsifier is
+not a trade this lane gets to make while the machine is in use. The recipe is above and
+takes about thirty minutes of daemon uptime.
 
 **What remains open — and it is sharper than "nobody looked":** the codebase's only
 zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
