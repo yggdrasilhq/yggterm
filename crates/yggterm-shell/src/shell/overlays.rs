@@ -502,25 +502,26 @@ fn CopyEditOverlay(
     }
 }
 #[component]
-/// Leaving vertical tabs while folders exist. The classic tab bar has no place
-/// to draw a folder, so the user's organization is about to move behind an
-/// overflow menu. Nothing is deleted — but a tab silently vanishing from the
-/// strip reads as data loss, and that is the surprise this dialog exists to
-/// prevent. It is raised over a native web surface, so `has_modal_over_viewport`
-/// counts it: without that the surface would paint straight over the dialog.
+/// Leaving vertical tabs while ROW GROUPS exist. The classic tab bar is a single
+/// strip with no place to draw a tree, so the user's organization is about to
+/// move behind an overflow menu. Nothing is deleted — but a tab silently
+/// vanishing from the strip reads as data loss, and that is the surprise this
+/// dialog exists to prevent. It is raised over a native web surface, so
+/// `has_modal_over_viewport` counts it: without that the surface would paint
+/// straight over the dialog.
 #[component]
 fn ClassicTabsSwitchOverlay(
     palette: Palette,
-    folder_count: usize,
+    group_count: usize,
     filed_count: usize,
     on_cancel: EventHandler<MouseEvent>,
     on_confirm: EventHandler<MouseEvent>,
 ) -> Element {
     let overlay_blur = overlay_backdrop_style("blur(18px) saturate(130%)");
-    let folders = if folder_count == 1 {
-        "1 folder".to_string()
+    let groups = if group_count == 1 {
+        "1 group".to_string()
     } else {
-        format!("{folder_count} folders")
+        format!("{group_count} groups")
     };
     let tabs = if filed_count == 1 {
         "1 tab".to_string()
@@ -558,13 +559,13 @@ fn ClassicTabsSwitchOverlay(
                             "font-size:18px; font-weight:700; letter-spacing:-0.01em; color:{};",
                             palette.text,
                         ),
-                        "The tab bar cannot show folders"
+                        "The tab bar cannot show groups"
                     }
                     div {
                         "data-classic-tabs-copy": "1",
                         style: format!("font-size:12px; line-height:1.6; color:{};", palette.muted),
-                        "Classic tabs are a single strip, so no folder is populated into it. \
-                         Only the root tabs stay in the bar; {tabs} in your {folders} move into a \
+                        "Classic tabs are a single strip, so a group cannot be drawn in it. \
+                         Only the root tabs stay in the bar; {tabs} in your {groups} move into a \
                          dropdown at the end of the strip, where the vertical-tabs control used to be. \
                          Nothing is closed or deleted, and switching back to vertical tabs restores the tree."
                     }
