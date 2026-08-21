@@ -2391,6 +2391,44 @@ here. Content says whether this text is in the tree. **Reachability says whether
 behaviour is there** — and that is the only one that answers the question anybody cares
 about. Run it before deleting a branch, and before believing one.
 
+
+## A FAULT THAT STOPS ON ITS OWN IS NOT A FAULT THAT WAS FIXED (2026-08-21)
+
+The app-render loop closed today ran at 44 renders/sec **for the first ten minutes after
+every GUI launch and then went quiet**, which is why it survived weeks of being reported.
+Nothing repaired it: the faulty branch was only reachable while a session had no preview
+target, and targets appear as the startup scans settle. **It ran out of things to spin on.**
+
+Two consequences worth carrying:
+
+1. **A self-limiting fault presents as weather.** "Startup feels janky" is what a
+   ten-minute burst sounds like when described by a person, and weather does not get a bug
+   entry. ⇒ When a symptom is reported as a *period* rather than an *event* — during
+   startup, after a switch, for a while — ask what is being consumed, because something
+   running out is what ends it.
+2. **It makes the measurement window everything.** A probe sampling the quiet sixteen
+   minutes afterwards found the same call site writing 570 times instead of 23,210 and
+   would have called it unremarkable. Both readings were correct.
+
+⇒ **Anchor a startup-window measurement to process start, never to wall clock.** `ps -o
+etimes=` on the GUI pid is the anchor; the proof of the fix was "the GUI has been up longer
+than the whole pre-fix storm lasted, with zero incidents", which is a statement no
+wall-clock window can make.
+
+### The numbers, as a worked before/after
+
+| | pre-fix, 9.0 min from launch | post-fix, 10.2 min from launch |
+|---|---|---|
+| signal writes | 2,689/min | 29/min |
+| top cause's share | 95.9%, one site | 10.7%, no site dominant |
+| root `app` renders | 2,606/min | 27/min |
+| render CPU | 15.67 s/min | 0.25 s/min |
+| `render/storm` incidents | 10 | 0 |
+
+⚠ And the preview path it belongs to still runs — `remote_preview_sync_begin`/`finish` in
+matched pairs on the fixed build. **A quiet probe is also what a broken feature looks like**,
+so a "the noise stopped" claim needs the feature's own evidence beside it.
+
 ## `ytrace tail` cannot compute a RATE in either direction (measured 2026-08-21)
 
 The cap (~20 records) is already noted above as inflating frequency. It distorts the
