@@ -1728,7 +1728,7 @@ green with the term added to the shared key.
 
 ## ⛔ [11.2] A PTY WRITER CANNOT SUBMIT ATOMICALLY — "PRESS ENTER IFF THE LINE EQUALS X" NEEDS A DAEMON VERB
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *Requested 2026-08-20 after a supervision tool typed over the owner's draft.*
 
@@ -1748,6 +1748,48 @@ line is exactly `<text>`, refuse otherwise, report which. Locality: `PtySessionR
 
 **Falsifier:** with the verb in place, a writer that types-then-submits while a synthetic
 keystroke stream is being fed into the same row can never submit a line containing both.
+
+⛔ **NOT IN 3.1.16, AND DELIBERATELY SO — it needs its own number.** 3.1.16 is a heat roll; this
+is a wire change in the safety family, and sweeping it in would mean one version number covering
+two request shapes, which is the exact thing `protocol_shape_stamp_forces_version_bump` exists to
+prevent. ⚠ **Whoever lands this must RE-CUT the stamp** (`STAMPED_AT_VERSION` +
+`STAMPED_SHAPE_HASH` in `daemon.rs`) to the number it actually ships under: it currently reads
+3.1.16, which was allocated while this work was in flight and then shipped without it.
+
+**LANDED IN CODE 2026-08-21 (11.14), on `lane/dev/11.14-input-ux`.** `server terminal write <session> --submit-iff-line-equals <text>`
+— it takes no `--data`, writes exactly one `\r`, and only if the composer's line already reads
+what the caller says it wrote. The verdict comes back as `refused_for_line` beside the existing
+`refused_for_draft`, and ⛔ **`accepted` now requires BOTH to be false** — a caller reading only
+the old field would take a line-mismatch refusal for a success and believe it had pressed Enter.
+
+⭐ **THE LINE IS RECONSTRUCTED FROM THE INPUT STREAM, NOT READ OFF THE SCREEN, and that is what
+makes it correct.** A screen answers what the program has ECHOED, which lags — and that lag IS
+the incident: the caller's own guard read an empty line while the human's keystrokes were still
+in flight. The daemon already walked forwarded bytes to maintain the sticky draft flag; that walk
+now carries the line as well (ONE walker — the grammar is escapes, SS3, OSC, bracketed paste
+where a newline is content, backspace, Ctrl-C/Ctrl-U, and a second walker beside it would drift
+on exactly the hard sequences). Comparison and Enter happen under one lock, so nothing that has
+reached the daemon can land between them.
+
+⚠ **The residual gap is named rather than papered over:** a keystroke still travelling from the
+client has reached nobody, and no daemon-side check can see it. This narrows the window to the
+client→daemon hop.
+
+⛔ **Two hazards found in the implementation and closed, both invisible from the outside.**
+(1) The `\r` goes through the daemon-authored write path, which deliberately skips the input walk
+so a readiness probe cannot fabricate a draft — correct for a probe, wrong here, because this
+Enter really did submit. Unclear, the line would still read the submitted text: a second
+identical call would press Enter AGAIN on a line the composer no longer holds, and the draft flag
+would stay true forever, refusing every later guarded write on an empty composer. The line is now
+cleared under the same guard the comparison held — dropping it first would let a keystroke for
+the NEXT line land and then be erased. (2) The refusal reports LENGTHS, never the text: the line
+it is refusing about may be the owner's own half-typed sentence, and a diagnostic that quotes it
+puts it in a log the way the bug put it on screen.
+
+**What live proof still owes:** the falsifier above, run against a real row — and the consumer
+side, which is the booter's Enter. ⚠ That consumer is another lane's, so this ships the verb and
+does not rewire the caller; per the queue's own note the caller-side mitigation stays correct
+either way, it simply stops being the only guard.
 
 ## ⛔ [11.3] THE INTERFACE LLM'S QUOTA IS GONE, AND EVERY SURFACE KEPT ASKING
 

@@ -1588,7 +1588,43 @@ pub fn input_unanswered_suggests_wedge(input_unanswered_ms: Option<u64>) -> bool
 /// Mirrors the GUI's per-keystroke optimistic busy hint
 /// (`terminal_input_busy_hint_decision`) but is byte-level, escape-aware, and
 /// returns only the sticky-draft bit the migration predicate needs.
-pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
+/// What the current input line holds, reconstructed from the bytes a client has
+/// forwarded to a PTY.
+///
+/// ⭐ THE LINE IS DERIVED FROM THE INPUT STREAM, NOT FROM THE SCREEN, and that
+/// is the whole point of it. A screen answers what the program has ECHOED, which
+/// lags — and that lag is exactly what let a supervision tool's text be spliced
+/// into a half-typed sentence and submitted: the human's keystrokes were still
+/// in flight when the guard looked, so the guard saw an empty line. Every byte
+/// the daemon has forwarded is in here whether or not anything has echoed it.
+///
+/// ⚠ The residual gap, and it is the true limit: keystrokes that have not yet
+/// REACHED the daemon cannot be in here either. This narrows the window to the
+/// client→daemon hop; it does not close it, and no daemon-side check can.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputLineReconstruction {
+    /// The bytes standing on the current line, backspaces already applied.
+    pub line: Vec<u8>,
+    /// Whether those bytes amount to an unsent draft — the sticky flag the
+    /// migration and write guards read.
+    pub draft: bool,
+}
+
+impl InputLineReconstruction {
+    /// The line as text, for comparison against what a writer intended to type.
+    pub fn line_text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.line)
+    }
+}
+
+/// Walk forwarded input bytes, carrying both the draft flag and the line.
+///
+/// ⛔ ONE WALKER, because the grammar is the hard part: escapes, SS3, OSC,
+/// bracketed paste (where a newline is content and not a submit), backspace,
+/// Ctrl-C and Ctrl-U. A second walker written beside this one to answer the
+/// "what does the line say" half would drift on exactly the sequences that are
+/// difficult, and drift here is a guard that types over somebody.
+pub fn input_line_after(prev: bool, prev_line: &[u8], data: &[u8]) -> InputLineReconstruction {
     #[derive(Clone, Copy)]
     enum EscState {
         Normal,
@@ -1602,6 +1638,7 @@ pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
     const PASTE_START_PARAMS: &[u8] = b"200";
     const PASTE_END_PARAMS: &[u8] = b"201";
     let mut draft = prev;
+    let mut line: Vec<u8> = prev_line.to_vec();
     let mut state = EscState::Normal;
     // Depth, not a bool: an unbalanced `ESC [ 201~` with no opener must not
     // wrap around and leave every later newline looking pasted.
@@ -1618,15 +1655,40 @@ pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
                 0x1b => state = EscState::Escape,
                 // In a paste these are content the composer keeps, so they
                 // must not clear the draft. Outside one they are the submit.
-                b'\r' | b'\n' if paste_depth == 0 => draft = false,
-                b'\r' | b'\n' => {}
-                0x03 | 0x15 if paste_depth == 0 => draft = false,
+                b'\r' | b'\n' if paste_depth == 0 => {
+                    draft = false;
+                    line.clear();
+                }
+                // Inside a paste a newline is CONTENT the composer keeps, so it
+                // neither submits nor clears — and it belongs in the line.
+                b'\r' | b'\n' => line.push(byte),
+                0x03 | 0x15 if paste_depth == 0 => {
+                    draft = false;
+                    line.clear();
+                }
                 0x03 | 0x15 => {}
-                0x08 | 0x7f => {}
+                // Backspace/DEL: invisible to the draft flag (a line edited down
+                // to nothing is still "was typed at"), but it must move the line
+                // or an equality test compares against text the composer no
+                // longer holds. Pops a whole UTF-8 scalar, never half of one.
+                0x08 | 0x7f => {
+                    while let Some(&last) = line.last() {
+                        line.pop();
+                        if last & 0xc0 != 0x80 {
+                            break;
+                        }
+                    }
+                }
                 // Printable, non-whitespace bytes (incl. UTF-8 continuation
                 // bytes >= 0x80) are typed text. Control bytes (< 0x20) and
                 // ASCII whitespace are ignored.
-                b if b >= 0x20 && b != b' ' && b != b'\t' => draft = true,
+                b if b >= 0x20 && b != b' ' && b != b'\t' => {
+                    draft = true;
+                    line.push(byte);
+                }
+                // Spaces and tabs are not evidence of a draft on their own, but
+                // they ARE part of the line.
+                b' ' | b'\t' => line.push(byte),
                 _ => {}
             },
             EscState::Escape => {
@@ -1681,7 +1743,15 @@ pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
             }
         }
     }
-    draft
+    InputLineReconstruction { line, draft }
+}
+
+/// The draft half alone — the shape every existing caller reads.
+///
+/// ⚠ Deliberately passes an EMPTY previous line: the draft verdict never
+/// depended on prior line content, so this returns exactly what it always did.
+pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
+    input_line_after(prev, &[], data).draft
 }
 
 pub fn resolve_yggterm_home() -> Result<PathBuf> {
@@ -3659,6 +3729,73 @@ mod tests {
     }
 
     #[test]
+    // The line half, which is what "submit iff the line equals X" is answered
+    // from. ⛔ Derived from the INPUT STREAM, so it is already true before the
+    // program echoes anything — the lag in the echo is what let a supervision
+    // tool's text be spliced into a half-typed sentence and submitted.
+    #[test]
+    fn the_reconstructed_line_is_what_the_composer_holds() {
+        let typed = input_line_after(false, &[], b"boot the row");
+        assert_eq!(typed.line_text(), "boot the row");
+        assert!(typed.draft);
+
+        // Spaces and tabs are content even though they are not, alone, a draft.
+        let spaced = input_line_after(false, &[], b"a\tb c");
+        assert_eq!(spaced.line_text(), "a\tb c");
+
+        // A submit clears the line, which is what makes the guard usable twice.
+        let submitted = input_line_after(false, &[], b"hello\r");
+        assert_eq!(submitted.line_text(), "");
+        assert!(!submitted.draft);
+
+        // Ctrl-C and Ctrl-U clear it too.
+        for clear in [b"typed\x03".as_slice(), b"typed\x15".as_slice()] {
+            assert_eq!(input_line_after(false, &[], clear).line_text(), "");
+        }
+    }
+
+    // ⛔ Backspace is invisible to the draft flag and must NOT be invisible to
+    // the line, or an equality test compares against text the composer no
+    // longer holds — and the guard would press Enter on something else.
+    #[test]
+    fn backspace_moves_the_line_and_never_splits_a_character() {
+        let edited = input_line_after(false, &[], b"boott\x7f");
+        assert_eq!(edited.line_text(), "boot");
+
+        // A whole multi-byte scalar comes off, not one byte of it — otherwise
+        // the line becomes invalid UTF-8 and every later comparison is against
+        // a replacement character.
+        let mut typed = "naïve".as_bytes().to_vec();
+        typed.push(0x7f);
+        let trimmed = input_line_after(false, &[], &typed);
+        assert_eq!(trimmed.line_text(), "naïv");
+        assert!(std::str::from_utf8(&trimmed.line).is_ok());
+    }
+
+    // Continuity across writes: the client forwards keystrokes in whatever
+    // chunks the transport gives it, so a line assembled over three writes must
+    // read the same as one typed in a single burst.
+    #[test]
+    fn the_line_carries_across_separate_writes() {
+        let first = input_line_after(false, &[], b"boot ");
+        let second = input_line_after(first.draft, &first.line, b"the ");
+        let third = input_line_after(second.draft, &second.line, b"row");
+        assert_eq!(third.line_text(), "boot the row");
+        assert_eq!(third.line_text(), input_line_after(false, &[], b"boot the row").line_text());
+    }
+
+    // Inside a paste a newline is content, so the line keeps it — the same rule
+    // the draft flag already follows, from the same walk.
+    #[test]
+    fn a_pasted_newline_stays_in_the_line() {
+        let mut pasted = b"\x1b[200~".to_vec();
+        pasted.extend_from_slice(b"one\ntwo");
+        pasted.extend_from_slice(b"\x1b[201~");
+        let state = input_line_after(false, &[], &pasted);
+        assert_eq!(state.line_text(), "one\ntwo");
+        assert!(state.draft);
+    }
+
     fn input_draft_survives_newlines_inside_a_bracketed_paste() {
         // ⛔ THE REGRESSION: he pastes a multi-line prompt and walks away. The
         // markers were already skipped, but the newlines BETWEEN them were read

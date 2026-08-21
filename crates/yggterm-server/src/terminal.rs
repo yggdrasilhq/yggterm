@@ -1199,6 +1199,21 @@ impl TerminalManager {
             .map(|session| session.has_pending_input_draft())
     }
 
+    /// Atomic conditional submit — see
+    /// [`PtySessionRuntime::submit_if_line_equals`]. `NotOwned` when this
+    /// daemon does not hold the runtime, which a caller must not confuse with a
+    /// refusal.
+    pub fn session_submit_if_line_equals(
+        &self,
+        key: &str,
+        expected: &str,
+    ) -> SubmitIffLineVerdict {
+        match self.sessions.get(key) {
+            Some(session) => session.submit_if_line_equals(expected),
+            None => SubmitIffLineVerdict::NotOwned,
+        }
+    }
+
     pub fn session_process_id(&self, key: &str) -> Option<u32> {
         self.sessions
             .get(key)
@@ -1773,6 +1788,23 @@ impl TerminalManager {
     }
 }
 
+/// What `submit_if_line_equals` did, and why.
+///
+/// ⛔ No variant carries the line's TEXT. The whole point of the guard is that
+/// the line may be the human's own half-typed sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitIffLineVerdict {
+    /// The line matched and the Enter was enqueued.
+    Submitted,
+    /// The line did not match; nothing was written.
+    LineMismatch { line_len: usize, expected_len: usize },
+    /// The line matched but the Enter could not be enqueued.
+    WriteFailed { error: String },
+    /// This daemon does not hold the runtime, so it cannot answer. ⚠ NOT a
+    /// refusal — the caller must not read it as "the line differed".
+    NotOwned,
+}
+
 struct PtySessionRuntime {
     key: String,
     // Unique per PTY spawn (across daemon restarts too — time-based). The
@@ -1812,6 +1844,15 @@ struct PtySessionRuntime {
     // from a release+re-resume session migration. See
     // [[finding-daemon-authoritative-working-state-2945]].
     pending_input_draft: Arc<AtomicBool>,
+    /// The bytes standing on the current input line, reconstructed from the
+    /// same walk that maintains `pending_input_draft`.
+    ///
+    /// ⛔ THE LOCK IS THE ATOMICITY. `submit_if_line_equals` compares and
+    /// enqueues the Enter while holding it, and `write` takes it to append —
+    /// so a keystroke that has reached this daemon can never land BETWEEN the
+    /// comparison and the submit. That gap is what put a supervision tool's
+    /// text into the middle of a half-typed sentence and sent it.
+    pending_input_line: Arc<Mutex<Vec<u8>>>,
     runtime_output_seen: Arc<AtomicBool>,
     eof_without_output: Arc<AtomicBool>,
     attach_ready_seen: Arc<AtomicBool>,
@@ -2516,6 +2557,7 @@ impl PtySessionRuntime {
         let last_activity_ms = Arc::new(AtomicU64::new(started_at_ms));
         let last_output_ms = Arc::new(AtomicU64::new(started_at_ms));
         let pending_input_draft = Arc::new(AtomicBool::new(false));
+        let pending_input_line: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let runtime_output_seen = Arc::new(AtomicBool::new(false));
         let eof_without_output = Arc::new(AtomicBool::new(false));
         let attach_ready_seen = Arc::new(AtomicBool::new(false));
@@ -2821,6 +2863,7 @@ impl PtySessionRuntime {
             last_activity_ms,
             last_output_ms,
             pending_input_draft,
+            pending_input_line,
             runtime_output_seen,
             eof_without_output,
             attach_ready_seen,
@@ -3004,6 +3047,62 @@ impl PtySessionRuntime {
     /// treats this as PROTECTED — releasing such a session would lose the draft.
     fn has_pending_input_draft(&self) -> bool {
         self.pending_input_draft.load(Ordering::SeqCst)
+    }
+
+    /// Press Enter IFF the composer's current line is exactly `expected`.
+    ///
+    /// ⛔ WHY THIS CANNOT BE DONE BY THE CALLER. Typing text and submitting it
+    /// are two discrete writes, and a human's keystrokes land in the gap: on
+    /// 2026-08-20 a supervision tool's text was spliced into the middle of a
+    /// half-typed sentence and submitted, because the caller's own guard read an
+    /// empty line while those keystrokes were still in flight. A caller-side
+    /// screen read-back narrows that window and cannot close it — the screen
+    /// answers what the program has ECHOED, which lags the input stream.
+    ///
+    /// Here the comparison and the Enter happen under one lock, against a line
+    /// derived from the bytes this daemon has forwarded, so nothing that has
+    /// reached this daemon can land between them.
+    ///
+    /// ⚠ The residual gap is honest and named: a keystroke still travelling
+    /// from the client has reached nobody, and no daemon-side check can see it.
+    fn submit_if_line_equals(&self, expected: &str) -> SubmitIffLineVerdict {
+        let mut line = self
+            .pending_input_line
+            .lock()
+            .expect("pty input line lock poisoned");
+        if line.as_slice() != expected.as_bytes() {
+            // ⛔ The lengths, never the text. This refusal is about the human's
+            // own half-typed sentence, and a diagnostic that quotes it puts it
+            // in a log the way the bug put it on screen.
+            return SubmitIffLineVerdict::LineMismatch {
+                line_len: line.len(),
+                expected_len: expected.len(),
+            };
+        }
+        // Still holding the lock: the Enter is a SEPARATE write of `\r`, and
+        // enqueueing it here is what makes the pair indivisible.
+        match self.write_daemon_originated("\r") {
+            Ok(()) => {
+                // ⛔ AND CLEAR WHAT THE ENTER JUST SENT, which the daemon-authored
+                // write path deliberately does not do. That path skips the input
+                // walk so a readiness probe cannot fabricate a draft — correct for
+                // a probe, wrong here: this `\r` really did submit the composer.
+                // Left unclear, the line would still read the submitted text, so a
+                // second identical call would press Enter AGAIN on a line the
+                // composer no longer holds, and the draft flag would stay true
+                // forever, refusing every later guarded write on a row with an
+                // empty composer.
+                // Cleared in place, under the SAME guard the comparison held —
+                // dropping it first would let a keystroke for the NEXT line land
+                // and then be erased by this clear.
+                line.clear();
+                self.pending_input_draft.store(false, Ordering::SeqCst);
+                SubmitIffLineVerdict::Submitted
+            }
+            Err(error) => SubmitIffLineVerdict::WriteFailed {
+                error: error.to_string(),
+            },
+        }
     }
 
     fn snapshot(&self) -> String {
@@ -3385,9 +3484,17 @@ impl PtySessionRuntime {
         // daemon-internal protocol auto-responses (DA/DSR replies) bypass it,
         // so they never fabricate a draft. See `pending_input_draft`.
         let prev_draft = self.pending_input_draft.load(Ordering::SeqCst);
-        let next_draft = yggterm_core::input_line_has_unsent_draft_after(prev_draft, data.as_bytes());
-        if next_draft != prev_draft {
-            self.pending_input_draft.store(next_draft, Ordering::SeqCst);
+        let next = {
+            let mut line = self
+                .pending_input_line
+                .lock()
+                .expect("pty input line lock poisoned");
+            let next = yggterm_core::input_line_after(prev_draft, &line, data.as_bytes());
+            *line = next.line.clone();
+            next
+        };
+        if next.draft != prev_draft {
+            self.pending_input_draft.store(next.draft, Ordering::SeqCst);
         }
         self.write_daemon_originated(data)
     }
@@ -8190,4 +8297,95 @@ line-two on the real screen\r\n\
         );
         let _ = manager.shutdown_all(|_key| None::<String>);
     }
+    // ⛔ THE RACE THIS CLOSES, in the shape it actually happened: a supervision
+    // tool types text, a human's keystroke lands in the gap, and the tool's
+    // Enter submits BOTH glued together. The guard refuses unless the line is
+    // exactly what the tool wrote — and it compares the forwarded input stream,
+    // not the screen, so it is right even before anything has echoed.
+    #[test]
+    fn a_conditional_submit_presses_enter_only_on_the_line_it_was_promised() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let pid = child.process_id().expect("bash pid");
+        let start = crate::pty_adoption::process_start_time(pid).expect("bash start time");
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send_master_fd");
+        let master = crate::pty_handoff_wire::recv_master_fd(&recv)
+            .expect("recv_master_fd")
+            .0;
+        drop(pair);
+
+        let mut manager = TerminalManager::new();
+        let key = "local://submit-iff-line-test";
+        manager
+            .adopt_session(key, "bash", None, 80, 24, master, pid, start, None)
+            .expect("adopt_session");
+
+        // The tool types its text. Nothing has echoed yet and it does not matter.
+        manager.write(key, "boot the row").expect("write boot text");
+
+        // A line that is not what we wrote is refused, and the refusal reports
+        // LENGTHS — never the text, which may be the human's own sentence.
+        match manager.session_submit_if_line_equals(key, "something else") {
+            SubmitIffLineVerdict::LineMismatch { line_len, expected_len } => {
+                assert_eq!(line_len, "boot the row".len());
+                assert_eq!(expected_len, "something else".len());
+            }
+            other => panic!("a differing line must refuse, got {other:?}"),
+        }
+
+        // The human's keystroke lands in the gap — the exact incident shape.
+        manager.write(key, "x").expect("write the human keystroke");
+        assert_eq!(
+            manager.session_submit_if_line_equals(key, "boot the row"),
+            SubmitIffLineVerdict::LineMismatch {
+                line_len: "boot the rowx".len(),
+                expected_len: "boot the row".len(),
+            },
+            "a keystroke in the gap must abort the submit — this is the whole bug"
+        );
+
+        // With the line exactly as promised, it submits.
+        manager.write(key, "\x7f").expect("the human backspaces");
+        assert_eq!(
+            manager.session_submit_if_line_equals(key, "boot the row"),
+            SubmitIffLineVerdict::Submitted
+        );
+
+        // ⛔ And it cannot submit twice: the Enter cleared the line, so the same
+        // call now refuses against an empty composer. Left unclear, this would
+        // press Enter again on text the composer no longer holds.
+        assert_eq!(
+            manager.session_submit_if_line_equals(key, "boot the row"),
+            SubmitIffLineVerdict::LineMismatch {
+                line_len: 0,
+                expected_len: "boot the row".len(),
+            }
+        );
+        assert_eq!(
+            manager.session_has_pending_input_draft(key),
+            Some(false),
+            "the submit cleared the draft, or every later guarded write refuses forever"
+        );
+
+        // A row this daemon does not hold answers NotOwned — which a caller must
+        // not read as a refusal.
+        assert_eq!(
+            manager.session_submit_if_line_equals("local://not-here", "boot the row"),
+            SubmitIffLineVerdict::NotOwned
+        );
+    }
+
 }
