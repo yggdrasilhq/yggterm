@@ -1337,7 +1337,9 @@ const TERMINAL_CODEX_ACTIVITY_HINT_MS: u64 = 6_000;
 // The sidebar sample insert re-renders the whole App root; the preview is
 // display-only so a few-times-per-second refresh is visually identical while
 // sparing the root a re-render on every HostHealth emit during a load.
-const SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS: u64 = 750;
+// 750 → 2500 (confirmed-roots dossier, 2026-08-21): a glanceable preview line
+// does not need 1.3 Hz freshness, and every write is a full root render.
+const SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS: u64 = 2_500;
 const CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS: u64 = 10_000;
 const TITLEBAR_HEIGHT_PX: f64 = 32.0;
 /// Where a top-centre toast sits when the titlebar is PINNED: below the chrome,
@@ -20201,6 +20203,98 @@ impl ShellState {
     /// surface is not up is a TRANSIENT drop that leaves the batch un-acked so
     /// the daemon re-sends until its own expiry. Returns `None` when the reply
     /// carries no well-formed batch.
+    /// Read-only twin of the ping-reply apply pass: would
+    /// [`Self::apply_sidebar_ping`] + [`Self::drain_ping_commands`] change any
+    /// reactive state for THIS reply? The common reply — no stamp moved, no
+    /// command batch, no refetch due — used to take `with_mut` anyway just to
+    /// stamp liveness, which made every 2.5s endpoint ping a full root render
+    /// (3.6/min measured on the laptop GUI, confirmed-roots dossier
+    /// 2026-08-21). Liveness for that case goes to the non-reactive side
+    /// table ([`note_sidebar_ping_liveness`]) that every liveness reader
+    /// max()es in.
+    ///
+    /// ⛔ The refetch half is NOT optional: with unchanged stamps a retry
+    /// budget can still be due (a policy fetch that lost the app's boot
+    /// race), and the fetch is dispatched from the apply pass — a twin that
+    /// ignored it would starve the retry loop. The conditions mirror the
+    /// `SidebarRefetch` tail of `upsert_sidebar_contribution` with the
+    /// stamps-unchanged reduction applied.
+    #[allow(clippy::too_many_arguments)]
+    fn sidebar_ping_would_change_reactive_state(
+        &self,
+        session_path: &str,
+        app_name: Option<&str>,
+        policy_version: Option<&str>,
+        zoom_version: Option<&str>,
+        appearance_version: Option<&str>,
+        document_version: Option<&str>,
+        reply: &serde_json::Value,
+        now_ms: u64,
+    ) -> bool {
+        let Some(existing) = self.sidebar_contributions.get(session_path) else {
+            // The apply pass bails on a missing contribution too — it only
+            // dirtied the signal on its way to doing nothing.
+            return false;
+        };
+        // The apply pass clears the not-responding overlay for this session.
+        if self.document_surface_stale.as_deref() == Some(session_path) {
+            return true;
+        }
+        // A stamp the reply actually carried, differing from the stored one.
+        if policy_version.is_some_and(|version| version != existing.policy_version)
+            || zoom_version.is_some_and(|version| version != existing.zoom_version)
+            || appearance_version.is_some_and(|version| version != existing.appearance_version)
+            || document_version.is_some_and(|version| version != existing.document_version)
+        {
+            return true;
+        }
+        if app_name.is_some() && app_name != existing.app_name.as_deref() {
+            return true;
+        }
+        // A command batch: the drain and its ack bookkeeping must run.
+        if reply
+            .get("commands")
+            .and_then(|commands| commands.get("batch_id"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|id| !id.is_empty())
+        {
+            return true;
+        }
+        // A refetch that fires even with unchanged stamps (retry budgets).
+        let effective_policy = policy_version.unwrap_or(&existing.policy_version);
+        if !effective_policy.is_empty()
+            && existing.policy.is_none()
+            && sidebar_policy_refetch_due(
+                existing.policy_attempts,
+                existing.policy_exhausted_at_ms,
+                now_ms,
+            )
+        {
+            return true;
+        }
+        let effective_zoom = zoom_version.unwrap_or(&existing.zoom_version);
+        if !effective_zoom.is_empty()
+            && !existing.zoom_loaded
+            && existing.zoom_attempts < MAX_ZOOM_FETCH_ATTEMPTS
+        {
+            return true;
+        }
+        let effective_appearance = appearance_version.unwrap_or(&existing.appearance_version);
+        if !effective_appearance.is_empty()
+            && !existing.appearance_loaded
+            && existing.appearance_attempts < MAX_APPEARANCE_FETCH_ATTEMPTS
+        {
+            return true;
+        }
+        let effective_document = document_version.unwrap_or(&existing.document_version);
+        if !effective_document.is_empty()
+            && !existing.document_loaded
+            && existing.document_attempts < MAX_DOCUMENT_FETCH_ATTEMPTS
+        {
+            return true;
+        }
+        false
+    }
     fn drain_ping_commands(&mut self, reply: &serde_json::Value) -> Option<CommandDrainOutcome> {
         let commands = reply.get("commands")?;
         let batch_id = commands
@@ -20713,7 +20807,10 @@ impl ShellState {
             if !reads_live {
                 return true;
             }
-            let effective_last_seen = contribution.last_seen_ms.max(reads_since);
+            let effective_last_seen = contribution
+                .last_seen_ms
+                .max(sidebar_ping_liveness_ms(session_path))
+                .max(reads_since);
             let live = now_ms.saturating_sub(effective_last_seen)
                 <= SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS;
             if !live {
@@ -20733,10 +20830,15 @@ impl ShellState {
         // contribution SURVIVED the retain but is past the stale window. One
         // owner (this sweep) and one clearer (a declare arriving), so the
         // overlay can never disagree with the sweep about staleness.
+        prune_sidebar_ping_liveness(&self.sidebar_contributions);
         self.document_surface_stale = active_visible_path.filter(|path| {
             self.sidebar_contributions.get(path).is_some_and(|contribution| {
-                now_ms.saturating_sub(contribution.last_seen_ms.max(reads_since))
-                    > WEB_SURFACE_STALE_AFTER_MS
+                now_ms.saturating_sub(
+                    contribution
+                        .last_seen_ms
+                        .max(sidebar_ping_liveness_ms(path))
+                        .max(reads_since),
+                ) > WEB_SURFACE_STALE_AFTER_MS
             })
         });
         // An expiry above may have taken the last declaration of the pane that
@@ -20771,7 +20873,12 @@ impl ShellState {
         let Some(contribution) = self.sidebar_contributions.get(&active) else {
             return self.document_surface_stale.is_some();
         };
-        let age = now_ms.saturating_sub(contribution.last_seen_ms.max(reads_since));
+        let age = now_ms.saturating_sub(
+            contribution
+                .last_seen_ms
+                .max(sidebar_ping_liveness_ms(&active))
+                .max(reads_since),
+        );
         if age > SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS {
             return true;
         }
@@ -20792,8 +20899,12 @@ impl ShellState {
         self.sidebar_contributions
             .get(session_path)
             .filter(|contribution| {
-                now_ms.saturating_sub(contribution.last_seen_ms.max(reads_since))
-                    <= WEB_SURFACE_STALE_AFTER_MS
+                now_ms.saturating_sub(
+                    contribution
+                        .last_seen_ms
+                        .max(sidebar_ping_liveness_ms(session_path))
+                        .max(reads_since),
+                ) <= WEB_SURFACE_STALE_AFTER_MS
             })
             .map(|contribution| {
                 contribution
@@ -34407,6 +34518,27 @@ async fn ping_and_apply_contribution(
     let now_ms = current_millis();
     // Apply stamps and drain commands atomically, and persist the ack so the
     // NEXT ping to this endpoint retires the batch we just drained.
+    // Peek before the write (confirmed-roots dossier, 2026-08-21): the common
+    // reply — no stamp moved, no commands, no refetch due — used to take
+    // `with_mut` anyway, one full root render per 2.5s ping. Liveness for that
+    // case rides the non-reactive side table instead; every liveness reader
+    // max()es it in, so aging semantics are unchanged.
+    let ping_would_change = state.with(|shell| {
+        shell.sidebar_ping_would_change_reactive_state(
+            &session_path,
+            app_name.as_deref(),
+            policy_version.as_deref(),
+            zoom_version.as_deref(),
+            appearance_version.as_deref(),
+            document_version.as_deref(),
+            &reply,
+            now_ms,
+        )
+    });
+    if !ping_would_change {
+        note_sidebar_ping_liveness(&session_path, now_ms);
+        return;
+    }
     let applied = state.with_mut_counted(|shell| {
         let refetch = shell.apply_sidebar_ping(
             &session_path,
@@ -34684,6 +34816,35 @@ impl ShellState {
             .collect()
     }
 
+}
+
+thread_local! {
+    /// Ping-liveness side table for sidebar contributions — the stamp a
+    /// changed-nothing ping leaves instead of dirtying the render signal.
+    /// Every liveness reader (`sweep_stale_sidebar_contributions`,
+    /// `sidebar_sweep_due`, `active_sidebar_panes`, the stale-overlay
+    /// computation) max()es this in beside `last_seen_ms`, so an app whose
+    /// pings all say "nothing changed" ages exactly as before — without one
+    /// root render per ping. UI-thread only, like the signal it stands beside.
+    static SIDEBAR_PING_LIVENESS_MS: RefCell<HashMap<String, u64>> =
+        RefCell::new(HashMap::new());
+}
+fn note_sidebar_ping_liveness(session_path: &str, now_ms: u64) {
+    SIDEBAR_PING_LIVENESS_MS.with(|table| {
+        table.borrow_mut().insert(session_path.to_string(), now_ms);
+    });
+}
+fn sidebar_ping_liveness_ms(session_path: &str) -> u64 {
+    SIDEBAR_PING_LIVENESS_MS.with(|table| {
+        table.borrow().get(session_path).copied().unwrap_or(0)
+    })
+}
+/// Drop side-table entries whose contribution is gone — called by the sweep
+/// after its retain, so the table cannot outgrow the contribution set.
+fn prune_sidebar_ping_liveness(live: &HashMap<String, SidebarContributionState>) {
+    SIDEBAR_PING_LIVENESS_MS.with(|table| {
+        table.borrow_mut().retain(|path, _| live.contains_key(path));
+    });
 }
 
 /// Record that a session was asked about, so it is not asked again until

@@ -2236,6 +2236,10 @@ CHOICE_PROMPT_MARKERS = (
 
 
 _CSI = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+# The same grammar arriving as LITERAL TEXT — six characters "\u001b[…" rather
+# than one escape byte — which is what a JSON envelope read raw (not parsed)
+# hands over. See _plain_screen's second paragraph.
+_CSI_LITERAL = re.compile(r"\\u001b\[([0-9;]*)([A-Za-z])")
 
 
 def _plain_screen(text):
@@ -2248,10 +2252,25 @@ def _plain_screen(text):
     nothing is worse than no guard: it reports "no prompt on screen" for a
     screen that is entirely a prompt.
     ⇒ Cursor-forward becomes a space (it IS whitespace on a rendered screen),
-      every other CSI is dropped, and runs of blanks collapse."""
+      every other CSI is dropped, and runs of blanks collapse.
+
+    ⛔⛔ AND THE SAME GRAMMAR CAN ARRIVE AS LITERAL TEXT — measured 2026-08-21 on
+    four wedged rows. The read-buffer arm's stdout is a JSON ENVELOPE; consumed
+    raw, every escape byte is the six literal characters `\\u001b[…`, the real-
+    byte regex above never fires, tokens split mid-word ("booter\\u001b[Cbooted"
+    does not contain "booter boot"), the residue cleaner's length cap blows on
+    the inflation, and the choice-prompt guard can silently miss a real billing
+    prompt — the exact failure its own docstring warns about, alive through the
+    other spelling. The primary fix is parsing the envelope (_screen_text);
+    normalizing the literal form here as well means no future caller can
+    reintroduce the hole by handing this function raw JSON.
+    Literal `\\n`/`\\r`/`\\t` collapse with the blanks for the same reason."""
     def sub(m):
         return " " if m.group(2) == "C" else ""
-    return re.sub(r"\s+", " ", _CSI.sub(sub, text))
+    text = _CSI.sub(sub, text)
+    text = _CSI_LITERAL.sub(sub, text)
+    text = text.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+    return re.sub(r"\s+", " ", text)
 
 
 def _daemon_screen_text(host, row):
@@ -2373,6 +2392,19 @@ def _screen_text(host, row):
     r = _run(host, ["server", "app", "terminal", "read-buffer", row,
                     "--mode", "screen"], "")
     body = (r.stdout or "")
+    # ⛔ The stdout is a JSON ENVELOPE, and the screen lives in its `text`
+    # field. Consuming the envelope raw hands every escape byte over as six
+    # literal characters (`[…`), which defeated the residue cleaner and
+    # blinded the choice-prompt guard on four rows at once (2026-08-21). Parse
+    # it; fall back to the raw body only when it is not JSON at all, where the
+    # literal-form normalization in _plain_screen still covers the match.
+    if body.strip():
+        try:
+            envelope = json.loads(body)
+            if isinstance(envelope, dict):
+                body = envelope.get("text") or ""
+        except ValueError:
+            pass
     if not body.strip():
         body = _daemon_screen_text(host, row) or ""
     return body if body.strip() else None

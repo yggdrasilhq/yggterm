@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Unwedge a frozen yggterm GUI without killing anything.
 #
+# ⛔ NOT FOR AN UNBOOTABLE ROW. The name invites reaching for this when the
+# booter refuses a row over composer residue ("holds boot-text residue PLUS
+# other content") — this script severs the GUI's edit socket and touches no
+# composer, so it does nothing for that. Residue recovery is the booter's own
+# residue cleaner (ygg-booter.py, `_composer_is_boot_residue_only`); a row it
+# still refuses holds something that may be the owner's and stays refused.
+#
 # The GUI freezes when its webview fails to acknowledge an edit batch: dioxus's
 # poll_vdom then skips the ENTIRE VirtualDom -- renders, effects and every
 # spawned task -- while the event loop stays healthy and idle. Severing the edit
