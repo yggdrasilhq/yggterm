@@ -3640,7 +3640,25 @@ pub fn agent_cli_open_session_label(kind: Option<SessionKind>) -> String {
 /// ([`TitleAuthority`]) — so this string's job is to be unmistakable for the
 /// few seconds it is on screen, not to be durable.
 pub fn new_session_birth_title(kind: SessionKind) -> String {
-    match agent_cli_descriptor(kind) {
+    new_session_birth_title_on(None, kind)
+}
+
+/// …and the form that says WHERE, which is the owner's convention:
+/// `New {Machine} {Thing}`.
+///
+/// `machine` is the resolved machine word ([`crate::birth_title::machine_title_word`]),
+/// or `None` on a host with no name worth saying — so a single-machine user's
+/// titles are exactly what they always were.
+///
+/// ⛔ The composition itself lives in [`crate::birth_title`], not here. An APP
+/// spawn has no `SessionKind` and must reach the same convention, and a rule
+/// written in this module could only be reached by things that are agent CLIs.
+pub fn new_session_birth_title_on(machine: Option<&str>, kind: SessionKind) -> String {
+    let thing = match agent_cli_descriptor(kind) {
+        // The descriptor's label already reads `New Claude Code Session`, so the
+        // convention's own `New ` is stripped back off before recomposing —
+        // rather than the label being re-authored here, where a second spelling
+        // of a product's name would drift from the registry's.
         Some(descriptor) => descriptor.new_session_label(),
         None => match kind {
             SessionKind::Shell => "New Terminal".to_string(),
@@ -3652,7 +3670,9 @@ pub fn new_session_birth_title(kind: SessionKind) -> String {
             // invent. Stay generic rather than guess a product name.
             _ => "New Session".to_string(),
         },
-    }
+    };
+    let bare = thing.strip_prefix("New ").unwrap_or(&thing);
+    crate::birth_title::birth_title(machine, bare, None)
 }
 
 /// Which CLI's store `path` lives under, if any. The store roots are mutually

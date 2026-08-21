@@ -40365,7 +40365,27 @@ fn spawn_launch_app_verb(
     insert_after: Option<String>,
 ) {
     let command = app.command_for(&verb);
-    let title_hint = verb.label.clone();
+    // ⛔ THROUGH THE ONE BUILDER. This used to be `verb.label.clone()` — the
+    // manifest verb naming the row directly — which is why the birth-title
+    // convention governed agent spawns and nothing else. A machine name added
+    // to the builder would have reached agent rows and silently missed every
+    // app row, which is the split the spec exists to close.
+    //
+    // The PRIMARY verb (the first the manifest declares) gets the convention
+    // exactly: `New {Machine} {App}`. Any other verb keeps its own qualifier, so
+    // two launches of one app on one machine stay tellable apart — collapsing
+    // them would be the near-duplicate-rows defect the slug fix removed.
+    let is_primary = app.verbs.first().map(|first| first.id == verb.id).unwrap_or(true);
+    let qualifier = if is_primary {
+        None
+    } else {
+        yggterm_core::birth_title::app_verb_title_qualifier(app.display_label(), &verb.label)
+    };
+    let title_hint = yggterm_core::birth_title::birth_title(
+        birth_title_machine_word(&launch_context).as_deref(),
+        app.display_label(),
+        qualifier.as_deref(),
+    );
     // The row's `Source` metadata — the one place a row says WHICH app it is,
     // and the SAME `app:<name>:<verb>` token every launcher menu speaks
     // (`app_verb_token_parts` is its one parser). Registry key, not display
@@ -54682,16 +54702,7 @@ fn queue_move_selected_items_to_group(
 /// can attach to the same host daemon; each records its arrangements under
 /// its own scope so the daemon's ledger can answer per-GUI placement.
 fn gui_row_order_scope() -> String {
-    let host = std::env::var("HOSTNAME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|value| value.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown-host".to_string());
-    format!("gui:{host}")
+    format!("gui:{}", local_host_name())
 }
 
 /// A drop that ARRANGES rather than reorders: what the pointer's band means for
@@ -56785,14 +56796,59 @@ fn ensure_home_scoped_workspace_dir(path: &str) -> Result<bool> {
 /// The naming rule is [`new_session_birth_title`], in core, beside the registry
 /// that knows every CLI's display name.
 fn group_session_title_hint(kind: SessionKind) -> String {
-    yggterm_core::agent_cli::new_session_birth_title(kind)
+    group_session_title_hint_on(None, kind)
+}
+
+/// …and the form that says WHICH MACHINE, which is the owner's convention.
+fn group_session_title_hint_on(machine: Option<&str>, kind: SessionKind) -> String {
+    yggterm_core::agent_cli::new_session_birth_title_on(machine, kind)
+}
+
+/// THIS host's name, as a birth title would say it.
+///
+/// ⛔ ONE owner for "what is this machine called", because there were already
+/// two readers of the same two sources and a third would have been a third
+/// spelling. `HOSTNAME` first (a login shell exports it), `/etc/hostname`
+/// second. `None` when neither says anything worth putting in a title — see
+/// [`yggterm_core::birth_title::machine_title_word`] for which names those are.
+fn local_machine_title_word() -> Option<String> {
+    yggterm_core::birth_title::machine_title_word(&local_host_name())
+}
+
+/// The raw local host name, or an honest placeholder. Not for display: a title
+/// asks [`local_machine_title_word`], which refuses the names that say nothing.
+fn local_host_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown-host".to_string())
+}
+
+/// The machine WORD a launch should be titled with: the ssh target's host for a
+/// remote launch, this host's own name for a local one.
+///
+/// One derivation, so an agent spawn and an APP spawn cannot come to disagree
+/// about which machine they are on — which is the half of the spec that was
+/// open, because the app path never reached the builder at all.
+fn birth_title_machine_word(context: &TerminalLaunchContext) -> Option<String> {
+    match context {
+        TerminalLaunchContext::Remote { ssh_target, .. } => {
+            yggterm_core::birth_title::machine_title_word(ssh_target)
+        }
+        TerminalLaunchContext::Local { .. } => local_machine_title_word(),
+    }
 }
 fn group_session_launch_context(
     shell: &ShellState,
     row: &BrowserRow,
     kind: SessionKind,
 ) -> TerminalLaunchContext {
-    let title_hint = Some(group_session_title_hint(kind));
     // Single source of truth for the launch cwd, local and remote alike:
     // `sidebar_row_launch_cwd` (the row's own `session_cwd`, else the remote
     // folder's path, else the live/active session's `Cwd` metadata), falling back
@@ -56802,15 +56858,25 @@ fn group_session_launch_context(
     // URI, not a directory — so `group_session_cwd` alone would hand
     // `local://<uuid>` to the local launcher and error. See [[spec-unify-local-remote]].
     let cwd = sidebar_row_launch_cwd(shell, row).or_else(|| group_session_cwd(row));
+    // ⚠ The title is composed AFTER the machine is known, not before: it names
+    // the machine the session is about to be born on, and for a remote launch
+    // that is the ssh target rather than this host.
     if let Some(machine) = remote_machine_for_sidebar_row(shell, row) {
+        let word = yggterm_core::birth_title::machine_title_word(&machine.ssh_target);
         return TerminalLaunchContext::Remote {
             ssh_target: machine.ssh_target.clone(),
             prefix: machine.prefix.clone(),
             cwd,
-            title_hint,
+            title_hint: Some(group_session_title_hint_on(word.as_deref(), kind)),
         };
     }
-    TerminalLaunchContext::Local { cwd, title_hint }
+    TerminalLaunchContext::Local {
+        cwd,
+        title_hint: Some(group_session_title_hint_on(
+            local_machine_title_word().as_deref(),
+            kind,
+        )),
+    }
 }
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
     let normalize_legacy_parent = |path: String| {
@@ -57431,7 +57497,10 @@ fn terminal_launch_context_for_row(shell: &ShellState, row: &BrowserRow) -> Term
     let context_row = resolve_creation_context_row(&snapshot.rows, row);
     TerminalLaunchContext::Local {
         cwd: group_session_cwd(&context_row),
-        title_hint: Some(group_session_title_hint(SessionKind::Shell)),
+        title_hint: Some(group_session_title_hint_on(
+            local_machine_title_word().as_deref(),
+            SessionKind::Shell,
+        )),
     }
 }
 fn workspace_view_mode_from_app_control(mode: AppControlViewMode) -> WorkspaceViewMode {

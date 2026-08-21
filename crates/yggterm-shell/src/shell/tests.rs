@@ -27354,7 +27354,12 @@ mod tests {
                 // The birth name says WHAT THE NEW ROW IS. It used to be
                 // `"{spawner label} shell"`, which named the row the context
                 // menu was opened on.
-                assert_eq!(title_hint.as_deref(), Some("New Terminal"));
+                //
+                // ⭐ …and WHERE, now: this is a REMOTE launch, so the machine
+                // word is the ssh target's host and not this one. A row born on
+                // another machine that said this machine's name would be worse
+                // than one that said none.
+                assert_eq!(title_hint.as_deref(), Some("New Dev Terminal"));
             }
             other => panic!("expected remote launch context, got {other:?}"),
         }
@@ -27560,7 +27565,10 @@ mod tests {
                 // Shell", and the session spawned from it used to be born
                 // "Samplenotes Shell codex" — a near-copy of its spawner's
                 // title, two rows apart in the sidebar and barely separable.
-                assert_eq!(title_hint.as_deref(), Some("New Codex Session"));
+                //
+                // The machine word comes from the SSH TARGET, because that is
+                // where this session is about to exist.
+                assert_eq!(title_hint.as_deref(), Some("New Dev Codex Session"));
             }
             other => panic!("expected remote Codex launch context, got {other:?}"),
         }
@@ -52475,6 +52483,72 @@ mod webtabs_menu_switcher_locks {
             tab.group_size = size;
         }
         tabs
+    }
+
+    // ======================================================================
+    // BIRTH TITLES: THE MACHINE, AND THE APP SPAWN THAT BYPASSED THE BUILDER
+    // ======================================================================
+
+    /// ⛔ THE HALF THAT WAS OPEN. `spawn_launch_app_verb` took its title
+    /// straight from the manifest verb's own label, so the ONE builder governed
+    /// agent spawns and nothing else — and a machine name added to the builder
+    /// would have reached agent rows and silently missed every app row.
+    ///
+    /// A source lock, because the bypass is invisible in behaviour: a title
+    /// composed the old way still looks like a title.
+    #[test]
+    fn an_app_spawn_composes_its_title_through_the_one_builder() {
+        let spawn = function_body(&product_source(), "fn spawn_launch_app_verb(");
+        assert!(
+            !spawn.contains("let title_hint = verb.label.clone();"),
+            "the app spawn is naming rows from the manifest verb again, which \
+             puts app rows outside the convention:\n{spawn}"
+        );
+        assert!(
+            spawn.contains("yggterm_core::birth_title::birth_title("),
+            "…and it must compose through the shared builder:\n{spawn}"
+        );
+        assert!(
+            spawn.contains("birth_title_machine_word(&launch_context)"),
+            "…with the machine of the launch it is actually part of — a remote \
+             app spawn titled with THIS host's name is worse than an unnamed \
+             one:\n{spawn}"
+        );
+    }
+
+    /// The convention end to end, over the shapes a real manifest has: the
+    /// primary verb reads exactly `New {Machine} {App}`, and a second verb of
+    /// the same app on the same machine stays tellable apart.
+    #[test]
+    fn the_convention_names_the_machine_and_keeps_two_verbs_apart() {
+        use yggterm_core::birth_title::{app_verb_title_qualifier, birth_title};
+        let machine = Some("Atlas");
+        let primary = birth_title(machine, "Ychrome", None);
+        assert_eq!(primary, "New Atlas Ychrome");
+
+        let second = birth_title(
+            machine,
+            "Ychrome",
+            app_verb_title_qualifier("Ychrome", "New Ychrome (Incognito)").as_deref(),
+        );
+        assert_ne!(
+            primary, second,
+            "two launches landing on one title is the near-duplicate-rows \
+             defect the slug fix removed"
+        );
+
+        // An AGENT spawn reaches the same convention through the same builder,
+        // so the two planes cannot drift apart.
+        assert_eq!(
+            yggterm_core::agent_cli::new_session_birth_title_on(machine, SessionKind::Shell),
+            "New Atlas Terminal",
+        );
+        // …and a host with no name worth saying leaves every title exactly as
+        // it read before the machine existed.
+        assert_eq!(
+            yggterm_core::agent_cli::new_session_birth_title_on(None, SessionKind::Shell),
+            yggterm_core::agent_cli::new_session_birth_title(SessionKind::Shell),
+        );
     }
 
     // ======================================================================
