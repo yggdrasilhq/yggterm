@@ -108,15 +108,31 @@ def main():
 
     # ⚠ The wait is the whole point. A row that is working will read this at the
     # top of its next turn; a row typed into mid-turn may never read it at all.
+    # ⛔⛔ `busy:false` IS NOT READINESS, AND A COLD-START ROW PROVES IT. A row whose
+    # CLI is still booting reports busy:false — nothing is working yet — and then
+    # refuses the submit with `submitted:false`, because the composer is drawn well
+    # before the input loop is live. Measured 2026-08-21 on a freshly spawned lane:
+    # busy:false, submit refused, one second after creation.
+    #
+    # ⇒ Two questions, two probes. `busy` answers "is somebody mid-turn"; only
+    #   `input-check consuming_input` answers "can this row take bytes at all".
+    #   Waiting on both means `submitted:false` is rare rather than routine, which
+    #   matters because the law forbids retrying it — so the ONE submit has to be
+    #   aimed well.
     deadline = time.time() + a.wait_min * 60
     while True:
         row = find_row(host, uuid) or row
-        if not row.get("busy"):
-            break
+        if row.get("busy"):
+            why = f"busy ({row.get('busy_reason')})"
+        else:
+            v = app(host, f"terminal input-check '{uri}' --check-timeout-ms 20000")
+            if (v.get("data") or {}).get("consuming_input"):
+                break
+            why = "not consuming input yet (still starting up?)"
         if time.time() > deadline:
-            log(f"⛔ still busy after {a.wait_min:g}m ({row.get('busy_reason')}) — NOT delivered")
+            log(f"⛔ {why} after {a.wait_min:g}m — NOT delivered")
             return 5
-        log(f"busy ({row.get('busy_reason')}) — waiting {POLL_S}s")
+        log(f"{why} — waiting {POLL_S}s")
         time.sleep(POLL_S)
 
     remote = f"/tmp/ygg-deliver-{uuid[:8]}.txt"
