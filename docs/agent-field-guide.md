@@ -2429,6 +2429,56 @@ wall-clock window can make.
 matched pairs on the fixed build. **A quiet probe is also what a broken feature looks like**,
 so a "the noise stopped" claim needs the feature's own evidence beside it.
 
+
+## A CACHED CRATE EMITS NO WARNINGS, AND THAT READS EXACTLY LIKE A CLEAN ONE (2026-08-21)
+
+`cargo check --workspace` re-prints warnings only for crates it actually compiles. Everything
+fresh in the cache is silent, so a second run of the same command reports a fraction of the
+first — and the fraction it reports is not a subset anybody chose.
+
+Measured today while inventorying dead code: the first workspace scan found **33** items and
+named zero in `yggterm-shell`. Touching the crate roots and re-running found **82**, of which
+**47 were in `yggterm-shell`** — the crate the first scan had implied was clean.
+
+```sh
+touch crates/*/src/lib.rs                    # ⛔ without this the next line reads a CACHE
+cargo check --workspace --message-format=json | …filter code.code == "dead_code"…
+```
+
+⇒ It is the compile-time twin of the fetch-less push audit: an instrument answering *"what has
+changed since I last looked"* while being read as *"what is there"*. **Any warning census must
+force the compile it is counting.**
+
+## ⛔⛔ NEVER `cargo fix --broken-code` — IT SPLICES SOURCE LINES AND MOSTLY COMPILES (2026-08-21)
+
+`--broken-code` applies a suggestion even when the result does not build, which is the flag's
+stated purpose and a much worse idea than it sounds. In one pass over `yggterm-shell` it
+corrupted **six sites** by merging two source lines into one:
+
+```
+"focused": focusedcwd: _                   "window": describe_window(&desktop),
+let effective_force = force || tar_precis_textk.source_updated_at…
+// Drop rememb_messagerdicts / streaks for sessions that are gone
+```
+
+⚠ **Two of the six were code and four were inside COMMENTS** — so the crate failed to compile
+for two of them, got fixed, and the other four sat there compiling perfectly with the prose
+destroyed. A build that goes green is not evidence that the tool behaved.
+
+⇒ **The scan that finds them, and it is cheap:** diff the set of identifiers in each changed
+file against `HEAD`'s and look at what is new. A splice always mints an identifier that exists
+nowhere in the original.
+
+```sh
+# for each changed .rs: set(identifiers in working copy) - set(identifiers in HEAD)
+# real edits add words you recognise; a splice adds `rememb_messagerdicts`
+```
+
+⭐ Use plain `cargo fix` (no `--broken-code`) or apply suggestions by hand. And when a bulk
+edit tool reports what it did, **read the size**: a helper asked to remove a 3-line enum variant
+reported 284 lines, because it matched `}` at the item's indent and an enum variant closes with
+`},`. It caught itself only because it printed the count before anything trusted it.
+
 ## `ytrace tail` cannot compute a RATE in either direction (measured 2026-08-21)
 
 The cap (~20 records) is already noted above as inflating frequency. It distorts the
