@@ -536,6 +536,37 @@ naming nodes that no longer exist — the JS applies batches inside a try/catch 
 rebuild that follows re-creates the tree, so it should be self-correcting, but "should" is
 the word doing the work.
 
+## ⛔⛔ [11.0] A CLIENT RESTART LEAVES A THIRD OF THE ROWS BLANK, AND THE RESTART IS NOW AUTOMATIC
+
+**Status:** OPEN — mitigated by a repair sweep; the seed race itself is not fixed.
+
+*Owner-reported 2026-08-21 as "input bugs are getting fancier by deleting the UI itself".*
+
+**Symptom.** After a client restart a row's viewport is not stale and not garbled — it is
+EMPTY. Client and daemon versions match, the row reads `running · idle`, the PTY size is
+right, and there is nothing in the surface. **Measured immediately after one restart on the
+GUI host: 31 seated rows with a blank or unreadable surface.**
+
+**Why it matters more than it used to.** The client now auto-restarts whenever it is behind
+the daemon (owner ruling: a backdated client against a new daemon is the skew a user must
+never face). That ruling is right, and it means **this defect moved from rare to routine** —
+every roll now re-mounts every row, and the seed races the mount each time.
+
+**Mitigation shipped, not a fix.** `scripts/ygg-roll-watch.sh` runs a repaint sweep after
+every restart it performs: any row whose surface is empty OR unreadable is re-attached with
+`server app sessions restore`, which is proven to make the screen paint on the next read and
+which TYPES NOTHING, so it is safe to run unconditionally. First run repaired 16 of 31.
+⚠ **That leaves the other half unexplained** — either they need longer than the sweep waits,
+or the re-attach does not repair every shape of blank. Both are unmeasured.
+
+**What is actually wanted:** the mount must not be able to land an empty surface. The
+retained-rehydrate retry ladder (`terminal_mount/retained_rehydrate_*`) exists for this and
+its own live proof is recorded as PARTIAL — the ladder above `end` has never been observed
+firing on a healthy fleet. ⇒ This entry and that one are the same defect seen from two ends.
+
+**Falsifier:** restart the client with many rows open and read every seated row's
+`nonblank_line_count` — none may be 0, without any sweep having run.
+
 ## ⛔⛔ [11.0] THE PANIC WATCHDOG'S MEMORY ARM THRESHOLDS A LEVEL, SO IT CANNOT EVER CLEAR
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
