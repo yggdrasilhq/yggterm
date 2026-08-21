@@ -140,12 +140,12 @@ text is replaced by its length, CSI sequences are verbatim, and an OSC is reduce
 length. Do not read it as a transcript — it is deliberately not one, and the reason is in
 `docs/spec-trace-plane-contract.md` §8.
 
-⭐⭐ **`xterm_paint/*` is the half of the chain that did not exist, and it answers ONE question the
-rest of this table cannot: did the glyphs arrive.** Every other probe here describes steady-state
-output, and every native probe stops at the bridge — so "the mount began" and "the mount painted"
-were the same event to every instrument in the project, while a mount **begins with an empty
-surface**. That is why a ghost frame and a broken TUI paint could only ever be judged from a
-photograph.
+⭐⭐ **`xterm_paint/*` answers ONE question the rest of this table cannot: did the glyphs arrive.**
+⚠ Not because the canvas was uninstrumented — the `xterm_write` and `xterm_render` rows above are
+real and this probe is built on them. It is that all of them count EVENTS in a running terminal,
+and every native probe stops at the bridge, so "the mount began" and "the mount painted" were the
+same event to all of them — while a mount **begins with an empty surface**. That is why a ghost
+frame and a broken TUI paint could only ever be judged from a photograph.
 
 ⛔⛔ **A FRAME COUNT IS NOT A PAINT, and this is the misreading the category exists to prevent.**
 The renderer repaints only the rows it marked dirty, so `frames > 0` says nothing about how much of
