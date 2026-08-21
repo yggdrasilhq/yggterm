@@ -6725,6 +6725,92 @@ mod tests {
         );
     }
 
+    /// The fleet's transcript table names the same stores the registry does.
+    ///
+    /// ⛔ **WHY A TABLE EXISTS OUTSIDE THIS FILE AT ALL.** The orchestration verbs
+    /// need one thing the registry does not publish: **where in a store path the
+    /// session id sits.** They had been answering it by slicing a row's address,
+    /// which is right only for a live `scheme://host/<id>` row — so of 281 rows
+    /// measured on a live plane, 246 were called something that was not their id
+    /// and five collapsed onto one shared name.
+    ///
+    /// ⚖ The registry stays the owner of WHERE A STORE IS. The table adds only the
+    /// id position, and this test is the join: transcribing `session_store_globs`
+    /// into it is safe precisely because a drift fails here rather than silently
+    /// in a watchdog at three in the morning.
+    ///
+    /// ⛔ It also refuses a template that does not point INTO the store it claims,
+    /// because a plausible-looking path is exactly what this area keeps shipping —
+    /// a probe that reads the wrong file answers "nothing here", which is the same
+    /// answer as the defect it was written to repair.
+    #[test]
+    fn the_fleet_transcript_table_matches_the_registry() {
+        let raw = include_str!(
+            "../../../.agents/skills/yggterm-agent-fleet/cli-stores.json"
+        );
+        let table: serde_json::Value =
+            serde_json::from_str(raw).expect("cli-stores.json is not valid JSON");
+        let clis = table["clis"].as_object().expect("cli-stores.json has no `clis` map");
+
+        for descriptor in AGENT_CLIS.iter() {
+            let entry = clis.get(descriptor.slug).unwrap_or_else(|| {
+                panic!(
+                    "{} is a registered CLI with no row in cli-stores.json — the fleet \
+                     verbs will find no transcript for it and read that as \"this row \
+                     has never done anything\"",
+                    descriptor.slug
+                )
+            });
+
+            let recorded: Vec<&str> = entry["store_globs"]
+                .as_array()
+                .expect("store_globs must be an array")
+                .iter()
+                .map(|value| value.as_str().expect("a glob must be a string"))
+                .collect();
+            assert_eq!(
+                recorded, descriptor.session_store_globs,
+                "cli-stores.json has drifted from the registry for {} — the registry \
+                 owns where a store is, so fix the JSON, not this test",
+                descriptor.slug
+            );
+
+            let template = entry["transcript"].as_str();
+            if descriptor.session_store_globs.is_empty() {
+                assert!(
+                    template.is_none(),
+                    "{} declares no store, so a transcript template for it is a guess \
+                     wearing the costume of a measurement",
+                    descriptor.slug
+                );
+                continue;
+            }
+            let template = template.unwrap_or_else(|| {
+                panic!(
+                    "{} declares a store but no transcript template, so the fleet \
+                     cannot tell one of its sessions from another",
+                    descriptor.slug
+                )
+            });
+            assert!(
+                template.contains("{id}"),
+                "{}'s template names no session id, so it cannot address one session: \
+                 {template}",
+                descriptor.slug
+            );
+            // ⛔ Substituting a real-shaped id must land INSIDE this CLI's own store,
+            //    judged by the registry's own predicate rather than by string eyeballing.
+            let sample = template.replace("{id}", "00000000-1111-4222-8333-444444444444");
+            let absolute = format!("/home/someone/{sample}");
+            assert!(
+                descriptor.store_path_is_under_root(&absolute),
+                "{}'s transcript template points outside the store the registry \
+                 declares for it: {absolute}",
+                descriptor.slug
+            );
+        }
+    }
+
     #[test]
     fn every_agent_cli_declares_a_store() {
         for descriptor in AGENT_CLIS {
