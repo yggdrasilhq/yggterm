@@ -34,9 +34,16 @@ what it said).
 
 **Still returning a blank:**
 
-- **muse** — its records carry no `type`/`role` key at all, so its turn shape has not
-  been identified. It has a large real store here, so this is measurable now and needs
-  no credential.
+- **muse** — ⚠ **investigated 2026-08-22; it is NOT a missing parser.** Its records are
+  a structured event stream keyed on `payload_type`/`payload`, and across the six
+  largest sessions on this host the tail holds only `runtime.session` (961),
+  `tool_batch.effect.*` and `session.end` — **task and command events, no
+  conversational turn anywhere.** The `session.peer-history.sqlite3` beside it is an
+  index of line offsets and hashes INTO that same file, not a second store. ⇒ muse has
+  been used here as a task runner rather than a chat, so its prose shape cannot be
+  identified from the stores present — the same category as qwen below, an
+  unmeasurable rather than a defect. **Do not write a muse parser from its source; get
+  one conversational session on disk first.**
 - **pi · grok-build** — no session on either host is big enough to read a turn from.
 - **qwen-code** — blocked behind the credential gate in the entry below.
 
