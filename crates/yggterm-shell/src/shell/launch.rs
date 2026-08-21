@@ -4478,6 +4478,112 @@ fn app() -> Element {
                         on_confirm: move |_| state.with_mut_counted(|shell| shell.confirm_classic_tabs_switch()),
                     }
                 }
+                // THE OMNIBOX, RAISED. Owner requirement: focusing the address
+                // input opens a CENTRED palette with visible results instead of
+                // a small corner field with a popover under it — and any route
+                // that focuses the input raises it, because the raise keys on
+                // the DRAFT existing rather than on which gesture created it.
+                //
+                // ⛔ It is mounted HERE, with the other over-viewport modals,
+                // not inside the rail. A native web surface draws above ALL DOM,
+                // so a palette drawn inside the rail's own subtree would be
+                // invisible over a browsing session; being a `TopModal` is what
+                // makes the reconciler stash the surface first.
+                if snapshot.web_command_palette_open
+                    && let Some(overlay) = snapshot.active_web_surface_overlay.clone()
+                {
+                    {
+                        let draft = overlay.address_text.clone();
+                        let items = web_omnibox_palette_items(&draft, &overlay.address_suggestions);
+                        let session = overlay.session.clone();
+                        let ssh = state
+                            .with(|shell| shell.web_surface_session_ssh_target(&session));
+                        let count = items.len();
+                        let accept_draft = draft.clone();
+                        let (move_session, accept_session, dismiss_session) =
+                            (session.clone(), session.clone(), session.clone());
+                        rsx! {
+                            // Hover, focus and the results' scrollbar — the
+                            // things inline styles cannot express. Mounted with
+                            // the palette rather than in a global block so the
+                            // rules exist exactly while something uses them.
+                            style { {YGGUI_COMMAND_PALETTE_CSS} }
+                            CommandPalette {
+                                palette: CommandPalettePalette::new(
+                                    snapshot.palette.text,
+                                    snapshot.palette.muted,
+                                    snapshot.palette.panel,
+                                    snapshot.palette.border,
+                                    snapshot.palette.accent_soft,
+                                    "rgba(16,24,34,0.34)",
+                                ),
+                                query: draft,
+                                items,
+                                // Row 0 is what plain Enter does, so "nothing
+                                // chosen yet" and "the go row" are the same
+                                // state and the palette always has a target.
+                                selected: overlay.address_suggestion_index.unwrap_or(0),
+                                placeholder: "Search or enter address".to_string(),
+                                empty_label: "Type an address, or a phrase to search for".to_string(),
+                                on_query: move |next: String| {
+                                    let session = session.clone();
+                                    state.with_mut_counted(|shell| {
+                                        shell.web_surface_type_address(&session, next);
+                                    });
+                                },
+                                on_move: move |moved: PaletteMove| {
+                                    let session = move_session.clone();
+                                    state.with_mut_counted(|shell| {
+                                        let current = shell
+                                            .web_surfaces
+                                            .get(&session)
+                                            .and_then(|surface| surface.address_suggestion_index)
+                                            .unwrap_or(0);
+                                        let next = palette_index_after(current, count, moved);
+                                        shell.web_surface_set_address_suggestion(&session, next);
+                                    });
+                                },
+                                on_accept: move |id: String| {
+                                    let session = accept_session.clone();
+                                    let Some(url) = web_omnibox_palette_target(&id, &accept_draft)
+                                    else {
+                                        return;
+                                    };
+                                    let tab = state.with(|shell| {
+                                        shell
+                                            .web_surfaces
+                                            .get(&session)
+                                            .map(|surface| surface.active_tab)
+                                    });
+                                    if let Some(tab) = tab {
+                                        // Clearing the draft is what SHUTS the
+                                        // palette: it is the one fact the raise
+                                        // reads, so navigating without clearing
+                                        // would leave it standing over the page
+                                        // it just loaded.
+                                        state.with_mut_counted(|shell| {
+                                            shell.web_surface_set_address_draft(&session, None)
+                                        });
+                                        navigate_web_surface_tab(
+                                            state,
+                                            session.clone(),
+                                            tab,
+                                            url,
+                                            ssh.clone(),
+                                            None,
+                                        );
+                                    }
+                                },
+                                on_dismiss: move |_| {
+                                    let session = dismiss_session.clone();
+                                    state.with_mut_counted(|shell| {
+                                        shell.web_surface_set_address_draft(&session, None)
+                                    });
+                                },
+                            }
+                        }
+                    }
+                }
                 if let Some(dialog) = snapshot.copy_edit_dialog.clone() {
                     CopyEditOverlay {
                         dialog,
