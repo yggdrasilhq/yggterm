@@ -107,6 +107,9 @@ are distinguished by the record's `layer` field, **not** by `component` — both
 | `xterm` | `xterm_screen/reset` | point | the canvas was wiped, with the reason |
 | `xterm` | `xterm_screen/{replay_reset,replay_reseed}` | point | the wipe-and-refill pair of a retained replay |
 | `xterm` | `xterm_attach/stream_sample` | point | the CONTROL structure of the bytes the canvas was handed, tagged `reseed` / `live_stream` / `restore`, with an SGR census |
+| `xterm` | `xterm_paint/mount_open` | point | `term.open()` returned and the surface is BLANK — the anchor the mount chain is measured from, carrying `script_to_host_ms`, `host_to_open_ms`, the grid, and whether the open needed a retry |
+| `xterm` | `xterm_paint/first_frame` | span (wall) | the empty surface to the first glyphs on it. `duration_ms` is open→frame; the payload splits it into `open_to_write_ms`, `write_to_parsed_ms`, `parsed_to_frame_ms` |
+| `xterm` | `xterm_paint/settle` | window | did this mount actually PAINT: `rows_covered` against `rows_with_content`, `rows_content_unpainted`, `complete`, `painted`, `blank_frames_before_write`, plus `overshoot_ms` |
 | `dioxus` | `dioxus_render/component_window` | window | per-component render cost (`renders`, `total_ms`, `max_ms`, `mean_ms`, hottest first) **and** the invalidation causes (`causes[]`, `root_renders`, `renders_unattributed`) |
 | `rust` | `trace_bridge/foreign_batch_faults` | point | what the boundary refused or repaired, and how far behind the emitter was running |
 
@@ -136,6 +139,60 @@ fault is in applying the attributes. ⛔ The `sample` field is **redacted**: eve
 text is replaced by its length, CSI sequences are verbatim, and an OSC is reduced to its opcode and
 length. Do not read it as a transcript — it is deliberately not one, and the reason is in
 `docs/spec-trace-plane-contract.md` §8.
+
+⭐⭐ **`xterm_paint/*` answers ONE question the rest of this table cannot: did the glyphs arrive.**
+⚠ Not because the canvas was uninstrumented — the `xterm_write` and `xterm_render` rows above are
+real and this probe is built on them. It is that all of them count EVENTS in a running terminal,
+and every native probe stops at the bridge, so "the mount began" and "the mount painted" were the
+same event to all of them — while a mount **begins with an empty surface**. That is why a ghost
+frame and a broken TUI paint could only ever be judged from a photograph.
+
+⛔⛔ **A FRAME COUNT IS NOT A PAINT, and this is the misreading the category exists to prevent.**
+The renderer repaints only the rows it marked dirty, so `frames > 0` says nothing about how much of
+the viewport was covered — a mount that painted two rows and stopped has frames, a render window,
+and a perfectly healthy `frame_gap` profile. `settle` answers the question the eye asks instead:
+
+* `rows_with_content` — rows the terminal HOLDS text on, read from the buffer.
+* `rows_covered` — rows any frame since the mount has painted, unioned over the frame ranges.
+* `rows_content_unpainted` — the difference, and **the field to read first**. Positive means the
+  screen is showing less than the session contains.
+
+The test is only sound because it is scoped to a **mount**: the surface started blank, so every row
+holding text must be painted at least once. It is not a claim about steady state, and it is not
+computed there.
+
+⛔⛔ **`painted` means "a frame landed AFTER bytes reached the canvas", not "a frame happened" — and
+the first cut of this probe got that wrong in the direction that flatters it.** Latching the first
+frame outright, the very first live mount reported `open → frame` of 218 ms with
+`writes_before_frame: 0`: a span that measured **the canvas painting itself empty**, which is the
+one event the probe exists to tell apart from glyphs arriving. Frames before the first write are now
+counted as `blank_frames_before_write` and never latched — and that count is worth reading on its
+own, because *a blank surface repainting is what a ghost frame is*. A mount with frames, no writes
+and an empty buffer would otherwise have reported itself `complete` for having faithfully painted
+nothing.
+
+⚠ **`rows_with_content: -1` is "the buffer could not be read", which is NOT `0`.** Blind is not
+empty — a reader that collapses the two reads an unreadable buffer as a terminal with nothing in
+it, i.e. as a perfectly painted one. `verdict: blind` in `scripts/paint-chain.py` is that case kept
+separate on purpose.
+
+⚠ **An invisible host is EXPECTED not to paint.** The mount churn re-mounts rows nobody is looking
+at and their renderer is idle by design, so those mounts report `painted: false` truthfully; the
+`visible` field is what separates a fault from a cost. It is also why no recheck follows an
+invisible mount, and why the first record says so in `recheck_scheduled` — a missing record and a
+healthy one look identical.
+
+⛔ **`overshoot_ms` is not a paint measurement — it is a UI-thread stall.** The settle timer runs on
+the very thread whose stalls are under investigation, so it is never assumed to have fired on time:
+it reports the measured window beside its nominal deadline. What it cannot report is a thread that
+never comes back at all, and that is what `mount_open` is for — **a mount with no `first_frame`
+after it never painted**, and the absence is legible from the native side by joining on `host_id`
+alone. Neither half is sufficient; the pair is the instrument.
+
+⭐ **Read the whole chain with `scripts/paint-chain.py`** (`--since 10m`, `--visible-only`,
+`--json`). It joins native `terminal_mount/*` to `xterm_paint/*` on `host_id` — which already
+encodes the mount epoch as `<host>-m<epoch>`, so no second identity was introduced — and prints one
+line per mount with a verdict of `painted` / `partial` / `unpainted` / `blind` / `open`.
 
 ⛔ **`xterm_screen/replay_reset` and `replay_reseed` are a PAIR, and the gap between them is the
 question.** Any record whose `seq` falls between the two wrote into a screen that was

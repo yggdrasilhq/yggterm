@@ -580,6 +580,30 @@ def rate_limit_hold():
     #    next read — the failure would look exactly like "no hold was ever set".
     if d.get("indefinite"):
         return d
+    # ⛔⛔ A HOLD WHOSE OWN EVIDENCE THIS CODE RECLASSIFIES IS RELEASED, NOT
+    #    WAITED OUT. Measured 2026-08-21, minutes after the balance/window split
+    #    shipped: the watcher was restarted, recognised the refusal as an
+    #    exhausted BALANCE on its first tick, suspended that one row exactly as
+    #    designed — and 18 other rows stayed unwakeable for another 16 minutes
+    #    behind a hold the previous code had armed from the very same tail.
+    #
+    #    ⇒ The fix corrected the DECISION and left the ARTEFACT in force. That is
+    #    the shape this file already knows from `note_rate_limit`: a frozen tail
+    #    read as a live signal. Here it is worse, because the tail is one this
+    #    code has just decided was never fleet-wide in the first place — so the
+    #    hold is not merely stale, it is unsupported by its own record.
+    #
+    #    ⚖ A DECLARED hold is untouched. That one is an instruction from a human
+    #    who could see the account, and a reclassification of the automatic path
+    #    does not get to overrule it.
+    if (not d.get("declared_until")
+            and refusal_is_a_balance_not_a_window(d.get("tail"))):
+        log("⭐ RELEASING the fleet quota hold — its own recorded refusal is an "
+            "exhausted CREDIT BALANCE, which this code holds PER ROW rather "
+            "than fleet-wide. The row that hit it is suspended; nobody else "
+            "should have been waiting on it.")
+        RLHOLDFILE.unlink(missing_ok=True)
+        return None
     if time.time() >= (d.get("until") or 0):
         RLHOLDFILE.unlink(missing_ok=True)
         return None
@@ -3549,6 +3573,75 @@ def _source_is_current():
         return (None, f"could not compare: {exc}")
 
 
+def _source_digest():
+    """sha256 of the file this process is EXECUTING, or None if it cannot be read.
+
+    ⛔ `None` is "cannot tell", never "unchanged" — a branch switch can take the
+    file out from under a running watcher, and a missing file must not read as
+    a match."""
+    try:
+        return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _reexec_if_source_changed(baseline):
+    """Re-exec into the current source when this file changes under us.
+
+    ⛔⛔ THE WATCHER IS A LOOP NOBODY RESTARTS, AND `_warn_if_stale_source` ONLY
+    EVER FIRES AT STARTUP — i.e. at the one moment it is least likely to be true.
+    A watcher that starts current and is superseded twenty minutes later reports
+    a clean source in its log forever, and every fix shipped to this file is
+    inert until a human happens to notice.
+
+    ⇒ Measured 2026-08-21. The watcher came up at 17:52 from a checkout that was
+    current. The balance/window split landed at 18:12. At 19:45 the fleet was
+    still fully blacked out behind one row's exhausted credit balance, 23
+    subscribers unwakeable, because the process was running code from twenty
+    minutes before the fix — with `source:` printed in its own log and the
+    startup staleness check reporting nothing wrong. Restarting it by hand fixed
+    the fleet in one tick, which is the whole argument: the fix existed, on disk,
+    in the right checkout, and nothing carried it into the running process.
+
+    ⭐ `os.execv` KEEPS THE PID, so the pidfile, the heartbeat's `pid`, and every
+    `watcher_alive()` reader stay correct across the swap. There is deliberately
+    no handover dance: all of this loop's state is on disk (subscriptions, write
+    ledger, holds), which is what makes replacing the code between ticks safe.
+
+    ⛔ It compiles the new source before exec-ing into it. Fourteen checkouts of
+    this repo share one host and a `git pull` is not the only way this file
+    changes; exec-ing into a half-written file would take the fleet's watchdog
+    down with a SyntaxError nobody is watching for. A file that does not compile
+    is left alone and retried next tick.
+    """
+    current = _source_digest()
+    if current is None or current == baseline:
+        return
+    src = Path(__file__).resolve()
+    try:
+        compile(src.read_bytes(), str(src), "exec")
+    except (SyntaxError, ValueError, OSError) as exc:
+        log(f"⚠ this booter's source changed ({baseline[:12]} -> {current[:12]}) "
+            f"but the new copy does not compile ({exc}) — staying on the old "
+            f"code and retrying next tick. Somebody may be mid-edit.")
+        return
+    log(f"⭐ SOURCE CHANGED UNDER THIS WATCHER ({baseline[:12]} -> "
+        f"{current[:12]}) — re-exec-ing into it now, same pid {os.getpid()}. "
+        f"A fix shipped to {src} is live from the next tick; nobody has to "
+        f"remember to restart the loop.")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable,
+             [sys.executable, str(src), "watch",
+              "--host", _REEXEC_ARGS["host"],
+              "--interval", str(_REEXEC_ARGS["interval"])])
+
+
+# The argv the loop must come back up with after a re-exec. Written once by
+# `cmd_watch` so the swap cannot silently drop a flag it was started with.
+_REEXEC_ARGS = {"host": None, "interval": None}
+
+
 def _warn_if_stale_source(where):
     ok, detail = _source_is_current()
     if ok is False:
@@ -3604,6 +3697,13 @@ def cmd_watch(args):
     #    sessions an afternoon.
     _warn_if_stale_source(f"this watcher (pid {os.getpid()})")
     log(f"  source: {Path(__file__).resolve()}")
+    # ⛔ The startup check above answers "was this copy current when I started".
+    #    This one answers "is the code I am RUNNING still the code on disk",
+    #    which is the question that actually costs the fleet — see
+    #    `_reexec_if_source_changed`.
+    _REEXEC_ARGS["host"] = args.host
+    _REEXEC_ARGS["interval"] = args.interval
+    source_baseline = _source_digest()
     try:
         while True:
             # ⛔ THE HEARTBEAT ASSERTS THE LOG IS BREATHING, NOT ONLY THAT WE ARE.
@@ -3625,6 +3725,11 @@ def cmd_watch(args):
             if not load_subs():
                 log("no subscribers left — retiring")
                 break
+            # ⛔ BETWEEN TICKS, never inside one: a tick holds the write ledger's
+            #    invariant across a boot, and swapping the code mid-boot is the
+            #    one moment where "all state is on disk" stops being true.
+            if source_baseline is not None:
+                _reexec_if_source_changed(source_baseline)
             tick(args)
             time.sleep(args.interval)
     finally:

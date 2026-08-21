@@ -57,31 +57,106 @@ painted partially. Both are what "a mount begins with an empty surface" looks li
 rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
 filing three entries for one symptom chain is what made this look half-fixed once already.
 
-**The tracing the owner asked for is END TO END:** kernel call → daemon → client →
-**xterm.js layer** → pixel.
+### ⭐ THE MOUNT→PAINT SPAN NOW EXISTS — 2026-08-21, `xterm_paint`
 
-⛔ **CORRECTED 2026-08-21 — THIS ENTRY SAID THE xterm.js HALF DID NOT EXIST, AND IT DOES.**
-Measured over 6 h on the GUI host: `xterm_render/frame_gap` carries **`rows_painted`
-against `rows`**, so a half-drawn frame is directly countable (2 partial of 4558 late
-frames); `xterm_render/frame_window` carries **`full_canvas_frames` against `count`** and,
-unlike `frame_gap`, is not threshold-gated, so it is the honest denominator; and
-`terminal_js/xterm_write_flush` carries `paint_repair` with its reason. The stale claim
-cost a lane a briefing before it was caught.
+*This section replaced the paragraph that said the tracing "does not exist yet", which would
+otherwise have routed the next reader away from the instrument built to serve this entry.*
 
-⚠ **And `frame_gap` is a trap read as a frame-rate meter: its minimum IS its threshold**
+⚠ **And it corrects that paragraph in the other direction too.** The xterm.js layer was NOT
+uninstrumented: `xterm_render/frame_gap` already carried `rows_painted` against `rows` and
+`frame_window` carried `full_canvas_frames`, and this probe is built on them rather than
+beside them. What did not exist is a probe that **spans the mount**. Every existing probe
+counts events in a running terminal; every native probe stops at the bridge; so "the mount
+began" and "the glyphs arrived" were the same event to all of them. **A mount begins with an
+empty surface**, which is exactly where the ghost frames and the broken TUI paint live.
+
+Three probes, `layer=xterm`, joined to the native half by `host_id` (which already encodes the
+mount epoch, so no second identity was introduced):
+
+| probe | says |
+|---|---|
+| `xterm_paint/mount_open` | the surface exists and is BLANK — the anchor |
+| `xterm_paint/first_frame` | open → first glyphs, split into write / parse / frame |
+| `xterm_paint/settle` | **did this mount paint**: rows covered against rows holding content |
+
+⛔⛔ **A FRAME COUNT IS NOT A PAINT** — the renderer repaints only dirty rows, so a mount that
+painted two rows and stopped has frames, a render window and a healthy frame-gap profile.
+`rows_content_unpainted` is the field: rows the terminal holds text on that no frame since the
+mount has covered. Positive means the screen is showing less than the session contains, which
+is what broken TUI paint is from the inside. The test is sound only because it is scoped to a
+MOUNT — the surface started blank, so every row with text must be painted at least once.
+
+⇒ **A partially-painted frame and a fully-painted one are now distinguishable in the trace,
+without a screenshot.** Read the whole chain with `scripts/paint-chain.py`; the columns and the
+traps are in `docs/observability.md` §2.3.
+
+#### What the instrument read on its first run — and the two things it separated
+
+Sandbox, headless compositor, six surface builds across three local shells. ⚠ These are shell
+sessions on one machine, not the owner's agent rows; the numbers below are the instrument
+working, not a characterisation of his GUI.
+
+| | cold build (first reveal) | rebuild (switch back) |
+|---|---:|---:|
+| `open → first byte` | 411 / 427 / 556 ms | 35 / 39 / 40 ms |
+| blank frames before any byte | 3 / 5 / 5 | 0 / 0 / 0 |
+| `write → parse` | 5–10 ms | — (sync path) |
+| `parse → frame` | 5–18 ms | — |
+| `write → frame` | 10 / 13 / 28 ms | 23 / 24 / 25 ms |
+| rows covered | 62/62, complete | 62/62, complete |
+
+⭐ **THE SEPARATION IS THE RESULT, not the totals.** On a cold build the empty-surface window is
+**97% spent waiting for BYTES and 3% painting them** — and the native half of the same chain says
+why: `terminal_mount/first_output` landed 391 ms after `mount_open`, and the canvas accepted those
+bytes 36 ms later. So that 427 ms is the SESSION starting up, not yggterm being slow to paint, and
+the 36 ms is the bridge hop. Before this probe those three costs were one number.
+
+⚠ **No switch in this run produced a partial or an unpainted mount.** Six of six painted every row
+they held. That is a clean sandbox, not an exoneration: the symptom is reported on a machine with
+~30 agent rows under orchestrator churn, and the instrument exists so the next occurrence is a
+reading rather than an impression.
+
+#### ⛔⛔ AND ONE THING THE INSTRUMENT FOUND ON THE WAY: `host_id` IS NOT ONE SURFACE
+
+Each of the three rows built its terminal surface **twice** — two `terminal_mount/begin` events and
+two `xterm_paint/mount_open` records twelve seconds apart — **both on `mount_epoch: 1`**, with
+`terminal_mount/mount_epoch_reused` sitting between them saying so.
+
+⇒ `host_id` is `<host>-m<mount_epoch>`, so **any count keyed on it collapses repeated surface
+builds into one.** That includes the "5 full terminal mounts / 3 distinct rows" table at the top of
+this entry: those numbers count `begin` events, which is right, but anything that later joins them
+by host id — including the first cut of `scripts/paint-chain.py` — silently kept only the LAST
+build per row. A second build painting badly would have vanished into the first build's clean
+record, which is the churn's own signature being hidden by the instrument sent to measure it.
+`paint-chain.py` now segments on `begin` and labels rebuilds `…#b1`. **Anything else keyed on
+`host_id` in this entry's chain should be re-checked the same way.**
+
+⇒ **RE-CHECKED against the isolation table further down, as that warning asks.** Those four
+windows count EVENT NAMES inside a wall-clock window and join nothing by `host_id`, so epoch
+reuse cannot collapse them; the 5-mounts-per-create figure stands. The mount TARGETS quoted
+there were read from `session_path`, which is stable across rebuilds. ⚠ What the warning does
+touch is any statement of the form "N distinct rows" — that is a host-id count and is a floor,
+not a total.
+
+
+⚠ **WHAT IS STILL MISSING, so nobody reads the above as the whole ask.** The activation ORIGIN
+— user gesture vs app-driven switch — is still not recorded, and it is still the measurement
+that would settle whether the *active session* changes on its own (see the paragraph below).
+That is a native-side event, not an xterm one, and this probe does not supply it.
+
+#### ⛔ AND ONE OF THE PRE-EXISTING PROBES LIES ABOUT FRAME RATE — with the ghost measured in it
+
+*The inventory of what was already there is in the correction at the top of this section; this
+is the one reading from it that must not be taken at face value.* (`terminal_js/xterm_write_flush`
+belongs on that inventory too — it carries `paint_repair` with its reason.)
+
+⛔ **`frame_gap` read as a frame-rate meter is a trap: its minimum IS its threshold**
 (250 ms), so it counts LATE frames only and any percentage taken from it is meaningless.
-What it says honestly is worth having — **median late-frame gap 499 ms, worst 999 ms.**
-Half a second is comfortably long enough to see the previous row's surface where the new
-one should be. **That is the ghost frame, measured.**
-
-⇒ **The real gap is one link further along.** Nothing carries a **frame id from the write
-that caused a paint to the paint that showed it**, so a frame that painted the WRONG BYTES
-and one that painted the right bytes are identical in the trace. That is a far smaller
-change than instrumenting a layer, and it is the one to ask for. ⇒ It also relocates this
-entry's broken-TUI symptom: at ~0.04% of late frames, "a frame drew half its rows" is
-probably not what is being seen. The candidates that remain are a paint from a STALE
-BUFFER, or a paint that never happened and left the previous surface up — the ghost, not a
-partial draw. Different bugs, different fixes.
+What it says honestly is worth having — **median late-frame gap 499 ms, worst 999 ms**
+over 6 h on the GUI host. Half a second is comfortably long enough to see the previous
+row's surface where the new one should be. **That is the ghost frame, measured** — and it
+is a different defect from an incomplete paint, which is what `rows_content_unpainted`
+above counts.
 
 ### ⭐⭐ THE LADDER SAYS THE BUG IS IN ATTACH, NOT IN MOUNT (measured 2026-08-21, ~2.2 h)
 
@@ -204,29 +279,68 @@ repeat window B — but activating a row takes the screen from whoever is at it,
 waits for a moment when that is acceptable, or for the duplicate to be removed. Until
 then the honest statement is the conjunction above, not "creates are expensive".
 
-⭐ **AND THE SAME DEFAULT HAS DONE THIS BEFORE, ON A DIFFERENT SCHEME.**
-`docs/cli-integration.md` already records the identical error string from
-2026-08-19: an `agy` row opened as Codex because `connect_session_kind_for_path()`
-kept a hand-written list of schemes, missed one, and **fell through to `Codex` as
-its default**. That fix went in on the READ side and made the lookup
-registry-derived. The WRITE side still has the same default:
+### ✅ ROOT-CAUSED AND FIXED 2026-08-21 (11.10) — AND THE CITED SUSPECT WAS INNOCENT
 
-```rust
-// crates/yggterm-core/src/agent_scheme.rs:467
-pub fn remote_agent_session_path(kind: SessionKind, machine_key: &str, session_id: &str) -> String {
-    let prefix = remote_agent_row_schemes()
-        .find(|scheme| scheme.kind == Some(kind))
-        .map(|scheme| scheme.prefix)
-        .unwrap_or("remote-session://");     // ⛔ the Codex scheme, for ANY unmatched kind
-```
+**The hypothesis this entry carried is DISPROVEN, and the disproof is one line.**
+`remote-cc://` IS a registered ClaudeCode scheme (`RowIdentity` · `Remote` · `agent`), so
+`remote_agent_session_path(ClaudeCode, …)` finds it and **never reaches**
+`unwrap_or("remote-session://")`. That default fires only for a kind with no registered
+remote row scheme, which ClaudeCode is not. ⇒ **The scheme was correct for the kind it was
+handed. The KIND was the lie.** The default is left alone deliberately — it is load-bearing
+for kinds that legitimately have no remote arm, and the server crate already has an
+Option-returning composer that refuses those by name.
 
-⇒ **A kind the registry cannot place does not fail here. It becomes a Codex row.**
-The row then looks entirely well-formed, is indistinguishable from a real saved
-Codex session everywhere downstream, and only reveals itself when something tries
-to restore it — which is a mount, i.e. the expensive path, on a row the user may
-already be sitting on. ⚠ This is a hypothesis with the shape and the symptom
-matching exactly; it is NOT yet proven to be the call that minted this particular
-row, and the lane that takes it should prove that before changing the default.
+**What actually minted the twin**, proved rather than reasoned about:
+
+1. **The trace names the function.** `remote_session/open` fired for exactly this session id
+   (`cwd` = the row's own worktree, `machine_key` = its host). Only
+   `open_remote_scanned_session_with_view` emits it.
+2. **The scan proves which branch it took.** That machine's scan held **748 sessions and not
+   this one**, so the lookup missed.
+3. **That branch had two fallbacks three lines apart, and they AGREED**: the path became
+   `remote-session://<machine>/<id>` and the kind became `Codex`. Agreeing defaults are the
+   dangerous kind — what comes out is a well-formed row, so nothing downstream can tell it was
+   invented. The resulting `resume-codex … --require-existing` produces verbatim the error
+   text quoted above.
+
+⭐ **AND THE ROOT IS ONE LINE ABOVE THE MINT, IN THE CALLER.** `focus_live_session` parsed the
+kind off the row path it was handed, bound it to **`_kind`**, and dropped it on the floor
+immediately before calling a verb whose signature — `(machine_key, session_id)` — cannot
+carry it. The fact was in its hand, named, and discarded; the verb then had to invent it.
+⇒ **The signature was the bug.** The verb now takes the caller's answer and resolves in four
+tiers: the scan's own declaration, the caller's stated kind, a row already held for that id
+(the daemon owned the correct `remote-cc://` row the whole time it minted the twin), then
+**refuse**. A guess here is not a degraded answer, it is a fabricated one.
+
+⚠ **In-process only, and that is a constraint not a shortcut.** The daemon's
+`OpenRemoteSession` request carries no kind; adding one is a WIRE change that needs a version
+bump in the same commit as the shape stamp. A socket caller therefore still passes nothing and
+falls to the evidence tiers, which is correct — it genuinely does not know.
+
+⚠ **A test was an accomplice.** `reopening_remote_scanned_session_refreshes_stale_launch_command`
+built a machine with an EMPTY scan and asserted `resume-codex` — so it passed for precisely the
+reason the twin shipped, and could never have caught it. Its premise now states the scanned
+Codex session it is actually about.
+
+### ✅ THE RETRY HALF IS FIXED TOO — fail once, stay failed
+
+Nothing recorded that a row had already failed, so every add asked the identical question at
+full price. The shell now remembers the failure and the mount path consults it **before** the
+ensure. ⚖ Keyed on the **launch command**, not the mount identity: the identity carries the
+epoch and the epoch CLIMBS on every retry, so keying on it would suppress nothing — every
+attempt would look new. The launch command is what cannot change between two attempts that
+will get the same answer, and when it does change the row retries with nobody clearing
+anything, which keeps this a memory rather than a latch. Held in the shell, not the component,
+because the component is torn down and rebuilt by the very churn this exists to stop. ⚠ The
+explanation is re-shown rather than swallowed — a suppressed retry that also went silent would
+leave a dead row looking merely slow, which is worse than the churn.
+
+⛔ **STILL OPEN, and it is the part the fixes cannot answer.** Whether a create against a
+*healthy* active row is free. The conjunction this entry established — an add AND an
+unmountable active row — is unchanged; both halves of the second condition are now fixed, so
+the decisive test is finally cheap: repeat window B once a mountable row is active. Until that
+is run, "creates are expensive" remains unproven, and the other **32 of 37** resets that fell
+outside any row-set change still point at a second driver nobody has named.
 
 ⚠ **Note what dual presence does and does not cover.** `AGENTS.md` "Session
 display = dual presence" makes one session render twice **sharing one
@@ -243,6 +357,171 @@ fail once and stay failed.
 **Falsifier:** leave the GUI untouched for ten minutes with several agent rows producing
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
+
+## ⛔⛔ [11.0] A REMOTE ROW FOR ANY CLI BUT CLAUDE CODE IS TITLED BY NOBODY
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-21 against a live Antigravity row still wearing its
+cwd-derived birth name. The registry-driven title fix landed and is real — it
+fixed ONE of the two chores.*
+
+**The gap is between two chores, and each one believes the other has it.**
+
+```rust
+// daemon.rs:11838  collect_live_store_title_syncs_in — the registry-driven one
+let is_local_row = session.session_path.starts_with("local://")
+    || descriptor.runtime_key_scheme
+        .is_some_and(|scheme| session.session_path.starts_with(scheme));
+if !is_local_row { continue; }        // "a remote-*:// row rides the OTHER chore"
+
+// daemon.rs:12042  remote_cc_title_poll_paths — the other chore
+if session.kind != SessionKind::ClaudeCode { continue; }
+```
+
+⇒ **A row keyed `remote-<slug>://` for any CLI other than Claude Code is skipped by
+the local chore for being remote, and refused by the remote chore for not being
+Claude Code.** It is titled by nothing, so it keeps whatever name it was born with.
+
+⚠ **"Local" here means the PATH SCHEME, not the machine.** A session running on
+this very host, opened through the remote path, carries a `remote-*://` key and
+falls in the gap. The observed row was on the daemon's own fleet.
+
+### ⛔⛔ AND THE INSTRUMENT BUILT TO CATCH THIS CANNOT SEE IT
+
+`cli/store_title_miss` was added precisely so a failed title pickup is
+distinguishable from an empty store. It is emitted **from the local chore only**,
+and the local chore never looks at these rows. Measured: **zero `store_title_miss`
+events in a 40,000-event trace window** while an untitled row sat in the sidebar.
+
+⇒ A probe that never fires and a system with nothing to report are the same
+reading. The miss counter must be emitted where the DECISION TO SKIP is made, not
+only where a lookup fails — a row skipped for its scheme is exactly the case
+nobody hears about.
+
+**The fix has the shape the local chore already took:** make the remote pickup
+registry-driven per descriptor instead of gated on one `SessionKind`. ⚠ It is not
+a one-line change — `read_live_store_title` is a local-file reader, and doing it
+per CLI over ssh is the actual work. Do not "fix" it by deleting the kind check.
+
+## ⛔⛔ [11.23] A RESTART LANDS ON A WEB SURFACE OVER A LIVE TERMINAL ROW — STALE FIRST, THEN BLANK
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-21, with a frame. He restarted the GUI and the viewport
+came up on an **old, cold webview** — content from a previous surface — which then
+changed to a **blank** one: a chat panel with a search box, `WORK · 2`,
+`Show 2 more`, nothing else.*
+
+⛔ **The row it was drawing is a TERMINAL session.** The metadata rail beside that
+blank page read `Type: Claude Code · running · idle · PTY size 173 × 65`. A live
+agent terminal was on screen as an empty web page.
+
+**Two cited paths, and neither is the web surface misbehaving — they are the
+workspace choosing it.**
+
+**1. The server is CONSTRUCTED in the web surface.** `lib.rs:4210` builds with
+`active_view_mode: WorkspaceViewMode::Rendered`. The enum has two variants
+(`lib.rs:274`), so a fresh server starts in `Rendered` and the terminal must be
+asked for.
+
+**2. The normaliser can only push TOWARD `Rendered`; there is no path back.**
+`normalize_active_view_mode` (`lib.rs:4234`) returns early if the mode is not
+`Terminal`, sets `Rendered` when there is no active session, and sets `Rendered`
+when the session cannot host a terminal. **Every arm ends in `Rendered`.** Nothing
+anywhere says *"the active row IS a terminal session, therefore show the
+terminal"*.
+
+⇒ For a product whose thesis is that the terminal handoff IS the product, the
+default is inverted. ⚠ Not a one-line flip: `show_start_page` (`lib.rs:4253`) sets
+`Rendered` deliberately and the start page depends on it. The question is what the
+mode must be **when a terminal-capable session is active**.
+
+**3. And an unrelated action flips the user into it as a side effect.**
+`remove_live_session` (`lib.rs:5271`) sets `active_view_mode = Rendered` when the
+row being removed is the active one — so tidying a corpse can move the person's
+viewport onto a web page.
+
+### ⭐ THE DEAD CODE IS ALREADY NAMED BY THE COMPILER
+
+`cargo check` reports, among others: `remote_preview_payload_terminal_prefill`,
+**`remote_preview_payload_terminal_prefill_before_2_1_103`** — a pre-2.1.103
+variant kept alongside its own successor — `declared_web_surface_open_from_payload`,
+`web_surface_socks_egress_donor`, `preview_blocks_effectively_empty`,
+`rendered_sections_effectively_empty`; and `viewport.rs:14170` still carries a
+comment about "the legacy native child webview".
+
+⛔ **`never used` is not `unreachable`.** Check `#[cfg]`, feature gates and dynamic
+dispatch before deleting any of them, and record what was checked.
+
+⚠ **A blank surface and a missing surface look identical**, which is the fault this
+campaign keeps paying for. If the webview is made to refuse stale content, it must
+SAY so rather than render empty.
+
+## ⛔⛔⛔ [11.0] REMOVING ONE OF TWO ROWS THAT SHARE A SESSION ID KILLS THE OTHER'S RUNTIME, AND REPORTS THAT IT REAPED NOTHING
+
+**Status:** OPEN
+
+*Measured 2026-08-21 by doing it, on a live agent session that was working at the time.*
+
+The scheme-twin defect leaves two rows for one session — a correctly kinded agent row and a
+mis-kinded one — under **two different keys but one session id**. Removing the mis-kinded row
+**terminates the runtime of the correctly kinded one.**
+
+**What the verb reported:**
+
+```
+accepted: true
+message: "closed terminal runtime for remote-session://dev/<id>"
+live_processes: []
+reaped_processes: []          ⛔ it had just killed a live agent process
+```
+
+**What the trace says actually happened** — one event, and it names the mechanism:
+
+```
+session/explicit_remote_session_close_requested
+  { "path": "remote-session://dev/<id>", "session_id": "<id>",
+    "kind": "Codex", "force_after_seconds": 2 }
+```
+
+⇒ **The close is dispatched by SESSION ID, not by the row key that was named.** The key
+resolution earlier in the path is exact — `resolve_live_session_entry` finds the row asked for,
+and the exact-key branch wins before any id fallback — and then the close request throws that
+key away and asks the remote to close *the id*. The remote holds one runtime for that id, so
+the surviving row's process is what dies, two seconds later, by force.
+
+⛔ **This makes a phantom row not merely unclickable but a KILL SWITCH for the real session it
+shadows** — and the natural remedy for a phantom row is exactly the action that fires it.
+
+⚠ **`reaped_processes: []` is what makes this dangerous rather than merely wrong.** An operator
+reading the reply has positive confirmation that nothing was killed. The kill is asynchronous
+and remote (`force_after_seconds: 2`), so it has not happened when the reply is composed, and
+nothing revisits it. ⇒ **The reply cannot answer "what did this end"** and should not appear to.
+
+**Two fixes, and the first is not sufficient alone:**
+
+1. The close must be dispatched by the resolved KEY, so closing one row cannot reach a runtime
+   the caller did not name. A shared id is a legitimate state — dual presence is spec — so
+   id-dispatch is wrong even after the twin that produced it is gone.
+2. `reaped_processes` must either report the outcome or not be present. A field that reads empty
+   *because the work has not happened yet* is worse than no field.
+
+⛔⛔ **AND THE SAFE PROCEDURE WAS FOLLOWED. IT DID NOT HELP.** The lane that root-caused the
+twin declined to remove it for exactly this reason, wrote the danger down, and recommended the
+mitigation: *remove by full path, then read back that the other row survives.* That is what was
+done. The path resolution IS exact — `resolve_live_session_entry`'s exact-key branch matches
+before any id fallback, which a code read confirmed beforehand — and the close request
+**downstream of it** discards the resolved key and dispatches the id anyway. ⇒ **A correct
+mitigation aimed at the wrong layer.** The read-back then reported the kill correctly, but only
+after the fact.
+
+**Falsifier:** create two rows for one session id under different schemes, remove one, and
+confirm the other's process still exists five seconds later.
+
+⚠ **What it cost when it fired:** a working lane. Its committed work survived on its branch and
+was landed; the running context did not, and a successor was spawned from its transcript.
+Nothing was uncommitted at the time, which was luck rather than design.
 
 ## ⛔⛔⛔ [11.20] ONE ROW'S BILLING STATE DECIDED WHETHER THE WHOLE FLEET COULD BE WOKEN — FIXED
 
@@ -574,11 +853,13 @@ differing** (`scripts/underglass-sandbox.sh`, Wayland-native, no XWayland):
 ⚠ `11.9` before `11.10` means the ten-before-two trap is now pinned on the render path in
 pixels, not only in the comparator's own suite.
 
-**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image, so his
-sidebar draws the old order until it restarts — and that restart is deliberately not taken
-here (he is using the machine, and `ygg-roll-watch.sh` will not restart a GUI on a timer by
-design). **Falsifier:** after his GUI comes up on an image containing `10711945`, one
-screenshot of the live sidebar shows `11.0`'s members in ascending order with no verb run.
+**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image
+(`139c6a39`, checked after the land), so his sidebar draws the old order until it restarts.
+That restart is not taken by this lane — he is using the machine. ⚠ It does not need a human
+any more either: an owner ruling reversed the roll's old refusal and `ygg-roll-watch.sh` now
+notifies, waits out a grace window and restarts the client, so the next roll carries this.
+**Falsifier:** once the GUI is up on an image containing `f9626a58`, one screenshot of the
+live sidebar shows `11.0`'s members in ascending order with no verb run.
 
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
@@ -2383,6 +2664,37 @@ its name). **Cheap next step for whoever takes this:** run the suite under `--te
 beside a heavy build; if it survives, the population is timing, and an isolation harness is
 aimed at the wrong thing.
 
+**⛔⛔ THE POPULATION IS NOW COUNTED, 2026-08-21 (11.10), AND IT IS TWENTY.** The 11.19
+narrowing named one instance; a sweep of the server crate finds that the same shape has
+**twenty distinct process-global environment variables** mutated from inside that one test
+binary, across ~87 call sites — `CODEX_HOME` (18), `YGGTERM_APPEARANCE` and the terminal
+appearance constants, `COLORFGBG`, `NO_COLOR`, `YGGTERM_HOME`, `HOME`, `PATH`, `TERM` and
+the rest. Every one is set, used and restored while sibling tests run on other threads, and
+several are read by product paths those siblings exercise. ⇒ **A per-test isolation harness
+cannot fix this and neither can `--test-threads=1` as a habit somebody remembers**: the
+binary is only sound single-threaded, and nothing says so.
+
+**⭐ WHAT LANDED, AND WHAT IT DELIBERATELY IS NOT.** A contract test
+(`the_process_globals_this_binarys_tests_mutate_are_all_declared`) now scans the crate and
+fails on any env global not on a declared list, each sanctioned *because it already exists,
+not because it is safe*. It does not fix a single flake. It stops the population growing
+silently, which is the expensive half — a flake whose cause is one of twenty invisible
+globals cannot be reasoned about at all. ⚠ Its first run found ITSELF: a scanner that spells
+its own pattern matches its own source, so the needles are assembled with `concat!`.
+
+**Sampling, same session, reported because a negative is a result:** three full server-suite
+runs at default threads beside a continuous `cargo build` in another worktree — **all green**.
+So this did not reproduce on demand under the companion-build condition, and the two
+hypotheses remain unseparated by sampling. ⚠ One earlier run exited **101 with no failing
+test named at all** and its log was discarded by the first harness version; the harness now
+keeps every non-zero run's output, because "a non-zero exit that names nothing" is its own
+finding and this entry has already lost one failure's identity that way.
+
+**⇒ NEXT, AND IT BEATS MORE SAMPLING:** thread the seams. `local_agent_store_vouches_for_
+session_in` and `collect_live_store_title_syncs_in` already show the pattern — the product
+path is told where to look instead of reading a global. Every variable removed from the
+declared list is one fewer way for two unrelated tests to collide.
+
 **⭐⭐ ONE INSTANCE NOW HAS ITS SHARED STATE NAMED — 2026-08-21 (11.19), and it is SHARED STATE,
 not timing.** `agent_arm_matrix::locality_does_not_fork_the_invocation` failed once in a
 full-suite run and passed in isolation. The assertion diff names the culprit outright: the two
@@ -3495,6 +3807,16 @@ where a newline is content, backspace, Ctrl-C/Ctrl-U, and a second walker beside
 on exactly the hard sequences). Comparison and Enter happen under one lock, so nothing that has
 reached the daemon can land between them.
 
+⛔⛔ **AND THE STAMP WAS NOT RE-CUT, SO MAIN IS RED RIGHT NOW — measured 2026-08-21 (11.10) while
+working on an unrelated lane.** `daemon::tests::protocol_shape_stamp_forces_version_bump` FAILS on
+a clean `origin/main`: computed `0xb0be92515d8e30a0` against a stamp still reading 3.1.16, on a
+workspace at 3.1.26. The obligation is written three paragraphs above this one and was missed at
+land time, which is the ordinary way this class survives — a warning in the entry is not a gate.
+⚠ It also means the wire change is shipping under a version whose stamp describes a DIFFERENT
+shape, which is the lost-PTY latch storm the stamp exists to prevent, and every lane's full
+server suite is red until it is re-cut. ⇒ Belongs to whoever cuts the next release number, not
+to a lane; **whoever cuts it must take the stamp with it in the same commit.**
+
 ⚠ **The residual gap is named rather than papered over:** a keystroke still travelling from the
 client has reached nobody, and no daemon-side check can see it. This narrows the window to the
 client→daemon hop.
@@ -3661,7 +3983,9 @@ on a host whose store has no such transcripts, so the resume could never succeed
 exists for either row on either host**, the launch is long dead, and the rows have already
 survived one daemon restart in that state — nothing times a RemoteBootstrap out, fails it
 loudly, or marks it dead. They are also the pair whose arrangement dead-head made them
-invisible on the sidebar (the [11.10] row-set entry), so the two defects compounded: a husk
+invisible on the sidebar (that arrangement entry is closed — `visible_rows` draws an
+orphaned member at top level, and a departed head's entry is now swept once its absence is
+confirmed), so the two defects compounded at the time: a husk
 nobody could see. The husks are left in place as specimens; the wake relay that spawned them
 (a parked-row wake addressed at a session that does not exist on the target) is its own
 defect for the plane that owns the booter's send path.
@@ -22032,5 +22356,50 @@ automating it further: the loop notifies and then RESTARTS the client, by an own
 reversed its original refusal to do so — so a supervisor is a decision about when someone's
 window may be restarted, not merely about uptime.
 
+**Re-measured four hours later, and the entry survives it.** The deployed version has since
+moved forward and now carries the fixes that were stranded — but **the roller did not do it**:
+no process carries the loop, and its log has not gained a line since the cycle that stopped it.
+Some other hand rolled the build. The gap it describes had already begun to reopen at the time
+of the re-measurement, with `main` sitting five commits past the deployed release.
+
+⚠ **That is the failure mode, not a reprieve from it.** A deploy that happens because somebody
+happened to do one is the same absent mechanism as a deploy that does not happen; it merely
+fails silently in the direction that looks fine. Reading "the fix arrived" as evidence the
+lane is healthy is the specific mistake this entry exists to prevent, and it is available to
+be made every time the gap is small.
+
 **Falsified by:** finding a supervisor that brings it back after its launching session exits,
 or any surface that reports how long it has been since a roll completed.
+
+## [11.9] THE PRESENCE MATRIX HAS NO READ-ONLY SURFACE, SO VERIFYING IT TAKES SOMEONE'S SCREEN
+
+**Status:** OPEN
+
+Every remote machine's `cli_presence` report is carried on `RemoteMachineSnapshot` and is
+what the "Agent CLI installation" modal renders. **It is not projected into `server app
+state`**, the read-only describe verb an agent uses to ask the running GUI what it holds.
+The projection carries each machine's `label`, `health`, `session_count`,
+`remote_deploy_state` and `ssh_target`, and drops the presence report entirely — a grep for
+`cli_presence` over a full describe payload returns zero hits.
+
+**What that costs.** The only way to read the matrix the user actually sees is to open the
+Settings modal on the running GUI, and the screenshot does not composite a modal while a
+terminal view is active, so the main area has to be swapped to the start page first. On a
+machine somebody is working on, verifying this one field means taking their viewport. That
+is why a fix to the matrix that was proven correct at the CLI on four machines still could
+not be confirmed as *rendered* without interrupting someone.
+
+**Why the CLI proof is not a substitute.** Per-machine `server remote cli-presence` answers
+what each machine reports about itself. It cannot show that the GUI asked, that the answer
+survived the wire, or that the row rendered against the right machine — which is precisely
+the class of fault this matrix exists to surface, and one that has already shipped once as a
+column labelled with the wrong host's answer.
+
+**The shape of the fix.** Project the presence report into the describe payload beside the
+machine entries that are already there. The field is serialized on the snapshot type
+already; only the projection drops it. A read-only verb that returns per-machine
+present/total makes this matrix verifiable by any seat, at any time, without touching a
+running window.
+
+**Falsified by:** any read-only verb or describe field that returns the per-machine
+present/total counts the modal renders.

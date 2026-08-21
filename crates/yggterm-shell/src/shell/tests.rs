@@ -9090,6 +9090,260 @@ mod tests {
     }
 
     #[test]
+    fn the_mount_paint_chain_marks_open_write_parse_and_frame() {
+        // ⛔⛔ THE SPAN NO PROBE COVERED. The canvas was instrumented — frame
+        // ranges, queue depth, screen resets — but every one of those counts
+        // events in a RUNNING terminal, and every native probe stops at the
+        // bridge, so "the mount began" and "the glyphs arrived" were one event
+        // to all of them. A mount begins with an EMPTY surface. Without these
+        // four marks a half-painted switch and a clean one are
+        // indistinguishable in the trace, which is why the ghost-frame and
+        // broken-TUI-paint symptoms could only be judged from a photograph.
+        //
+        // Reachability is the property under test, not presence: a helper that
+        // exists and is never called is a probe that reads zero forever, and
+        // the trace it feeds looks exactly like a healthy system.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        for marker in [
+            // The four marks, at their call sites.
+            "paintNoteHostReady();",
+            "paintNoteMountOpen({",
+            "paintNoteParsed();",
+            "paintNoteFrame(",
+            // The write tap, which is what makes T0 a measurement rather than
+            // a guess about which call site wrote first.
+            "paintInstallWriteTaps",
+            "term.__yggPaintTapped",
+            // The two records, by the names a reader queries.
+            "name: \"mount_open\"",
+            "ytrace.window(\"xterm_paint\", \"settle\"",
+            "ytrace.span(\"xterm_paint\", \"first_frame\"",
+            // ⭐ The field the whole probe exists for. A frame count cannot
+            // answer "did this mount paint": the renderer repaints only dirty
+            // rows, so coverage against the rows that HOLD CONTENT is the only
+            // reading that separates a partial paint from a complete one.
+            "rows_content_unpainted:",
+            "rows_with_content:",
+            // The stall tell: the settle timer runs on the thread under
+            // investigation, so it reports how late it was rather than
+            // assuming it was on time.
+            "overshoot_ms:",
+            // ⛔ The latch that was WRONG on the first live mount: a frame
+            // before any bytes is the canvas painting itself empty, and
+            // latching it made "the glyphs arrived" mean "the blank surface
+            // repainted" — a 218 ms span measuring the very thing the probe
+            // exists to tell apart from a paint.
+            "paintChain.blankFrames += 1;",
+            "blank_frames_before_write:",
+        ] {
+            assert!(
+                script.contains(marker),
+                "the composed script must carry `{marker}`"
+            );
+        }
+        // ⛔ RATIONED LIKE EVERY OTHER PROBE HERE. One record at the surface,
+        // one at the first frame, one settle, and at most one recheck — bounded
+        // by the MOUNT RATE, never by output volume. A per-frame paint record
+        // would be the 48.7%-of-the-plane mistake a second time.
+        assert!(
+            script.contains("recheckScheduled = !recheck && !complete && visible === true"),
+            "the recheck must be conditional; an invisible host is expected not to \
+             paint and re-reporting it spends the budget to restate a known fact"
+        );
+        assert!(
+            !script.contains("category: \"xterm_paint\",\n                    name: \"frame\""),
+            "there must be no per-frame paint record"
+        );
+    }
+
+    /// ⭐ THE DISCRIMINATOR, PROVEN AGAINST A PAINT THAT IS KNOWN TO BE PARTIAL.
+    ///
+    /// Live traffic will not produce one on demand: a healthy mount paints
+    /// everything it holds, and waiting for a broken one is waiting for the
+    /// bug this instrument exists to judge. So the coverage arithmetic is
+    /// driven here a frame at a time, through the same public `term.write`
+    /// the app uses, on a fixture whose buffer holds 20 rows of text in a
+    /// 24-row viewport.
+    ///
+    /// ⛔ The blank-frame case is the one that must not regress. The first
+    /// cut latched the first frame outright and, on the first live mount,
+    /// reported a 218 ms `open → frame` span with `writes_before_frame: 0` —
+    /// a measurement of the canvas painting itself EMPTY, wearing the name of
+    /// the glyphs arriving.
+    ///
+    /// Skipped rather than failed when `node` is absent, matching
+    /// `the_composed_terminal_script_is_valid_javascript` above: a missing
+    /// toolchain is not a defect in the probe.
+    #[test]
+    fn the_paint_coverage_arithmetic_separates_a_partial_mount_from_a_complete_one() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        // The block is delimited by its own first constant and the next
+        // declaration in the template, so the slice cannot silently pick up
+        // unrelated code if either moves.
+        let start = script
+            .find("const YGG_PAINT_SETTLE_MS")
+            .expect("the paint block must be in the composed script");
+        let end = script[start..]
+            .find("const recvTerminalCommand")
+            .expect("the paint block must end before the command loop")
+            + start;
+        let block = &script[start..end];
+        assert!(
+            block.contains("paintNoteMountOpen") && block.len() > 4_000,
+            "the extracted block does not look like the paint chain ({} bytes)",
+            block.len()
+        );
+        let harness = r#"// ── harness ──────────────────────────────────────────────────────────
+// A synthetic mount, driven a frame at a time, so the coverage arithmetic
+// can be checked against a paint that is KNOWN to be partial. Live traffic
+// does not produce one on demand: a healthy mount paints everything, and
+// waiting for a broken one is waiting for the bug this instrument exists
+// to judge.
+const emitted = [];
+let clock = 0;
+const timers = [];
+const VIEWPORT_ROWS = 24;
+const CONTENT_ROWS = 20;
+const ytrace = {
+    emit: (record) => emitted.push(record),
+    span: (category, name, ctx) => ({
+        finish: (payload) => emitted.push({
+            category, name, kind: 'span',
+            payload: Object.assign({}, ctx || {}, payload || {}),
+        }),
+    }),
+    window: (category, name, payload) => emitted.push({ category, name, kind: 'window', payload }),
+};
+const hostId = 'yggterm-terminal-fixture-m7';
+const term = {
+    rows: VIEWPORT_ROWS,
+    cols: 80,
+    element: { getBoundingClientRect: () => ({ width: 800, height: 400 }) },
+    write: (data, callback) => { if (callback) { callback(); } },
+    _core: {},
+    buffer: {
+        active: {
+            viewportY: 0,
+            getLine: (index) => ({
+                translateToString: () => (index < CONTENT_ROWS ? 'content' : ''),
+            }),
+        },
+    },
+};
+const host = null;
+const document = { hidden: false };
+const window = {
+    performance: { now: () => clock },
+    setTimeout: (fn, ms) => { timers.push({ at: clock + Math.max(0, Number(ms) || 0), fn }); },
+};
+const runTimersUpTo = (target) => {
+    for (;;) {
+        timers.sort((a, b) => a.at - b.at);
+        const next = timers.find((t) => t.at <= target);
+        if (!next) { clock = target; return; }
+        timers.splice(timers.indexOf(next), 1);
+        clock = next.at;
+        next.fn();
+    }
+};
+"#;
+        let driver = r#"// ── the drive ────────────────────────────────────────────────────────
+const fail = (message) => { console.error('FAIL: ' + message); process.exit(1); };
+const settleRecords = () => emitted.filter((r) => r.category === 'xterm_paint' && r.name === 'settle');
+const need = (actual, expected, what) => {
+    if (actual !== expected) { fail(what + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual)); }
+};
+
+clock = 5;
+paintNoteHostReady();
+clock = 40;
+paintNoteMountOpen({});
+const open = emitted.find((r) => r.name === 'mount_open');
+if (!open) { fail('no mount_open record'); }
+need(open.payload.write_taps_installed, true, 'the write tap must install');
+need(open.payload.rows, VIEWPORT_ROWS, 'mount_open rows');
+
+// Two frames on a surface nobody has written to. These are the canvas
+// painting itself EMPTY and must never be mistaken for glyphs arriving.
+clock = 60; paintNoteFrame(0, VIEWPORT_ROWS - 1, VIEWPORT_ROWS);
+clock = 80; paintNoteFrame(0, VIEWPORT_ROWS - 1, VIEWPORT_ROWS);
+if (emitted.some((r) => r.name === 'first_frame')) {
+    fail('a frame before any bytes was latched as the first paint');
+}
+
+// Bytes reach the canvas THROUGH the public write, so the tap is what is
+// under test and not a hand-placed call.
+clock = 100; term.write('some output');
+clock = 112; paintNoteParsed();
+// One frame that covers less than half the viewport: the partial paint.
+clock = 130; paintNoteFrame(0, 9, VIEWPORT_ROWS);
+const first = emitted.find((r) => r.name === 'first_frame');
+if (!first) { fail('no first_frame after bytes were written'); }
+need(first.payload.blank_frames_before_write, 2, 'blank frames before the first write');
+need(first.payload.open_to_write_ms, 60, 'open -> write');
+need(first.payload.write_to_parsed_ms, 12, 'write -> parsed');
+need(first.payload.parsed_to_frame_ms, 18, 'parsed -> frame');
+need(first.payload.parsed_seen, true, 'the parse mark must be reported as seen');
+
+runTimersUpTo(40 + 1200);
+const partial = settleRecords()[0];
+if (!partial) { fail('the settle timer produced no record'); }
+need(partial.payload.painted, true, 'a frame landed after bytes, so painted');
+need(partial.payload.rows_with_content, CONTENT_ROWS, 'rows the buffer holds text on');
+need(partial.payload.rows_covered, 10, 'rows any frame has covered');
+need(partial.payload.rows_content_unpainted, 10, 'the field the probe exists for');
+need(partial.payload.complete, false, 'a half-covered mount is not complete');
+need(partial.payload.recheck_scheduled, true, 'a visible incomplete mount must be rechecked');
+need(partial.payload.overshoot_ms, 0, 'a timer that fired on time overshoots by nothing');
+
+// The rest of the viewport paints, and the recheck must now read complete.
+clock = 1400; paintNoteFrame(10, VIEWPORT_ROWS - 1, VIEWPORT_ROWS);
+runTimersUpTo(40 + 4000);
+const settled = settleRecords()[1];
+if (!settled) { fail('no recheck record after an incomplete settle'); }
+need(settled.payload.recheck, true, 'the second record must identify itself as a recheck');
+need(settled.payload.rows_covered, VIEWPORT_ROWS, 'every row covered after the second frame');
+need(settled.payload.rows_content_unpainted, 0, 'nothing left unpainted');
+need(settled.payload.complete, true, 'a fully covered mount is complete');
+need(settleRecords().length, 2, 'at most two settle records per mount');
+
+// ⛔ The budget claim, checked rather than asserted in prose: a mount costs a
+// bounded number of records regardless of how many frames it painted.
+need(emitted.filter((r) => r.category === 'xterm_paint').length, 4,
+     'a mount must cost mount_open + first_frame + settle + at most one recheck');
+console.log('ok');
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-paint-selftest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("paint-selftest.js");
+        std::fs::write(
+            &path,
+            format!("(() => {{\n{harness}\n{block}\n{driver}\n}})();\n"),
+        )
+        .expect("write the paint self-test");
+        let run = std::process::Command::new("node").arg(&path).output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match run {
+            Ok(output) => assert!(
+                output.status.success(),
+                "the paint coverage self-test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(_) => eprintln!("node not available; paint coverage self-test skipped"),
+        }
+    }
+
+    #[test]
     fn the_replay_script_marks_its_wipe_and_refill_and_captures_the_reseed() {
         // ⚠ THE ONE PATH THE SANDBOX COULD NOT TRIGGER. A retained replay needs
         // a re-attach with daemon-held history, which a freshly started sandbox
@@ -21681,6 +21935,122 @@ mod tests {
             shell.row_arrangement.sets.parent_of(&member),
             Some(head.as_str()),
             "a sighting resets the count; only three CONSECUTIVE absences act"
+        );
+    }
+
+    /// ⛔⛔ AN UNRESTORABLE ROW FAILS ONCE, NOT ONCE PER TREE CHANGE.
+    ///
+    /// Measured on the GUI host 2026-08-21 with an isolation test — one create
+    /// alone, quiet controls either side: a SINGLE row creation drove five full
+    /// terminal mounts and four bootstrap resets, every one aimed at the same
+    /// unmountable active row, every one ending in `ensure_error` and re-arming
+    /// with the mount epoch climbing. A remove cost nothing. Each of those is a
+    /// full remote mount that repaints the surface, which is what the owner sees
+    /// as blinking and broken TUI paint.
+    ///
+    /// ⚖ The record is keyed on the LAUNCH COMMAND, not on the mount identity.
+    /// The mount identity carries the epoch and the epoch climbs on every retry,
+    /// so keying on it would suppress nothing. The launch command is what cannot
+    /// change between two attempts that will get the same answer — and when it
+    /// DOES change, the row must retry with no one clearing anything, which is
+    /// the property that keeps this from being a latch. Both halves asserted.
+    #[test]
+    fn a_failed_ensure_is_remembered_until_the_launch_it_failed_on_changes() {
+        let path = "remote-cc://testhost/4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        let bootstrap = test_shell_bootstrap_with_active_session(path);
+        let mut shell = ShellState::new(bootstrap);
+
+        let with_launch = |command: &str| {
+            let mut session =
+                yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(path));
+            session.kind = SessionKind::ClaudeCode;
+            session.launch_command = command.to_string();
+            ServerUiSnapshot {
+                active_session_path: Some(path.to_string()),
+                active_session: Some(session.clone()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![session],
+                apps: Vec::new(),
+            }
+        };
+
+        // Nothing recorded ⇒ nothing suppressed.
+        shell
+            .server
+            .apply_snapshot(with_launch("ssh dev -- resume-cc --require-existing"));
+        assert!(
+            shell.terminal_ensure_already_failed(path).is_none(),
+            "a row that has not failed must never be suppressed"
+        );
+
+        // It fails once.
+        shell.note_terminal_ensure_failed(path, "saved session is no longer available");
+        let remembered = shell
+            .terminal_ensure_already_failed(path)
+            .expect("the failure is remembered for the launch it failed on");
+        assert_eq!(
+            remembered.error, "saved session is no longer available",
+            "the explanation is kept — a suppressed retry that also went silent \
+             would leave a dead row looking merely slow"
+        );
+
+        // Anything that re-mounts the tree asks again, and is refused, as long
+        // as the launch is the same question.
+        shell
+            .server
+            .apply_snapshot(with_launch("ssh dev -- resume-cc --require-existing"));
+        assert!(
+            shell.terminal_ensure_already_failed(path).is_some(),
+            "the same launch must stay suppressed across remounts — that is the \
+             churn this exists to stop"
+        );
+
+        // ⭐ THE WAY OUT, and it needs no one to remember it: the launch changed,
+        // so the question changed, so the row retries.
+        shell
+            .server
+            .apply_snapshot(with_launch("ssh dev -- resume-cc"));
+        assert!(
+            shell.terminal_ensure_already_failed(path).is_none(),
+            "a repaired launch must retry by itself; a suppression nothing can \
+             clear is a latch, not a fix"
+        );
+    }
+
+    /// The state above is only worth having if the mount path CONSULTS it, and a
+    /// unit test cannot reach inside the component's async task to prove that.
+    /// So the guard is pinned where it lives: in front of the ensure, not after
+    /// it. Scanned over the product half so this test's own text cannot satisfy
+    /// it.
+    #[test]
+    fn the_mount_path_checks_for_a_known_failure_before_it_ensures() {
+        let source = yggterm_core::agent_cli::product_lines(include_str!("viewport.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let guard = source
+            .find("terminal_ensure_already_failed")
+            .expect("the mount path consults the recorded failure");
+        // ⛔ THE CALL SITE, NOT THE NAME. A bare `find` on the function name
+        // matches its DEFINITION, which sits above everything that calls it — so
+        // the first version of this test failed against correct code and would
+        // have passed against code with no guard at all, as long as the
+        // definition moved. A scan comparing positions has to anchor on the
+        // syntax of the thing it means.
+        let ensure = source
+            .find("if let Err(error) = terminal_ensure_with_retry_async(")
+            .expect("the mount path still ensures");
+        assert!(
+            guard < ensure,
+            "the guard must sit BEFORE the ensure — after it, every retry has \
+             already paid for the full remote mount it was supposed to avoid"
+        );
+        assert!(
+            source.contains("note_terminal_ensure_failed"),
+            "and the failure branch must record, or the guard has nothing to read"
         );
     }
 

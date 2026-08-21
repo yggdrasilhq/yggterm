@@ -210,7 +210,19 @@ fi
 # deadlocking the fleet on a killed process.
 DEPLOY_LEASE="${YGG_DEPLOY_LEASE:-$HOME/.yggterm/relay/deploy.lease}"
 DEPLOY_LEASE_CEILING_S=1800
-HOLDER="${YGGTERM_SESSION_ID##*/}"
+# ⛔⛔ THE FALLBACK BELOW CANNOT RUN IF THE EXPANSION ABOVE IT DIES FIRST. Under
+# `set -u`, `${VAR##*/}` on an UNSET variable is an unbound-variable error, not an
+# empty string — so the `[ -n ... ] ||` default was unreachable in exactly the
+# environment it was written for. The hourly roll runs with no session id, so
+# every roll from the moment this lease landed refused the deploy at this line and
+# reported it as a refusal rather than a crash. Nothing reached any host for four
+# hours while `main` went on advancing, and the fleet read as "up to date at the
+# last version that shipped".
+#
+# ⇒ A guard that fails CLOSED in the one environment that matters is worse than no
+#   guard. Default first, then transform.
+HOLDER="${YGGTERM_SESSION_ID:-}"
+HOLDER="${HOLDER##*/}"
 [ -n "$HOLDER" ] || HOLDER="$(whoami)@$(hostname)/$$"
 
 mkdir -p "$(dirname "$DEPLOY_LEASE")"
