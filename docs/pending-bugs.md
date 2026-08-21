@@ -193,6 +193,60 @@ activation** of its own.
 
 ⭐ Cost: **0.86% of records, 1.21% of trace bytes** in a switch-dense window.
 
+### ⛔⛔⛔ THE INSTRUMENT FOUND IT: A VISIBLE MOUNT HELD 41 ROWS OF TEXT AND RENDERED NOTHING
+
+*Measured on the live GUI host, 38.5 minutes of trace with `xterm_paint` running, 2026-08-21.
+This is the symptom this entry is about, caught in the trace rather than on a screen.*
+
+| | |
+|---|---|
+| native mounts (`terminal_mount/begin`) | 31 |
+| surfaces actually built (`xterm_paint/mount_open`) | 16 |
+| builds that painted completely | 15 |
+| **builds that were VISIBLE, held content, and painted nothing** | **1** |
+
+**The one that failed**, with the native half of its own chain interleaved:
+
+```
+-1201 ms  xterm_paint/mount_open              surface exists, BLANK
+-1051 ms  xterm_screen/reset  snapshot_reseed
+ -988 ms  xterm_screen/reset  clear_to_empty
+ -843 ms  terminal_mount/first_output         33283 bytes
+ -840 ms  xterm_write/enqueue_backlog         32871 chars accepted
+ -831 ms  xterm_write/flush                   handed to the canvas
+ -611 ms  terminal_mount/paint_ready          ⛔ the app concluded it painted
+    0 ms  xterm_paint/settle    frames 0 · rows_covered 0/41 · visible true
++2800 ms  xterm_paint/settle    frames 0 · rows_covered 0/41 · recheck
+```
+
+⇒ **The bytes arrived, the canvas accepted them, and the renderer never ran** — for at least four
+seconds, on a row the user could see. Not a slow paint, not a partial paint: zero frames.
+
+⛔ **AND THE APP BELIEVED THE OPPOSITE.** `terminal_mount/paint_ready` fired 611 ms earlier. It
+tests `child_count > 0 || xterm_present || screen_present || …` — DOM presence, named for pixels —
+and latches `terminal_host_painted`, which gates the resume overlay and the recovery paths. So on
+the one mount that needed recovery, the app had already concluded there was nothing to recover.
+**That is a concrete mechanism for "the recovery machinery is not idle, it is losing"** at the top
+of this entry. ⚠ It is right 8 times in 9; see the field guide for why that makes it worse rather
+than better. ⛔ Not fixed here — `terminal_host_painted` gates behaviour, so it belongs to whoever
+owns the cause, not to the lane that owns the instrument.
+
+### ⭐ AND THE FREEZE IS NOW A NUMBER: THE SETTLE TIMER RAN UP TO 1.3 s LATE
+
+`xterm_paint/settle` reports `overshoot_ms` — how late its own timer fired — precisely because it
+runs on the thread under investigation. Across 21 settles on the live host:
+
+**median 4 ms · p90 944 ms · max 1323 ms · 6 of 21 over 250 ms.**
+
+⇒ A `setTimeout` that is ~1 s late is a UI thread that did not run for ~1 s. That is the owner's
+*"ghost and frame freezes while switching"* as a measurement rather than an impression, taken from
+inside the frozen thread by the one reading a frozen thread can still produce: how long it was
+gone. ⚠ Median 4 ms says this is not a background load — it is episodic, and it clusters.
+
+⭐ **And the blank-frame count says what the eye sees during it:** one build repainted the empty
+canvas **22 times before a single byte arrived**. A blank surface repainting is what a ghost frame
+is.
+
 #### ⛔ AND ONE OF THE PRE-EXISTING PROBES LIES ABOUT FRAME RATE — with the ghost measured in it
 
 *The inventory of what was already there is in the correction at the top of this section; this

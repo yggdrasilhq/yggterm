@@ -566,6 +566,43 @@ has a daemon and sessions but no client. `server app clients` answers "is the GU
 variable at it, which is how a second live instance can be READ for comparison. Never DRIVE one:
 a mode change or relaunch corrupts whatever it is measuring.
 
+### ⛔⛔⛔ `terminal_mount/paint_ready` MEASURES THE DOM AND IS NAMED FOR PIXELS — AND IT IS RIGHT 8 TIMES IN 9
+
+Its condition is `child_count > 0 || xterm_present || screen_present || viewport_present ||
+rows_present`: *the xterm elements exist*. It then latches `terminal_host_painted`, which gates
+the resume overlay and the recovery paths — so the app stands its recovery machinery down on a
+DOM check.
+
+**Measured on the live GUI, 38.5 minutes, 2026-08-21.** Nine surface builds carried the claim.
+Eight agreed with the renderer. The ninth was a **visible** mount holding **41 rows of text that
+rendered ZERO frames**, still unpainted at the four-second recheck — with `paint_ready` fired
+611 ms before the settle that measured it. The sequence, from one build:
+
+```
+-1201 ms  xterm_paint/mount_open              surface exists, BLANK
+-1051 ms  xterm_screen/reset  snapshot_reseed
+ -988 ms  xterm_screen/reset  clear_to_empty
+ -843 ms  terminal_mount/first_output         33283 bytes
+ -840 ms  xterm_write/enqueue_backlog         32871 chars accepted
+ -831 ms  xterm_write/flush                   handed to the canvas
+ -611 ms  terminal_mount/paint_ready          ⛔ "it painted"
+    0 ms  xterm_paint/settle                  frames 0 · covered 0/41 · visible true
+```
+
+⇒ **THE SHAPE WORTH NAMING, because it generalises past this probe: an instrument that is right
+in the healthy case and wrong in the failure case is not merely unreliable, it is ANTI-reliable.**
+Its eight agreements are exactly what earn it the trust that makes the ninth reading
+load-bearing. A probe that was wrong half the time would have been distrusted years ago.
+
+⛔ **Do not read this as "paint_ready lies".** It answers a real question — are the elements
+there — and answers it correctly. It is the NAME and the consumers that overreach. Cross-check it
+against `xterm_paint/settle` for the same build; `scripts/paint-chain.py` does this in its
+`claim` column and prints a line when a claim is falsified.
+
+⚠ **Join by BUILD, not by `host_id`.** The first cut of this very cross-check joined last-wins on
+`host_id`, picked a later healthy build of the same row, and reported *"9 claims, 0 falsified"* —
+the disagreement vanished into the trap documented one entry above. Segment on `mount_open`.
+
 ### ⛔⛔ A FRAME COUNT IS NOT A PAINT — `renderEventCount`, `frame_window` and `frame_gap` ALL READ HEALTHY ON A HALF-PAINTED SCREEN
 
 The renderer repaints only the rows it marked dirty. So a mount that painted two rows and stopped
