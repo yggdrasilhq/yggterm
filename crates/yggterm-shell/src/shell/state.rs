@@ -14189,6 +14189,103 @@ async fn web_surface_native_reconcile_loop(
         // The page reports this (WebKitGTK never emits its own `close` signal for
         // a `window.close()` — proven on the harness), so the SHELL decides:
         // only a tab a script opened may be closed this way.
+        // ── the media probe's door onto the trace plane (layer=webkit) ──
+        //
+        // ⭐ THIS HOP IS THE (ROW, TAB) ADDRESSING, and it is why the probe is
+        // worth having rather than a devtools console being open. `applied`
+        // already joins a surface's `native_id` to the (session_path, tab) that
+        // owns it, so the shell can stamp every record with the row and tab it
+        // came from. The page never says which tab it is — it CANNOT, which is
+        // the point: the same reasoning that makes the contract stamp `pid`
+        // rather than carry it. A page that could name its own tab could name
+        // another's, and every attribution downstream would inherit that.
+        //
+        // ⇒ `ytrace query --category media` is then filterable by row and by
+        // tab without anything in the page cooperating, which is the agent-side
+        // half of "pick which row and which tab to inspect".
+        let trace_batches = desktop.take_web_surface_trace_batches();
+        if !trace_batches.is_empty() {
+            let mut records: Vec<yggterm_core::ForeignTraceRecord> = Vec::new();
+            let mut undecodable = 0usize;
+            let mut unattributed = 0usize;
+            for batch in trace_batches {
+                // A surface whose tab has already gone is not an error: the
+                // page can drain on its way out (`pagehide`), and that batch is
+                // the most interesting one there is. It is counted rather than
+                // dropped silently, but it is dropped — a record that cannot
+                // name its row would pool with every other unattributed row and
+                // is worse than absent.
+                let Some((session_path, tab_id)) = applied
+                    .iter()
+                    .find(|(_, entry)| entry.native_id == batch.surface_id)
+                    .map(|(key, _)| key.clone())
+                else {
+                    unattributed += batch.records.len();
+                    continue;
+                };
+                for raw in batch.records {
+                    let Ok(mut record) =
+                        serde_json::from_value::<yggterm_core::ForeignTraceRecord>(raw)
+                    else {
+                        undecodable += 1;
+                        continue;
+                    };
+                    if let Some(payload) = record.payload.as_object_mut() {
+                        payload.insert("row".to_string(), json!(session_path));
+                        payload.insert("tab".to_string(), json!(tab_id));
+                        payload.insert("surface_id".to_string(), json!(batch.surface_id));
+                    }
+                    records.push(record);
+                }
+            }
+            if !records.is_empty() || undecodable > 0 || unattributed > 0 {
+                let newest_ts_ms = records
+                    .iter()
+                    .map(|record| record.ts_ms)
+                    .max()
+                    .unwrap_or_default();
+                let flush_lag_ms = current_millis().saturating_sub(newest_ts_ms);
+                let submitted = records.len();
+                let batch_trace_home = trace_home.clone();
+                // OFF the loop, for the same reason the terminal bridge moved
+                // off it: validating and writing a batch touches no UI state,
+                // and doing it inline held the one thread every keystroke
+                // crosses.
+                tokio::task::spawn_blocking(move || {
+                    let outcome = append_foreign_trace_batch(&batch_trace_home, records);
+                    if outcome.rejected_total() > 0
+                        || outcome.emitter_dropped > 0
+                        || outcome.over_batch_cap > 0
+                        || outcome.repaired > 0
+                        || undecodable > 0
+                        || unattributed > 0
+                    {
+                        append_trace_event(
+                            &batch_trace_home,
+                            "ui",
+                            "trace_bridge",
+                            "surface_batch_faults",
+                            json!({
+                                "submitted": submitted,
+                                "accepted": outcome.accepted,
+                                "repaired": outcome.repaired,
+                                "over_batch_cap": outcome.over_batch_cap,
+                                "emitter_dropped": outcome.emitter_dropped,
+                                "undecodable": undecodable,
+                                "unattributed": unattributed,
+                                "rejected": outcome
+                                    .rejected
+                                    .iter()
+                                    .map(|(fault, count)| json!({ "fault": fault, "count": count }))
+                                    .collect::<Vec<_>>(),
+                                "flush_lag_ms": flush_lag_ms,
+                            }),
+                        );
+                    }
+                });
+            }
+        }
+
         for request in desktop.take_web_surface_close_requests() {
             let Some((session_path, receiving_tab)) = applied
                 .iter()

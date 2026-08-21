@@ -27,7 +27,9 @@ mod shortcut;
 mod waker;
 mod web_surface;
 mod web_surface_clipboard_image_paste;
+mod web_surface_media_trace;
 pub use web_surface_clipboard_image_paste::CLIPBOARD_IMAGE_PASTE_SHIM_JS;
+pub use web_surface_media_trace::MEDIA_TRACE_SHIM_JS;
 #[cfg(not(any(
     target_os = "windows",
     target_os = "macos",
