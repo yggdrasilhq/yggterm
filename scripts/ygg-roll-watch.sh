@@ -239,6 +239,14 @@ fold_sweep() {
   #   the remedy is ONE `continue`, once per stall, and never into a composer that
   #   is holding text.
   #
+  # ⚠ THE STALL THRESHOLD IS TEN MINUTES, NOT FORTY, AND THE FIRST NUMBER WAS
+  #   CHOSEN TO BE SAFE RATHER THAN TO BE RIGHT. At forty minutes a lane that stops
+  #   after one turn — which is the ordinary way a lane stops — sits idle for most
+  #   of an hour while every instrument calls it WORKING, and the person looking at
+  #   the sidebar sees a campaign doing nothing. The wake is guarded three ways and
+  #   is a no-op on a row that is genuinely busy, so the cost of asking early is
+  #   near zero and the cost of asking late is the whole campaign idling.
+  #
   # 2. AN ORCHESTRATOR FOLDS ITS OWN SPAWNS AND NOBODY ELSE'S. Unscoped, the same
   #    run reaped a row belonging to a different campaign entirely — idle for
   #    nearly five hours and genuinely finished, which is precisely what makes it
@@ -249,7 +257,7 @@ fold_sweep() {
   [ "$DRY" = 1 ] && apply=""
   local campaign
   for campaign in $FOLD_CAMPAIGNS; do
-    python3 "$fold" sweep --campaign "$campaign" $apply --wake --finished-idle-min 45 --stall-idle-min 40 2>&1 \
+    python3 "$fold" sweep --campaign "$campaign" $apply --wake --finished-idle-min 45 --stall-idle-min 10 2>&1 \
       | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|[⛔✔🔒])' || true
   done
   python3 "$fold" worktrees $apply 2>&1 \

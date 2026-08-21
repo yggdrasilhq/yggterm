@@ -189,6 +189,35 @@ correctly folds nothing.
 needs the row to announce it; a lane that simply stops is `WORKING` forever. The honest signal
 would be the monitor's stall verdict, which is a different plane and a different entry.
 
+## ⛔⛔ [11.0] A FRESH LANE ENDS ITS TURN ON THE CLAIM, SO EVERY SPAWN STALLS BEFORE IT STARTS
+
+**Status:** OPEN
+
+*Measured 2026-08-21 after the owner asked why nothing was working.*
+
+**Symptom.** A lane spawned and briefed does one thing and stops. Its transcript ends with
+`Claiming my row first, as required.` and 27 records, and it is then idle for as long as
+nobody notices — eighteen minutes in the measured case, forty-five in the one before it.
+
+**The mechanism is the brief's own first instruction.** Every brief this campaign writes opens
+with *claim your row first, unasked, as your first act*, which runs `ygg-claim.sh`. That is
+the correct standing order for a session that arrives with no brief — the row a human most
+needs to find is the one running the work. It is the wrong FIRST act for a lane an
+orchestrator just spawned, seated and briefed, because the lane spends its opening turn on
+bookkeeping and the turn ends there.
+
+⇒ **An orchestrator that spawns a row already knows the seat and the title, and can set both
+itself** — `session outline` applies cleanly as a separate call. So the claim is redundant
+work for exactly the lanes that can least afford to spend a turn on it.
+
+**What is not yet established:** whether the turn ends because the claim's watch phase runs
+long, or simply because the lane treats "I have claimed my row" as a complete response. The
+remedy is the same either way — do not put it first — but the distinction decides whether
+`ygg-claim.sh` itself needs to change for the unbriefed case.
+
+**Falsifier:** spawn two lanes with identical briefs, one told to claim first and one seated
+by the orchestrator and told to start on the work. Count turns before the first stall.
+
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
 **Status:** OPEN
