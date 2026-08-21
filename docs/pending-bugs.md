@@ -2242,6 +2242,37 @@ its name). **Cheap next step for whoever takes this:** run the suite under `--te
 beside a heavy build; if it survives, the population is timing, and an isolation harness is
 aimed at the wrong thing.
 
+**⛔⛔ THE POPULATION IS NOW COUNTED, 2026-08-21 (11.10), AND IT IS TWENTY.** The 11.19
+narrowing named one instance; a sweep of the server crate finds that the same shape has
+**twenty distinct process-global environment variables** mutated from inside that one test
+binary, across ~87 call sites — `CODEX_HOME` (18), `YGGTERM_APPEARANCE` and the terminal
+appearance constants, `COLORFGBG`, `NO_COLOR`, `YGGTERM_HOME`, `HOME`, `PATH`, `TERM` and
+the rest. Every one is set, used and restored while sibling tests run on other threads, and
+several are read by product paths those siblings exercise. ⇒ **A per-test isolation harness
+cannot fix this and neither can `--test-threads=1` as a habit somebody remembers**: the
+binary is only sound single-threaded, and nothing says so.
+
+**⭐ WHAT LANDED, AND WHAT IT DELIBERATELY IS NOT.** A contract test
+(`the_process_globals_this_binarys_tests_mutate_are_all_declared`) now scans the crate and
+fails on any env global not on a declared list, each sanctioned *because it already exists,
+not because it is safe*. It does not fix a single flake. It stops the population growing
+silently, which is the expensive half — a flake whose cause is one of twenty invisible
+globals cannot be reasoned about at all. ⚠ Its first run found ITSELF: a scanner that spells
+its own pattern matches its own source, so the needles are assembled with `concat!`.
+
+**Sampling, same session, reported because a negative is a result:** three full server-suite
+runs at default threads beside a continuous `cargo build` in another worktree — **all green**.
+So this did not reproduce on demand under the companion-build condition, and the two
+hypotheses remain unseparated by sampling. ⚠ One earlier run exited **101 with no failing
+test named at all** and its log was discarded by the first harness version; the harness now
+keeps every non-zero run's output, because "a non-zero exit that names nothing" is its own
+finding and this entry has already lost one failure's identity that way.
+
+**⇒ NEXT, AND IT BEATS MORE SAMPLING:** thread the seams. `local_agent_store_vouches_for_
+session_in` and `collect_live_store_title_syncs_in` already show the pattern — the product
+path is told where to look instead of reading a global. Every variable removed from the
+declared list is one fewer way for two unrelated tests to collide.
+
 **⭐⭐ ONE INSTANCE NOW HAS ITS SHARED STATE NAMED — 2026-08-21 (11.19), and it is SHARED STATE,
 not timing.** `agent_arm_matrix::locality_does_not_fork_the_invocation` failed once in a
 full-suite run and passed in isolation. The assertion diff names the culprit outright: the two

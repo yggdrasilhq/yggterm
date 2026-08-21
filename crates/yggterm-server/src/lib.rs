@@ -32388,6 +32388,110 @@ mod tests {
         );
     }
 
+    /// ⛔⛔ EVERY PROCESS-GLOBAL ENVIRONMENT VARIABLE THIS BINARY'S TESTS MUTATE
+    /// IS LISTED HERE, AND A NEW ONE MUST BE ADDED DELIBERATELY.
+    ///
+    /// `std::env::set_var` is PROCESS-global, and `cargo test` runs a binary's
+    /// tests on many threads at once. So a test that sets `CODEX_HOME`, runs, and
+    /// restores it is not isolated at all — every sibling test on every other
+    /// thread saw the temporary value, and any of them whose product path reads
+    /// that variable can fail for a reason that has nothing to do with what it is
+    /// testing. Measured 2026-08-21: a launch-command assertion failed on a
+    /// `YGGTERM_HOME` pointing at another test's temp directory, and passed in
+    /// isolation immediately after — the shape behind the suite flake that has
+    /// been paid for repeatedly with re-runs.
+    ///
+    /// ⚖ THIS TEST DOES NOT FIX THAT, AND SHOULD NOT PRETEND TO. The fix is to
+    /// thread the seam as an argument, the way `local_agent_store_vouches_for_
+    /// session_in` and `collect_live_store_title_syncs_in` already do, so the
+    /// product path is told where to look instead of reading a global. That is
+    /// per-variable work across a long list, and until it is done this binary's
+    /// tests are only sound single-threaded.
+    ///
+    /// ⇒ What this DOES is stop the list growing silently. The population is the
+    /// expensive part of the problem — a flake whose cause is one of twenty
+    /// invisible globals cannot be reasoned about — so adding a twenty-first is
+    /// made a deliberate act with this comment attached to it.
+    #[test]
+    fn the_process_globals_this_binarys_tests_mutate_are_all_declared() {
+        // Sanctioned because they already exist, NOT because they are safe.
+        // Removing one from this list by threading its seam is the direction of
+        // travel; adding one is a decision to make the flake population larger.
+        const DECLARED: &[&str] = &[
+            "CODEX_HOME",
+            "COLORFGBG",
+            "COLORTERM",
+            "HOME",
+            "NO_COLOR",
+            "PATH",
+            "TERM",
+            "TERM_PROGRAM",
+            "TERM_PROGRAM_VERSION",
+            "YGGTERM_APPEARANCE",
+            "YGGTERM_APP_CONTROL_CLIENT",
+            "YGGTERM_APP_CONTROL_PID",
+            "YGGTERM_GOVERNOR",
+            "YGGTERM_TERM_PROGRAM",
+            // Referenced through their constants rather than spelled.
+            "ENV_YGGTERM_TERMINAL_APPEARANCE",
+            "ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND",
+            "ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND",
+            "ENV_YGGTERM_CC_EXTRA_ARGS",
+            "ENV_YGGTERM_HOME",
+            // A loop restoring a captured (key, value) pair — the key is whatever
+            // that test captured, and the values it can hold are already above.
+            "key",
+        ];
+        // ⛔ THE NEEDLES ARE ASSEMBLED, NEVER SPELLED. A scanner that contains its
+        // own pattern finds itself, and this one did on the first run — reporting
+        // a "variable" cut out of its own source line. Same family as a fixture
+        // that satisfies the assertion it is supposed to test.
+        let needles = [
+            concat!("env::", "set_var("),
+            concat!("env::", "remove_var("),
+        ];
+        let mut found: Vec<String> = Vec::new();
+        for source in [
+            include_str!("lib.rs"),
+            include_str!("terminal.rs"),
+            include_str!("audio_cli.rs"),
+            include_str!("resource_governor.rs"),
+        ] {
+            for line in source.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for call in needles {
+                    let Some(rest) = line.split_once(call).map(|(_, rest)| rest) else {
+                        continue;
+                    };
+                    let name = rest
+                        .split([',', ')'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_start_matches('&')
+                        .trim_matches('"');
+                    // Constants are cited by path; compare on the final segment.
+                    let name = name.rsplit("::").next().unwrap_or(name).trim();
+                    if name.is_empty() || DECLARED.contains(&name) {
+                        continue;
+                    }
+                    found.push(name.to_string());
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        assert!(
+            found.is_empty(),
+            "these process globals are mutated but not declared: {found:?}. \
+             Every entry is a variable a sibling test on another thread can \
+             observe mid-flight; add it to DECLARED only if the seam genuinely \
+             cannot be threaded as an argument."
+        );
+    }
+
     /// ⛔ THE REMOTE TWIN OF THE ABOVE, root-caused 2026-08-20: a remote CC
     /// spawn's `--model` never reached the process although the create
     /// composed it correctly (`launch.applied: true`) — because BOTH remote
