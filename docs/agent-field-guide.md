@@ -2357,6 +2357,40 @@ together; a family count answers a question nobody asked and answers it alarming
 `incident: true` every 60 s while its own diagnosis says the host is *below* every threshold.
 An incident that reports the absence of a problem is the shape this whole entry is about.
 
+
+## A CONTENT RESIDUE IS A PROMPT TO LOOK, AND THE LOOK IS WHERE THE ANSWER IS (2026-08-21)
+
+`ygg-land.py status` now answers "is this branch landed" from CONTENT rather than from
+patch-ids, because a patch re-applied at different context reads unlanded forever. That
+turned six false alarms into one real candidate — and the candidate then needed a human
+judgement the probe cannot make. Worked example, because the shape recurs:
+
+`lane/dev/gum-never-hangs`, 1,637 commits behind, residue **57 substantive lines of 451**:
+
+| residue | what it actually was |
+|---|---|
+| 1 line, a skill doc | a stale recipe reading a config file main replaced with a resolver script |
+| 14 lines, both binaries | a hardcoded `media answer` dispatch arm — **main routes it generically** |
+| 42 lines, the queue | an older draft of a narrative main carries, rewritten, in its successor entry |
+
+**Every one superseded, none of it detectable from the diff.** What settled the code half
+was not reading more source, it was **reachability**: one `server app media answer allow`
+against the live binary, which answered `no_pending_request` through
+`answer_media_capture` — the verb exists and the branch's arm is redundant. ⚠ And it had to
+be run against **both** binaries, because the branch's own comment warned that its arm was
+"both binaries or neither"; a single-binary probe would have proven half of it and read as
+proof of all.
+
+What settled the docs half was finding main's successor entry, which says in its own first
+line that the older bug "was real, root-caused and closed" and carries the same falsified
+hypotheses in better form.
+
+⇒ **Three instruments, each strictly better than the last, and the last one is not a
+git command at all.** Refs say how many SHAs. Patch-ids say whether these patches applied
+here. Content says whether this text is in the tree. **Reachability says whether the
+behaviour is there** — and that is the only one that answers the question anybody cares
+about. Run it before deleting a branch, and before believing one.
+
 ## `ytrace tail` cannot compute a RATE in either direction (measured 2026-08-21)
 
 The cap (~20 records) is already noted above as inflating frequency. It distorts the
