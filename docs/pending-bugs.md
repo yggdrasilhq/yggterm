@@ -45,6 +45,31 @@ same window — `retained_empty_surface_settle_wait` ×2,
 `resume_recovery_begin/end`, `reveal_forced_incomplete` ×2 — so the recovery
 machinery is not idle, it is losing.
 
+### ⭐ OWNER, 2026-08-21, THE SAME DEFECT SEEN FROM THE SEAT: GHOST FRAMES AND BROKEN PAINT ON SWITCH
+
+*"I see a lot of ghost and frame freezes while switching. This is INPUT BLOCKING BUG. Also, I
+see TUI paint broken on switching. Another INPUT BLOCKING BUG."*
+
+⇒ **Recorded here rather than as new entries, because a switch IS a mount** and this entry
+already measures mounts landing on rows nobody asked for. A ghost frame is the previous row's
+surface still on screen while the new mount has not painted; broken TUI paint is a mount that
+painted partially. Both are what "a mount begins with an empty surface" looks like to the eye
+rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
+filing three entries for one symptom chain is what made this look half-fixed once already.
+
+**The tracing the owner asked for is END TO END and it does not exist yet:** kernel call →
+daemon → client → **xterm.js layer** → pixel. The xterm.js half is the gap; every measurement
+in this entry stops at the Rust boundary, so "the mount began" and "the glyphs arrived" are
+currently the same event as far as any instrument here can tell. ⇒ Until a probe spans that
+boundary, a partially-painted frame and a fully-painted one are indistinguishable, and no
+amount of daemon-side tracing closes it.
+
+⭐ **This is what the `ytop` Legendary Bugs notebook is for** (seat 11.21): the Top shelf
+carrying the kernel/process half and the Dash shelf the yggterm half, so the chain is visible
+in one place instead of being re-derived from a trace file per session. **Where a probe does
+not exist, the page must say so** — a missing probe and a quiet system look identical, which is
+the failure this campaign keeps paying for.
+
 ### ⭐ NARROWED 2026-08-21 — THE REMOUNTS TRACK ROWS BEING ADDED AND REMOVED, NOT TIME
 
 The churn is not a background loop on a timer. Over 2.2 minutes with the trace open:
