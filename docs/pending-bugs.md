@@ -582,7 +582,7 @@ reads that through `list | grep <uuid>`, which throws the header away. A sibling
 
 ## ⛔⛔ [11.20] THE DRAFT FLAG IS RESET BY EVERY DAEMON HANDOVER, AND IT FAILS OPEN
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *Found 2026-08-21 while confirming the composer-draft entry below. It is the reason
 that entry's replacement is a UNION of two readings rather than one clean owner.*
@@ -607,30 +607,30 @@ consults the same flag, so the release that destroys a draft is also cleared by 
 **Falsifier:** type into a row, confirm `server rows drafts` names it, roll the daemon,
 and ask again without touching the row. It must still name it.
 
-**Not fixed here.** The seeding this wants — reconstruct the line from the rendered
-composer row at adoption, then let keystrokes maintain it as they already do — is a
-change to the adopt path, and this lane could not prove it without a daemon bump it was
-told not to take. What shipped instead is the union in
-`TerminalManager::session_composer_holds_draft`, where the rendered grid covers exactly
-the window the counter is blind in.
+**Fixed by making every reader that does not write first consult the UNION**, rather
+than by seeding the counter at adoption. `session_composer_holds_draft` already existed
+and already covered exactly the window the counter is blind in; it was simply not what
+the guards were reading. Three of them were still on the keystroke arm alone — the
+drafts sweep, the migratability signals, and `--refuse-if-draft` on `server terminal
+write` — which is to say the three places the answer decides whether somebody's line
+survives. They read the union now.
 
-## ⛔ [11.20] `server rows drafts` REPORTS FULL COVERAGE WHILE SEEING ONE DAEMON IN FOUR
+⚖ **Two readers deliberately keep the keystroke arm, and a test states the split.**
+`submit_prompt_echo_verified` and the §5 hot-restart repair re-ask their draft closure
+AFTER typing a probe marker into the composer, so the rendered-grid arm would read their
+own probe as a person mid-sentence and abort the submit they were asked to make. There
+the counter is the correct instrument precisely because a daemon-originated write is
+invisible to it. Without that test, "finish the migration" is a one-line change that
+silently breaks the probe.
 
-**Status:** OPEN
+⛔ **Adopt-path seeding is still the better answer and is NOT done.** The union refuses
+correctly, but it cannot tell a caller *what* the line is, and a row whose CLI has not
+yet redrawn its composer is invisible to both arms at once.
 
-Measured 2026-08-21 on the build host: four `yggterm-headless server daemon` processes
-were running, and `server rows drafts` answered `daemons_seen: 1` with
-`daemons_or_rows_unable_to_answer: 0` — i.e. it declared it had asked everybody.
-
-The verb's own contract is right and is quoted in its docstring: *a daemon that cannot
-answer is counted apart, never as clean; blind is not clear*. That protects a daemon
-that ANSWERS "I am too old to say". It does nothing for a daemon that is never
-enumerated, because there is then nobody to be blind — and the fan-out enumerates by
-socket, while a version bump replaces older sockets with symlinks to the newest one.
-
-⇒ **A coverage count is not coverage.** The verb should compare the daemons it reached
-against the daemon PROCESSES on the host and report the difference, or its `verdict:
-"clear"` means "clear among the ones I happened to find".
+**Live proof owed, and it cannot be taken without a roll:** the falsifier below reads
+the daemon's own `pending_input_drafts`, which the DAEMON builds — so it needs a daemon
+running this code, and the roll watcher has been dead since 15:51 today (its own queue
+entry). Ask for it after the next deploy.
 
 ## ⛔⛔⛔ [11.20] `composer_held_draft` HAD NO DISCRIMINATOR LEFT — CONFIRMED, AND FIXED
 
@@ -971,6 +971,8 @@ and read the row's `/proc/<pid>/environ` — no agent-session marker may appear,
 row's JSONL must exist and grow from turn one.
 ## ⛔⛔ [11.13] THE FLEET WAKE PATH IS EFFECTIVELY DEAD — 196 BOOTS ABORTED, 2 ROWS EVER WOKEN
 
+**Status:** OPEN
+
 Counted from one day of `booter.log`: **196 `⛔ ABORTING BOOT … boot text never appeared on
 screen after 6 s. Enter NOT sent`**, against exactly **two rows in the entire fleet that have
 ever recorded a boot** (`boots: 3` and `boots: 1`). Every other subscription, across every
@@ -1009,6 +1011,8 @@ quiet is this, not a quiet campaign. ⚠ Do not read "the row woke up" as eviden
 landed — a human typing into a row looks identical from every instrument the fleet has.
 
 ## ⛔⛔ [11.13] A LIVE, WORKING SESSION CAN BE ABSENT FROM THE GUI HOST'S ROW TREE — SO THE WATCHER LAPSES IT AND NOTHING CAN REACH IT
+
+**Status:** OPEN
 
 ⛔ **THIS ENTRY REPLACES A FALSIFIED MECHANISM. Re-measured 2026-08-21 16:45-16:50 against a
 session that was alive and writing while it was measured.** The previous text said a spawned row
@@ -1081,7 +1085,9 @@ unresolved one.
 
 ## ⛔⛔ [11.13] AN ABSENCE-LAPSE IS PERMANENT AND NEVER RE-CHECKED, SO ONE TRANSIENT LISTING GAP UNWATCHES A LIVE SESSION FOREVER
 
-**Status:** OPEN. Measured 2026-08-21 across the whole subscription set.
+**Status:** OPEN
+
+Measured 2026-08-21 across the whole subscription set.
 
 A subscription that goes absent from the GUI host's row tree for `GONE_SIGHTINGS` consecutive
 readings is marked `lapsed`. The tick's very next act on that record is:
@@ -1125,6 +1131,8 @@ The two facts are printed by different instruments and nothing reconciles them, 
 sits in plain sight and reads as two unrelated lines.
 
 ## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
+
+**Status:** OPEN
 
 ⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
 mentions it — collateral loss in a file rewrite, not a fix. This file's own rule is that an
@@ -22290,7 +22298,9 @@ reader knows the instrument's reach ended before the answer did.
 
 ## ⚠ [11.1] TWO INSTRUMENTS THAT ANSWER A DIFFERENT QUESTION THAN THEIR NAME, FOUND FALSIFYING ROW GROUPS
 
-**Status:** OPEN. Both hit 2026-08-21 in `scripts/underglass-sandbox.sh`.
+**Status:** OPEN
+
+Both hit 2026-08-21 in `scripts/underglass-sandbox.sh`.
 
 Neither is a defect in the feature under test; both are traps for the NEXT lane
 that tries to falsify anything in the tab rail, which is why they are filed
@@ -22386,7 +22396,9 @@ safe read-back is a listing instrument, not the verb itself.
 
 ## [19.1] A ROW CAN BE DISPLAYED BUT UNBOUND — EVERY MUTATING VERB THEN NO-OPS, AND `rename` REPORTS SUCCESS
 
-**Status:** OPEN — reproduced repeatedly 2026-08-21 on build 3.1.17, client and daemon agreeing.
+**Status:** OPEN
+
+reproduced repeatedly 2026-08-21 on build 3.1.17, client and daemon agreeing.
 
 ⭐ **THE STATE, which is the part worth naming:** the row renders in the sidebar, the metadata panel
 populates from its rollout file, and the session is plainly alive and working — **while the daemon

@@ -43334,6 +43334,53 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
 
+    /// ⛔⛔ A BLIND READING MAY NOT LICENSE A RESTART. `input-check` reports
+    /// `wedged`, which is a POSITIVE claim, and hangs a remedy off it that
+    /// restarts a live agent row. That verdict used to be computed from a
+    /// `bool` built with `unwrap_or(false)` — so a composer NOBODY COULD READ
+    /// arrived as "holds no draft" and the row was declared wedged on the
+    /// strength of a reading that never happened.
+    ///
+    /// ⭐ The write-permission logic beside it always kept the distinction
+    /// (`probe_write_is_permitted` demands `Some(false)`); it was only the
+    /// REPORT that threw it away, which is why nothing failed and the field
+    /// looked healthy. A source scan is the instrument because the defect is
+    /// a collapsed type, not a wrong branch.
+    #[test]
+    fn a_composer_nobody_could_read_is_not_reported_as_wedged() {
+        let source = SHELL_SOURCE;
+        let start = source
+            .find("\"composer_held_draft\": verdict.composer_held_draft,")
+            .expect("input-check must still report the composer reading");
+        let window = &source[start.saturating_sub(1200)..start + 1200];
+
+        assert!(
+            !window.contains("verdict.composer_held_draft.unwrap_or"),
+            "the wire field must stay TRI-STATE — true, false, or null. \
+             `unwrap_or(false)` here is the defect: it tells a caller \
+             `composer_held_draft: false` about a composer that was never read, \
+             and `false` is what every reader takes as permission to type."
+        );
+        assert!(
+            window.contains("verdict.composer_held_draft == Some(false)"),
+            "`wedged` and its restart remedy must both require a POSITIVE \
+             reading that the composer is empty. `!composer_held_draft` over a \
+             tri-state collapses `nobody could say` into `it is clear`, which is \
+             how a row nobody could read gets a restart recommended for it."
+        );
+        let wedged_at = window
+            .find("\"wedged\":")
+            .expect("the wedged verdict must still be reported");
+        let remedy_at = window.find("\"remedy\":").unwrap_or(window.len());
+        assert_eq!(
+            window[wedged_at..].matches("== Some(false)").count(),
+            window[remedy_at..].matches("== Some(false)").count() + 1,
+            "the remedy and the verdict must be computed from the SAME \
+             condition — a remedy that restarts a row on looser terms than the \
+             claim that justifies it is the worse half of the two"
+        );
+    }
+
     /// The owner's #1: a row that has stopped reading its PTY must stop looking
     /// exactly like a healthy one.
     ///
