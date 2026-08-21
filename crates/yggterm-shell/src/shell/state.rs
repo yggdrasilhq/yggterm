@@ -78908,10 +78908,35 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             if (!atlas) { return { index: -1, pages: null }; }
                             let index = atlases.indexOf(atlas);
                             if (index < 0) { atlases.push(atlas); index = atlases.length - 1; }
+                            // ⛔ A CLEAR COUNTER COUNTS CALLS, NOT CLEARS.
+                            // `forced_atlas_clear_count` is incremented by OUR
+                            // funnel the moment it calls the addon; the addon's
+                            // own `clearTexture()` opens with
+                            //   if (0 !== pages[0].currentRow.x || 0 !== ...y)
+                            // and does NOTHING when the first page is still at
+                            // its origin. So a run can report N atlas clears and
+                            // have wiped nothing at all -- and an experiment
+                            // built on it would "refute" a cause it never
+                            // applied, which is the same failure shape as a
+                            // harness reporting clean results it never rendered.
+                            // `page0_row_x/y` is the fill cursor the guard reads,
+                            // and it is the honest witness: a page that is only
+                            // being filled can never go DOWN, so a backwards move
+                            // is a clear reporting itself. ⚠ `page0_version` is
+                            // NOT a clear counter -- `Page.clear()` bumps it, but
+                            // so does every glyph rasterised into the page, and
+                            // one run moved it 1,088 -> 8,573 across nine clears.
+                            // It says the page is live, not that it was wiped.
+                            const page0 = (atlas._pages || [])[0] || null;
                             return {
                                 index,
                                 pages: (atlas._pages || []).length,
                                 active_pages: (atlas._activePages || []).length,
+                                page0_row_x: page0 && page0.currentRow
+                                    ? Number(page0.currentRow.x || 0) : -1,
+                                page0_row_y: page0 && page0.currentRow
+                                    ? Number(page0.currentRow.y || 0) : -1,
+                                page0_version: page0 ? Number(page0.version || 0) : -1,
                             };
                         } catch (_e) { return { index: -1, pages: null }; }
                     };
@@ -78926,6 +78951,9 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             atlas_index: atlas.index,
                             atlas_pages: atlas.pages,
                             atlas_active_pages: atlas.active_pages,
+                            atlas_page0_row_x: atlas.page0_row_x,
+                            atlas_page0_row_y: atlas.page0_row_y,
+                            atlas_page0_version: atlas.page0_version,
                             mounted_at: Number(e.mountedAt || 0),
                             // The repair funnel's own counters. A forced refresh
                             // that never fired and one that fired and did not help
@@ -78974,6 +79002,31 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             // COULD have run for this host.
                             recent_frame_like_write_until_ms:
                                 Number(e.recentFrameLikeWriteUntilMs || 0),
+                            // Is a repair still OWED to this host? A refusal count
+                            // cannot answer it: a demand refused and still standing
+                            // and one refused and lost look identical in the
+                            // counters and mean opposite things about the repair
+                            // path.
+                            pending_full_refresh_demand:
+                                Boolean(e.pendingVisiblePaintForceFullRefresh),
+                            pending_full_refresh_since_ms:
+                                Number(e.pendingVisiblePaintForceFullRefreshSinceMs || 0),
+                            // How many times the demand watchdog had to rescue a
+                            // stranded repair. Non-zero means the recovery timer
+                            // was lost and the deadline was never evaluated -- the
+                            // fault this counter exists to make visible.
+                            visible_paint_demand_rescue_count:
+                                Number(e.visiblePaintDemandRescueCount || 0),
+                            pending_recovery: Boolean(e.pendingVisiblePaintRecovery),
+                            pending_recovery_until_ms:
+                                Number(e.pendingVisiblePaintRecoveryUntilMs || 0),
+                            // The gate with no deadline. `frame_like` and
+                            // `rate_limited` are both bypassed once a demand is
+                            // overdue; `input_hot` is a hard AND with no escape,
+                            // so while this is in the future the repair cannot run
+                            // however old the demand is.
+                            terminal_input_hot_until_ms:
+                                Number(e.terminalInputHotUntilMs || 0),
                         });
                     }
                     const indices = hosts.map((h) => h.atlas_index).filter((i) => i >= 0);

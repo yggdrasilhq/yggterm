@@ -9898,6 +9898,62 @@ console.log('ok');
             "watchdog must be cleared on cleanup (no leaked intervals)"
         );
     }
+    /// ⛔⛔ AN EXPIRY THAT ONLY FIRES WHEN SOMEONE ASKS AGAIN IS NOT AN EXPIRY.
+    ///
+    /// The 1,500 ms full-refresh deadline is a term INSIDE the grant condition,
+    /// so it is only evaluated when something re-enters `requestVisiblePaint`.
+    /// The only thing that would is a single-slot recovery timer that every later
+    /// `scheduleVisiblePaintRecovery` cancels — and when that slot is lost the
+    /// demand is stranded with the expiry never running. Measured in a sandbox
+    /// on one host with no remount: a demand outstanding 43,154 ms against the
+    /// 1,500 ms deadline, `pending_recovery` due 9,074 ms in the PAST, and both
+    /// `forced_refresh_count` and `forced_refresh_skipped_count` frozen across
+    /// the window — the funnel was not re-entered once, and that row had not been
+    /// repaired since it mounted.
+    ///
+    /// ⛔ The watchdog must NOT override `input_hot`. A granted refresh clears the
+    /// shared glyph atlas and redraws every row; landing that mid-keystroke is
+    /// plausibly an input-block source, and that trade belongs to the input-block
+    /// lane. Serving the demand a second after typing stops is the whole
+    /// difference between "deferred" and "stranded".
+    #[test]
+    fn terminal_eval_script_serves_a_stranded_full_refresh_demand() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const visiblePaintDemandWatchdog = window.setInterval(() => {"),
+            "the deadline needs a timer that re-enters the funnel, not only a bypass"
+        );
+        let ix = script
+            .find("const visiblePaintDemandWatchdog")
+            .expect("demand watchdog present");
+        let body = &script[ix..ix + 1400];
+        assert!(
+            body.contains("if (!pendingVisiblePaintForceFullRefresh) { return; }"),
+            "it must cost nothing while no repair is owed"
+        );
+        assert!(
+            body.contains("if (terminalInputHot()) { return; }"),
+            "it must never pre-empt typing — that gate is the input-block lane's call"
+        );
+        assert!(
+            body.contains("outstandingMs < VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS"),
+            "it must serve the EXISTING deadline rather than inventing a second one"
+        );
+        assert!(
+            body.contains("requestVisiblePaint(true)"),
+            "the rescue goes through the existing repair funnel, never a duplicate"
+        );
+        assert!(
+            body.contains("visiblePaintDemandRescueCount += 1"),
+            "a rescue must be countable, or the underlying loss becomes invisible \
+             the moment it is repaired"
+        );
+        assert!(
+            script.contains("window.clearInterval(visiblePaintDemandWatchdog);"),
+            "watchdog must be cleared on cleanup (no leaked intervals)"
+        );
+    }
     #[test]
     fn terminal_eval_script_focuses_host_and_scopes_wheel_capture() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
