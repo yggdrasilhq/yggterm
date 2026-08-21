@@ -2704,7 +2704,19 @@ def _screen_text(host, row):
         try:
             envelope = json.loads(body)
             if isinstance(envelope, dict):
-                body = envelope.get("text") or ""
+                # ⛔⛔ THE SCREEN IS AT `data.text`, NOT `text`. The fix that
+                # stopped this consuming the envelope RAW replaced one nesting
+                # error with another and read a field that does not exist at the
+                # top level — so this arm returned empty on EVERY row, every
+                # tick, and the booter fell through to the daemon screen or
+                # reported "screen unreadable" and refused to wake anything.
+                # Its own notification then blamed the verb for being missing;
+                # the verb is present and answers in full.
+                # ⇒ Measured 2026-08-21: `data.text` held 2837 characters for a
+                #   row the booter had just called unreadable for three ticks.
+                data = envelope.get("data")
+                body = ((data or {}).get("text") if isinstance(data, dict)
+                        else None) or envelope.get("text") or ""
         except ValueError:
             pass
     if not body.strip():
