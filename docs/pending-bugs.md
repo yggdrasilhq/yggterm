@@ -23036,3 +23036,54 @@ running window.
 
 **Falsified by:** any read-only verb or describe field that returns the per-machine
 present/total counts the modal renders.
+
+## [11.9] A ROLL REPLACES A LIVE DAEMON'S SOCKET WITH A SYMLINK TO THE NEW ONE, SO THE WRONG DAEMON ANSWERS
+
+**Status:** OPEN
+
+Older daemons stay alive after a roll and keep owning the sessions that were mid-flight on
+them — that is the constitution working. But the roll also **rewrites every older version's
+socket path into a symlink pointing at the new daemon's socket**, while those daemons are
+still running and still bound to the inode the path used to name.
+
+⇒ **Nothing can address an older daemon any more, and the failure is silent.** A query sent
+to a previous version's socket is redirected to the CURRENT daemon, which has never heard of
+the session being asked about and answers authoritatively that it has no screen: an empty
+array, or a payload with `char_count: 0` and `client_host: "missing"`. **An unreachable
+daemon that refuses a connection is a loud, correct failure. A symlink turns it into a
+confident wrong answer**, which is the harder of the two to ever notice.
+
+**Measured on one machine, one instant, two independent instruments agreeing:**
+
+| reading | value |
+|---|---|
+| live terminal sessions the current daemon ADVERTISES | 68 |
+| terminal sessions it actually OWNS (`owned_terminal_session_count`) | **4** |
+| rows it could produce a screen for | the same **4** |
+| previous versions' socket paths, now symlinks to the current one | every one checked |
+
+Three superseded daemons were alive at the time, two running from a deleted binary, each
+still bound to a socket path that now points somewhere else.
+
+**What it breaks.** The wake path reads a row's screen before deciding whether it may type,
+and correctly refuses when it cannot see one — *blind is not clear*. Since the redirect makes
+every session owned by a superseded daemon unreadable, those rows are refused forever, and
+the refusal is logged as our own instrument failing with a suggestion to check whether the
+build still exposes the screen-read verb. **The verb is present and answers in full; it is
+being asked of the wrong daemon.** The same redirect stands behind the guarantee that a row
+owned by an older daemon must still open and co-browse from the current GUI.
+
+⚠ **The symlink is not obviously wrong on its own** — pointing a superseded VERSION's socket
+at the current daemon is a reasonable compatibility shim for an old CLIENT. The defect is
+applying it to a socket whose daemon is **still alive and still owns sessions**, which
+converts "which daemon owns this PTY" from a question with one owner into one where the
+answer depends on a path that has been repointed underneath it.
+
+**The shape of the fix.** A live daemon's socket path is not free to take. Either leave it
+alone while the daemon holds sessions and let the shim cover only versions with no live
+owner, or make ownership explicit so a redirected query that lands on a daemon which does not
+own the session says exactly that instead of returning an empty screen.
+
+**Falsified by:** a superseded daemon that is still reachable at its own socket path while it
+holds sessions, or a redirected screen read that reports "not my session" rather than an
+empty one.
