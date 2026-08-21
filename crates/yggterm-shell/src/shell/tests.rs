@@ -1426,6 +1426,8 @@ mod tests {
                     reload_nonce: 0,
                     profile: "default".to_string(),
                     folder: None,
+                    group_head: None,
+                    group_collapsed: false,
                     custom_title: None,
                     loading: false,
                     loading_since_ms: 0,
@@ -55114,6 +55116,305 @@ mod webtabs_menu_switcher_locks {
     // paths pushed onto the END of the list independently — so a link opened
     // from the top of the rail appeared at the bottom of it.
     // ======================================================================
+
+    /// A plain tab, every field at rest, so a test can state ONLY the thing it
+    /// is about.
+    fn web_surface_test_tab(id: u64) -> WebSurfaceTab {
+        WebSurfaceTab {
+            media_playing: false,
+            media_seen_ms: 0,
+            id,
+            url: format!("https://example.invalid/{id}"),
+            effective_url: format!("https://example.invalid/{id}"),
+            socks_port: None,
+            title: None,
+            forward_child: None,
+            history: Vec::new(),
+            history_index: 0,
+            engine_nav: None,
+            reload_nonce: 0,
+            profile: "default".to_string(),
+            folder: None,
+            group_head: None,
+            group_collapsed: false,
+            custom_title: None,
+            loading: false,
+            loading_since_ms: 0,
+            theme_color: None,
+            lease_until_ms: None,
+            script_opened: false,
+            opener: None,
+        }
+    }
+
+    /// A tab as the FOLDER era wrote it: an id, the folder it was filed in, and
+    /// optionally a name the user gave it.
+    fn folder_era_tab(id: u64, folder: Option<&str>, custom_title: Option<&str>) -> WebSurfaceTab {
+        let mut tab = web_surface_test_tab(id);
+        tab.folder = folder.map(str::to_string);
+        tab.custom_title = custom_title.map(str::to_string);
+        tab
+    }
+
+    fn folder_era_folder(id: &str, name: &str, parent: Option<&str>, collapsed: bool) -> WebTabFolder {
+        WebTabFolder {
+            id: id.to_string(),
+            name: name.to_string(),
+            collapsed,
+            parent: parent.map(str::to_string),
+        }
+    }
+
+    fn group_shape(tabs: &[WebSurfaceTab]) -> Vec<(u64, Option<u64>)> {
+        tabs.iter().map(|tab| (tab.id, tab.group_head)).collect()
+    }
+
+    /// THE MIGRATION, as the owner stated it: a folder's FIRST tab becomes the
+    /// group's HEAD, the rest point at it, and the head joins the group its
+    /// folder sat inside — "row headers belong to the OUTSIDE group, or to root
+    /// when there is none".
+    #[test]
+    fn folders_flatten_into_row_groups_headed_by_their_first_tab() {
+        // app(0); "Work" holds 1,2,3; "Deep" is nested in Work and holds 4,5.
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("work"), None),
+            folder_era_tab(2, Some("work"), None),
+            folder_era_tab(4, Some("deep"), None),
+            folder_era_tab(5, Some("deep"), None),
+            folder_era_tab(3, Some("work"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("work", "Work", None, false),
+            folder_era_folder("deep", "Deep", Some("work"), false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(report.groups_formed, 2);
+        assert_eq!(report.empty_folders_dropped, 0);
+        assert_eq!(
+            group_shape(&tabs),
+            vec![
+                (0, None),       // the app tab, always root
+                (1, None),       // Work's head — its folder was at root
+                (2, Some(1)),    // …and Work's other members point at it
+                (4, Some(1)),    // Deep's HEAD joins the OUTSIDE group, Work
+                (5, Some(4)),    // …and Deep's member points at Deep's head
+                (3, Some(1)),
+            ],
+            "the nesting survives as nesting, and every group is contiguous"
+        );
+        // ⭐ Note the ORDER: 4 and 5 stay BETWEEN 2 and 3, exactly where the
+        // user had them. Contiguity is about each group being an unbroken block,
+        // NOT about sorting — a migration that tidied these into id order would
+        // rearrange every profile in the fleet the first time it ran, and the
+        // user would have no way to put it back.
+    }
+
+    /// ⭐ WHERE THE FOLDER'S NAME GOES — the half that decides whether this
+    /// migration is lossless. A folder called "Reading" must not become whatever
+    /// its first page happens to be titled.
+    #[test]
+    fn a_head_adopts_its_folders_name_unless_the_user_already_named_it() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("reading"), None),
+            folder_era_tab(2, Some("reading"), None),
+            // This head ALREADY carries a name the user typed.
+            folder_era_tab(3, Some("named"), Some("My own name")),
+            folder_era_tab(4, Some("named"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("reading", "Reading", None, false),
+            folder_era_folder("named", "Folder label", None, false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        let title_of = |id: u64| {
+            tabs.iter()
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.custom_title.clone())
+        };
+        assert_eq!(
+            title_of(1),
+            Some("Reading".to_string()),
+            "the folder's label survives on the head that took its place"
+        );
+        assert_eq!(
+            title_of(3),
+            Some("My own name".to_string()),
+            "a name the USER typed outranks the folder's label — the more \
+             specific statement of the same intent"
+        );
+        assert_eq!(report.names_adopted, 1);
+        assert_eq!(
+            report.names_yielded_to_custom_title, 1,
+            "the one genuinely lossy case is COUNTED, not passed over in silence"
+        );
+        // The label lands where every drawing of the row already looks for it.
+        assert_eq!(title_of(2), None, "a plain member is not renamed");
+    }
+
+    /// ⛔ THE APP TAB IS UNTOUCHABLE. Every close verb in the product is written
+    /// on the premise that `tabs[0]` is the app's — a migration that filed it
+    /// into a group would break all of them at once, on load, on data the user
+    /// cannot get back.
+    #[test]
+    fn the_migration_never_files_the_app_tab_into_a_group() {
+        // A store that (wrongly, or from an older bug) has the app tab filed.
+        let mut tabs = vec![
+            folder_era_tab(0, Some("work"), None),
+            folder_era_tab(1, Some("work"), None),
+            folder_era_tab(2, Some("work"), None),
+        ];
+        let folders = vec![folder_era_folder("work", "Work", None, false)];
+
+        migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(tabs[0].id, 0, "the app tab keeps its seat");
+        assert_eq!(tabs[0].group_head, None, "and it is never a member");
+        assert_eq!(
+            tabs[0].custom_title, None,
+            "nor does it adopt a folder's name — it would have been the first \
+             tab in that folder, and heading the group is exactly what it must \
+             not do"
+        );
+        assert_eq!(
+            group_shape(&tabs),
+            vec![(0, None), (1, None), (2, Some(1))],
+            "tab 1 heads the group instead, being the first tab that MAY"
+        );
+    }
+
+    /// An empty folder held nothing, so it migrates to nothing — and its
+    /// children re-parent to the nearest ancestor that DID form a group rather
+    /// than being stranded at root.
+    #[test]
+    fn an_empty_folder_drops_out_without_stranding_what_was_nested_inside_it() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("outer"), None),
+            folder_era_tab(2, Some("inner"), None),
+            folder_era_tab(3, Some("inner"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("outer", "Outer", None, false),
+            // Holds no tabs of its own, and sits between outer and inner.
+            folder_era_folder("hollow", "Hollow", Some("outer"), false),
+            folder_era_folder("inner", "Inner", Some("hollow"), false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(report.groups_formed, 2);
+        assert_eq!(report.empty_folders_dropped, 1);
+        assert_eq!(
+            group_shape(&tabs),
+            vec![(0, None), (1, None), (2, Some(1)), (3, Some(2))],
+            "inner's head skips the hollow folder and joins outer's group — \
+             \"or to root when there is none\" generalizes to the nearest \
+             ancestor that exists"
+        );
+    }
+
+    /// ⛔ `parent` is DATA OFF DISK. A cycle in it must not hang the app on load,
+    /// before there is any UI to say why — and every tab must still be drawn.
+    #[test]
+    fn a_cycle_in_the_stored_folder_parents_terminates_and_loses_no_tab() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("a"), None),
+            folder_era_tab(2, Some("b"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("a", "A", Some("b"), false),
+            folder_era_folder("b", "B", Some("a"), false),
+        ];
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        assert_eq!(report.groups_formed, 2);
+        assert_eq!(tabs.len(), 3, "no tab is dropped by a malformed store");
+        assert!(
+            tabs.iter().all(|tab| tab.folder.is_none()),
+            "and none is left holding a retired folder id"
+        );
+    }
+
+    /// The collapsed state is part of what the user arranged, so it moves onto
+    /// the head that now stands for the folder.
+    #[test]
+    fn a_collapsed_folder_migrates_to_a_collapsed_group() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, Some("shut"), None),
+            folder_era_tab(2, Some("shut"), None),
+            folder_era_tab(3, Some("open"), None),
+        ];
+        let folders = vec![
+            folder_era_folder("shut", "Shut", None, true),
+            folder_era_folder("open", "Open", None, false),
+        ];
+
+        migrate_web_tab_folders_into_row_groups(&mut tabs, &folders);
+
+        let collapsed_of = |id: u64| {
+            tabs.iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| tab.group_collapsed)
+        };
+        assert_eq!(collapsed_of(1), Some(true));
+        assert_eq!(collapsed_of(3), Some(false));
+    }
+
+    /// NOTHING TO DO is its own case: a surface that never had a folder must
+    /// come out byte-identical, not merely equivalent. A migration that reorders
+    /// or renames on a no-op would rearrange every profile in the fleet the
+    /// first time it ran.
+    #[test]
+    fn a_surface_with_no_folders_is_left_exactly_as_it_was() {
+        let before = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(7, None, Some("kept")),
+            folder_era_tab(3, None, None),
+        ];
+        let mut after = before.clone();
+
+        let report = migrate_web_tab_folders_into_row_groups(&mut after, &[]);
+
+        assert_eq!(report, WebTabGroupMigration::default());
+        assert_eq!(group_shape(&after), group_shape(&before));
+        assert_eq!(
+            after.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![0, 7, 3],
+            "the order is untouched — note 7 before 3, which a sort would fix \
+             and a migration must not"
+        );
+        assert_eq!(after[1].custom_title.as_deref(), Some("kept"));
+    }
+
+    /// ⛔ A `group_head` pointing at a tab that is GONE must not delete the tab
+    /// from the walk. It would vanish from the rail while still existing in
+    /// state — the worst of both, and unrecoverable by the user.
+    #[test]
+    fn a_dangling_group_head_is_drawn_at_root_rather_than_disappearing() {
+        let mut tabs = vec![
+            folder_era_tab(0, None, None),
+            folder_era_tab(1, None, None),
+            folder_era_tab(2, None, None),
+        ];
+        tabs[2].group_head = Some(404);
+
+        order_web_tabs_by_group(&mut tabs);
+
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the orphan is still drawn"
+        );
+    }
 
     fn placement_row(id: u64, opener: Option<u64>, folder: Option<&str>) -> WebTabPlacementRow {
         WebTabPlacementRow {

@@ -1846,9 +1846,18 @@ struct WebSurfacePickerState {
     control_url: String,
     forward_child: Option<Arc<Mutex<std::process::Child>>>,
 }
-/// A virtual folder in the tab tree. Purely organizational, exactly like a cwd
-/// tree folder: it has an identity, a name the user can rename, and a collapsed
-/// state. It owns no tabs — the TABS name the folder.
+/// ⛔ RETIRED CONCEPT, KEPT ONLY TO BE MIGRATED AWAY FROM.
+///
+/// A virtual folder in the tab tree: an identity, a name, a collapsed state, and
+/// a parent. It owned no tabs — the TABS named the folder.
+///
+/// Folders were replaced by ROW GROUPS, whose head is a TAB
+/// ([`WebSurfaceTab::group_head`]). This type survives so that a profile written
+/// before the change can be read and flattened by
+/// [`migrate_web_tab_folders_into_row_groups`]. ⛔ Do not give it new callers,
+/// and do not write it back out — a retired concept with one live writer is not
+/// retired.
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct WebTabFolder {
     id: String,
@@ -1862,6 +1871,243 @@ struct WebTabFolder {
     /// existed, which reads back as the flat single level those stores meant.
     #[serde(default)]
     parent: Option<String>,
+}
+
+/// What a folder→row-group migration did, so a caller can log it and a test can
+/// assert on it without re-deriving the answer from the tabs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct WebTabGroupMigration {
+    /// Folders that became a group (they had at least one tab).
+    groups_formed: usize,
+    /// Folders that held no tabs at all. They carry no content, so nothing is
+    /// created for them — but they ARE counted, because "3 folders in, 2 groups
+    /// out" is the shape of a lossy migration and the count is how anyone
+    /// notices.
+    empty_folders_dropped: usize,
+    /// Heads that took their folder's NAME because they had no name of their
+    /// own. This is where the folder's label survives.
+    names_adopted: usize,
+    /// Heads that already carried a user-given name, so the folder's label was
+    /// dropped in favour of it. ⚠ The one genuinely lossy case, and it is
+    /// counted rather than hidden.
+    names_yielded_to_custom_title: usize,
+}
+
+/// Flatten virtual folders into ROW GROUPS, in place, losslessly.
+///
+/// **The rule, which is the owner's:** a folder's FIRST tab in display order
+/// becomes the group's HEAD; every other member points at that head. The head
+/// itself joins the group its folder sat inside, or root when there is none —
+/// so nesting survives as nesting.
+///
+/// **Where the folder's NAME goes.** A group has one label and it is the head
+/// row's. `custom_title` is exactly the right vessel: it already exists, and it
+/// already outranks the engine-written `title` everywhere a row is drawn, so a
+/// folder called "Reading" stays called "Reading" instead of becoming whatever
+/// its first page happens to be titled. ⚠ Where the head ALREADY carries a
+/// user-given name, that name wins and the folder's label is dropped — the more
+/// specific statement of the same user's intent — and the case is COUNTED in
+/// `names_yielded_to_custom_title` rather than passed over in silence.
+///
+/// **An empty folder migrates to nothing**, because it held nothing. Its
+/// children, if any, re-parent to the nearest ancestor that DID form a group,
+/// or to root: "or to root when there is none" generalizes to "the nearest
+/// ancestor that exists", and an empty folder does not.
+///
+/// ⛔ The app tab (id 0) is untouchable: never a head, never a member. Every
+/// close verb in the product is written on the premise that `tabs[0]` is the
+/// app's, and a migration that filed it into a group would break all of them at
+/// once, on load, on someone else's data.
+///
+/// Tabs are REORDERED so each group is contiguous with its head first. The rail
+/// draws a tree by walking the list, so a group whose members are scattered is
+/// not a group that renders — the pointer and the order have to agree.
+fn migrate_web_tab_folders_into_row_groups(
+    tabs: &mut Vec<WebSurfaceTab>,
+    folders: &[WebTabFolder],
+) -> WebTabGroupMigration {
+    let mut report = WebTabGroupMigration::default();
+    if folders.is_empty() {
+        return report;
+    }
+    // `tabs[0]` is the app's — the product's one convention for saying so, and
+    // it is POSITIONAL. Resolve it to an ID once, here, because this function
+    // REORDERS: after the first sort an index no longer answers the question,
+    // and a second convention for "which one is the app tab" is how the two
+    // drift apart.
+    let app_tab_id = tabs.first().map(|tab| tab.id);
+
+    // The head each folder formed, if it formed one. Resolved in display order
+    // so "first tab" means what the user sees, not what the store happens to
+    // list first.
+    let mut head_of_folder: HashMap<String, u64> = HashMap::new();
+    for folder in folders {
+        let first = tabs
+            .iter()
+            .find(|tab| {
+                Some(tab.id) != app_tab_id && tab.folder.as_deref() == Some(folder.id.as_str())
+            });
+        match first {
+            Some(tab) => {
+                head_of_folder.insert(folder.id.clone(), tab.id);
+                report.groups_formed += 1;
+            }
+            None => report.empty_folders_dropped += 1,
+        }
+    }
+
+    let parent_of: HashMap<&str, Option<&str>> = folders
+        .iter()
+        .map(|folder| (folder.id.as_str(), folder.parent.as_deref()))
+        .collect();
+
+    // The group a HEAD joins: the nearest ancestor folder that actually formed
+    // one. Walks rather than reading `parent` once, so an empty folder in the
+    // middle of a chain does not strand everything below it at root.
+    //
+    // The `seen` set is not defensive dressing: `parent` is data off disk, and a
+    // cycle there would hang the app on load, before any UI exists to say why.
+    let nearest_group_ancestor = |folder_id: &str| -> Option<u64> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cursor = *parent_of.get(folder_id)?;
+        while let Some(id) = cursor {
+            if !seen.insert(id) {
+                return None;
+            }
+            if let Some(head) = head_of_folder.get(id) {
+                return Some(*head);
+            }
+            cursor = parent_of.get(id).copied().flatten();
+        }
+        None
+    };
+
+    let name_of: HashMap<&str, &str> = folders
+        .iter()
+        .map(|folder| (folder.id.as_str(), folder.name.as_str()))
+        .collect();
+    let collapsed_of: HashMap<&str, bool> = folders
+        .iter()
+        .map(|folder| (folder.id.as_str(), folder.collapsed))
+        .collect();
+
+    for tab in tabs.iter_mut() {
+        if Some(tab.id) == app_tab_id {
+            tab.group_head = None;
+            tab.folder = None;
+            continue;
+        }
+        let Some(folder_id) = tab.folder.clone() else {
+            continue;
+        };
+        let head = head_of_folder.get(folder_id.as_str()).copied();
+        if head == Some(tab.id) {
+            // This tab IS the head: it joins the OUTSIDE group, and it takes the
+            // folder's identity.
+            tab.group_head = nearest_group_ancestor(&folder_id);
+            tab.group_collapsed = collapsed_of
+                .get(folder_id.as_str())
+                .copied()
+                .unwrap_or(false);
+            match tab.custom_title.as_deref() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    let _ = existing;
+                    report.names_yielded_to_custom_title += 1;
+                }
+                _ => {
+                    if let Some(name) = name_of.get(folder_id.as_str()) {
+                        tab.custom_title = Some((*name).to_string());
+                        report.names_adopted += 1;
+                    }
+                }
+            }
+        } else {
+            tab.group_head = head;
+        }
+        tab.folder = None;
+    }
+
+    order_web_tabs_by_group(tabs);
+    report
+}
+
+/// Reorder tabs so every group is contiguous: a head is immediately followed by
+/// its own subtree, and relative order is otherwise preserved.
+///
+/// The rail draws the tree by walking this list, so the parent pointer alone is
+/// not enough — a member sitting three unrelated tabs away from its head reads
+/// as a break in the group, not as membership. ⛔ The app tab keeps index 0
+/// regardless: it is not part of the user's tree and every close verb assumes
+/// its seat.
+fn order_web_tabs_by_group(tabs: &mut Vec<WebSurfaceTab>) {
+    // Positional convention, resolved to an id BEFORE the sort — see
+    // [`migrate_web_tab_folders_into_row_groups`] for why an index cannot be
+    // asked this question here.
+    let app_tab_id = tabs.first().map(|tab| tab.id);
+    let mut children: HashMap<Option<u64>, Vec<u64>> = HashMap::new();
+    for tab in tabs.iter() {
+        if Some(tab.id) == app_tab_id {
+            continue;
+        }
+        children.entry(tab.group_head).or_default().push(tab.id);
+    }
+
+    // A `group_head` pointing at a tab that is gone would otherwise drop that
+    // tab from the walk entirely — it would vanish from the rail while still
+    // existing in state, which is the worst of both. Treat a dangling pointer as
+    // root, the same way the placement owner treats a dangling opener.
+    let live: HashSet<u64> = tabs.iter().map(|tab| tab.id).collect();
+    let mut roots: Vec<u64> = Vec::new();
+    for tab in tabs.iter() {
+        if Some(tab.id) == app_tab_id {
+            continue;
+        }
+        let rooted = match tab.group_head {
+            None => true,
+            Some(head) => !live.contains(&head) || head == tab.id,
+        };
+        if rooted {
+            roots.push(tab.id);
+        }
+    }
+
+    let mut order: Vec<u64> = Vec::with_capacity(tabs.len());
+    let mut emitted: HashSet<u64> = HashSet::new();
+    // Explicit stack, not recursion: depth is user data (folders nested
+    // arbitrarily), and a deep tree must not blow the stack on load.
+    let mut stack: Vec<u64> = roots.into_iter().rev().collect();
+    while let Some(id) = stack.pop() {
+        if !emitted.insert(id) {
+            continue;
+        }
+        order.push(id);
+        if let Some(kids) = children.get(&Some(id)) {
+            for kid in kids.iter().rev() {
+                if !emitted.contains(kid) {
+                    stack.push(*kid);
+                }
+            }
+        }
+    }
+    // Anything a cycle kept out of the walk still has to be drawn.
+    for tab in tabs.iter() {
+        if Some(tab.id) != app_tab_id && emitted.insert(tab.id) {
+            order.push(tab.id);
+        }
+    }
+
+    let rank: HashMap<u64, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, index))
+        .collect();
+    tabs.sort_by_key(|tab| {
+        if Some(tab.id) == app_tab_id {
+            (0usize, 0usize)
+        } else {
+            (1usize, rank.get(&tab.id).copied().unwrap_or(usize::MAX))
+        }
+    });
 }
 #[derive(Debug, Clone)]
 struct WebSurfaceTab {
@@ -1925,10 +2171,33 @@ struct WebSurfaceTab {
     /// (`~/.yggterm/web-profiles/<profile>/`). A change recreates the webview
     /// (storage is fixed per WebContext). All tabs of one surface share it.
     profile: String,
-    /// The virtual folder this tab is filed in (`WebTabFolder::id`), or `None`
-    /// for a root tab. Filed = saved organization; root = the browsing session.
-    /// The app tab (id 0) is always root: it belongs to the app, not the tree.
+    /// ⛔ LEGACY, read on load and never written. The virtual folder this tab was
+    /// filed in (`WebTabFolder::id`). Folders were replaced by ROW GROUPS —
+    /// `group_head` below — and this field survives only so a store written
+    /// before the change can be migrated by
+    /// [`migrate_web_tab_folders_into_row_groups`]. Nothing else may read it: a
+    /// second reader is how a retired concept comes back to life.
     folder: Option<String>,
+    /// The id of the TAB that heads this tab's group, or `None` for a root tab.
+    ///
+    /// This is the whole of the group model, and it is deliberately the same
+    /// shape yggterm live-session rows use: a group is headed by a ROW, not by a
+    /// separate folder object that owns a list. A parent pointer cannot describe
+    /// a tab in two groups and has no member list to keep in sync — the two bugs
+    /// the folder model was one refactor away from at all times.
+    ///
+    /// A head's OWN `group_head` names the head of the group it sits inside, or
+    /// `None` at root. That is the owner's definition stated as arithmetic: row
+    /// headers belong to the OUTSIDE group, or to root when there is none.
+    ///
+    /// ⛔ The app tab (id 0) is always root and can never head or join a group.
+    /// It belongs to the app, not to the user's organization.
+    group_head: Option<u64>,
+    /// Is the group this tab HEADS drawn collapsed? Meaningless on a tab that
+    /// heads nothing, which is why it is a plain bool rather than an Option: a
+    /// non-head's value is simply never read, and carrying `Some(false)` for
+    /// every ordinary tab would invite a caller to believe it meant something.
+    group_collapsed: bool,
     /// A name the USER gave this row, which outranks `title` wherever the tab
     /// is drawn. It has to be its own field: `title` is written from the engine
     /// on every reconcile poll, so a rename stored there would last about a
@@ -19938,6 +20207,8 @@ impl ShellState {
             reload_nonce: 0,
             profile: profile.clone(),
             folder: None,
+            group_head: None,
+            group_collapsed: false,
             custom_title: None,
             loading: true,
             loading_since_ms: current_millis(),
@@ -20026,6 +20297,8 @@ impl ShellState {
                 reload_nonce: 0,
                 profile: profile.clone(),
                 folder: saved.folder,
+                group_head: None,
+                group_collapsed: false,
                 // The name the user gave the row, restored with it. Empty in a
                 // store written before rows could be renamed.
                 custom_title: Some(saved.name).filter(|name| !name.is_empty()),
@@ -20152,6 +20425,8 @@ impl ShellState {
             reload_nonce: 0,
             profile: "default".to_string(),
             folder: None,
+            group_head: None,
+            group_collapsed: false,
             custom_title: None,
             loading: false,
             loading_since_ms: 0,
@@ -21357,6 +21632,8 @@ impl ShellState {
                 reload_nonce: 0,
                 profile,
                 folder: placement.folder.clone(),
+                group_head: None,
+                group_collapsed: false,
                 custom_title: None,
                 loading: false,
                 loading_since_ms: 0,
@@ -21460,6 +21737,8 @@ impl ShellState {
                 reload_nonce: 0,
                 profile: profile.clone(),
                 folder: placement.folder.clone(),
+                group_head: None,
+                group_collapsed: false,
                 custom_title: None,
                 // WebKit began the load the moment it made the view.
                 loading: true,
