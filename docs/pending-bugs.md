@@ -814,6 +814,27 @@ remainder is due refetches/drains by design). Laptop window: roots **0.29/s** (f
 `ui/block` 0. Remaining dossier items (restore-card 1 Hz tick, retarget noop, hot-leaf-state
 architecture split) are in the 11.12 brief §2 with risk notes.
 
+⛔ **THE FOLD'S "ABSENT FROM CAUSES" DID NOT SURVIVE DAYTIME USE (2026-08-21 typed window):**
+`terminal_attach_host_health_sample` is back as the **TOP cause — 250 renders_preceded over
+79.5 min (~3/min)**. The gate exempts only the ACTIVE-VISIBLE session and a hidden sidebar;
+under real use the sidebar is visible and the samples are for BACKGROUND sessions, which the
+gate never covered. The 01:1x proof window (owner asleep) measured the exempted case, not the
+common one. The narrowing has to gate on "would this sample change what the sidebar shows",
+not on which session it is for.
+
+**TYPED-WINDOW RENDER READ, 2026-08-21 10:17–11:37 (79.5 min, laptop, natural typing +
+fleet load):** roots **0.50/s** (pre-fix 1.57, quiet windows 0.29–0.35, target ~0.1) —
+typing costs ~0.2/s over quiet, and the falsifier is NOT met. `renders_unattributed`
+**947 of 2362 (40%)** — the forced-wake amplification is still the largest single lever.
+Memoization holds under load: MainSurface 540/2362, Sidebar 538/2362; `TerminalCanvas`
+6445 renders on its own subscriptions (the granularity floor, as briefed). Ranked causes
+after the health sample: `launch.rs:1998`/`launch.rs:2019` (92+91 — the preview-refresh
+scheduler's `with_mut_counted` calls, each writing `record_preview_issue_telemetry` INTO the
+render signal: the `recent_ui_telemetry` debt of item 4 made measurable),
+`remote_preview_sync_begin/finish` (92+92), the retarget noop (79 — dossier item, still open),
+`app_control_defer_background_refresh` (67 — the 1s hysteresis is not enough under probe
+traffic), `terminal_input_schedule_live_snapshot_refresh` (61).
+
 **FIRST POST-FIX WINDOW, 2026-08-20 ~21:33–22:05 (commit `2d834fd6`):** root renders
 **0.35/s** (from 1.57/s), **Sidebar 39 of 330** root renders (from 232 of 234 — the hoist
 delivers), remaining causes are real content work (`background_copy_scan_*`,
@@ -825,8 +846,11 @@ completions) instead of rendering per wake. `MainSurface` still renders on every
 (direct `state` subscription), though its own body is cheap (~0.4 ms mean); the `app` root
 pass carries the cost (~26 ms mean).
 
-**TWO MORE 1 Hz SOURCES REMOVED 2026-08-21 (11.14), both on the input-gate deadline tick,
-live proof owed.** Neither is a chore: both are predicates that answered a BROADER question
+**TWO MORE 1 Hz SOURCES REMOVED 2026-08-21 (11.14), both on the input-gate deadline tick —
+LIVE-PROVEN in the 2026-08-21 typed window (11.12): across 79.5 focused, actively-typed
+minutes no 1 Hz site appears in `causes[]` at all (the top cause is 250 renders_preceded;
+a surviving 1 Hz tick would show ~4,770). The focus trap the verify script names is
+satisfied by the typing itself.** Neither is a chore: both are predicates that answered a BROADER question
 than the work behind them, so the tick took its `with_mut` — one full app-root re-render —
 every second while having nothing to do.
 
@@ -1485,6 +1509,46 @@ running). Same-day baselines on older builds: 53 blocks/h at cruise, 4–6/min a
 ⚠ Not signed off: the window held **no human keystrokes** (the echo-chain tail needs his next
 natural typing session — do not manufacture samples) and evening load; the entry closes on a
 clean TYPED window under comparable daytime load.
+
+**THE TYPED WINDOW ARRIVED 2026-08-21 10:14–11:30 (laptop GUI host, ~5,475 natural keystrokes,
+notebooks 01+06, zero builds on the host) — AND THE BAR DOES NOT HOLD:**
+
+| leg | n | p50 | p95 | p99 | max | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| keystroke → pty | 5397 | **1 ms** | **221 ms** | 922 ms | **4817 ms** | 🔴 FAIL (bar p95 ≤ 50) |
+| keystroke → render | 5261 | 38 ms | 86 ms | 1301 ms | 4900 ms | 🟢 PASS (≤ 150) |
+| keystrokes losing the pty leg | — | — | — | — | 1.4% | 🟢 PASS (≤ 5%) |
+
+`ui/block`: 0.68/min over 120 min (PASS < 1/min), but **9 blocks > 1 s** — 7 of them in
+steady-state minutes, not the two GUI restarts the window contains — worst **3,339 ms**
+(after `dioxus_render/component_window`), so the "no block above 1 s" clause FAILS.
+`webview_edit_stall` incidents in the same 3 h: **zero** — that class did not fire.
+
+**What the window attributes, and what it cannot:**
+
+1. ⭐ **The echo tail is NOT the UI thread.** Of 309 slow (>200 ms) keystrokes, only **3**
+   overlap a `ui/block` gap. The UI-thread entry above and the echo tail are now two
+   separate defects sharing one queue entry.
+2. ⭐ **The `pre_select` guard (added by this lane) now names its own branch as the giant:**
+   the select loop held **2.8 s, 7.9 s, 9.8 s, 10.0 s, 9.6 s, 9.0 s** in `pre_select` across
+   steady-state minutes — the screen-reconcile daemon round trip runs INLINE, so any daemon
+   slowness lands on the loop, and the `js_event` branch that feeds the ordered write channel
+   sits behind it. Same family as `HostHealth`'s 8 inline awaits (brief §2.3); the ordered
+   writer fixed the write leg's OWN await and the loop's other inline awaits remained.
+3. **The flat p95 ~221 ms band is consistent with per-iteration loop cost, not stalls:**
+   p95 was 210/223/229 ms on 3.1.15/16/17 respectively (the fixes are in all three), evenly
+   spread across the hour, local sessions no faster than SSH ones (255 vs 206 ms p95) — a
+   shared client-side floor. `read_poll_apply` loop_blocks recorded at 129–219 ms put its
+   ~2900-line synchronous body right at that band. Hypothesis, supported not proven: a
+   keystroke arriving mid-iteration waits one `read_poll_apply` pass.
+4. ⛔ **The window is swap-poisoned, and that cuts BOTH ways.** 17 `host_panic_memory`
+   incidents over 3 h: **7.5–7.8 GiB swap residue** (panic floor 4 GiB) with RAM mostly free —
+   major-fault swap-ins can stall any thread for seconds and were in force most of the window.
+   So this window cannot CLOSE the entry, and its FAIL cannot cleanly convict the slice-3 fix
+   either (the pre-fix p95 205 ms baseline's swap state is unknown). It IS the owner's real
+   daytime experience — the lane's goal says "under any fleet load" — so the entry stays open
+   loudly rather than parked on the confound. The clean next falsifier needs the swap residue
+   drained first (routed to 6.7, who owns MEMORY).
 
 ## ⛔⛔⛔ [11.5] THE INPUT CHAIN PROVES DELIVERY TO THE PTY, NEVER CONSUMPTION BY THE PROGRAM — AND THAT IS THE GAP "I CANNOT TYPE" FALLS THROUGH
 
