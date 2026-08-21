@@ -6485,6 +6485,9 @@ fn TerminalCanvas(
             let mut force_remote_restart_attempted = false;
             let mut protected_remote_restore_attempted = false;
             let mut post_attach_read_recovery_attempts = 0_u64;
+            // Latch so the exhausted-transport release fires once per mount rather
+            // than on every subsequent event that still sees the spent budget.
+            let mut transport_error_input_released = false;
             let mut blank_retry_poison_recovery_attempts = 0_u64;
             let mut retained_empty_surface_recovery_attempts = 0_u64;
             // First poll at which the empty-surface condition was observed in the
@@ -8371,6 +8374,7 @@ fn TerminalCanvas(
                                     set_signal_if_changed(resume_overlay_timed_out, false);
                                     resume_visual_reveal_after_ms = None;
                                     post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                     let _ = eval.send(TerminalJsCommand::SetInputEnabled {
                                         enabled: true,
                                         focus: true,
@@ -8439,6 +8443,7 @@ fn TerminalCanvas(
                                     set_signal_if_changed(resume_overlay_timed_out, false);
                                     resume_visual_reveal_after_ms = None;
                                     post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                     let _ = eval.send(TerminalJsCommand::SetInputEnabled {
                                         enabled: true,
                                         focus: true,
@@ -8499,6 +8504,7 @@ fn TerminalCanvas(
                                     set_signal_if_changed(resume_overlay_timed_out, false);
                                     resume_visual_reveal_after_ms = None;
                                     post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                     let _ = eval.send(TerminalJsCommand::SetInputEnabled {
                                         enabled: true,
                                         focus: true,
@@ -8755,6 +8761,7 @@ fn TerminalCanvas(
                                                 set_signal_if_changed(resume_overlay_timed_out, false);
                                                 resume_visual_reveal_after_ms = None;
                                                 post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                                 clear_terminal_resume_notification(
                                                     state,
                                                     &session_path,
@@ -9015,6 +9022,7 @@ fn TerminalCanvas(
                                             set_signal_if_changed(resume_overlay_timed_out, false);
                                             resume_visual_reveal_after_ms = None;
                                             post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                             clear_terminal_resume_notification(
                                                 state,
                                                 &session_path,
@@ -9259,6 +9267,52 @@ fn TerminalCanvas(
                                     }
                                     cursor = 0;
                                     read_poll_ms = 60;
+                                } else if has_transport_error
+                                    && is_remote_resume_session
+                                    && !terminal_overlay_dismissed()
+                                    && post_attach_read_recovery_attempts >= 2
+                                {
+                                    // ⛔⛔ THE SAME LATCH AS THE WRITE TWIN, AND THIS
+                                    // ONE HAD NO EXIT BRANCH AT ALL. The arm above
+                                    // disables input and retries twice; past the
+                                    // second attempt the whole condition simply goes
+                                    // false and the loop moves on, with
+                                    // `inputEnabled=false` still in force and only a
+                                    // successful attach able to clear it. On a
+                                    // surface whose transport is genuinely gone that
+                                    // success never comes, so the row is untypeable
+                                    // until the GUI is restarted.
+                                    //
+                                    // ⇒ Two sites, one shape: a recovery that closes
+                                    //   an input gate on entry must reopen it on
+                                    //   EVERY exit, not only the happy one. Only
+                                    //   fire this once, when the budget is first
+                                    //   spent, or it re-sends on every later event.
+                                    if !transport_error_input_released {
+                                        transport_error_input_released = true;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "transport_error_recovery_exhausted_input_released",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "attempts": post_attach_read_recovery_attempts,
+                                            }),
+                                        );
+                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                            enabled: true,
+                                            focus: false,
+                                        });
+                                        clear_terminal_resume_notification(state, &session_path);
+                                        safe_push_notification(
+                                            state,
+                                            NotificationTone::Warning,
+                                            "Terminal Surface Disconnected",
+                                            "Yggterm could not restore this terminal surface. Typing is re-enabled; switch away and back to remount it."
+                                                .to_string(),
+                                        );
+                                    }
                                 }
                             }
                             Ok(TerminalJsEvent::Resize { cols, rows }) => {
@@ -10179,11 +10233,61 @@ fn TerminalCanvas(
                             cursor = 0;
                             read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
                         } else {
+                            // ⛔⛔ THE GATE MUST RELEASE, AND THIS BRANCH USED TO
+                            // ONLY NOTIFY. The retry arm above disables input on
+                            // the FIRST write error and re-enables it only on a
+                            // SUCCESSFUL attach. When the retries are spent, the
+                            // old code pushed a toast and returned — leaving
+                            // `inputEnabled=false` with nothing left that would
+                            // ever set it back. The composer was then dead for
+                            // good on that surface: the JS input path drops every
+                            // keystroke while the flag is false, so the row stayed
+                            // silently untypeable until the user switched away and
+                            // back, or restarted the GUI.
+                            //
+                            // ⇒ Owner-reported 2026-08-21 as the defect that makes
+                            //   the product unusable — "I have to restart yggterm
+                            //   frequently and for the first minute it works like a
+                            //   dream and then its GG". That is this latch, not a
+                            //   latency: it is fine until the first write error and
+                            //   permanently dead afterwards.
+                            //
+                            // ⚠ The read twin was fixed for exactly this and its
+                            // fix was recorded as "read-exhaust re-enables the
+                            // composer"; the write twin was left with its stricter
+                            // gate and nobody noticed the strictness had no exit.
+                            // A gate whose release condition is "success" is a trap
+                            // whenever failure is terminal.
+                            //
+                            // Re-enabling here is safe and is strictly better than
+                            // the alternative: a keystroke is its own request that
+                            // the daemon (which owns the PTY) either accepts or
+                            // rejects on its own merits, and a user typing into a
+                            // surface that reports the error is strictly better off
+                            // than one typing into a surface that silently discards.
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "terminal_write_recovery_exhausted_input_released",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "attempts": post_attach_read_recovery_attempts,
+                                    "error": write_error.to_string(),
+                                }),
+                            );
+                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                enabled: true,
+                                focus: false,
+                            });
+                            clear_terminal_resume_notification(state, &session_path);
                             safe_push_notification(
                                 state,
                                 NotificationTone::Error,
                                 "Terminal Input Failed",
-                                write_error.to_string(),
+                                format!(
+                                    "{write_error}. Typing is re-enabled — the surface may need a switch away and back."
+                                ),
                             );
                         }
                     }
@@ -10877,6 +10981,7 @@ fn TerminalCanvas(
                                             set_signal_if_changed(resume_overlay_timed_out, false);
                                             resume_visual_reveal_after_ms = None;
                                             post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                             clear_terminal_resume_notification(
                                                 state,
                                                 &session_path,
@@ -11821,6 +11926,7 @@ fn TerminalCanvas(
                                             deferred_resume_output.clear();
                                         }
                                         post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                         set_signal_if_changed(resume_overlay_failed, false);
                                         set_signal_if_changed(resume_overlay_timed_out, false);
                                         resume_visual_reveal_after_ms = Some(
@@ -11950,6 +12056,7 @@ fn TerminalCanvas(
                                     set_signal_if_changed(resume_overlay_timed_out, false);
                                     resume_visual_reveal_after_ms = None;
                                     post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                 }
                                 if is_remote_resume_session
                                     && attach_ready
@@ -12000,6 +12107,7 @@ fn TerminalCanvas(
                                     set_signal_if_changed(resume_overlay_timed_out, false);
                                     resume_visual_reveal_after_ms = None;
                                     post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                 }
                                 if is_remote_resume_session
                                     && traced_attach_ready
@@ -12243,6 +12351,7 @@ fn TerminalCanvas(
                                     set_signal_if_changed(resume_overlay_timed_out, false);
                                     resume_visual_reveal_after_ms = None;
                                     post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                     continue;
                                 }
                                 if clean_remote_resume_ready_attempt_should_enable_input(
@@ -12309,6 +12418,7 @@ fn TerminalCanvas(
                                     set_signal_if_changed(resume_overlay_timed_out, false);
                                     resume_visual_reveal_after_ms = None;
                                     post_attach_read_recovery_attempts = 0;
+                                    transport_error_input_released = false;
                                     continue;
                                 }
                                 if is_remote_resume_session
