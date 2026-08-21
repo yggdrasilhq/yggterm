@@ -582,7 +582,7 @@ reads that through `list | grep <uuid>`, which throws the header away. A sibling
 
 ## ⛔⛔ [11.20] THE DRAFT FLAG IS RESET BY EVERY DAEMON HANDOVER, AND IT FAILS OPEN
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *Found 2026-08-21 while confirming the composer-draft entry below. It is the reason
 that entry's replacement is a UNION of two readings rather than one clean owner.*
@@ -607,30 +607,30 @@ consults the same flag, so the release that destroys a draft is also cleared by 
 **Falsifier:** type into a row, confirm `server rows drafts` names it, roll the daemon,
 and ask again without touching the row. It must still name it.
 
-**Not fixed here.** The seeding this wants — reconstruct the line from the rendered
-composer row at adoption, then let keystrokes maintain it as they already do — is a
-change to the adopt path, and this lane could not prove it without a daemon bump it was
-told not to take. What shipped instead is the union in
-`TerminalManager::session_composer_holds_draft`, where the rendered grid covers exactly
-the window the counter is blind in.
+**Fixed by making every reader that does not write first consult the UNION**, rather
+than by seeding the counter at adoption. `session_composer_holds_draft` already existed
+and already covered exactly the window the counter is blind in; it was simply not what
+the guards were reading. Three of them were still on the keystroke arm alone — the
+drafts sweep, the migratability signals, and `--refuse-if-draft` on `server terminal
+write` — which is to say the three places the answer decides whether somebody's line
+survives. They read the union now.
 
-## ⛔ [11.20] `server rows drafts` REPORTS FULL COVERAGE WHILE SEEING ONE DAEMON IN FOUR
+⚖ **Two readers deliberately keep the keystroke arm, and a test states the split.**
+`submit_prompt_echo_verified` and the §5 hot-restart repair re-ask their draft closure
+AFTER typing a probe marker into the composer, so the rendered-grid arm would read their
+own probe as a person mid-sentence and abort the submit they were asked to make. There
+the counter is the correct instrument precisely because a daemon-originated write is
+invisible to it. Without that test, "finish the migration" is a one-line change that
+silently breaks the probe.
 
-**Status:** OPEN
+⛔ **Adopt-path seeding is still the better answer and is NOT done.** The union refuses
+correctly, but it cannot tell a caller *what* the line is, and a row whose CLI has not
+yet redrawn its composer is invisible to both arms at once.
 
-Measured 2026-08-21 on the build host: four `yggterm-headless server daemon` processes
-were running, and `server rows drafts` answered `daemons_seen: 1` with
-`daemons_or_rows_unable_to_answer: 0` — i.e. it declared it had asked everybody.
-
-The verb's own contract is right and is quoted in its docstring: *a daemon that cannot
-answer is counted apart, never as clean; blind is not clear*. That protects a daemon
-that ANSWERS "I am too old to say". It does nothing for a daemon that is never
-enumerated, because there is then nobody to be blind — and the fan-out enumerates by
-socket, while a version bump replaces older sockets with symlinks to the newest one.
-
-⇒ **A coverage count is not coverage.** The verb should compare the daemons it reached
-against the daemon PROCESSES on the host and report the difference, or its `verdict:
-"clear"` means "clear among the ones I happened to find".
+**Live proof owed, and it cannot be taken without a roll:** the falsifier below reads
+the daemon's own `pending_input_drafts`, which the DAEMON builds — so it needs a daemon
+running this code, and the roll watcher has been dead since 15:51 today (its own queue
+entry). Ask for it after the next deploy.
 
 ## ⛔⛔⛔ [11.20] `composer_held_draft` HAD NO DISCRIMINATOR LEFT — CONFIRMED, AND FIXED
 

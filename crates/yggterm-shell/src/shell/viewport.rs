@@ -17015,7 +17015,17 @@ fn probe_retry_backoff(previous: Duration) -> Duration {
 struct TerminalInputProbeVerdict {
     consuming_input: bool,
     composer_shown: bool,
-    composer_held_draft: bool,
+    /// ⛔⛔ TRI-STATE, AND `None` IS NOT `false`. This was a `bool` built with
+    /// `unwrap_or(false)`, so a composer NOBODY COULD READ was reported to the
+    /// caller as one holding no draft — while the write-permission logic three
+    /// lines away correctly refused to touch it. The logic kept the distinction
+    /// and the report threw it away, which is the worse half: `wedged` is
+    /// computed from this field, so an unreadable composer produced a POSITIVE
+    /// claim that the row was wedged, complete with a remedy that restarts it.
+    /// That is a restart recommended for a live agent row on the strength of a
+    /// reading that never happened. **Blind is not clear, and it is not broken
+    /// either.**
+    composer_held_draft: Option<bool>,
     /// What the row is DOING, read off the CLI's own chrome. Carried beside
     /// liveness rather than derived from it — a healthy IDLE row consumes input
     /// exactly as well as a working one, and reporting only the first is how a
@@ -17091,7 +17101,9 @@ async fn probe_terminal_input_consumption(
         return TerminalInputProbeVerdict {
             consuming_input: false,
             composer_shown: false,
-            composer_held_draft: false,
+            // No composer was ever drawn, so nothing was read: `None`, not
+            // "there is no draft".
+            composer_held_draft: None,
             activity,
             waited_ms: started.elapsed().as_millis() as u64,
             reason: TERMINAL_INPUT_NO_COMPOSER_REASON,
@@ -17110,7 +17122,7 @@ async fn probe_terminal_input_consumption(
             return TerminalInputProbeVerdict {
                 consuming_input: false,
                 composer_shown: true,
-                composer_held_draft: composer_draft_now.unwrap_or(false),
+                composer_held_draft: composer_draft_now,
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: match composer_draft_now {
@@ -17153,7 +17165,7 @@ async fn probe_terminal_input_consumption(
             return TerminalInputProbeVerdict {
                 consuming_input: true,
                 composer_shown: true,
-                composer_held_draft: composer_held_draft.unwrap_or(false),
+                composer_held_draft,
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: TERMINAL_INPUT_CONSUMING_REASON,
@@ -17169,7 +17181,7 @@ async fn probe_terminal_input_consumption(
             return TerminalInputProbeVerdict {
                 consuming_input: false,
                 composer_shown: true,
-                composer_held_draft: composer_draft_now.unwrap_or(false),
+                composer_held_draft: composer_draft_now,
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: match composer_draft_now {
@@ -17194,7 +17206,7 @@ async fn probe_terminal_input_consumption(
     TerminalInputProbeVerdict {
         consuming_input: false,
         composer_shown: true,
-        composer_held_draft: composer_held_draft.unwrap_or(false),
+        composer_held_draft,
         activity,
         waited_ms: started.elapsed().as_millis() as u64,
         reason: TERMINAL_INPUT_WEDGED_REASON,
