@@ -3323,6 +3323,13 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     if is_agent_plane_composed_title(compact) {
         return false;
     }
+    // ⛔ ASK THE COMPOSER, don't re-list its output. Every birth name this build
+    // mints is `New [{machine}] {noun}`, and the literal tables below cannot see
+    // the machine in the middle — so without this a freshly born row reads as
+    // ALREADY TITLED and keeps its placeholder for the life of the session.
+    if crate::agent_cli::is_new_row_birth_title(compact) {
+        return true;
+    }
     let lower = compact.to_ascii_lowercase();
     let words = compact.split_whitespace().collect::<Vec<_>>();
     let prefixed_session_uuid = [

@@ -43,7 +43,7 @@ use crate::terminal_observe::{
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
     AgentRowActivity, terminal_chunk_agent_activity,
     terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_agent_composer_row,
-    terminal_chunk_has_current_codex_input_row, terminal_composer_row_holds_draft,
+    terminal_chunk_has_current_codex_input_row,
     terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
@@ -16122,6 +16122,15 @@ struct ShellState {
     /// the hand half of an arrangement; the seats supply the rest, derived, and
     /// this outranks them per row. Persisted beside the split groups.
     row_arrangement: yggterm_core::row_set_outline::RowArrangement,
+    /// How many CONSECUTIVE snapshots each arranged path has been absent from
+    /// the live set.
+    ///
+    /// ⛔ IN MEMORY, NEVER PERSISTED, AND THAT IS THE POINT. The arrangement
+    /// outlives daemons; this counter must not. A restart is exactly the moment
+    /// every row is briefly absent, so a count that survived one would prune the
+    /// user's whole arrangement on the first snapshot after a handover — which is
+    /// presumably why nothing was ever wired to `retain_live` at all.
+    row_arrangement_absent_sightings: HashMap<String, u8>,
     /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
     /// source of truth for splits: the compound sidebar row, the viewport pane
     /// layout, keep-alive, and persistence all derive from this list. No
@@ -18661,6 +18670,7 @@ impl ShellState {
             // Restored so a group the user built by dragging is still there
             // after a restart — the same promise the split groups make.
             row_arrangement: restored_row_arrangement,
+            row_arrangement_absent_sightings: HashMap::new(),
             // Restored from settings so a built split-view workspace reopens as
             // the intentional artifact the user shaped ([[campaign-split-view-groups]]).
             // Normalized on parse; a group whose members no longer exist is
@@ -27212,6 +27222,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.needs_initial_server_sync = false;
                 self.request_background_copy_scan_if_unscheduled();
@@ -27306,6 +27317,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -27376,6 +27388,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_departed_row_arrangement();
                 self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -29524,6 +29537,100 @@ impl ShellState {
         promoted.sort();
         promoted.dedup();
         promoted
+    }
+
+    /// How many consecutive snapshots a row must be absent from before its
+    /// arrangement entry is forgotten.
+    ///
+    /// Three, for the same reason the boot watchdog confirms an absence three
+    /// times before acting on it: one missing sighting is a snapshot arriving
+    /// mid-handover, and the cost of being wrong is asymmetric — pruning early
+    /// destroys work the user did by hand, while pruning late leaves a dead
+    /// entry nobody can see.
+    const ROW_ARRANGEMENT_GONE_SIGHTINGS: u8 = 3;
+
+    /// Forget the arrangement of rows that have CONFIRMABLY departed.
+    ///
+    /// ⛔ **THE DEPARTURE POINT IS WHY THIS TOOK SO LONG TO WIRE.**
+    /// `RowArrangement::retain_live` has existed, correct and tested, with no
+    /// production caller at all: the GUI's own close and remove paths dissolve
+    /// and detach the row being closed, but a head that dies daemon-side or
+    /// remotely leaves its entry behind forever, and the stored arrangement
+    /// accumulates rows that exist nowhere. The obvious fix — prune every frame
+    /// against the live set — is worse than the leak, because the live set
+    /// FLICKERS: it is briefly empty or partial during a daemon handover, and a
+    /// naive prune would delete the user's whole arrangement at every restart.
+    ///
+    /// ⇒ So absence is CONFIRMED before it is acted on, and the confirmation
+    /// lives in memory so a restart starts the count over rather than inheriting
+    /// one taken across the very gap it must not trust.
+    ///
+    /// ⛔ **AN EMPTY LIVE SET DECIDES NOTHING.** "No rows" and "I have not been
+    /// told about the rows yet" are indistinguishable here and only one of them
+    /// means everyone departed. Counting on it would let three quiet snapshots
+    /// during a handover wipe an arrangement built over weeks.
+    fn prune_departed_row_arrangement(&mut self) {
+        let live: HashSet<String> = self
+            .server
+            .live_sessions()
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .map(live_session_row_path)
+            .collect();
+        if live.is_empty() {
+            self.row_arrangement_absent_sightings.clear();
+            return;
+        }
+        let arranged: HashSet<String> = self
+            .row_arrangement
+            .sets
+            .heads()
+            .map(ToOwned::to_owned)
+            .chain(
+                self.row_arrangement
+                    .sets
+                    .heads()
+                    .flat_map(|head| self.row_arrangement.sets.members_of(head))
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .chain(self.row_arrangement.detached.iter().cloned())
+            .collect();
+        self.row_arrangement_absent_sightings
+            .retain(|path, _| arranged.contains(path));
+        let mut confirmed_gone: HashSet<String> = HashSet::new();
+        for path in &arranged {
+            if live.contains(path) {
+                self.row_arrangement_absent_sightings.remove(path);
+                continue;
+            }
+            let seen = self
+                .row_arrangement_absent_sightings
+                .entry(path.clone())
+                .or_insert(0);
+            *seen = seen.saturating_add(1);
+            if *seen >= Self::ROW_ARRANGEMENT_GONE_SIGHTINGS {
+                confirmed_gone.insert(path.clone());
+            }
+        }
+        if confirmed_gone.is_empty() {
+            return;
+        }
+        // `retain_live` keeps what it is GIVEN, so the set handed to it is every
+        // arranged path that is not confirmed gone — not the live set. An
+        // unconfirmed absence must survive untouched, and a live row obviously
+        // must too.
+        let keep: HashSet<String> = arranged
+            .iter()
+            .filter(|path| !confirmed_gone.contains(*path))
+            .cloned()
+            .collect();
+        if self.row_arrangement.retain_live(&keep) {
+            for path in &confirmed_gone {
+                self.row_arrangement_absent_sightings.remove(path);
+            }
+            self.sync_browser_settings();
+        }
     }
 
     /// The arrangement the sidebar is drawing right now.
@@ -40207,7 +40314,13 @@ fn spawn_launch_app_verb(
     insert_after: Option<String>,
 ) {
     let command = app.command_for(&verb);
-    let title_hint = verb.label.clone();
+    // ⛔ NO TITLE HINT. `AppVerb::label` is, by its own contract, "what the menu
+    // item says" — and handing a menu label to the daemon as a row NAME is what
+    // put `New Yedit` on rows across three machines with nothing to tell them
+    // apart. The daemon composes `New {machine} {app}` from the `Source` stamp
+    // below, which is the only place in the birth path that knows the row is an
+    // app row at all.
+    let title_hint: Option<String> = None;
     // The row's `Source` metadata — the one place a row says WHICH app it is,
     // and the SAME `app:<name>:<verb>` token every launcher menu speaks
     // (`app_verb_token_parts` is its one parser). Registry key, not display
@@ -40244,7 +40357,7 @@ fn spawn_launch_app_verb(
                 start_command_session_placed(
                     &endpoint,
                     cwd.as_deref(),
-                    Some(&title_hint),
+                    title_hint.as_deref(),
                     &local_app_verb_launch_command(&command),
                     Some(&source_label),
                     Some(&terminal_appearance),
@@ -40264,7 +40377,7 @@ fn spawn_launch_app_verb(
                     &ssh_target,
                     prefix.as_deref(),
                     cwd.as_deref(),
-                    Some(&title_hint),
+                    title_hint.as_deref(),
                     Some(&terminal_appearance),
                     insert_after.as_deref(),
                 )?;
@@ -43748,7 +43861,7 @@ fn live_terminal_generation_context(
     endpoint: &ServerEndpoint,
     session_path: &str,
 ) -> Option<String> {
-    let (snapshot, _running, _runtime_output_seen, _post_resize_output_seen, _last_resize_seq, _runtime_spawn_id) =
+    let (snapshot, _running, _runtime_output_seen, _post_resize_output_seen, _last_resize_seq, _runtime_spawn_id, ..) =
         terminal_snapshot(endpoint, session_path).ok()?;
     let stripped = strip_terminal_control_sequences(&snapshot)
         .replace("\r\n", "\n")
@@ -51873,6 +51986,31 @@ fn push_live_session_rows(
     if !expanded {
         return;
     }
+    // ⭐⭐ OUTLINE ORDER IS A PROPERTY OF THE SEATS, NOT OF ARRIVAL — AND THE
+    // SIDEBAR DRAWS IT CONTINUOUSLY. `sort_by_outline` documents itself as "the
+    // one sort … both the rendered sidebar and any verb that reports an order
+    // call this", and the rendered sidebar was the half that never did: the only
+    // caller was `AppControlCommand::SortSessions`, so correct order was a manual
+    // repair somebody had to remember and every spawn, fold and re-group undid
+    // it. Owner-reported twice on 2026-08-21 as rows not being in ascending
+    // order.
+    //
+    // ⚠ THE COMPARATOR WAS NEVER THE BUG. It parses a seat into `Vec<u64>` and
+    // has a test named for the ten-before-two trap. What was missing is that
+    // nothing on the render path asked it.
+    //
+    // ⚖ A SEATED ROW CAN NO LONGER BE HAND-ORDERED OUT OF SEAT ORDER HERE, and
+    // that is the intended model rather than a casualty: the seat IS the order.
+    // The sort is stable, so un-numbered rows keep the arrangement a drag gave
+    // them and only fall in around the numbered ones.
+    let sessions: Vec<&ManagedSessionView> = {
+        let mut ordered = sessions.to_vec();
+        yggterm_core::session_outline::sort_by_outline(&mut ordered, |session| {
+            session.outline_prefix.clone()
+        });
+        ordered
+    };
+    let sessions = sessions.as_slice();
     let short_ids = unique_session_short_ids_for_pairs(
         &sessions
             .iter()
@@ -53363,9 +53501,24 @@ fn remote_scanned_session_label_with_saved_title(
         .or_else(|| {
             (session.user_message_count == 0)
                 .then(|| {
-                    yggterm_core::agent_scheme::session_kind_for_path(&session.session_path)
-                        .and_then(yggterm_core::agent_cli::agent_cli_descriptor)
-                        .map(|descriptor| descriptor.new_session_label())
+                    yggterm_core::agent_scheme::session_kind_for_path(&session.session_path).map(
+                        |kind| {
+                            // The SAME birth rule the daemon mints a live row
+                            // with, so a row that has said nothing yet reads
+                            // identically whichever surface is showing it. The
+                            // machine comes off the row's own path for a remote
+                            // row and is this host otherwise.
+                            let machine = yggterm_core::agent_scheme::remote_row_machine_key(
+                                &session.session_path,
+                            )
+                            .map(ToOwned::to_owned)
+                            .or_else(yggterm_core::local_machine_name_opt);
+                            yggterm_core::agent_cli::new_session_birth_title(
+                                kind,
+                                machine.as_deref(),
+                            )
+                        },
+                    )
                 })
                 .flatten()
         })
@@ -56572,23 +56725,25 @@ fn ensure_home_scoped_workspace_dir(path: &str) -> Result<bool> {
         .with_context(|| format!("failed to create workspace cwd {}", path.display()))?;
     Ok(true)
 }
-/// The placeholder title a session is BORN with.
+/// The title hint a launch carries — and for a NEW row there is none.
 ///
-/// ⛔ **It names the new row's own kind, never the row the menu was opened
-/// on.** This used to be `format!("{} {}", row.label, slug)`, so spawning from
-/// a session's context menu minted a near-duplicate of THAT session's title —
-/// two sidebar entries reading almost identically until the CLI self-titled.
-/// The naming rule is [`new_session_birth_title`], in core, beside the registry
-/// that knows every CLI's display name.
-fn group_session_title_hint(kind: SessionKind) -> String {
-    yggterm_core::agent_cli::new_session_birth_title(kind)
+/// ⛔ **THE BIRTH NAME IS THE DAEMON'S, and the shell must not compose one.**
+/// The rule is `New {machine} {what it is}` and only the daemon knows which
+/// machine the row is landing on, so a hint composed here is a second answer to
+/// a question that has an owner. This function used to compose one — and before
+/// that composed `format!("{} {}", row.label, slug)`, the label of whichever row
+/// the menu was opened on, which names the SPAWNER rather than the spawned.
+/// Returning `None` is what lets the one rule in
+/// `yggterm_core::agent_cli::new_session_birth_title` apply to every surface.
+fn group_session_title_hint(_kind: SessionKind) -> Option<String> {
+    None
 }
 fn group_session_launch_context(
     shell: &ShellState,
     row: &BrowserRow,
     kind: SessionKind,
 ) -> TerminalLaunchContext {
-    let title_hint = Some(group_session_title_hint(kind));
+    let title_hint = group_session_title_hint(kind);
     // Single source of truth for the launch cwd, local and remote alike:
     // `sidebar_row_launch_cwd` (the row's own `session_cwd`, else the remote
     // folder's path, else the live/active session's `Cwd` metadata), falling back
@@ -57185,17 +57340,17 @@ fn terminal_launch_context(shell: &ShellState) -> TerminalLaunchContext {
                 ssh_target: machine.ssh_target.clone(),
                 prefix: machine.prefix.clone(),
                 cwd: (!cwd.trim().is_empty()).then_some(cwd),
-                title_hint: Some(format!("{} ssh", machine.machine_key)),
+                // ⛔ `format!("{} ssh", …)` stood here: the new row named after
+                // the machine, or after the row the launch came FROM. Both are
+                // the spawner-names-the-spawned defect, and both defeat the one
+                // birth rule. The daemon composes `New {machine} Terminal`.
+                title_hint: None,
             };
         }
         let cwd = metadata_value(active, "Cwd");
         return TerminalLaunchContext::Local {
             cwd: (!cwd.trim().is_empty()).then_some(cwd),
-            title_hint: if active.title.trim().is_empty() {
-                None
-            } else {
-                Some(format!("{} terminal", active.title))
-            },
+            title_hint: None,
         };
     }
     TerminalLaunchContext::Local {
@@ -57206,28 +57361,26 @@ fn terminal_launch_context(shell: &ShellState) -> TerminalLaunchContext {
 fn terminal_launch_context_for_row(shell: &ShellState, row: &BrowserRow) -> TerminalLaunchContext {
     if let Some(machine) = remote_machine_for_sidebar_row(shell, row) {
         let cwd = sidebar_row_launch_cwd(shell, row);
-        let title_hint = Some(match row.kind {
-            BrowserRowKind::Session => format!("{} ssh", row.label),
-            _ => format!("{} ssh", machine.machine_key),
-        });
         return TerminalLaunchContext::Remote {
             ssh_target: machine.ssh_target.clone(),
             prefix: machine.prefix.clone(),
             cwd,
-            title_hint,
+            // See the twin above: the row that LAUNCHED a terminal is not its
+            // name. The daemon owns `New {machine} Terminal`.
+            title_hint: None,
         };
     }
     if row.kind == BrowserRowKind::Session {
         return TerminalLaunchContext::Local {
             cwd: row.session_cwd.clone(),
-            title_hint: Some(format!("{} terminal", row.label)),
+            title_hint: None,
         };
     }
     let snapshot = shell.snapshot();
     let context_row = resolve_creation_context_row(&snapshot.rows, row);
     TerminalLaunchContext::Local {
         cwd: group_session_cwd(&context_row),
-        title_hint: Some(group_session_title_hint(SessionKind::Shell)),
+        title_hint: group_session_title_hint(SessionKind::Shell),
     }
 }
 fn workspace_view_mode_from_app_control(mode: AppControlViewMode) -> WorkspaceViewMode {
@@ -57533,28 +57686,57 @@ fn app_control_created_launch_report(
     created_path: Option<&str>,
     requested: &AgentLaunchOptions,
 ) -> Value {
-    let launch_command = created_path.and_then(|path| {
+    let created = created_path.and_then(|path| {
         snapshot
             .live_sessions
             .iter()
             .chain(snapshot.active_session.iter())
             .find(|session| session.session_path == path)
-            .map(|session| session.launch_command.clone())
     });
-    let expected = created_path
-        .and_then(|path| {
-            snapshot
-                .live_sessions
-                .iter()
-                .chain(snapshot.active_session.iter())
-                .find(|session| session.session_path == path)
-        })
-        .map(|session| requested.launch_tokens(session.kind).unwrap_or_default())
-        .unwrap_or_default();
-    // Every requested token must be present in the command the row carries.
+    let launch_command = created.map(|session| session.launch_command.clone());
+    // ⛔ THE VERDICT COMES FROM WHAT THE ROW STORES, NEVER FROM THE COMMAND
+    // STRING — because the command string is re-derived and the stored options
+    // are what every re-derivation consults.
+    //
+    // This field used to be a substring test against `launch_command`, and that
+    // is a question about an artifact rather than about the row: the snapshot
+    // post-processor rebuilds a remote row's command (the identity refresh
+    // fires between a remote row's birth and its first spawn), so `applied`
+    // could read `false` for a spawn whose flag DID reach the process, and
+    // could read `true` for a create that composed the token into a string
+    // while failing to store it on the row — which is the shape the remote
+    // `--model` drop hid behind for a day. A row that stores the option
+    // re-applies it at every rebuild, relaunch and restore; a row that merely
+    // had it spelled into one command loses it at the first refresh. So the
+    // stored options are the only durable answer, and the string test is
+    // demoted to what it always was: an observation about the command as it
+    // reads right now, reported beside the verdict rather than as it.
+    let stored = created.map(|session| session.agent_launch_options.clone());
+    let applied = created.map(|session| {
+        // A kind that cannot express the request is NOT "applied". The token
+        // builder refuses rather than ignores, and swallowing that refusal into
+        // an empty expectation is how a `--model` on a shell row would report
+        // success while going nowhere.
+        if requested.launch_tokens(session.kind).is_err() {
+            return false;
+        }
+        let stored = &session.agent_launch_options;
+        requested
+            .model
+            .as_ref()
+            .is_none_or(|model| stored.model.as_deref() == Some(model.as_str()))
+            && requested
+                .permission_mode
+                .is_none_or(|mode| stored.permission_mode == Some(mode))
+    });
+    // Every requested token present in the command the row carries RIGHT NOW.
     // Quoting is the launch builder's business, so compare on the unquoted
-    // token — `--model` and `'--model'` are the same statement.
-    let applied = launch_command.as_ref().map(|command| {
+    // token — `--model` and `'--model'` are the same statement. Informational:
+    // it can differ from `applied` in both directions, and when it does, the
+    // difference is a re-derivation artifact and not a verdict.
+    let command_carries_tokens = created.map(|session| {
+        let expected = requested.launch_tokens(session.kind).unwrap_or_default();
+        let command = &session.launch_command;
         expected
             .iter()
             .all(|token| command.contains(token.as_str()))
@@ -57563,10 +57745,15 @@ fn app_control_created_launch_report(
         "model": requested.model,
         "permission_mode": requested.permission_mode.map(|mode| mode.name()),
         "applied": applied,
+        "stored_model": stored.as_ref().and_then(|stored| stored.model.clone()),
+        "stored_permission_mode": stored
+            .as_ref()
+            .and_then(|stored| stored.permission_mode)
+            .map(|mode| mode.name()),
+        "command_carries_tokens": command_carries_tokens,
         "launch_command": launch_command,
     })
 }
-
 fn app_control_created_session_path(
     snapshot: &ServerUiSnapshot,
     message: Option<&str>,
@@ -77627,7 +77814,7 @@ async fn reconcile_terminal_from_daemon_for(
     trace_home: &Path,
 ) -> Value {
     let snapshot = terminal_snapshot_async(endpoint, session_path.to_string(), trace_home).await;
-    let (screen, running, _runtime_output_seen, _post_resize, _seq, _runtime_spawn_id) = match snapshot {
+    let (screen, running, _runtime_output_seen, _post_resize, _seq, _runtime_spawn_id, ..) = match snapshot {
         Ok(value) => value,
         Err(error) => {
             return json!({

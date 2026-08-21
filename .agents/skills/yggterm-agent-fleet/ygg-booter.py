@@ -180,6 +180,65 @@ MIN_BOOT_AFTER_SECS = 60
 MAX_BOOTS = 3
 DEFAULT_INTERVAL = 300
 
+# ⛔⛔ A REFUSAL THAT REPEATS FOR THE SAME REASON IS A CONDITION, AND A CONDITION
+# MUST BE VISIBLE IN STATE. Measured 2026-08-21 across four campaigns: four rows
+# sat permanently unbootable for DAYS while every instrument read healthy. The
+# refusal was correct each time and the refund is correct too — the row was never
+# asked, so charging it a wake would be a lie — but a refund means `boots` never
+# rises, so the row can never reach MAX_BOOTS and can therefore NEVER escalate.
+# The only record of the standing condition was one log line per tick, in a log
+# nobody tails.
+#
+# ⚖ THE SILENCE IS THE DEFECT, NOT THE REFUSAL. So a run of identical refusals is
+# counted on the subscription itself (`standing_refusal`), surfaced by `list` and
+# `status`, and escalated exactly ONCE per condition — while the refusal decision
+# and the refund are left exactly as they were.
+#
+# ⚠ WHY 12 AND NOT MAX_BOOTS. A draft or a choice prompt is a real thing in front
+# of a real row and waiting is the right answer; escalating at three ticks (15 min)
+# would page a human about an owner who stepped away from a half-typed sentence.
+# Twelve ticks is an hour at the default interval — long enough that a genuine
+# owner-facing prompt lives its natural life, short enough that "days" is
+# impossible.
+STANDING_REFUSAL_TICKS = 12
+
+# How many consecutive identical refusals before a human is told, per reason.
+# ⛔ `None` means NEVER, and every None states its reason here rather than
+# leaving the absence to be read as an oversight — which is exactly how the
+# missing entry below became a crash.
+STANDING_REFUSAL_ESCALATE_AFTER = {
+    # OUR OWN INSTRUMENT failing, and it does not clear itself: if the verb the
+    # guard reads with is missing from the running build, the screen is
+    # unreadable on every tick from now until someone is told. Bounded tight.
+    "refused-screen-unreadable": MAX_BOOTS,
+    # Observations of the ROW. Each clears itself when the row moves on — except
+    # when nothing can move it, which is the case this exists for.
+    "refused-draft": STANDING_REFUSAL_TICKS,
+    "refused-choice-prompt": STANDING_REFUSAL_TICKS,
+    "refused-draft-race": STANDING_REFUSAL_TICKS,
+    # ⛔ NEVER, and deliberately: a limit wait is self-resolving by construction
+    # (the CLI's own auto-continue is armed) and a human cannot grant quota, so
+    # paging one buys nothing. Same argument as the fleet-wide RATE-LIMITED
+    # hold. It is still COUNTED and still shown, so the wait is never invisible.
+    "refused-limit-wait": None,
+    # ⛔ THIS LANE ADDED FOUR REFUSALS AND HAD TO COME BACK FOR THIS TABLE AND FOR
+    # THE REFUND LIST BESIDE IT — which is the exact omission the comment on that
+    # list was written about, committed by the person who had just read it.
+    # ⇒ A guard that learns a new refusal is not finished until BOTH lists know
+    #   the name: one decides whether the row is charged a wake it never got, the
+    #   other whether anybody is ever told.
+    # No composer drawn is an observation of the ROW and clears when it moves on.
+    "refused-no-composer": STANDING_REFUSAL_TICKS,
+    # ⛔ These two do NOT clear themselves. A write that could not be confirmed
+    # stands in the composer until somebody takes it out, and refusing to type a
+    # second copy is correct and permanent — so the row is alive, unwakeable, and
+    # nothing about waiting changes that. Bounded tight, like a blind instrument.
+    "refused-unconfirmed-write": MAX_BOOTS,
+    "refused-submit-unconfirmed": MAX_BOOTS,
+    # Our own state directory refusing a write. Also does not clear itself.
+    "refused-no-ledger": MAX_BOOTS,
+}
+
 # ⭐⭐ HOW LONG THE FLEET HOLDS AFTER SEEING A 429 (reported 2026-08-13: "during a
 # rate-limited window, subscribers kept being booted").
 #
@@ -202,6 +261,12 @@ DEFAULT_INTERVAL = 300
 # and the owner is the person whose quota it is — he already knows. A watchdog
 # that pages about the weather teaches people to ignore it, which is the failure
 # the CONTEXT_DEAD arm was written to undo.
+#
+# ⛔⛔ EVERY LINE ABOVE IS ABOUT A TIMED WINDOW AND NONE OF IT HOLDS FOR AN
+# EXHAUSTED CREDIT BALANCE — see `refusal_is_a_balance_not_a_window`. There the
+# limit is not account-wide (the refusal offers `/model`, a per-row switch), a
+# timer clears nothing, and a human CAN fix it. That class takes a per-row
+# suspension and one escalation, and the fleet stays wakeable.
 RATE_LIMIT_HOLD_SECS = 1800
 
 # ⭐ HOW LONG A MANUAL DISARM LASTS BY DEFAULT.
@@ -893,6 +958,46 @@ def _evidence_marker(uuid):
     return None
 
 
+# ⛔⛔ A BALANCE IS NOT A WINDOW, AND ONLY ONE OF THEM IS ACCOUNT-WIDE.
+#
+# The fleet-wide hold is right for a SESSION LIMIT: the account is out of quota
+# for a while, a timer clears it, and booting other rows meanwhile just walks
+# them into the same wall one at a time.
+#
+# It is WRONG for an exhausted CREDIT BALANCE, and the refusal says so itself —
+# it offers `/model` as a remedy, which is a PER-ROW switch, and a balance is
+# restored by a purchase rather than by waiting. So on that class the fleet hold
+# has no upside and a fleet-scale downside: the row is deterministically
+# unbootable, the timer clears nothing, and every probe re-arms a blackout over
+# every other campaign's rows. Reported live 2026-08-21 with 23 subscribers
+# unwakeable behind one row's billing state; the same shape ran 7.4 continuous
+# hours on 2026-08-14.
+#
+# ⚖ AND THE ESCALATION RULE INVERTS WITH IT. The note on RATE_LIMIT_HOLD_SECS
+# says not to page a human about a quota window, because a human cannot grant
+# quota. A human CAN add credits and CAN switch model — so this is the carve-out
+# that note describes, not an exception to it.
+#
+# ⚠ Matched on the refusal's own wording, which is the only evidence there is:
+# the API reports both classes with the same status.
+BALANCE_REFUSAL_MARKERS = (
+    "out of usage credits", "usage-credits", "purchase more credits",
+    "credit balance", "insufficient credits", "add credits",
+)
+
+
+def refusal_is_a_balance_not_a_window(tail):
+    """True when the refusal is an exhausted balance rather than a timed window.
+
+    ⛔ CONSERVATIVE BY CONSTRUCTION: anything it does not recognise is treated as
+    a WINDOW, so every refusal whose wording has not been measured keeps today's
+    fleet-wide behaviour. A wrong True stops holding the fleet during a real
+    account outage; a wrong False costs what it costs today, which is at least
+    visible in the log."""
+    low = (tail or "").lower()
+    return any(marker in low for marker in BALANCE_REFUSAL_MARKERS)
+
+
 def note_rate_limit(uuid, tail):
     """A subscriber was refused on quota ⇒ hold the whole fleet.
 
@@ -1343,11 +1448,27 @@ def cmd_subscribe(args):
         #    override in either direction.
         "kind": getattr(args, "kind", None)
         or ("task" if uuid == own_uuid() else "monitor"),
+        # ⛔⛔ NOT A LIFETIME BOOT COUNT, DESPITE THE NAME. This is the run of
+        # CONSECUTIVE boots the row has not answered: any progress resets it to
+        # zero ("progress clears the stall counter" in the tick loop), a refused
+        # or rate-limited attempt is refunded, and it escalates at MAX_BOOTS.
+        # ⇒ **`boots: 0` IS THE HEALTHY STATE**, and a rising value is the
+        # alarm.
+        #
+        # ⛔ THEREFORE COUNTING `boots > 0` ACROSS SUBSCRIBERS MEASURES ROWS
+        # THAT ARE FAILING TO ANSWER, NOT ROWS THAT HAVE EVER BEEN WOKEN — the
+        # two readings run in opposite directions. Measured 2026-08-21: a census
+        # found 2 of 23 live records above zero and concluded the fleet wake path
+        # was dead, while this file's own log held 341 successful boots across 98
+        # distinct rows, and the seat doing the counting had been woken by that
+        # path minutes earlier. ⇒ **The log is the history; this field is a
+        # gauge. For "does waking work", read the log.**
         "boots": 0,
-        # Consecutive ticks refused because WE could not read the screen. Kept
-        # apart from `boots` because it counts a failure of our instrument, not
-        # an observation about the row -- see the escalation in the tick loop.
-        "blind_skips": 0,
+        # The run of consecutive refusals for ONE reason, or absent when nothing
+        # is standing in the way. Kept apart from `boots` because a refusal is
+        # not a wake: the row was never asked. See `note_standing_refusal` and
+        # the escalation in the tick loop.
+        "standing_refusal": None,
         "last_size": 0,
         "escalated": False,
     }
@@ -1400,6 +1521,42 @@ def update_sub(uuid, rec):
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(rec, indent=1))
     return True
+
+
+def clear_standing_refusal(s):
+    """The row moved (or was actually booted), so nothing is standing in the way.
+
+    ⛔ ONE OWNER. This also drops the pre-2026-08-21 `blind_skips` /
+    `blind_escalated` pair, which counted exactly one of the five refusals and is
+    now expressed through `standing_refusal` like every other. Leaving both would
+    be two encodings of "how long has this row been refused", and the older one
+    would keep answering for the single reason it knew about."""
+    s.pop("standing_refusal", None)
+    s.pop("blind_skips", None)
+    s.pop("blind_escalated", None)
+    # ⭐ AND A BALANCE SUSPENSION ENDS THE SAME WAY AND ONLY THAT WAY. It cannot
+    # expire on a timer, for the reason it was not armed on one — nothing about
+    # waiting restores a balance. A row that has written again has been paid for
+    # by somebody, and that is the only evidence available.
+    for key in ("balance_suspended", "balance_marker", "balance_since",
+                "balance_escalated"):
+        s.pop(key, None)
+
+
+def note_standing_refusal(s, via):
+    """Advance — or start — the run of consecutive refusals for THIS reason.
+
+    A DIFFERENT reason restarts the run rather than extending it: "refused twelve
+    times" is only a condition if it is twelve times for the same thing. A row
+    that alternates between a draft and a choice prompt is a row someone is
+    using, and it should not accumulate toward an escalation."""
+    rec = s.get("standing_refusal") or {}
+    if rec.get("reason") != via:
+        rec = {"reason": via, "since": int(time.time()), "ticks": 0, "escalated": False}
+    rec["ticks"] = rec.get("ticks", 0) + 1
+    rec["last"] = int(time.time())
+    s["standing_refusal"] = rec
+    return rec
 
 
 def boot_after_for(s):
@@ -1554,8 +1711,15 @@ def fleet_state(args):
             "note": s.get("note") or "",
             "age_h": round((now - s["subscribed_at"]) / 3600, 2),
             "max_hours": s.get("max_hours"),
+            # ⛔ Consecutive UNANSWERED boots, not a lifetime count — zero is
+            # healthy. See the field's definition in the subscribe record.
             "boots": s.get("boots", 0),
             "escalated": bool(s.get("escalated")),
+            # ⛔ A ROW REFUSED EVERY TICK IS INDISTINGUISHABLE FROM A HEALTHY ONE
+            # WITHOUT THIS. `boots` cannot rise (the refusal is refunded, and
+            # rightly), so every other field here reads exactly as it would for a
+            # row that has simply never needed a boot.
+            "standing_refusal": s.get("standing_refusal"),
             # WHEN this row is next at risk of a boot, which is the thing a human
             # actually wants ("who is due") — not the raw window it was set to.
             "boot_window_secs": win,
@@ -2114,8 +2278,27 @@ def cmd_list(args):
         #    a watchdog unfalsifiable, and it is how one outage ran 7.5 hours
         #    with every instrument green.
         held = "  ⏸ SUPPRESSED — fleet quota hold, no boot can be delivered" if rl else ""
+        # ⛔⛔ AND THE STANDING REFUSAL GOES ON THIS LINE TOO, for the same reason
+        #    the suppression does. It is recorded on the subscription — but a row
+        #    refused on every tick still PRINTS as `boots=0` beside a healthy one,
+        #    because a refused boot is refunded. The datum existing is not the
+        #    same as anybody seeing it, and the header nobody reads is where it
+        #    would otherwise live. A sibling lane lost ~7.8 hours reading exactly
+        #    this line and concluding it was armed.
+        rec = s.get("standing_refusal") or {}
+        refused = ""
+        if s.get("balance_suspended"):
+            refused = ("  ⛔ SUSPENDED — refused for an exhausted CREDIT BALANCE; neither "
+                       "waiting nor a boot can clear it (add credits, or switch model)")
+        elif rec.get("ticks"):
+            mins = int((time.time() - rec.get("since", time.time())) // 60)
+            refused = (f"  ⚠ REFUSED {rec['ticks']}x for {mins}m ({rec.get('reason')})"
+                       f" — armed, and NOT being woken")
+        # ⭐ AND "IT WOKE" IS A THIRD FACT. `boots` is a stall counter that gets
+        #    refunded; a row can be escalated for never waking while it reads 0.
+        woke = "  ⚠ ESCALATED — boots delivered, no turn started" if s.get("escalated") else ""
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
-            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{held}{mark}")
+            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{held}{refused}{woke}{mark}")
     log(f"{len(subs)} subscription(s) in {SUBS}"
         + (f" — ⛔ {lapsed} LAPSED and no longer watched" if lapsed else ""))
     return 0
@@ -2197,13 +2380,16 @@ def boot(host, row, dry):
       decoration. [[finding-a-deadline-shorter-than-its-release-condition]]
       One line only — a multi-line send is one Enter per line and the rest queue.
 
-    ⚠ **THE APPEND HAZARD PAID OUT 2026-08-20 AND IS NOW GUARDED TWICE** — the
-      owner's half-typed sentence was submitted with the boot text spliced in.
-      The text write asks the daemon (`--refuse-if-draft`), and the Enter is
-      gated by a screen read-back that requires the composer to hold the boot
-      text alone (see `_pty_type_and_enter`). Residual window: one write
-      round-trip; the atomic close ("submit iff line equals X", a daemon verb)
-      is requested in pending-bugs."""
+    ⚠ **THE APPEND HAZARD PAID OUT 2026-08-20 AND THE WINDOW IS NOW CLOSED** —
+      the owner's half-typed sentence was submitted with the boot text spliced
+      in. The text write asks the daemon (`--refuse-if-draft`), and the Enter is
+      no longer a second unguarded write: `--submit-iff-line-equals` presses it
+      only if the input line still reads exactly what we wrote, compared and
+      enqueued under one lock in the daemon that owns the PTY.
+      ⛔ THAT VERB HAS EXISTED SINCE 3.1.x. This docstring said it "is requested
+      in pending-bugs" for as long as the gap it describes stayed open, and a
+      stale claim about a missing tool is indistinguishable from the tool being
+      missing. Re-test an inherited "not available" before building around it."""
     if dry:
         log(f"DRY-RUN would boot {row}")
         return "dry-run"
@@ -2479,172 +2665,278 @@ def _screen_text(host, row):
     return body if body.strip() else None
 
 
+# ⛔⛔ THE COMPOSER IS A ROW, AND THE BOOT TEXT LIVES IN THE TRANSCRIPT TOO.
+# Measured 2026-08-21 across 19 rows and 434 consecutive refusals. The residue
+# check flattened the WHOLE SCREEN to one line and asked whether the boot text
+# stood after a `❯`. The agent CLI prefixes every DELIVERED message with the
+# same glyph, so a boot that WORKED read back as composer residue for as long
+# as it stayed on screen — and nothing clears a transcript, so the row refused
+# every later boot forever. One row was made unbootable by each boot it had
+# already accepted.
+# ⇒ Read the composer ROW off the daemon's RENDERED GRID. A `❯` with prose
+#   under it is a transcript entry; the composer is the bottom-most one, with
+#   only the CLI's own border and footer below it.
+COMPOSER_MARKERS = ("❯", "›")
+
+# How far above the last chrome row the composer's marker may be. A composer
+# wraps over a few rows when the line is long; anything deeper is transcript.
+COMPOSER_WRAP_ROWS = 14
+
+
+def _is_composer_chrome(row_text):
+    """Rows that may sit BELOW the composer without making it a transcript entry."""
+    t = row_text.strip()
+    if not t:
+        return True
+    if not t.strip("─━│╭╮╰╯╱-=_ "):
+        return True                      # a pure border run, drawn or ASCII
+    low = t.lower()
+    return any(h in low for h in (
+        "bypass permissions", "shift+tab", "for shortcuts", "⏵⏵",
+        "esc to interrupt", "auto-accept", "plan mode", "accept edits",
+        "context left", "/clear to save", "new task?",
+    ))
+
+
+def _composer_row_content(host, row):
+    """What the COMPOSER ROW holds. FOUR states, and they license opposite acts:
+
+        (False, None)  could not look          -> refuse; blind is not clear
+        (True,  None)  no composer on screen   -> refuse; mid-output or a modal
+        (True,  "")    composer present, empty -> the only state that may be typed into
+        (True,  "...") composer holds text     -> refuse; capture it, type nothing
+
+    ⛔ THE GRID, NEVER THE STREAM. `screen_plain_rows` is the daemon's vt100
+    viewport, one entry per VISIBLE row. The escape stream that paints it is not
+    row-shaped: measured on this fleet, a 65-row screen arrived as FOUR
+    newline-delimited lines, so "the last line beginning with the marker" is not
+    a window over anything a person can see."""
+    uuid = row.rsplit("/", 1)[-1]
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "screen", f"cc-runtime://{uuid}", "--json"], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    try:
+        entries = json.loads((r.stdout or "").strip() or "[]")
+    except Exception:
+        return (False, None)
+    if not isinstance(entries, list):
+        return (False, None)
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("session_key") or "").rsplit("/", 1)[-1] != uuid:
+            continue
+        rows = e.get("screen_plain_rows")
+        if not isinstance(rows, list) or not rows:
+            return (False, None)         # it said plainly that it could not look
+        return (True, _composer_from_grid(rows))
+    return (False, None)
+
+
+def _composer_from_grid(rows):
+    """The composer row's content on a rendered grid, or None if none is drawn.
+
+    Walks up from the bottom past the CLI's own chrome, then up through the
+    composer's wrapped continuation rows to the marker. Stops at the first
+    marker: a `❯` with prose still below it is a delivered message, not a
+    composer, and returning None there refuses the boot rather than typing
+    into a screen nobody can vouch for."""
+    end = len(rows) - 1
+    while end >= 0 and _is_composer_chrome(rows[end]):
+        end -= 1
+    if end < 0:
+        return None                      # nothing but chrome: no composer drawn
+    collected = []
+    for idx in range(end, max(-1, end - COMPOSER_WRAP_ROWS), -1):
+        text = rows[idx].strip().lstrip("│ ")
+        for marker in COMPOSER_MARKERS:
+            if text.startswith(marker):
+                collected.append(text[len(marker):])
+                collected.reverse()
+                return re.sub(r"\s+", " ", " ".join(collected)).strip()
+        collected.append(text)
+    return None                          # no marker within reach: transcript
+
+
+# ⭐ THE WRITE LEDGER — one file per row, written BEFORE the bytes go out.
+#
+# ⛔⛔ THE STORM THIS ENDS, measured 2026-08-21: the booter typed its wake text,
+# could not confirm it on screen, refused to press Enter ("residue self-heals
+# next tick"), and then TYPED ANOTHER COPY next tick — because both decisions
+# read the same failing detector, and "I cannot see it" licensed *do not
+# submit* and *type again* at once. Two rows were found holding a dozen
+# unsent copies filling the viewport, cleared by hand.
+# ⇒ A WRITER THAT CANNOT CONFIRM ITS OWN SUBMIT MUST NOT WRITE AGAIN. The
+#   ledger survives the tick, so the next pass COMPLETES the pending write
+#   with an atomic submit or refuses; it never re-types.
+def _pending_write_path(row):
+    d = os.path.join(STATE, "booter", "pending-write")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{row.rsplit('/', 1)[-1]}.json")
+
+
+def _pending_write(row):
+    try:
+        with open(_pending_write_path(row)) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) and rec.get("text") else None
+    except Exception:
+        return None
+
+
+def _record_pending_write(row, text):
+    try:
+        with open(_pending_write_path(row), "w") as f:
+            json.dump({"text": text, "at": time.time(),
+                       "row": row, "attempts": 1}, f)
+    except Exception as e:
+        # ⛔ A ledger that cannot be written must STOP the write, not accompany
+        # it. Typing without the record is exactly the storm shape again.
+        log(f"  ⛔ could not record the pending write for {row}: {e}")
+        return False
+    return True
+
+
+def _clear_pending_write(row):
+    try:
+        os.unlink(_pending_write_path(row))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"  ⚠ could not clear the pending write for {row}: {e}")
+
+
+def _atomic_submit(host, row, text):
+    """Press Enter IFF the composer's line is exactly `text`. TRI-STATE.
+
+    ⭐ `--submit-iff-line-equals` is a DAEMON verb and has shipped since 3.1.x.
+    This file carried a comment saying the atomic form "needs a daemon-side
+    verb — requested via pending-bugs" long after it existed, and that stale
+    claim is why the two-write submit kept its unguarded gap. The daemon holds
+    the input line under the same lock it enqueues the Enter with, so a
+    keystroke can never land between the comparison and the submit.
+
+    ⛔ `accepted:true` IS NOT PROOF HERE. A daemon that does not own the row
+    never evaluates the condition, and the envelope's `accepted` is then true
+    for a submit that never happened. The daemon's own message is the answer."""
+    uuid = row.rsplit("/", 1)[-1]
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "terminal", "write", f"cc-runtime://{uuid}",
+                     "--submit-iff-line-equals", text], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    out = r.stdout or ""
+    if _field(out, "submitted") is True:
+        return True
+    if _field(out, "refused_for_line") is True:
+        return False
+    message = _field(out, "message") or ""
+    if isinstance(message, str) and message.startswith("submitted:"):
+        return True
+    if isinstance(message, str) and "line" in message and "expected" in message:
+        return False
+    return None                          # the daemon could not say
+
+
 def _pty_type_and_enter(host, row, text=None):
-    """Type `text` (default: the boot text), pause, then press Enter — TWO writes.
+    """Deliver `text` to a row's composer and submit it — AT MOST ONCE.
 
     ⭐ `text` IS A PARAMETER BECAUSE THIS IS THE FLEET'S ONLY GUARDED WRITER, AND
     THE OTHER WATCHDOG HAD NONE. The monitor's `wake()` typed with a bare
     `terminal send` plus a lone `\\r`: no screen read, no choice-prompt refusal,
-    no `--refuse-if-draft`, no verify-before-Enter. So the two watchdogs typed
-    into the SAME rows with opposite levels of care, and the careless one is the
-    one aimed at orchestrators. Owner-reported 2026-08-21: a monitor wake landed
-    in the middle of his orchestrator's turn.
-    ⇒ One guarded path, parameterised, rather than a second copy of five guards
-      that would drift. Every guard below is text-agnostic — they are about the
-      COMPOSER's state, not about what we intend to say.
+    no draft guard, no verify-before-Enter. So the two watchdogs typed into the
+    SAME rows with opposite levels of care, and the careless one was aimed at
+    orchestrators. One guarded path, parameterised, rather than a second copy of
+    five guards that would drift.
 
-    The 80 ms mirrors `shell.rs`'s own submit path exactly; see `boot`'s §3 for
-    why a concatenated Enter reads as pasted content rather than a submit.
+    THE SEQUENCE, and every step refuses rather than guesses:
 
-    ⛔ `--refuse-if-draft` is not optional politeness. A PTY write APPENDS, so if
-    the owner half-typed a sentence into this row and walked away — which is
-    precisely the shape of a row a watchdog calls idle — an unguarded boot glues
-    `continue, the booter booted` onto the end of HIS sentence and submits the
-    pair. The guard is evaluated by the daemon that OWNS the PTY (the only one
-    that can see a draft) and is therefore TOCTOU-free.
-    ⚠ A pre-3.0.83 owner ignores the flag, so acceptance is not proof the guard
-    ran. That is the honest limit and it is why the return distinguishes a
-    refusal rather than folding it into failure."""
+    1. the row's STATE, from the daemon — a modal reads single keys and a bare
+       Enter SELECTS, so a watcher must not type into one;
+    2. the COMPOSER ROW, from the rendered grid — the only state that may be
+       typed into is a composer that is present and EMPTY;
+    3. a PENDING WRITE from an earlier tick is COMPLETED, never repeated;
+    4. the write, recorded before it is sent;
+    5. the ATOMIC submit, which presses Enter only if the line is still exactly
+       what we wrote — so a sentence that raced us cannot be submitted as ours.
+
+    ⛔ There is no path here that types twice. The bytes we could not confirm
+    are the bytes we must not send again."""
     text = BOOT_TEXT if text is None else text
-    # ⛔⛔ SCREEN FIRST. The Enter below SELECTS a highlighted option, so a row
+    short = row.rsplit("/", 1)[-1][:8]
+    # ⛔⛔ STATE FIRST. The Enter below SELECTS a highlighted option, so a row
     # parked on a choice prompt must never be typed into. Refuse on doubt.
     choice = _screen_shows_a_choice(host, row)
     if choice is True:
-        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — its SCREEN is showing a "
-            f"prompt awaiting a choice (plan limit / billing). A bare Enter here "
-            f"SELECTS an option; that decision is the owner's, not a timer's.")
+        log(f"⛔ NOT BOOTING {short} — its SCREEN is showing a prompt awaiting a "
+            f"choice (plan limit / billing). A bare Enter here SELECTS an option; "
+            f"that decision is the owner's, not a timer's.")
         return "refused-choice-prompt"
     if choice is None:
-        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — could not read its screen, "
-            f"so it cannot be ruled out that a prompt is waiting. Blind is not clear.")
+        log(f"⛔ NOT BOOTING {short} — could not read its screen, so it cannot be "
+            f"ruled out that a prompt is waiting. Blind is not clear.")
         return "refused-screen-unreadable"
-    # ⭐ RESIDUE SELF-HEAL, BEFORE ANY WRITE — measured 2026-08-20 12:12–12:23:
-    # an abort leaves the typed boot text unsent, the next tick typed a SECOND
-    # copy, and the copy's own prefix then read as "a foreign draft". The
-    # machinery was compounding its own residue on a row the owner was viewing.
-    # ⇒ If the composer ALREADY shows the boot head: never type again. Complete
-    # with a lone Enter when the residue is the boot text alone; otherwise
-    # capture whatever else is there to the durable draft store and refuse.
-    head = text[:27]            # default: "continue, the booter booted"
-    pre = _plain_screen(_screen_text(host, row) or "")
-    pidx = pre.rfind(head)
-    if pidx >= 0:
-        pprefix = pre[max(0, pidx - 60):pidx].rstrip()
-        if pprefix.endswith(("❯", ">")):
-            log(f"⭐ RESIDUE SELF-HEAL {row.rsplit('/', 1)[-1][:8]} — an earlier "
-                f"abort left the boot text typed and unsent; completing it with "
-                f"a lone Enter instead of typing a second copy.")
-            enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
-            return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
-        _capture_draft(row, pre, head, text)
-        # ⭐ MULTI-COPY RESIDUE CLEANER — measured 2026-08-20 12:28: three aborted
-        # boots left three (glyph-mangled) copies, the LAST copy's prefix is the
-        # END of the previous one, so this branch refused forever and the row was
-        # stuck unbootable. When the composer content is provably BOOT-MATERIAL
-        # ONLY (and it is already captured durably above, so nothing can be
-        # lost), clear it with ONE Ctrl+C and boot clean. A real owner draft —
-        # text before the first copy, or a substantial tail after the last —
-        # still refuses untouched.
-        if _composer_is_boot_residue_only(pre, head, text):
-            log(f"⭐ RESIDUE CLEANER {row.rsplit('/', 1)[-1][:8]} — composer is "
-                f"boot-material only (captured first); clearing with one Ctrl+C "
-                f"and booting clean.")
-            _run(host, ["server", "terminal", "write", row, "--stdin"], "\x03")
-            time.sleep(1.2)
-            post = _plain_screen(_screen_text(host, row) or "")
-            if post.rfind(head) >= 0:
-                log(f"  ⚠ residue survived the clear — refusing rather than typing more.")
-                return "refused-draft-race"
-            # fall through to a normal typed boot below
+    readable, composer = _composer_row_content(host, row)
+    if not readable:
+        log(f"⛔ NOT BOOTING {short} — could not read its composer row. "
+            f"Blind is not clear.")
+        return "refused-screen-unreadable"
+    if composer is None:
+        log(f"⛔ NOT BOOTING {short} — no composer is drawn on its screen "
+            f"(mid-output, or a modal). Nothing here may be typed into.")
+        return "refused-no-composer"
+    pending = _pending_write(row)
+    if pending:
+        # ⛔ COMPLETE IT OR REFUSE IT. Never a second copy.
+        done = _atomic_submit(host, row, pending["text"])
+        if done is True:
+            _clear_pending_write(row)
+            log(f"⭐ COMPLETED the pending write to {short} with an atomic submit "
+                f"— the line still held exactly what we wrote.")
+            return "pty-write"
+        if not composer:
+            # The composer is empty, so our bytes are not standing in it: the
+            # write evaporated (a restart, a CLI clear). The ledger is stale and
+            # a fresh attempt is honest — but it starts from zero copies.
+            _clear_pending_write(row)
+            log(f"⚠ the pending write to {short} is no longer in its composer; "
+                f"the ledger is cleared and this tick starts a fresh single write.")
         else:
-            log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — composer holds boot-text "
-                f"residue PLUS other content; captured to the draft store, typing nothing.")
-            return "refused-draft-race"
+            _capture_draft(row, composer, text[:27], text)
+            log(f"⛔ NOT BOOTING {short} — a write from an earlier tick could not "
+                f"be confirmed and the composer no longer holds exactly it. "
+                f"Captured to the draft store; typing nothing. "
+                f"[[a writer that cannot confirm its own submit must not write again]]")
+            return "refused-unconfirmed-write"
+        pending = None
+    if composer:
+        # Somebody else's words, or our own unconfirmed ones. Either way this
+        # writer does not get to add to them.
+        _capture_draft(row, composer, text[:27], text)
+        log(f"⛔ NOT BOOTING {short} — its composer already holds text "
+            f"({len(composer)} chars). Captured to the draft store; typing nothing.")
+        return "refused-draft"
+    if not _record_pending_write(row, text):
+        return "refused-no-ledger"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
                         "--refuse-if-draft"], text)
     if _field(typed.stdout or "", "refused_for_draft") is True:
-        _capture_draft(row, pre, head, text)
+        _clear_pending_write(row)
+        _capture_draft(row, composer, text[:27], text)
         return "refused-draft"
     if _field(typed.stdout or "", "accepted") is not True:
+        _clear_pending_write(row)
         return ""
-    # ⛔⛔ VERIFY BEFORE ENTER — the Enter used to be UNGUARDED, and the owner
-    # paid for it 2026-08-20: his half-typed sentence raced into the gap
-    # between the two writes, and the lone `\r` submitted HIS SENTENCE with
-    # the boot text spliced into the middle. `--refuse-if-draft` cannot guard
-    # the Enter — by now the boot text itself IS the draft. Press Enter ONLY
-    # if the composer holds the boot text alone.
-    # ⭐ WITH PATIENCE: three of four live aborts were "not visible on screen"
-    # — the verify read racing a LAGGING ECHO (the ui/block disease itself), on
-    # a screen that would have shown the text a second later. Poll up to ~6 s
-    # before concluding; only a FOREIGN PREFIX aborts immediately.
-    # ⚠ The residual race window is one write round-trip. The atomic form
-    # ("submit iff the input line equals X") needs a daemon-side verb —
-    # requested via pending-bugs; this check is the best a caller can do.
-    verdict = None                              # "clean" | "foreign" | None=not seen
-    for attempt in range(4):
-        time.sleep(0.4 if attempt == 0 else 1.8)
-        plain = _plain_screen(_screen_text(host, row) or "")
-        idx = plain.rfind(head)
-        if idx >= 0:
-            prefix = plain[max(0, idx - 60):idx].rstrip()
-            verdict = "clean" if prefix.endswith(("❯", ">")) else "foreign"
-            if verdict == "foreign":
-                break
-            # clean on a late read is trustworthy; no need to re-poll
-            break
-    if verdict != "clean":
-        why = ("a foreign draft precedes it" if verdict == "foreign"
-               else "boot text never appeared on screen after 6 s")
-        if verdict == "foreign":
-            _capture_draft(row, plain, head, text)
-        log(f"⛔ ABORTING BOOT of {row.rsplit('/', 1)[-1][:8]} between write and "
-            f"Enter — {why}. Enter NOT sent; residue self-heals next tick.")
-        target = resolve(host, row)
-        nargs = ["server", "app", "notify", "booter: aborted mid-boot",
-                 "a draft raced the booter; your typed text is captured in "
-                 "~/.yggterm/relay/drafts/ and nothing was submitted", "--tone", "warning"]
-        if target:
-            nargs += ["--session", target]
-        ygg(host, *nargs)
-        return "refused-draft-race"
-    enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
-    return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
-
-
-def _composer_is_boot_residue_only(plain_screen, boot_head, full_text=None):
-    """True iff the composer segment is boot-text copies (possibly glyph-mangled
-    by the render defect) and nothing of the owner's. Conservative both ways:
-    - owner text BEFORE the first copy (the original splice shape) ⇒ False;
-    - a chunk much longer than one boot copy (an appended owner tail) ⇒ False —
-      glyph drops only SHORTEN a copy, so length is a safe one-sided test.
-    The caller has ALREADY captured the full content durably, so a wrong True
-    loses nothing that cannot be re-delivered."""
-    # ⛔ THE TOKEN SET BELOW IS SPECIFIC TO THE BOOT TEXT. When this writer is
-    # driving some OTHER message (a monitor steer), we cannot recognise its
-    # copies, and a wrong True would CLEAR A COMPOSER we did not understand.
-    # ⇒ Refuse. The caller then captures the content durably and types nothing,
-    #   which is the correct outcome for every text except the one we can parse.
-    if full_text is not None and full_text != BOOT_TEXT:
-        return False
-    m = plain_screen.rfind("❯")
-    if m < 0:
-        return False
-    seg = plain_screen[m + 1:].strip()
-    # Token density, not head-splitting: the render defect drops glyphs, so even
-    # the HEAD arrives mangled ("boot▮d") and a split-by-head fuses copies. Six
-    # distinctive tokens per copy survive scattered drops; every estimate errs
-    # toward False (refuse), never toward clearing an owner's text.
-    tokens = ("booter boot", "RELAY session", "ygg-booter.py unsubscribe",
-              "MONITOR is never", "handover yourself", "DECIDE and ACT")
-    hits = {t: seg.count(t) for t in tokens}
-    if sum(1 for c in hits.values() if c) < 3:
-        return False                      # not recognisably boot material
-    copies = max(hits.values())
-    first = min((seg.find(t) for t in tokens if t in seg), default=-1)
-    if first < 0 or len(seg[:first].strip()) > 24:
-        return False                      # owner text before the copies
-    limit = copies * int(len(_plain_screen(BOOT_TEXT)) * 1.25) + 220  # footer slack
-    return len(seg) <= limit
+    done = _atomic_submit(host, row, text)
+    if done is True:
+        _clear_pending_write(row)
+        return "pty-write"
+    # ⛔ THE LEDGER STAYS. Whatever happened, the next tick COMPLETES this write
+    # or refuses it; it does not type a second copy.
+    why = ("the line no longer reads exactly what we wrote"
+           if done is False else "the daemon could not answer")
+    log(f"⛔ ENTER NOT SENT to {short} — {why}. The write is recorded as pending; "
+        f"the next tick completes it or refuses. Nothing will be typed twice.")
+    return "refused-submit-unconfirmed"
 
 
 def _capture_draft(row, plain_screen, boot_head, full_text=None):
@@ -2959,10 +3251,43 @@ def tick(args):
                         log(f"   ⚠ could not record the retirement: {exc}")
                     sub_path(uuid).unlink(missing_ok=True)
                 continue
-            # A LIVE row refused on quota is the real thing: hold the FLEET, do
-            # not escalate (a human cannot grant quota), and do not unsubscribe
-            # — unlike CONTEXT_DEAD this ends by itself, and the row is meant
-            # to still be watched when it does.
+            # ⛔⛔ AN EXHAUSTED BALANCE IS THIS ROW'S PROBLEM, NOT THE FLEET'S.
+            #    Suspend ONE row, tell a human ONCE, and leave every other
+            #    campaign wakeable — see `refusal_is_a_balance_not_a_window`.
+            #    ⛔ It cannot expire on a timer, for exactly the reason it was not
+            #    armed on one: nothing about waiting restores a balance. It ends
+            #    when the row WRITES SOMETHING NEW, which is the same
+            #    anti-stale-artefact discipline `note_rate_limit` uses — a frozen
+            #    tail is evidence about a moment, never about now.
+            if refusal_is_a_balance_not_a_window(c.get("tail")):
+                marker = _evidence_marker(uuid)
+                if marker is not None and s.get("balance_marker") != marker:
+                    s["balance_marker"] = marker
+                    s.pop("balance_escalated", None)   # a NEW refusal is news
+                s["balance_suspended"] = True
+                s["balance_since"] = s.get("balance_since") or int(time.time())
+                if not s.get("balance_escalated"):
+                    rc = max(rc, 4)
+                    escalate(host, row,
+                             "refused for an exhausted CREDIT BALANCE, not a timed quota "
+                             "window. No timer clears this and no boot can: it needs "
+                             "credits added or a different model. This row is suspended "
+                             "until it writes again; the rest of the fleet is NOT held.")
+                    s["balance_escalated"] = True
+                note_standing_refusal(s, "balance-exhausted")
+                if s.get("boots"):
+                    s["boots"] -= 1
+                action = "SUSPENDED:balance"
+                log(f"{'BALANCE':<14} {c['age'] / 60:>6.1f}m  {action:<12} {uuid[:8]}  "
+                    f"refused for exhausted credits, which no wait can fix — holding THIS "
+                    f"ROW only; the fleet stays wakeable")
+                if not args.dry_run:
+                    update_sub(uuid, s)
+                continue
+            # A LIVE row refused on a timed WINDOW is the real account-wide
+            # thing: hold the FLEET, do not escalate (a human cannot grant
+            # quota), and do not unsubscribe — unlike CONTEXT_DEAD this ends by
+            # itself, and the row is meant to still be watched when it does.
             rl = note_rate_limit(uuid, c["tail"])
             # ⭐ GIVE THE LAST ATTEMPT BACK. That boot was refused by the API
             #    before the agent ran, so counting it toward MAX_BOOTS would
@@ -2974,9 +3299,8 @@ def tick(args):
         elif state in ("WORKING", "JUST_ENDED"):
             s["boots"] = 0                     # progress clears the stall counter
             s["escalated"] = False
-            # The row moved, so whatever we could not read no longer strands it.
-            s["blind_skips"] = 0
-            s["blind_escalated"] = False
+            # The row moved, so whatever was standing in the way no longer is.
+            clear_standing_refusal(s)
         elif state == "UNREACHABLE":
             action = "CANNOT-SEE"              # never a verdict about the row
         elif state == "NO_TRANSCRIPT":
@@ -2996,8 +3320,7 @@ def tick(args):
         elif state == "IDLE" and c["age"] >= (boot_after := boot_after_for(s)[0]):
             if grew:
                 s["boots"] = 0                 # it worked since last tick
-                s["blind_skips"] = 0
-                s["blind_escalated"] = False
+                clear_standing_refusal(s)
             if rl:
                 # ⛔ A BOOT INTO AN EXHAUSTED QUOTA IS REFUSED BEFORE THE AGENT
                 #    RUNS. It spends the wake, changes nothing, and — because the
@@ -3031,7 +3354,9 @@ def tick(args):
                 via = boot(host, row, args.dry_run)
                 if via in ("refused-draft", "refused-choice-prompt",
                            "refused-screen-unreadable", "refused-draft-race",
-                           "refused-limit-wait"):
+                           "refused-limit-wait", "refused-no-composer",
+                           "refused-unconfirmed-write", "refused-submit-unconfirmed",
+                           "refused-no-ledger"):
                     # ⛔ A refusal is NOT a failed boot and must not count as one.
                     # The row is idle because its owner is mid-sentence, which is
                     # the one state where booting is worse than waiting — so give
@@ -3053,56 +3378,91 @@ def tick(args):
                     #    which is true of a draft, a choice prompt, and an
                     #    unreadable screen alike.
                     s["boots"] -= 1
+                    # ⛔⛔ `.get`, NOT `[via]`, AND THE DEFAULT IS DERIVED — this
+                    #    lookup used to be an exhaustive dict over a set defined
+                    #    two thousand lines away in `boot()`, and it DRIFTED: a
+                    #    fifth refusal (`refused-limit-wait`) was added to the
+                    #    membership test above without being added here, so the
+                    #    first limit-waiting row to come due would raise KeyError
+                    #    out of the per-row loop, out of `tick()`, past the
+                    #    `finally` that removes the pidfile, and kill the watcher
+                    #    for the whole host. Latent, never fired, and it would
+                    #    have fired on the ordinary event of a session running out
+                    #    of quota. ⇒ A label is cosmetic; never let one be able to
+                    #    stop the loop that types.
                     action = {"refused-draft": "SKIP:drafting",
                               "refused-choice-prompt": "SKIP:choice-prompt",
                               "refused-screen-unreadable": "SKIP:blind",
-                              "refused-draft-race": "SKIP:draft-race"}[via]
+                              "refused-draft-race": "SKIP:draft-race",
+                              "refused-limit-wait": "SKIP:limit-wait",
+                              }.get(via, f"SKIP:{via.removeprefix('refused-')}")
                     # ⛔⛔ THE MIRROR IMAGE OF THE DOUBLE-CHARGE ABOVE, AND IT IS
                     #    WORSE: a refund means `boots` never rises, so the row
                     #    can never reach MAX_BOOTS, so it can NEVER ESCALATE. A
-                    #    row refused forever is a row silent forever, and
-                    #    `SKIP:blind` is invisible to every instrument except
-                    #    this log line. Measured 2026-08-14: a lane slept
-                    #    through a hard external deadline while the watchdog
-                    #    refused it every tick and told nobody.
+                    #    row refused forever is a row silent forever, and the
+                    #    condition was invisible to every instrument except this
+                    #    log line. Measured 2026-08-14: a lane slept through a
+                    #    hard external deadline while the watchdog refused it
+                    #    every tick and told nobody. Measured again 2026-08-21,
+                    #    the other reason and the expensive one: FOUR rows across
+                    #    four campaigns stood refused for DAYS on boot-text
+                    #    residue — a condition that cannot clear itself, because
+                    #    the only thing that could clear it is the boot being
+                    #    refused.
                     #
                     # ⚖ THE REFUND STAYS CORRECT — the row was never asked, so
                     #   charging it a wake would be a lie. What was missing is
                     #   that the SILENCE is the defect, not the refusal.
                     #
-                    # ⭐ WHY ONLY THIS ONE OF THE THREE ESCALATES. A draft and a
-                    #   choice prompt are OBSERVATIONS OF THE ROW: something is
-                    #   genuinely in front of it, waiting is the right answer,
-                    #   and the condition clears itself when the row moves on.
-                    #   An unreadable screen is an observation of OUR OWN
-                    #   INSTRUMENT, and it does not clear itself — if the verb
-                    #   the guard reads with is missing from the running build,
-                    #   it is unreadable on every tick from now until someone is
-                    #   told. So it is bounded in time and then escalated.
+                    # ⇒ So the run is counted on the subscription, where `list`
+                    #   and `status` can show it, and told to a human exactly
+                    #   once per condition. The refusal itself is untouched: this
+                    #   arm still does NOT type. "Blind is not clear" remains the
+                    #   right rule for WRITING into a row.
                     #
-                    # ⛔ It still does NOT type. "Blind is not clear" remains the
-                    #   right rule for WRITING into a row; relaxing that is the
-                    #   owner's call and is logged for him, not taken here.
-                    if via == "refused-screen-unreadable":
-                        s["blind_skips"] = s.get("blind_skips", 0) + 1
-                        if s["blind_skips"] >= MAX_BOOTS and not s.get("blind_escalated"):
-                            rc = max(rc, 4)
-                            escalate(host, row,
-                                     f"screen unreadable for {s['blind_skips']} ticks "
-                                     f"({c['age']/60:.0f} min idle) — the guard cannot rule "
-                                     f"out a waiting prompt, so it will not boot this row. "
-                                     f"This is our instrument failing, not the row: check "
-                                     f"that the running build still exposes the screen-read "
-                                     f"verb. The row is NOT being woken by anything.")
-                            s["blind_escalated"] = True
-                            action = "SKIP:blind→ESCALATED"
-                    else:
-                        s["blind_skips"] = 0
+                    # ⭐ THE THRESHOLD DIFFERS BY REASON, and the reasons are not
+                    #   symmetric. An unreadable screen is an observation of OUR
+                    #   OWN INSTRUMENT and does not clear itself, so it stays
+                    #   bounded tight at MAX_BOOTS. A draft or a choice prompt is
+                    #   an observation of the ROW — something is genuinely in
+                    #   front of it and waiting is usually right — so it gets an
+                    #   hour before anyone is paged. A limit wait is exempt
+                    #   entirely and says so in the table.
+                    rec = note_standing_refusal(s, via)
+                    after = STANDING_REFUSAL_ESCALATE_AFTER.get(
+                        via, STANDING_REFUSAL_TICKS)
+                    if after is not None and rec["ticks"] >= after and not rec["escalated"]:
+                        rc = max(rc, 4)
+                        held = (time.time() - rec["since"]) / 60
+                        if via == "refused-screen-unreadable":
+                            why = (f"screen unreadable for {rec['ticks']} ticks "
+                                   f"({c['age']/60:.0f} min idle) — the guard cannot rule "
+                                   f"out a waiting prompt, so it will not boot this row. "
+                                   f"This is our instrument failing, not the row: check "
+                                   f"that the running build still exposes the screen-read "
+                                   f"verb.")
+                        else:
+                            why = (f"refused {rec['ticks']} consecutive ticks for the same "
+                                   f"reason ({via}) over {held:.0f} min — the refusal is "
+                                   f"correct and is NOT being relaxed; the standing "
+                                   f"condition is the defect. Nothing clears this by "
+                                   f"itself: the row is alive, is not being woken, and no "
+                                   f"counter rises to say so. For boot-text residue try "
+                                   f"`ygg-unwedge.sh`.")
+                        escalate(host, row, why + " The row is NOT being woken by anything.")
+                        rec["escalated"] = True
+                        action = f"{action}→ESCALATED"
                 else:
                     # Say WHICH door delivered it. A watchdog that reports
                     # "booted" without saying how cannot be debugged when it
                     # silently stops.
                     action = f"BOOT#{s['boots']}:{via or 'NOT-DELIVERED'}"
+                    # The write went through, so nothing is standing in the way
+                    # any more — a run of refusals ended by a delivered boot must
+                    # not keep counting toward an escalation about a condition
+                    # that is over.
+                    if via:
+                        clear_standing_refusal(s)
                     # ⭐ A deferral covers ONE wait. Once the boot it was
                     # protecting has fired, the reason for it is over — leaving
                     # it set would silently widen the window for everything that

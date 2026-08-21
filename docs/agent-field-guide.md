@@ -2153,3 +2153,85 @@ happened most recently before the block, so the most FREQUENT event wins by acci
 Across a sample it was `None` for half the blocks, with four different named
 activities splitting the rest — one payload read alone would have named a culprit that
 is not one.
+
+## Group incidents by `app_version` before comparing anything to a bar (2026-08-21)
+
+A fleet mid-roll has several builds emitting into ONE incident stream. So a window
+chosen by wall clock reports whatever mix of versions it happens to span, and
+attributes it to the version running now.
+
+⛔ **This is how a FIXED class reads as a live one.** Measured the same day, one class
+read **0.81/min** across a straddling two-hour window and **0.00/min** once split by
+emitter version — and a queue entry was edited to say the class was firing on the
+strength of the first number.
+
+```sh
+ytrace incidents --since 6h --json \
+  | python3 -c '...bucket by i["app_version"], and divide by that bucket's OWN span...'
+```
+
+Divide by the bucket's own first-to-last span, not by the window you asked for, or a
+version that only appears for two minutes reports an enormous rate.
+
+⚠ It cuts both ways, and both halves cost real time in one session:
+- proving an alarm **stopped** needs the emitter version, because the retiring daemon
+  keeps emitting for seconds after its successor binds;
+- proving one is **still firing** needs it too, because old builds in the window answer
+  for the new one.
+
+⇒ **A window that spans a roll describes the roll.** Check what the running build
+actually contains by ANCESTRY (`git merge-base --is-ancestor <fix> <release>`), never by
+comparing version strings — and then read only the window that build owns.
+## Prove an alarm STOPPED by pinning it to the handover, with the trigger still armed (2026-08-21)
+
+An alarm going quiet proves nothing on its own — the condition may simply have
+passed. Two checks turn silence into evidence, and both are cheap.
+
+**1. Pin the silence to the build boundary, by emitter version.** Incidents carry
+`app_version`, and a fleet mid-roll has several versions emitting at once. Count by
+version, not by wall clock:
+
+```sh
+ytrace incidents --since 1h --json | python3 -c '...group by app_version...'
+```
+
+⚠ A record timestamped AFTER the new daemon bound may still come from the OLD one —
+daemons coexist by design during a handover, and the retiring process keeps emitting
+for seconds. Read the record's own `app_version` before calling it a regression. A
+count that stopped at the handover, with zero from the new version, is the shape you
+want; "one incident after the start timestamp" was the old daemon's last word.
+
+**2. Prove the TRIGGER IS STILL ARMED.** This is the half that gets skipped, and
+without it the whole reading is worthless:
+
+```sh
+# the alarm's own predicate, evaluated against the live machine
+mem_used_fraction = (MemTotal - MemAvailable) / MemTotal   # vs the panic threshold
+swap_used_gib     = SwapTotal - SwapFree                   # vs the OLD trigger
+```
+
+If the old predicate would fire RIGHT NOW and the fixed build is silent, the silence
+is the fix. If the condition has lapsed, you have measured the weather.
+
+⇒ Applied to the swap-residency alarm: swap 7.15 GiB against a 4.0 GiB old trigger —
+armed — with zero incidents from the fixed version across ten minutes, against a prior
+0.82/min. That is a falsifier answered; "no incidents lately" would not have been.
+## `ytrace tail` cannot compute a RATE in either direction (measured 2026-08-21)
+
+The cap (~20 records) is already noted above as inflating frequency. It distorts the
+other way too, and that failure is quieter because the number comes out SMALLER and a
+small number reads as good news.
+
+- **Frequency from `tail` is too HIGH**: a fixed record count divided by the short span
+  those records happen to cover. Produced ~67/min for an event whose true rate was ~2/min.
+- **A TOTAL from `tail` is too LOW**: summing `duration_ms` over a truncated sample and
+  dividing by its span under-counts everything the cap dropped. Produced "5.2% of a
+  core" for a render cost the span query put at 11.3% — a 2x under-report that would
+  have been published as a 9x win.
+
+⇒ **Anything divided by time comes from `ytrace query` (spans) or `ytrace incidents`
+(incident flag). `tail` is for READING RECORDS, never for arithmetic over them.**
+
+⭐ The under-report was caught only because two instruments were compared and disagreed.
+When a measurement is about to become a headline, take it twice by different means — a
+single instrument agreeing with your hopes is not a reading.

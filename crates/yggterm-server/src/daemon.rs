@@ -3,6 +3,7 @@ use crate::codex_cli::{
 };
 use crate::hot_restart_queue;
 use crate::hot_restart_repair;
+use crate::lock_holder_trace;
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity, GhosttyHostSupport,
@@ -45,7 +46,7 @@ use tracing::{info, warn};
 use yggterm_core::{
     AgentLaunchOptions, AppSettings, LIVE_SUMMARY_REFRESH_HORIZON, PerfSpan, SessionNode,
     SessionNodeKind, SessionStore, append_bounded_jsonl_record, append_trace_event,
-    local_cc_session_jsonl_path, looks_like_generated_fallback_title, read_cc_session_title,
+    local_cc_session_jsonl_path, looks_like_generated_fallback_title,
     resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
@@ -3292,6 +3293,21 @@ pub enum ServerResponse {
         // fails OPEN (no guard) on 0.
         #[serde(default)]
         runtime_spawn_id: u64,
+        /// Does this row's composer hold typed-but-unsent text?
+        ///
+        /// ⛔ THREE STATES, AND `None` IS NOT PERMISSION. `None` means nobody
+        /// could answer — an older daemon that has never heard of the field
+        /// deserializes to exactly that, rather than to a confident `false`
+        /// that would license a probe's Ctrl+U over somebody's sentence.
+        ///
+        /// ⭐ It rides on the snapshot the readiness probe ALREADY fetches, so
+        /// asking the one daemon that can answer costs no extra round trip.
+        /// The alternative — deriving it client-side from `text` — is the
+        /// defect this replaces: `text` is the escape stream, it is not
+        /// row-shaped, and the SGR bit that used to separate a person's typing
+        /// from the CLI's own chrome stopped carrying that distinction.
+        #[serde(default)]
+        composer_holds_draft: Option<bool>,
     },
     TerminalRetainedSnapshot {
         text: String,
@@ -4775,6 +4791,16 @@ impl DaemonRuntime {
             let call_started = std::time::Instant::now();
             let outcome = working_flags(&owner);
             let cost_ms = call_started.elapsed().as_millis();
+            // M2: Record if this blocking remote call happened inside the lock.
+            // Any peer call should be fast (~1-5ms), so > 50ms is worth tracing.
+            if cost_ms > 50 {
+                lock_holder_trace::record_blocking_call_inside_lock(
+                    self.store.home_dir(),
+                    "working_flags",
+                    cost_ms,
+                    Some(&owner_endpoint_label(&owner)),
+                );
+            }
             match outcome {
                 Ok(owner_flags) => {
                     merge_proxied_working_flags(&mut flags, &mut answered, &wanted, owner_flags)
@@ -7670,6 +7696,7 @@ impl DaemonRuntime {
                 _post_resize_output_seen,
                 _last_resize_seq,
                 _runtime_spawn_id,
+                _composer_holds_draft,
             )) => {
                 if !runtime_output_seen || snapshot.trim().is_empty() {
                     return false;
@@ -10496,6 +10523,7 @@ impl DaemonRuntime {
                                 post_resize_output_seen,
                                 last_resize_seq,
                                 runtime_spawn_id,
+                                composer_holds_draft,
                             )) => {
                                 return Ok(ServerResponse::TerminalSnapshot {
                                     text,
@@ -10504,6 +10532,10 @@ impl DaemonRuntime {
                                     post_resize_output_seen,
                                     last_resize_seq,
                                     runtime_spawn_id,
+                                    // The owner's answer, forwarded. This
+                                    // daemon does not hold the line and must
+                                    // not invent one.
+                                    composer_holds_draft,
                                 });
                             }
                             Err(error) => {
@@ -10530,6 +10562,9 @@ impl DaemonRuntime {
                         .session_post_resize_output_seen(&runtime_path),
                     last_resize_seq: self.terminals.session_last_resize_seq(&runtime_path),
                     runtime_spawn_id: self.terminals.session_runtime_spawn_id(&runtime_path),
+                    composer_holds_draft: self
+                        .terminals
+                        .session_composer_holds_draft(&runtime_path),
                 }
             }
             ServerRequest::TerminalRetainedSnapshot { path } => {
@@ -10764,11 +10799,18 @@ impl DaemonRuntime {
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
-                    match terminal_write_guarded(
+                    // ⛔⛔ THE CONDITIONAL SUBMIT TRAVELS TOO. It used to be
+                    // dropped here, and a conditional submit carries no data —
+                    // so a row held by a preserved owner answered a write of
+                    // zero bytes: the Enter was never pressed and nothing said
+                    // so. The guard silently became a no-op for exactly the
+                    // rows a version-coexisting fleet keeps alive longest.
+                    match terminal_write_guarded_full(
                         &owner_endpoint,
                         &runtime_path,
                         &data,
                         refuse_if_draft,
+                        submit_iff_line_equals.clone(),
                     ) {
                         // ⛔ Propagate the owner's message rather than dropping
                         // it. This arm used to answer a bare `Ack { None }`, so a
@@ -11736,161 +11778,148 @@ fn collect_remote_copy_candidates(
 /// title forever. Sync the live row's title from the CC JSONL whenever CC's
 /// title exists and differs (yggterm renames are written back into the JSONL,
 /// so the JSONL stays the single source of truth).
-fn collect_live_cc_title_syncs(
+/// Pick up a CLI's OWN title for its LIVE local rows, for every registered CLI
+/// that has a measured way to be asked.
+///
+/// ⛔ **ONE chore, driven by the descriptor** — it was two hand-written arms,
+/// `collect_live_cc_title_syncs` and `collect_live_antigravity_title_syncs`,
+/// which is the shape a CLI silently falls out of. Seven of the ten registered
+/// CLIs were in neither, and two of those seven are
+/// [`TitleAuthority::Store`] — a CLI yggterm refuses to generate copy for
+/// precisely because its store is authoritative. Nothing asked that store, so
+/// their rows kept their birth title for the life of the session.
+///
+/// ⛔ **THE HOME IS THE AGENT STORE HOME.** The Antigravity arm passed
+/// `resolve_yggterm_home()` (`~/.yggterm`) where `~` was required, so every
+/// lookup ran against a path that does not exist. Measured on the GUI host
+/// 2026-08-21: 96 consecutive `no_title_in_store` events over 91 minutes for a
+/// single row, while the CLI's own `history.jsonl` had held that conversation's
+/// title the entire time. `agent_store_home` is the one owner of this question
+/// (`AGENTS.md` §Multi-CLI, and `docs/cli-integration.md` §Issue Heading 1).
+fn collect_live_store_title_syncs(
     live_sessions: &[ManagedSessionView],
     working_paths: &HashSet<String>,
 ) -> Vec<BackgroundCopyUpdate> {
-    let mut updates = Vec::new();
-    for session in live_sessions {
-        // local:// AND cc-runtime:// both live on THIS machine (the host
-        // daemon that owns the PTY also owns ~/.claude/projects), so both
-        // sync from the local JSONL. remote-cc:// rows belong to another
-        // machine and ride collect_remote_cc_title_syncs instead.
-        if session.kind != SessionKind::ClaudeCode
-            || !(session.session_path.starts_with("local://")
-                || session.session_path.starts_with("cc-runtime://"))
-        {
-            continue;
-        }
-        // Spec: pick up CC's own title (incl. /rename mid-session) on WORKING
-        // turns — a rename necessarily makes the session active+working, so
-        // polling here is complete coverage with zero idle cost.
-        if !working_paths.contains(&session.session_path) {
-            continue;
-        }
-        // The session id equals CC's own rollout uuid because a fresh CC session
-        // is launched with `--session-id <uuid>` (build_live_session) and a
-        // resumed one with `--resume <uuid>`, so this id-keyed lookup finds the
-        // JSONL on the very first turn. (A bare `claude` would mint its own uuid
-        // → this lookup fails → stuck launch hint; live-caught drift 2026-07-01.)
-        //
-        // ⛔ The `continue` here is CORRECT for a title poll and is not the
-        // swallow: this loop's job is titles, and a row with no transcript has
-        // no title to read. The hint the comment names now has a home of its
-        // own — `collect_stuck_launch_faults` — so the signal is reported by
-        // the code that wants it instead of being discarded by the code that
-        // does not.
-        let Some(jsonl) = local_cc_session_jsonl_path(&session.id) else {
-            continue;
-        };
-        let Some(title) = read_cc_session_title(&jsonl).ok().flatten() else {
-            continue;
-        };
-        let title = title.trim().to_string();
-        if !title.is_empty() && title != session.title {
-            if let Ok(home) = crate::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "daemon",
-                    "title_trigger",
-                    "cc_title_pickup",
-                    serde_json::json!({
-                        "session_path": session.session_path,
-                        "previous_title": session.title,
-                        "new_title": title,
-                    }),
-                );
-            }
-            updates.push(BackgroundCopyUpdate {
-                session_path: session.session_path.clone(),
-                title: Some(title),
-                summary: None,
-            });
-        }
-    }
-    updates
+    let Some(home) = live_store_title_home() else {
+        return Vec::new();
+    };
+    collect_live_store_title_syncs_in(&home, live_sessions, working_paths)
 }
 
-/// Collect title syncs for local Antigravity sessions from `conversation_summaries.db`.
-fn collect_live_antigravity_title_syncs(
+/// The home every `read_live_store_title` lookup is resolved under.
+///
+/// ⛔ A FUNCTION, not an inline expression, so the defect it exists to prevent
+/// can be ASSERTED ON rather than reviewed for. The wrong answer here is not a
+/// crash and not an error: it is a directory that does not exist, so every
+/// lookup returns `None` and the chore reports "this CLI's store has no title
+/// for this session" — a sentence that is indistinguishable from the truth.
+/// `the_store_title_home_is_the_agent_store_home` fails the build on it.
+fn live_store_title_home() -> Option<PathBuf> {
+    let yggterm_home = crate::resolve_yggterm_home().ok()?;
+    Some(yggterm_core::startpage::agent_store_home(&yggterm_home))
+}
+
+/// [`collect_live_store_title_syncs`] against an explicit agent store home — the
+/// test seam, so a test never reads the machine's real CLI stores (a unit test
+/// that consults the user's own store passes or fails on THEIR data).
+fn collect_live_store_title_syncs_in(
+    home: &Path,
     live_sessions: &[ManagedSessionView],
     working_paths: &HashSet<String>,
 ) -> Vec<BackgroundCopyUpdate> {
     let mut updates = Vec::new();
-    let Ok(home) = crate::resolve_yggterm_home().or_else(|_| dirs::home_dir().context("home")) else {
-        return updates;
-    };
     for session in live_sessions {
-        if session.kind != SessionKind::Antigravity
-            || !(session.session_path.starts_with("local://")
-                || session.session_path.starts_with("agy-runtime://"))
-        {
+        let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) else {
+            continue;
+        };
+        let Some(read_title) = descriptor.read_live_store_title else {
+            continue;
+        };
+        // A row on THIS machine: `local://` is every live local row's runtime
+        // key, and each CLI's own `<slug>-runtime://` is the other spelling the
+        // same daemon owns. A `remote-*://` row belongs to another host's store
+        // and rides `collect_remote_cc_title_syncs`.
+        let is_local_row = session.session_path.starts_with("local://")
+            || descriptor
+                .runtime_key_scheme
+                .is_some_and(|scheme| session.session_path.starts_with(scheme));
+        if !is_local_row {
             continue;
         }
-        // "Agent unnamed ..." is authored (is_agent_plane_composed_title) so
-        // looks_like_generated_fallback_title is false and idle rows stuck forever
-        // on the birth title. Treat unnamed agent-plane titles as needing sync.
-        let is_unnamed_agent_title = yggterm_core::is_agent_plane_composed_title(&session.title)
-            && session.title.contains(" unnamed ");
-        if !working_paths.contains(&session.session_path)
-            && !looks_like_generated_fallback_title(&session.title)
-            && !is_unnamed_agent_title
-            && session.title != session.id
-        {
+        // ⛔ The writer's own predicate, asked before any IO. A row the owner
+        // named is one `set_session_title_hint` will refuse, and a refused
+        // delta never stops being a delta — the livelock that pinned this
+        // chore at its 12 s floor for a daemon's whole life. The Antigravity
+        // arm did NOT carry this guard and would re-read the store forever for
+        // an owner-titled row whose title happened to read as a placeholder.
+        if session.title_is_owner_set() {
             continue;
         }
-        let Some(title) = yggterm_core::read_antigravity_session_title(&home, &session.id)
-            .ok()
-            .flatten()
-        else {
+        // WORKING rows always: a title (or a `/rename`) lands during a turn.
+        // Plus any row still wearing a PLACEHOLDER, because a title can also
+        // land out of band — Antigravity writes its summary index on its own
+        // schedule, and a row restored from persistence comes back carrying the
+        // birth name. That second set is self-limiting: it shrinks by one every
+        // time a title lands, unlike a poll keyed on a delta that can never be
+        // satisfied.
+        let title_is_placeholder = yggterm_core::looks_like_generated_fallback_title(
+            &session.title,
+        )
+            // "Agent unnamed …" is AUTHORED, so the recogniser above says no —
+            // and an idle row wearing one would never be polled again.
+            || (yggterm_core::is_agent_plane_composed_title(&session.title)
+                && session.title.contains(" unnamed "))
+            || session.title.trim() == session.id.trim();
+        if !working_paths.contains(&session.session_path) && !title_is_placeholder {
+            continue;
+        }
+        let Some(title) = read_title(home, &session.id) else {
             yggterm_core::perf::ytrace_emit_event(
                 "daemon",
                 "cli",
-                "agy_title",
+                "store_title_miss",
                 serde_json::json!({
                     "session_path": session.session_path,
+                    "slug": descriptor.slug,
+                    // The id the store was asked about. A CLI that mints its own
+                    // id is rebound by the identity poll, and a miss whose id is
+                    // the row's birth uuid is a REBIND failure wearing a store
+                    // failure's clothes — two very different repairs.
+                    "session_id": session.id,
                     "reason": "no_title_in_store",
                 }),
             );
             continue;
         };
         let title = title.trim().to_string();
-        if yggterm_core::looks_like_generated_fallback_title(&title) {
-            yggterm_core::perf::ytrace_emit_event(
-                "daemon",
-                "cli",
-                "agy_title",
-                serde_json::json!({
-                    "session_path": session.session_path,
-                    "title": title,
-                    "fallback": true,
-                }),
-            );
+        if title.is_empty() || title == session.title {
+            continue;
         }
-        if !title.is_empty() && title != session.title {
-            yggterm_core::perf::ytrace_emit_event(
-                "daemon",
-                "cli",
-                "agy_title",
-                serde_json::json!({
-                    "session_path": session.session_path,
-                    "title": title.clone(),
-                    "is_untitled": title.to_ascii_lowercase() == "untitled session",
-                }),
-            );
+        if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
                 &home,
                 "daemon",
                 "title_trigger",
-                "antigravity_title_pickup",
+                "store_title_pickup",
                 serde_json::json!({
                     "session_path": session.session_path,
+                    "slug": descriptor.slug,
                     "previous_title": session.title,
                     "new_title": title,
                 }),
             );
-            updates.push(BackgroundCopyUpdate {
-                session_path: session.session_path.clone(),
-                title: Some(title),
-                summary: None,
-            });
         }
+        updates.push(BackgroundCopyUpdate {
+            session_path: session.session_path.clone(),
+            title: Some(title),
+            summary: None,
+        });
     }
     updates
 }
 
 /// Local Claude Code rows that are MID-TURN and yet have no transcript of
-/// their own — the "stuck launch hint" `collect_live_cc_title_syncs` names in
+/// their own — the "stuck launch hint" `collect_live_store_title_syncs` names in
 /// its comment and, being a title poll, correctly has nothing to do with.
 ///
 /// ⭐ WHY THIS IS SOUND, AND WHY THE OBVIOUS VERSION IS NOT. The row id IS the
@@ -12235,11 +12264,10 @@ fn build_background_copy_updates(
     working_paths: &HashSet<String>,
     generation_enabled: bool,
 ) -> Result<Vec<BackgroundCopyUpdate>> {
-    let mut updates = collect_live_cc_title_syncs(live_sessions, working_paths);
-    updates.extend(collect_live_antigravity_title_syncs(live_sessions, working_paths));
-    // LLM title/summary generation is opt-in (env-gated); the CC and Antigravity title syncs
-    // above are cheap local-file/db reads and always run — their own stores are the
-    // SSOT for their titles and need no LLM.
+    let mut updates = collect_live_store_title_syncs(live_sessions, working_paths);
+    // LLM title/summary generation is opt-in (env-gated); the store title sync
+    // above is a cheap local-file/db read and always runs — a CLI's own store is
+    // the SSOT for its title and needs no LLM.
     if !generation_enabled {
         return Ok(updates);
     }
@@ -16337,7 +16365,7 @@ pub fn terminal_read(
 pub fn terminal_snapshot(
     endpoint: &ServerEndpoint,
     path: &str,
-) -> Result<(String, bool, bool, bool, u64, u64)> {
+) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalSnapshot {
@@ -16351,6 +16379,7 @@ pub fn terminal_snapshot(
             post_resize_output_seen,
             last_resize_seq,
             runtime_spawn_id,
+            composer_holds_draft,
         } => Ok((
             text,
             running,
@@ -16358,6 +16387,7 @@ pub fn terminal_snapshot(
             post_resize_output_seen,
             last_resize_seq,
             runtime_spawn_id,
+            composer_holds_draft,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
@@ -16577,9 +16607,29 @@ pub fn terminal_write_guarded_full(
     )?)
 }
 
+/// The prefix a conditional submit CONFIRMS with. A caller that presses Enter
+/// through this verb has exactly one honest reading of "it landed", and this is
+/// it — see [`terminal_submit_landed`].
+pub const SUBMIT_LANDED_MESSAGE: &str = "submitted:";
+
 /// Did a conditional submit REFUSE because the line differed?
 pub fn terminal_submit_was_refused_for_line(message: Option<&str>) -> bool {
     message.is_some_and(|message| message.starts_with(SUBMIT_LINE_REFUSAL_MESSAGE))
+}
+
+/// Did the conditional submit actually PRESS ENTER?
+///
+/// ⛔⛔ "NOT REFUSED" IS NOT "SUBMITTED", and treating them as the same is how a
+/// writer believes it has delivered a message that is still sitting unsent in a
+/// composer. A conditional submit carries no data, so a daemon that never
+/// evaluated the condition — because it does not own the row — answers a plain
+/// write of zero bytes: nothing refused, nothing typed, nothing submitted. A
+/// caller reading only the two refusal flags scores that as success, stops
+/// watching, and the next cycle types a SECOND copy of the same text on top of
+/// the first. That is the storm this repository has now paid for twice.
+/// ⇒ The affirmative answer is the daemon saying it submitted, and nothing else.
+pub fn terminal_submit_landed(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.starts_with(SUBMIT_LANDED_MESSAGE))
 }
 
 /// Did this write land, or was it refused because the owner has unsent text?
@@ -20116,7 +20166,10 @@ fn lock_daemon_runtime_for_request<'a>(
     request_name: &'static str,
 ) -> MutexGuard<'a, DaemonRuntime> {
     match runtime.try_lock() {
-        Ok(guard) => return guard,
+        Ok(guard) => {
+            lock_holder_trace::enter_lock_holder(request_name);
+            return guard;
+        }
         // Poison is handled identically to the blocking path; fall through so
         // there is exactly one recovery site.
         Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -20135,6 +20188,7 @@ fn lock_daemon_runtime_for_request<'a>(
     // which was true and beside the point: it is the SLOW path that is hot.
     let guard = lock_daemon_runtime(runtime, "handle_request");
     let waited = started.elapsed();
+    lock_holder_trace::enter_lock_holder(request_name);
     let Some(home) = home.as_deref() else {
         return guard;
     };
@@ -20644,7 +20698,7 @@ fn daemon_request_response(
     }
     let mut runtime = lock_daemon_runtime_for_request(runtime, request_name);
     let home_dir = runtime.store.home_dir().to_path_buf();
-    match panic::catch_unwind(AssertUnwindSafe(|| {
+    let response = match panic::catch_unwind(AssertUnwindSafe(|| {
         runtime.handle_request(request, identity)
     })) {
         Ok(Ok(response)) => response,
@@ -20676,7 +20730,10 @@ fn daemon_request_response(
                 message: format!("daemon request {request_name} panicked: {panic_message}"),
             }
         }
-    }
+    };
+    // M1: Record that we're releasing the lock after handling the request.
+    lock_holder_trace::exit_lock_holder(&home_dir);
+    response
 }
 
 #[cfg(unix)]
@@ -28188,9 +28245,111 @@ mod tests {
         ));
     }
 
+    /// ⛔ THE HOME IS THE AGENT STORE HOME (`~`), NEVER THE YGGTERM HOME.
+    ///
+    /// The defect, measured on the GUI host 2026-08-21: the Antigravity title
+    /// sync resolved its home with `resolve_yggterm_home()` and then looked for
+    /// `<home>/.gemini/antigravity-cli/...`, i.e. `~/.yggterm/.gemini/...` — a
+    /// directory that has never existed. 96 consecutive `no_title_in_store`
+    /// events in 91 minutes for one row, while the CLI's own `history.jsonl`
+    /// held that conversation's title the whole time. Nothing failed: a wrong
+    /// home is not an error, it is an empty directory, and an empty directory
+    /// answers "this session has no title" in a voice indistinguishable from
+    /// the truth.
+    ///
+    /// ⚠ The fallback that was supposed to save it — `.or_else(|_|
+    /// dirs::home_dir())` — could not, because `resolve_yggterm_home()` does
+    /// not fail. A fallback behind a branch that never runs is decoration.
+    #[test]
+    fn the_store_title_home_is_the_agent_store_home() {
+        let home = super::live_store_title_home().expect("a resolvable home");
+        assert_eq!(
+            Some(home.clone()),
+            dirs::home_dir(),
+            "store lookups must run under the AGENT store home",
+        );
+        if let Ok(yggterm_home) = crate::resolve_yggterm_home() {
+            assert_ne!(
+                home, yggterm_home,
+                "the yggterm home holds yggterm's own state, never a CLI's store",
+            );
+        }
+    }
+
+    /// A row the OWNER named is not polled — no store read, no ssh, no delta.
+    ///
+    /// ⚖ The writer refuses to overwrite an owner-set title, and a refused
+    /// delta never stops being a delta: that is the livelock that pinned this
+    /// chore at its 12 s floor for a whole daemon's life. The per-CLI arm this
+    /// replaced carried the guard on one CLI and not the other, so an
+    /// owner-titled Antigravity row whose name happened to read as a
+    /// placeholder was re-read from disk on every tick, for ever.
+    #[test]
+    fn an_owner_titled_row_is_never_polled_for_a_store_title() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-store-title-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let key = server.start_local_session(
+            crate::SessionKind::ClaudeCode,
+            Some("/home/user/proj"),
+            Some("home/pi claude"),
+        );
+        let session_id = server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == key)
+            .map(|session| session.id.clone())
+            .expect("the row exists");
+        // A transcript the store WOULD answer from, so the only thing that can
+        // keep the update away is the owner-set guard itself.
+        let projects = home.join(".claude/projects/-home-user-proj");
+        std::fs::create_dir_all(&projects).expect("projects dir");
+        std::fs::write(
+            projects.join(format!("{session_id}.jsonl")),
+            "{\"type\":\"custom-title\",\"customTitle\":\"Renamed by the CLI\"}\n",
+        )
+        .expect("transcript");
+
+        let working: std::collections::HashSet<String> =
+            server.live_sessions().iter().map(|s| s.session_path.clone()).collect();
+
+        // Un-owned: the store's title lands, which proves the fixture reaches
+        // the reader at all — without this the guard below would pass vacuously.
+        let updates = super::collect_live_store_title_syncs_in(
+            &home,
+            &server.live_sessions(),
+            &working,
+        );
+        assert_eq!(
+            updates.first().and_then(|u| u.title.as_deref()),
+            Some("Renamed by the CLI"),
+            "a live row must pick up the title its own CLI wrote",
+        );
+
+        // Owner-set: nothing, even though the store still holds a different
+        // title and the row is still working.
+        server.set_session_title_explicit(&key, "the owner's own name");
+        let updates = super::collect_live_store_title_syncs_in(
+            &home,
+            &server.live_sessions(),
+            &working,
+        );
+        assert!(
+            updates.is_empty(),
+            "an owner-titled row must not be polled: {updates:?}",
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn live_cc_title_sync_skips_sessions_without_jsonl_and_matching_titles() {
-        // collect_live_cc_title_syncs must fail open: no CC JSONL on disk →
+        // collect_live_store_title_syncs must fail open: no CC JSONL on disk →
         // no update (and never touch non-CC or remote sessions).
         let server = {
             let mut server = crate::YggtermServer::new(
@@ -28213,12 +28372,16 @@ mod tests {
             .iter()
             .map(|s| s.session_path.clone())
             .collect();
-        let updates = super::collect_live_cc_title_syncs(&server.live_sessions(), &working);
+        let updates = super::collect_live_store_title_syncs(&server.live_sessions(), &working);
         assert!(updates.is_empty());
-        // And a NON-working CC session is never polled at all (the working
-        // indicator is the trigger — spec-title-summary-working-indicator).
+        // An IDLE row is polled only while it still wears a placeholder, and a
+        // store with nothing in it still yields nothing. (The working indicator
+        // is the primary trigger — spec-title-summary-working-indicator — and
+        // the placeholder arm is the out-of-band half: a title can also land
+        // between turns, and a row restored from persistence comes back wearing
+        // its birth name.)
         let idle = std::collections::HashSet::new();
-        let updates = super::collect_live_cc_title_syncs(&server.live_sessions(), &idle);
+        let updates = super::collect_live_store_title_syncs(&server.live_sessions(), &idle);
         assert!(updates.is_empty());
     }
 
@@ -28528,7 +28691,7 @@ mod tests {
         };
         let working: std::collections::HashSet<String> = [session.session_path.clone()].into();
         // No JSONL exists for the nil UUID → fail open with no update (and no panic).
-        let updates = super::collect_live_cc_title_syncs(&[session], &working);
+        let updates = super::collect_live_store_title_syncs(&[session], &working);
         assert!(updates.is_empty());
     }
 

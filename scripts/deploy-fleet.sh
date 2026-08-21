@@ -189,6 +189,60 @@ if [ "$PREFLIGHT" = 1 ]; then
   exit 0
 fi
 
+# ⛔⛔⛔ ONE DEPLOY AT A TIME, AND IT MUST NAME WHO HOLDS IT.
+#
+# The fleet runs a dozen lanes in parallel, each in its own worktree with its own
+# `target/release`. Nothing stopped two of them reaching this point at once, and
+# the owner reported hitting exactly that: two agents pushing builds. The damage
+# is not a failed copy — it is that the two interleave. Each allocates its own
+# version, each writes the same three binaries on the same three hosts, and the
+# census then names a commit that is a mixture of two builds no tree ever held.
+# Every "is my fix live?" check afterwards answers about a binary that never
+# existed as a whole.
+#
+# ⚠ A LEASE, NOT A MUTEX QUEUE. A second deploy must be REFUSED and told who has
+# it, not silently queued behind a build it knows nothing about — the caller can
+# then decide, which is the whole point of the orchestrator owning the roll.
+#
+# ⭐ The lease is taken AFTER preflight (which is read-only and must stay free) and
+# BEFORE any binary is written. It is released on every exit path by trap, and a
+# lease older than the ceiling is taken over WITH A LOUD LINE rather than
+# deadlocking the fleet on a killed process.
+DEPLOY_LEASE="${YGG_DEPLOY_LEASE:-$HOME/.yggterm/relay/deploy.lease}"
+DEPLOY_LEASE_CEILING_S=1800
+HOLDER="${YGGTERM_SESSION_ID##*/}"
+[ -n "$HOLDER" ] || HOLDER="$(whoami)@$(hostname)/$$"
+
+mkdir -p "$(dirname "$DEPLOY_LEASE")"
+if ! (set -o noclobber; printf '%s
+%s
+%s
+' "$HOLDER" "$$" "$(date +%s)" > "$DEPLOY_LEASE") 2>/dev/null; then
+  LEASE_WHO="$(sed -n 1p "$DEPLOY_LEASE" 2>/dev/null)"
+  LEASE_PID="$(sed -n 2p "$DEPLOY_LEASE" 2>/dev/null)"
+  LEASE_AT="$(sed -n 3p "$DEPLOY_LEASE" 2>/dev/null)"
+  AGE=$(( $(date +%s) - ${LEASE_AT:-0} ))
+  if [ "${LEASE_AT:-0}" -gt 0 ] && [ "$AGE" -lt "$DEPLOY_LEASE_CEILING_S" ]      && { [ "$LEASE_PID" = "$$" ] || kill -0 "${LEASE_PID:-0}" 2>/dev/null || [ -z "$LEASE_PID" ]; }; then
+    echo "⛔ deploy-fleet: another deploy holds the lease." >&2
+    echo "   holder : ${LEASE_WHO:-unknown} (pid ${LEASE_PID:-?}, ${AGE}s ago)" >&2
+    echo "   lease  : $DEPLOY_LEASE" >&2
+    echo "   ⇒ Two deploys interleaving write a fleet no tree ever held, and every" >&2
+    echo "     version check afterwards answers about a binary that never existed." >&2
+    echo "     Wait, or ask that holder. Do NOT delete the lease to get past this." >&2
+    exit 75
+  fi
+  echo "⚠ deploy-fleet: taking over a STALE lease from ${LEASE_WHO:-unknown} (${AGE}s old," >&2
+  echo "  pid ${LEASE_PID:-?} is gone). If that deploy is in fact running, stop now." >&2
+  printf '%s
+%s
+%s
+' "$HOLDER" "$$" "$(date +%s)" > "$DEPLOY_LEASE"
+fi
+# ⛔ Released on EVERY exit path. A lease that outlives its holder is a fleet that
+# cannot deploy until a human deletes a file nobody documented.
+trap 'rm -f "$DEPLOY_LEASE"' EXIT
+echo "deploy-fleet: lease held by $HOLDER"
+
 GUI="$FROM/yggterm"
 HL="$FROM/yggterm-headless"
 for f in "$GUI" "$HL"; do

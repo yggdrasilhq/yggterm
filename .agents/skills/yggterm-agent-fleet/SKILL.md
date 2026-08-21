@@ -1799,6 +1799,33 @@ demotion mid-turn.
 ⇒ **That state is recoverable by a single `continue`.** A monitor that only
 *detects* stalls and tells a human is doing half the job.
 
+#### ⛔⛔⛔ BUT ONLY WHILE THE ROW IS STILL CHEAP TO RESUME — **NEVER KICK A COLD SESSION**
+
+**This paragraph exists because the two halves of this skill contradicted each
+other and a tool believed the nearer one.** §6 says a cold session is succeeded by
+HARVESTING its transcript and never by prompting it. This section said a stopped
+session is one word from resuming, *with no qualification at all* — so a sweep
+built from this section sent `continue` to rows carrying multi-megabyte
+transcripts, which is exactly what §6 forbids.
+
+⇒ **A `continue` IS an ask.** It does not feel like one, which is the whole
+problem: cold cache × large context multiply, **the prompt is the expense**, and
+it makes the row warm, so replacing it afterwards wastes precisely what the prompt
+just bought.
+
+| the row | the remedy |
+|---|---|
+| small transcript, idle minutes | **one `continue`** — cheap, correct, this section |
+| large transcript, or long cold | ⛔ **harvest → despawn → respawn at the same seat** (§6) |
+
+⭐ **The fork has no middle.** Touch nothing and succeed it from artefacts, or,
+having touched it, keep it. `ygg-fold.py` encodes the split — a cold stall
+classifies as `COLD`, never `STALLED`, and its remedy is a successor brief
+distilled from the row's title, its last written words and its lane branch, with
+nothing asked of the session. The thresholds are `wakeable()` in that file and
+they are an AND: an OR has the strength of the weaker test, which is how a 5 MB
+row gets prompted for being recently idle.
+
 ⛔ Three guards, or the cure is worse than the disease:
 - **Once per stall, never per poll.** A watcher that re-nudges every tick is
   worse than one that never nudges.
@@ -2364,6 +2391,35 @@ for any row with nothing mounted — which is most rows a watcher looks at. Both
 stalled rows above refused `submit` twice and took a PTY write immediately. And
 **the Enter is a separate write of `\r`** after a short pause; concatenated, an
 agent CLI reads it as pasted composer content rather than a submit.
+
+⛔⛔ **AND THE SECOND WRITE HAS AN ATOMIC FORM — USE IT.**
+`server terminal write <row> --submit-iff-line-equals <text>` presses Enter only
+if the input line still reads exactly what you wrote, compared and enqueued under
+one lock in the daemon that owns the PTY. A plain `\r` after a plain write leaves
+a gap a person's keystroke can land in, and it has: a half-typed sentence was
+submitted with a watchdog's text spliced into it.
+⚠ `accepted:true` is NOT proof for this form. A conditional submit carries no
+data, so a daemon that never evaluated the condition answers a plain write of
+zero bytes — nothing refused, nothing pressed. **Read `submitted`.**
+
+⛔⛔ **AND A WRITER THAT CANNOT CONFIRM ITS OWN SUBMIT MUST NOT WRITE AGAIN.**
+Measured across 19 rows and 434 refusals: a watcher typed, could not see its text,
+correctly refused the Enter, and then typed another copy on the next tick —
+because both decisions read the same failing detector, so "I cannot see it"
+licensed *do not submit* and *type again* at once. Rows were found holding a dozen
+unsent copies. Record the write before the bytes go out, and COMPLETE it next tick
+or refuse it. **Two decisions that disagree must not share one reading.**
+
+⛔⛔ **THE COMPOSER IS A ROW, AND THE MARKER IS NOT UNIQUE TO IT.** An agent CLI
+prefixes every DELIVERED message in its transcript with the same glyph the
+composer uses, so a search of the SCREEN for "the marker then your text" finds
+messages the row already received — and nothing clears a transcript, so a wake
+that WORKED can make the row refuse every later one, permanently. Read the
+composer off the daemon's rendered grid (`server screen <row> --json` →
+`screen_plain_rows`), take the bottom-most marker row with only the CLI's own
+border and footer beneath it, and treat *could not look* · *no composer drawn* ·
+*present and empty* · *holds text* as four states. Only the third may be typed
+into.
 
 ### ⭐⭐ ANY SESSION CAN ATTACH TO A RUNNING ORCHESTRATOR
 

@@ -21553,6 +21553,202 @@ mod tests {
         .collect()
     }
 
+    /// ⛔ A HEAD THAT DIES DAEMON-SIDE MUST NOT LEAVE ITS ARRANGEMENT BEHIND —
+    /// AND AN ABSENCE MUST BE CONFIRMED BEFORE IT COUNTS.
+    ///
+    /// `RowArrangement::retain_live` existed, correct and tested, with no
+    /// production caller: the GUI's close and remove paths handle the row being
+    /// closed, and a head that dies daemon-side or remotely left an entry stored
+    /// forever. The obvious wiring — prune every frame against the live set — is
+    /// worse than the leak, because the live set FLICKERS during a daemon
+    /// handover and the user's whole arrangement would go with it. So this
+    /// asserts the confirmation as hard as it asserts the prune: two sightings
+    /// change nothing, and an EMPTY live set changes nothing at any count.
+    #[test]
+    fn a_departed_head_is_forgotten_only_after_its_absence_is_confirmed() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://head");
+        let mut shell = ShellState::new(bootstrap);
+        let head = "local://head".to_string();
+        let member = "local://member".to_string();
+        shell
+            .row_arrangement
+            .attach(&head, &member, None)
+            .expect("a hand-built set");
+
+        let survivor =
+            yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&member));
+        let snapshot_without_the_head = |sessions: Vec<yggterm_server::SnapshotSessionView>| ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: sessions,
+            apps: Vec::new(),
+        };
+
+        // ⛔ NOTHING LIVE AT ALL — a handover, not a departure. Any number of
+        // these must decide nothing, or three quiet snapshots would wipe an
+        // arrangement built over weeks.
+        shell.server.apply_snapshot(snapshot_without_the_head(Vec::new()));
+        for _ in 0..6 {
+            shell.prune_departed_row_arrangement();
+        }
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            Some(head.as_str()),
+            "an empty live set is 'I have not been told yet', never 'everyone left'"
+        );
+
+        // The member is live; the head is gone. Two sightings are not enough.
+        shell
+            .server
+            .apply_snapshot(snapshot_without_the_head(vec![survivor.clone()]));
+        shell.prune_departed_row_arrangement();
+        shell.prune_departed_row_arrangement();
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            Some(head.as_str()),
+            "an unconfirmed absence must leave the arrangement untouched"
+        );
+
+        // The third confirms it.
+        shell.prune_departed_row_arrangement();
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            None,
+            "a confirmed departure re-parents the member per retain_live's own \
+             contract"
+        );
+        assert!(
+            !shell.row_arrangement.sets.is_head(&head),
+            "and the dead head's entry is gone from the arrangement"
+        );
+        assert_eq!(
+            shell.settings.row_arrangement, shell.row_arrangement,
+            "the prune persists: an entry cleared in memory and left in settings \
+             comes straight back at the next start"
+        );
+    }
+
+    /// A row that comes BACK before the count runs out keeps its arrangement —
+    /// the counter must reset on sight, not merely stop rising, or a row that
+    /// flickers once per handover would be pruned on its third handover rather
+    /// than on its third absence.
+    #[test]
+    fn a_row_that_reappears_keeps_the_arrangement_it_had() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://head");
+        let mut shell = ShellState::new(bootstrap);
+        let head = "local://head".to_string();
+        let member = "local://member".to_string();
+        shell
+            .row_arrangement
+            .attach(&head, &member, None)
+            .expect("a hand-built set");
+        let snapshot = |sessions: Vec<yggterm_server::SnapshotSessionView>| ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: sessions,
+            apps: Vec::new(),
+        };
+        let head_row =
+            yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&head));
+        let member_row =
+            yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&member));
+
+        for _ in 0..2 {
+            shell
+                .server
+                .apply_snapshot(snapshot(vec![member_row.clone()]));
+            shell.prune_departed_row_arrangement();
+        }
+        // Back on the next snapshot.
+        shell
+            .server
+            .apply_snapshot(snapshot(vec![head_row.clone(), member_row.clone()]));
+        shell.prune_departed_row_arrangement();
+        // Two more absences: with the counter reset, that is still not three.
+        for _ in 0..2 {
+            shell
+                .server
+                .apply_snapshot(snapshot(vec![member_row.clone()]));
+            shell.prune_departed_row_arrangement();
+        }
+        assert_eq!(
+            shell.row_arrangement.sets.parent_of(&member),
+            Some(head.as_str()),
+            "a sighting resets the count; only three CONSECUTIVE absences act"
+        );
+    }
+
+    /// ⛔⛔ THE SIDEBAR DRAWS OUTLINE ORDER CONTINUOUSLY — NO VERB RUN AT ALL.
+    ///
+    /// Owner-reported twice on 2026-08-21 as rows not being in ascending order.
+    /// `sort_by_outline` calls itself "the one sort … both the rendered sidebar
+    /// and any verb that reports an order call this", and the rendered sidebar
+    /// was the half that never did: its only caller was the `SortSessions` verb,
+    /// so rendered order was arrival order and correct order was a manual repair
+    /// that every spawn, fold and re-group undid.
+    ///
+    /// The rows arrive here in a deliberately hostile order — reversed, and with
+    /// `11.20` ahead of `11.9` so a lexicographic regression is caught on the
+    /// render path rather than only in the comparator's own suite.
+    #[test]
+    fn the_sidebar_draws_seats_in_ascending_order_without_any_verb() {
+        let drawn = live_rows_for_seats(
+            &[
+                ("remote-session://dev/twenty", "11.20"),
+                ("remote-session://dev/orch", "11.0"),
+                ("remote-session://dev/nine", "11.9"),
+                ("remote-session://dev/ten", "11.10"),
+            ],
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+        assert_eq!(
+            drawn,
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/nine".to_string(), 2),
+                ("remote-session://dev/ten".to_string(), 2),
+                ("remote-session://dev/twenty".to_string(), 2),
+            ],
+            "the seats say the order and the sidebar draws it, at the top level \
+             and inside the set alike"
+        );
+    }
+
+    /// The same, one level deeper and with no head to collect them: three
+    /// top-level books arriving out of order still draw in order, so the fix is
+    /// about the render path rather than about a set's membership vector.
+    #[test]
+    fn top_level_books_draw_in_order_even_with_nothing_to_nest_under() {
+        let drawn = live_rows_for_seats(
+            &[
+                ("remote-session://dev/ten", "10"),
+                ("remote-session://dev/two", "2"),
+                ("remote-session://dev/loose", ""),
+                ("remote-session://dev/one", "1"),
+            ],
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+        assert_eq!(
+            drawn,
+            vec![
+                ("remote-session://dev/one".to_string(), 1),
+                ("remote-session://dev/two".to_string(), 1),
+                ("remote-session://dev/ten".to_string(), 1),
+                // Un-numbered sorts last and keeps its incoming place, which is
+                // the key's own contract.
+                ("remote-session://dev/loose".to_string(), 1),
+            ]
+        );
+    }
+
     /// ⛔⛔ AN ARRANGEMENT ENTRY WHOSE HEAD IS DEAD MAY NOT HIDE ITS MEMBERS.
     ///
     /// Row-set membership persists in settings while rows come and go, and
@@ -26345,13 +26541,19 @@ mod tests {
             HashMap::from([(session.session_path.clone(), "0000000".to_string())]);
 
         let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
-        assert_eq!(label, "New Muse Code Session");
+        // ⭐ AND IT NAMES THE MACHINE, off the row's OWN path. This read
+        // `New Muse Code Session` until 2026-08-21 — the same string on every
+        // host in a fleet, for a row plane whose whole job is to span hosts.
+        // The birth rule is one rule now (`new_session_birth_title`), so a
+        // scanned row that has said nothing reads exactly like the live row the
+        // daemon would mint for it.
+        assert_eq!(label, "New devhost Muse Code");
 
         // Once a turn exists the placeholder is no longer the truth, and the
         // ordinary chain takes over again.
         session.user_message_count = 1;
         let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
-        assert_ne!(label, "New Muse Code Session");
+        assert_ne!(label, "New devhost Muse Code");
     }
 
     #[test]
@@ -27359,10 +27561,13 @@ mod tests {
                 assert_eq!(ssh_target, "pi@dev");
                 assert_eq!(prefix.as_deref(), Some("cd /srv"));
                 assert_eq!(cwd.as_deref(), Some("/home/user/gh/yggterm"));
-                // The birth name says WHAT THE NEW ROW IS. It used to be
-                // `"{spawner label} shell"`, which named the row the context
-                // menu was opened on.
-                assert_eq!(title_hint.as_deref(), Some("New Terminal"));
+                // ⛔ NO HINT AT ALL, and that is the fix. The birth name is
+                // `New {machine} Terminal` and only the DAEMON knows which
+                // machine the row is landing on, so a hint composed here is a
+                // second answer to a question that has an owner. The shell used
+                // to compose `New Terminal` (no machine) and before that
+                // `"{spawner label} shell"` (the row the menu was opened on).
+                assert_eq!(title_hint, None);
             }
             other => panic!("expected remote launch context, got {other:?}"),
         }
@@ -27570,7 +27775,10 @@ mod tests {
                 // Shell", and the session spawned from it used to be born
                 // "Samplenotes Shell codex" — a near-copy of its spawner's
                 // title, two rows apart in the sidebar and barely separable.
-                assert_eq!(title_hint.as_deref(), Some("New Codex Session"));
+                // The cure is now the ABSENCE of a hint: the daemon composes
+                // `New {machine} Codex`, which names neither the spawner nor a
+                // machine the shell had to guess at.
+                assert_eq!(title_hint, None);
             }
             other => panic!("expected remote Codex launch context, got {other:?}"),
         }
@@ -39902,6 +40110,126 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         }
     }
 
+    /// ⛔ `launch.applied` IS A FACT ABOUT THE ROW, NOT ABOUT THE COMMAND STRING.
+    ///
+    /// Root-caused as the narrowed residue of the remote `--model` drop: the
+    /// snapshot post-processor RE-DERIVES a remote row's `launch_command`
+    /// between its birth and its first spawn, so a verdict computed by
+    /// substring-testing that string answers a question about a rebuildable
+    /// artifact. It can read `false` for a spawn whose flag reached the
+    /// process, and — the more expensive direction — `true` for a create that
+    /// spelled the token into one command without storing it on the row, which
+    /// loses the model at the very next refresh.
+    ///
+    /// Both directions are asserted here, and both fail on the pre-fix tree:
+    /// it answered `applied: false` for the stored-but-re-derived row and
+    /// `applied: true` for the spelled-but-unstored one.
+    #[test]
+    fn launch_applied_reads_the_stored_options_not_the_re_derived_command() {
+        let path = "remote-cc://testhost/4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        let requested = AgentLaunchOptions {
+            model: Some("sample-model-tier".to_string()),
+            permission_mode: None,
+        };
+
+        // (1) THE MASK: the row STORES the model, so every rebuild re-applies
+        // it and the flag is on the process — but the command as it reads right
+        // now is a re-derivation that does not spell it.
+        let mut stored_but_re_derived = test_snapshot_session_view(path);
+        stored_but_re_derived.kind = SessionKind::ClaudeCode;
+        stored_but_re_derived.agent_launch_options = requested.clone();
+        stored_but_re_derived.launch_command =
+            "ssh dev -- yggterm server remote cc-resume …".to_string();
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(stored_but_re_derived.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![stored_but_re_derived],
+            apps: Vec::new(),
+        };
+        let report = app_control_created_launch_report(&snapshot, Some(path), &requested);
+        assert_eq!(
+            report["applied"],
+            serde_json::json!(true),
+            "the row stores the option, so every rebuild re-applies it — a \
+             re-derived command that does not happen to spell it is not a \
+             failed launch, and reporting it as one is the mask this closes"
+        );
+        assert_eq!(
+            report["stored_model"],
+            serde_json::json!("sample-model-tier"),
+            "the verdict must be auditable: report what the row stores"
+        );
+        assert_eq!(
+            report["command_carries_tokens"],
+            serde_json::json!(false),
+            "the string observation is still reported — beside the verdict, \
+             never as it"
+        );
+
+        // (2) THE WORSE DIRECTION: the token is spelled into the command but
+        // the create never stored it, so the first identity refresh erases it.
+        // The old substring test called this a success.
+        let mut spelled_but_unstored = test_snapshot_session_view(path);
+        spelled_but_unstored.kind = SessionKind::ClaudeCode;
+        spelled_but_unstored.agent_launch_options = AgentLaunchOptions::default();
+        spelled_but_unstored.launch_command =
+            "ssh dev -- yggterm server remote cc-resume … --model sample-model-tier".to_string();
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(spelled_but_unstored.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![spelled_but_unstored],
+            apps: Vec::new(),
+        };
+        let report = app_control_created_launch_report(&snapshot, Some(path), &requested);
+        assert_eq!(
+            report["applied"],
+            serde_json::json!(false),
+            "an option that lives only inside a string the daemon rewrites is \
+             not an applied option"
+        );
+        assert_eq!(
+            report["command_carries_tokens"],
+            serde_json::json!(true),
+            "the command really does spell it — which is exactly why the two \
+             answers must be separate fields"
+        );
+    }
+
+    /// A kind with no CLI to pass the flag to must not report success. The
+    /// token builder REFUSES rather than ignores; swallowing that refusal into
+    /// an empty expectation is how `--model` on a shell row would read applied.
+    #[test]
+    fn launch_applied_refuses_a_kind_that_cannot_express_the_request() {
+        let path = "local://shell-row";
+        let requested = AgentLaunchOptions {
+            model: Some("sample-model-tier".to_string()),
+            permission_mode: None,
+        };
+        let mut shell_row = test_snapshot_session_view(path);
+        shell_row.kind = SessionKind::Shell;
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(shell_row.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![shell_row],
+            apps: Vec::new(),
+        };
+        let report = app_control_created_launch_report(&snapshot, Some(path), &requested);
+        assert_eq!(
+            report["applied"],
+            serde_json::json!(false),
+            "a shell row has no CLI to pass --model to, so nothing was applied"
+        );
+    }
+
     #[test]
     fn superseded_client_handoff_selects_outgoing_active_live_session() {
         let stale_path = "remote-session://dev/stale";
@@ -42941,6 +43269,77 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             busy.reason
         );
     }
+    /// ⛔ EVERY AGENT CLI'S DOT READS THE DAEMON, NOT A HEURISTIC — and the arm
+    /// that decides is derived from the registry, not hand-listed.
+    ///
+    /// Owner-reported 2026-08-21: an Antigravity row sat perfectly still while
+    /// its own metadata rail read `running · working` and the CLI printed
+    /// `Running command… esc to cancel`. The daemon had computed `working` from
+    /// that CLI's own measured phrases and was right; the SIDEBAR asked
+    /// `matches!(kind, Codex | CodexLiteLlm | ClaudeCode)` and dropped the other
+    /// seven registered CLIs into the screen-text heuristics below it, where an
+    /// active agy row resolves to idle.
+    ///
+    /// Driven off the registry so an eleventh CLI cannot be added into silence.
+    #[test]
+    fn every_agent_cli_blinks_off_the_daemon_working_flag() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let kind = descriptor.kind;
+            for (working, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+                let path = "remote-session://example-host/working-arm";
+                let mut shell =
+                    ShellState::new(test_shell_bootstrap_with_active_session(path));
+                let mut session = test_live_shell_session(path);
+                session.id = "working-arm".to_string();
+                session.kind = kind;
+                session.source = SessionSource::LiveSsh;
+                session.working = working;
+                // The heuristic fall-through the hand-list used to reach reads
+                // these, and reads them WRONG for an agent CLI. Pinned to the
+                // shape that most tempts it: a running row whose last captured
+                // frame looks like a quiet prompt.
+                session.terminal_foreground_active = Some(false);
+                session.launch_phase = yggterm_server::TerminalLaunchPhase::Running;
+                shell.server.apply_snapshot(ServerUiSnapshot {
+                    active_session_path: Some(path.to_string()),
+                    active_session: Some(snapshot_session_view_for_ui(session.clone())),
+                    active_view_mode: WorkspaceViewMode::Terminal,
+                    remote_machines: Vec::new(),
+                    ssh_targets: Vec::new(),
+                    live_sessions: vec![snapshot_session_view_for_ui(session)],
+                    apps: Vec::new(),
+                });
+                shell.needs_initial_server_sync = false;
+                shell.browser.select_path(path.to_string());
+
+                let snapshot = shell.snapshot();
+                let row = snapshot
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        normalize_live_session_path(&row.full_path)
+                            == normalize_live_session_path(path)
+                    })
+                    .expect("live session row");
+                let busy = sidebar_row_busy_state(&snapshot, row);
+                assert_eq!(
+                    busy.visible,
+                    expected,
+                    "{:?} with working={working:?} rendered {:?}: an agent row's \
+                     dot is the daemon's flag, never a screen heuristic",
+                    kind,
+                    busy.reason,
+                );
+                if expected {
+                    assert_eq!(
+                        busy.reason, "agent_working_daemon",
+                        "{kind:?} blinked for the wrong reason",
+                    );
+                }
+            }
+        }
+    }
+
     // ⛔ THE PRECEDENCE IS THE WHOLE FIX. A row holding an owner question is
     // MID-TURN, so the daemon answers `working: Some(true)` truthfully — and a
     // dot that reads only `working` therefore reports ordinary busy work on a
