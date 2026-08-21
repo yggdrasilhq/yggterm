@@ -77,7 +77,7 @@ def find_row(host, target):
     return None
 
 
-def _reap_if_never_briefed(uuid, uri, host, a, kind=None):
+def _reap_if_never_briefed(uuid, row_kind):
     """⛔⛔ A ROW THAT WAS NEVER BRIEFED MUST NOT OUTLIVE THE ATTEMPT TO BRIEF IT.
 
     A spawn whose submit failed used to leave its row seated and empty — holding a
@@ -90,12 +90,21 @@ def _reap_if_never_briefed(uuid, uri, host, a, kind=None):
     — losing a working lane to a delivery timeout would be far worse than the
     debris this cleans up. Only a row with NO transcript at all is reaped, because
     that row has, demonstrably, never been given anything to do.
+
+    ⛔⛔ `row_kind` IS A PARAMETER, AND FOR ONE COMMIT IT WAS NOT. It was read as a
+    free name out of `main()`'s locals, which a module-level function cannot see,
+    so every call raised `NameError` and this whole interlock was unreachable —
+    on both of its callsites, which are the two delivery FAILURE paths and so are
+    the two nobody exercises. The signature was the tell: it took `uri`, `host`
+    and `a`, none of which the body has ever used, and omitted the one value it
+    did. ⇒ Pass what the body reads and nothing else; an unused parameter is where
+    a missing one hides.
     """
     # ⛔ EVERY CLI's store, not just the reference one. This decides whether to
     #    DESTROY the row, and the old glob could only ever answer "no" for a CLI
     #    that keeps its transcripts anywhere else — so a working lane that was
     #    merely busy past the deadline was force-folded as never briefed.
-    if ygg_transcript.has_transcript(uuid, kind=kind):
+    if ygg_transcript.has_transcript(uuid, kind=row_kind):
         log("  the row has a transcript — it has been briefed before, so it STAYS")
         return 6
     fold = os.path.join(HERE, "ygg-fold.py")
@@ -174,7 +183,7 @@ def main():
             why = "not consuming input yet (still starting up?)"
         if time.time() > deadline:
             log(f"⛔ {why} after {a.wait_min:g}m — NOT delivered")
-            return _reap_if_never_briefed(uuid, uri, host, a, row_kind)
+            return _reap_if_never_briefed(uuid, row_kind)
         log(f"{why} — waiting {POLL_S}s")
         time.sleep(POLL_S)
 
@@ -186,7 +195,7 @@ def main():
         # ⛔ NEVER RETRY. `submitted:false` means the row was mid-output, not that
         # it is unreachable, and a retry is a second write into the same composer.
         log(f"⛔ submitted:false ({reply.get('error')}) — NOT retried, by law")
-        return _reap_if_never_briefed(uuid, uri, host, a, row_kind)
+        return _reap_if_never_briefed(uuid, row_kind)
     log(f"submitted {data.get('bytes')}B, proving delivery from the transcript")
 
     if not ack:

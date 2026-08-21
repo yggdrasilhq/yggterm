@@ -17,6 +17,11 @@ reap. A different typo in the same place reaps a working lane.
 nobody has run it.** Cheap paths get exercised incidentally; the expensive ones are
 guarded by conditions that a passing test suite is designed never to meet.
 
+⚖ This is the DYNAMIC half and it has a static twin, `test_no_verb_reads_a_name_
+nothing_binds`, which sweeps every verb for unbound names. The twin catches the typo
+anywhere; this one catches the decision being wrong — a reap that runs, asks the right
+question, and still folds a row that has spoken would pass the static check happily.
+
 Every fixture is invented.
 """
 import importlib.util
@@ -61,8 +66,7 @@ try:
     deliver.subprocess.run = lambda *a, **k: folded.append(a) or None
 
     try:
-        result = deliver._reap_if_never_briefed(ID, f"remote-xx://invented/{ID}",
-                                                "invented-host", None, "codex")
+        result = deliver._reap_if_never_briefed(ID, "codex")
     except NameError as exc:
         FAILURES.append(f"the reap path raised NameError instead of deciding: {exc} — "
                         f"this is the branch that destroys a row")
