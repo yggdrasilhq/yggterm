@@ -203,7 +203,8 @@ pid runs the new image with the supervisor alive and every row intact.
 
 **Status:** OPEN
 
-Measured 2026-08-21 ~00:15 by the cli-practice lane.
+*Measured 2026-08-21 ~00:15 by the cli-practice lane.*
+
 A rebuilt binary installed at the SAME version answers `already_ready:true` from the deploy
 gate while `/proc/<daemon>/exe` md5 differs from disk — the daemon keeps running the old
 code and every instrument agrees the deploy landed. Any lane that ships a fix without
@@ -218,6 +219,8 @@ change, install, and the gate must roll the daemon and the change must be observ
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Owner-reported live 2026-08-21 ~00:1x as "INPUT BLOCK ON 13.0".*
 
 A seat raised an interactive question picker (the standing owner-question shape) and sat on
 it 27 minutes. Every surface misdescribed the state: `gate-screen` answered
@@ -274,6 +277,8 @@ plus Enter, never of keystrokes.
 ## ⚠ [11.0] A WEBVIEW THAT STOPS ACKING EDIT BATCHES IS DEAD INPUT WEARING A LIVE WINDOW
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Incident evidence; owner-reported as "input blocked — trauma".*
 
 2026-08-20 ~23:2x-23:37: the GUI instance launched at 23:20 (via app-control, unsupervised
 after the raw-kill-loses-the-supervisor gap below) logged **13 ×** `webview never
@@ -515,6 +520,14 @@ removing user activity would not remove most of these renders.
 **Falsifier:** under the same streaming-row load, renders track user-visible changes (order
 of 0.1/s), and the viewport repaints only for its own session's bytes. Read `Sidebar`'s
 `renders` against `root_renders` in `component_window` — with the hoist live they must separate.
+
+**CONFIRMED-ROOTS FOLD (2026-08-21 01:1x, commit `74430ab3`, live both GUIs):** the dossier's
+two standing top causes cut at their gates — `terminal_attach_host_health_sample` now ABSENT
+from causes (skips the active-visible session and a hidden sidebar; throttle 750ms→2.5s), the
+contribution ping behind a read-only precheck with non-reactive liveness (3.6→1.2/min; the
+remainder is due refetches/drains by design). Laptop window: roots **0.29/s** (from 1.22/s),
+`ui/block` 0. Remaining dossier items (restore-card 1 Hz tick, retarget noop, hot-leaf-state
+architecture split) are in the 11.12 brief §2 with risk notes.
 
 **FIRST POST-FIX WINDOW, 2026-08-20 ~21:33–22:05 (commit `2d834fd6`):** root renders
 **0.35/s** (from 1.57/s), **Sidebar 39 of 330** root renders (from 232 of 234 — the hoist
@@ -829,6 +842,23 @@ identify the shared state in the three named tests first (they are the observed 
 not the population); an isolation harness (per-test temp home, serialized group) beats a
 retry culture. **Falsifier:** two full workspace suites running concurrently on one machine
 both pass.
+
+## ⚠ [11.10] A STANDING BOOT REFUSAL IS INVISIBLE IN EVERY STATE FILE — ONLY THE LOG KNOWS
+
+**Status:** OPEN
+
+*Filed 2026-08-21 from a cross-lane report that proved out: four rows across four campaigns
+sat permanently unbootable for days while every instrument read healthy.* A refused boot is
+deliberately REFUNDED (`boots` stays 0 — correct, the row was never asked anything), so a
+row refused every tick forever is indistinguishable in the subscription state from one that
+never needed a boot: no counter rises, nothing escalates, and only a log line per tick
+records the standing condition. The immediate cause of those four (the read-buffer JSON
+envelope consumed raw, defeating the residue cleaner and half-blinding the choice-prompt
+guard) is fixed with a falsifying fixture test; THIS entry is the structural residue: a
+refusal that repeats N ticks for the SAME reason should surface — a `standing_refusal`
+field on the subscription and one escalation, not a per-tick log line nobody tails.
+**Falsifier:** wedge a row so a boot refuses repeatedly; within N ticks the subscription
+state names the standing refusal and exactly one escalation fires.
 
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
