@@ -2141,6 +2141,43 @@ result.
 Cleanup: kill by EXE, not by pattern — `pgrep -f <path>` matches the shell that holds
 the path in its own command line, so it reports a stray that is your own probe.
 
+## Counting a daemon's zombies, and why zero is not an answer (measured 2026-08-21)
+
+A long-lived process accumulates one permanent process-table entry per child it spawns
+and never waits on. Nothing in the watch plane counts them, so the census is by hand:
+
+```sh
+# ⛔ Enumerate by the ARGUMENT, never the binary name — a daemon does not have to be
+#    called yggterm-headless, and one launched as `yggterm server daemon` was holding
+#    69 of a 233-zombie fleet total that a name-based sweep reported as 164.
+ps -eo pid,ppid,stat,etimes,args --no-headers |
+  awk '/server daemon/ && !/awk/ {print}'
+# then, per daemon pid:
+ps -eo ppid,stat --no-headers | awk -v P=<pid> '$1==P && $2 ~ /^Z/' | wc -l
+```
+
+⛔⛔ **ZERO ZOMBIES IS NOT A PASS. It is the reading a daemon that never spawned
+anything also gives**, and the fleet reliably has one of those — an older build without
+the code path under test. Any claim that a reap works needs the count of things it
+actually launched, standing beside the zero:
+
+- **From 3.1.30 on, read it:** `daemon/heartbeat/notify_spawned` carries the pid.
+  ⚠ The event is written on the failure path too, with a null pid — filter on `spawned`.
+- **On an older daemon, infer it:** take its `daemon/heartbeat/panic` events at severity
+  `error` and replay them through `NOTIFY_COOLDOWN_MS`. That is what the count was
+  before the event existed, and it is inference sitting where a control belongs.
+
+⭐ **And run the control on the same host, in the same window.** Pre-fix daemons keep
+their accumulated pile until they exit — that is expected and is not a failed fix, but
+it is also the comparison that makes the zero mean something: 91 → 92 and 80 → 81 on two
+old daemons across the window in which a rolled one stayed at 0.
+
+⚠ **The `comm` of a zombie is a trap.** It reads as the PARENT's name, which looks like a
+fork that never exec'd; it is equally consistent with a child exec'ing the same binary,
+and that is what it is. And **a daemon whose binary was replaced under it answers
+`--version` from the FILE, not from the running code** — the 23-hour daemon carrying the
+pre-fix pile reports the version that was installed over it an hour ago.
+
 ## A single red in the server suite is not automatically a flake (measured 2026-08-21)
 
 `cargo test -p yggterm-server --lib` runs ~1,220 tests in one binary on a loaded host,
