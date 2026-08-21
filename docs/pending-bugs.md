@@ -322,9 +322,13 @@ question. **Status here is about which surface is chosen and whether the launch 
 `YGGTERM_HOME` on the shipped binary, with its own trace plane, in about a minute, without
 touching the desktop. Reach for it before parking a restore-path claim on "the next restart".
 
-## ⛔⛔⛔ [11.0] LEGENDARY — A DAEMON RESTART ORPHANS ITS PTY MASTERS, AND NOTHING CAN EVER ATTACH AGAIN
+## ⛔⛔⛔ [11.27] LEGENDARY — A REFUSED PTY ADOPTION DESTROYS THE MASTER IT HAS ALREADY TAKEN
 
 **Status:** OPEN
+
+**Owner:** seat 11.27; root measured 2026-08-22. ⚠ The first two sections below are the ORIGINAL
+report and its first diagnosis; the correction that renamed this entry is the third section, and
+it is the one to act on.
 
 *Caught live 2026-08-22 00:38, with the owner locked out of every session on his GUI and having
 to open a KDE terminal outside yggterm to report it. His words: "This is the legendary daemon bug
@@ -365,8 +369,47 @@ Measured on this seat's OWN process while it was landing commits and spawning la
 | peer socket | **ALIVE** — a peer session reached it while the GUI could not |
 
 ⇒ **The survivors need no rescuing.** Process healthy, transcript intact, peer plane reachable.
-**What is missing is purely a way for a NEW daemon to adopt an orphaned slave PTY** — or for the
-session to have been handed a master that outlives the daemon in the first place.
+
+### ⛔⛔ CORRECTED 2026-08-22 — TWO OF THOSE THREE PROBES CANNOT TELL HEALTHY FROM ORPHANED
+
+**Both readings above are TRUE of a perfectly adopted, working session**, so neither one
+separates the two states, and the conclusion drawn from them — *"nobody holds the master"* — was
+never measured.
+
+| the probe | what it actually answers |
+|---|---|
+| `PPID 1` | an adopted child **is** reparented to init. PPID 1 is the EXPECTED state after a SUCCESSFUL adoption, not evidence against one. |
+| `fuser /dev/pts/N` | holders of the **SLAVE**. A master is an unnamed `/dev/ptmx` descriptor and can never appear under `/dev/pts/N`, in any case, healthy or broken. |
+
+⭐ **The instrument that does answer it** is a scan of `/proc/*/fd` for links equal to
+`/dev/ptmx`. Taken live on a row adopted minutes earlier and working normally: `ppid=1`, `fuser`
+naming only its own wrapper, **and the current daemon holding a master fd for it** — all three at
+once. ⇒ Read the master holder from `/proc`, never from `fuser` on the slave.
+
+### ⛔ AND THE STATED MISSING PIECE IS NOT MISSING — IT IS BUILT, WIRED, AND RUNNING
+
+This entry said what was needed was *"a way for a NEW daemon to adopt an orphaned slave PTY"*.
+`pty_adoption.rs` + `pty_handoff.rs` + `pty_handoff_wire.rs` do exactly that over `SCM_RIGHTS`,
+and they run on every daemon swap: **162 `pty_handoff_adopted` events in one night**, with four of
+six handover sweeps reporting `AllMoved` and `all_moved: true`.
+
+**The real defect is narrower and it is a LOSS, not an absence.** The successor's refusal is
+evaluated AFTER the commit point, so a refused session does not merely fail to move — its master
+is destroyed:
+
+```
+Partial { moved: 10, reason: "<key>: successor took the fd and refused to seat it:
+  refusing to adopt <key>: this daemon already runs a live PTY for it
+  (AFTER the commit point — the fd is gone)" }        readers_stood_down: 11
+handoff_settle_window   all_moved=false  held=10  bytes_stolen_after_park=187
+```
+
+Twice in one night, the same key, `bytes_stolen_after_park` **187 on exactly those two occasions
+and 0 on every clean one**. `send_session` is metadata → **sendmsg (commit)** → ack, and its own
+module doc states the invariant it breaks: *everything before the sendmsg is recoverable.* The
+metadata already carries the runtime key, the child pid and its start time — everything the
+refusal needs — so the decision can be taken while the descriptor is still the predecessor's.
+⇒ The policy is right; only its TIMING is wrong. Owned by seat **11.27**.
 
 ### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 
