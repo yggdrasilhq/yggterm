@@ -2375,6 +2375,22 @@ enum WebTabOrigin {
     /// open from the top*. Do not "unify" the two directions; see
     /// [`web_tab_placement`].
     Top,
+    /// **Ctrl+T: born where the user already is.** The id is the ACTIVE tab.
+    ///
+    /// ⭐ Owner requirement, 2026-08-21: *"When I am at say row 34 and press
+    /// ctrl+t I want the new row to spawn at 34 and the old one moved to 35,
+    /// not the new one at the top."* This is a REFINEMENT of *new tabs open
+    /// from the top*, not a reversal of it — and the two gestures now say
+    /// different things, which is the whole point:
+    ///
+    /// - the header **"+"** means *a new tab for this window* ⇒ [`Top`], row 1;
+    /// - **Ctrl+T** means *a new tab HERE* ⇒ this, at the active row.
+    ///
+    /// Before, both were `Top`, so a keyboard user working 34 rows down was
+    /// thrown to the top of the rail on every new tab and lost their place.
+    ///
+    /// [`Top`]: WebTabOrigin::Top
+    Here(u64),
     /// Born inside a group, with no opener: a group HEAD row's "+". It joins the
     /// top of that group's run — directly under the head that minted it —
     /// rather than at the far end of the window.
@@ -2448,6 +2464,16 @@ impl WebTabOpenRequest {
     fn blank_in_group(head: u64) -> Self {
         Self {
             origin: WebTabOrigin::Group(head),
+            destination: WebTabDestination::Blank,
+            foreground: true,
+        }
+    }
+    /// **Ctrl+T**: a blank tab at the ACTIVE row, typing-ready. The row that
+    /// was there moves down one. See [`WebTabOrigin::Here`] for why this is not
+    /// the same gesture as the header's "+".
+    fn blank_here(active: u64) -> Self {
+        Self {
+            origin: WebTabOrigin::Here(active),
             destination: WebTabDestination::Blank,
             foreground: true,
         }
@@ -2629,6 +2655,33 @@ fn web_tab_placement(rows: &[WebTabPlacementRow], origin: &WebTabOrigin) -> WebT
         // ([`order_web_tabs_by_group`]), so displacing the head would put the
         // new tab outside the group it was born into and leave the group
         // headless in the same stroke.
+        // Take the active row's own slot, pushing it down — unless that row
+        // HEADS a group, in which case sit directly under it instead. Displacing
+        // a head would put the new tab outside the group it was born into and
+        // leave the group headless in the same stroke, which is the refusal
+        // `Group` already documents one arm below.
+        WebTabOrigin::Here(active) => match rows.iter().position(|row| row.id == *active) {
+            Some(at) if web_tab_rows_head_group(rows, *active) => WebTabPlacement {
+                index: (at + 1).clamp(top, rows.len()),
+                group_head: Some(*active),
+                opener: None,
+            },
+            Some(at) => WebTabPlacement {
+                index: at.clamp(top, rows.len()),
+                // Stay in whatever group the active row is in, so Ctrl+T inside
+                // a group fills that group rather than escaping to root.
+                group_head: rows.get(at).and_then(|row| row.group_head),
+                opener: None,
+            },
+            // The active row went away between the keystroke and the mint — or
+            // the app tab is the active one, which cannot be displaced. An
+            // ordinary top open, which is where Ctrl+T used to land anyway.
+            None => WebTabPlacement {
+                index: top,
+                group_head: None,
+                opener: None,
+            },
+        },
         WebTabOrigin::Group(head) => match rows.iter().position(|row| row.id == *head) {
             Some(at) => WebTabPlacement {
                 index: (at + 1).clamp(top, rows.len()),
@@ -10895,6 +10948,34 @@ fn omnibox_frecency_score(visit_count: usize, days_since_last_visit: f64) -> f64
     let recency = (-days_since_last_visit / 14.0).exp().max(0.2);
     (visit_count as f64) * recency
 }
+/// Has the user typed a COMPLETE host they have visited?
+///
+/// Pure, so the rule is a unit test rather than a history fixture. See the
+/// caller for why it exists: the inline completion requires a candidate strictly
+/// LONGER than what was typed, so the bare host — the one candidate equal to it
+/// — is the single thing it can never offer, and every keystroke re-completed to
+/// some deep URL instead.
+///
+/// ⚠ Only meaningful before a `/`. After a slash the user is navigating INTO the
+/// site and completing the path is exactly what they want.
+fn omnibox_typed_is_a_whole_host<'a>(typed: &str, urls: impl Iterator<Item = &'a str>) -> bool {
+    if typed.contains('/') || !typed.contains('.') {
+        return false;
+    }
+    let matches_host = |url: &str| {
+        let stripped = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        let host = stripped.split(['/', '?', '#']).next().unwrap_or(stripped);
+        host.eq_ignore_ascii_case(typed)
+            || host
+                .strip_prefix("www.")
+                .is_some_and(|bare| bare.eq_ignore_ascii_case(typed))
+    };
+    urls.into_iter().any(matches_host)
+}
+
 fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
     let typed = typed.trim_start();
     if typed.is_empty() || typed.contains(char::is_whitespace) {
@@ -10922,6 +11003,27 @@ fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
             e.1 = ts;
             e.2 = title;
         }
+    }
+    // ⛔⛔ A COMPLETE HOST IS A DESTINATION, NOT A PREFIX. Owner-reported:
+    // *"when I type just youtube.com understand that I want to go to
+    // youtube.com and not youtube.com/some-pat-url-i-visited"*.
+    //
+    // The loop below requires `candidate.len() > typed.len()`, so the bare host
+    // — the one candidate that equals what was typed — is the ONE thing it can
+    // never offer. Every keystroke therefore re-completed to whichever deep URL
+    // scored highest, and pressing Enter went there. There was no way to reach
+    // the site's own front page except by deleting the completion every time.
+    //
+    // ⇒ Once the typed text IS a host that has been visited, inline completion
+    // stops. The deep URLs are still one Down-arrow away in the dropdown, which
+    // is where a choice between several of them belongs — inline completion is
+    // for the case with one obvious answer, and "which page of youtube.com" is
+    // not that case.
+    //
+    // ⚠ Only when there is no `/` yet. After a slash the user is navigating
+    // INTO the site and completing the path is exactly what they want.
+    if omnibox_typed_is_a_whole_host(typed, agg.keys().map(String::as_str)) {
+        return None;
     }
     let now_ms = current_millis();
     let mut best: Option<(f64, String)> = None;
