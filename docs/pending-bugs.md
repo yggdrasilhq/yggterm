@@ -519,6 +519,47 @@ fail once and stay failed.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔ [11.0] A ROW CAN BE ALIVE AND WORKING WITH NO READABLE SCREEN AT ALL
+
+**Status:** OPEN
+
+*Measured 2026-08-21, while chasing a booter refusal to a different cause.*
+
+A lane whose process is alive, whose transcript is being written, and whose last
+turn is recent, can have **no rendered grid at all**. Every reader agrees and all
+of them read empty:
+
+```
+server screen 'cc-runtime://<uuid>' --state-only        -> unreadable
+server screen 'remote-cc://<host>/<uuid>' --state-only   -> unreadable
+server app terminal read-buffer <row> --mode screen      -> 0 characters
+```
+
+⇒ **Everything that decides by looking at a screen is blind on such a row**, and
+each blindness is reported as a fact about the ROW rather than about the reader:
+
+* the fold classifies it `screen says unreadable, quiet Nm`
+* the booter refuses to wake it — correctly, since it cannot rule out a waiting
+  prompt — and says so as *"screen unreadable for N ticks"*
+
+⚠ **AND IT LOOKS EXACTLY LIKE A SEPARATE BUG THAT WAS REAL.** The booter's
+envelope parse was reading the screen text at the wrong nesting level and
+returning empty for EVERY row, so "unreadable" had two causes at once, one of them
+universal. Fixing the parse — proved on a row where the correct level held 2837
+characters and the wrong one held zero — does not make this one readable.
+
+**What is not established:** whether the grid is lost at a client restart, never
+mounted for that row, or dropped when the daemon changed hands. All three fit.
+
+**Falsifier:** find a row reading `unreadable` after the parse fix, and ask the
+daemon whether it holds a PTY and a grid for that session. If it does, the loss is
+in the read path; if it does not, the surface is genuinely gone and the question
+becomes when it went.
+
+⇒ **Until then, no verb may treat `unreadable` as a statement about the row.** It
+is a statement about what the reader could see, and the two have been confused in
+both directions today.
+
 ## ⛔⛔⛔ [11.0] A GUI RESTART STARTS A SECOND `--resume` ON A SESSION WHOSE PROCESS IS STILL ALIVE
 
 **Status:** OPEN
