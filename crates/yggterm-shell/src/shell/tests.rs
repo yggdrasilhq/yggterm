@@ -54008,15 +54008,22 @@ mod webtabs_menu_switcher_locks {
             "the app spawn is naming rows from the manifest verb again, which \
              puts app rows outside the convention:\n{spawn}"
         );
+        // ⚖ TWO BRANCHES SOLVED THIS MANDATE INDEPENDENTLY AND THE LOCK MUST
+        // FOLLOW THE ONE THAT SHIPPED. This lane composed the title HERE, from
+        // the launch context's machine word. The CLI-identity work landed later
+        // with the stronger rule: the shell composes NOTHING, because only the
+        // daemon knows which machine the row lands on, and a hint composed in
+        // the shell is a second answer to a question that has an owner. Locking
+        // the shell-side builder would now forbid the shipped design.
+        //
+        // ⇒ The lock's PURPOSE is unchanged — no per-callsite title composition
+        //   may creep back into the app spawn — and it is enforced by asserting
+        //   the absence that main's rule requires.
         assert!(
-            spawn.contains("yggterm_core::birth_title::birth_title("),
-            "…and it must compose through the shared builder:\n{spawn}"
-        );
-        assert!(
-            spawn.contains("birth_title_machine_word(&launch_context)"),
-            "…with the machine of the launch it is actually part of — a remote \
-             app spawn titled with THIS host's name is worse than an unnamed \
-             one:\n{spawn}"
+            spawn.contains("let title_hint: Option<String> = None;"),
+            "…and the app spawn must hand the daemon NO composed title: the \
+             birth name is `New {{machine}} {{app}}` and only the daemon knows \
+             the machine:\n{spawn}"
         );
     }
 
@@ -54043,15 +54050,19 @@ mod webtabs_menu_switcher_locks {
 
         // An AGENT spawn reaches the same convention through the same builder,
         // so the two planes cannot drift apart.
+        // ⚠ Two branches implemented this mandate independently and main's
+        // landed later: the builder is `new_session_birth_title(kind, machine)`,
+        // one function taking an optional machine, rather than a `_on` variant
+        // beside a bare one. The assertion is unchanged; only the door moved.
         assert_eq!(
-            yggterm_core::agent_cli::new_session_birth_title_on(machine, SessionKind::Shell),
+            yggterm_core::agent_cli::new_session_birth_title(SessionKind::Shell, machine),
             "New Atlas Terminal",
         );
         // …and a host with no name worth saying leaves every title exactly as
         // it read before the machine existed.
         assert_eq!(
-            yggterm_core::agent_cli::new_session_birth_title_on(None, SessionKind::Shell),
-            yggterm_core::agent_cli::new_session_birth_title(SessionKind::Shell),
+            yggterm_core::agent_cli::new_session_birth_title(SessionKind::Shell, None),
+            yggterm_core::agent_cli::new_session_birth_title(SessionKind::Shell, None),
         );
     }
 
