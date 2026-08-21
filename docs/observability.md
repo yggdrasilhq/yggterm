@@ -147,6 +147,29 @@ differ from the terminal background" calls every one of them a ghost and reports
 faults on a perfectly painted terminal. A cell holding a glyph has internal contrast; a cell
 holding a flat colour has none, whatever colour it is.
 
+⛔⛔ **`atlas_clears` COUNTS OUR CALLS, NOT THE ADDON'S CLEARS — read `page0v` beside it.**
+`forced_atlas_clear_count` is incremented by our own refresh funnel at the moment it calls the
+addon. `TextureAtlas.clearTexture()` then opens with a guard — it does nothing at all while the
+first page is still at its origin — so a run can report N atlas clears having wiped nothing. An
+experiment built on that number would "refute" a cause it never applied, which is the same failure
+shape as a harness reporting clean results it never rendered. The frame now also carries
+`atlas_page0_row_x/y` — the fill cursor, which is what the guard reads — and `atlas_page0_version`.
+
+⚠ **Read those two correctly, because the obvious reading of the version is wrong.**
+`Page.version` is bumped by `Page.clear()` **and by every glyph rasterised into the page**, so it
+is a "this page changed" counter, not a clear counter: one run here moved it 1,088 → 8,573 across
+nine atlas clears. The evidence that a clear actually RAN is the fill cursor **moving backwards** —
+`page0row` went `8,102` → `8,75`, and a page that is only being filled can never go down.
+**A refutation of anything atlas-shaped is only valid if the fill cursor was seen to reset.**
+
+⭐ **AND THE WARMED RANGE DECIDES WHETHER A FIXTURE CAN TEST THE ATLAS AT ALL.** `_doWarmUp()`
+rasterises codepoints **33..125 at DEFAULT fg/bg/ext** in a fixed order, and `clearTexture()` sets
+`_didWarmUp = false` so it runs again after every clear — returning default-coloured ASCII to the
+same slots. A co-owner's stale glyph coordinates for that range therefore stay valid **by
+construction**. Any fixture drawn in plain default-coloured ASCII is testing the one case where
+atlas sharing is provably harmless; a fixture meant to exercise it has to draw outside the warmed
+set — non-ASCII, or any coloured or bold cell, since fg/bg/ext are part of the cache key.
+
 ⚠ **What it cannot see, so that nothing is built on it:** it does not read the glyphs, so a cell
 painted with the WRONG character reads `ok` — it answers "was something drawn here", not "was it
 right". A native web surface draws above all DOM and is absent from the frame. And
