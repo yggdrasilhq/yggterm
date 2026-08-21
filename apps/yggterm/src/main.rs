@@ -1398,7 +1398,12 @@ fn main() -> Result<()> {
         ) = if retained {
             terminal_retained_snapshot(&endpoint, &args[3])?
         } else {
-            terminal_snapshot(&endpoint, &args[3])?
+            // ⚠ Only the LIVE screen can vouch for what is in a composer now, so
+            // only it carries the verdict; the retained frame is a stored one and
+            // is not given a value it cannot stand behind.
+            let (text, running, seen, post, seq, spawn, _composer) =
+                terminal_snapshot(&endpoint, &args[3])?;
+            (text, running, seen, post, seq, spawn)
         };
         if raw {
             print!("{text}");

@@ -172,54 +172,159 @@ a row whose backing session is gone will never restore, so re-arming after
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
-## ⛔⛔⛔ [11.0] `composer_held_draft` FIRES ON AN EMPTY COMPOSER, AND IT HAS JAMMED THE WAKE PLANE
+## ⛔⛔ [11.20] THE DRAFT FLAG IS RESET BY EVERY DAEMON HANDOVER, AND IT FAILS OPEN
 
 **Status:** OPEN
 
-*Measured 2026-08-21. This is not a cosmetic misread: it is why briefs cannot be delivered to
-several lanes, and why the booter has stopped being able to wake anything.*
+*Found 2026-08-21 while confirming the composer-draft entry below. It is the reason
+that entry's replacement is a UNION of two readings rather than one clean owner.*
 
-**Symptom.** `server app terminal input-check <row>` answers `composer_held_draft: true` for a
-row whose composer is **empty**. Read in the same minute, that row's rendered screen ends:
+`pending_input_draft` — the keystroke-derived answer to "is somebody mid-sentence in
+there" — is reconstructed from the bytes forwarded through **one daemon's** `write`.
+It has exactly one construction site and it is always `AtomicBool::new(false)` with an
+empty `pending_input_line` beside it. A session ADOPTED by a newer daemon therefore
+starts reading **clean** while the person's sentence is still standing in the composer,
+because the text lives in the CLI's own process, not in the counter.
 
-```
-                                                              new tas…
-──────────────────────────────────────────────────────────────────────
-❯
-──────────────────────────────────────────────────────────────────────
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent
-```
+**Measured.** One row on the fleet visibly held an unsent line on its rendered grid.
+`server rows drafts`, asked in the same minute, reported it as holding no draft; the
+daemon owning it had started 2h earlier, after the line was typed.
 
-Nothing after the `❯`. The row is idle at an ordinary prompt with a background agent running.
+**Why it is worse than a missing reading.** Handovers are routine — the roll takes one
+every hour — so this is a guard that goes quiet on a schedule, and the direction it
+fails in is the expensive one: `--refuse-if-draft` waves the write through and the
+readiness probe's `Ctrl+U` is licensed over whatever is there. `session_is_migratable`
+consults the same flag, so the release that destroys a draft is also cleared by it.
 
-**Why it is expensive rather than annoying.** The booter refuses to wake a row that holds a
-draft — correctly, because typing into somebody's half-written line is the defect this whole
-campaign exists to prevent. So a false positive makes the row **permanently unwakeable**: the
-booter captures the "draft", sends one clear, sees the same screen, and logs `residue survived
-the clear — refusing rather than typing more` followed by `SKIP:draft-race`, every cycle,
-forever. ⇒ **A loop whose exit depends on a condition it cannot change**, which this repo has
-already recorded as a bug class — except here the condition is not a draft at all, so no amount
-of clearing could ever satisfy it. Two lanes were unreachable when this was found, and a
-LEGENDARY brief could not be delivered.
+**Falsifier:** type into a row, confirm `server rows drafts` names it, roll the daemon,
+and ask again without touching the row. It must still name it.
 
-**Likely mechanism, NOT yet confirmed in code.** `terminal_composer_row_holds_draft`
-(`crates/yggterm-shell/src/terminal_observe.rs`) is a **line-shaped rule**: it takes the last
-line beginning with the CLI's composer marker and asks whether the first printable glyph after
-that marker was drawn faint. Correct on a grid. It is fed `terminal_snapshot_async`, and if that
-is the raw stream rather than the rendered rows, then a positioned-draw screen — which arrives
-as a few very long lines rather than as display rows — puts the *next* row's chrome after the
-marker on the same line, and that chrome is not faint. ⇒ **This is exactly the class 11.17
-fixed for the gate classifiers ("a screen does not contain the words on it; classify from the
-rendered grid"), still live in the draft detector.** The daemon now exposes
-`session_screen_plain_rows` for precisely this.
+**Not fixed here.** The seeding this wants — reconstruct the line from the rendered
+composer row at adoption, then let keystrokes maintain it as they already do — is a
+change to the adopt path, and this lane could not prove it without a daemon bump it was
+told not to take. What shipped instead is the union in
+`TerminalManager::session_composer_holds_draft`, where the rendered grid covers exactly
+the window the counter is blind in.
 
-⚠ **Confirm before fixing.** The alternative is that the faint-tracking walk is right and the
-`← 1 agent` background-agent chrome reaches it by another route; the CHANGELOG records the write
-guard being taught this distinction already, and the two may simply have diverged.
+## ⛔ [11.20] `server rows drafts` REPORTS FULL COVERAGE WHILE SEEING ONE DAEMON IN FOUR
 
-**Falsifier:** take a row with a demonstrably empty composer and a running background agent, and
-read `composer_held_draft`. It must be false. Then type one character into it and read again: it
-must be true. Both halves, or the fix is a way of never seeing a draft.
+**Status:** OPEN
+
+Measured 2026-08-21 on the build host: four `yggterm-headless server daemon` processes
+were running, and `server rows drafts` answered `daemons_seen: 1` with
+`daemons_or_rows_unable_to_answer: 0` — i.e. it declared it had asked everybody.
+
+The verb's own contract is right and is quoted in its docstring: *a daemon that cannot
+answer is counted apart, never as clean; blind is not clear*. That protects a daemon
+that ANSWERS "I am too old to say". It does nothing for a daemon that is never
+enumerated, because there is then nobody to be blind — and the fan-out enumerates by
+socket, while a version bump replaces older sockets with symlinks to the newest one.
+
+⇒ **A coverage count is not coverage.** The verb should compare the daemons it reached
+against the daemon PROCESSES on the host and report the difference, or its `verdict:
+"clear"` means "clear among the ones I happened to find".
+
+## ⛔⛔⛔ [11.20] `composer_held_draft` HAD NO DISCRIMINATOR LEFT — CONFIRMED, AND FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*The entry asked for confirmation before any change, and named the alternative: that the
+faint walk was right and the background-agent chrome reached it another way. **The walk
+is not right.** Three of its premises were tested against live rows on 2026-08-21 and
+all three are false.*
+
+**1. The SGR discriminator is dead.** The guard separated the CLI's chrome from a
+person's typing by whether the first glyph after the composer marker was drawn FAINT.
+That was measured true on 2026-08-07. On a live row holding a person's visible unsent
+sentence, the composer's raw line now reads `ESC[m<marker>NBSP ESC[2m` and then their
+words — **the CLI dims the composer's content whatever wrote it.** So the one bit the
+guard turned on stopped carrying the distinction, and it stopped in the direction that
+types over a sentence: the same row read `composer_held_draft: false` over a real draft,
+twice, in the same minute the queue said it was firing on empty ones.
+
+**2. The marker is not unique to the composer.** The CLI prefixes every DELIVERED
+message in its transcript with the same glyph, drawn in an ordinary colour rather than
+faint. Any reading that lands on one of those answers "a person has typed here" about a
+message the row already received and replied to.
+
+**3. It was fed the escape stream, which is not row-shaped.** Across 26 live rows the
+median was ~2.2 rendered rows per newline-delimited line and the worst was 16.25 — one
+65-row viewport arrived as FOUR lines. "The last line beginning with the marker" is
+therefore not a window over anything a person can see. This is the class 11.17 fixed for
+the gate classifiers, still live here.
+
+⇒ **A discriminator that has died is not repaired by reading it more carefully.** The
+predicate is deleted rather than mended, along with the test corpus that made it look
+healthy — every fixture in that test put the composer alone on its own line, which is
+the one shape the live stream never produces. *A contract test that builds its own input
+tests the constructor.*
+
+**What replaced it.** The daemon answers, on the snapshot the probe already fetches
+(`ServerResponse::TerminalSnapshot::composer_holds_draft`, `serde(default)` so an older
+daemon deserializes to `None` = nobody could say, which is not permission). Its answer
+is the union of the keystroke-derived line buffer and
+`yggterm_core::composer_row_holds_text`, which reads the RENDERED GRID and takes the
+composer to be the bottom-most marker row with only the CLI's own border and footer
+under it. The two are unioned because each is blind where the other sees: see the
+handover entry above.
+
+**Live proof owed, and it is the entry's own falsifier, both halves:** a row with a
+demonstrably empty composer and a running background agent must read
+`composer_held_draft: false`; type one character into it and it must read `true`. The
+grid arm is already proven against the live jam — on the row that had refused 84
+consecutive wakes, the new reader answers "composer empty", which is what the screen
+plainly shows — but the daemon carrying the field is not deployed, so the `input-check`
+half is owed after the next roll.
+
+## ⛔⛔⛔ [11.20] THE BOOTER READ ITS OWN DELIVERED MESSAGES AS COMPOSER RESIDUE — FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*This is the second half of the wake-plane jam and it is the expensive one. 19 rows,
+434 consecutive `SKIP:draft-race` refusals, and two rows found holding about a dozen
+copies of the same unsent wake message, cleared by hand.*
+
+**The root, and it is one sentence.** The residue check flattened the WHOLE SCREEN to a
+single line and asked whether the boot text stood after a `❯`. The CLI draws that same
+glyph in front of every DELIVERED message, so **a wake that WORKED read back as composer
+residue for as long as it stayed on screen** — and nothing clears a transcript. Every
+later wake to that row was then refused by the ones that had succeeded. On the worst row
+the cleaner fired a `Ctrl+C` into a live campaign session every five and a half minutes
+for three hours, re-captured the same 1,978 characters each time, and grew a draft file
+to 172 KB.
+
+**And the storm that fed it.** Earlier in the same log the writer typed its text, could
+not confirm it on screen, refused to press Enter — *"residue self-heals next tick"* —
+and then typed ANOTHER copy next tick. Both decisions read the SAME failing detector,
+so "I cannot see it" licensed *do not submit* and *type again* at once. That is the
+shape: **a writer that cannot confirm its own submit must not write again.**
+
+**Fixed in `ygg-booter.py`:**
+
+* the composer is read as a ROW off the daemon's rendered grid, and a marker row with
+  prose under it is a transcript entry, not a composer. Four states, not two — could
+  not look · no composer drawn · present and empty · holds text — and only the third
+  may be typed into;
+* the Enter is the atomic `--submit-iff-line-equals`, which presses it only if the input
+  line still reads exactly what we wrote, compared and enqueued under one lock in the
+  daemon that owns the PTY. ⛔ **That verb had existed for versions.** The file's own
+  docstring said it "is requested in pending-bugs", and that stale claim is why the
+  two-write gap stayed open — *an inherited "not available" is a claim, not a fact*;
+* a write LEDGER on disk, written before the bytes go out. A write that could not be
+  confirmed is COMPLETED next tick or refused; there is no path that types twice.
+
+**Two beside it, in the product:**
+
+* a conditional submit carries no data, so a daemon that never evaluated the condition
+  answered a plain write of zero bytes — nothing refused, nothing pressed — and the CLI
+  scored that `accepted: true`. `submitted` is now reported from the daemon's own word
+  and `accepted` follows it for the conditional form;
+* the conditional submit was **dropped** when a write was proxied to a preserved owner,
+  so the guard was silently a no-op for exactly the rows a version-coexisting fleet
+  keeps alive longest. It now travels.
+
+**Live proof owed:** one unattended hour in which a subscribed row is woken and the
+booter log shows no `SKIP:draft-race` on a row whose composer is empty.
 
 ## ⛔⛔ [11.0] A FINISHED LANE HAD NO WAY TO BE RETIRED, SO NOBODY EVER RETIRED ONE
 
@@ -301,42 +406,50 @@ remedy is the same either way — do not put it first — but the distinction de
 **Falsifier:** spawn two lanes with identical briefs, one told to claim first and one seated
 by the orchestrator and told to start on the work. Count turns before the first stall.
 
-## ⛔⛔ [11.10] `sessions sort` REPORTS `changed: true` AND THE TREE DOES NOT MOVE — IT IS BLIND TO ROW SETS
+## ⛔ [11.10] THE SIDEBAR NOW DRAWS SEAT ORDER — HIS GUI IS STILL ON THE PRE-FIX IMAGE
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Owner-reported 2026-08-21, twice, as rows not being in ascending order — and it is not the
-comparator, which is correct and has a test for exactly this.*
+*Owner-reported 2026-08-21, twice, as rows not being in ascending order.* The comparator
+was never it. Two things around it were, and both are fixed:
 
-**The comparator is right.** `sort_by_outline` in `yggterm-core::session_outline` parses a seat
-into `Vec<u64>` and sorts numerically; its test suite already pins the trap
-(`a_tenth_lobe_does_not_sort_before_the_second`). Nothing about `11.9` vs `11.10` is wrong there.
+1. **The sort only ran when a verb asked for it.** `sort_by_outline` calls itself "the one
+   sort — both the rendered sidebar and any verb that reports an order call this", and the
+   rendered sidebar was the half that never did: its only caller was
+   `AppControlCommand::SortSessions`. Rendered order was arrival order and correct order was
+   a manual repair that every spawn, fold and re-group undid. The Live Sessions render path
+   now sorts before it derives anything.
+2. **And that alone still would not move a nested row.** `visible_rows` emits a set's
+   children from the membership vector, not from the list the sidebar walks. Members are now
+   ordered by seat as well, in `row_set_outline` — the one module allowed to know both what a
+   set is and what a seat is; `row_set` takes the key from its caller and still refuses to
+   know. Seats beat insertion order deliberately: a drag says WHICH set a row joins, and the
+   index it lands on is a by-product of the drop point. Un-numbered rows tie under a stable
+   sort, so a hand-built set of un-numbered rows is untouched.
 
-**Two things are wrong around it.**
+**⭐ THE MECHANISM WAS NARROWER THAN FILED, MEASURED IN PIXELS.** For a SEAT-DERIVED set the
+verb does reach the members — membership is rebuilt by iterating the flat list, so sorting
+that list reorders the children too, and the sandbox showed the tree moving. The case that
+cannot be fixed by the verb is the HAND-ARRANGED set, whose membership vector is stored. And
+there the instrument lies in the opposite direction from the one filed: with the flat list
+already sorted, `sessions sort` answers **`changed: false`** — "already sorted, nothing to
+do" — over a tree drawn in full reverse. Both readings are the same defect: the verb answers
+about the flat list, and `changed` in either polarity is a statement about something the
+person is not looking at.
 
-1. **The sort only runs when a verb asks for it.** `sort_by_outline` is called from exactly two
-   places, and the sidebar's continuous rendering is neither of them — the shell calls it only
-   inside `AppControlCommand::SortSessions`. So the rendered order is whatever order rows
-   happened to arrive in, and correct order is a manual repair somebody has to remember. Every
-   spawn, fold and re-group therefore leaves the sidebar wrong until a human notices.
+**Pixel proof, one sandbox home, one hand-arranged set nested in reverse, only the binary
+differing** (`scripts/underglass-sandbox.sh`, Wayland-native, no XWayland):
+- pre-fix `139c6a39`: `11.0 · 11.20 · 11.13 · 11.10 · 11.9`, and the verb said `changed: false`;
+- fixed `10711945`: `11.0 · 11.9 · 11.10 · 11.13 · 11.20`, **with no verb run at all**.
 
-2. **⛔ And running the verb does not fix a nested row.** `sessions sort` orders the flat
-   `live_sessions` list. The sidebar draws ROW SETS, and a set's children render in membership
-   order, so a sorted flat list changes nothing a reader can see. Measured: after the verb
-   returned `changed: true` with an applied order placing `11.9` immediately after `11.0`, the
-   tree still rendered `11.20, 11.21, 11.10, 11.13, 11.15, 11.9, 11.16, 11.19`.
+⚠ `11.9` before `11.10` means the ten-before-two trap is now pinned on the render path in
+pixels, not only in the comparator's own suite.
 
-⚠ **`changed: true` is the instrument lying.** It describes the flat list it rewrote, not the
-tree the person is looking at — so the one verb that exists to fix this reports success while
-the symptom stays on screen, which is why it survived being run.
-
-**What is wanted.** Outline order is a property of the seats, not of arrival: the tree should
-render it continuously, including inside a row set, and `sessions sort` should either reach set
-members or say plainly that it cannot. ⇒ Until then an orchestrator must re-sort after every
-row-set change, and that is a workaround, not the fix.
-
-**Falsifier:** nest three rows seated `11.9`, `11.10` and `11.20` into one set in that reverse
-order, then read the rendered tree. They must draw `11.9, 11.10, 11.20` with no verb run at all.
+**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image, so his
+sidebar draws the old order until it restarts — and that restart is deliberately not taken
+here (he is using the machine, and `ygg-roll-watch.sh` will not restart a GUI on a timer by
+design). **Falsifier:** after his GUI comes up on an image containing `10711945`, one
+screenshot of the live sidebar shows `11.0`'s members in ascending order with no verb run.
 
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
@@ -599,6 +712,155 @@ ADD a second one … Re-run with --replace`). ⛔ **The supervisor half of claim
 falsified and was not testable there:** that host's GUI is parented to pid 1, so there is no
 supervised pair to lose. Re-test the supervisor claim where the GUI actually runs under one
 before treating this entry as closed.
+
+## ⛔ [11.15] EVERY DAEMON LEAKS A ZOMBIE EVERY FIFTEEN MINUTES, AND NOTHING COUNTS THEM
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+⇒ *The deploy-level falsifier below has been run against an isolated daemon built
+from this commit. It has NOT been run against a rolled fleet daemon, and that is what
+this entry is still open for.*
+
+*Measured on one host 2026-08-21: five live daemons holding **233 zombie processes**
+between them.*
+
+| daemon | uptime | zombies | oldest zombie |
+|---|---|---|---|
+| the installed headless, binary since replaced | 20.8 h | 82 | 20.8 h |
+| a worktree build | 17.7 h | 71 | 17.7 h |
+| a second worktree build, launched as `yggterm server daemon` | 17.2 h | 69 | 17.2 h |
+| the current installed headless | 2.7 h | 11 | 2.7 h |
+| a worktree build predating the host-panic notifier | 28.2 h | **0** | — |
+
+**In every leaking one the oldest zombie is the same age as the daemon**, so nothing
+had ever been reaped, and the arrivals are a metronome: inter-arrival p50 **903s**,
+min 901, max 906.
+
+⛔ **The first census undercounted, and the reason is reusable: a daemon does not
+have to be called `yggterm-headless`.** Enumerating the fleet by that binary name
+missed a daemon launched as `yggterm server daemon`, which was holding 69 of the 233.
+**Enumerate by the `server daemon` argument, never by the binary's name.**
+
+### The attribution is an exact correspondence, not an arithmetic coincidence
+
+The first pass explained 912s as "the fifteen-minute notify cooldown plus one
+`PERF_INCIDENT_MONITOR_MS` tick". That arithmetic is wrong — the perf monitor is not
+in this path at all — and the number was 903s. The real spacing is fifteen ticks of
+`HOST_PANIC_INTERVAL_MS` (60s), each carrying its own loop drift.
+
+The attribution that does hold is a one-to-one match against an independent
+instrument. Every `tick()` that produces an incident appends
+`daemon/heartbeat/panic` to the trace, whether or not the cooldown lets it notify.
+Replaying one daemon's own traced events through the cooldown rule predicts the
+notifications it must have spawned:
+
+| | |
+|---|---|
+| traced `panic` events, all severity `error` | 1054 |
+| notifications the cooldown permits from those | **71** |
+| zombies that daemon is holding | **71** |
+| first permitted notification / first zombie birth | 23:57:23 / 23:57:23 |
+| last permitted notification / last zombie birth | 17:30:40 / 17:30:39 |
+
+⭐ **And the fifth daemon is the control.** The one daemon on that host with zero
+zombies is the one built before the host-panic notifier existed — its binary contains
+none of the notifier's strings. The counterexample is the mechanism confirming itself,
+not a hole in it.
+
+Root: `host_panic::notify_owner` ended in `let _ = cmd.spawn()`. **A dropped
+`std::process::Child` is never waited on**, so each owner notification left a
+permanent entry in the daemon's process table. The host is genuinely under load, so
+the notifier fires on every cooldown expiry, forever.
+
+⚠ **Two instruments nearly gave a good-looking wrong answer here.** The zombies'
+`comm` reads `yggterm-headles`, the parent's own name — which looks like a fork that
+never exec'd, but is equally consistent with a child exec'ing the same binary, and it
+is the latter. And `pgrp`/`session` matching the parent is what EXCLUDED
+`spawn_daemon_process_from_executable`, which `setsid`s and already reaps correctly.
+
+### The class was named before it was finished — four more call sites leaked
+
+The first fix created the owner (`child_reaper`) and converted two call sites. It did
+not sweep the class, and four more sites in the two long-lived processes were still
+dropping a `Child`:
+
+- **`platform::send_user_notification`**, both the Linux `notify-send` arm and the
+  macOS `osascript` arm. This is the same shape as the bug that was found, in the
+  GUI rather than the daemon, and the GUI raises a toast per finished job — so it
+  leaked on precisely the events the owner sees most.
+- **`platform::launch_controlled_ghostty`** and the `ExternalGhostty` arm of
+  `host::GhosttyHost::launch`, which both read `child.id()` and then drop the handle.
+  One permanent zombie per docked or external window, once the user closes it.
+- **the update relaunch in the shell**, which spawns the successor GUI and relies on
+  this process closing afterwards — a decision taken further down that does not always
+  happen.
+
+⛔ **`child_reaper` had to move to make this possible, and that is the interesting
+half.** It was in `yggterm-core`, which `yggterm-platform` does not depend on and must
+not: core pulls in a bundled SQLite, a TLS HTTP client and a tar reader, and platform
+is the layer under all of that. Leaving the primitive there would have forced a second
+encoding of the reap into platform — exactly the fallback layer the SSOT rule forbids.
+It now lives in `yggterm-platform`, which both the daemon and the GUI already depend
+on, so there is one owner reachable from every caller. No crate gained a dependency.
+
+**Fixed** with that one owner. `spawn_and_reap` is what a fire-and-forget caller
+reaches for instead of `let _ = cmd.spawn()`, and it returns a pid rather than a
+`Child`, so there is nothing in scope for a later edit to forget to wait on.
+`reap_child_in_background` is the primitive under it, for a caller that already holds
+a `Child` or wants the exit status.
+
+⛔ **The one-line fix is wrong and is recorded so nobody tries it:** `SIGCHLD` set to
+`SIG_IGN` auto-reaps, and would break every `.wait()` / `.output()` / `.status()` in
+the codebase at once by turning them into `ECHILD`.
+
+### The locks, and what each one can and cannot see
+
+⭐ **The daemon call site is a proven lock, not an assumed one.**
+`notify_owner_reaps_the_notification_child` drives the real production function
+against a stub binary in a fake home and counts zombie children of the test process.
+It was falsified by reverting `notify_owner` to `let _ = cmd.spawn()`, and it failed
+with *"left a zombie behind: 1 zombie children against a baseline of 0"*.
+
+⭐ **The GUI call sites are locked structurally, because behaviourally they cannot
+be.** They shell out to `notify-send` and `ghostty` by name, so exercising them means
+mutating `PATH` for the whole test binary — which every other test in it would race
+with. `this_crate_spawns_only_through_the_child_reaper` asserts the invariant that IS
+available and is exact: `yggterm-platform`'s `lib.rs` must not spawn at all, because
+`child_reaper` owns the only `.spawn()` in the crate and cannot leak. Falsified by
+restoring the bare `.spawn()?` in `send_user_notification`: it goes red naming the
+line. ⚠ Its first run failed on ITSELF — the predicate line contained the literal it
+searches for, the same family as a `pgrep` that counts its own shell. The needle is
+now assembled rather than written out.
+
+### Falsifier — and it must assert its control or it passes by being blind
+
+⛔ **"The new daemon holds zero zombies" proves nothing on its own.** A daemon that
+never notified also holds zero, and the fifth daemon in the table above is exactly
+that case. The control is the daemon's own trace: replay its
+`daemon/heartbeat/panic` events at severity `error` through the fifteen-minute
+cooldown, and that count is how many notifications it really spawned.
+
+⇒ **On a daemon built from this commit:** notifications-spawned must be at least 3
+(so, past 46 minutes of uptime on a host under load) AND
+`ps -eo ppid,stat | awk '$1==<pid> && $2 ~ /Z/' | wc -l` must read 0, while the same
+probe against an older daemon on the same host still counts its accumulated pile.
+Old daemons keep their zombies until they exit; that is expected and is not a failed
+fix.
+
+**Run green on an isolated daemon 2026-08-21** — a daemon built from this commit,
+started with its own `YGGTERM_HOME` so it could not touch the fleet, observed
+continuously through `/proc/<pid>/task/*/children` (an observer that spawns nothing,
+so it cannot contribute to the table it measures). RESULT PENDING IN THIS ENTRY UNTIL
+THE OBSERVATION WINDOW CLOSES — see the relay note if this line is still here.
+
+**What remains open — and it is sharper than "nobody looked":** the codebase's only
+zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
+that a corpse is never reported as a survivor. That is CORRECT for a teardown question
+("did this process really go away") and it is precisely why the leak was invisible:
+the one function that knows what a zombie is exists to filter them out, and nothing
+anywhere COUNTS them as a resource. A process-table census in the resource watch is
+not built here — routed to the 6.7 usability/resource-watch seat, which owns
+MEMORY > CPU > SPACE, rather than fixed by this lane.
 
 ## ⛔⛔ [11.15] A GATE THAT JUDGES THE STORED ANSWER REOPENS ITSELF WHEN THE ANSWER IS BAD
 
@@ -1682,21 +1944,31 @@ decomposed into four distinct defects, each proven from the trace or `/proc`:
    deploy that relied on it left daemons unconverged — plausibly the parent of today's
    generation pile-up.
 
-## ⚠ [11.0→11.10] `launch.applied` IS STILL COMPUTED AGAINST A RE-DERIVED COMMAND
+## ⚠ [11.0→11.10] `launch.applied` — THE VERDICT IS FIXED, THE LIVE PROOF IS OWED
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*The narrowed residue of the remote `--model` drop, closed 2026-08-20 on live proof against
-the 3.1.14 dev daemon: a remote CC spawn with a non-default model reached its process with
-the flag on the cmdline, an explicit `sync_terminal_identity` refreshed the launch command
-("refreshed 1") and the model SURVIVED, and the row's `agent_launch_options` carried the
-stored model.* What remains is the reporting mask the original entry named: the snapshot
-post-processor re-derives a remote row's `launch_command`, and `launch.applied` is computed
-against that re-derivation rather than against the command the create composed — so it can
-read `false` for an unverifiable reason (observed on the 3.1.12 probe) and its verdict
-cannot be told from a re-derivation artifact. **Falsifier:** `launch.applied` reflects the
-command the create actually composed, and a spawn whose flag reached the process never
-answers `applied: false`.
+*The narrowed residue of the remote `--model` drop.* The verdict was computed by
+substring-testing the row's `launch_command`, which the snapshot post-processor
+re-derives, so it answered a question about a rebuildable artifact rather than about
+the row: `false` for a spawn whose flag reached the process, and — the expensive
+direction — `true` for a create that spelled the token into one command without
+storing it, which loses the option at the very next identity refresh.
+
+**Changed:** `applied` now reads the row's stored `agent_launch_options`, which is what
+every rebuild, relaunch and restore consults. The string test survives as a separate
+`command_carries_tokens` field reported beside the verdict, and the stored values are
+reported too, so the answer is auditable. A kind with no CLI to pass the flag to reads
+`false` rather than inheriting the empty expectation a swallowed refusal produced. Both
+directions fail on the pre-fix tree
+(`launch_applied_reads_the_stored_options_not_the_re_derived_command`).
+
+**⛔ WHAT KEEPS THIS OPEN.** A unit test builds its own snapshot; it cannot show that a
+real create stores what it composed. **Falsifier:** spawn a remote CC row with a
+non-default model, read `launch.applied` from the create's own reply, and confirm the
+flag on the target process's cmdline — `applied: true` and the flag present, in one
+sample. Not taken here: the GUI host is the owner's machine and in use, and a spawn
+opens a row.
 
 ## ⛔⛔ [11.5] SESSION SWITCHES PAINT GHOST FRAMES AND FULL-CANVAS GLYPH SOUP — EVIDENCE FILED, MECHANISM UNPROVEN
 
@@ -1807,24 +2079,6 @@ what happens after a boot decision.
 silence; a live stalled row is booted with exactly one typed copy and one Enter; `ps` shows
 exactly one watcher after two racing starts.
 
-## ⚠ [11.10] `RowArrangement::retain_live` STILL HAS NO PRODUCTION CALLER, SO DEAD-HEAD GARBAGE ACCUMULATES IN SETTINGS
-
-**Status:** OPEN
-
-*The narrowed residue of the dead-head visibility entry, closed 2026-08-20 on live proof:
-with the dead-head arrangement entry still stored, one simultaneous window answered start
-page 825 == `startpage ls` 825 == `cwdtree ls` 825, and both formerly-hidden live rows
-render in the rail at top level.* Visibility no longer depends on pruning — `visible_rows`
-draws an orphaned member at top level — but the STORED arrangement still keeps entries for
-rows that no longer exist anywhere, forever: `retain_live` (which dissolves a departed head
-and detaches departed members) is called only by its own unit tests. The wiring needs a
-NON-TRANSIENT departure point — a naive per-frame prune against a flickering universe would
-destroy user arrangement during every daemon restart, which is presumably why it was never
-wired. The GUI close/remove paths already call `dissolve`/`detach` for the row being closed;
-the gap is heads that die daemon-side or remotely. **Falsifier:** close a head row through a
-daemon-side removal, and the arrangement entry for it is gone from settings within the
-session, with members re-parented per `retain_live`'s own contract.
-
 ## ⚠ [11.10] THE SERVER AND SHELL TEST SUITES FLAKE UNDER CONCURRENT RUNS — A DIFFERENT TEST EACH TIME, EVERY ONE GREEN IN ISOLATION
 
 **Status:** OPEN
@@ -1878,23 +2132,6 @@ this one is small and worth taking first:** the env-mutating test wants an env m
 and `collect_live_store_title_syncs_in` are), so it stops reaching into a variable other
 threads are reading. Any test that calls `std::env::set_var` in this workspace is a candidate —
 grep for it before assuming this is the only one.
-
-## ⚠ [11.10] A STANDING BOOT REFUSAL IS INVISIBLE IN EVERY STATE FILE — ONLY THE LOG KNOWS
-
-**Status:** OPEN
-
-*Filed 2026-08-21 from a cross-lane report that proved out: four rows across four campaigns
-sat permanently unbootable for days while every instrument read healthy.* A refused boot is
-deliberately REFUNDED (`boots` stays 0 — correct, the row was never asked anything), so a
-row refused every tick forever is indistinguishable in the subscription state from one that
-never needed a boot: no counter rises, nothing escalates, and only a log line per tick
-records the standing condition. The immediate cause of those four (the read-buffer JSON
-envelope consumed raw, defeating the residue cleaner and half-blinding the choice-prompt
-guard) is fixed with a falsifying fixture test; THIS entry is the structural residue: a
-refusal that repeats N ticks for the SAME reason should surface — a `standing_refusal`
-field on the subscription and one escalation, not a per-tick log line nobody tails.
-**Falsifier:** wedge a row so a boot refuses repeatedly; within N ticks the subscription
-state names the standing refusal and exactly one escalation fires.
 
 ## ⚠ [11.x] THE TITLE STORE IS OPENED AT THREE DIFFERENT HOMES, AND THE STRAY DB EXISTS
 
@@ -2243,14 +2480,32 @@ steady-state minutes, not the two GUI restarts the window contains — worst **3
 (after `dioxus_render/component_window`), so the "no block above 1 s" clause FAILS.
 `webview_edit_stall` incidents in the same 3 h: **zero** — that class did not fire.
 
-⛔ **THAT LAST LINE WENT STALE THE SAME DAY. RE-MEASURED 2026-08-21 AFTERNOON (11.15 monitor,
-GUI host, daemon 3.1.20, a 116-minute window): the class is FIRING — 76 `webview/edit_stall`
-incidents — and `ui/block` is at 2.23/min against the 0.68/min this entry records for the
-morning window.** Counted with `ytrace incidents` (payload.incident=true), not with the span
-query, and not with `ytrace tail`, which is silently capped at 20 records and gave a rate
-3x too high before the cap was noticed.
+⛔⛔ **THE PARAGRAPH THAT WAS HERE WAS WRONG, AND IT WAS MINE. WITHDRAWN 2026-08-21 BY ITS
+OWN AUTHOR (11.15 monitor).** I reported that this class "is FIRING — 76 `webview/edit_stall`
+incidents" and that the zero above had gone stale. **It had not. The 76 came almost entirely
+from builds that PREDATE the fixes**, and my 116-minute window straddled the rolls.
 
-⭐ **AND THE TWO INSTRUMENTS ARE WATCHING ONE EVENT.** The edit-stall diagnosis reads
+Split by the emitter's own `app_version`, over a 6-hour sample:
+
+| | pre-3.1.20 (91.2 min) | **3.1.20+ (76.6 min)** |
+|---|---:|---:|
+| `webview/edit_stall` | 74 = 0.81/min | **0 = 0.00/min** |
+| `ui/block` | 233 = 2.56/min | **33 = 0.43/min** |
+
+⇒ **This entry's claim HOLDS on the builds that carry its fixes**: `edit_stall` is at zero,
+and `ui/block` at 0.43/min is comfortably inside the `< 1/min` bar this entry sets. The
+6x drop in blocks is the fixes working, not weather.
+
+⚠ **The lesson is the one I had just written into the field guide myself, which is why it is
+recorded here rather than quietly deleted: a window that spans a roll describes the roll.**
+Counting by wall-clock window and not by emitter version is how a fixed class reads as a
+live one — the third time that trap landed in a single session, and the first time it landed
+on the person warning about it. **Group incidents by `app_version` before comparing anything
+to a bar.**
+
+⭐ **WHAT THE CLASS LOOKED LIKE WHILE IT WAS STILL FIRING (pre-3.1.20 only — kept because it
+names the mechanism, NOT because it is current):** the two instruments were watching ONE
+event. The edit-stall diagnosis reads
 *"webview edit plane stalled: N new flush-gate timeout(s) (VirtualDom frozen ~2s each), **0**
 new unapplied batch(es) (DOM divergence, restart-only), N late ack(s)"* — and `ui/block` in the
 same window has p95 1,969ms, max 3,317ms. A ~2s VirtualDom freeze and a ~2s UI block are the
@@ -2260,9 +2515,11 @@ same freeze seen from two sides, which is worth more than either count alone.
 acked-batch-that-never-applied class (DOM divergence, restart-only); the plane is not corrupt,
 it is STALLING. So the fix is on the freeze, not on the edit transport.
 
-⚠ The incidents cluster rather than spread: 39 and 21 in two adjacent ten-minute buckets, 12
-in another, spanning app_version 3.1.18 and 3.1.19 — bursts under some condition, not a
-constant drip, so a short quiet window will show zero and mean nothing.
+⚠ They clustered rather than spread: 39 and 21 in two adjacent ten-minute buckets, 12 in
+another — all on 3.1.18 and 3.1.19, which is consistent with the class being fixed at 3.1.20
+rather than merely quiet. Kept as the shape to recognise if it ever returns: bursts under
+some condition, not a constant drip, so a short quiet window proves nothing on its own —
+the emitter-version split is what proves it.
 
 ⚠ And do NOT read the `last_activity` field on a single `ui/block` as its cause. Across the
 sampled blocks it is `None` for half, then `app_declare/daemon_declare_absent` (4),
@@ -6515,6 +6772,28 @@ act on.
 
 ⭐ **The discriminator that worked, and it needs no new verb:** **transcript ROW-COUNT growth.** A busy
 row grows; an unreachable one is frozen. Sample twice a few seconds apart.
+
+⛔⛔ **THERE IS A THIRD STATE, AND IT IS THE ONE THE ROW LISTING CANNOT SEE: the session is DEAD.**
+Measured 2026-08-21 against a live orchestrator row. Its transcript had been frozen for 95 minutes,
+NO process on the host carried its uuid — and `server app rows` still listed it as
+`busy: false, busy_reason: "idle"`. So the refusal is correct and unavoidable (there is no composer
+because there is no CLI), while every surface an agent would consult to check first says the row is
+healthy and available.
+
+⇒ The two-state framing above is not enough: **busy** (drains at its turn boundary), **superseded
+socket** (never drains, restart the terminal), **dead** (never drains, and the row is a corpse the
+listing renders as idle). The transcript-growth probe cannot separate the last two — both are frozen
+— so the join to the PROCESS TABLE is what settles it.
+
+⚠ **And `terminal_process_id` is NOT the tell**, though it looks like one. Measured on the same
+listing: it is `None` on **all 120 live agent rows**, including the 8 reading
+`busy_reason: agent_working_daemon` — so it does not discriminate anything on this surface, and a
+reader who reached for it would conclude every row is dead.
+
+⇒ **What this costs:** an agent addressing a dead row pays a 30-second timeout per attempt and gets
+a message describing the wrong cause. Four of six reports from one lane were lost this way before
+the row was checked out-of-band. **`busy_reason: "idle"` currently conflates "waiting for input"
+with "no longer exists".**
 
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
