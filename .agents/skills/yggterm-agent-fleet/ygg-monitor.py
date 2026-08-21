@@ -1428,8 +1428,22 @@ def fishy_audit(subs, dry):
 
 
 def _transcript_for(uuid, host=None):
-    """(path, bytes, mtime) for a row's transcript, local or over ssh."""
-    if host and host not in ("", "local", "dev"):
+    """(path, bytes, mtime) for a row's transcript, local or over ssh.
+
+    ⛔⛔ THE HOST THAT COUNTS AS "LOCAL" IS THIS MACHINE, AND IT USED TO BE THE
+    LITERAL STRING "dev". That is correct on exactly one host and wrong on every
+    other: run anywhere else, every row belonging to that peer was looked up in
+    the LOCAL filesystem, found nothing, and returned None — which `fishy_audit`
+    renders as "⚠ has NO TRANSCRIPT — its brief may never have been delivered".
+    So the audit produced a false alarm for every remote row of one host, on
+    every tick, and an alarm that is always wrong is one nobody reads.
+
+    ⇒ Measured 2026-08-21 from the desktop host: all seven live lanes reported
+      NO-TRANSCRIPT while every one of them had a healthy, growing transcript.
+    ⚠ A hardcoded peer name inside a locality test is the shape to watch for —
+      it makes a tool correct on its author's machine and silently wrong on the
+      rest of the fleet."""
+    if host and host not in ("", "local", _this_host()):
         # ⛔ NO SINGLE QUOTES IN THIS COMMAND. `_run` wraps every argv element in
         # single quotes, and shell single-quotes cannot nest — so a `stat -c '%s
         # %Y'` here arrives malformed and returns nothing. The audit then read
