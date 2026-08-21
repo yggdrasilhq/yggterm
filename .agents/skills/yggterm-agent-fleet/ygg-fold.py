@@ -708,7 +708,7 @@ def main():
             log(f"⛔ no seated row matches {a.target}")
             return 2
 
-    counts, folded = {}, 0
+    counts, folded, seen_rows = {}, 0, []
     for row in sorted(rows, key=lambda r: r["seat"]):
         if a.cmd == "sweep" and a.campaign:
             head = row["seat"].split(".")[0]
@@ -716,6 +716,8 @@ def main():
                 continue
         verdict, why = classify(row, live, protected)
         counts[verdict] = counts.get(verdict, 0) + 1
+        if verdict != "PROTECTED":
+            seen_rows.append(row)
         mark = {"DEAD": "⛔", "FINISHED": "✔", "WORKING": "·",
                 "PROTECTED": "🔒", "STALLED": "⏸", "COLD": "❄"}[verdict]
         log(f"{mark} {row['seat']:<7} {row['uuid'][:8]} {verdict:<9} {why}")
@@ -735,6 +737,21 @@ def main():
                 path = successor_brief(row, why)
                 log(f"  successor brief → {os.path.relpath(path, os.path.expanduser('~'))}")
                 log("  ⛔ NOT woken. Re-run with --respawn to replace it at this seat.")
+    # ⛔⛔ TWO ROWS AT ONE SEAT IS THE HYGIENE DEFECT THIS TOOL EXISTS TO PREVENT,
+    # AND THE TOOL CAUSED ONE. A respawn spawns the successor first and folds the
+    # predecessor second, on purpose — but when that second half fails, the seat
+    # holds two rows and NOTHING SAID SO. It read as a healthy census: both rows
+    # classify WORKING, both are listed, and the duplicate is visible only to a
+    # person counting seat numbers in the sidebar.
+    # ⇒ Uniqueness is asserted at the end of every sweep, because the failure is
+    #   silent by construction and a count of verdicts cannot show it.
+    from collections import Counter
+    dupes = [seat for seat, n in Counter(r["seat"] for r in seen_rows).items() if n > 1]
+    for seat in sorted(dupes):
+        holders = [r["uuid"][:8] for r in seen_rows if r["seat"] == seat]
+        log(f"⛔ SEAT {seat} IS HELD BY {len(holders)} ROWS: {', '.join(holders)}")
+        log(f"   A respawn whose fold half failed leaves exactly this. Decide which is live")
+        log(f"   and fold the other: ygg-fold.py row <uuid> --force --apply")
     log(f"— {counts} · {'folded' if a.apply else 'would fold'} {folded}")
     if not a.apply:
         log("  nothing was changed. Re-run with --apply.")
