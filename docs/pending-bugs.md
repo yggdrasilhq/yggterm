@@ -1002,7 +1002,19 @@ started with its own `YGGTERM_HOME` so it could not touch the fleet, watched
 continuously through `/proc/<pid>/task/*/children` — an observer that spawns nothing of
 its own, so it cannot contribute to the table it is measuring.
 
-FALSIFIER_RESULT_TABLE
+| | |
+|---|---|
+| daemon uptime at the end of the window | **47.7 min** |
+| notifications it really spawned | **4** (15-minute spacing, first one at start) |
+| notification children caught in the act | **3** (the first predates the observer) |
+| longest any of them was seen in state `Z` | **never observed in `Z` at all** |
+| zombies the daemon holds | **0** |
+| other children observed in the same window | 41, of which 6 passed transiently through `Z` and every one cleared |
+
+Each notification child appeared at the same second its notification was decided
+(17:56:48.680, 18:11:50.067, 18:26:51.491), lived about seven tenths of a second, and
+disappeared. The four pre-fix daemons on the same host went on accumulating throughout
+the same window: 233 zombies between them at 17:47, 242 at 18:13.
 
 ⭐ **The middle column is what makes this a proof rather than a quiet machine.** Each
 notification child was seen at the same second its notification was decided, lived
