@@ -558,8 +558,25 @@ every roll now re-mounts every row, and the seed races the mount each time.
 every restart it performs: any row whose surface is empty OR unreadable is re-attached with
 `server app sessions restore`, which is proven to make the screen paint on the next read and
 which TYPES NOTHING, so it is safe to run unconditionally. First run repaired 16 of 31.
-⚠ **That leaves the other half unexplained** — either they need longer than the sweep waits,
-or the re-attach does not repair every shape of blank. Both are unmeasured.
+
+⭐ **THE OTHER 15 ARE NOW EXPLAINED, AND THEY ARE NOT THIS DEFECT** (measured 2026-08-21 on
+the GUI host, 36 seated rows). Every one of the 15 rows the sweep could not repaint has **no
+agent process at all** — 15 of 15, against 17 of the 18 painting rows having one. Their
+sessions ended; there is no CLI producing output, so a re-attach has nothing to attach to and
+cannot conjure a screen. ⇒ **The sweep repaired 16 of the 16 rows that had anything to
+repair.** The remaining fifteen are a different and much milder bug: *a durable row whose CLI
+has exited renders an empty viewport instead of saying that it ended* — filed separately below
+rather than left inside this entry, because merging them is what made this one look half-fixed.
+
+⚠ **The instrument that answered this had to be repaired first, and it lied in BOTH
+directions.** `ygg-procfind.sh match` excludes a command line identical to one of its own
+ancestors', which catches subshells and pipeline siblings and is blind to the shape every
+fleet query actually has: run over `ssh <host>` from that same host, the `ssh` client sits in
+the target's process table carrying the pattern, in a tree `sshd` started fresh. Dead rows
+therefore reported `pids=2` and live rows `pids=4` — **a count inflated by a constant, whose
+differences still look right**, which is the hardest kind to notice. Fixed by excluding any
+command line naming this script; regression test
+`.agents/skills/yggterm-agent-fleet/tests/test_procfind_excludes_the_delivered_query.py`.
 
 **What is actually wanted:** the mount must not be able to land an empty surface. The
 retained-rehydrate retry ladder (`terminal_mount/retained_rehydrate_*`) exists for this and
@@ -567,7 +584,42 @@ its own live proof is recorded as PARTIAL — the ladder above `end` has never b
 firing on a healthy fleet. ⇒ This entry and that one are the same defect seen from two ends.
 
 **Falsifier:** restart the client with many rows open and read every seated row's
-`nonblank_line_count` — none may be 0, without any sweep having run.
+`nonblank_line_count`, without any sweep having run — no row **that has a live agent process**
+may read 0. ⚠ The qualifier is load-bearing and was missing: a row whose CLI has exited reads
+0 legitimately and forever, so the unqualified form can never pass on a real fleet, and a
+falsifier that cannot pass tells you nothing when it fails.
+
+## ⛔ [11.0] A ROW WHOSE AGENT HAS EXITED SHOWS AN EMPTY VIEWPORT INSTEAD OF SAYING SO
+
+**Status:** OPEN
+
+*Split out of the blank-mount entry above on 2026-08-21, because it was being counted as an
+unrepaired instance of that defect and made a complete mitigation read as half a one.*
+
+**Symptom.** A seated, durable row whose agent CLI is no longer running renders a completely
+empty terminal surface — 65 blank lines, `nonblank_line_count: 0`, `accepted: true`. Nothing
+distinguishes it on screen from a row that failed to seed, which is the whole cost: the two
+have opposite remedies (this one wants a relaunch, the other wants a re-attach) and a reader
+cannot tell which they are looking at.
+
+**Measured.** 15 of 36 seated rows on the GUI host, all of them from finished campaign waves.
+Confirmed by process identity, not by inference: `ygg-procfind.sh match <uuid>` returns zero
+pids for all 15, and one or more for 17 of the 18 rows that paint. The lone exception paints
+only a three-line launch banner left over from an earlier mount, which is residue rather than
+a session and is itself a small argument for this entry.
+
+**Why it is not the blank-mount defect.** A re-attach (`server app sessions restore`) repairs a
+blank mount and is a no-op here — there is no process whose output could arrive. So this row
+is not repairable by the repaint sweep and must never be counted against it.
+
+**What is wanted.** The surface should say what happened, in words, the way the daemon already
+says `unreadable: ... may have gone` — an ended session is an ordinary outcome and the product
+knows it has ended. Clicking such a row should resume, and the empty screen should never be
+the answer.
+
+**Falsifier:** find a row with `nonblank_line_count: 0` and zero agent processes whose
+viewport nonetheless explains itself; or find one with zero processes that a re-attach
+repaints.
 
 ## ⛔⛔ [11.0] THE PANIC WATCHDOG'S MEMORY ARM THRESHOLDS A LEVEL, SO IT CANNOT EVER CLEAR
 
