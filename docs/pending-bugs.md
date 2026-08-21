@@ -45,6 +45,37 @@ same window — `retained_empty_surface_settle_wait` ×2,
 `resume_recovery_begin/end`, `reveal_forced_incomplete` ×2 — so the recovery
 machinery is not idle, it is losing.
 
+### ⭐ NARROWED 2026-08-21 — THE REMOUNTS TRACK ROWS BEING ADDED AND REMOVED, NOT TIME
+
+The churn is not a background loop on a timer. Over 2.2 minutes with the trace open:
+
+* **9 of 11 `bootstrap_reset`s fell within six seconds of a row-set change** — an
+  app-control `remove_session` or `create_terminal` issued by an orchestrator.
+* **A 41-second window in which nothing touched the row set produced ZERO resets**, while
+  `daemon/snapshot_response` went on ticking throughout. That is the control, and it rules
+  out the 15-second snapshot refresh as the driver on its own.
+* Inside a burst the remounts cycle across rows 0.2–2 s apart — which is what the flashing
+  and session-changing looks like from the outside.
+
+⛔ **AND A FALSIFIER THAT CAME BACK NEGATIVE, kept because it narrows the target rather than
+widening it.** One `set_session_outline` issued into a quiet GUI, setting a seat to the value
+it already held, produced **no reset and no launch in the following twelve seconds**. So it is
+not "any app-control mutation": an ATTRIBUTE change is free, and what costs a remount is the
+row SET changing. ⇒ The next test is one `create_terminal` and one `remove_session` in
+isolation, which nobody has run.
+
+⚠ **This makes the orchestrator's own housekeeping a cause of the symptom.** Folding corpses,
+spawning lanes and reseating rows are exactly row-set changes, and a session that does a dozen
+of them makes the window flash for as long as it is working. That is not a reason to stop
+folding; it is the reason this entry is LEGENDARY.
+
+⚠ **A hypothesis discarded rather than published:** that `app_declare/daemon_declare_absent`
+(87 in 2.2 min) starves the ownership guard in
+`rearm_active_remote_runtime_recovery_after_snapshot`. It does not. That trace is the SIDEBAR
+declare plane, and a plain agent row correctly has no sidebar declare — with ~30 rows on a
+one-minute retry ladder, ~40/min is the expected rate, not a fault. The ownership guard reads
+`latest_runtime_status`, a different field entirely.
+
 ⚠ **What is NOT established, and must not be asserted.** Whether the *active session*
 also changes on its own. It was observed on three different rows inside thirty seconds,
 but the owner was at the machine and a person clicking between rows produces exactly the
