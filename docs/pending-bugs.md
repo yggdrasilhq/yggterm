@@ -322,6 +322,83 @@ question. **Status here is about which surface is chosen and whether the launch 
 `YGGTERM_HOME` on the shipped binary, with its own trace plane, in about a minute, without
 touching the desktop. Reach for it before parking a restore-path claim on "the next restart".
 
+## ⛔⛔⛔ [11.0] LEGENDARY — A DAEMON RESTART ORPHANS ITS PTY MASTERS, AND NOTHING CAN EVER ATTACH AGAIN
+
+**Status:** OPEN
+
+*Caught live 2026-08-22 00:38, with the owner locked out of every session on his GUI and having
+to open a KDE terminal outside yggterm to report it. His words: "This is the legendary daemon bug
+in action." The evidence screenshot is staged OUTSIDE any repo at
+`~/.yggterm/relay/evidence/daemon-attach-deadlock-20260822-0038.png` — ⛔ a faithful screenshot
+leaks by BACKGROUND and must never land in `~/gh`.*
+
+**What he saw, repeating in the viewport:**
+
+```
+yggterm: Claude Code session <uuid> is already running under yggterm (pid …);
+waiting to attach instead of starting a second resume, which would corrupt the
+transcript. Nothing to close. Waiting 12s so far. / Waiting 24s so far.
+```
+
+### THE DEADLOCK — and both halves are individually CORRECT
+
+```
+daemon restart  ->  PTY MASTERS die with it
+                ->  the CLI processes reparent to init and SURVIVE, unharmed
+                ->  a new daemon correctly REFUSES a second resume (it would corrupt the transcript)
+                ->  but it holds no master fd to attach to
+                ->  it waits, and nothing ever ends the wait
+```
+
+⭐ **Neither half is a bug on its own.** The refusal is right — a second `--resume` would corrupt
+the transcript. The wait is right — attaching is what was asked for. **Together they are a
+deadlock with no self-exit**, and the user-visible symptom is "nothing attaches".
+
+### VERIFIED ON THE MACHINE, NOT INFERRED — and the orchestrator was itself an instance
+
+Measured on this seat's OWN process while it was landing commits and spawning lanes:
+
+| probe | reading |
+|---|---|
+| `ps -o ppid,etimes` | **PPID 1**, alive 2 h 44 m — reparented to init, working perfectly |
+| `fuser /dev/pts/N` | **only the CLI itself** — the SLAVE side. Nobody holds the master. |
+| peer socket | **ALIVE** — a peer session reached it while the GUI could not |
+
+⇒ **The survivors need no rescuing.** Process healthy, transcript intact, peer plane reachable.
+**What is missing is purely a way for a NEW daemon to adopt an orphaned slave PTY** — or for the
+session to have been handed a master that outlives the daemon in the first place.
+
+### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
+
+The report reaching this seat said *"all sessions are breaking out like this"*. Checked instead of
+echoed: **every session that OUTLIVED a daemon restart is orphaned; every session born after it
+has a parent and attaches normally.** Four live lanes checked at the same minute all had real
+PPIDs. ⇒ The blast radius is the survivor set, which is exactly the set the constitution promises
+to protect.
+
+### ⚠ A SECOND INSTRUMENT LYING, IN THE SAME FRAME
+
+The GUI's **Session Metadata panel reported a pid that does not exist on the host.** The live
+process was a different pid entirely. ⇒ **That panel is not reading the process**; do not diagnose
+from it. Same family as every other entry here — a field named for a thing, answering about
+something else.
+
+### WHY THIS IS LEGENDARY AND NOT MERELY BAD
+
+It is the CONSTITUTION failing in its most expensive direction. Every guarantee about
+version-coexisting daemons held — the work *did* survive the restart, exactly as promised — and
+it became **invisible and undrivable anyway**. The owner could not reach a single session on his
+own machine, while all of them were healthy.
+
+⇒ The owner-settled spec that governs the fix is in `settled-calls.md`
+(**THE GUI IS A VIEWER, NEVER A LIFELINE**). Clause 2 is the one that names this defect: **row
+liveness must not be defined by attachability.**
+
+**Falsifier:** restart the daemon under a live agent row, then attach to that row from a fresh
+client — the scrollback comes back, the row drives, and nothing reports a wait. And the negative
+control: the CLI's pid must be the SAME one before and after, or something started a second
+resume.
+
 ## ⛔⛔⛔ [11.26] LEGENDARY — THE TUI PAINTS WRONG WHILE THE BUFFER IS CORRECT, AND EACH CLI BREAKS IN A DIFFERENT REGION
 
 **Status:** OPEN
