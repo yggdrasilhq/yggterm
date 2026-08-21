@@ -11179,6 +11179,7 @@ impl YggtermServer {
                 }
             }
         });
+        let mut recovered_remote_live_session: Option<String> = None;
         let missing_remote_live_session = self.sessions.get(&path).and_then(|session| {
             if !live_session_uses_remote_runtime(session)
                 || !is_remote_scanned_live_session_path(&session.session_path)
@@ -11189,12 +11190,22 @@ impl YggtermServer {
             let ssh_target = session.ssh_target.clone()?;
             let ssh_prefix = session.ssh_prefix.clone();
             let session_id = session.id.clone();
-            match fetch_remote_saved_codex_session_exists(
+            match fetch_remote_saved_agent_session_exists(
+                session.kind,
                 &ssh_target,
                 ssh_prefix.as_deref(),
                 &session_id,
             ) {
-                Ok(true) => None,
+                // ⚠ `Ok(true)` is not merely "nothing to do": it is the answer
+                // that RETRACTS a mark this sweep may have written earlier, from
+                // a probe that asked a different CLI's store.
+                Ok(true) => {
+                    if session_metadata_value(session, "Saved Session").as_deref() == Some("missing")
+                    {
+                        recovered_remote_live_session = Some(session.session_path.clone());
+                    }
+                    None
+                }
                 Ok(false) => Some((session.session_path.clone(), ssh_target, session_id)),
                 Err(error) => {
                     if let Ok(home) = resolve_yggterm_home() {
@@ -11214,6 +11225,11 @@ impl YggtermServer {
                 }
             }
         });
+        if let Some(recovered_path) = recovered_remote_live_session {
+            if let Some(session) = self.sessions.get_mut(&recovered_path) {
+                clear_missing_saved_remote_live_session(session);
+            }
+        }
         if let Some((stale_path, ssh_target, session_id)) = missing_remote_live_session {
             if let Some(session) = self.sessions.get_mut(&stale_path) {
                 preserve_missing_saved_remote_live_session(session, &session_id);
@@ -13112,6 +13128,29 @@ fn preserve_missing_saved_remote_live_session(session: &mut ManagedSessionView, 
         &mut session.metadata,
         "Status",
         format!("saved {display} transcript missing; preserving live PTY row"),
+    );
+}
+
+/// Undo [`preserve_missing_saved_remote_live_session`] once the store answers
+/// that the session is there after all.
+///
+/// ⛔ **THE MARK WAS STICKY AND NOTHING REMOVED IT.** `Saved Session: missing` is
+/// what [`remote_saved_session_launch_blocked_reason`] reads to refuse a launch,
+/// and it was only ever written. So a row marked missing by a probe that asked
+/// the wrong CLI's store stayed unopenable for the rest of its life even after
+/// the probe was corrected — the diagnosis outliving the condition. A verdict
+/// that can only be written in one direction is not a verdict, it is a scar.
+fn clear_missing_saved_remote_live_session(session: &mut ManagedSessionView) {
+    session.last_launch_error = None;
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Saved Session",
+        "present".to_string(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Status",
+        "saved transcript found; row restorable".to_string(),
     );
 }
 
@@ -15839,15 +15878,54 @@ pub fn fetch_remote_preview_tail_payload(
     Ok(payload)
 }
 
-fn fetch_remote_saved_codex_session_exists(
+/// Which remote wrapper verb asks whether THIS kind still holds a saved session.
+///
+/// Split out so the choice is testable without a network hop — the defect it
+/// locks was a hardcoded verb name, and a hardcoded name is invisible to every
+/// test that goes through the socket.
+fn remote_session_exists_verb(kind: SessionKind) -> Option<String> {
+    agent_cli_descriptor(kind).and_then(|descriptor| descriptor.session_exists_subcommand())
+}
+
+/// Ask the REMOTE host whether it still holds this session, in the store of the
+/// CLI that actually wrote it.
+///
+/// ⛔⛔ THIS ASKED `codex-session-exists` FOR EVERY KIND. An Antigravity row was
+/// therefore checked against Codex's store, which correctly answered "no", and
+/// the row was marked `Saved Session: missing` and refused with *"saved
+/// Antigravity session … is no longer available on this machine"* — a message
+/// that names one CLI while the probe behind it asked a different one. Reported
+/// from the seat 2026-08-22 as "I cannot launch this antigravity session", with
+/// the transcript and the presence lock both sitting on disk the whole time.
+///
+/// ⚠ **The local half of this exact question was already fixed** —
+/// [`remote_saved_agent_session_exists`] dispatches per kind and deliberately
+/// answers `true` for a store it cannot read, precisely so an unreadable store
+/// cannot false-death a live session. That fix never reached the caller one
+/// function away, which is this project's own law about walking a callee's
+/// callers, arriving by a third route.
+///
+/// The per-CLI remote verb already existed and was simply never called:
+/// [`AgentCliDescriptor::session_exists_subcommand`] names it, and the remote
+/// arm resolves it through the same registry that generates it.
+fn fetch_remote_saved_agent_session_exists(
+    kind: SessionKind,
     ssh_target: &str,
     exec_prefix: Option<&str>,
     session_id: &str,
 ) -> anyhow::Result<bool> {
+    // ⛔ NO VERB, NO VERDICT. A local-only CLI has no remote arm to ask, and the
+    // only two answers this returns are "keep the row" and "kill the row". An
+    // absent probe is not evidence of an absent session, so it answers the one
+    // that cannot destroy anything — the same reasoning, and the same choice,
+    // as the local dispatcher makes for a store it cannot read.
+    let Some(verb) = remote_session_exists_verb(kind) else {
+        return Ok(true);
+    };
     let output = run_remote_yggterm_command(
         ssh_target,
         exec_prefix,
-        &["server", "remote", "codex-session-exists", session_id],
+        &["server", "remote", verb.as_str(), session_id],
         None,
     )?;
     let response: RemoteSavedCodexSessionExistsResponse =
@@ -49252,4 +49330,39 @@ terminal_window_id: None,
             "a fixed iteration count is not a duration — use the deadline"
         );
     }
+
+    #[test]
+    fn the_remote_saved_session_probe_asks_each_cli_about_its_own_store() {
+        // ⛔ THE DEFECT THIS LOCKS. The remote existence probe sent
+        // `codex-session-exists` for EVERY kind, so an Antigravity row was
+        // checked against Codex's store, correctly answered "no", and was
+        // refused with "saved Antigravity session … is no longer available on
+        // this machine" — a message naming one CLI over a probe that asked
+        // another. Reported from the seat 2026-08-22 with the session's
+        // transcript and presence lock both on disk.
+        assert_eq!(
+            super::remote_session_exists_verb(SessionKind::Antigravity).as_deref(),
+            Some("agy-session-exists"),
+        );
+        // The shipped spelling for the CLI that had the only working arm must
+        // not move: the remote parses it as a literal, ahead of the registry.
+        assert_eq!(
+            super::remote_session_exists_verb(SessionKind::Codex).as_deref(),
+            Some("codex-session-exists"),
+        );
+        // ⚠ And no two kinds may share a verb, which is the property the old
+        // code violated in the most direct way possible. Asserted over the
+        // whole registry rather than the three kinds someone thought of.
+        let mut seen: std::collections::HashMap<String, SessionKind> =
+            std::collections::HashMap::new();
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let Some(verb) = super::remote_session_exists_verb(descriptor.kind) else {
+                continue;
+            };
+            if let Some(other) = seen.insert(verb.clone(), descriptor.kind) {
+                panic!("{verb} is claimed by both {other:?} and {:?}", descriptor.kind);
+            }
+        }
+    }
+
 }
