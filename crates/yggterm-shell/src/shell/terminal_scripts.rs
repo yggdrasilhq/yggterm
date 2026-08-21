@@ -6902,14 +6902,30 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             forceTerminalRepaint(lastVisualTransitionReason);
         }};
+        const forcedRefreshSkippedReasons = {{}};
         const recordVisiblePaintRefreshSkipped = (reason, forceFullRefresh) => {{
             forcedRefreshSkippedCount += 1;
+            const skipReason = String(reason || 'skipped');
+            // ⛔ WHICH gate refused is the whole question, and the COUNT cannot
+            // answer it. `frame_like` is the agent-CLI discriminator (a TUI's
+            // hide-cursor re-arms it every frame, so it suppresses forever);
+            // `rate_limited` clears in 750 ms; `input_hot` means the user is
+            // typing. Three very different verdicts behind one number. The perf
+            // event that carried the reason is throttled by `recentFrameLikeWrite`
+            // — the same flag as one of the reasons — so on an agent row it is
+            // the `frame_like` case that goes unreported, which is precisely the
+            // one that never lapses. Keep it on the entry, where the same-frame
+            // record can read it without going through the throttle.
+            forcedRefreshSkippedReasons[skipReason] =
+                Number(forcedRefreshSkippedReasons[skipReason] || 0) + 1;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].forcedRefreshSkippedCount =
                     forcedRefreshSkippedCount;
+                window.__yggtermXtermHosts[hostId].forcedRefreshSkippedReasons =
+                    forcedRefreshSkippedReasons;
+                window.__yggtermXtermHosts[hostId].lastForcedRefreshSkipReason = skipReason;
             }}
             const now = Date.now();
-            const skipReason = String(reason || 'skipped');
             if (skipReason === 'input_hot' || now - lastVisiblePaintRefreshSkipPerfAtMs >= 1000) {{
                 lastVisiblePaintRefreshSkipPerfAtMs = now;
                 emitPerf("xterm_forced_refresh_skipped", {{

@@ -901,6 +901,23 @@ impl DesktopService {
             .unwrap_or_default()
     }
 
+    /// Every media-probe drain since the last tick — the `layer=webkit` half of
+    /// the trace plane. The shell validates and writes them; nothing here
+    /// interprets a record. See `web_surface_media_trace`.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_trace_batches(&self) -> Vec<crate::web_surface::SurfaceTraceBatch> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_trace_batches())
+            .unwrap_or_default()
+    }
+
     /// Every page currently waiting on `getUserMedia()`, for `server app state`.
     #[cfg(not(any(
         target_os = "windows",
