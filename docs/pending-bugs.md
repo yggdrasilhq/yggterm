@@ -537,10 +537,14 @@ red on exactly this defect and not on something adjacent. The primitive's own te
 asserts its CONTROL first (an un-waited exited child really does show as `Z`), so
 neither test can pass by being blind to the state it checks.
 
-**What remains open:** nothing in the watch plane counts zombies, which is why this
-ran unremarked for the daemons' entire uptime. A resource-watch probe that reports a
-process-table census is not built here — routed to the 6.7 usability/resource-watch
-seat rather than fixed by this lane.
+**What remains open — and it is sharper than "nobody looked":** the codebase's only
+zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
+that a corpse is never reported as a survivor. That is CORRECT for a teardown question
+("did this process really go away") and it is precisely why the leak was invisible:
+the one function that knows what a zombie is exists to filter them out, and nothing
+anywhere COUNTS them as a resource. A process-table census in the resource watch is
+not built here — routed to the 6.7 usability/resource-watch seat, which owns
+MEMORY > CPU > SPACE, rather than fixed by this lane.
 
 ## ⛔⛔ [11.15] A GATE THAT JUDGES THE STORED ANSWER REOPENS ITSELF WHEN THE ANSWER IS BAD
 
