@@ -2823,6 +2823,36 @@ it holds; that is what the ACK token is for. (§3.)
 
 ---
 
+#### ⛔⛔ A FRESH CWD OPENS AT A TRUST PROMPT, AND IT READS AS `consuming_input:false`
+
+**The tell:** you spawn a row per §3, step 2 answers `consuming_input: false` and
+`wedged: false`, the process is demonstrably alive and its age keeps climbing, and
+a longer `--check-timeout-ms` changes nothing. Two 40-60 s waits in a row look
+exactly like a cold start that is taking too long.
+
+**What it actually is:** the first launch into a directory this CLI has not seen
+before paints a workspace-trust gate — *"Quick safety check: Is this a project you
+created or one you trust?"* — with `❯ 1. Yes, I trust this folder` highlighted and
+`2. No, exit` below. The composer is not up yet, so the readiness probe is telling
+the exact truth: nothing is consuming input. **`wedged:false` is the discriminator
+that separates this from a real hang**, and it was right both times.
+
+⛔ **Do not diagnose this from the readiness probe — READ THE SCREEN.** A blocking
+gate and a slow start are indistinguishable through `input-check`, and only one of
+them is fixed by waiting.
+
+**The fix is a bare `\r`**, and it is safe here for a reason worth stating rather
+than assuming: the highlight sits on the option that grants nothing beyond what
+the spawn already intended, and the gate is about a directory you chose. ⚠ That
+reasoning does NOT generalise to every highlighted prompt — a plan-limit or
+billing dialog wears the same shape and its options spend money. The rule stays:
+`❯` adjacent to exactly one numbered option is a selection, and you must read
+WHICH option before pressing Enter.
+
+⚠ **It fires per (CLI, directory), so a brand-new worktree hits it even though
+every sibling checkout is trusted** — which is exactly when a spawn recipe looks
+broken rather than gated.
+
 ### Codex
 
 **1. Enter is part of the payload on a raw `send`** — append `\r` or codex will
