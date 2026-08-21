@@ -1,0 +1,97 @@
+{
+  "_doc": [
+    "Where each agent CLI keeps a session's transcript, and WHERE IN THAT PATH THE",
+    "SESSION ID SITS — the one thing the fleet verbs need that the CLI registry does",
+    "not already publish on a row.",
+    "",
+    "⛔ THIS FILE IS NOT A SECOND COPY OF THE REGISTRY. `store_globs` is transcribed",
+    "from `AgentCliDescriptor::session_store_globs` and is checked against it by",
+    "`the_fleet_transcript_table_matches_the_registry` in yggterm-core, which FAILS",
+    "the build if the two drift. The registry stays the owner of where a store is;",
+    "this file adds only the id position, expressed as `{id}` inside the glob.",
+    "",
+    "⚠ Every template here was resolved against a REAL store, not a fixture: a genuine",
+    "session id taken from disk, substituted in, and required to return exactly the",
+    "file it came from. A CLI with no store, or one whose store has never been seen on",
+    "a real machine, says so rather than guessing — an unverified template that looks",
+    "plausible is the failure this whole area keeps repeating.",
+    "",
+    "`verified_on_disk` means exactly that and nothing weaker."
+  ],
+  "clis": {
+    "codex": {
+      "store_globs": [".codex/sessions/**/rollout-*.jsonl"],
+      "transcript": ".codex/sessions/**/rollout-*-{id}.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": true,
+      "note": "The file name DECORATES the id with a timestamp, so the id is a suffix."
+    },
+    "codex-litellm": {
+      "store_globs": [".codex-litellm/sessions/**/rollout-*.jsonl"],
+      "transcript": ".codex-litellm/sessions/**/rollout-*-{id}.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": false,
+      "note": "Same layout as codex under its own root; no session on any host reached."
+    },
+    "claude-code": {
+      "store_globs": [".claude/projects/*/*.jsonl"],
+      "transcript": ".claude/projects/*/{id}.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": true,
+      "note": "The only store whose file name IS the id. Every verb assumed this shape."
+    },
+    "pi": {
+      "store_globs": [".pi/agent/sessions/*/*.jsonl"],
+      "transcript": ".pi/agent/sessions/*/*_{id}.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": true,
+      "note": "Timestamp prefix, underscore, then the id."
+    },
+    "qwen-code": {
+      "store_globs": [".qwen/projects/*/chats/*.jsonl"],
+      "transcript": ".qwen/projects/*/chats/{id}.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": false,
+      "note": "⛔ UNVERIFIED AND THE ONLY ONE THAT LOOKS WRONG. 27 sessions across two hosts hold ONLY `<id>.runtime.json` sidecars — a pid/cwd marker with no title and no conversation — and zero `.jsonl` files. Every one of them was an unauthenticated probe that never exchanged a message, so this cannot yet be told apart from `a transcript appears only once a session says something`. Settle it by authenticating this CLI and running ONE exchange; until then neither this template nor the registry's live reader has been shown to resolve a real session."
+    },
+    "muse": {
+      "store_globs": [".local/share/muse/sessions/**/session.jsonl"],
+      "transcript": ".local/share/muse/sessions/**/{id}/session.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": true,
+      "note": "The id names the session's DIRECTORY; every file inside is named the same."
+    },
+    "antigravity": {
+      "store_globs": [
+        ".gemini/antigravity-cli/conversations/*.db",
+        ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl",
+        ".antigravitycli/*.json"
+      ],
+      "transcript": ".gemini/antigravity-cli/brain/{id}/.system_generated/logs/transcript_full.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": true,
+      "note": "The id names a directory several levels above the file, and every session's file has the SAME name — which is why slicing a row's path for its id collapsed five rows onto one. The `.db` in the store is a summaries index, not the transcript."
+    },
+    "grok-build": {
+      "store_globs": [".grok/sessions/*/*/summary.json"],
+      "transcript": ".grok/sessions/*/{id}/summary.json",
+      "format": "json",
+      "verified_on_disk": true,
+      "note": "Sits under a URL-ENCODED cwd directory, so the parent cannot be derived."
+    },
+    "opencode": {
+      "store_globs": [],
+      "transcript": null,
+      "format": null,
+      "verified_on_disk": false,
+      "note": "Declares no store in the registry. Nothing to resolve, and saying so is the honest answer — a guessed path here would read as measured."
+    },
+    "kimi": {
+      "store_globs": [],
+      "transcript": null,
+      "format": null,
+      "verified_on_disk": false,
+      "note": "Declares no store in the registry."
+    }
+  }
+}
