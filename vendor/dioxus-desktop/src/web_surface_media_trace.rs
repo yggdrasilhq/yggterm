@@ -174,7 +174,11 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
     if (live.has(mid)) { return; }
     var st = {
       el: el, presented: 0, waits: 0, lastPresented: null,
-      t0: performance.now(), m0: el.currentTime, timer: null, rvfc: true
+      t0: performance.now(), m0: el.currentTime, timer: null,
+      // Did the callback REGISTER, and did it ever actually FIRE? Two
+      // different facts, and conflating them is what made this probe report a
+      // healthy playback as zero frames. See `closeWindow`.
+      rvfc: true, everFired: false
     };
     // rVFC: one counter increment per presented frame. The engine's own
     // `presentedFrames` in the metadata is cumulative and trustworthy — unlike
@@ -183,6 +187,7 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
       var cb = function (now, meta) {
         if (!live.has(mid)) { return; }   // disarmed: stop re-registering
         st.presented++;
+        st.everFired = true;
         if (meta && typeof meta.presentedFrames === "number") {
           st.lastPresented = meta.presentedFrames;
         }
@@ -211,8 +216,22 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
       // UI thread is busy, and dividing by the constant is wrong by exactly the
       // overrun, which is largest in the traces someone reads after an incident.
       window_ms: Math.round(t1 - st.t0),
-      presented: st.presented,
-      fps: Math.round((st.presented / wall) * 10) / 10,
+      // ⛔⛔ A BLIND INSTRUMENT MUST NOT REPORT A NUMBER.
+      //
+      // `requestVideoFrameCallback` does not fire under every compositing
+      // arrangement this shell can be launched in — measured: with under-glass
+      // OFF it registered without error and never fired once, through a
+      // playback whose media clock was advancing at 1.00x. Reporting
+      // `fps: 0` there is not a noisy reading, it is a confident wrong one:
+      // "no frames were presented" and "I cannot see frames" are opposite
+      // findings and were the same number.
+      //
+      // ⇒ When the callback was armed and never fired, `presented` and `fps`
+      // are null and `frames_blind` says why. A consumer that averages fps
+      // across windows then skips these instead of averaging in zeros.
+      frames_blind: st.rvfc && !st.everFired,
+      presented: st.everFired ? st.presented : null,
+      fps: st.everFired ? Math.round((st.presented / wall) * 10) / 10 : null,
       // The engine's cumulative frame count, if it gave us one.
       presented_total: st.lastPresented,
       // ⭐ The headline number: media seconds per wall second. 1.0 is healthy;
@@ -539,6 +558,44 @@ mod tests {
             !shim_code().contains("getVideoPlaybackQuality"),
             "getVideoPlaybackQuality() is windowed on this engine and resets; a record \
              built from it reports 0 dropped frames through a visible shortfall"
+        );
+    }
+
+    /// ⛔⛔ A BLIND INSTRUMENT MUST NOT REPORT A NUMBER.
+    ///
+    /// Measured, and it is why this guard exists rather than being an idea:
+    /// with under-glass compositing OFF, `requestVideoFrameCallback`
+    /// registered without error and **never fired once**, through a playback
+    /// whose media clock was advancing at 1.00x. The window reported
+    /// `fps: 0` — and `fps: 0` on a playing video reads as a total
+    /// presentation failure, which is the opposite of what was happening.
+    ///
+    /// Two A/B arms were then not comparable and the difference looked
+    /// enormous. The same shape has burned this stack before: a compositing
+    /// flag that silenced `rVFC` entirely while leaving the rendered frame
+    /// byte-identical, so every pixel check passed and every frame count lied.
+    ///
+    /// ⇒ "no frames were presented" and "I cannot see frames" are opposite
+    /// findings and must never be the same value.
+    #[test]
+    fn a_window_that_could_not_see_frames_reports_null_and_not_zero() {
+        let code = shim_code();
+        assert!(
+            code.contains("frames_blind: st.rvfc && !st.everFired"),
+            "a window must say when the frame callback never fired"
+        );
+        assert!(
+            code.contains("fps: st.everFired ?"),
+            "fps must be null when the callback never fired, never 0"
+        );
+        assert!(
+            code.contains("presented: st.everFired ?"),
+            "presented must be null when the callback never fired, never 0"
+        );
+        // Registering is not firing. Conflating them is the whole defect.
+        assert!(
+            code.contains("st.everFired = true;"),
+            "the callback must record that it actually fired, not merely that it registered"
         );
     }
 
