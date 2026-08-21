@@ -2481,6 +2481,43 @@ settled this bug had `remote_machines` EMPTY, which looked wrong until the live
 `server-state.json` showed the owner's active row was genuinely absent from the scan. A
 fixture assembled from what the code accepts tests the code's opinion of itself.
 
+
+## A UUID'S TAIL IS TWELVE DIGITS, AND THE LEAK GUARD READ IT AS AN ID NUMBER (2026-08-22)
+
+`ygg-privacy-guard` refused a push carrying a GENERATED upstream adblock rule, on
+`00000000-0000-0000-0000-000000000000` in a consent-cookie payload. Its `aadhaar-like` pattern
+looks for twelve digits with non-hex neighbours — and a UUID's final group is twelve hex
+characters whose neighbours are `-` and `"`, neither of which is hex. When those characters
+happen to be digits, the pattern fires.
+
+⛔ **The override was the wrong cure and so was the rewrite.** The file is generated: any edit
+is undone the next time the asset is regenerated, so "rewrite it" was never available. That
+leaves `YGG_PRIVACY_ALLOW=1`, which is the outcome the guard's own header warns about —
+*"a checker that cries wolf is the thing that teaches the override"* — on a gate whose whole
+job is to be believed on the day it is right.
+
+⇒ **Cut the pattern instead**: `(?<![0-9a-fA-F]{4}-)` rejects a UUID tail group, and `(?!0{12})`
+rejects an all-zeros mask. Verified in BOTH polarities before pushing — it still fires on a bare
+twelve-digit run and on the same run spaced into groups of four, and no longer fires on a nil
+UUID, a real UUID tail, or a commit sha.
+
+⛔ **AND THE REWRITE OF THIS VERY PARAGRAPH IS THE THIRD LESSON.** The first draft quoted its two
+positive cases as literal numbers, and the guard refused the push carrying it — correctly, because
+they ARE twelve-digit runs. **A numeric-identity check cannot be documented with an example that
+satisfies it.** The home-path rule solved the same problem with an explicit placeholder list; the
+numeric classes have no such escape, so the rule for prose is simply: *describe the shape, never
+write the digits.* The method survives, the identity does not — including when the "identity" was
+invented for a test.
+
+⚠ **This is the SAME failure the hex boundary was cut for on 2026-08-13**, one step further out:
+that round fixed a 10-digit run inside a 40-char sha reading as a phone number. A structural
+pattern over a numeric class will keep meeting new well-formed neighbours; each time, the answer
+is a narrower pattern, never a wider allowance.
+
+⭐ **And fix it in the tool, then push the tool to every host.** This guard travels with the
+binary, not with a repo, so a fix that lives on one machine leaves the other two crying wolf.
+Verify by hash on each host, not by having run the copy.
+
 ## ⛔⛔ NEVER `cargo fix --broken-code` — IT SPLICES SOURCE LINES AND MOSTLY COMPILES (2026-08-21)
 
 `--broken-code` applies a suggestion even when the result does not build, which is the flag's
