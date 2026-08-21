@@ -905,3 +905,36 @@ deploy prolonged the diagnostic fog by leaving newer instruments dead on disk.
 ⇒ Concretely: deploy verification is against the RUNNING process; input-path regressions are
 release-blocking; and any watch/optimization that could degrade interactivity must prove it did
 not (the ui/block + input latency instruments are the proof surface).
+
+## THE GUI IS A VIEWER, NEVER A LIFELINE — the row system runs without it (2026-08-22)
+
+Settled while **nothing could attach to the GUI at all**, relayed from a terminal the owner had
+to open outside yggterm to say it:
+
+> *"In spite of no yggterm GUI our row system MUST run. In case of my laptop shutdown I don't
+> want long agents or N.x.y orchestration systems to crash themselves. In fact, quite the
+> opposite. If a GUI is needed then they should spawn a yggterm client in any host and continue
+> work. When I spawn my client, I see everything as if nothing has been the issue."*
+
+He named it a SPEC UPDATE of the orchestration system, and it resolves into five clauses:
+
+1. **NO GUI IS NOT A STOP CONDITION.** A long-running agent or an `N.x.y` lane must never
+   self-terminate, stall, or abandon work because the GUI died, the laptop shut down, or its row
+   stopped rendering. **GUI absence is weather, not a signal about the work.**
+2. **ROW LIVENESS IS NOT ATTACHABILITY.** The two are conflated today and that conflation *is*
+   the defect below. A session is live because its process is live and its transcript is intact,
+   never because something can currently draw it.
+3. **A LANE THAT NEEDS A GUI SPAWNS ONE — on ANY host.** It does not wait for his laptop and it
+   does not hand the task back to him.
+4. **RE-ATTACH IS SEAMLESS ON HIS SIDE.** When he starts his client, everything is simply there —
+   same rows, same order, same scrollback — with no evidence anything went wrong. **A viewer
+   connecting to work that never stopped, not a recovery flow he has to drive.**
+5. **HIS LAPTOP SHUTTING DOWN IS A NORMAL EVENT**, not an incident. Nothing may crash itself
+   because of it.
+
+⚖ This is the CONSTITUTION's existing guarantee — *"other agents' sessions survive our restarts"*,
+*"the user must never have to know which daemon owns what"* — failing in the direction that hurts
+most: **the work survived perfectly and became invisible and undrivable anyway.**
+
+⇒ ⛔ **The constitution text in `CLAUDE.md` is HIS to amend, not a relay's.** This entry records
+the settled call; folding it into the constitution proper is an owner action.
