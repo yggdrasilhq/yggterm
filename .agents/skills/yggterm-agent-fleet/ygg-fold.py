@@ -695,6 +695,62 @@ def sweep_worktrees(repo, apply_it):
     return 0
 
 
+def cmd_orphans(a, host, live):
+    """⛔⛔ REMOVING A WORKTREE DOES NOT REMOVE ITS ROWS, AND NOTHING SAID SO.
+
+    A lane's session is rooted in the lane's worktree, so the cwd tree draws a
+    folder for it. Reclaim the worktree and the folder stays — pointing at a
+    directory that no longer exists, with rows under it that can only fail when
+    clicked. Measured 2026-08-21, after the first sweep that actually removed
+    anything: 9 such rows across 7 vanished trees, and 7 of them predated that
+    sweep by weeks. ⇒ The tidy-up was creating exactly the litter it was run to
+    clear, and quietly.
+
+    ⚖ A LIVE session in a vanished tree is NOT reaped here. Its process is fine,
+    its cwd is simply gone; re-rooting it to the repo's main checkout is a product
+    verb this tool does not have, so it is named and left alone rather than killed
+    for the crime of being untidy.
+    """
+    rows = rows_census(host)
+    # rows_census keeps only SEATED rows; an orphan usually has no seat left.
+    r = run(["ssh", "-n", host, f"{YGG} server app rows --json"])
+    try:
+        allrows = (json.loads(r.stdout).get("data") or {}).get("rows") or []
+    except Exception:
+        log("⛔ could not read the row list")
+        return 2
+    seen, dead, alive = set(), [], []
+    for row in allrows:
+        path = row.get("full_path") or ""
+        cwd = (row.get("session_cwd") or "").strip()
+        if "://" not in path or path in seen or not cwd:
+            continue
+        seen.add(path)
+        if os.path.isdir(cwd):
+            continue
+        uuid = path.rsplit("/", 1)[-1]
+        (alive if uuid in live else dead).append((path, cwd, row.get("outline_prefix")))
+    for path, cwd, seat in alive:
+        log(f"· {str(seat):<7} {path[-40:]} — ALIVE in a vanished tree {cwd}")
+        log("    left alone: re-rooting a live session is a product verb, not a reap")
+    for path, cwd, seat in dead:
+        log(f"⛔ {str(seat) or '-':<7} {path[-40:]} — dead, and its tree {os.path.basename(cwd)} is gone")
+        if a.apply:
+            row = {"uri": path, "uuid": path.rsplit("/", 1)[-1], "seat": str(seat or "-"),
+                   "label": row_label(allrows, path), "session_cwd": cwd}
+            fold(row, "DEAD", "cwd tree no longer exists", host, True)
+    log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive"
+        + ("" if a.apply else " · nothing was changed. Re-run with --apply."))
+    return 0
+
+
+def row_label(allrows, path):
+    for r in allrows:
+        if (r.get("full_path") or "") == path:
+            return r.get("label") or ""
+    return ""
+
+
 def main():
     global FINISHED_IDLE_MIN, STALL_IDLE_MIN
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -733,6 +789,10 @@ def main():
                      help="fold this row whatever the verdict — for a row an operator has "
                           "named explicitly and decided about. Never available to `sweep`, "
                           "and never able to touch a PROTECTED row.")
+    orph = sub.add_parser("orphans",
+                          help="rows whose cwd tree no longer exists — reap the dead, name the live")
+    orph.add_argument("--apply", action="store_true")
+    orph.add_argument("--host")
     wt = sub.add_parser("worktrees")
     wt.add_argument("--apply", action="store_true")
     wt.add_argument("--repo", default=os.path.abspath(os.path.join(HERE, "..", "..", "..")))
@@ -763,6 +823,9 @@ def main():
         log("   refusing to classify: an unreachable host reads as a host with no agents,")
         log("   and with --apply that is the whole fleet reaped in one pass.")
         return 2
+
+    if a.cmd == "orphans":
+        return cmd_orphans(a, host, live)
 
     if a.cmd == "row":
         rows = [r for r in rows if a.target in r["uri"]]
