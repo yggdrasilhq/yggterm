@@ -3908,6 +3908,64 @@ a delete.**
 
 ---
 
+## 11.9 ⭐ REHEARSE A VERB BEFORE IT DECIDES SOMETHING — aim it at a sandbox
+
+Every fleet verb takes its aim from the environment, so the destructive ones can
+be run somewhere that does not matter before they are run somewhere that does:
+
+```sh
+SB=$(mktemp -d); mkdir -p "$SB/bin"
+cp <the headless binary> "$SB/bin/"
+export YGGTERM_HOME="$SB"                 # ⛔ before anything starts, not after
+export YGG_HEADLESS_BIN="$SB/bin/yggterm-headless"
+ygg-deliver.py <row> --message brief.txt  # …now drives the sandbox plane
+```
+
+Three variables, one owner (`ygg_appctl`), and each verb prints what it aimed at
+on its first line — `host=… home=… bin=…`:
+
+| variable | moves |
+|---|---|
+| `YGGTERM_HOME` | which STATE plane: daemon socket, database, and the fleet's own relay store |
+| `YGG_HEADLESS_BIN` | which BINARY asks — a freshly built one, or a recording stand-in |
+| `YGG_APPCTL_HOST` | which MACHINE answers; `local` means no ssh at all |
+
+⭐ **A non-default `YGGTERM_HOME` implies the local transport**, because a home is
+a PATH and a path is a fact about one machine. Exporting the real home changes
+nothing, which is the point — the inference has to be inert for everyone who is
+not sandboxing. `--host` beats it, so a sandbox on another machine still works.
+
+⛔⛔ **THE HALF THAT LOOKS DONE AND IS NOT: the home must be written INTO the
+remote command.** Exporting `YGGTERM_HOME` in the shell that runs a verb does
+nothing if the verb reaches the plane over ssh — the far end starts a fresh login
+shell and inherits none of it, so the call silently answers about the REAL home.
+A gate that only exercises the local arm is green over that, because there the
+variable reaches the child through ordinary inheritance. Both arms, or neither.
+
+⚖ **Why this is worth a section.** For most of its life this plane could not be
+aimed anywhere but at a living person's desktop: the binary was a module constant
+in four separate files and `--host` moved the machine and never the home. So a
+verb that force-folds a row was only ever exercised by the run that mattered, on
+rows somebody was working in — and its most destructive branch turned out to have
+raised `NameError` for a whole commit without anyone noticing, because a healthy
+suite never takes a delivery-failure path. **The more destructive a branch, the
+more certain it is that nobody has run it.**
+
+⚠ **What a sandbox does NOT give you.** The row plane needs a GUI client, and
+that needs Xvfb *plus a private dbus session plus* `WEBKIT_DISABLE_COMPOSITING_MODE=1`
+— recipe and the silent failure mode are in `docs/agent-field-guide.md`. And what
+is learned there about RENDERING does not travel to a real desktop; what is
+learned about the daemon and these verbs does, because it is the same code.
+
+⛔ **Two guards are UNIONED across both homes rather than aimed**: `never-arm.tsv`
+in `ygg-deliver` and `protected_uuids` in `ygg-fold`. A fresh sandbox home has no
+list, so aiming those with everything else would mean nothing is protected —
+correct for sandbox rows and catastrophic if the aim is ever wrong. Refusing too
+much costs a rerun; refusing one row too few types into somebody's half-written
+turn.
+
+---
+
 ## 12. Adapting this to your own setup
 
 Everything above is generic. To make it yours:

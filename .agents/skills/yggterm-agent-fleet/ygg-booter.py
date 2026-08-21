@@ -94,6 +94,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ygg_appctl  # noqa: E402
 from ygg_host import resolve_gui_host  # noqa: E402
 from ygg_rowarg import bare_uuid, resolve_row  # noqa: E402
 
@@ -102,7 +103,12 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import ygg_transcript  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-STATE = Path.home() / ".yggterm" / "relay"
+#: ⛔ The fleet's own store lives IN the yggterm home; `~/.yggterm/relay` is
+#: this expression with the home left at its default, so a sandbox rehearsal
+#: does not write into the roster the live watchdogs read. See ygg_appctl.
+#: ⚠ The TRANSPORT here is not yet aimable — `_run` picks between two binaries
+#: by host and neither comes from the environment. Filed, not fixed here.
+STATE = Path(ygg_appctl.relay_dir())
 SUBS = STATE / "booter"
 PIDFILE = STATE / "booter.pid"
 HEARTBEAT = STATE / "booter.heartbeat"

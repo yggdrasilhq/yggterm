@@ -49,13 +49,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ygg_appctl  # noqa: E402
 from ygg_host import resolve_gui_host  # noqa: E402
 
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import ygg_transcript  # noqa: E402
 
-STATE = Path.home() / ".yggterm" / "relay"
+#: ⛔ The fleet's own store lives IN the yggterm home; `~/.yggterm/relay` is
+#: this expression with the home left at its default. See ygg_appctl.
+STATE = Path(ygg_appctl.relay_dir())
 PROJECTS = Path.home() / ".claude" / "projects"
 
 # A row idle longer than this, with its turn ENDED, is a stall candidate.
