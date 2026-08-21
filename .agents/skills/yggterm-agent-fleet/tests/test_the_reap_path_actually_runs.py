@@ -17,6 +17,13 @@ reap. A different typo in the same place reaps a working lane.
 nobody has run it.** Cheap paths get exercised incidentally; the expensive ones are
 guarded by conditions that a passing test suite is designed never to meet.
 
+⚖ AND IT MUST HOOK THE FUNCTION THE CODE ACTUALLY CALLS. The reap's question later
+moved from a boolean `has_transcript` to a three-valued `transcript_evidence`, because
+that boolean answered False for "never wrote", "no template declared" and "on another
+machine" alike and the row was destroyed on all three. A patch still aimed at the old
+name leaves this test green over code it never touches — the stale-seam failure, one
+level up from the one it was written to catch.
+
 ⚖ This is the DYNAMIC half and it has a static twin, `test_no_verb_reads_a_name_
 nothing_binds`, which sweeps every verb for unbound names. The twin catches the typo
 anywhere; this one catches the decision being wrong — a reap that runs, asks the right
@@ -56,10 +63,18 @@ try:
         '{"type":"event_msg","payload":{"type":"agent_message","message":"invented"}}\n')
 
     calls = []
-    real_has = deliver.ygg_transcript.has_transcript
-    deliver.ygg_transcript.has_transcript = (
-        lambda uuid, kind=None, home=str(home): calls.append((uuid, kind))
-        or real_has(uuid, kind=kind, home=home))
+    # ⚠ THE SEAM MOVED, and hooking the old one made this test pass over code it was
+    #   no longer touching. The reap used to ask `has_transcript`, a BOOLEAN, which
+    #   returns the same False for "it never wrote", "its CLI declares no template"
+    #   and "its transcript is on another machine" — and destroyed the row on all
+    #   three. It now asks `transcript_evidence`, which distinguishes them. Hooking
+    #   the function the code ACTUALLY calls is the whole point of a dynamic gate:
+    #   pointed at the stale seam, this file went green while the fixture home was
+    #   never consulted at all.
+    real_evidence = deliver.ygg_transcript.transcript_evidence
+    deliver.ygg_transcript.transcript_evidence = (
+        lambda uuid, kind=None, home=str(home), host=None, **kw:
+        calls.append((uuid, kind)) or real_evidence(uuid, kind=kind, home=home, host=host))
     # ⛔ Neutralise the actual fold: this test proves the DECISION, and a test that
     #    can reap something is a test that will eventually reap something real.
     folded = []
