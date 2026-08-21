@@ -1,6 +1,14 @@
 {
   "_doc": [
     "Where each agent CLI keeps a session's transcript, and WHERE IN THAT PATH THE",
+    "",
+    "⛔ `icon_kind` IS THE SPELLING A ROW REPORTS, AND IT IS NOT ALWAYS THE SLUG.",
+    "A codex row's `icon_kind` is the historical `session`, which ships on the wire",
+    "and may not be renamed. A resolver that matched a row's kind against these KEYS",
+    "therefore never narrowed for codex — 410 of 742 live rows on 2026-08-22 — and",
+    "fell through to trying every declared store, which was right only by luck.",
+    "`session_kind_for_row` in yggterm-core is the one owner of this question and",
+    "the Rust lock makes it ratify every alias here.",
     "SESSION ID SITS — the one thing the fleet verbs need that the CLI registry does",
     "not already publish on a row.",
     "",
@@ -20,42 +28,60 @@
   ],
   "clis": {
     "codex": {
-      "store_globs": [".codex/sessions/**/rollout-*.jsonl"],
+      "store_globs": [
+        ".codex/sessions/**/rollout-*.jsonl"
+      ],
+      "icon_kind": "session",
       "transcript": ".codex/sessions/**/rollout-*-{id}.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
       "note": "The file name DECORATES the id with a timestamp, so the id is a suffix."
     },
     "codex-litellm": {
-      "store_globs": [".codex-litellm/sessions/**/rollout-*.jsonl"],
+      "store_globs": [
+        ".codex-litellm/sessions/**/rollout-*.jsonl"
+      ],
+      "icon_kind": "session",
       "transcript": ".codex-litellm/sessions/**/rollout-*-{id}.jsonl",
       "format": "jsonl",
       "verified_on_disk": false,
       "note": "Same layout as codex under its own root; no session on any host reached."
     },
     "claude-code": {
-      "store_globs": [".claude/projects/*/*.jsonl"],
+      "store_globs": [
+        ".claude/projects/*/*.jsonl"
+      ],
+      "icon_kind": "claude-code",
       "transcript": ".claude/projects/*/{id}.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
       "note": "The only store whose file name IS the id. Every verb assumed this shape."
     },
     "pi": {
-      "store_globs": [".pi/agent/sessions/*/*.jsonl"],
+      "store_globs": [
+        ".pi/agent/sessions/*/*.jsonl"
+      ],
+      "icon_kind": "pi",
       "transcript": ".pi/agent/sessions/*/*_{id}.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
       "note": "Timestamp prefix, underscore, then the id."
     },
     "qwen-code": {
-      "store_globs": [".qwen/projects/*/chats/*.jsonl"],
+      "store_globs": [
+        ".qwen/projects/*/chats/*.jsonl"
+      ],
+      "icon_kind": "qwen-code",
       "transcript": ".qwen/projects/*/chats/{id}.jsonl",
       "format": "jsonl",
       "verified_on_disk": false,
       "note": "⛔ UNVERIFIED AND THE ONLY ONE THAT LOOKS WRONG. 27 sessions across two hosts hold ONLY `<id>.runtime.json` sidecars — a pid/cwd marker with no title and no conversation — and zero `.jsonl` files. Every one of them was an unauthenticated probe that never exchanged a message, so this cannot yet be told apart from `a transcript appears only once a session says something`. Settle it by authenticating this CLI and running ONE exchange; until then neither this template nor the registry's live reader has been shown to resolve a real session."
     },
     "muse": {
-      "store_globs": [".local/share/muse/sessions/**/session.jsonl"],
+      "store_globs": [
+        ".local/share/muse/sessions/**/session.jsonl"
+      ],
+      "icon_kind": "muse",
       "transcript": ".local/share/muse/sessions/**/{id}/session.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
@@ -67,13 +93,17 @@
         ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl",
         ".antigravitycli/*.json"
       ],
+      "icon_kind": "antigravity",
       "transcript": ".gemini/antigravity-cli/brain/{id}/.system_generated/logs/transcript_full.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
       "note": "The id names a directory several levels above the file, and every session's file has the SAME name — which is why slicing a row's path for its id collapsed five rows onto one. The `.db` in the store is a summaries index, not the transcript."
     },
     "grok-build": {
-      "store_globs": [".grok/sessions/*/*/summary.json"],
+      "store_globs": [
+        ".grok/sessions/*/*/summary.json"
+      ],
+      "icon_kind": "grok-build",
       "transcript": ".grok/sessions/*/{id}/summary.json",
       "format": "json",
       "verified_on_disk": true,
@@ -81,6 +111,7 @@
     },
     "opencode": {
       "store_globs": [],
+      "icon_kind": "opencode",
       "transcript": null,
       "format": null,
       "verified_on_disk": false,
@@ -88,6 +119,7 @@
     },
     "kimi": {
       "store_globs": [],
+      "icon_kind": "kimi",
       "transcript": null,
       "format": null,
       "verified_on_disk": false,
