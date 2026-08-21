@@ -954,6 +954,80 @@ pub struct AgentCliDescriptor {
     /// this CLI's store layout has not been read off a real machine, so no
     /// lookup is attempted rather than a plausible path being guessed at.
     pub read_live_store_title: Option<fn(&Path, &str) -> Option<String>>,
+    /// The ssh half of [`Self::read_live_store_title`]: how a REMOTE row of
+    /// this CLI is asked for its own title.
+    ///
+    /// ⛔⛔ **THE FIELD THAT CLOSES A GAP BETWEEN TWO CHORES.** yggterm titles
+    /// live rows from two places — a local chore that reads this machine's
+    /// stores off disk, and a remote chore that reads another machine's over
+    /// ssh. The local one skipped every `remote-*://` row saying *"that rides
+    /// the other chore"*, and the remote one was written for ONE CLI and
+    /// refused everything else by kind. A remote row of any CLI but Claude Code
+    /// was therefore titled by nothing and kept its birth name for the life of
+    /// the session, with no event anywhere saying so.
+    ///
+    /// ⚠ **It cannot be [`Self::read_live_store_title`] with a different home.**
+    /// That reader opens local files (and, for one CLI, a local sqlite index);
+    /// there is no such thing as passing it a path on another machine. The
+    /// remote arm is necessarily a program that runs THERE, which is what this
+    /// field carries.
+    ///
+    /// `None` ⇒ UNMEASURED, the same law as [`Self::working_screen_phrases`]:
+    /// this CLI's store has not been read off a real remote machine, so no
+    /// round trip is attempted. The chore reports `skipped_no_reader` for such
+    /// a row rather than staying silent about it
+    /// ([`crate::cli_plane::CliTitleOutcome`]).
+    pub remote_live_store_title: Option<RemoteStoreTitleProbe>,
+}
+
+/// How a remote machine is asked for one of its own CLI session titles.
+///
+/// ⚖ **The script is pure IO; the SEMANTICS stay in Rust.** A probe returns the
+/// raw strings the store holds, in the CLI's own precedence order, and
+/// [`Self::choose`] decides which of them is a title — using the same
+/// predicates the local reader uses. Deciding it in Python would put a second
+/// encoding of "what counts as a title" on the far side of an ssh hop, where it
+/// could drift from the local reader for a whole release without anything
+/// disagreeing out loud.
+// ⛔ No `PartialEq`: `choose` is a function pointer and comparing those is
+// meaningless (addresses are not unique across codegen units), so a derived
+// equality would silently answer wrong. Probes are compared by the CLI that
+// owns them, never by value.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteStoreTitleProbe {
+    /// Python 3 source, fed to `python3 -` on the session's host.
+    ///
+    /// **argv contract:** the locators first, then a literal `--`, then the
+    /// session ids. ⛔ The separator is load-bearing — the predecessor script
+    /// took `argv[1]` as the single locator and `argv[2:]` as ids, so a CLI
+    /// with two store globs would have had its second glob read as a session
+    /// id. It survived only because the one wired CLI declares exactly one.
+    ///
+    /// **Output contract:** one JSON object per line,
+    /// `{"session_id": "…", "candidates": ["…", …]}`, candidates in the CLI's
+    /// own precedence order. A session it cannot answer for is simply absent.
+    pub script: &'static str,
+    /// Which `$HOME`-relative paths the script is handed.
+    pub locators: RemoteStoreLocators,
+    /// Which of the raw candidates is this CLI's title.
+    pub choose: fn(&[String]) -> Option<String>,
+}
+
+/// Where a [`RemoteStoreTitleProbe`] looks, expressed so that the answer stays
+/// owned by the registry rather than transcribed into a script's argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteStoreLocators {
+    /// This CLI's own [`AgentCliDescriptor::session_store_globs`] — for a CLI
+    /// whose title lives in the session file itself.
+    StoreGlobs,
+    /// File names resolved in this CLI's HOME, the directory above its first
+    /// store root — for a CLI whose title lives in a shared index BESIDE the
+    /// sessions rather than in any one of them.
+    ///
+    /// ⚠ Names, never paths: the directory comes from the store globs, so
+    /// relocating a CLI's store moves its index with it and nothing here has to
+    /// be edited.
+    CliHomeFiles(&'static [&'static str]),
 }
 
 /// How a live session of a CLI is recognised from a path its process holds open.
@@ -1109,6 +1183,22 @@ impl AgentCliDescriptor {
         }
         tokens.push(session_id_quoted.to_string());
         tokens
+    }
+
+    /// The token an existing session id rides on, whichever shape it takes —
+    /// `resume`, `--resume`, `--session`, `--conversation`.
+    ///
+    /// ⚖ For a READER, not a composer: [`Self::resume_tokens`] stays the one
+    /// owner of what is actually emitted. This flattens the two shapes to one
+    /// string so a diagnostic can compare CLIs side by side without
+    /// re-implementing the match — and the flattening deliberately LOSES the
+    /// flag/subcommand distinction, which is why it must never be used to build
+    /// a command line.
+    pub fn resume_selector_token(&self) -> &'static str {
+        match self.resume_selector {
+            ResumeSelector::Flag(flag) => flag,
+            ResumeSelector::Subcommand(subcommand) => subcommand,
+        }
     }
 
     /// Whether this CLI has a remote arm at all. Derived from
@@ -1315,6 +1405,46 @@ impl AgentCliDescriptor {
                 .iter()
                 .map(|glob| literal_prefix(glob)),
         )
+    }
+
+    /// The `$HOME`-relative directory this CLI keeps its own state in — the
+    /// parent of its first store root (`.gemini/antigravity-cli` for a store
+    /// rooted at `.gemini/antigravity-cli/conversations`).
+    ///
+    /// ⚖ Derived, never declared, so a CLI that relocates its store carries its
+    /// sibling index with it and no second table has to be edited to agree.
+    /// `None` when the store root has no parent segment, or when this CLI
+    /// declares no store at all.
+    pub fn cli_home_relative(&self) -> Option<&'static str> {
+        let root = self.store_roots().into_iter().next()?;
+        root.rsplit_once('/').map(|(parent, _leaf)| parent)
+    }
+
+    /// The `$HOME`-relative locators this CLI's remote title probe is handed,
+    /// as argv, before the `--` separator.
+    ///
+    /// Empty ⇒ no probe, or a probe whose locators cannot be resolved — either
+    /// way the caller must not run the round trip.
+    pub fn remote_store_title_locators(&self) -> Vec<String> {
+        let Some(probe) = self.remote_live_store_title else {
+            return Vec::new();
+        };
+        match probe.locators {
+            RemoteStoreLocators::StoreGlobs => self
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .collect(),
+            RemoteStoreLocators::CliHomeFiles(names) => {
+                let Some(home) = self.cli_home_relative() else {
+                    return Vec::new();
+                };
+                names
+                    .iter()
+                    .map(|name| format!("{home}/{name}"))
+                    .collect()
+            }
+        }
     }
 
     /// The path fragments a containment test keys on, e.g. `/.codex/sessions/`.
@@ -1701,6 +1831,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
@@ -1813,6 +1944,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::ClaudeCode,
@@ -2047,6 +2179,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: Some(read_claude_code_live_store_title),
+        remote_live_store_title: Some(CLAUDE_CODE_REMOTE_TITLE_PROBE),
     },
     // ── The 2026-08-08 intake. Every field below was read off the CLI's own
     // source or its installed binary on this date, never from memory; the
@@ -2171,6 +2304,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::OpenCode,
@@ -2266,6 +2400,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::QwenCode,
@@ -2392,6 +2527,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
@@ -2517,6 +2653,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -2661,6 +2798,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             file_name: ".session.lock",
         }),
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
@@ -2842,6 +2980,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             extension: "lock",
         }),
         read_live_store_title: Some(read_antigravity_live_store_title),
+        remote_live_store_title: Some(ANTIGRAVITY_REMOTE_TITLE_PROBE),
     },
     // ── The 2026-08-13 intake. Every field below was read off the installed
     // binary (`@xai-official/grok` 1.0.3 `1a29d5bc12`, provisioned into the
@@ -3043,6 +3182,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_marker: None,
         read_live_store_title: None,
+        remote_live_store_title: None,
     },
 ];
 
@@ -3425,6 +3565,207 @@ fn read_antigravity_live_store_title(home: &Path, session_id: &str) -> Option<St
     crate::read_antigravity_session_title(home, session_id)
         .ok()
         .flatten()
+}
+
+/// The ssh probe for Claude Code — the shape every other CLI's probe follows.
+///
+/// Head (512 KB) catches the early `ai-title`; the tail window catches a late
+/// `custom-title`, because a `/rename` appends at the END of a large transcript,
+/// past any head cap. Candidates come back newest-first with custom before ai,
+/// which is the precedence Claude Code itself displays.
+const CLAUDE_CODE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: CLAUDE_CODE_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
+
+const CLAUDE_CODE_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+HEAD_BYTES = 512 * 1024
+TAIL_BYTES = 128 * 1024
+
+def titles_from_lines(lines):
+    custom = None
+    ai = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        kind = record.get('type', '')
+        if kind == 'custom-title':
+            value = (record.get('customTitle') or '').strip()
+            if value:
+                custom = value
+        elif kind == 'ai-title':
+            value = (record.get('aiTitle') or '').strip()
+            if value:
+                ai = value
+    return custom, ai
+
+# argv: <store glob>... -- <session id>...  The separator is load-bearing; a CLI
+# may declare more than one store glob and a glob must never be read as an id.
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+globs = [value for value in argv[:split] if value.strip()]
+ids = [value for value in argv[split + 1:] if value.strip()]
+if not globs or not ids:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+# The glob names FILES; a session's transcript is `<id>.jsonl` under it, so match
+# on the stem rather than re-deriving the CLI's project-directory encoding.
+by_id = {}
+for glob in globs:
+    for candidate in home.glob(glob):
+        by_id.setdefault(candidate.stem, candidate)
+for session_id in ids:
+    found = by_id.get(session_id)
+    if found is None:
+        continue
+    try:
+        size = found.stat().st_size
+        with open(found, encoding='utf-8', errors='ignore') as handle:
+            head = handle.read(HEAD_BYTES).splitlines()
+        tail = []
+        if size > HEAD_BYTES:
+            with open(found, 'rb') as handle:
+                handle.seek(max(0, size - TAIL_BYTES))
+                raw = handle.read().decode('utf-8', errors='ignore')
+            # First chunk is likely a partial line; drop it.
+            tail = raw.splitlines()[1:]
+    except Exception:
+        continue
+    custom_head, ai_head = titles_from_lines(head)
+    custom_tail, ai_tail = titles_from_lines(tail)
+    candidates = [value for value in (custom_tail, custom_head, ai_tail, ai_head) if value]
+    if candidates:
+        print(json.dumps({'session_id': session_id, 'candidates': candidates},
+                         ensure_ascii=False))
+"#;
+
+/// The ssh probe for Antigravity — the CLI the filed defect was reported
+/// against.
+///
+/// ⚠ **Its title is not in its session file**, which is why the local reader
+/// needed a bespoke arm and why this probe reads an INDEX rather than a
+/// transcript. The order below mirrors that reader exactly: the summaries index
+/// first (title, then preview), then the CLI's own history log.
+///
+/// ⚠ The third local fallback — parsing the conversation's brain transcript —
+/// is deliberately NOT in the remote probe. It is a multi-megabyte read per
+/// session on a machine we reached over ssh, and the two index reads above it
+/// answer for every conversation that has had a turn. A remote row that only
+/// the transcript could name reports `no_title_in_store`, which is true and
+/// cheap; guessing it would have cost a store walk per tick.
+const ANTIGRAVITY_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: ANTIGRAVITY_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::CliHomeFiles(&["conversation_summaries.db", "history.jsonl"]),
+    choose: first_agy_prompt_line_candidate,
+};
+
+const ANTIGRAVITY_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sqlite3, sys
+from pathlib import Path
+
+# argv: <home-relative locator>... -- <session id>...
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+locators = [value for value in argv[:split] if value.strip()]
+ids = [value for value in argv[split + 1:] if value.strip()]
+if not locators or not ids:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+candidates = {session_id: [] for session_id in ids}
+
+def open_read_only(path):
+    # Never take a write lock on a store yggterm does not own. `mode=ro` still
+    # wants to recover a hot WAL, which a read-only opener cannot do, so fall
+    # back to `immutable=1` — that reads the main database file alone and may
+    # miss the newest rows, which is a stale title rather than no title.
+    for uri in (f'file:{path}?mode=ro', f'file:{path}?immutable=1'):
+        try:
+            return sqlite3.connect(uri, uri=True, timeout=2.0)
+        except Exception:
+            continue
+    return None
+
+for locator in locators:
+    path = home / locator
+    if not path.exists():
+        continue
+    if path.suffix == '.db':
+        conn = open_read_only(path)
+        if conn is None:
+            continue
+        try:
+            placeholders = ','.join('?' * len(ids))
+            rows = conn.execute(
+                'SELECT conversation_id, title, preview FROM conversation_summaries '
+                'WHERE conversation_id IN (%s);' % placeholders, ids).fetchall()
+            for conversation_id, title, preview in rows:
+                if conversation_id not in candidates:
+                    continue
+                for value in (title, preview):
+                    if value and str(value).strip():
+                        candidates[conversation_id].append(str(value))
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        continue
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                conversation_id = record.get('conversationId')
+                if conversation_id not in candidates:
+                    continue
+                display = record.get('display')
+                if display and str(display).strip():
+                    candidates[conversation_id].append(str(display))
+    except Exception:
+        continue
+
+for session_id in ids:
+    found = candidates.get(session_id) or []
+    if found:
+        print(json.dumps({'session_id': session_id, 'candidates': found}, ensure_ascii=False))
+"#;
+
+/// [`RemoteStoreTitleProbe::choose`] for a CLI whose store hands back finished
+/// titles: the first non-empty candidate, in the order the probe emitted them.
+fn first_non_empty_candidate(candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.trim())
+        .find(|candidate| !candidate.is_empty())
+        .map(str::to_string)
+}
+
+/// [`RemoteStoreTitleProbe::choose`] for Antigravity: its index holds whole
+/// PROMPTS, not titles, so the same cleaner the local reader applies decides
+/// which candidate is usable.
+fn first_agy_prompt_line_candidate(candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .find_map(|candidate| clean_agy_prompt_first_line(candidate))
 }
 
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
@@ -4842,6 +5183,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ⛔⛔ THE LOCK ON THE GAP BETWEEN THE TWO TITLE CHORES.
+    ///
+    /// yggterm titles a live row from two places: a local chore reading this
+    /// machine's stores off disk, and a remote chore reading another machine's
+    /// over ssh. A CLI that has a measured LOCAL reader and a remote arm is a
+    /// CLI whose rows can exist on both sides of that seam — and if only the
+    /// local half is wired, its `remote-*://` rows are titled by NOBODY: the
+    /// local chore skips them for their scheme, the remote chore has nothing to
+    /// run, and the row keeps its birth name for the life of the session.
+    ///
+    /// That is not hypothetical. It shipped, for every CLI but one, and was
+    /// found by a person looking at a sidebar rather than by any instrument.
+    #[test]
+    fn a_cli_that_can_be_titled_locally_and_has_a_remote_arm_can_be_titled_remotely() {
+        for descriptor in AGENT_CLIS {
+            if descriptor.read_live_store_title.is_none() || !descriptor.has_remote_arm() {
+                continue;
+            }
+            assert!(
+                descriptor.remote_live_store_title.is_some(),
+                "{}: its local store reader is measured and it has a remote arm, so its \
+                 `remote-*://` rows exist and nothing would title them",
+                descriptor.display_name
+            );
+        }
+    }
+
+    /// The converse fork: a remote probe with no local reader would mean the
+    /// same CLI answers "what is this session called" one way on this machine
+    /// and another way over ssh, with no shared predicate to keep them honest.
+    #[test]
+    fn a_remote_title_probe_never_ships_without_its_local_reader() {
+        for descriptor in AGENT_CLIS {
+            if descriptor.remote_live_store_title.is_none() {
+                continue;
+            }
+            assert!(
+                descriptor.read_live_store_title.is_some(),
+                "{}: a remote title probe with no local reader is two answers to one \
+                 question, free to drift",
+                descriptor.display_name
+            );
+            assert!(
+                descriptor.has_remote_arm(),
+                "{}: a remote probe for a local-only CLI can never run",
+                descriptor.display_name
+            );
+        }
+    }
+
+    /// ⛔ THE SEPARATOR IS LOAD-BEARING. The predecessor script read `argv[1]`
+    /// as its single locator and `argv[2:]` as session ids, which is only safe
+    /// while every wired CLI declares exactly one store glob. Antigravity
+    /// declares three. A script that does not split on `--` would read a glob
+    /// as a session id and answer for nothing, silently.
+    #[test]
+    fn every_remote_title_probe_splits_its_argv_on_the_separator() {
+        for descriptor in AGENT_CLIS {
+            let Some(probe) = descriptor.remote_live_store_title else {
+                continue;
+            };
+            assert!(
+                probe.script.contains("'--'"),
+                "{}: its remote probe does not honour the `--` argv separator",
+                descriptor.display_name
+            );
+            assert!(
+                probe.script.contains("candidates"),
+                "{}: its remote probe must return raw CANDIDATES and leave the choice \
+                 to `choose`, so the title predicate is not re-encoded in Python",
+                descriptor.display_name
+            );
+        }
+    }
+
+    /// A probe whose locators do not resolve can never run, and the failure is
+    /// an empty argv rather than an error — so it is asserted here instead of
+    /// being discovered as a title that never lands.
+    #[test]
+    fn every_remote_title_probe_resolves_at_least_one_locator() {
+        for descriptor in AGENT_CLIS {
+            if descriptor.remote_live_store_title.is_none() {
+                continue;
+            }
+            let locators = descriptor.remote_store_title_locators();
+            assert!(
+                !locators.is_empty(),
+                "{}: its remote probe resolves no locators, so the round trip would \
+                 ask the remote machine about nothing",
+                descriptor.display_name
+            );
+            for locator in &locators {
+                assert!(
+                    !locator.starts_with('/') && !locator.starts_with('~'),
+                    "{}: locator {locator:?} must be $HOME-relative — the script expands \
+                     it against the REMOTE home",
+                    descriptor.display_name
+                );
+            }
+        }
+    }
+
+    /// ⭐ The index-beside-the-store shape, derived rather than transcribed: the
+    /// directory comes from the CLI's own store globs, so relocating its store
+    /// moves its index with it and no second table has to agree.
+    #[test]
+    fn a_home_file_locator_is_resolved_under_the_clis_own_store_directory() {
+        let descriptor = agent_cli_descriptor(SessionKind::Antigravity)
+            .expect("Antigravity is a registered CLI");
+        let home = descriptor
+            .cli_home_relative()
+            .expect("its store root has a parent");
+        let locators = descriptor.remote_store_title_locators();
+        for locator in &locators {
+            assert!(
+                locator.starts_with(&format!("{home}/")),
+                "{locator:?} is not under the CLI home {home:?} the registry derives"
+            );
+        }
+        assert!(
+            locators
+                .iter()
+                .any(|locator| locator.ends_with("conversation_summaries.db")),
+            "the summaries index is the first place its title lives: {locators:?}"
+        );
+    }
+
+    /// The `choose` half, tested where it belongs — in Rust, against the same
+    /// cleaner the local reader uses.
+    #[test]
+    fn the_title_choice_is_made_in_rust_not_in_the_remote_script() {
+        let cc = agent_cli_descriptor(SessionKind::ClaudeCode)
+            .and_then(|descriptor| descriptor.remote_live_store_title)
+            .expect("Claude Code declares a remote probe");
+        assert_eq!(
+            (cc.choose)(&["  ".to_string(), "Fix the login race".to_string()]),
+            Some("Fix the login race".to_string()),
+            "a blank candidate must not win over a real one"
+        );
+        assert_eq!((cc.choose)(&[]), None);
+
+        let agy = agent_cli_descriptor(SessionKind::Antigravity)
+            .and_then(|descriptor| descriptor.remote_live_store_title)
+            .expect("Antigravity declares a remote probe");
+        // Its index holds whole PROMPTS, so the first candidate is a wrapper the
+        // local reader strips. Answering with it verbatim would put a fenced
+        // code block in the sidebar.
+        assert_eq!(
+            (agy.choose)(&["<USER_REQUEST>\nRefactor the CSV import\n</USER_REQUEST>".to_string()]),
+            Some("Refactor the CSV import".to_string())
+        );
     }
 
     /// Tier ids are unique within a CLI — they address a tier from a verb and a

@@ -13,6 +13,7 @@ mod browser;
 // error. See ychrome/docs/collections.md §Import.
 pub mod browser_import;
 pub mod cli_args;
+pub mod cli_plane;
 pub mod cli_install;
 pub mod click_grid;
 pub mod gl_probe;

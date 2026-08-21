@@ -44,6 +44,7 @@ use std::sync::{
 use std::time::SystemTime;
 use time::OffsetDateTime;
 use tracing::{info, warn};
+use yggterm_core::cli_plane::{CliIdOrigin, CliTitleChore, CliTitleOutcome, CliTitleSweep};
 use yggterm_core::{
     AgentLaunchOptions, AppSettings, LIVE_SUMMARY_REFRESH_HORIZON, PerfSpan, SessionNode,
     SessionNodeKind, SessionStore, append_bounded_jsonl_record, append_trace_event,
@@ -12049,99 +12050,171 @@ fn live_store_title_home() -> Option<PathBuf> {
 /// [`collect_live_store_title_syncs`] against an explicit agent store home — the
 /// test seam, so a test never reads the machine's real CLI stores (a unit test
 /// that consults the user's own store passes or fails on THEIR data).
+/// Why the LOCAL chore will not ask this row's own store, or `None` when it
+/// will.
+///
+/// ⛔ Pulled out as a pure function so a SKIP is testable. Its predecessor
+/// expressed every one of these as a bare `continue`, which is why the filed
+/// defect — a remote row of any CLI but one, refused by both chores — could not
+/// be reproduced by a test and had to be found by a person looking at a
+/// sidebar.
+fn local_store_title_skip(
+    descriptor: &yggterm_core::agent_cli::AgentCliDescriptor,
+    session: &ManagedSessionView,
+    working_paths: &HashSet<String>,
+) -> Option<(CliTitleOutcome, serde_json::Value)> {
+    // A row on THIS machine: `local://` is every live local row's runtime key,
+    // and each CLI's own `<slug>-runtime://` is the other spelling the same
+    // daemon owns.
+    let is_local_row = session.session_path.starts_with("local://")
+        || descriptor
+            .runtime_key_scheme
+            .is_some_and(|scheme| session.session_path.starts_with(scheme));
+    if !is_local_row {
+        // ⛔⛔ THE SKIP THAT USED TO BE SILENT, AND THE DEFECT IT HID. This
+        // chore hands a `remote-*://` row to the remote chore — but whether the
+        // remote chore actually serves it depends on that CLI declaring a
+        // probe, and for eight of ten CLIs it did not. Both chores then
+        // believed the other had the row and neither said so. `served_by`
+        // answers it at the point of the skip, where `"nobody"` IS the bug
+        // rather than a gap between two functions.
+        let served_by = if descriptor.remote_live_store_title.is_some()
+            && yggterm_core::agent_scheme::parse_remote_agent_session_path(&session.session_path)
+                .is_some()
+        {
+            "remote_store_chore"
+        } else {
+            "nobody"
+        };
+        return Some((
+            CliTitleOutcome::SkippedSchemeServedElsewhere,
+            serde_json::json!({ "served_by": served_by }),
+        ));
+    }
+    if descriptor.read_live_store_title.is_none() {
+        // A DECLARED gap, not a failure: this CLI's store layout has not been
+        // read off a real machine, so nothing is guessed at. Reported beside
+        // its title authority, because the pair is the finding — a `Store`
+        // authoritative CLI with no reader is a row yggterm refuses to name AND
+        // cannot look up.
+        return Some((
+            CliTitleOutcome::SkippedNoReader,
+            serde_json::json!({
+                "title_authority": format!("{:?}", descriptor.title_authority),
+            }),
+        ));
+    }
+    // ⛔ The writer's own predicate, asked before any IO. A row the owner named
+    // is one `set_session_title_hint` will refuse, and a refused delta never
+    // stops being a delta — the livelock that pinned this chore at its 12 s
+    // floor for a daemon's whole life.
+    if session.title_is_owner_set() {
+        return Some((CliTitleOutcome::SkippedOwnerTitled, serde_json::json!({})));
+    }
+    // WORKING rows always: a title (or a `/rename`) lands during a turn. Plus
+    // any row still wearing a PLACEHOLDER, because a title can also land out of
+    // band — Antigravity writes its summary index on its own schedule, and a
+    // row restored from persistence comes back carrying the birth name. That
+    // second set is self-limiting: it shrinks by one every time a title lands,
+    // unlike a poll keyed on a delta that can never be satisfied.
+    let title_is_placeholder = yggterm_core::looks_like_generated_fallback_title(&session.title)
+        // "Agent unnamed …" is AUTHORED, so the recogniser above says no — and
+        // an idle row wearing one would never be polled again.
+        || (yggterm_core::is_agent_plane_composed_title(&session.title)
+            && session.title.contains(" unnamed "))
+        || session.title.trim() == session.id.trim();
+    if !working_paths.contains(&session.session_path) && !title_is_placeholder {
+        return Some((
+            CliTitleOutcome::SkippedTitleSettled,
+            serde_json::json!({ "reason": "idle_and_named" }),
+        ));
+    }
+    None
+}
+
 fn collect_live_store_title_syncs_in(
     home: &Path,
     live_sessions: &[ManagedSessionView],
     working_paths: &HashSet<String>,
 ) -> Vec<BackgroundCopyUpdate> {
     let mut updates = Vec::new();
+    // ⛔ The sweep is an accumulator, not a counter the loop may forget: it
+    // records an outcome for EVERY agent row it considers and reports at the
+    // end even when nothing happened. Before it, a row this chore skipped
+    // produced no event at all, so "skipped every remote row" was
+    // indistinguishable from "nothing to do" for the life of the daemon.
+    let mut sweep = CliTitleSweep::new("daemon", CliTitleChore::Local);
     for session in live_sessions {
+        // Not an agent CLI row at all — a plain shell, a document. The CLI
+        // plane has nothing to say about it, and reporting one per tick would
+        // bury the rows it does answer for.
         let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) else {
             continue;
         };
-        let Some(read_title) = descriptor.read_live_store_title else {
-            continue;
-        };
-        // A row on THIS machine: `local://` is every live local row's runtime
-        // key, and each CLI's own `<slug>-runtime://` is the other spelling the
-        // same daemon owns. A `remote-*://` row belongs to another host's store
-        // and rides `collect_remote_cc_title_syncs`.
-        let is_local_row = session.session_path.starts_with("local://")
-            || descriptor
-                .runtime_key_scheme
-                .is_some_and(|scheme| session.session_path.starts_with(scheme));
-        if !is_local_row {
-            continue;
-        }
-        // ⛔ The writer's own predicate, asked before any IO. A row the owner
-        // named is one `set_session_title_hint` will refuse, and a refused
-        // delta never stops being a delta — the livelock that pinned this
-        // chore at its 12 s floor for a daemon's whole life. The Antigravity
-        // arm did NOT carry this guard and would re-read the store forever for
-        // an owner-titled row whose title happened to read as a placeholder.
-        if session.title_is_owner_set() {
+        if let Some((outcome, detail)) = local_store_title_skip(descriptor, session, working_paths)
+        {
+            let signature = detail
+                .get("served_by")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            sweep.record(
+                &session.session_path,
+                session.kind,
+                &session.id,
+                outcome,
+                signature.as_deref(),
+                detail,
+            );
             continue;
         }
-        // WORKING rows always: a title (or a `/rename`) lands during a turn.
-        // Plus any row still wearing a PLACEHOLDER, because a title can also
-        // land out of band — Antigravity writes its summary index on its own
-        // schedule, and a row restored from persistence comes back carrying the
-        // birth name. That second set is self-limiting: it shrinks by one every
-        // time a title lands, unlike a poll keyed on a delta that can never be
-        // satisfied.
-        let title_is_placeholder = yggterm_core::looks_like_generated_fallback_title(
-            &session.title,
-        )
-            // "Agent unnamed …" is AUTHORED, so the recogniser above says no —
-            // and an idle row wearing one would never be polled again.
-            || (yggterm_core::is_agent_plane_composed_title(&session.title)
-                && session.title.contains(" unnamed "))
-            || session.title.trim() == session.id.trim();
-        if !working_paths.contains(&session.session_path) && !title_is_placeholder {
-            continue;
-        }
-        let Some(title) = read_title(home, &session.id) else {
-            yggterm_core::perf::ytrace_emit_event(
-                "daemon",
-                "cli",
-                "store_title_miss",
-                serde_json::json!({
-                    "session_path": session.session_path,
-                    "slug": descriptor.slug,
-                    // The id the store was asked about. A CLI that mints its own
-                    // id is rebound by the identity poll, and a miss whose id is
-                    // the row's birth uuid is a REBIND failure wearing a store
-                    // failure's clothes — two very different repairs.
-                    "session_id": session.id,
-                    "reason": "no_title_in_store",
-                }),
+        let read_title = descriptor
+            .read_live_store_title
+            .expect("the skip classifier refuses a CLI with no reader");
+        let stored = read_title(home, &session.id).map(|title| title.trim().to_string());
+        let Some(title) = stored.filter(|title| !title.is_empty()) else {
+            sweep.record(
+                &session.session_path,
+                session.kind,
+                &session.id,
+                CliTitleOutcome::NoTitleInStore,
+                None,
+                // The id the store was asked about. A CLI that mints its own id
+                // is rebound by the identity poll, and a miss whose id is the
+                // row's birth uuid is a REBIND failure wearing a store
+                // failure's clothes — two very different repairs.
+                serde_json::json!({ "id_origin": CliIdOrigin::declared_for(session.kind).label() }),
             );
             continue;
         };
-        let title = title.trim().to_string();
-        if title.is_empty() || title == session.title {
+        if title == session.title {
+            sweep.record(
+                &session.session_path,
+                session.kind,
+                &session.id,
+                CliTitleOutcome::SkippedTitleSettled,
+                None,
+                serde_json::json!({ "reason": "store_agrees_with_row" }),
+            );
             continue;
         }
-        if let Ok(home) = crate::resolve_yggterm_home() {
-            append_trace_event(
-                &home,
-                "daemon",
-                "title_trigger",
-                "store_title_pickup",
-                serde_json::json!({
-                    "session_path": session.session_path,
-                    "slug": descriptor.slug,
-                    "previous_title": session.title,
-                    "new_title": title,
-                }),
-            );
-        }
+        sweep.record(
+            &session.session_path,
+            session.kind,
+            &session.id,
+            CliTitleOutcome::PickedUp,
+            Some(&title),
+            serde_json::json!({
+                "previous_title": session.title,
+                "new_title": title,
+            }),
+        );
         updates.push(BackgroundCopyUpdate {
             session_path: session.session_path.clone(),
             title: Some(title),
             summary: None,
         });
     }
+    sweep.finish();
     updates
 }
 
@@ -12183,207 +12256,294 @@ fn collect_stuck_launch_faults(
         .collect()
 }
 
-/// Reads CC titles for a given list of session ids on the remote machine.
-/// Head (512 KB) catches the early `ai-title`; the tail window catches a
-/// late `custom-title` (a /rename appends at the END of a large JSONL, past
-/// any head cap). Latest record wins, custom-title over ai-title — the same
-/// precedence CC itself displays.
-const REMOTE_CC_TITLE_SCRIPT: &str = r#"
-import json, os, sys
-from pathlib import Path
-HEAD_BYTES = 512 * 1024
-TAIL_BYTES = 128 * 1024
+/// One live row, classified for this tick's remote title poll.
+///
+/// Pure data so the selection boundary can be tested without ssh, a daemon or a
+/// home directory — and so a SKIP carries its reason to the caller instead of
+/// dying as a `continue`.
+#[derive(Debug, Clone)]
+struct RemoteTitlePollDecision {
+    session_path: String,
+    kind: SessionKind,
+    session_id: String,
+    machine_key: String,
+    /// `None` ⇒ poll this row. `Some(outcome)` ⇒ skipped, with the reason the
+    /// sweep will report.
+    skipped: Option<CliTitleOutcome>,
+    detail: serde_json::Value,
+}
 
-def titles_from_lines(lines):
-    custom = None
-    ai = None
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        t = r.get('type', '')
-        if t == 'custom-title':
-            ct = (r.get('customTitle') or '').strip()
-            if ct:
-                custom = ct
-        elif t == 'ai-title':
-            at = (r.get('aiTitle') or '').strip()
-            if at:
-                ai = at
-    return custom, ai
-
-# argv[1] is CC's store glob ($HOME-relative), from
-# AgentCliDescriptor.session_store_globs — the same declaration the scanners
-# use. argv[2:] are the session ids to read. Where the store lives is NOT this
-# script's decision to re-encode (docs/spec-agent-cli-harness.md §3).
-store_glob = sys.argv[1] if len(sys.argv) > 1 else ''
-ids = [i for i in sys.argv[2:] if i.strip()]
-home = Path(os.path.expanduser('~'))
-if not store_glob or not ids:
-    sys.exit(0)
-# The glob names FILES; a session's transcript is `<id>.jsonl` under it, so
-# match on the stem rather than re-deriving CC's project-dir encoding.
-by_id = {}
-for candidate in home.glob(store_glob):
-    by_id.setdefault(candidate.stem, candidate)
-for sid in ids:
-    found = by_id.get(sid)
-    if found is None:
-        continue
-    try:
-        size = found.stat().st_size
-        with open(found, encoding='utf-8', errors='ignore') as f:
-            head = f.read(HEAD_BYTES).splitlines()
-        tail = []
-        if size > HEAD_BYTES:
-            with open(found, 'rb') as f:
-                f.seek(max(0, size - TAIL_BYTES))
-                raw = f.read().decode('utf-8', errors='ignore')
-            # First chunk is likely a partial line; drop it.
-            tail = raw.splitlines()[1:]
-    except Exception:
-        continue
-    custom_h, ai_h = titles_from_lines(head)
-    custom_t, ai_t = titles_from_lines(tail)
-    title = custom_t or custom_h or ai_t or ai_h
-    if title:
-        print(json.dumps({'session_id': sid, 'title': title}, ensure_ascii=False))
-"#;
-
-/// Pure selection of which live `remote-cc://` rows to poll for a title this
-/// tick: rows on a WORKING turn (renames and ai-titles land during turns)
-/// plus — once per daemon lifetime — every row whose title was never
-/// confirmed against the remote JSONL (heals stale launch-hint titles left
-/// over from restores). Returns (machine_key, session_id, session_path).
-fn remote_cc_title_poll_paths(
+/// Which live REMOTE agent rows to poll for a title this tick, and why the rest
+/// were not — for EVERY registered CLI, not one.
+///
+/// ⛔⛔ **THE FIX'S LOAD-BEARING CHANGE.** This selection used to open with
+/// `if session.kind != SessionKind::ClaudeCode { continue; }`, and its partner
+/// chore skipped every `remote-*://` row saying "that rides the other one". A
+/// row keyed `remote-<slug>://` for any CLI but Claude Code was refused by both
+/// and titled by nothing — it kept its birth name for the life of the session,
+/// with no event anywhere recording the refusal.
+///
+/// ⛔ **The kind check is not DELETED, it is REPLACED by the registry.** A CLI
+/// is polled when it declares a measured remote probe
+/// ([`AgentCliDescriptor::remote_live_store_title`]); one that does not is
+/// skipped as `skipped_no_reader`, which is the same UNMEASURED law the rest of
+/// the descriptor follows. Deleting the check outright would have sent an ssh
+/// round trip per tick to run a Claude Code transcript reader against nine
+/// stores that are not transcripts.
+///
+/// Selection, once a CLI is eligible: rows on a WORKING turn (renames and
+/// generated titles land during turns) plus — once per daemon lifetime — every
+/// row whose title was never confirmed against the remote store (which heals
+/// stale launch-hint titles left over from restores).
+fn remote_store_title_poll_decisions(
     live_sessions: &[ManagedSessionView],
     working_paths: &HashSet<String>,
     confirmed_paths: &HashSet<String>,
-) -> Vec<(String, String, String)> {
+) -> Vec<RemoteTitlePollDecision> {
     let mut out = Vec::new();
     for session in live_sessions {
-        if session.kind != SessionKind::ClaudeCode {
+        let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) else {
             continue;
-        }
-        let Some((machine_key, session_id)) =
-            crate::parse_remote_cc_session_path(&session.session_path)
+        };
+        // Not a remote agent row: the LOCAL chore owns it and has already
+        // reported an outcome for it. Reporting it twice would make one row's
+        // single fate read as two.
+        let Some((scheme_kind, machine_key, session_id)) =
+            yggterm_core::agent_scheme::parse_remote_agent_session_path(&session.session_path)
         else {
             continue;
         };
+        let mut decision = RemoteTitlePollDecision {
+            session_path: session.session_path.clone(),
+            kind: session.kind,
+            session_id: session_id.to_string(),
+            machine_key: machine_key.to_string(),
+            skipped: None,
+            // ⭐ The scheme's own CLI beside the row's. A row kinded one way and
+            // keyed under another CLI's scheme is the filed scheme-twin defect,
+            // and the poll is the place it becomes visible: the store consulted
+            // would be the WRONG CLI's.
+            detail: serde_json::json!({
+                "scheme_kind": format!("{scheme_kind:?}"),
+            }),
+        };
+        if descriptor.remote_live_store_title.is_none() {
+            decision.skipped = Some(CliTitleOutcome::SkippedNoReader);
+            decision.detail = serde_json::json!({
+                "scheme_kind": format!("{scheme_kind:?}"),
+                "title_authority": format!("{:?}", descriptor.title_authority),
+            });
+            out.push(decision);
+            continue;
+        }
         // ⛔ The writer's rule, asked of the writer's own predicate. Polling a
         // row whose title the owner set spends an ssh round trip to rediscover
         // a delta `set_session_title_hint` will refuse — and a refused delta
-        // never stops being a delta, so the row re-arms the chore on every
-        // tick forever. See [`ManagedSessionView::title_is_owner_set`].
+        // never stops being a delta, so the row re-arms the chore on every tick
+        // forever. See [`ManagedSessionView::title_is_owner_set`].
         if session.title_is_owner_set() {
+            decision.skipped = Some(CliTitleOutcome::SkippedOwnerTitled);
+            out.push(decision);
             continue;
         }
         if !working_paths.contains(&session.session_path)
             && confirmed_paths.contains(&session.session_path)
         {
+            decision.skipped = Some(CliTitleOutcome::SkippedTitleSettled);
+            out.push(decision);
             continue;
         }
-        out.push((
-            machine_key.to_string(),
-            session_id.to_string(),
-            session.session_path.clone(),
-        ));
+        out.push(decision);
     }
     out
 }
 
-/// Remote half of the CC title sync ([[spec-codex-cc-title-summary]]): live
-/// `remote-cc://machine/uuid` rows read their title from the remote machine's
-/// CC JSONL — the single source of truth (CC writes ai-title/custom-title
-/// there, and yggterm renames are appended there too). One ssh per machine
-/// per tick, only for the rows `remote_cc_title_poll_paths` selects.
-fn collect_remote_cc_title_syncs(
+/// Remote half of the live title sync: a `<scheme>machine/id` row reads its
+/// title from THAT machine's copy of its own CLI's store, which is the single
+/// source of truth for it.
+///
+/// One ssh per (machine, CLI) per tick, only for the rows
+/// [`remote_store_title_poll_decisions`] selects. The script and the locators
+/// both come off the descriptor, so registering a CLI's probe is the whole of
+/// wiring its remote titles.
+fn collect_remote_store_title_syncs(
     live_sessions: &[ManagedSessionView],
     working_paths: &HashSet<String>,
     ssh_targets: &[SshConnectTarget],
     confirmed_paths: &mut HashSet<String>,
 ) -> Vec<BackgroundCopyUpdate> {
-    let targets = remote_cc_title_poll_paths(live_sessions, working_paths, confirmed_paths);
-    if targets.is_empty() {
-        return Vec::new();
+    let decisions =
+        remote_store_title_poll_decisions(live_sessions, working_paths, confirmed_paths);
+    let mut sweep = CliTitleSweep::new("daemon", CliTitleChore::Remote);
+    let mut by_group: HashMap<(String, SessionKind), Vec<RemoteTitlePollDecision>> = HashMap::new();
+    for decision in decisions {
+        match decision.skipped {
+            Some(outcome) => sweep.record(
+                &decision.session_path,
+                decision.kind,
+                &decision.session_id,
+                outcome,
+                None,
+                decision.detail.clone(),
+            ),
+            None => by_group
+                .entry((decision.machine_key.clone(), decision.kind))
+                .or_default()
+                .push(decision),
+        }
     }
-    let mut by_machine: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (machine_key, session_id, session_path) in targets {
-        by_machine
-            .entry(machine_key)
-            .or_default()
-            .push((session_id, session_path));
-    }
+
     let mut updates = Vec::new();
-    for (machine_key, rows) in by_machine {
+    for ((machine_key, kind), rows) in by_group {
+        // Both are `Some` by construction — the decision list only holds a row
+        // whose descriptor declares a probe — but neither is unwrapped: a
+        // registry edit that removed one mid-flight would otherwise panic the
+        // chore rather than report it.
+        let Some(probe) = yggterm_core::agent_cli::agent_cli_descriptor(kind)
+            .and_then(|descriptor| descriptor.remote_live_store_title)
+        else {
+            continue;
+        };
         let Some(target) = ssh_targets
             .iter()
             .find(|target| background_machine_key(&target.label) == machine_key)
         else {
+            // ⭐ PREVIOUSLY A BARE `continue`. This daemon has no way to reach
+            // the machine the row names, which is a different fault from "the
+            // store had no title" and needs a different repair — and it used to
+            // look exactly like silence.
+            for row in &rows {
+                sweep.record(
+                    &row.session_path,
+                    row.kind,
+                    &row.session_id,
+                    CliTitleOutcome::StoreUnreachable,
+                    Some("no_ssh_target"),
+                    serde_json::json!({ "machine": machine_key, "reason": "no_ssh_target" }),
+                );
+            }
             continue;
         };
-        // The store glob leads, the ids follow — see the script's argv contract.
-        let mut args = crate::remote_cc_scan_args();
-        args.extend(rows.iter().map(|(id, _)| id.clone()));
+        // The locators lead, then the `--` separator, then the ids. Where a
+        // store lives is the registry's answer, never the script's.
+        let locators = yggterm_core::agent_cli::agent_cli_descriptor(kind)
+            .map(|descriptor| descriptor.remote_store_title_locators())
+            .unwrap_or_default();
+        if locators.is_empty() {
+            continue;
+        }
+        let mut args = locators;
+        args.push("--".to_string());
+        args.extend(rows.iter().map(|row| row.session_id.clone()));
         let lines = match crate::run_remote_python_lines(
             &target.ssh_target,
             target.prefix.as_deref(),
-            REMOTE_CC_TITLE_SCRIPT,
+            probe.script,
             &args,
         ) {
             Ok(lines) => lines,
             // ssh failed: leave the rows unconfirmed so the next tick retries
             // (the chore's idle backoff bounds the retry rate).
-            Err(_) => continue,
-        };
-        let mut titles: HashMap<String, String> = HashMap::new();
-        for line in &lines {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
-                && let (Some(id), Some(title)) = (
-                    value.get("session_id").and_then(|v| v.as_str()),
-                    value.get("title").and_then(|v| v.as_str()),
-                )
-            {
-                titles.insert(id.to_string(), title.trim().to_string());
-            }
-        }
-        for (session_id, session_path) in rows {
-            confirmed_paths.insert(session_path.clone());
-            let Some(title) = titles.get(&session_id).filter(|title| !title.is_empty()) else {
-                continue;
-            };
-            let current = live_sessions
-                .iter()
-                .find(|session| session.session_path == session_path)
-                .map(|session| session.title.as_str())
-                .unwrap_or("");
-            if title.as_str() != current {
-                if let Ok(home) = crate::resolve_yggterm_home() {
-                    append_trace_event(
-                        &home,
-                        "daemon",
-                        "title_trigger",
-                        "remote_cc_title_pickup",
+            Err(error) => {
+                for row in &rows {
+                    sweep.record(
+                        &row.session_path,
+                        row.kind,
+                        &row.session_id,
+                        CliTitleOutcome::StoreUnreachable,
+                        Some("ssh_failed"),
                         serde_json::json!({
-                            "session_path": session_path,
-                            "machine_key": machine_key,
-                            "previous_title": current,
-                            "new_title": title,
+                            "machine": machine_key,
+                            "reason": "ssh_failed",
+                            "error": error.to_string(),
                         }),
                     );
                 }
-                updates.push(BackgroundCopyUpdate {
-                    session_path,
-                    title: Some(title.clone()),
-                    summary: None,
-                });
+                continue;
+            }
+        };
+        // ⛔ The CANDIDATES come back raw and the CHOICE is made here, with the
+        // same predicate the local reader uses. Deciding "what counts as a
+        // title" in the remote script would put a second encoding of it on the
+        // far side of an ssh hop, free to drift for a whole release.
+        let mut titles: HashMap<String, String> = HashMap::new();
+        for line in &lines {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(id) = value.get("session_id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let candidates: Vec<String> = value
+                .get("candidates")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(title) = (probe.choose)(&candidates) {
+                let title = title.trim().to_string();
+                if !title.is_empty() {
+                    titles.insert(id.to_string(), title);
+                }
             }
         }
+        for row in rows {
+            confirmed_paths.insert(row.session_path.clone());
+            let current = live_sessions
+                .iter()
+                .find(|session| session.session_path == row.session_path)
+                .map(|session| session.title.as_str())
+                .unwrap_or("");
+            let Some(title) = titles.get(&row.session_id) else {
+                sweep.record(
+                    &row.session_path,
+                    row.kind,
+                    &row.session_id,
+                    CliTitleOutcome::NoTitleInStore,
+                    None,
+                    serde_json::json!({
+                        "machine": machine_key,
+                        "id_origin": CliIdOrigin::declared_for(row.kind).label(),
+                    }),
+                );
+                continue;
+            };
+            if title.as_str() == current {
+                sweep.record(
+                    &row.session_path,
+                    row.kind,
+                    &row.session_id,
+                    CliTitleOutcome::SkippedTitleSettled,
+                    None,
+                    serde_json::json!({ "reason": "store_agrees_with_row" }),
+                );
+                continue;
+            }
+            sweep.record(
+                &row.session_path,
+                row.kind,
+                &row.session_id,
+                CliTitleOutcome::PickedUp,
+                Some(title),
+                serde_json::json!({
+                    "machine": machine_key,
+                    "previous_title": current,
+                    "new_title": title,
+                }),
+            );
+            updates.push(BackgroundCopyUpdate {
+                session_path: row.session_path,
+                title: Some(title.clone()),
+                summary: None,
+            });
+        }
     }
+    sweep.finish();
     updates
 }
 
@@ -12896,7 +13056,7 @@ fn run_background_copy_chore(
         &working_paths,
         generation_enabled,
     )?;
-    updates.extend(collect_remote_cc_title_syncs(
+    updates.extend(collect_remote_store_title_syncs(
         &live_sessions,
         &working_paths,
         &ssh_targets,
@@ -27650,7 +27810,7 @@ mod tests {
             .split("let local_root = if scan_local_tree {")
             .nth(1)
             .and_then(|suffix| suffix.split("\n    };").next())
-            && gated.contains("collect_remote_cc_title_syncs(")
+            && gated.contains("collect_remote_store_title_syncs(")
         {
             violations.push("the CC title sync must not be gated on the tree scan".to_string());
         }
@@ -27672,7 +27832,7 @@ mod tests {
             body.len()
         );
         assert!(
-            body.contains("collect_remote_cc_title_syncs("),
+            body.contains("collect_remote_store_title_syncs("),
             "the per-owned-session half must still run every tick"
         );
         let violations = tree_scan_gate_violations(body);
@@ -27691,7 +27851,7 @@ mod tests {
         &settings,
         &local_root,
     )?;
-    updates.extend(collect_remote_cc_title_syncs(&live_sessions));
+    updates.extend(collect_remote_store_title_syncs(&live_sessions));
 "#;
         let violations = tree_scan_gate_violations(ungated);
         assert!(
@@ -27706,7 +27866,7 @@ mod tests {
     let local_root = if scan_local_tree {
         Some(store.load_codex_tree(&settings)?)
     } else {
-        updates.extend(collect_remote_cc_title_syncs(&live_sessions));
+        updates.extend(collect_remote_store_title_syncs(&live_sessions));
         None
     };
     daemon_copy_chore_should_scan_local_tree(generation_enabled, is_superseded);
@@ -28932,12 +29092,32 @@ mod tests {
         );
     }
 
+    /// Polled paths, in order, out of a decision list.
+    fn polled_paths(decisions: &[super::RemoteTitlePollDecision]) -> Vec<&str> {
+        decisions
+            .iter()
+            .filter(|decision| decision.skipped.is_none())
+            .map(|decision| decision.session_path.as_str())
+            .collect()
+    }
+
+    /// The outcome recorded for one row, or `None` if it was polled.
+    fn skip_outcome<'a>(
+        decisions: &'a [super::RemoteTitlePollDecision],
+        path: &str,
+    ) -> Option<yggterm_core::cli_plane::CliTitleOutcome> {
+        decisions
+            .iter()
+            .find(|decision| decision.session_path == path)
+            .and_then(|decision| decision.skipped)
+    }
+
     #[test]
-    fn remote_cc_title_poll_selects_working_and_unconfirmed_rows() {
-        // Working remote-cc rows are always polled (renames/ai-titles land on
-        // working turns); idle rows are polled only until their title has been
-        // confirmed once against the remote JSONL (heals stale launch hints
-        // after a restore). Non-CC and non-remote-cc rows are never selected.
+    fn remote_store_title_poll_selects_working_and_unconfirmed_rows() {
+        // Working remote rows are always polled (renames and generated titles
+        // land on working turns); idle rows are polled only until their title
+        // has been confirmed once against the remote store (which heals stale
+        // launch hints after a restore). Local rows ride the other chore.
         let template = {
             let mut server = crate::YggtermServer::new(
                 false,
@@ -28960,40 +29140,52 @@ mod tests {
         };
         let sessions = vec![
             make(
-                "remote-cc://practice/aaaa",
+                "remote-cc://example-host/aaaa",
                 "aaaa",
                 crate::SessionKind::ClaudeCode,
             ),
             make(
-                "remote-cc://practice/bbbb",
+                "remote-cc://example-host/bbbb",
                 "bbbb",
                 crate::SessionKind::ClaudeCode,
             ),
             make("local://cccc", "cccc", crate::SessionKind::ClaudeCode),
             make(
-                "remote-session://practice/dddd",
+                "remote-session://example-host/dddd",
                 "dddd",
                 crate::SessionKind::Codex,
             ),
         ];
         let working: std::collections::HashSet<String> =
-            ["remote-cc://practice/aaaa".to_string()].into();
+            ["remote-cc://example-host/aaaa".to_string()].into();
         let mut confirmed = std::collections::HashSet::new();
         // First tick: both remote-cc rows selected (aaaa working, bbbb unconfirmed).
-        let picked = super::remote_cc_title_poll_paths(&sessions, &working, &confirmed);
-        let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
+        let picked = super::remote_store_title_poll_decisions(&sessions, &working, &confirmed);
         assert_eq!(
-            paths,
-            vec!["remote-cc://practice/aaaa", "remote-cc://practice/bbbb"]
+            polled_paths(&picked),
+            vec!["remote-cc://example-host/aaaa", "remote-cc://example-host/bbbb"]
         );
-        assert_eq!(picked[0].0, "practice");
-        assert_eq!(picked[0].1, "aaaa");
+        assert_eq!(picked[0].machine_key, "example-host");
+        assert_eq!(picked[0].session_id, "aaaa");
+        // ⛔⛔ THE DEFECT'S OWN ASSERTION. A remote codex row is a CLI with no
+        // measured remote probe: it must be REPORTED as skipped for that
+        // reason, never silently dropped the way the CC-only kind check did.
+        // Silence here is what let a remote row of every other CLI keep its
+        // birth name with nothing anywhere recording the refusal.
+        assert_eq!(
+            skip_outcome(&picked, "remote-session://example-host/dddd"),
+            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader),
+            "a CLI with no remote probe is skipped WITH A REASON, not dropped"
+        );
         // Once confirmed, an idle row is no longer polled; a working row still is.
-        confirmed.insert("remote-cc://practice/aaaa".to_string());
-        confirmed.insert("remote-cc://practice/bbbb".to_string());
-        let picked = super::remote_cc_title_poll_paths(&sessions, &working, &confirmed);
-        let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
-        assert_eq!(paths, vec!["remote-cc://practice/aaaa"]);
+        confirmed.insert("remote-cc://example-host/aaaa".to_string());
+        confirmed.insert("remote-cc://example-host/bbbb".to_string());
+        let picked = super::remote_store_title_poll_decisions(&sessions, &working, &confirmed);
+        assert_eq!(polled_paths(&picked), vec!["remote-cc://example-host/aaaa"]);
+        assert_eq!(
+            skip_outcome(&picked, "remote-cc://example-host/bbbb"),
+            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedTitleSettled)
+        );
 
         // ⛔ THE LIVELOCK LOCK. A row the owner titled is refused by
         // `set_session_title_hint`, so polling it can only rediscover a delta
@@ -29004,11 +29196,15 @@ mod tests {
         let mut owner_titled = sessions.clone();
         owner_titled[0].title_is_explicit = true;
         owner_titled[0].title = "11.15 [daemon-burn]".to_string();
-        let picked = super::remote_cc_title_poll_paths(&owner_titled, &working, &confirmed);
+        let picked = super::remote_store_title_poll_decisions(&owner_titled, &working, &confirmed);
         assert!(
-            picked.is_empty(),
+            polled_paths(&picked).is_empty(),
             "an owner-titled working row must not be polled: the write is refused, \
              so every poll re-detects the same permanently-unsatisfiable delta"
+        );
+        assert_eq!(
+            skip_outcome(&picked, "remote-cc://example-host/aaaa"),
+            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedOwnerTitled)
         );
 
         // ⚠ The empty-title arm: `title_is_explicit` with nothing in the title
@@ -29016,9 +29212,148 @@ mod tests {
         let mut explicit_but_blank = sessions.clone();
         explicit_but_blank[0].title_is_explicit = true;
         explicit_but_blank[0].title = "   ".to_string();
-        let picked = super::remote_cc_title_poll_paths(&explicit_but_blank, &working, &confirmed);
-        let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
-        assert_eq!(paths, vec!["remote-cc://practice/aaaa"]);
+        let picked =
+            super::remote_store_title_poll_decisions(&explicit_but_blank, &working, &confirmed);
+        assert_eq!(polled_paths(&picked), vec!["remote-cc://example-host/aaaa"]);
+    }
+
+    /// ⛔⛔ THE REGRESSION GATE FOR THE FILED DEFECT: **a remote row for any CLI
+    /// but Claude Code was titled by nobody.**
+    ///
+    /// Two chores, and each believed the other had the row. The local chore
+    /// skipped it for its `remote-*://` scheme; the remote chore refused it for
+    /// not being Claude Code. The row kept its birth name for the life of the
+    /// session and no event anywhere recorded either refusal.
+    ///
+    /// This asserts the pair of decisions together, which is the only way to
+    /// see the gap — each half in isolation looks perfectly correct, which is
+    /// exactly why it survived.
+    #[test]
+    fn no_live_agent_row_is_refused_by_both_title_chores_without_saying_so() {
+        let template = {
+            let mut server = crate::YggtermServer::new(
+                false,
+                crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+                yggui_contract::UiTheme::ZedLight,
+            );
+            server.start_local_session(
+                crate::SessionKind::ClaudeCode,
+                Some("/home/user/proj"),
+                Some("a launch hint"),
+            );
+            server.live_sessions()[0].clone()
+        };
+        let make = |path: &str, id: &str, kind: crate::SessionKind| {
+            let mut session = template.clone();
+            session.session_path = path.to_string();
+            session.id = id.to_string();
+            session.kind = kind;
+            // A birth name, so the row is eligible on both sides.
+            session.title = "agy in proj".to_string();
+            session.title_is_explicit = false;
+            session
+        };
+        let working = std::collections::HashSet::new();
+        let confirmed = std::collections::HashSet::new();
+
+        // The reported row: an Antigravity session opened through the remote
+        // path, keyed under its own CLI's remote scheme.
+        let agy = make(
+            "remote-agy://example-host/aaaa",
+            "aaaa",
+            crate::SessionKind::Antigravity,
+        );
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(agy.kind)
+            .expect("Antigravity is registered");
+        let (outcome, detail) = super::local_store_title_skip(descriptor, &agy, &working)
+            .expect("the local chore does not serve a remote row");
+        assert_eq!(
+            outcome,
+            yggterm_core::cli_plane::CliTitleOutcome::SkippedSchemeServedElsewhere
+        );
+        assert_eq!(
+            detail.get("served_by").and_then(|value| value.as_str()),
+            Some("remote_store_chore"),
+            "the local chore hands this row on, and must be able to NAME who to"
+        );
+        let picked = super::remote_store_title_poll_decisions(
+            std::slice::from_ref(&agy),
+            &working,
+            &confirmed,
+        );
+        assert_eq!(
+            polled_paths(&picked),
+            vec!["remote-agy://example-host/aaaa"],
+            "the chore the local one handed it to must actually poll it"
+        );
+
+        // ⚠ And the honest half: a CLI whose remote store nobody has measured
+        // is still served by NOBODY — but it now SAYS so on both sides instead
+        // of falling through two `continue`s. A declared gap is findable; a
+        // silent one is what shipped.
+        let codex = make(
+            "remote-session://example-host/bbbb",
+            "bbbb",
+            crate::SessionKind::Codex,
+        );
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(codex.kind)
+            .expect("Codex is registered");
+        let (_, detail) = super::local_store_title_skip(descriptor, &codex, &working)
+            .expect("the local chore does not serve a remote row");
+        assert_eq!(
+            detail.get("served_by").and_then(|value| value.as_str()),
+            Some("nobody"),
+            "a CLI with no remote probe must be reported as unserved, not passed \
+             to a chore that will drop it"
+        );
+        let picked = super::remote_store_title_poll_decisions(
+            std::slice::from_ref(&codex),
+            &working,
+            &confirmed,
+        );
+        assert!(polled_paths(&picked).is_empty());
+        assert_eq!(
+            skip_outcome(&picked, "remote-session://example-host/bbbb"),
+            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader),
+            "the reason must reach the trace; a bare `continue` is what hid this \
+             defect through a 40,000-event window"
+        );
+    }
+
+    /// ⛔ The local chore still serves LOCAL rows of every CLI, including the
+    /// ones with no reader — and says which is which. A fix that widened the
+    /// remote half by narrowing the local one would trade one silence for
+    /// another.
+    #[test]
+    fn a_local_row_of_a_cli_with_no_measured_reader_says_so() {
+        let template = {
+            let mut server = crate::YggtermServer::new(
+                false,
+                crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+                yggui_contract::UiTheme::ZedLight,
+            );
+            server.start_local_session(crate::SessionKind::Muse, Some("/home/user/proj"), None);
+            server.live_sessions()[0].clone()
+        };
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(crate::SessionKind::Muse)
+            .expect("Muse is registered");
+        assert!(
+            descriptor.read_live_store_title.is_none(),
+            "this test describes the UNMEASURED case; wire Muse's reader and \
+             retarget it rather than deleting it"
+        );
+        let (outcome, detail) =
+            super::local_store_title_skip(descriptor, &template, &std::collections::HashSet::new())
+                .expect("a CLI with no reader is skipped");
+        assert_eq!(
+            outcome,
+            yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader
+        );
+        assert!(
+            detail.get("title_authority").is_some(),
+            "the skip must carry who owns this CLI's title, because a \
+             store-authoritative CLI with no reader is a row nothing can name"
+        );
     }
 
     /// The unchanged-source gate, which is what stops an unchanged session
