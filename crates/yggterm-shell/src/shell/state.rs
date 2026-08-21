@@ -15844,6 +15844,20 @@ struct SidebarResizeDrag {
     origin_client_x: f64,
     origin_width: f32,
 }
+/// A terminal ensure that failed, and the launch it failed for.
+///
+/// The error text is kept so a SUPPRESSED retry can still show the user why the
+/// row is dead — suppressing the retry must not also suppress the explanation,
+/// or the row goes quiet and reads as merely slow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalEnsureFailure {
+    /// The launch command the failure was about. While this is unchanged, the
+    /// ensure is being asked an identical question and will get the identical
+    /// answer.
+    launch_command: String,
+    error: String,
+}
+
 #[derive(Clone)]
 struct ShellState {
     /// One render's worth of [`RenderSnapshot`], reused while nothing wrote.
@@ -16204,6 +16218,31 @@ struct ShellState {
     terminal_bootstrap_owner_by_session: HashMap<String, String>,
     terminal_bootstrap_lease_by_session: HashMap<String, String>,
     terminal_resume_ready_paths: HashSet<String>,
+    /// Rows whose terminal ensure has ALREADY FAILED, and the exact launch the
+    /// failure was about.
+    ///
+    /// ⛔⛔ **AN UNRESTORABLE ROW MUST FAIL ONCE, NOT ONCE PER TREE CHANGE.**
+    /// Measured on the GUI host 2026-08-21 with an isolation test — one create
+    /// alone, quiet controls either side — a SINGLE row creation drove five full
+    /// terminal mounts and four bootstrap resets, every one of them aimed at the
+    /// same unmountable active row, every one ending in `ensure_error`, and every
+    /// one re-arming with the mount epoch climbing. A remove cost nothing. So the
+    /// blinking, the ghost frames and the broken TUI paint the owner sees are a
+    /// create-driven retry loop against one row that cannot ever succeed.
+    ///
+    /// ⚖ **KEYED ON THE LAUNCH, NOT ON THE MOUNT.** The mount identity carries
+    /// the epoch and the epoch CLIMBS on every retry, so keying on it would
+    /// suppress nothing — each attempt would look new. What actually cannot
+    /// change between attempts is the launch command: while that is the same
+    /// string, `ensure` is being asked the identical question and will get the
+    /// identical answer. A row whose launch is repaired gets a fresh attempt for
+    /// free, which is the property that keeps this from becoming a latch nobody
+    /// can clear.
+    ///
+    /// ⚠ In the SHELL rather than in the component, deliberately: the component
+    /// is torn down and rebuilt by the very churn this exists to stop, so a
+    /// per-component memory forgets exactly when it is needed.
+    terminal_ensure_failed: HashMap<String, TerminalEnsureFailure>,
     /// When the input gate first refused the ACTIVE row, per session path.
     /// The gate has ~20 removal sites and no deadline of its own, so this is
     /// the clock that turns "untypeable forever" into "untypeable for N
@@ -18722,6 +18761,7 @@ impl ShellState {
             terminal_bootstrap_owner_by_session: HashMap::new(),
             terminal_bootstrap_lease_by_session: HashMap::new(),
             terminal_resume_ready_paths: HashSet::new(),
+            terminal_ensure_failed: HashMap::new(),
             input_gate_denied_since_ms: HashMap::new(),
             input_gate_stuck_reported: HashSet::new(),
             retained_terminal_session_paths: HashSet::new(),
@@ -25009,6 +25049,48 @@ impl ShellState {
         };
         self.terminal_attach_in_flight.contains(&session_path)
     }
+    /// Remember that this row's ensure failed, for the launch it failed on.
+    fn note_terminal_ensure_failed(&mut self, session_path: &str, error: &str) {
+        let launch_command = self
+            .server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == session_path)
+            .map(|session| session.launch_command.clone())
+            .unwrap_or_default();
+        self.terminal_ensure_failed.insert(
+            session_path.to_string(),
+            TerminalEnsureFailure {
+                launch_command,
+                error: error.to_string(),
+            },
+        );
+    }
+
+    /// The recorded failure for this row, IF the launch it failed on is still
+    /// the launch we would retry with.
+    ///
+    /// ⛔ Returns `None` the moment the launch command changes, which is the
+    /// only automatic way out of the suppression and the reason this is not a
+    /// latch: a repaired row retries without anyone clearing anything. A row
+    /// the daemon no longer holds also reads `None` rather than staying
+    /// suppressed on a launch nobody can see.
+    fn terminal_ensure_already_failed(&self, session_path: &str) -> Option<&TerminalEnsureFailure> {
+        let failure = self.terminal_ensure_failed.get(session_path)?;
+        let current = self
+            .server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == session_path)
+            .map(|session| session.launch_command.clone())?;
+        (current == failure.launch_command).then_some(failure)
+    }
+
+    /// Forget a row's recorded failure — an explicit retry, or the row going away.
+    fn clear_terminal_ensure_failure(&mut self, session_path: &str) {
+        self.terminal_ensure_failed.remove(session_path);
+    }
+
     fn maybe_finish_terminal_surface_request_for_session(&mut self, session_path: &str) {
         if self.terminal_attach_in_flight.contains(session_path) {
             return;

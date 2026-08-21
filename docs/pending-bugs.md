@@ -279,29 +279,68 @@ repeat window B — but activating a row takes the screen from whoever is at it,
 waits for a moment when that is acceptable, or for the duplicate to be removed. Until
 then the honest statement is the conjunction above, not "creates are expensive".
 
-⭐ **AND THE SAME DEFAULT HAS DONE THIS BEFORE, ON A DIFFERENT SCHEME.**
-`docs/cli-integration.md` already records the identical error string from
-2026-08-19: an `agy` row opened as Codex because `connect_session_kind_for_path()`
-kept a hand-written list of schemes, missed one, and **fell through to `Codex` as
-its default**. That fix went in on the READ side and made the lookup
-registry-derived. The WRITE side still has the same default:
+### ✅ ROOT-CAUSED AND FIXED 2026-08-21 (11.10) — AND THE CITED SUSPECT WAS INNOCENT
 
-```rust
-// crates/yggterm-core/src/agent_scheme.rs:467
-pub fn remote_agent_session_path(kind: SessionKind, machine_key: &str, session_id: &str) -> String {
-    let prefix = remote_agent_row_schemes()
-        .find(|scheme| scheme.kind == Some(kind))
-        .map(|scheme| scheme.prefix)
-        .unwrap_or("remote-session://");     // ⛔ the Codex scheme, for ANY unmatched kind
-```
+**The hypothesis this entry carried is DISPROVEN, and the disproof is one line.**
+`remote-cc://` IS a registered ClaudeCode scheme (`RowIdentity` · `Remote` · `agent`), so
+`remote_agent_session_path(ClaudeCode, …)` finds it and **never reaches**
+`unwrap_or("remote-session://")`. That default fires only for a kind with no registered
+remote row scheme, which ClaudeCode is not. ⇒ **The scheme was correct for the kind it was
+handed. The KIND was the lie.** The default is left alone deliberately — it is load-bearing
+for kinds that legitimately have no remote arm, and the server crate already has an
+Option-returning composer that refuses those by name.
 
-⇒ **A kind the registry cannot place does not fail here. It becomes a Codex row.**
-The row then looks entirely well-formed, is indistinguishable from a real saved
-Codex session everywhere downstream, and only reveals itself when something tries
-to restore it — which is a mount, i.e. the expensive path, on a row the user may
-already be sitting on. ⚠ This is a hypothesis with the shape and the symptom
-matching exactly; it is NOT yet proven to be the call that minted this particular
-row, and the lane that takes it should prove that before changing the default.
+**What actually minted the twin**, proved rather than reasoned about:
+
+1. **The trace names the function.** `remote_session/open` fired for exactly this session id
+   (`cwd` = the row's own worktree, `machine_key` = its host). Only
+   `open_remote_scanned_session_with_view` emits it.
+2. **The scan proves which branch it took.** That machine's scan held **748 sessions and not
+   this one**, so the lookup missed.
+3. **That branch had two fallbacks three lines apart, and they AGREED**: the path became
+   `remote-session://<machine>/<id>` and the kind became `Codex`. Agreeing defaults are the
+   dangerous kind — what comes out is a well-formed row, so nothing downstream can tell it was
+   invented. The resulting `resume-codex … --require-existing` produces verbatim the error
+   text quoted above.
+
+⭐ **AND THE ROOT IS ONE LINE ABOVE THE MINT, IN THE CALLER.** `focus_live_session` parsed the
+kind off the row path it was handed, bound it to **`_kind`**, and dropped it on the floor
+immediately before calling a verb whose signature — `(machine_key, session_id)` — cannot
+carry it. The fact was in its hand, named, and discarded; the verb then had to invent it.
+⇒ **The signature was the bug.** The verb now takes the caller's answer and resolves in four
+tiers: the scan's own declaration, the caller's stated kind, a row already held for that id
+(the daemon owned the correct `remote-cc://` row the whole time it minted the twin), then
+**refuse**. A guess here is not a degraded answer, it is a fabricated one.
+
+⚠ **In-process only, and that is a constraint not a shortcut.** The daemon's
+`OpenRemoteSession` request carries no kind; adding one is a WIRE change that needs a version
+bump in the same commit as the shape stamp. A socket caller therefore still passes nothing and
+falls to the evidence tiers, which is correct — it genuinely does not know.
+
+⚠ **A test was an accomplice.** `reopening_remote_scanned_session_refreshes_stale_launch_command`
+built a machine with an EMPTY scan and asserted `resume-codex` — so it passed for precisely the
+reason the twin shipped, and could never have caught it. Its premise now states the scanned
+Codex session it is actually about.
+
+### ✅ THE RETRY HALF IS FIXED TOO — fail once, stay failed
+
+Nothing recorded that a row had already failed, so every add asked the identical question at
+full price. The shell now remembers the failure and the mount path consults it **before** the
+ensure. ⚖ Keyed on the **launch command**, not the mount identity: the identity carries the
+epoch and the epoch CLIMBS on every retry, so keying on it would suppress nothing — every
+attempt would look new. The launch command is what cannot change between two attempts that
+will get the same answer, and when it does change the row retries with nobody clearing
+anything, which keeps this a memory rather than a latch. Held in the shell, not the component,
+because the component is torn down and rebuilt by the very churn this exists to stop. ⚠ The
+explanation is re-shown rather than swallowed — a suppressed retry that also went silent would
+leave a dead row looking merely slow, which is worse than the churn.
+
+⛔ **STILL OPEN, and it is the part the fixes cannot answer.** Whether a create against a
+*healthy* active row is free. The conjunction this entry established — an add AND an
+unmountable active row — is unchanged; both halves of the second condition are now fixed, so
+the decisive test is finally cheap: repeat window B once a mountable row is active. Until that
+is run, "creates are expensive" remains unproven, and the other **32 of 37** resets that fell
+outside any row-set change still point at a second driver nobody has named.
 
 ⚠ **Note what dual presence does and does not cover.** `AGENTS.md` "Session
 display = dual presence" makes one session render twice **sharing one
@@ -649,11 +688,13 @@ differing** (`scripts/underglass-sandbox.sh`, Wayland-native, no XWayland):
 ⚠ `11.9` before `11.10` means the ten-before-two trap is now pinned on the render path in
 pixels, not only in the comparator's own suite.
 
-**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image, so his
-sidebar draws the old order until it restarts — and that restart is deliberately not taken
-here (he is using the machine, and `ygg-roll-watch.sh` will not restart a GUI on a timer by
-design). **Falsifier:** after his GUI comes up on an image containing `10711945`, one
-screenshot of the live sidebar shows `11.0`'s members in ascending order with no verb run.
+**⛔ WHAT KEEPS THIS OPEN.** The owner's GUI is still running the pre-fix image
+(`139c6a39`, checked after the land), so his sidebar draws the old order until it restarts.
+That restart is not taken by this lane — he is using the machine. ⚠ It does not need a human
+any more either: an owner ruling reversed the roll's old refusal and `ygg-roll-watch.sh` now
+notifies, waits out a grace window and restarts the client, so the next roll carries this.
+**Falsifier:** once the GUI is up on an image containing `f9626a58`, one screenshot of the
+live sidebar shows `11.0`'s members in ascending order with no verb run.
 
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
@@ -2317,6 +2358,37 @@ its name). **Cheap next step for whoever takes this:** run the suite under `--te
 beside a heavy build; if it survives, the population is timing, and an isolation harness is
 aimed at the wrong thing.
 
+**⛔⛔ THE POPULATION IS NOW COUNTED, 2026-08-21 (11.10), AND IT IS TWENTY.** The 11.19
+narrowing named one instance; a sweep of the server crate finds that the same shape has
+**twenty distinct process-global environment variables** mutated from inside that one test
+binary, across ~87 call sites — `CODEX_HOME` (18), `YGGTERM_APPEARANCE` and the terminal
+appearance constants, `COLORFGBG`, `NO_COLOR`, `YGGTERM_HOME`, `HOME`, `PATH`, `TERM` and
+the rest. Every one is set, used and restored while sibling tests run on other threads, and
+several are read by product paths those siblings exercise. ⇒ **A per-test isolation harness
+cannot fix this and neither can `--test-threads=1` as a habit somebody remembers**: the
+binary is only sound single-threaded, and nothing says so.
+
+**⭐ WHAT LANDED, AND WHAT IT DELIBERATELY IS NOT.** A contract test
+(`the_process_globals_this_binarys_tests_mutate_are_all_declared`) now scans the crate and
+fails on any env global not on a declared list, each sanctioned *because it already exists,
+not because it is safe*. It does not fix a single flake. It stops the population growing
+silently, which is the expensive half — a flake whose cause is one of twenty invisible
+globals cannot be reasoned about at all. ⚠ Its first run found ITSELF: a scanner that spells
+its own pattern matches its own source, so the needles are assembled with `concat!`.
+
+**Sampling, same session, reported because a negative is a result:** three full server-suite
+runs at default threads beside a continuous `cargo build` in another worktree — **all green**.
+So this did not reproduce on demand under the companion-build condition, and the two
+hypotheses remain unseparated by sampling. ⚠ One earlier run exited **101 with no failing
+test named at all** and its log was discarded by the first harness version; the harness now
+keeps every non-zero run's output, because "a non-zero exit that names nothing" is its own
+finding and this entry has already lost one failure's identity that way.
+
+**⇒ NEXT, AND IT BEATS MORE SAMPLING:** thread the seams. `local_agent_store_vouches_for_
+session_in` and `collect_live_store_title_syncs_in` already show the pattern — the product
+path is told where to look instead of reading a global. Every variable removed from the
+declared list is one fewer way for two unrelated tests to collide.
+
 **⭐⭐ ONE INSTANCE NOW HAS ITS SHARED STATE NAMED — 2026-08-21 (11.19), and it is SHARED STATE,
 not timing.** `agent_arm_matrix::locality_does_not_fork_the_invocation` failed once in a
 full-suite run and passed in isolation. The assertion diff names the culprit outright: the two
@@ -3429,6 +3501,16 @@ where a newline is content, backspace, Ctrl-C/Ctrl-U, and a second walker beside
 on exactly the hard sequences). Comparison and Enter happen under one lock, so nothing that has
 reached the daemon can land between them.
 
+⛔⛔ **AND THE STAMP WAS NOT RE-CUT, SO MAIN IS RED RIGHT NOW — measured 2026-08-21 (11.10) while
+working on an unrelated lane.** `daemon::tests::protocol_shape_stamp_forces_version_bump` FAILS on
+a clean `origin/main`: computed `0xb0be92515d8e30a0` against a stamp still reading 3.1.16, on a
+workspace at 3.1.26. The obligation is written three paragraphs above this one and was missed at
+land time, which is the ordinary way this class survives — a warning in the entry is not a gate.
+⚠ It also means the wire change is shipping under a version whose stamp describes a DIFFERENT
+shape, which is the lost-PTY latch storm the stamp exists to prevent, and every lane's full
+server suite is red until it is re-cut. ⇒ Belongs to whoever cuts the next release number, not
+to a lane; **whoever cuts it must take the stamp with it in the same commit.**
+
 ⚠ **The residual gap is named rather than papered over:** a keystroke still travelling from the
 client has reached nobody, and no daemon-side check can see it. This narrows the window to the
 client→daemon hop.
@@ -3595,7 +3677,9 @@ on a host whose store has no such transcripts, so the resume could never succeed
 exists for either row on either host**, the launch is long dead, and the rows have already
 survived one daemon restart in that state — nothing times a RemoteBootstrap out, fails it
 loudly, or marks it dead. They are also the pair whose arrangement dead-head made them
-invisible on the sidebar (the [11.10] row-set entry), so the two defects compounded: a husk
+invisible on the sidebar (that arrangement entry is closed — `visible_rows` draws an
+orphaned member at top level, and a departed head's entry is now swept once its absence is
+confirmed), so the two defects compounded at the time: a husk
 nobody could see. The husks are left in place as specimens; the wake relay that spawned them
 (a parked-row wake addressed at a session that does not exist on the target) is its own
 defect for the plane that owns the booter's send path.
