@@ -2336,6 +2336,7 @@ is the fix. If the condition has lapsed, you have measured the weather.
 ⇒ Applied to the swap-residency alarm: swap 7.15 GiB against a 4.0 GiB old trigger —
 armed — with zero incidents from the fixed version across ten minutes, against a prior
 0.82/min. That is a falsifier answered; "no incidents lately" would not have been.
+
 ## `ytrace tail` cannot compute a RATE in either direction (measured 2026-08-21)
 
 The cap (~20 records) is already noted above as inflating frequency. It distorts the
@@ -2399,4 +2400,5 @@ two SCAFFOLD blocks ("… stays attached", "Launch command prepared:"), which th
 old heuristic already treated as empty — so it coerced correctly and the sandbox
 comes up green on both arms. The discriminating input is a transcript of TOOL
 CALLS with no prose, and no exposed verb injects one into a live row.
+
 
