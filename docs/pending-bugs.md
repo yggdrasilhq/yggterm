@@ -12,6 +12,76 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [11.13] A SPAWNED ROW IS AUTO-SUBSCRIBED BY BARE UUID, LAPSES UNWATCHED, AND NEVER WAKES
+
+Spawning a row auto-subscribes it to the booter and stores the row as a **bare uuid**. The
+watcher resolves rows against the GUI host's listing, where that session appears as an
+**addressable path** (`remote-cc://<host>/<uuid>`). The bare uuid matches nothing, the row is
+counted absent, and after 3 consecutive listings the subscription LAPSES:
+`⛔ LAPSED — absent from 3 consecutive row listings · NOT WATCHED; re-subscribe to clear`.
+
+⇒ **The row is then never booted.** Measured: a successor spawned at 11:50 sat at `boots: 0`
+for **193 minutes** having ended its turn expecting to be woken, while a monitor subscription
+created BY HAND with the full path was booted reliably over the same period, on the same host,
+by the same watcher. The stored identifier is the only difference. ⚠ The row is visible in the
+listing the whole time — this is a key-matching failure, not a visibility one.
+
+**Why this is worse than a missed wake-up: it breaks THE RELAY, silently.**
+1. ⛔ **The handover looks complete.** The spawn returns, the row works, lands, writes a
+   successor brief — and nothing ever wakes it. The chain stops with every artefact present
+   and no error anywhere.
+2. ⛔ **The booter WARNS at subscribe time and subscribes anyway** — *"does not resolve to a
+   live row on host X — subscribing anyway; the first tick will retire it if it stays gone"* —
+   then does exactly that. The warning goes to a log nobody tails, at the one moment the caller
+   is not reading, while the reply says `subscribed`.
+3. ⚠ **Invisible from inside the row:** a session cannot tell a watched subscription from an
+   unwatched one. Both look like "I deferred and stood by".
+
+**Fix: resolve the row AT SUBSCRIBE TIME.** The verb already accepts `scheme://host/<uuid>`,
+and the subscriber already knows how to look a session up — it warns that it could not. ⛔ Do
+not refuse outright: a row may legitimately be subscribed before it appears. Resolve, store the
+addressable form, and re-resolve on the tick that would otherwise count a sighting as gone.
+
+**Workaround:** after spawning, re-subscribe with the full path —
+`ygg-booter.py subscribe "remote-cc://<host>/<uuid>" --campaign <c> --kind task` — which prints
+`⭐ CLEARING A LAPSE` and resets the sightings. ⚠ **The tell: `boots: 0` on a row that has been
+quiet for hours is this bug, not a quiet campaign.**
+
+## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
+
+⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
+mentions it — collateral loss in a file rewrite, not a fix. This file's own rule is that an
+entry is deleted in the same commit as its VERIFIED FIX. Re-measured 2026-08-21 and still real.
+
+The fleet scripts live at `.agents/skills/yggterm-agent-fleet/*.py`, INSIDE the repo, so every
+git worktree has its own copy — and both the watcher and any agent invoking a verb resolve them
+by **RELATIVE** path. The live watcher's command line is literally
+`python3 .agents/skills/yggterm-agent-fleet/ygg-booter.py watch --host … --interval …`.
+
+⇒ **Which copy runs is decided by the process CWD**, which nobody chose. Measured: the running
+watcher sat in a worktree missing `7d2fa0ea` (*"the resolver named the wrong host, and the
+watchdog that types had no guards"*) — so the fleet's live watchdog was running the UNGUARDED
+version of the code that TYPES INTO ROWS.
+
+These scripts are the fleet's INSTRUMENTS: a lane on a stale copy gets stale answers ABOUT
+OTHER LANES and cannot tell, because the script reports success in its own terms either way.
+⚠ Same shape as the split install the daemon audit reports for the BINARIES — which is why the
+audit now also checks the scripts, and why that check took three tries to get right (see below).
+
+**Wanted:** either the audit check becomes shared tooling rather than one host's private hook,
+or the scripts stop being resolved relatively — one installed copy on PATH, in-repo tree as its
+source. ⛔ Never fix an instance by copying the file into another worktree: those are live
+checkouts holding other lanes' uncommitted work.
+
+⭐ **THREE WAYS A CHECKER IS CONFIDENTLY WRONG**, all hit while writing that check, all shipped
+looking fine: `sha1sum` of EMPTY input is a valid hash (guard the CONTENT, not the hash);
+`$( )` STRIPS TRAILING NEWLINES so a captured blob never matches the file it came from — which
+flagged every host, and *looked* right because the fleet genuinely carries drift; and
+`origin/main` is a LOCAL CACHE until fetched. ⛔ And the fourth, worst one: **"differs from
+main" is NOT "behind main"** — a watcher in a lane worktree legitimately carries unmerged work,
+so a hash comparison flags it every session for being AHEAD, which is how an audit teaches
+people to ignore it. The right question is `git log origin/main --not HEAD -- <path>`.
+
 ## [11.11] A COMPOSITOR-DRIVEN FULLSCREEN KEEPS ITS ROUNDED CORNERS, SO THEY COMPOSITE ONTO BLACK
 
 **Status:** OPEN
