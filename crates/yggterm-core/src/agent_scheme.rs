@@ -479,6 +479,21 @@ pub fn is_remote_agent_session_path(path: &str) -> bool {
     remote_agent_row_schemes().any(|scheme| trimmed.starts_with(scheme.prefix))
 }
 
+/// The MACHINE a remote row lives on, read off the row's own path — the inverse
+/// of [`remote_agent_session_path`], and `None` for a row on this machine.
+///
+/// ⚖ Registry-driven over every remote scheme, not a match on the two spellings
+/// somebody remembered: the composer already derives the prefix from the
+/// registry, and an inverse that did not would answer `None` for the next CLI
+/// registered — which reads on screen as "this row is local".
+pub fn remote_row_machine_key(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start();
+    let rest = remote_row_schemes()
+        .find_map(|scheme| trimmed.strip_prefix(scheme.prefix))?;
+    let key = rest.split('/').next()?.trim();
+    (!key.is_empty()).then_some(key)
+}
+
 /// Returns true if the path begins with any registered remote row scheme (agent or ssh).
 pub fn is_remote_row_path(path: &str) -> bool {
     let trimmed = path.trim_start();

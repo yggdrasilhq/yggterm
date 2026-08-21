@@ -703,21 +703,30 @@ pub enum SessionSource {
 
 pub use yggterm_core::SessionKind;
 
-/// A row's title at birth, before the CLI or the LLM chore names it.
+/// A row's title at birth, before the CLI or the LLM chore names it —
+/// `New {machine} {what it is}`, for every kind alike.
 ///
-/// A SHELL is titled by its working directory, because that is all a shell is.
-/// Every agent CLI — and a document — keeps the caller's fallback, because its
-/// real title arrives shortly from its own store or the generation chore, and a
-/// cwd there would be overwritten within a turn.
-fn live_session_default_title(kind: SessionKind, cwd: Option<&str>, fallback: &str) -> String {
-    match kind {
-        SessionKind::Shell | SessionKind::SshShell => cwd
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| fallback.to_string()),
-        _ => fallback.to_string(),
-    }
+/// ⛔ **THE cwd IS NOT A NAME.** This function used to title a Shell/SshShell by
+/// its working directory and hand every other kind whatever fallback the caller
+/// had to hand, on the reasoning that "a shell is only its directory". Two
+/// things were wrong with that. A path is not a name a person picks a row out
+/// of a list by — the owner's `ytop`, launched in a terminal, wore an absolute
+/// path where its name belongs. And the callers' fallbacks disagreed with each
+/// other and with the agent-CLI menu label, so no two families of row were born
+/// under the same rule.
+///
+/// ⚖ The rule and its noun table live in `yggterm_core::agent_cli`, beside the
+/// registry that knows every CLI's display name, and this is a THIN resolver
+/// for the one thing the core cannot know: which machine the row is landing on.
+/// Nothing else about a birth name is decided here — a second spelling of the
+/// rule in this crate is exactly how the two halves drifted apart before.
+fn live_session_default_title(kind: SessionKind, machine: Option<&str>) -> String {
+    yggterm_core::agent_cli::new_session_birth_title(kind, machine)
+}
+
+/// The birth name for a row on THIS machine.
+fn local_live_session_default_title(kind: SessionKind) -> String {
+    live_session_default_title(kind, yggterm_core::local_machine_name_opt().as_deref())
 }
 
 fn live_session_default_summary(kind: SessionKind, target: &SshConnectTarget) -> String {
@@ -7480,12 +7489,10 @@ impl YggtermServer {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
-                let fallback = ssh_target
-                    .rsplit('@')
-                    .next()
-                    .unwrap_or(ssh_target.as_str())
-                    .to_string();
-                live_session_default_title(SessionKind::SshShell, cwd.as_deref(), &fallback)
+                live_session_default_title(
+                    SessionKind::SshShell,
+                    Some(ssh_host_from_target(&ssh_target)),
+                )
             });
         let target_label = self
             .ssh_targets
@@ -7591,8 +7598,7 @@ impl YggtermServer {
             .unwrap_or_else(|| {
                 live_session_default_title(
                     SessionKind::Codex,
-                    target.cwd.as_deref(),
-                    &ssh_machine_label(&target),
+                    Some(ssh_machine_label(&target).as_str()),
                 )
             });
         let (remote_binary, remote_deploy_state) = self
@@ -7813,7 +7819,7 @@ impl YggtermServer {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
-                live_session_default_title(kind, cwd.as_deref(), &ssh_machine_label(&agent_target))
+                live_session_default_title(kind, Some(ssh_machine_label(&agent_target).as_str()))
             });
 
         let mut session = build_live_session(
@@ -9174,7 +9180,7 @@ impl YggtermServer {
         };
         let target = local_session_target(kind, cwd);
         let title = title_hint.map(ToOwned::to_owned).unwrap_or_else(|| {
-            live_session_default_title(kind, target.cwd.as_deref(), &target.label)
+            local_live_session_default_title(kind)
         });
         self.insert_live_session_with_launch_options(
             &key,
@@ -9199,8 +9205,19 @@ impl YggtermServer {
         let uuid = Uuid::new_v4().to_string();
         let key = local_live_runtime_key(&uuid);
         let target = local_session_target(SessionKind::Shell, cwd);
-        let title = title_hint
-            .map(ToOwned::to_owned)
+        // An APP row's birth name comes from the birth rule, not from the
+        // caller: the string the launcher had to hand is its MENU ITEM's label
+        // (`AppVerb::label`, "what the menu item says"), which names the action
+        // a person chose rather than the row it made. So a libyggterm app row
+        // wore `New Yedit` on every machine at once and said nothing about
+        // which one. A non-app caller (a recipe) still names its own row.
+        let title = app_row_birth_title(source_label)
+            .or_else(|| {
+                title_hint
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
             .unwrap_or_else(|| "recipe shell".to_string());
         self.insert_live_session(
             &key,
@@ -9712,7 +9729,7 @@ impl YggtermServer {
             .map(|session| session.title.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| {
-                live_session_default_title(SessionKind::Shell, target.cwd.as_deref(), &target.label)
+                local_live_session_default_title(SessionKind::Shell)
             });
         if !self.sessions.contains_key(&key) {
             self.insert_live_session(
@@ -30440,6 +30457,50 @@ fn local_interactive_shell_launch_command(shell_program: &str) -> String {
 /// another. A bare `app:<name>` (no verb) is NOT this token: it names an app
 /// without saying which verb the row is, and guessing the first verb on restore
 /// would silently change what the row runs.
+/// The birth name of a libyggterm APP row — `New {machine} {app label}` — or
+/// `None` when `source_label` is not an app token at all.
+///
+/// ⚖ It reads the SAME `app:<name>:<verb>` stamp [`session_is_app_row`] reads,
+/// so "is this an app row" and "what is this app row called" cannot answer
+/// differently, and the registry's own `label` supplies the name so an app is
+/// called on a row what it is called in the menu that launched it.
+///
+/// ⚠ KNOWN AND DELIBERATE: an app with several verbs births several rows that
+/// read alike, because the rule names the APP and yggterm never renames an app
+/// row afterwards ([`session_accepts_generated_copy`]). That is the rule as
+/// specified, and the honest fix for a multi-verb app is a `row_title` of its
+/// own in the manifest — a field, not a second borrowing of the menu label.
+fn app_row_birth_title(source_label: Option<&str>) -> Option<String> {
+    let (app_name, _verb) = app_verb_token_parts(source_label?)?;
+    // ⛔ THE REGISTRY IS A NICETY HERE, NEVER A PRECONDITION. The manifest
+    // supplies a display label ("Ychrome"), but a row must still be named when
+    // the registry cannot be read — a manifest deleted, a restore running
+    // before the registry is warm — and the token itself already carries the
+    // app's name. Returning `None` on a registry miss would have dropped the
+    // row onto the caller's fallback, which for an app row is now nothing at
+    // all: it would have been born "recipe shell".
+    let label = cached_app_registry()
+        .iter()
+        .find(|app| app.name == app_name)
+        .map(|app| app.label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| capitalize_first(app_name));
+    Some(yggterm_core::agent_cli::new_row_birth_title(
+        yggterm_core::local_machine_name_opt().as_deref(),
+        &label,
+    ))
+}
+
+/// `ychrome` -> `Ychrome`. The registry key is lowercase by contract (it must
+/// equal the manifest's file stem); a row name is not.
+fn capitalize_first(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 pub fn app_verb_token_parts(token: &str) -> Option<(&str, &str)> {
     let rest = token.strip_prefix("app:")?;
     let (app, verb) = rest.split_once(':')?;
@@ -34659,6 +34720,30 @@ mod tests {
             "the persisted row must carry WHICH app verb it is, or the restore \
              has nothing to re-derive from"
         );
+
+        // ⛔ AND THE ROW IS NOT NAMED AFTER THE MENU ITEM THAT MADE IT. The
+        // launcher used to hand `AppVerb::label` over as the row's title, and
+        // that field's own contract is "what the menu item says" — so an app
+        // row wore a menu string with no machine in it, identically on every
+        // host in the fleet. The birth rule composes the name from the app,
+        // here, where the `Source` stamp is the only thing that knows the row is
+        // an app row at all.
+        assert!(
+            session.title.starts_with("New "),
+            "an app row is born under the birth rule, got `{}`",
+            session.title,
+        );
+        assert!(
+            !session.title.contains('/'),
+            "an app row must not be born wearing a path: `{}`",
+            session.title,
+        );
+        assert_eq!(
+            crate::app_row_birth_title(Some("recipe-session")),
+            None,
+            "a recipe shell is not an app row and keeps the name its caller gave it",
+        );
+        assert_eq!(crate::app_row_birth_title(None), None);
 
         // The verb is not optional in the token, and this is why: restoring
         // `app:ychrome` would have to GUESS a verb, silently changing what the
