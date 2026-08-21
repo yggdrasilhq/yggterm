@@ -1651,6 +1651,24 @@ clean typed window.
   user feels it; no probe sees it) — a JS-side timestamp would make the chain honest end to
   end, filed as its own debt.
 
+**THE SPLIT LANDED THE SAME AFTERNOON AND NAMED THE DAM — A SELF-DEADLOCK THROUGH AN
+ADOPTION SYMLINK (2026-08-21 14:5x, fix `af6da839` on main, bites on the next daemon roll):**
+`writer:rpc` is ~1 ms typical; one write per dam eats ~10 s and `writer:queue_wait` goes
+bimodal (instant, or 37 keystrokes dammed to 10 s — measured live at 14:16:28). The daemon's
+own `client_handler_cost` window puts `snapshot` at wall_max 10.2 s at both dam times, and
+`proxied_working_flags_slow_peer` names the holder: the working-flags refresh probing
+`server-3-1-22.sock` — **a symlink to the daemon's OWN socket** (adoption artifact, one daemon
+running). A stale discovery claim sends a request into the daemon's own accept queue while the
+prober holds the runtime lock its handler needs: self-deadlock, resolved only by the 10 s
+client timeout, once per 300 s backoff expiry, on schedule, forever (six in 27 min). The
+`633e22d8` budget/backoff bounded the SERIES; the instance recurred by design. ⭐ **The class:
+a census-time self-drop cannot see an alias created at ADOPTION time — endpoint identity must
+be judged canonicalized at USE time, and a claim that resolves to self must be PURGED** (it is
+factually false post-adoption; those rows are owned locally). Lock:
+`a_symlink_to_our_own_socket_is_self_not_a_peer`. ⚠ Debt remaining with the daemon plane: a
+deaf REAL peer's first probe after each backoff expiry still pays the full 10 s under the lock
+— the probe wants a sub-second timeout or the fan-out wants to run off the lock.
+
 ## ⛔⛔⛔ [11.5] THE INPUT CHAIN PROVES DELIVERY TO THE PTY, NEVER CONSUMPTION BY THE PROGRAM — AND THAT IS THE GAP "I CANNOT TYPE" FALLS THROUGH
 
 **Status:** OPEN
