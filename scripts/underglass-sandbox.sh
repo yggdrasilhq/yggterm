@@ -27,6 +27,9 @@
 #            real binaries after eval-ing this. Reported 2026-08-14 by the
 #            second session to use the harness, having cost it a false start.
 #   stop     tear everything down (sandbox home is preserved for inspection)
+#   reap     delete DEAD sandbox homes, skipping any whose compositor is alive.
+#            The homes sit in a tmpfs -- RAM -- and nothing else ever frees
+#            them; 48 leaked ones once filled it and made `start` fail silently.
 #
 # start options:
 #   --under-glass 0|1   arm or disarm Phase F under-glass (default 1)
@@ -142,6 +145,23 @@ wayland_sockets() {
 }
 
 sandbox_env() {
+  # ⛔⛔ A MISSING DISPLAY IS AN ERROR, NOT A STATE. This used to emit
+  # `export WAYLAND_DISPLAY=''` when the file was absent -- `cat` complained on
+  # stderr and the export went out empty anyway, so `eval "$(... env)"` handed
+  # the caller a sandbox with no display and returned 0. Every probe downstream
+  # then measured nothing and said so in the language of success: a reproduction
+  # loop of eight trials printed a clean verdict for every one of them and no
+  # GUI had started in any. A harness that renders no pixels must never be able
+  # to report absence of a fault. See docs/pending-bugs.md [11.26] harness entry.
+  if [ ! -s "$DISPLAY_FILE" ]; then
+    echo "sandbox '$NAME' has no wayland display ($DISPLAY_FILE missing or empty);" >&2
+    echo "  it is not running, or \`start\` failed. Nothing measured here means anything." >&2
+    exit 6
+  fi
+  if ! is_running "$SWAY_PID_FILE"; then
+    echo "sandbox '$NAME' has a display file but its compositor is dead (pid file $SWAY_PID_FILE)." >&2
+    exit 6
+  fi
   echo "export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
   echo "export WAYLAND_DISPLAY='$(cat "$DISPLAY_FILE")'"
   echo "export GDK_BACKEND=wayland"
@@ -186,6 +206,14 @@ EOF
     done
     [ -n "$display" ] || { echo "headless compositor did not come up; see $LOG" >&2; exit 4; }
     echo "$display" > "$DISPLAY_FILE"
+    # The write above is the one that fails first when the runtime tmpfs is
+    # full, and a start that wrote no display file must not go on to report a
+    # GUI. Assert it landed rather than trusting the redirect's exit status.
+    [ -s "$DISPLAY_FILE" ] || {
+      echo "could not record the sandbox display in $DISPLAY_FILE" >&2
+      df -h "$XDG_RUNTIME_DIR" >&2 || true
+      exit 4
+    }
 
     # GDK_BACKEND is set EXPLICITLY and never left to inference. Two separate
     # pieces of code force x11 when it is unset -- yggterm's own
@@ -323,10 +351,47 @@ EOF
     for pid in $(pgrep -f "sway -c $CONF" 2>/dev/null || true); do
       kill "$pid" 2>/dev/null || true
     done
-    echo "sandbox '$NAME' stopped (home preserved at $SANDBOX_HOME)"
+    echo "sandbox '$NAME' stopped (home preserved at $SANDBOX_HOME; \`reap\` frees it)"
+    ;;
+  reap)
+    # ⛔ THE HOMES LIVE IN A tmpfs -- RAM, NOT DISK -- AND NOTHING EVER REAPED
+    # THEM. 48 dead ones once held a 51 GB runtime dir at 100% full, after which
+    # `start` failed and the whole harness reported clean results it never
+    # rendered. `stop` preserves by design (the inspection case), so the reaping
+    # has to be its own verb.
+    # ⛔ AND THE HOST IS SHARED: another session's sandbox may be LIVE in this
+    # same runtime dir, so every directory is liveness-checked on its OWN
+    # compositor pid and skipped if it answers. A blanket rm here takes down
+    # work that is not yours.
+    reaped=0; kept=0
+    for d in "$XDG_RUNTIME_DIR"/yggterm-uglass/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      pidf="$d/sway.pid"
+      alive=0
+      if [ -f "$pidf" ]; then
+        pid="$(cat "$pidf" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then alive=1; fi
+      fi
+      # A pid file can go missing while the compositor lives, so ask the config
+      # path too -- the same discriminator `stop` uses to find a sway the pid
+      # file failed to name.
+      if [ "$alive" -eq 0 ] && pgrep -f "sway -c $d/sway.conf" >/dev/null 2>&1; then alive=1; fi
+      if [ "$alive" -eq 1 ]; then
+        echo "  keep  $name (compositor alive)"
+        kept=$((kept + 1))
+        continue
+      fi
+      size="$(du -sh "$d" 2>/dev/null | cut -f1)"
+      rm -rf "$d"
+      echo "  reap  $name ($size)"
+      reaped=$((reaped + 1))
+    done
+    echo "reaped $reaped dead sandbox home(s), kept $kept live"
+    df -h "$XDG_RUNTIME_DIR" | tail -1
     ;;
   *)
-    echo "usage: $0 <start|capture|burst|cursor|click|scroll|backend|env|stop> [args] [--name id] [--size WxH] [--under-glass 0|1] [--env K=V] [--xwayland]" >&2
+    echo "usage: $0 <start|capture|burst|cursor|click|scroll|backend|env|stop|reap> [args] [--name id] [--size WxH] [--under-glass 0|1] [--env K=V] [--xwayland]" >&2
     exit 2
     ;;
 esac
