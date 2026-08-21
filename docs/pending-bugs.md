@@ -19750,6 +19750,37 @@ reader knows the instrument's reach ended before the answer did.
 
 ---
 
+## ⛔ ITEM 3 (ROW GROUPS): THE MIGRATION IS BUILT AND TESTED BUT DELIBERATELY NOT CALLED
+
+**Status:** OPEN, half delivered. yggterm `79253196` on `lane/dev/11.13-ychrome-ux`.
+
+`WebSurfaceTab::group_head` and `migrate_web_tab_folders_into_row_groups` exist, with 8
+tests covering the failure modes (lossless name transfer, the untouchable app tab, empty
+folders, a cycle in the stored `parent`, a dangling head, and the no-op case). What is NOT
+done is the other 560 call sites, and the migration is **not wired into the restore path on
+purpose**. It was wired, the suite objected, and the objection was right twice over.
+
+**Two ordering constraints, either of which silently destroys a user's arrangement.**
+
+1. ⛔ **The save schema cannot hold a group yet, and TAB IDS ARE PER-RUN.** `SavedWebTab` has
+   no `group_head`, and `next_tab_id` reassigns ids on every restore — so persisting a raw
+   head id would point at a different tab next launch. Migrate-then-save as things stand
+   writes "no folders, no groups": the folder is gone from disk AND the grouping was never
+   written, which is the whole organization destroyed on first launch of the new binary,
+   with no way back. ⇒ Persist the head's **INDEX within the saved list** and map it back to
+   the new id on restore; a raw id is only meaningful inside one run.
+2. ⛔ **The rail still draws `folders`.** Migrating on load before the rail can render groups
+   empties `folders` and `tab.folder`, so every group renders as loose tabs — the user sees
+   their folders DELETED, which is indistinguishable from the bug. ⇒ The migration call and
+   the rail's group rendering must land in the SAME change.
+
+⚠ **This is why it is filed rather than half-shipped.** A migration that is merely present
+is inert; a migration that is called one commit too early is unrecoverable, and it fails on
+the user's real profile at launch rather than in a test. The persistence rule also needs
+re-deciding as part of the same change: today "filed in a folder = saved organization, root
+= browsing session" (`web_tab_is_saved`). The faithful translation is "part of a group =
+organization", and nothing else preserves the old promise.
+
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
 **Status:** OPEN. Hit 2026-08-20 on the shared `~/gh/yggterm` checkout.
