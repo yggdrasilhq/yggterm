@@ -162,11 +162,41 @@ repeat window B — but activating a row takes the screen from whoever is at it,
 waits for a moment when that is acceptable, or for the duplicate to be removed. Until
 then the honest statement is the conjunction above, not "creates are expensive".
 
-⚠ **The two follow-ups this hands over.** (1) Whatever mints a `remote-session://`
-row for a session that already has a `remote-cc://` one is a row-identity defect and
-owns the duplicate. (2) The mount path retries an error that can never succeed —
-a row whose backing session is gone will never restore, so re-arming after
-`ensure_error` buys nothing and pays a full mount each time.
+⭐ **AND THE SAME DEFAULT HAS DONE THIS BEFORE, ON A DIFFERENT SCHEME.**
+`docs/cli-integration.md` already records the identical error string from
+2026-08-19: an `agy` row opened as Codex because `connect_session_kind_for_path()`
+kept a hand-written list of schemes, missed one, and **fell through to `Codex` as
+its default**. That fix went in on the READ side and made the lookup
+registry-derived. The WRITE side still has the same default:
+
+```rust
+// crates/yggterm-core/src/agent_scheme.rs:467
+pub fn remote_agent_session_path(kind: SessionKind, machine_key: &str, session_id: &str) -> String {
+    let prefix = remote_agent_row_schemes()
+        .find(|scheme| scheme.kind == Some(kind))
+        .map(|scheme| scheme.prefix)
+        .unwrap_or("remote-session://");     // ⛔ the Codex scheme, for ANY unmatched kind
+```
+
+⇒ **A kind the registry cannot place does not fail here. It becomes a Codex row.**
+The row then looks entirely well-formed, is indistinguishable from a real saved
+Codex session everywhere downstream, and only reveals itself when something tries
+to restore it — which is a mount, i.e. the expensive path, on a row the user may
+already be sitting on. ⚠ This is a hypothesis with the shape and the symptom
+matching exactly; it is NOT yet proven to be the call that minted this particular
+row, and the lane that takes it should prove that before changing the default.
+
+⚠ **Note what dual presence does and does not cover.** `AGENTS.md` "Session
+display = dual presence" makes one session render twice **sharing one
+`full_path`** — that is spec and is not this. These two rows carry DIFFERENT
+paths under different schemes, so nothing downstream can tell they are one
+session.
+
+⚠ **The second follow-up.** The mount path retries an error that can never
+succeed: a row whose backing session does not exist will never restore, so
+re-arming after `ensure_error` buys nothing and pays a full mount every time
+something is added. Even with the scheme bug fixed, an unrestorable row should
+fail once and stay failed.
 
 **Falsifier:** leave the GUI untouched for ten minutes with several agent rows producing
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
