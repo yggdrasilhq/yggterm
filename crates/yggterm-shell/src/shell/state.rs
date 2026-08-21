@@ -1964,6 +1964,33 @@ struct WebSurfaceTab {
     /// both tab homes. A tab with no webview yet (restored, never activated) is
     /// never loading — it is a URL in the tree until it is selected.
     loading: bool,
+    /// Is this tab's page PLAYING MEDIA right now, as the ENGINE reports it?
+    ///
+    /// Written from `webkit_web_view_is_playing_audio` by the native-surface
+    /// reconciler and rendered as the tab's blinking dot when the tab is in the
+    /// BACKGROUND — the "which of these rows is making noise" signal.
+    ///
+    /// ⛔ **The engine is the only admissible source.** Anything the shell could
+    /// infer from outside — the URL's host, the title, whether a media site was
+    /// ever loaded here — blinks on rows that are silent, and an indicator the
+    /// user has caught lying once is worth less than no indicator at all.
+    ///
+    /// Not persisted: it is a property of a live web process, and a restored
+    /// tab has none.
+    media_playing: bool,
+    /// When the engine last CONFIRMED `media_playing` — re-stamped while it
+    /// stays true, so the claim decays if the thing that makes it stops running.
+    ///
+    /// ⛔⛔ The twin of [`WebSurfaceTab::loading_since_ms`]'s lesson (*a positive
+    /// claim with no expiry is a permanent lie when its clearer never runs*), and
+    /// deliberately the OTHER instrument. A load is bounded, so a ceiling is
+    /// honest for it; playback is not — an hour-long album must keep its dot —
+    /// so the honest shape here is a HEARTBEAT: every confirmation re-stamps, and
+    /// [`web_surface_tab_media_is_live`] believes the flag only while the stamp is
+    /// fresh. A surface that stops being polled at all (destroyed, session gone,
+    /// reconciler not running) therefore decays to silent within seconds, with no
+    /// clearer that anyone has to remember to call.
+    media_seen_ms: u64,
     /// This tab's page theme color, verbatim as the page declared it (its
     /// `<meta name="theme-color">`, else its painted body background). Written
     /// from the ENGINE by the native-surface reconciler — the only place that
@@ -2057,17 +2084,27 @@ impl WebSurfaceTab {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebTabOrigin {
     /// Nothing opened it: the rail header's "+", the classic strip's "+", an
-    /// agent's `open_tab` command. It joins the end of the list, which is where
-    /// a browser has always put a tab nobody asked to sit anywhere.
-    Append,
-    /// Born filed, with no opener: a folder row's "+". It joins the end of THAT
+    /// agent's `open_tab` command. It joins the TOP of the list, directly under
+    /// the app tab.
+    ///
+    /// ⚠ **This is the browser's direction, and it is deliberately the OPPOSITE
+    /// of a live session's.** A terminal row list grows downward because it is a
+    /// log — the thing you started last is the thing you scroll to. A tab list
+    /// is a working set, and the tab you just opened is the one you are about to
+    /// use, so it belongs where the eye already is. Owner requirement: *new tabs
+    /// open from the top*. Do not "unify" the two directions; see
+    /// [`web_tab_placement`].
+    Top,
+    /// Born filed, with no opener: a folder row's "+". It joins the TOP of THAT
     /// FOLDER's run, so it appears under the header that minted it rather than
-    /// at the bottom of the window.
+    /// at the far end of the window.
     Folder(String),
-    /// A TAB opened it: the row menu's "New tab below this one", a middle- or
+    /// A TAB opened it: the row menu's "New tab above this one", a middle- or
     /// ctrl-clicked link, a duplicate, a `window.open` / `target="_blank"`.
-    /// It lands immediately below its opener and CASCADES after the children
-    /// that opener already has — Chrome's and Firefox's opener-group model.
+    /// It lands immediately ABOVE its opener and CASCADES above the children
+    /// that opener already has, so the newest child of a page is always the
+    /// topmost row of that page's group — the mirror of Chrome's opener-group
+    /// model, flipped for the same reason [`WebTabOrigin::Top`] is.
     Opener(u64),
     /// Back where it was: the "Reopen closed tab" verb. The index is the one the
     /// CLOSE recorded, clamped on the way in — the list has moved on since, and
@@ -2113,10 +2150,10 @@ struct WebTabOpenRequest {
 }
 
 impl WebTabOpenRequest {
-    /// A header "+": a blank tab at the end, typing-ready.
+    /// A header "+": a blank tab at the TOP, typing-ready.
     fn blank() -> Self {
         Self {
-            origin: WebTabOrigin::Append,
+            origin: WebTabOrigin::Top,
             destination: WebTabDestination::Blank,
             foreground: true,
         }
@@ -2129,9 +2166,9 @@ impl WebTabOpenRequest {
             foreground: true,
         }
     }
-    /// The row menu's "New tab below this one": a blank tab in the clicked
+    /// The row menu's "New tab above this one": a blank tab in the clicked
     /// tab's group, typing-ready.
-    fn blank_below(opener: u64) -> Self {
+    fn blank_above(opener: u64) -> Self {
         Self {
             origin: WebTabOrigin::Opener(opener),
             destination: WebTabDestination::Blank,
@@ -2148,18 +2185,18 @@ impl WebTabOpenRequest {
             foreground: !background,
         }
     }
-    /// A duplicate: the same page, below the original, and the user goes with
-    /// it — which is what "duplicate" means to someone who wants two of
-    /// something to compare.
+    /// A duplicate: the same page, directly above the original, and the user
+    /// goes with it — which is what "duplicate" means to someone who wants two
+    /// of something to compare.
     fn duplicate_of(source: u64) -> Self {
         Self::opened_by(source, false)
     }
     /// An agent's `open_tab` command. No opener — the command names a session,
-    /// not a page — so it appends, and it carries a URL, so it never steals the
-    /// keyboard even when it raises.
+    /// not a page — so it takes the top, and it carries a URL, so it never
+    /// steals the keyboard even when it raises.
     fn command(raise: bool) -> Self {
         Self {
-            origin: WebTabOrigin::Append,
+            origin: WebTabOrigin::Top,
             destination: WebTabDestination::Bound,
             foreground: raise,
         }
@@ -2237,55 +2274,80 @@ fn web_tab_descends_from(rows: &[WebTabPlacementRow], index: usize, ancestor: u6
 /// THE single owner of "where does a new tab go".
 ///
 /// Pure, total, and a function of the rows alone — never of timing, of which
-/// call site asked, or of how many webviews happen to exist. The three rules:
+/// call site asked, or of how many webviews happen to exist.
 ///
-/// - `Append` joins the end.
-/// - `Folder` joins the end of that folder's run, so a folder's "+" fills the
+/// ⭐ **EVERY BRANCH GROWS UPWARD.** Owner requirement: *new tabs open from the
+/// top*. A tab list is a working set rather than a log, so the row you just
+/// minted is the row you are about to use, and it belongs where the eye already
+/// is instead of below whatever has accumulated. The three rules:
+///
+/// - `Top` joins the top, directly under the app tab.
+/// - `Folder` joins the top of that folder's run, so a folder's "+" fills the
 ///   folder instead of the window.
-/// - `Opener` lands immediately below its opener, AFTER the descendants that
-///   opener already has. That last clause is the cascade: the second link
-///   opened from a page goes after the first, not between the page and it.
+/// - `Opener` lands immediately ABOVE its opener, BEFORE the descendants that
+///   opener already has. That last clause is the cascade, mirrored: the second
+///   link opened from a page goes above the first, so the newest child of a page
+///   is always the topmost row of that page's group.
+///
+/// ⚠ **The inversion against a live session's row order is DELIBERATE** — a
+/// yggterm Live session appends BELOW its spawnee, a browser tab opens ABOVE it.
+/// Two different objects with two different reading directions; do not unify
+/// them.
 ///
 /// The app tab is `tabs[0]` and stays there — no branch can return 0, because
-/// `Append`/`Folder` return a length (≥ 1, the app tab is always present) and
-/// `Opener` returns at least `at + 1`.
+/// every branch is clamped to at least 1 and the upward `Opener` walk stops at
+/// the app tab, which descends from nothing.
 fn web_tab_placement(rows: &[WebTabPlacementRow], origin: &WebTabOrigin) -> WebTabPlacement {
+    // The topmost slot a new tab may take. `tabs[0]` is the app's, and every
+    // close verb in the product is written on that premise — but a surface can
+    // legitimately be empty for the instant before the app tab arrives, so this
+    // is a clamp against the row count rather than a bare `1`.
+    let top = rows.len().min(1);
     match origin {
-        WebTabOrigin::Append => WebTabPlacement {
-            index: rows.len(),
+        WebTabOrigin::Top => WebTabPlacement {
+            index: top,
             folder: None,
             opener: None,
         },
         WebTabOrigin::Folder(folder_id) => WebTabPlacement {
             index: rows
                 .iter()
-                .rposition(|row| row.folder.as_deref() == Some(folder_id.as_str()))
-                .map(|last| last + 1)
-                .unwrap_or(rows.len()),
+                .position(|row| row.folder.as_deref() == Some(folder_id.as_str()))
+                .map(|first| first.max(top))
+                .unwrap_or(top),
             folder: Some(folder_id.clone()),
             opener: None,
         },
         WebTabOrigin::Restore { index, folder } => WebTabPlacement {
             // Never onto the app tab's slot, never past the end.
-            index: (*index).clamp(1, rows.len()),
+            index: (*index).clamp(top, rows.len()),
             folder: folder.clone(),
             opener: None,
         },
         WebTabOrigin::Opener(opener) => {
             let Some(at) = rows.iter().position(|row| row.id == *opener) else {
                 // The opener went away between the gesture and the mint. There
-                // is nothing to sit below, so this is an ordinary append — and
+                // is nothing to sit above, so this is an ordinary top open — and
                 // it carries NO opener id, because a dangling one would quietly
-                // turn every later open in this group into an append too.
+                // turn every later open in this group into a plain one too.
                 return WebTabPlacement {
-                    index: rows.len(),
+                    index: top,
                     folder: None,
                     opener: None,
                 };
             };
-            let mut index = at + 1;
-            while index < rows.len() && web_tab_descends_from(rows, index, *opener) {
-                index += 1;
+            // Walk UP through the descendants this opener already has, so the
+            // new child lands above all of them rather than between the opener
+            // and its first child.
+            //
+            // ⛔ `max(top)` is load-bearing: the APP TAB can open a tab too (a
+            // link in the app's own page), and it sits at index 0 with nothing
+            // above it. Without the clamp, its children would be minted onto
+            // `tabs[0]` — the one slot every close verb in the product assumes
+            // is the app's.
+            let mut index = at.max(top);
+            while index > top && web_tab_descends_from(rows, index - 1, *opener) {
+                index -= 1;
             }
             WebTabPlacement {
                 index,
@@ -3008,15 +3070,48 @@ struct WebSurfacePolicy {
     /// taking its adblock ruleset down with its userscripts.
     #[serde(default)]
     userscripts_v2: Option<Vec<WireUserscript>>,
-    /// The UA string the app's surfaces identify as. Browsing config, so the app
-    /// owns it; only the GUI can apply it (WebKit fixes the UA at webview
-    /// creation), the same shape as the ruleset. `None` = WebKitGTK's default,
-    /// whose "Safari on X11/Linux" shape names a browser that does not exist:
-    /// UA-allowlisting edges 403 it outright (claude.ai answers exactly
-    /// `{"error":{"type":"forbidden","message":"Request not allowed"}}`, while
-    /// the same request from a macOS-Safari UA is served).
+    /// The UA string the app's surfaces identify as — the app's whole-browser
+    /// decision, for a surface that has no page yet. Browsing config, so the app
+    /// owns it; only the GUI can apply it, the same shape as the ruleset.
+    /// `None` = leave WebKitGTK's own UA alone.
+    ///
+    /// ⚠ An earlier revision of this comment said the engine's own UA "names a
+    /// browser that does not exist" and was 403'd by UA-allowlisting edges. That
+    /// reading is retired: the app re-measured it (ychrome `useragent.rs`) and
+    /// made the engine's own identity the DEFAULT, because a UA that claims
+    /// macOS while `navigator.platform` says Linux is the inconsistency a
+    /// managed challenge actually scores. A site that really does gate on the
+    /// string gets ONE entry in `user_agent_sites` below.
     #[serde(default)]
     user_agent: Option<String>,
+    /// Per-site identity, host -> the UA string to send, `null` for "the
+    /// engine's own". The app resolves its own preset vocabulary away, so the
+    /// GUI never learns what a preset is — the same division as `/zoom`.
+    ///
+    /// ⛔ THIS WAS ON THE WIRE AND NOWHERE ELSE. ychrome has served it since the
+    /// per-site identity shipped; this struct had no field for it, so serde
+    /// dropped it silently and a per-site identity set in the pane was stored,
+    /// reported as applied, and never sent by a single request. Only the
+    /// headless engine plane honoured it, which is why it read as "the setting
+    /// does not stick" on the visible surface alone.
+    #[serde(default)]
+    user_agent_sites: HashMap<String, Option<String>>,
+}
+
+impl WebSurfacePolicy {
+    /// The identity for one page's host: its own entry, else its parent
+    /// domain's, else the app's whole-browser choice. `None` = the engine's own.
+    ///
+    /// ⚠ The UA is a REQUEST header, so this is applied BEFORE a surface opens
+    /// and again whenever the host on screen changes — the page already fetched
+    /// keeps the identity it was fetched with, and the next request carries the
+    /// new one.
+    fn user_agent_for_host(&self, host: &str) -> Option<String> {
+        match site_override_for_host(&self.user_agent_sites, host) {
+            Some(entry) => entry.clone(),
+            None => self.user_agent.clone(),
+        }
+    }
 }
 
 /// One entry of `userscripts_v2`: a body plus the placement the app's host read
@@ -5470,6 +5565,15 @@ struct WebSurfaceOverlayTabView {
     /// The page is loading right now — drawn as the blinking dot, in BOTH tab
     /// homes (the rail rows and the classic strip's chips).
     loading: bool,
+    /// This tab is in the BACKGROUND and the engine says it is playing media —
+    /// drawn as the same blinking dot, in the same two homes.
+    ///
+    /// The "in the background" half is resolved HERE, once, rather than at the
+    /// two paint sites: the owner's ask is for the row the user cannot see, and
+    /// a rule that lives in the renderers is a rule the two renderers can come
+    /// to disagree about. The freshness gate is resolved here too, so no paint
+    /// site ever sees a raw flag it could believe for too long.
+    media_playing: bool,
 }
 /// The name a tab ROW shows, in one place. Precedence: the name the USER gave
 /// it, then the page's own title, then the app tab's app name / the URL host.
@@ -5883,6 +5987,58 @@ const WEB_SURFACE_LOADING_MAX_MS: u64 = 30_000;
 fn web_surface_tab_loading_is_live(loading: bool, loading_since_ms: u64, now_ms: u64) -> bool {
     loading && now_ms.saturating_sub(loading_since_ms) <= WEB_SURFACE_LOADING_MAX_MS
 }
+
+/// How long a tab's MEDIA light is believed after the last engine confirmation.
+///
+/// Not a ceiling on playback — playback is unbounded and a two-hour album must
+/// keep its dot. It is the width of the heartbeat window: the reconciler
+/// re-confirms every [`WEB_SURFACE_MEDIA_HEARTBEAT_MS`], so anything past a few
+/// missed beats means the confirmer itself has stopped, and the honest reading
+/// of a claim nobody is renewing is that it has lapsed.
+const WEB_SURFACE_MEDIA_MAX_MS: u64 = 6_000;
+/// How often the reconciler re-stamps a media light that is still true.
+///
+/// ⚠ Comfortably inside [`WEB_SURFACE_MEDIA_MAX_MS`] so an ordinarily busy tick
+/// never lets a genuinely playing tab lapse, and far above the reconcile beat
+/// (16 ms) so a playing tab costs ONE shell write every two seconds rather than
+/// sixty a second. The edge itself is written through immediately and does not
+/// wait for a heartbeat — this only governs the RENEWAL of a claim already made.
+const WEB_SURFACE_MEDIA_HEARTBEAT_MS: u64 = 2_000;
+
+/// Does a tab's media light still deserve its dot?
+///
+/// ⛔ A LAPSED CLAIM IS SILENT. `media_playing` is only ever true because some
+/// tick asked the engine and the engine said yes; if no tick has asked recently,
+/// what the flag records is the last answer to a question nobody is putting any
+/// more. The surface may have been destroyed by a session close, replaced by a
+/// profile change or a reload's destroy-and-recreate, or left behind by a
+/// reconciler that no longer walks it — and from here those are indistinguishable
+/// from each other and from real playback, which is exactly why a freshness
+/// window is the honest answer rather than a guess about which one it is.
+fn web_surface_tab_media_is_live(media_playing: bool, media_seen_ms: u64, now_ms: u64) -> bool {
+    media_playing && now_ms.saturating_sub(media_seen_ms) <= WEB_SURFACE_MEDIA_MAX_MS
+}
+
+/// Does this tab earn the media dot? The WHOLE rule, in one function.
+///
+/// Both halves live here rather than at the two paint sites, because both are
+/// rules the rail and the classic strip could otherwise come to answer
+/// differently — and a signal the user is meant to trust cannot mean one thing
+/// in one tab home and another thing in the other.
+///
+/// - `is_active` — the foreground tab never wears it. The owner's ask is for the
+///   row they cannot see; a dot on the page they are watching states something
+///   they already know, and every mark that says nothing new makes the marks
+///   that do say something harder to find.
+/// - freshness — see [`web_surface_tab_media_is_live`].
+fn web_tab_earns_media_dot(
+    is_active: bool,
+    media_playing: bool,
+    media_seen_ms: u64,
+    now_ms: u64,
+) -> bool {
+    !is_active && web_surface_tab_media_is_live(media_playing, media_seen_ms, now_ms)
+}
 /// ⭐ **WHO HOLDS THE KEYBOARD OVER A WEB SURFACE — one rule, one answer.**
 ///
 /// This is not a nicety. Every legacy browser chord (`WEB_PAGE_CHORDS`) is
@@ -5981,6 +6137,14 @@ struct AppliedWebSurface {
     /// reconciler re-applies whenever the desired factor (the global "Web View"
     /// zoom setting; per-site overrides land later) diverges from this.
     zoom_factor: f64,
+    /// The identity last pushed to this surface — the resolved UA string, or
+    /// `None` for the engine's own. Re-applied when the host on screen moves
+    /// into (or out of) a per-site override, exactly as the zoom is.
+    ///
+    /// ⚠ It records what was PUSHED, not what the page in front of you was
+    /// FETCHED with: a header cannot be applied retroactively. Held here so the
+    /// FFI is touched on a real change only.
+    user_agent: Option<String>,
     /// Set while the surface is STASHED (session backgrounded, webview kept
     /// alive detached from the overlay). Unstashed on reveal; destroyed when
     /// the background hold expires.
@@ -5998,6 +6162,19 @@ struct AppliedWebSurface {
     /// loading light. Only a CHANGE is written through to the tab, so a page
     /// that sits loaded does not re-render the rail every tick.
     loading: bool,
+    /// Last engine-reported `is-playing-audio` — the poll baseline for the
+    /// tab's media light. Same edge discipline as `loading`.
+    ///
+    /// ⚠ Unlike `loading`, the poll that maintains this one runs OUTSIDE the
+    /// not-stashed guard, and that is the whole point rather than an oversight:
+    /// a soft-stashed surface is precisely a BACKGROUND tab, which is the only
+    /// case this signal exists for. Polled under the same guard as the rest, the
+    /// instrument would read silence from every tab it was built to find.
+    media_playing: bool,
+    /// When the media claim above was last written through. The renewal clock,
+    /// so a tab that keeps playing costs one shell write every couple of seconds
+    /// rather than one per reconcile beat.
+    media_seen_ms: u64,
     /// Last engine-reported page (uri, title) — the poll baseline for
     /// observing in-page navigation (address bar follow, tab title, history).
     page_url: String,
@@ -6051,6 +6228,7 @@ impl AppliedWebSurface {
         // what the view carries, because that is what a rebuild would change.
         policy_attached: bool,
         zoom_factor: f64,
+        user_agent: Option<String>,
         now_ms: u64,
     ) -> Self {
         Self {
@@ -6066,6 +6244,7 @@ impl AppliedWebSurface {
             profile,
             policy_settled: policy_attached,
             zoom_factor,
+            user_agent,
             stashed_at_ms: (!want_visible).then_some(now_ms),
             ever_revealed: want_visible,
             // A surface is created BY a navigation, so it is loading from its
@@ -6074,6 +6253,8 @@ impl AppliedWebSurface {
             loading: want_visible,
             page_title: String::new(),
             page_theme_color: None,
+            media_playing: false,
+            media_seen_ms: 0,
             generation: next_web_surface_generation(),
         }
     }
@@ -6116,11 +6297,18 @@ impl AppliedWebSurface {
             // carries whatever `attach_userscripts` gave the opener's window.
             policy_settled: true,
             zoom_factor,
+            // A popup is built by WebKit inside the opener's create handler and
+            // carries the OPENER's identity. We did not choose it, so we record
+            // nothing rather than a guess — the reconciler's next pass resolves
+            // the popup's own host and pushes the right one if it differs.
+            user_agent: None,
             stashed_at_ms: None,
             ever_revealed: !background,
             loading: true,
             page_title: String::new(),
             page_theme_color: None,
+            media_playing: false,
+            media_seen_ms: 0,
             generation: next_web_surface_generation(),
         }
     }
@@ -7167,12 +7355,15 @@ mod web_surface_reclaim_locks {
             profile: "default".to_string(),
             policy_settled: true,
             zoom_factor: 1.0,
+            user_agent: None,
             stashed_at_ms,
             ever_revealed: true,
             loading: false,
             page_url: String::new(),
             page_title: String::new(),
             page_theme_color: None,
+            media_playing: false,
+            media_seen_ms: 0,
             generation: 1,
         }
     }
@@ -12123,6 +12314,7 @@ async fn web_surface_native_reconcile_loop(
             modal_over_viewport,
             global_zoom_factor,
             zoom_overrides,
+            surface_policies,
         ): (
             Vec<WebSurfaceDesiredSurface>,
             std::collections::HashSet<String>,
@@ -12131,6 +12323,7 @@ async fn web_surface_native_reconcile_loop(
             bool,
             f64,
             HashMap<String, HashMap<String, f32>>,
+            HashMap<String, Option<Arc<WebSurfacePolicy>>>,
         ) = {
             let shell = state.peek();
             let shell_ref: &ShellState = &shell;
@@ -12236,6 +12429,24 @@ async fn web_surface_native_reconcile_loop(
                     Some((session_path.clone(), overrides))
                 })
                 .collect();
+            // The app's policy per session, for the identity refinement below.
+            // Taken from the SAME peek as everything else here: reading it a
+            // moment later could hand one surface the zoom from one instant and
+            // the identity from another, and a difference found that way is TIME,
+            // not disagreement.
+            let surface_policies: HashMap<String, Option<Arc<WebSurfacePolicy>>> = shell_ref
+                .web_surfaces
+                .keys()
+                .map(|session_path| {
+                    (
+                        session_path.clone(),
+                        shell_ref
+                            .sidebar_contributions
+                            .get(session_path)
+                            .and_then(|contribution| contribution.policy.clone()),
+                    )
+                })
+                .collect();
             (
                 desired,
                 active_visible_sessions,
@@ -12244,6 +12455,7 @@ async fn web_surface_native_reconcile_loop(
                 modal_over_viewport,
                 global_zoom_factor,
                 zoom_overrides,
+                surface_policies,
             )
         };
         // Which tab each session's page area shows, from the SAME `desired` the
@@ -12295,6 +12507,18 @@ async fn web_surface_native_reconcile_loop(
                 .and_then(|overrides| zoom_override_for_host(overrides, &host))
                 .map(|percent| (percent as f64 / 100.0).clamp(0.25, 5.0))
                 .unwrap_or(global_zoom_factor)
+        };
+        // The identity for the host on screen, from the app's own policy. `None`
+        // means "leave WebKitGTK's own UA alone", which is also what a session
+        // with no app contribution gets: a plain web page is not a browser
+        // profile and has no identity of ours to present.
+        let surface_user_agent = |session_path: &str, url: &str| -> Option<String> {
+            surface_policies
+                .get(session_path)
+                .and_then(|policy| policy.as_ref())
+                .and_then(|policy| {
+                    policy.user_agent_for_host(&web_surface_tab_host_label(url))
+                })
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -12667,6 +12891,60 @@ async fn web_surface_native_reconcile_loop(
                     // attributed to the human, and the page-visibility work needs
                     // the same bit.
                     entry.latch_reveal();
+                    // ⭐ THE MEDIA LIGHT — and it is deliberately ABOVE the
+                    // not-stashed guard below, not inside it.
+                    //
+                    // A soft-stashed surface IS a background tab, and a
+                    // background tab is the only thing this signal was asked
+                    // for. Polled under the same guard as the page state, the
+                    // instrument would go quiet on exactly the rows it exists to
+                    // find, and would do it in the reassuring direction: every
+                    // silent row silent, no dot anywhere, nothing obviously
+                    // broken. `is_playing_audio` reads the engine's own media
+                    // session, which a detached, unpainted webview still has —
+                    // stash is a paint decision and explicitly never a mute.
+                    let media_playing = desktop.web_surface_is_playing_audio(entry.native_id);
+                    // The EDGE is written through at once so the dot appears and
+                    // disappears on the beat the engine changed its answer. While
+                    // the answer stays true the claim is RENEWED on a slow
+                    // heartbeat instead, because it is the renewal that keeps
+                    // `web_surface_tab_media_is_live` believing it — and renewing
+                    // it every 16 ms beat would repaint the rail sixty times a
+                    // second for a tab that is only doing what it did last tick.
+                    let media_edge = entry.media_playing != media_playing;
+                    let media_stale = media_playing
+                        && now_ms.saturating_sub(entry.media_seen_ms)
+                            >= WEB_SURFACE_MEDIA_HEARTBEAT_MS;
+                    if media_edge || media_stale {
+                        entry.media_playing = media_playing;
+                        entry.media_seen_ms = now_ms;
+                        let mut writable = state;
+                        writable.with_mut(|shell| {
+                            shell.set_web_tab_media_playing(&key.0, key.1, media_playing);
+                        });
+                        // EDGES ONLY. The renewal fires every couple of seconds
+                        // for as long as a tab plays, and a trace line per
+                        // heartbeat would bury the trace under a tab nobody is
+                        // even looking at. What a reader ever wants from here is
+                        // WHEN the light turned on or off, and whether the
+                        // surface was stashed at the time — which is the one
+                        // question "why is my dot not lit" turns into.
+                        if media_edge {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "web_surface",
+                                "media_light",
+                                json!({
+                                    "session_path": key.0,
+                                    "tab_id": key.1,
+                                    "native_id": entry.native_id,
+                                    "playing": media_playing,
+                                    "stashed": entry.stashed_at_ms.is_some(),
+                                }),
+                            );
+                        }
+                    }
                     // Observe engine-side page state: in-page navigations
                     // (link clicks, redirects, form submits) never pass
                     // through the shell's nav model, so poll the engine and
@@ -12809,6 +13087,21 @@ async fn web_surface_native_reconcile_loop(
                     if (entry.zoom_factor - want_zoom).abs() > f64::EPSILON {
                         desktop.set_web_surface_zoom(entry.native_id, want_zoom);
                         entry.zoom_factor = want_zoom;
+                    }
+                    // The browser IDENTITY for the host now on screen, on the
+                    // same tick and for the same reason: a per-site setting the
+                    // app serves has to reach the surface the user is looking
+                    // at. ⚠ Unlike zoom this cannot repaint the current page —
+                    // the UA rode the request that fetched it. What it governs
+                    // is every request AFTER this point: subresources, XHR, and
+                    // the reload a user performs when a site refuses to render.
+                    let want_identity = surface_user_agent(&key.0, &entry.page_url);
+                    if entry.user_agent != want_identity {
+                        desktop.set_web_surface_user_agent(
+                            entry.native_id,
+                            want_identity.as_deref(),
+                        );
+                        entry.user_agent = want_identity;
                     }
                 } else {
                     // Headless materialization (agent control plane slice 2):
@@ -12968,7 +13261,14 @@ async fn web_surface_native_reconcile_loop(
                                 .adblock_rules
                                 .as_deref()
                                 .and_then(web_surface_adblock_cache),
-                            policy.user_agent.clone(),
+                            // The identity for the host this surface is ABOUT to
+                            // open, not the browser-wide one: the UA is a request
+                            // header, so the very first request is the one a
+                            // UA-gating site scores, and applying it afterwards
+                            // would be one load too late.
+                            policy.user_agent_for_host(&web_surface_tab_host_label(
+                                &effective_url,
+                            )),
                         ),
                         _ => (Vec::new(), None, None),
                     };
@@ -13164,6 +13464,10 @@ async fn web_surface_native_reconcile_loop(
                                     // by a rebuild.
                                     matches!(policy_gate, SurfacePolicyGate::Ready(_)),
                                     open_zoom,
+                                    // The identity this webview was BUILT with,
+                                    // recorded so the refinement tick does not
+                                    // re-push what is already applied.
+                                    user_agent.clone(),
                                     current_millis(),
                                 ),
                             );
@@ -15461,6 +15765,15 @@ fn web_surface_tab_host_label(url: &str) -> String {
 /// the GUI twin of ychrome's `webzoom::zoom_for_host`; both must agree, or a
 /// zoom set in the pane would apply to a different set of pages than it names.
 fn zoom_override_for_host(overrides: &HashMap<String, f32>, host: &str) -> Option<f32> {
+    site_override_for_host(overrides, host).copied()
+}
+
+/// The longest-suffix walk itself, over ANY per-site map the app serves: zoom
+/// percentages, identities, whatever comes next. ONE matcher, because a second
+/// copy is a second place for the rule to drift — and a per-site setting that
+/// matched a different set of pages than the one it names is not a bug a user
+/// can see, only one they can suffer.
+fn site_override_for_host<'a, T>(overrides: &'a HashMap<String, T>, host: &str) -> Option<&'a T> {
     if overrides.is_empty() {
         return None;
     }
@@ -15470,8 +15783,8 @@ fn zoom_override_for_host(overrides: &HashMap<String, f32>, host: &str) -> Optio
     }
     let mut candidate = host.as_str();
     loop {
-        if let Some(percent) = overrides.get(candidate) {
-            return Some(*percent);
+        if let Some(entry) = overrides.get(candidate) {
+            return Some(entry);
         }
         match candidate.split_once('.') {
             Some((_, rest)) if rest.contains('.') => candidate = rest,
@@ -19659,6 +19972,8 @@ impl ShellState {
             custom_title: None,
             loading: true,
             loading_since_ms: current_millis(),
+            media_playing: false,
+            media_seen_ms: 0,
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
@@ -19749,6 +20064,8 @@ impl ShellState {
                 // is loading in it.
                 loading: false,
                 loading_since_ms: 0,
+                media_playing: false,
+                media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
@@ -19869,6 +20186,8 @@ impl ShellState {
             custom_title: None,
             loading: false,
             loading_since_ms: 0,
+            media_playing: false,
+            media_seen_ms: 0,
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
@@ -21181,6 +21500,8 @@ impl ShellState {
                 custom_title: None,
                 loading: false,
                 loading_since_ms: 0,
+                media_playing: false,
+                media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
@@ -21283,6 +21604,8 @@ impl ShellState {
                 // WebKit began the load the moment it made the view.
                 loading: true,
                 loading_since_ms: current_millis(),
+                media_playing: false,
+                media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 // A script opened it, so a script may close it.
@@ -21990,6 +22313,16 @@ impl ShellState {
                 active: tab.id == active_tab_id,
                 folder: tab.folder.clone(),
                 loading: tab.loading,
+                // FOREGROUND IS NOT THE INTERESTING CASE — the user is already
+                // looking at it, and a dot beside the page they are watching
+                // teaches them nothing. The signal exists to answer "which of
+                // these rows is the one making noise".
+                media_playing: web_tab_earns_media_dot(
+                    tab.id == active_tab_id,
+                    tab.media_playing,
+                    tab.media_seen_ms,
+                    now_ms,
+                ),
             })
             .collect();
         // ENGINE TRUTH. The shell's own stack only ever recorded navigations the
@@ -22082,6 +22415,23 @@ impl ShellState {
                 tab.loading_since_ms = current_millis();
             }
             tab.loading = loading;
+        }
+    }
+    /// Write the ENGINE's media answer onto a tab, and stamp WHEN it was heard.
+    ///
+    /// The stamp is what makes the claim decay ([`web_surface_tab_media_is_live`]),
+    /// so it is refreshed on every confirmation, not only on the rising edge —
+    /// the opposite discipline to [`ShellState::set_web_tab_loading`] above, and
+    /// for the opposite reason. There a re-stamp would push the ceiling out
+    /// forever and the light could never expire; here a re-stamp IS the signal
+    /// that the light is still earned, and a rising-edge-only stamp would put a
+    /// two-hour album dark after six seconds.
+    fn set_web_tab_media_playing(&mut self, session_path: &str, tab_id: u64, playing: bool) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.media_playing = playing;
+            tab.media_seen_ms = if playing { current_millis() } else { 0 };
         }
     }
     /// Write the PAGE's declared theme color onto a tab. Twin of
@@ -23881,7 +24231,7 @@ impl ShellState {
             // clipboard owner. Same reason the split and the duplicate live
             // there.
             WebTabMenuAction::NewTab
-            | WebTabMenuAction::NewTabBelow(_)
+            | WebTabMenuAction::NewTabAbove(_)
             | WebTabMenuAction::ReopenClosedTabs
             | WebTabMenuAction::CopyTabUrl(_) => return false,
             WebTabMenuAction::DuplicateTab(tab_id) => {
@@ -39799,8 +40149,32 @@ fn spawn_launch_app_verb_here(
 /// context menu, the start page. One derivation, so they cannot show different
 /// apps, and adding a surface never means copying a list.
 fn app_launcher_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
+    // ⛔ ONE APP'S VERB IS OFFERED ONCE. The user reported a launcher listing the
+    // same two verbs TWICE, from a screenshot.
+    //
+    // A single manifest cannot do that on its own — `is_usable` requires its
+    // `name` to equal its own file stem, so one app is one file and one file is
+    // read once. A repeated verb therefore means the LIST reaching here was
+    // assembled with the same registration in it twice, and the honest defence
+    // is at the point where the list becomes a menu: whatever went wrong
+    // upstream, a menu must not offer the user a choice in which both answers do
+    // the same thing.
+    //
+    // ⚠ Keyed on (app, verb) and deliberately NOT on the resolved command, which
+    // was the first attempt and over-reaches: two genuinely different apps may
+    // share a binary — `launcher_entries_flatten_every_app_verb_in_registry_order`
+    // has exactly that shape — and collapsing them would delete a real entry to
+    // fix a cosmetic one. ⇒ A tool installed under two DIFFERENT names is a
+    // separate case this does not claim to cover; it needs a decision about
+    // which registration is the real one, not a silent pick here.
+    //
+    // FIRST WINS, and the registry scan sorts its paths, so the survivor does
+    // not wander between renders — a menu whose entries reorder under the cursor
+    // is its own bug.
+    let mut seen = std::collections::HashSet::new();
     apps.iter()
         .flat_map(|app| app.verbs.iter().map(move |verb| (app.clone(), verb.clone())))
+        .filter(|(app, verb)| seen.insert((app.name.clone(), verb.id.clone())))
         .collect()
 }
 /// Launch a libyggterm app's verb: open a terminal session wherever the user
@@ -46050,23 +46424,52 @@ fn app_pane_row_status_dot_style(palette: Palette, status: &str) -> Option<Strin
 fn live_session_keep_alive_dot_style(palette: Palette) -> String {
     live_session_status_dot_style(palette, true, false)
 }
-/// A web tab's loading light — the SAME traffic-signal vocabulary the live
+/// A web tab's ACTIVITY light — the SAME traffic-signal vocabulary the live
 /// session rows use (DESIGN.md "Status indicator vocabulary"): a hard step-end
 /// BLINK means work is in flight right now, and a tab carries no durability
 /// class of its own, so the carrier is GREEN. One home for the rule, drawn in
 /// both tab homes (the rail rows and the classic strip).
 ///
+/// TWO signals, ONE dot, and that is a decision rather than a shortcut. The
+/// vocabulary says colour encodes durability and blink encodes activity, and it
+/// forbids minting a colour without amending that section first. A background
+/// tab playing media is not a new durability class — it is the same fact the
+/// loading light states, *this row is alive right now*, arriving from a second
+/// source. So it joins the existing light rather than opening a second slot
+/// beside it, which would also cost every tab row 7px of width for a mark that
+/// is absent almost always.
+///
+/// ⚠ What the two causes do NOT share is the tooltip: the callers title the dot,
+/// so a user who wants to know WHY a row is lit can hover it. If a visual split
+/// is ever wanted, DESIGN.md is the first file to edit, not this function.
+///
 /// The slot is laid out whether or not it blinks: a dot that appears must not
 /// shove the tab's title sideways.
-fn web_tab_loading_dot_style(loading: bool) -> String {
+fn web_tab_activity_dot_style(loading: bool, media_playing: bool) -> String {
+    let lit = loading || media_playing;
     let paint = format!(
         "background:{};{}",
-        if loading { "#22c55e" } else { "transparent" },
-        status_dot_blink_opacity_css(loading)
+        if lit { "#22c55e" } else { "transparent" },
+        status_dot_blink_opacity_css(lit)
     );
     format!(
         "display:inline-block; flex:0 0 auto; width:7px; min-width:7px; height:7px; border-radius:999px; {paint}",
     )
+}
+
+/// What a lit tab dot means, in words, for the row's `title`.
+///
+/// `None` for an unlit dot: an empty tooltip slot is silent, and a tooltip that
+/// says "not loading" on every idle row in the rail is noise the user has to
+/// read past. Loading is named first because it is the transient of the two — a
+/// row that is both is a page still arriving, and that is the more useful thing
+/// to say about it while it lasts.
+fn web_tab_activity_dot_title(loading: bool, media_playing: bool) -> Option<&'static str> {
+    match (loading, media_playing) {
+        (true, _) => Some("Loading"),
+        (false, true) => Some("Playing media in the background"),
+        (false, false) => None,
+    }
 }
 fn preview_block_cache() -> &'static Mutex<PreviewBlockCache> {
     PREVIEW_BLOCK_CACHE.get_or_init(|| Mutex::new(PreviewBlockCache::default()))
@@ -70447,6 +70850,8 @@ mod web_do_verb_tests {
         fn applied(native_id: u64, ever_revealed: bool) -> AppliedWebSurface {
             AppliedWebSurface {
                 engine_nav: None,
+                media_playing: false,
+                media_seen_ms: 0,
                 native_id,
                 url: "https://example.invalid/".to_string(),
                 bounds: (0, 0, 800, 600),
@@ -70457,6 +70862,7 @@ mod web_do_verb_tests {
                 profile: "default".to_string(),
                 policy_settled: true,
                 zoom_factor: 1.0,
+                user_agent: None,
                 // BOTH are stashed: that is the point — `stashed` cannot tell
                 // "never shown" from "shown, then backgrounded".
                 stashed_at_ms: Some(1),
@@ -70551,6 +70957,7 @@ mod web_do_verb_tests {
                 "default".to_string(),
                 true,
                 1.0,
+                None,
                 1_000,
             )
         };
@@ -70665,6 +71072,7 @@ mod web_do_verb_tests {
             "default".to_string(),
             true,
             1.0,
+            None,
             1_000,
         );
 

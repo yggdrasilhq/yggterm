@@ -581,21 +581,108 @@ restore is refused, the surface disarms mouse tracking (and bracketed paste) bef
 the failure state. **Falsifier:** kill a remote session behind a row, move the mouse over its
 viewport — no bytes appear.
 
-## ⚠ [11.0] THE LIBYGGTERM CONTEXT MENU: CURATION, REGISTRY, AND PER-HOST TRUTH (owner spec)
+## ⚠ [11.0] SPAWN TITLES: THE MACHINE IS MISSING, AND AN APP SPAWN BYPASSES THE ONE BUILDER
 
-**Status:** OPEN
+**Status:** PARTLY OPEN. Re-measured against the tree 2026-08-21. The owner spec asks
+for a `New {Machine} {App}` convention composed by ONE title builder, plus
+context-menu sessions reading the CLI's DISPLAY NAME rather than its slug.
 
-Owner screenshot 2026-08-20: the row context menu lists Fleet topology and Fleet booter
-TWICE, plus tools that do not belong there at all. The spec, verbatim in intent: (1) REMOVE
-Fleet topology, Fleet booter, and ytop from the menu — terminal-invoked tools, meaningless as
-row spawns; (2) the list is REGISTRY-DRIVEN — updated when any libyggterm app registers on
-first launch (app writes manifest, menu reads registry, one owner — the duplicate listing is
-the one-app-N-manifests trap); (3) PER-HOST filtering — an entry shows only if the app is
-available on the host of the right-clicked session. Related owner spec, same family: every
-libyggterm app spawn defaults to a row titled "New {Machine} {App}" (e.g. a browser session
-on the integrator host titles "New Dev Ychrome"), composed by ONE title builder.
-**Falsifier:** right-click a row on each host — each menu lists exactly that host's installed
-apps, once each, no monitors/booters/ytop; a fresh app spawn lands titled by the convention.
+### ✅ THE SLUG HALF IS ALREADY FIXED, AND BY A ONE-OWNER BUILDER
+`yggterm_core::agent_cli::new_session_birth_title` is that builder, and it lives
+beside the registry that knows every CLI's display name. A context-menu spawn
+lands titled `New Claude Code Session`, not a slug. Its own doc comment records
+the defect it replaced — a birth title composed from the label of whichever row
+the menu was opened on plus the slug, which named the SPAWNER rather than the
+spawned and minted near-duplicate sidebar rows. The menu ENTRY comes from the
+same place (`new_session_label`), so the entry and the resulting row agree by
+construction.
+
+### ⛔ WHAT IS ACTUALLY OPEN
+1. **The machine is missing.** Nothing composes `{Machine}` into a birth title.
+   A browser session on the integrator host should read `New Dev Ychrome`.
+2. **An APP spawn does not use the builder at all.** `spawn_launch_app_verb`
+   takes its title straight from the manifest verb's own `label`, so the one
+   builder governs agent spawns and nothing else — the exact split the spec is
+   trying to close. A machine name added to the builder today would not reach an
+   app spawn.
+
+### ⚠ THE DESIGN FORK, RECORDED BECAUSE IT DECIDES THE SHAPE
+`New {Machine} {App}` has no room for a verb. Apps declare several — a browser
+manifest typically has a plain "new" and an incognito variant — and folding them
+into one convention would give two different launches the same birth title, which
+is the near-duplicate-rows defect the slug fix just removed.
+
+⇒ **Recommendation:** the builder takes (machine, app, verb) and composes
+`New {Machine} {App}` for an app's PRIMARY verb, appending the verb's own
+qualifier for any other. That keeps the owner's convention exactly for the case
+they named, keeps two launches distinguishable, and leaves the qualifier in the
+app's words where the libyggterm contract puts it.
+
+⚠ Related and NOT the same thing: `spawn_title_generation_for_target` is the LLM
+titler. It is not this builder and is not a head start on it.
+
+**Falsifier:** a fresh app spawn on a named host lands titled by the convention,
+and a second, non-primary verb of the same app lands distinguishable from it.
+
+## ⚠ [11.0] THE LIBYGGTERM CONTEXT MENU: CURATION — the registry and per-host halves are DONE
+
+**Status:** PARTLY OPEN. Re-measured against the tree 2026-08-21; two of the three
+halves were already built when this was filed, and the entry said otherwise.
+
+Owner spec, from a screenshot: (1) REMOVE Fleet-topology / booter / monitor style
+entries — terminal-invoked tools, meaningless as row spawns; (2) the list is
+REGISTRY-DRIVEN, written when an app registers on first launch; (3) PER-HOST
+filtering — an entry shows only if the app is available on the host of the
+right-clicked session.
+
+### ✅ (2) REGISTRY-DRIVEN — already true, and was when this was filed
+There is no hardcoded app anywhere in the launcher family. The list is whatever
+the host's `~/.yggterm/apps/*.json` manifests declare, scanned by
+`yggterm_core::scan_app_registry` (which also PRUNES a manifest whose binary no
+longer resolves, so an uninstall cleans itself up), flattened by the one owner
+`app_launcher_entries`, and rendered by all three surfaces — row menu, titlebar
+`+`, start page.
+
+### ✅ (3) PER-HOST — already true, with one owner
+`app_registry_for_row` resolves a row to its machine's registry
+(`RemoteMachineSnapshot::apps`), falling back to this host's only for a local
+row. `SnapshotView::apps` carries a comment naming the exact bug this fixed: a
+right-click on a remote row used to offer the GUI host's apps, with the GUI
+host's absolute binary paths, for execution on the other machine.
+
+### ✅ THE DUPLICATE LISTING — fixed
+The screenshot showed the same two verbs offered TWICE. A single manifest cannot
+do that (`is_usable` requires `name` == file stem, so one app is one file read
+once), so the list reaching the menu held the registration twice.
+`app_launcher_entries` now offers one app's verb once, keyed on (app, verb).
+⚠ Keyed there and NOT on the resolved command, which was the first attempt and
+over-reaches: two genuinely different apps may share a binary, and collapsing
+them deletes a real entry to fix a cosmetic one.
+⇒ **Still uncovered, deliberately:** one tool installed under two DIFFERENT names
+is a separate case. It needs a decision about which registration is real, not a
+silent pick in a menu builder.
+
+### ⛔ (1) CURATION — THE ONLY PART STILL OPEN, and it is a schema question
+The entries to remove are VERBS in an app's own manifest (a monitor declares its
+dashboard and booter verbs there). So yggterm cannot curate them without either
+hardcoding another app's name — the precise anti-pattern the libyggterm contract
+exists to prevent — or being TOLD.
+
+⇒ **Recommendation:** the manifest declares it. An `AppVerb` gains a flag
+(`row_spawn`, serde default `true`, so every existing manifest keeps working) and
+the ROW menu filters on it; the titlebar `+` and start page keep their own
+answer, since "open my dashboard" is a reasonable thing to offer there and a
+meaningless thing to spawn a ROW for.
+
+⚠ **The cost, stated because it decides the order of work:** the flag only takes
+effect once each app WRITES it, and an app rewrites its manifest on every launch,
+so a hand-edit of the JSON is not durable. The schema change is therefore
+worthless on its own — it has to land with, or before, the change in the app that
+declares it. That is why it is filed rather than half-shipped here.
+
+**Falsifier for the remaining half:** right-click a row on each host — exactly
+that host's installed apps, once each, and no terminal-invoked monitors or
+booters. The "once each" and "that host's" halves hold today.
 
 ## ⚠ [11.0] THE ROW CLI DEMANDS RITUAL THE DEFAULTS SHOULD OWN — the papercut backlog
 
@@ -20198,3 +20285,137 @@ downgrade the verdict to `UNPROVEN (row lives on <host>; probe ran on <this host
 reader knows the instrument's reach ended before the answer did.
 
 ---
+
+## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
+
+**Status:** OPEN. Hit 2026-08-20 on the shared `~/gh/yggterm` checkout.
+
+The shared checkout is used by several lanes at once. Something rebased it onto `origin/main`
+mid-flight; to do that it ran a `stash` first. The rebase finished, the branch moved, and the
+stash **was never popped**.
+
+⇒ A lane holding a finished, tested, uncommitted unit came back to `git status` reporting a
+single modified lock file. The unit was not lost — it was sitting in `stash@{0}` — but nothing
+in the tree said so, and the obvious reading of that status is *"my work is gone"* or, worse,
+*"my work was never here, I must redo it"*.
+
+**Why this is the dangerous shape and not merely annoying.**
+
+1. ⛔ **It fails silently and in the reassuring direction.** A clean tree is what a healthy
+   checkout looks like. There is no error, no marker file, no conflict — the one signal is a
+   stash entry nobody thought to list.
+2. ⛔ **The recovery instinct is the destructive one.** An agent that reads "my edits are gone"
+   redoes them from memory, and then a later `stash pop` collides with the redo. The cheap
+   check — `git stash list` before concluding anything about missing work — is the one nobody
+   runs, because stashes are something *you* make, not something that happens to you.
+3. ⚠ **The blast radius is every lane sharing the checkout**, and the lane that loses work is
+   never the lane that ran the rebase.
+
+**What is wanted.** A helper that rebases a shared checkout must (a) refuse outright when the
+tree is dirty, or (b) pop what it stashed, in the same run, and fail loudly if the pop
+conflicts. A stash it opens and does not close is a trap it leaves for a different lane.
+
+⇒ **Until that exists, the standing rule for any lane on a shared checkout:** before
+concluding work is missing, run `git stash list` and `git reflog`. A tree that looks
+innocent has still been edited by someone.
+
+## ygg-claim: a fresh top-level claim can derive a PID-shaped seat number
+
+**Status:** OPEN. Hit 2026-08-21 claiming a fresh orchestrator row.
+
+A fresh session (no existing `outline_prefix`, predecessor already retired) ran the claim
+script and was seated as **`6914974.0`** — a number that looks like a process id, not a seat.
+The claim read-back reported it as verified, so nothing failed loudly; the garbage number
+would have sat in the sidebar as the row's family for the rest of the campaign.
+
+Expected: a top-level claim derives the next small family number against existing rows
+(the fixed derivation of 2026-08-20 evening), and something sanity-checks the magnitude —
+a seat family in the millions is never right and should refuse or warn rather than verify.
+
+Repair that worked: `server app session outline <row> <seat>` + read-back, per the standing
+corollary that a wrong seat is repaired with the outline verb, never a re-claim.
+
+## server app session outline: calling it without a seat CLEARS the prefix — a read that writes
+
+**Status:** OPEN. Hit 2026-08-21, immediately after the repair above.
+
+`server app session outline <row> 12.0` applies the seat. The natural way to READ it back is
+to call the same verb without the seat argument — and that call **applies the empty string**:
+`daemon_message: outline "" on <row>`, `outline_prefix: null`, `applied: true`. The read-shaped
+form is a destructive write, and it reports success.
+
+⇒ The one verb is both the setter and the eraser, selected by argument arity, with no
+confirmation on the erasing form. Wanted: the no-argument form should RETURN the current
+value (or refuse), and clearing should be an explicit flag (`--clear`). Until then the only
+safe read-back is a listing instrument, not the verb itself.
+
+## [19.1] `server app session outline` REPORTS `error: null` WHILE `applied: false`, SO A SEAT SILENTLY DOES NOT LAND
+
+**Status:** OPEN — observed 2026-08-21 against the current build.
+
+A CLI-runtime session renamed its own row successfully and then set its seat number in the
+same claim. **The rename landed; the seat did not.** The read-back showed an empty prefix,
+which the claim script reported as `claim never verified (row reads: |<title>)`.
+
+Calling the verb directly returns the reason, and the reason is only in `data`:
+
+```json
+{ "data": { "applied": false,
+            "daemon_message": "no live session for cc-runtime://<uuid>",
+            "outline_prefix": null, "requested": "19.1" },
+  "error": null }
+```
+
+⛔ **`error` is `null` for a request that did nothing.** Any caller that checks the documented
+error channel concludes success. The claim script only caught it because it independently
+re-reads row state — a caller written to the obvious contract would not.
+
+⚠ **And the two verbs disagree about what a row is.** `rename` accepted the same row path in the
+same second that `outline` called it "no live session". So a row can be renameable and
+unseatable at once, which is not a state any caller is written to expect.
+
+**What would falsify this:** a run where `outline` on a row absent from the daemon's live-session
+table returns a non-null `error`, or where `rename` refuses the same path for the same reason.
+
+**Suggested shape of a fix:** `applied: false` should always be accompanied by a non-null `error`,
+and the two verbs should agree on the liveness precondition — either both require a live session
+or neither does.
+
+## [19.2] REPORT — CROSS-CLI ORCHESTRATION: WHAT BLOCKS DRIVING A NON-CLAUDE AGENT CLI AS A FLEET LANE
+
+**Status:** AWAITING A DECISION (orchestration owner). Not a defect report — a survey, written
+after actually launching a third-party agent CLI as a work lane on 2026-08-21. It worked, but
+none of the fleet machinery reached it.
+
+**1. A third-party CLI session is invisible to the row plane.** It runs as an ordinary background
+process. It cannot be claimed, titled, seated, monitored for stalls, or messaged by any existing
+verb, and it does not appear in `server app rows`. ⇒ **Today the only way to supervise one is to
+poll files it writes.** Anything built on rows — the stall detector, the booter, succession —
+simply does not apply.
+
+**2. Argument order silently changes what runs.** On the CLI tested, putting the print/non-
+interactive flag *before* the model selector caused **both** the model choice and the prompt
+itself to be dropped: the agent ran on the default model and answered a question nobody asked,
+with exit status 0. ⇒ ⛔ **A wrapper must pin flag order and then VERIFY the model actually used**,
+because the failure is silent and looks like a bad answer rather than a bad invocation.
+
+**3. Non-interactive mode buffers all output to completion.** A multi-hour run produces a
+zero-byte log and is indistinguishable from a hung process. ⇒ **Any long third-party run must be
+instructed to write incremental artefacts and a progress log**, or it cannot be observed at all.
+That instruction has to be in the prompt; there is no flag for it.
+
+**4. Capability cannot be assumed and must be positively controlled.** Before committing a long
+batch, one input was processed and the result compared against a reading taken independently. It
+matched. ⇒ **Cheap, and the only thing separating "the tool can do this" from "the tool produced
+confident text".** Recommend this become standard practice for any new engine.
+
+**5. Blast radius has to be pre-shrunk, because a third-party lane cannot be trusted with shared
+registries.** The approach that worked: **reserve the identifier range up front** so the lane never
+negotiates for one, forbid it from editing any shared index, and have it write only additive
+artefacts that a first-party lane later promotes. ⇒ **Generalisable rule: give a foreign lane a
+sandbox and a promotion step, never a seat at a shared table.**
+
+**The decision owed:** whether the row plane should model non-Claude sessions at all — a thin
+"external lane" row carrying pid, log path and progress file would make items 1 and 3 tractable —
+or whether foreign CLIs stay file-supervised by design. **Both are defensible; the current state
+is neither, and it is undocumented.**

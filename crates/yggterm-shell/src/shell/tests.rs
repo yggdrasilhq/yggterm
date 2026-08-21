@@ -1412,6 +1412,8 @@ mod tests {
             session_path.to_string(),
             WebSurfaceUiState {
                 tabs: vec![WebSurfaceTab {
+                    media_playing: false,
+                    media_seen_ms: 0,
                     id: 0,
                     url: "https://app".to_string(),
                     effective_url: "https://app".to_string(),
@@ -17261,6 +17263,7 @@ mod tests {
                 userscripts: vec!["console.log(1)".to_string()],
                 userscripts_v2: None,
                 user_agent: None,
+                user_agent_sites: Default::default(),
             },
         );
 
@@ -17300,6 +17303,7 @@ mod tests {
                 userscripts: vec!["console.log(1)".to_string()],
                 userscripts_v2: None,
                 user_agent: None,
+                user_agent_sites: Default::default(),
             },
         );
         let SurfacePolicyGate::Ready(policy) = shell.web_surface_policy_gate("local://p") else {
@@ -17537,6 +17541,7 @@ mod tests {
                 userscripts: Vec::new(),
                 userscripts_v2: None,
                 user_agent: None,
+                user_agent_sites: Default::default(),
             },
         );
         assert_eq!(
@@ -20698,7 +20703,7 @@ mod tests {
         let dot_styles = [
             live_session_status_dot_style(dark, true, true),
             live_session_status_dot_style(dark, false, true),
-            web_tab_loading_dot_style(true),
+            web_tab_activity_dot_style(true, false),
             status_dot_blink_opacity_css(true),
         ];
         for style in &dot_styles {
@@ -20733,11 +20738,209 @@ mod tests {
             keys(&live_session_status_dot_style(dark, true, false))
         );
         assert_eq!(
-            keys(&web_tab_loading_dot_style(true)),
-            keys(&web_tab_loading_dot_style(false))
+            keys(&web_tab_activity_dot_style(true, false)),
+            keys(&web_tab_activity_dot_style(false, false))
         );
         assert!(status_dot_blink_opacity_css(false).contains("opacity: 1;"));
         assert!(!status_dot_blink_opacity_css(false).contains("var("));
+    }
+
+    // ========================================================================
+    // A BACKGROUND TAB PLAYING MEDIA — the blinking indicator (owner mandate,
+    // 2026-08-20). The falsifier is a live screenshot and no unit test can
+    // stand in for it; what these lock is everything that would make the
+    // screenshot lie.
+    // ========================================================================
+
+    /// ⛔ THE ONE RULE: the dot marks a BACKGROUND tab whose media claim is
+    /// FRESH. Both halves have their own failure and each one is silent.
+    #[test]
+    fn only_a_background_tab_with_a_fresh_engine_answer_earns_the_media_dot() {
+        let now = 1_000_000_u64;
+        // The case the mandate exists for.
+        assert!(web_tab_earns_media_dot(false, true, now, now));
+        // FOREGROUND: the user is already looking at it.
+        assert!(!web_tab_earns_media_dot(true, true, now, now));
+        // Silent: the whole point. An indicator that blinks on a quiet row is
+        // worse than none, because the user stops believing the ones that mean it.
+        assert!(!web_tab_earns_media_dot(false, false, now, now));
+        // A claim still inside the freshness window is still believed — this is
+        // what lets an hour-long album keep its dot between heartbeats.
+        assert!(web_tab_earns_media_dot(
+            false,
+            true,
+            now - (WEB_SURFACE_MEDIA_MAX_MS - 1),
+            now,
+        ));
+        // ...and one nobody has renewed has lapsed. The surface may have been
+        // destroyed by a session close or replaced by a reload; from here those
+        // are indistinguishable from real playback, which is why the window and
+        // not a guess is the answer.
+        assert!(!web_tab_earns_media_dot(
+            false,
+            true,
+            now - (WEB_SURFACE_MEDIA_MAX_MS + 1),
+            now,
+        ));
+        // A stamp from the future (clock step) must not read as ancient.
+        assert!(web_tab_earns_media_dot(false, true, now + 5_000, now));
+    }
+
+    /// The heartbeat has to be comfortably inside the window it renews, or a
+    /// genuinely playing tab flickers off between beats — the exact false
+    /// negative that teaches the user to ignore the dot.
+    #[test]
+    fn the_media_heartbeat_renews_well_inside_the_window_it_renews() {
+        assert!(
+            WEB_SURFACE_MEDIA_HEARTBEAT_MS * 2 <= WEB_SURFACE_MEDIA_MAX_MS,
+            "a renewal every {WEB_SURFACE_MEDIA_HEARTBEAT_MS}ms cannot keep a \
+             {WEB_SURFACE_MEDIA_MAX_MS}ms claim alive across a slow tick",
+        );
+        // ...and far above the reconcile beat, or a playing tab writes shell
+        // state sixty times a second and repaints the rail with it.
+        assert!(WEB_SURFACE_MEDIA_HEARTBEAT_MS > WEB_SURFACE_RECONCILE_BEAT_MS * 10);
+    }
+
+    /// The media dot is the SAME dot, so it must obey the same two laws the
+    /// loading light does: join the one blink clock, and declare the same style
+    /// keys lit and unlit (Dioxus never clears a key a later render drops, so an
+    /// arm that omitted one would leave a finished tab blinking forever).
+    #[test]
+    fn the_media_dot_joins_the_one_clock_and_keeps_the_key_set_fixed() {
+        let keys = |style: &str| {
+            let mut keys: Vec<String> = style
+                .split(';')
+                .filter_map(|decl| decl.split(':').next())
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+                .collect();
+            keys.sort();
+            keys
+        };
+        let media = web_tab_activity_dot_style(false, true);
+        assert!(
+            media.contains("var(--yggterm-status-dot-blink, 1)"),
+            "the media dot must read the shared phase, never its own: {media}"
+        );
+        assert!(
+            !media.contains("animation:"),
+            "a dot must never own an animation: {media}"
+        );
+        assert!(media.contains("#22c55e"), "a lit dot is the vocabulary's green");
+        assert_eq!(keys(&media), keys(&web_tab_activity_dot_style(false, false)));
+        // Either cause lights it, and a tab that is both loading AND playing is
+        // lit once, not twice.
+        assert_eq!(web_tab_activity_dot_style(true, false), media);
+        assert_eq!(web_tab_activity_dot_style(true, true), media);
+        assert!(web_tab_activity_dot_style(false, false).contains("transparent"));
+    }
+
+    /// ⛔ THE DUPLICATE LISTING, reported from a screenshot of a real launcher:
+    /// the same two verbs offered twice in one menu.
+    ///
+    /// One manifest cannot cause it — its `name` must equal its own file stem,
+    /// so one app is one file — which means the list reaching the menu builder
+    /// already held the registration twice. The defence belongs where the list
+    /// becomes a menu, because that is the one place that can be sure, whatever
+    /// went wrong upstream.
+    #[test]
+    fn one_apps_verb_is_offered_once_however_often_it_is_registered() {
+        let verb = |id: &str, label: &str, args: &[&str]| AppVerb {
+            id: id.to_string(),
+            label: label.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            ..Default::default()
+        };
+        let meter = AppManifest {
+            name: "meter".into(),
+            label: "Meter".into(),
+            binary: "/opt/demo/meter".into(),
+            verbs: vec![
+                verb("open", "Cluster meter", &[]),
+                verb("boot", "Cluster boot", &["--tab", "boot"]),
+            ],
+            ..Default::default()
+        };
+        // The reported shape: the same registration present twice.
+        let entries = app_launcher_entries(&[meter.clone(), meter.clone()]);
+        let labels: Vec<&str> = entries.iter().map(|(_, v)| v.label.as_str()).collect();
+        assert_eq!(labels, vec!["Cluster meter", "Cluster boot"]);
+
+        // ⚠ ...and the over-reach this must NOT have. Two DIFFERENT apps that
+        // happen to share a binary are two real entries, and a key built on the
+        // resolved command would silently delete one of them.
+        let twin = AppManifest {
+            name: "gauge".into(),
+            label: "Gauge".into(),
+            binary: "/opt/demo/meter".into(),
+            verbs: vec![verb("open", "Gauge", &[])],
+            ..Default::default()
+        };
+        assert_eq!(app_launcher_entries(&[meter, twin]).len(), 3);
+    }
+
+    /// A lit dot says WHY when hovered; an unlit one says nothing at all, so the
+    /// rail is not full of rows announcing that they are idle.
+    #[test]
+    fn only_a_lit_activity_dot_carries_a_tooltip() {
+        assert_eq!(web_tab_activity_dot_title(false, false), None);
+        assert_eq!(web_tab_activity_dot_title(true, false), Some("Loading"));
+        assert_eq!(
+            web_tab_activity_dot_title(false, true),
+            Some("Playing media in the background"),
+        );
+        // Loading is the transient of the two, so it is what a row that is both
+        // reports while it lasts.
+        assert_eq!(web_tab_activity_dot_title(true, true), Some("Loading"));
+    }
+
+    /// ⛔⛔ THE DEFECT THAT WOULD BLIND THE WHOLE FEATURE, AND IT FAILS SILENTLY.
+    ///
+    /// The reconciler's page-state poll sits behind `if entry.stashed_at_ms
+    /// .is_none()`, because a stashed surface's URL and title cannot change while
+    /// nothing drives it. Media is the opposite case: a soft-stashed surface IS a
+    /// background tab, which is the only thing this signal was ever asked for.
+    /// Tucked under that guard — the natural place for a new engine poll, right
+    /// beside the three that are already there — the probe would read silence
+    /// from every tab it was built to find, and would do it in the reassuring
+    /// direction: no dot anywhere, nothing visibly broken, a feature that simply
+    /// never fires.
+    ///
+    /// ⚠ Locked on the SOURCE because there is nothing else to lock it on: the
+    /// bug is a line's POSITION, and a probe in the wrong place computes a
+    /// perfectly correct answer to a question about the wrong surface.
+    #[test]
+    fn the_media_probe_runs_outside_the_not_stashed_guard() {
+        let source = SHELL_SOURCE;
+        let product: Vec<&str> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("fn the_media_probe_runs_outside_the_not_stashed_guard")),
+            "the scan is reading this test, so its own needle would satisfy it",
+        );
+        let probe = product
+            .iter()
+            .position(|line| {
+                line.contains("let media_playing = desktop.web_surface_is_playing_audio(")
+            })
+            .expect(
+                "the reconciler no longer probes the engine for media — the tab dot \
+                 is now driven by something that is not the engine's own answer",
+            );
+        let guard = product
+            .iter()
+            .position(|line| line.trim() == "if entry.stashed_at_ms.is_none()")
+            .expect("the not-stashed guard moved; re-read this test before editing it");
+        assert!(
+            probe < guard,
+            "the media probe (line {probe} of the product scan) sits INSIDE the \
+             not-stashed guard (line {guard}) — it will read silent on every \
+             backgrounded tab, which is every tab this indicator exists for",
+        );
     }
     #[test]
     fn codex_completion_notification_only_fires_after_busy_session_becomes_idle() {
@@ -28971,6 +29174,7 @@ mod tests {
                     "default".to_string(),
                     true,
                     1.0,
+                    None,
                     1_000,
                 ),
             );
@@ -52677,6 +52881,10 @@ mod webtabs_menu_switcher_locks {
 
     fn tab(id: u64, label: &str, folder: Option<&str>, active: bool) -> WebSurfaceOverlayTabView {
         WebSurfaceOverlayTabView {
+            // The rail fixture builds SILENT tabs; the media cases say so
+            // explicitly, so a row that blinks in a layout assertion is a bug
+            // and never a fixture default.
+            media_playing: false,
             id,
             // A user tab always holds a saved page; the app-tab cases that care
             // build the view themselves and say so.
@@ -52761,8 +52969,25 @@ mod webtabs_menu_switcher_locks {
             WebSurfaceOpenKind::Launch,
             1_000,
         );
+        // ⚠ Seeded at the END on purpose. This fixture describes a surface that
+        // ALREADY HOLDS these tabs, in this order, with ids 1..n — it is not
+        // exercising the placement rule. Opening them through the normal path
+        // would put each new one on TOP (the browser's direction, see
+        // [`web_tab_placement`]) and every layout assertion built on this
+        // fixture would silently read backwards.
         for (url, folder_id) in tabs {
-            shell.web_surface_open_tab("local://ws", &WebTabOpenRequest::blank());
+            let at = shell.web_surfaces["local://ws"].tabs.len();
+            shell.web_surface_open_tab(
+                "local://ws",
+                &WebTabOpenRequest {
+                    origin: WebTabOrigin::Restore {
+                        index: at,
+                        folder: folder_id.map(|id| id.to_string()),
+                    },
+                    destination: WebTabDestination::Blank,
+                    foreground: true,
+                },
+            );
             let surface = shell
                 .web_surfaces
                 .get_mut("local://ws")
@@ -54775,7 +55000,7 @@ mod webtabs_menu_switcher_locks {
             menu_shape(&menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))),
             vec![
                 "webtab-new",
-                "webtab-new-below",
+                "webtab-new-above",
                 "webtab-reopen",
                 "--",
                 "webtab-reload",
@@ -54827,19 +55052,19 @@ mod webtabs_menu_switcher_locks {
     /// The CREATE verbs the menu never had — including the one the placement
     /// model is what makes meaningful.
     #[test]
-    fn the_menu_can_open_a_tab_and_open_one_below_this_one() {
+    fn the_menu_can_open_a_tab_and_open_one_above_this_one() {
         assert_eq!(
             web_tab_menu_action(&WebTabMenuTarget::Tab(3), "webtab-new"),
             Some(WebTabMenuAction::NewTab),
         );
         assert_eq!(
-            web_tab_menu_action(&WebTabMenuTarget::Tab(3), "webtab-new-below"),
-            Some(WebTabMenuAction::NewTabBelow(3)),
+            web_tab_menu_action(&WebTabMenuTarget::Tab(3), "webtab-new-above"),
+            Some(WebTabMenuAction::NewTabAbove(3)),
         );
         // "Below this one" IS the opener group: the tab it opens is this tab's
         // child, so the next one cascades after it.
         assert_eq!(
-            WebTabOpenRequest::blank_below(3).origin,
+            WebTabOpenRequest::blank_above(3).origin,
             WebTabOrigin::Opener(3),
         );
 
@@ -54848,7 +55073,7 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_surface(&[("https://a/", None)]);
         for action in [
             WebTabMenuAction::NewTab,
-            WebTabMenuAction::NewTabBelow(1),
+            WebTabMenuAction::NewTabAbove(1),
             WebTabMenuAction::ReopenClosedTabs,
             WebTabMenuAction::CopyTabUrl(1),
         ] {
@@ -55133,9 +55358,10 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(
             shell.web_surfaces["local://ws"]
                 .tabs
-                .last()
+                .get(1)
                 .and_then(|tab| tab.folder.clone()),
             Some("f2".to_string()),
+            "the folder's + opens at the TOP of the list, directly under the app tab"
         );
     }
 
@@ -55492,80 +55718,84 @@ mod webtabs_menu_switcher_locks {
             .collect()
     }
 
-    /// The CASCADE, as arithmetic. Two links opened from one page go below that
-    /// page in the order they were opened — not both immediately under it,
-    /// which would show them reversed.
+    /// The CASCADE, as arithmetic, and it runs UPWARD. Two links opened from one
+    /// page go ABOVE that page, newest first — the mirror of Chrome's model,
+    /// because the owner's rule for this browser is *new tabs open from the top*.
     #[test]
-    fn a_spawned_tab_lands_below_its_opener_and_siblings_cascade_after_it() {
+    fn a_spawned_tab_lands_above_its_opener_and_siblings_cascade_before_it() {
         // app(0), page(1).
         let rows = vec![placement_row(0, None, None), placement_row(1, None, None)];
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Opener(1)),
             WebTabPlacement {
-                index: 2,
+                index: 1,
                 folder: None,
                 opener: Some(1)
             },
-            "the first link opened from page 1 sits directly below it"
+            "the first link opened from page 1 sits directly above it"
         );
 
-        // …with that first child (2) now present, the SECOND link from page 1
-        // must go after it, not between 1 and 2.
+        // …with that first child (2) now present ABOVE page 1, the SECOND link
+        // from page 1 must go above IT, not between 2 and 1.
         let rows = vec![
             placement_row(0, None, None),
-            placement_row(1, None, None),
             placement_row(2, Some(1), None),
+            placement_row(1, None, None),
         ];
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Opener(1)).index,
-            3,
-            "the second link cascades AFTER the first"
+            1,
+            "the second link cascades ABOVE the first"
         );
 
-        // A link opened from child 2 sits directly under 2 — the rule is the
+        // A link opened from child 2 sits directly above 2 — the rule is the
         // same one level down.
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Opener(2)).index,
-            3,
-            "a link from child 2, which has no children yet, goes right below it"
+            1,
+            "a link from child 2, which has no children yet, goes right above it"
         );
 
         // A GRANDCHILD counts as part of the group it descends from: the next
         // link from page 1 must clear the whole subtree, not just the child.
         let rows = vec![
             placement_row(0, None, None),
-            placement_row(1, None, None),
-            placement_row(2, Some(1), None),
             placement_row(3, Some(2), None),
+            placement_row(2, Some(1), None),
+            placement_row(1, None, None),
         ];
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Opener(1)).index,
-            4,
+            1,
             "the group is the whole subtree, so page 1's next link clears the \
              grandchild too"
         );
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Opener(2)).index,
-            4,
-            "…and child 2's next link cascades after the child IT already has"
+            1,
+            "…and child 2's next link cascades above the child IT already has"
         );
 
-        // A tab from ANOTHER group is where the scan stops — page 1's group
-        // does not swallow the tab that follows it.
+        // A tab from ANOTHER group is where the upward scan stops — page 1's
+        // group does not swallow the tab that precedes it.
         let rows = vec![
             placement_row(0, None, None),
-            placement_row(1, None, None),
-            placement_row(2, Some(1), None),
             placement_row(3, None, None),
+            placement_row(2, Some(1), None),
+            placement_row(1, None, None),
         ];
-        assert_eq!(web_tab_placement(&rows, &WebTabOrigin::Opener(1)).index, 3);
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(1)).index,
+            2,
+            "the unrelated tab 3 is not part of page 1's group, so the walk halts"
+        );
     }
 
-    /// `Append` appends, a folder's "+" fills its folder, and NO branch can
-    /// displace the app tab — `tabs[0]` is the app's, and every close verb in
-    /// the product is written on that premise.
+    /// `Top` takes the top, a folder's "+" fills its folder from the top, and NO
+    /// branch can displace the app tab — `tabs[0]` is the app's, and every close
+    /// verb in the product is written on that premise.
     #[test]
-    fn placement_appends_fills_folders_and_never_displaces_the_app_tab() {
+    fn placement_opens_from_the_top_fills_folders_and_never_displaces_the_app_tab() {
         let rows = vec![
             placement_row(0, None, None),
             placement_row(1, None, Some("f1")),
@@ -55573,36 +55803,37 @@ mod webtabs_menu_switcher_locks {
             placement_row(3, None, Some("f1")),
         ];
         assert_eq!(
-            web_tab_placement(&rows, &WebTabOrigin::Append),
+            web_tab_placement(&rows, &WebTabOrigin::Top),
             WebTabPlacement {
-                index: 4,
+                index: 1,
                 folder: None,
                 opener: None
             },
+            "directly under the app tab — new tabs open from the top"
         );
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Folder("f1".to_string())),
             WebTabPlacement {
-                index: 4,
+                index: 1,
                 folder: Some("f1".to_string()),
                 opener: None
             },
-            "after the LAST tab already filed in f1, so a folder's + fills the \
+            "at the FIRST tab already filed in f1, so a folder's + fills the \
              folder rather than the window"
         );
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Folder("empty".to_string())).index,
-            4,
-            "a folder with nothing in it yet takes the end"
+            1,
+            "a folder with nothing in it yet takes the top"
         );
 
-        // An opener that has already gone is an append, and — the part that
-        // matters — it carries NO opener id. A dangling id would make the next
-        // open in that group append too, silently.
+        // An opener that has already gone is an ordinary top open, and — the
+        // part that matters — it carries NO opener id. A dangling id would make
+        // the next open in that group a plain one too, silently.
         assert_eq!(
             web_tab_placement(&rows, &WebTabOrigin::Opener(99)),
             WebTabPlacement {
-                index: 4,
+                index: 1,
                 folder: None,
                 opener: None
             },
@@ -55610,7 +55841,7 @@ mod webtabs_menu_switcher_locks {
 
         // Nothing returns 0. Every origin, against every shape of list.
         for origin in [
-            WebTabOrigin::Append,
+            WebTabOrigin::Top,
             WebTabOrigin::Folder("f1".to_string()),
             WebTabOrigin::Folder("nope".to_string()),
             WebTabOrigin::Opener(0),
@@ -55634,11 +55865,41 @@ mod webtabs_menu_switcher_locks {
         ];
         let placement = web_tab_placement(&rows, &WebTabOrigin::Opener(1));
         assert_eq!(placement.folder.as_deref(), Some("work"));
-        assert_eq!(placement.index, 2);
+        assert_eq!(placement.index, 1);
+    }
+
+    /// The direction is a PRODUCT decision that differs per app, so it is locked
+    /// here rather than left to whichever call site is read next: a browser tab
+    /// opens ABOVE what spawned it, a live terminal session appends BELOW. An
+    /// agent-driven "unify the two" would silently undo the owner's rule.
+    #[test]
+    fn every_origin_grows_the_list_upward() {
+        let rows = vec![
+            placement_row(0, None, None),
+            placement_row(1, None, None),
+            placement_row(2, None, None),
+        ];
+        for origin in [
+            WebTabOrigin::Top,
+            WebTabOrigin::Folder("nope".to_string()),
+            WebTabOrigin::Opener(2),
+            WebTabOrigin::Opener(404),
+        ] {
+            let index = web_tab_placement(&rows, &origin).index;
+            assert!(
+                index < rows.len(),
+                "{origin:?} landed at the END ({index}) — the browser opens from the top"
+            );
+            assert!(index >= 1, "{origin:?} would have displaced the app tab");
+        }
+        // An EMPTY surface (the instant before the app tab arrives) must not
+        // panic or produce an out-of-range index.
+        assert_eq!(web_tab_placement(&[], &WebTabOrigin::Top).index, 0);
     }
 
     /// The whole model, run through the real shell: a middle-click, then a
-    /// second one, then a duplicate — each landing where the user expects.
+    /// second one, then a duplicate — each landing where the user expects, which
+    /// in this browser is ABOVE.
     #[test]
     fn the_open_paths_place_their_tabs_where_the_placement_owner_says() {
         let mut shell = shell_with_surface(&[("https://page/", None), ("https://other/", None)]);
@@ -55651,40 +55912,44 @@ mod webtabs_menu_switcher_locks {
             .expect("surface is live");
         assert_eq!(
             tab_ids(&shell),
-            vec![0, 1, first, 2],
-            "the link lands directly below the page that linked it, not at the end"
+            vec![0, first, 1, 2],
+            "the link lands directly above the page that linked it, not at the end"
         );
         assert_eq!(
             shell.web_surfaces["local://ws"].active_tab, 2,
             "a background open does not move the front"
         );
 
-        // A second middle-click on the SAME page cascades after the first.
+        // A second middle-click on the SAME page cascades ABOVE the first.
         let (second, _) = shell
             .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
             .expect("surface is live");
-        assert_eq!(tab_ids(&shell), vec![0, 1, first, second, 2]);
+        assert_eq!(tab_ids(&shell), vec![0, second, first, 1, 2]);
 
-        // A duplicate of `other` sits below `other`, not at the bottom.
+        // A duplicate of `other` sits directly above `other`, not at either end.
         let copy = shell
             .web_surface_duplicate_tab("local://ws", 2)
             .expect("other has a URL to copy");
-        assert_eq!(tab_ids(&shell), vec![0, 1, first, second, 2, copy]);
+        assert_eq!(tab_ids(&shell), vec![0, second, first, 1, copy, 2]);
         assert_eq!(
             shell.web_surfaces["local://ws"].active_tab, copy,
             "a duplicate takes the front"
         );
 
-        // The header "+" still appends, with no opener: nothing spawned it.
-        let appended = shell
+        // The header "+" takes the TOP, with no opener: nothing spawned it.
+        let opened = shell
             .web_surface_open_tab("local://ws", &WebTabOpenRequest::blank())
             .expect("surface is live");
-        assert_eq!(tab_ids(&shell), vec![0, 1, first, second, 2, copy, appended]);
+        assert_eq!(
+            tab_ids(&shell),
+            vec![0, opened, second, first, 1, copy, 2],
+            "the header + opens directly under the app tab"
+        );
         assert_eq!(
             shell.web_surfaces["local://ws"]
                 .tabs
                 .iter()
-                .find(|tab| tab.id == appended)
+                .find(|tab| tab.id == opened)
                 .and_then(|tab| tab.opener),
             None,
         );
@@ -55729,12 +55994,12 @@ mod webtabs_menu_switcher_locks {
              they had not visited are spent"
         );
 
-        // So the next link from page 1 goes directly below page 1 again, ahead
-        // of the child it opened before.
+        // So the next link from page 1 goes directly above page 1 again, below
+        // the child it opened before.
         let (later, _) = shell
             .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
             .expect("surface is live");
-        assert_eq!(tab_ids(&shell), vec![0, 1, later, child]);
+        assert_eq!(tab_ids(&shell), vec![0, child, later, 1]);
     }
 
     /// An opener id may NEVER dangle. Closing a tab in the middle of a group
@@ -55749,7 +56014,7 @@ mod webtabs_menu_switcher_locks {
         let (grandchild, _) = shell
             .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(child, true))
             .expect("surface is live");
-        assert_eq!(tab_ids(&shell), vec![0, 1, child, grandchild]);
+        assert_eq!(tab_ids(&shell), vec![0, grandchild, child, 1]);
 
         shell.web_surface_close_tab("local://ws", child);
         let surface = &shell.web_surfaces["local://ws"];
@@ -55775,7 +56040,7 @@ mod webtabs_menu_switcher_locks {
         let (next, _) = shell
             .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
             .expect("surface is live");
-        assert_eq!(tab_ids(&shell), vec![0, 1, grandchild, next]);
+        assert_eq!(tab_ids(&shell), vec![0, next, grandchild, 1]);
     }
 
     /// THE FOCUS RULE, as one predicate. Both clauses are load-bearing and both
@@ -55788,7 +56053,7 @@ mod webtabs_menu_switcher_locks {
         assert!(web_tab_opens_typing_ready(
             &WebTabOpenRequest::blank_in_folder("f1")
         ));
-        assert!(web_tab_opens_typing_ready(&WebTabOpenRequest::blank_below(
+        assert!(web_tab_opens_typing_ready(&WebTabOpenRequest::blank_above(
             1
         )));
 
@@ -56553,7 +56818,7 @@ mod webtabs_menu_switcher_locks {
     /// through); a second rule spelled here would drift from it the first time
     /// either changed.
     #[test]
-    fn middle_click_on_a_nav_control_opens_a_new_tab_below_this_one() {
+    fn middle_click_on_a_nav_control_opens_a_new_tab_above_this_one() {
         let product = product_source();
 
         // 1. ALL FOUR controls, one shape: gated on the middle button, default
@@ -56618,7 +56883,7 @@ mod webtabs_menu_switcher_locks {
             route.contains("WebTabOpenRequest::opened_by(opener_tab_id, true)")
                 && route.contains("open_web_surface_tab("),
             "the new tab must be minted by the UI opener from an Opener origin \
-             — that IS \"below this one\":\n{route}"
+             — that IS \"above this one\":\n{route}"
         );
         assert!(
             !route.contains("web_tab_placement") && !route.contains("tabs.insert("),
@@ -56629,7 +56894,7 @@ mod webtabs_menu_switcher_locks {
             "the minted tab is blank until something navigates it:\n{route}"
         );
 
-        // 4. And the origin it names really does mean "below the active tab,
+        // 4. And the origin it names really does mean "above the active tab,
         //    cascading, without moving the front".
         let mut shell = shell_with_surface(&[
             ("https://a.example/", None),
@@ -56649,8 +56914,8 @@ mod webtabs_menu_switcher_locks {
             .expect("a live surface opens a tab");
         assert_eq!(
             index_of(&shell, first),
-            2,
-            "the middle-clicked tab lands DIRECTLY below the active tab, not at \
+            1,
+            "the middle-clicked tab lands DIRECTLY above the active tab, not at \
              the end of the list"
         );
         assert_eq!(
@@ -56661,9 +56926,9 @@ mod webtabs_menu_switcher_locks {
             .web_surface_open_tab("local://ws", &WebTabOpenRequest::opened_by(active, true))
             .expect("a live surface opens a tab");
         assert_eq!(
-            (index_of(&shell, first), index_of(&shell, second)),
-            (2, 3),
-            "a second middle-click CASCADES after the first, rather than \
+            (index_of(&shell, second), index_of(&shell, first)),
+            (1, 2),
+            "a second middle-click CASCADES above the first, rather than \
              shoving in between the active tab and it"
         );
     }
