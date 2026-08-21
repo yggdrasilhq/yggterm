@@ -850,14 +850,17 @@ fn print_server_help() {
   yggterm server ledger [--scope <scope>]
   yggterm server daemons [--json]
   yggterm server write-lock <acquire|release|status> [--holder <who>]
-  yggterm server screen [<session-key>] [--state|--state-only] [--json]
+  yggterm server screen [<session-key>] [--state|--state-only|--states] [--json]
     a row's screen as PLAIN DECODED TEXT on stdout — one line per visible row,
     no JSON envelope, nothing to unwrap. This is the only check that can tell a
     DELIVERED brief from one QUEUED behind a modal: every other instrument is
     downstream of the write, and a pty accepts bytes whether or not anything is
     consuming them. `--state` prefixes the row's state with its remedy and its
     prohibition; `--state-only` prints just the state token, for a spawn recipe
-    to branch on. Read-only, never written to the trace.
+    to branch on. `--states` prints the whole classifier registry — every
+    state with its remedy and its prohibition — and needs no daemon and no
+    row, because the moment you need it is the moment the row is in doubt.
+    Read-only, never written to the trace.
   yggterm server gate-screen [<session-key>] [--tail <n>] [--json]
   yggterm server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
   yggterm server wpe <verb> [--key value ...]
