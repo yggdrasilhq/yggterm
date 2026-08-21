@@ -569,6 +569,10 @@ card added the same day (see the adoption-chain entry below) is exactly a long-l
 non-stage card, raised on a row whose surface is already broken — the worst moment to be
 spending a render per second.
 
+⭐ **The falsifier for both is in `scripts/verify-input-block-fixes.sh`, and it names the trap
+in the measurement:** keep the window FOCUSED while you look. The gate leak was cleared by
+unfocusing, so an unfocused window hides the very thing you are checking.
+
 ⛔ **AND ONE FILED ROOT IS FALSIFIED — do not spend on it again.** The evidence dossier's
 keystroke-path root claimed `terminal_input_schedule_live_snapshot_refresh` "inserts an
 8.7-15.5 ms vdom pass + webview edit batch between the user's Enter and its echo". It does
