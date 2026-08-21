@@ -196,6 +196,14 @@ fn print_server_help() {
     host — i.e. may a daemon bump be taken right now. Read-only, and it reports
     presence only, never what was typed. `verdict:\"blind\"` means some daemon
     predates the field and could not answer; that is NOT `\"clear\"`.
+  yggterm-headless server screen [<session-key>] [--state|--state-only] [--json]
+    a row's screen as PLAIN DECODED TEXT on stdout — one line per visible row,
+    no JSON envelope, nothing to unwrap. This is the only check that can tell a
+    DELIVERED brief from one QUEUED behind a modal: every other instrument is
+    downstream of the write, and a pty accepts bytes whether or not anything is
+    consuming them. `--state` prefixes the row's state with its remedy and its
+    prohibition; `--state-only` prints just the state token, for a spawn recipe
+    to branch on. Read-only, never written to the trace.
   yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]
     what the hot-restart idle gate is CLASSIFYING FROM, per owned session — the
     live in-daemon screen plus the blocker it produced. This is not
@@ -1326,6 +1334,14 @@ fn main() -> Result<()> {
     }
     if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
         return yggterm_server::server_cli::run_server_gate_screen_cli(&store, &args);
+    }
+    // ⛔ BOTH BINARIES, and pinned by a test. This dispatcher exists twice, and
+    // a consolidation that touched only one copy has silently removed five
+    // verbs before — the handlers and their tests stayed, so the verbs looked
+    // present in the source and were absent from a built binary. Reachability
+    // is the only property that notices.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "screen" {
+        return yggterm_server::server_cli::run_server_screen_cli(&store, &args);
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "app-declares"
     {
