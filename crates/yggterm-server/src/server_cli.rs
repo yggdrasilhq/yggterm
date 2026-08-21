@@ -290,7 +290,7 @@ pub fn run_server_gate_screen_cli(store: &SessionStore, args: &[String]) -> anyh
             None => "not blocking".to_string(),
         };
         println!(
-            "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}{limit_wait}{question_picker}\n   screen: {screen}",
+            "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}{limit_wait}{question_picker}{background_agent_hint}\n   screen: {screen}",
             key = session.session_key,
             working = session.shows_agent_working,
             // Printed only when armed, and loudly, for the opposite reason to
@@ -300,6 +300,16 @@ pub fn run_server_gate_screen_cli(store: &SessionStore, args: &[String]) -> anyh
             // its owner, and swallowing everything typed at it.
             question_picker = if session.shows_question_picker {
                 "\n   screen_shows_question_picker: true — STOPPED, asking its owner a question; typed text is eaten, answer with arrows/Enter"
+            } else {
+                ""
+            },
+            // ⛔ The one that stops a WRITE, not a read. A residue detector that
+            // sees the dim composer line without this flag concludes somebody
+            // left a draft in the row, and then either types over a healthy
+            // session or refuses to boot it. The line is chrome; the composer
+            // is empty.
+            background_agent_hint = if session.shows_background_agent_hint {
+                "\n   screen_shows_background_agent_hint: true — the dim composer line is CHROME, not a draft; the composer is EMPTY"
             } else {
                 ""
             },

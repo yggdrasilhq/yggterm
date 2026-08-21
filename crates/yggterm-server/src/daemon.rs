@@ -2590,6 +2590,13 @@ pub struct HotRestartGateScreen {
     /// answers readable.
     #[serde(default)]
     pub shows_question_picker: bool,
+    /// Whether the screen is advertising a BACKGROUND AGENT, i.e. the dim line
+    /// in the composer is chrome rather than a draft somebody left there.
+    /// ⛔ A residue detector must require this to be FALSE before calling a
+    /// composer line typed-but-unsent — three parties misread this hint as a
+    /// stuck draft at once, and two `\r` probes agreed with them.
+    #[serde(default)]
+    pub shows_background_agent_hint: bool,
 }
 
 /// How much of the screen a gate-screen reading returns when the caller does not
@@ -7098,6 +7105,9 @@ impl DaemonRuntime {
                     shows_question_picker: screen
                         .as_deref()
                         .is_some_and(yggterm_core::screen_text_shows_agent_question_picker),
+                    shows_background_agent_hint: screen
+                        .as_deref()
+                        .is_some_and(yggterm_core::screen_text_shows_agent_background_hint),
                     screen_tail: screen.map(|screen| gate_screen_tail(&screen, tail_lines)),
                 }
             })

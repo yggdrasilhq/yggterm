@@ -1500,6 +1500,18 @@ pub fn screen_text_shows_agent_question_picker(sample: &str) -> bool {
         .any(|descriptor| descriptor.screen_shows_question_picker(sample))
 }
 
+/// Kind-agnostic union of every CLI's BACKGROUND-AGENT-HINT phrases.
+///
+/// ⛔ Read this before calling a composer line a typed-but-unsent draft. The
+/// hint is chrome drawn into an EMPTY composer, and the residue detectors that
+/// cannot tell the two apart will either type over a row that is fine or refuse
+/// to boot one that is.
+pub fn screen_text_shows_agent_background_hint(sample: &str) -> bool {
+    agent_cli::AGENT_CLIS
+        .iter()
+        .any(|descriptor| descriptor.screen_shows_background_agent_hint(sample))
+}
+
 /// How long input may go unanswered before a row is worth pointing
 /// `terminal input-check` at.
 ///

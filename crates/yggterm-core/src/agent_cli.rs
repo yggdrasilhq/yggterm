@@ -654,6 +654,25 @@ pub struct AgentCliDescriptor {
     ///
     /// ⛔ EMPTY means UNMEASURED, the same law as `working_screen_phrases`.
     pub question_picker_screen_phrases: &'static [ScreenWorkingPhrase],
+    /// Whole-SCREEN phrases meaning the CLI is running a BACKGROUND AGENT and
+    /// is advertising it in its own chrome.
+    ///
+    /// ⛔ THIS ONE EXISTS TO PREVENT A FALSE POSITIVE, NOT TO REPORT A STATE.
+    /// A CLI running a background agent draws a dim line in its EMPTY composer
+    /// describing the task, and on the screen plane that is indistinguishable
+    /// from a half-typed message nobody sent. Three parties misread it at once:
+    /// the owner read it as a robot having typed into his row without sending,
+    /// two `\r` probes agreed with him (a lone Enter correctly no-ops on an
+    /// empty buffer, so it looked like a stuck draft), and only a printable
+    /// character settled it — typing `x` REPLACED the line instead of appending
+    /// to it, and the text appeared nowhere in the transcript.
+    ///
+    /// ⇒ A reader that finds this signature must treat the composer as EMPTY.
+    /// Combine with [`Self::screen_shows_working`]: hint present and working
+    /// false is IDLE-WITH-A-BACKGROUND-AGENT, which is a healthy row.
+    ///
+    /// ⛔ EMPTY means UNMEASURED, the same law as `working_screen_phrases`.
+    pub background_agent_hint_screen_phrases: &'static [ScreenWorkingPhrase],
     /// How an existing session id is named on resume.
     pub resume_selector: ResumeSelector,
     /// Whether resuming into a known cwd passes it explicitly.
@@ -1103,6 +1122,24 @@ impl AgentCliDescriptor {
         })
     }
 
+    /// Whether this CLI's SCREEN is advertising a background agent, i.e. the
+    /// dim composer line is CHROME and not a draft. See
+    /// [`Self::background_agent_hint_screen_phrases`].
+    pub fn screen_shows_background_agent_hint(&self, sample: &str) -> bool {
+        sample.lines().rev().take(10).any(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            self.background_agent_hint_screen_phrases.iter().any(|phrase| {
+                lower.contains(phrase.needle)
+                    && (phrase.also_any.is_empty()
+                        || phrase.also_any.iter().any(|also| lower.contains(also)))
+            })
+        })
+    }
+
     /// Tokens for the CLI's own resume PICKER (no session id).
     pub fn resume_picker_tokens(&self) -> Vec<String> {
         match self.resume_selector {
@@ -1420,6 +1457,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &["worked for "],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // `codex resume <id>` reopens the session's ORIGINAL cwd unless
         // re-rooted; the cwd tree's whole promise is that a row opens where the
@@ -1573,6 +1611,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &["worked for "],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // ⚠ Deliberately FALSE, preserving shipped behavior exactly: the
         // pre-descriptor builder gated `-C "$PWD"` on `SessionKind::Codex`
@@ -1712,6 +1751,16 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 also_any: &[],
             },
         ],
+        // ⭐ MEASURED 2026-08-21 from a real `claude` driven in a pty: the
+        // composer's own line reads `❯   · ← 1 agent` while a background agent
+        // runs, and the mode footer above it carries `← for agents`. The count
+        // varies and the wording around it does not, so the test is the arrow
+        // glyph and the word on the SAME line — either alone is common English,
+        // and together on one line they are this chrome.
+        background_agent_hint_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "\u{2190}",
+            also_any: &["agent"],
+        }],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -1852,6 +1901,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         // `pi` takes `process.cwd()`; there is no `--cwd`, and `--session-dir`
         // relocates STORAGE, not the working directory.
@@ -1963,6 +2013,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -2053,6 +2104,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -2189,6 +2241,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &["thought for "],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         // ⭐ CONFIRMED 2026-08-08 against a real `kimi --help` on guihost (yggterm
         // provisioned it via uv the same day): `--session,--resume  -S,-r`. The
         // value was read from source at intake and is now MEASURED — recorded
@@ -2308,6 +2361,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         // ⭐ MEASURED 2026-08-08 on guihost, from `muse resume --help` on a real
         // install: `muse resume` / `muse resume --last` / `muse resume
         // <session-uuid>`. ⛔ The placeholder here said `Flag("--resume")`,
@@ -2452,6 +2506,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
         resume_selector: ResumeSelector::Flag("--conversation"),
@@ -2663,6 +2718,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
         resume_selector: ResumeSelector::Flag("--resume"),
         // grok takes the process cwd (`--cwd <CWD>` exists but the launch
@@ -5236,6 +5292,51 @@ mod tests {
         assert!(!codex.screen_shows_question_picker(
             " Enter to select · ↑/↓ to navigate · Esc to cancel\n"
         ));
+    }
+
+    // ⭐ MEASURED from the same pty run as the picker screens. The composer is
+    // EMPTY on every line asserted here — that is the whole point.
+    #[test]
+    fn a_background_agent_hint_is_chrome_and_not_a_typed_draft() {
+        let descriptor = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
+        assert!(descriptor.screen_shows_background_agent_hint("\u{276f}   \u{b7} \u{2190} 1 agent\n"));
+        assert!(descriptor.screen_shows_background_agent_hint(
+            " \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} for agents\n"
+        ));
+        // Plural, because the count varies and the wording around it does not.
+        assert!(descriptor.screen_shows_background_agent_hint("\u{276f}  \u{2190} 3 agents\n"));
+    }
+
+    // Either half alone is ordinary text; only the pair on ONE line is chrome.
+    #[test]
+    fn prose_about_agents_does_not_read_as_the_background_hint() {
+        let descriptor = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
+        assert!(!descriptor.screen_shows_background_agent_hint(
+            "  I will spawn an agent to sweep the remaining files.\n"
+        ));
+        assert!(!descriptor.screen_shows_background_agent_hint("  \u{2190} back to the menu\n"));
+        assert!(!descriptor.screen_shows_background_agent_hint(""));
+        // Unmeasured CLIs fold to false rather than guessing.
+        let codex = agent_cli_descriptor(SessionKind::Codex).unwrap();
+        assert!(codex.background_agent_hint_screen_phrases.is_empty());
+        assert!(!codex.screen_shows_background_agent_hint("\u{276f}  \u{2190} 1 agent\n"));
+    }
+
+    // The state the misread turned on: a hint with NO working phrase is a
+    // healthy idle row, not a stuck draft and not a busy one.
+    #[test]
+    fn a_hint_without_a_working_phrase_is_idle_with_a_background_agent() {
+        let screen = "\u{276f}   \u{b7} \u{2190} 1 agent\n";
+        assert!(crate::screen_text_shows_agent_background_hint(screen));
+        assert!(
+            !crate::screen_text_shows_agent_working(screen),
+            "no interrupt footer means no turn is in flight"
+        );
+        // And while a turn IS running the row carries both, which is also true
+        // and must not be reported as a draft either.
+        let working = " esc to interrupt \u{b7} \u{2190} 1 agent\n";
+        assert!(crate::screen_text_shows_agent_background_hint(working));
+        assert!(crate::screen_text_shows_agent_working(working));
     }
 
     // The union is what callers with no kind in hand read, and it must agree
