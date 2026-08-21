@@ -2482,6 +2482,39 @@ settled this bug had `remote_machines` EMPTY, which looked wrong until the live
 fixture assembled from what the code accepts tests the code's opinion of itself.
 
 
+## A BRANCH NOBODY TAKES CANNOT BE PROVEN BY RUNNING IT (2026-08-22)
+
+`ygg-deliver`'s reap interlock — the one that decides whether an un-briefed row is
+destroyed — read `row_kind` as a free name. It is a local of `main()`, and a
+module-level function cannot see another function's locals, so **every call raised
+`NameError`**: the interlock was unreachable, and the caller got a traceback and
+exit 1 where the contract promises 6.
+
+⚠ **It shipped through a green suite, and that is the useful part.** Its two
+callsites are the two delivery-FAILURE paths — the timeout and the refused submit.
+Nothing routine goes down them, so no test, no run and no live use had ever
+executed the line. **Python resolves a global at CALL time, so an unbound name in
+a branch nobody takes is indistinguishable from correct code right up until the
+day something is already going wrong** — which is the day it runs.
+
+⇒ **The branches that most need to work are the ones hardest to reach, so their
+correctness has to be established WITHOUT executing them.** That is a scan, not
+another unit test: `tests/test_no_verb_reads_a_name_nothing_binds.py` in the fleet
+skill walks every verb's AST and reports a name read where nothing in scope binds
+it. ~90 lines of stdlib `ast`, deliberately not `pyflakes` — that is not installed
+on these hosts and PEP 668 refuses the install, so the gate would silently not run.
+
+⛔ **The signature was the tell, and it is the cheaper thing to look for.** The
+function took `uri`, `host` and `a`, none of which its body has ever used, and
+omitted the one value it did. **An unused parameter is where a missing one hides.**
+
+⚠ **Writing the scanner reproduced the same class twice, both times QUIETLY.**
+Collecting module-level names with `ast.walk` descends into function bodies, so
+every local reads as a global and the scan reported CLEAN over the very defect it
+was written for. Then, tracking no scope chain, it called all 30 legitimate
+closures findings — and 30 false alarms teach a reader to stop believing a gate as
+surely as one missed finding does. Both polarities are pinned in the test.
+
 ## A UUID'S TAIL IS TWELVE DIGITS, AND THE LEAK GUARD READ IT AS AN ID NUMBER (2026-08-22)
 
 `ygg-privacy-guard` refused a push carrying a GENERATED upstream adblock rule, on
