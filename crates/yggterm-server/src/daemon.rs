@@ -3142,6 +3142,22 @@ pub enum ServerRequest {
         /// everything. Read the response message.
         #[serde(default)]
         refuse_if_draft: bool,
+        /// Press Enter IFF the composer's current line is exactly this text.
+        ///
+        /// ⛔ THE ATOMIC HALF OF A TWO-WRITE SUBMIT. Typing text and submitting
+        /// it are two writes, and a human's keystrokes land in the gap — that
+        /// is how a supervision tool's text ended up spliced into the middle of
+        /// a half-typed sentence and sent. The comparison and the Enter happen
+        /// together, under the runtime's own line lock, against the bytes this
+        /// daemon has forwarded rather than against a lagging screen.
+        ///
+        /// When set, `data` is ignored: this verb only ever writes `\r`.
+        ///
+        /// `#[serde(default)]` = `None`, so an older daemon ignores it — and,
+        /// exactly as for `refuse_if_draft`, ⛔ a caller CANNOT read acceptance
+        /// as proof the guard ran. Read the response message.
+        #[serde(default)]
+        submit_iff_line_equals: Option<String>,
     },
     TerminalResize {
         path: String,
@@ -10538,6 +10554,7 @@ impl DaemonRuntime {
                 path,
                 data,
                 refuse_if_draft,
+                submit_iff_line_equals,
             } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
                 // The draft guard, checked HERE because this is where a runtime
@@ -10553,6 +10570,39 @@ impl DaemonRuntime {
                         message: Some(format!(
                             "{DRAFT_REFUSAL_MESSAGE}: {runtime_path} has typed-but-unsent input"
                         )),
+                    });
+                }
+                // The conditional submit, answered HERE for the same reason the
+                // draft guard is: this is where the runtime — and therefore the
+                // line — actually lives. A daemon that only proxies the row
+                // must forward the request, never decide it.
+                if let Some(expected) = submit_iff_line_equals.as_deref()
+                    && self.terminals.has_session(&runtime_path)
+                {
+                    use crate::terminal::SubmitIffLineVerdict;
+                    return Ok(ServerResponse::Ack {
+                        message: Some(
+                            match self
+                                .terminals
+                                .session_submit_if_line_equals(&runtime_path, expected)
+                            {
+                                SubmitIffLineVerdict::Submitted => {
+                                    format!("submitted: {runtime_path} line matched")
+                                }
+                                SubmitIffLineVerdict::LineMismatch {
+                                    line_len,
+                                    expected_len,
+                                } => format!(
+                                    "{SUBMIT_LINE_REFUSAL_MESSAGE}: {runtime_path} holds {line_len} bytes, expected {expected_len}"
+                                ),
+                                SubmitIffLineVerdict::WriteFailed { error } => {
+                                    format!("submit failed: {runtime_path}: {error}")
+                                }
+                                SubmitIffLineVerdict::NotOwned => format!(
+                                    "submit unavailable: {runtime_path} is not held by this daemon"
+                                ),
+                            },
+                        ),
                     });
                 }
                 if let Some(owner_endpoint) =
@@ -16333,6 +16383,9 @@ pub fn terminal_write(endpoint: &ServerEndpoint, path: &str, data: &str) -> Resu
 /// reply. ⛔ Which is also the caveat: a bare acceptance from an old owner is not
 /// proof the guard ran, only that nothing objected.
 pub const DRAFT_REFUSAL_MESSAGE: &str = "refused: pending input draft";
+/// The prefix a conditional submit refuses with. ⛔ It must never be followed by
+/// the line itself — the line may be the human's own half-typed sentence.
+pub const SUBMIT_LINE_REFUSAL_MESSAGE: &str = "refused: composer line does not match";
 
 /// [`terminal_write`] with the draft guard. See
 /// [`ServerRequest::TerminalWrite::refuse_if_draft`] for why the flag travels to
@@ -16343,14 +16396,34 @@ pub fn terminal_write_guarded(
     data: &str,
     refuse_if_draft: bool,
 ) -> Result<Option<String>> {
+    terminal_write_guarded_full(endpoint, path, data, refuse_if_draft, None)
+}
+
+/// The same write with the conditional-submit guard carried too.
+///
+/// ⛔ Kept as one function with the flags rather than two write paths: a second
+/// path is where a guard gets forgotten on the branch nobody reads.
+pub fn terminal_write_guarded_full(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    data: &str,
+    refuse_if_draft: bool,
+    submit_iff_line_equals: Option<String>,
+) -> Result<Option<String>> {
     expect_ack(send_request(
         endpoint,
         &ServerRequest::TerminalWrite {
             path: path.to_string(),
             data: data.to_string(),
             refuse_if_draft,
+            submit_iff_line_equals,
         },
     )?)
+}
+
+/// Did a conditional submit REFUSE because the line differed?
+pub fn terminal_submit_was_refused_for_line(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.starts_with(SUBMIT_LINE_REFUSAL_MESSAGE))
 }
 
 /// Did this write land, or was it refused because the owner has unsent text?
@@ -25532,6 +25605,7 @@ mod tests {
                 path: "p".into(),
                 data: "x".into(),
                 refuse_if_draft: false,
+                submit_iff_line_equals: None,
             },
             ServerRequest::TerminalResize {
                 path: "p".into(),
@@ -32035,8 +32109,17 @@ mod tests {
         // a gate-screen reading is only meaningful from the daemon that OWNS
         // the session, so silently answering from the wrong one would produce a
         // corpus describing nothing.
-        const STAMPED_AT_VERSION: &str = "3.0.142";
-        const STAMPED_SHAPE_HASH: u64 = 0x967609ee5ac9a131;
+        // Re-stamped for 3.1.16: `TerminalWrite` gained `submit_iff_line_equals`
+        // — the atomic half of a two-write submit, so a supervision tool can
+        // press Enter ONLY on the line it typed and never on a human's sentence
+        // that landed in the gap. `#[serde(default)]`, so an older daemon
+        // ignores it and behaves exactly as before; ⛔ which is precisely why a
+        // caller cannot read acceptance as proof the guard ran, and why the
+        // version must move with the shape — two builds of one version
+        // answering the same request differently is the lost-PTY latch storm
+        // this stamp exists to prevent.
+        const STAMPED_AT_VERSION: &str = "3.1.16";
+        const STAMPED_SHAPE_HASH: u64 = 0x59be8a8cd2b159bf;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
