@@ -328,3 +328,205 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
   window.__yggtermMediaTrace = { emit: emit };
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::MEDIA_TRACE_SHIM_JS;
+
+    /// The surface source, for the guards that are about WIRING rather than
+    /// about the shim's own text.
+    fn surface_source() -> &'static str {
+        include_str!("web_surface.rs")
+    }
+
+    /// ⛔⛔ THE PRIVACY GUARD, and the reason it is a source scan rather than a
+    /// review note.
+    ///
+    /// This shim runs inside pages the user chose and we did not write, and the
+    /// trace file it writes into is kept for hours, read by agents, and quoted
+    /// into reports. A URL, a document title, a track label and a media `src`
+    /// are all content, and several of them name **what someone was watching**.
+    ///
+    /// The rule the module doc states is "no string that came from the page
+    /// ever reaches a record", and the only way to keep that true through
+    /// future edits is to make the page's string-bearing accessors unreachable
+    /// from this file at all. A payload-shaped check would not do: the leak
+    /// that matters arrives as someone adding `title: document.title` to an
+    /// existing `emit` for a good reason, and a reviewer reads that as context
+    /// rather than as content.
+    ///
+    /// ⚠ `currentSrc` is the deliberate exception and is why the exception is
+    /// spelled out here: `srcKind` reads it to CLASSIFY it three ways and
+    /// returns a tag. The guard therefore pins the classifier's shape too — a
+    /// `srcKind` that started returning the URL would satisfy a naive
+    /// "currentSrc appears once" check.
+    #[test]
+    fn no_page_authored_string_can_reach_a_record() {
+        for banned in [
+            "document.title",
+            "location.href",
+            "location.pathname",
+            "location.hostname",
+            "location.origin",
+            "textContent",
+            "innerText",
+            "getAttribute",
+            ".label",
+            ".name",
+        ] {
+            assert!(
+                !MEDIA_TRACE_SHIM_JS.contains(banned),
+                "`{banned}` is page-authored content and must never be reachable from the \
+                 media probe — the trace file outlives the page and is quoted into reports"
+            );
+        }
+        // The one accessor that IS read, and the shape that makes it safe.
+        assert_eq!(
+            MEDIA_TRACE_SHIM_JS.matches("currentSrc").count(),
+            1,
+            "`currentSrc` may be read in exactly one place — the `srcKind` classifier"
+        );
+        assert!(
+            MEDIA_TRACE_SHIM_JS.contains(r#"return s.lastIndexOf("blob:", 0) === 0 ? "mse" : "direct";"#),
+            "`srcKind` must return a TAG, never the url it classified"
+        );
+    }
+
+    /// ⛔ A probe wired on the tab path alone goes quiet at the exact moment
+    /// the user moves the video somewhere more comfortable. A site that pops
+    /// its player into its own window is ordinary, not exotic, and the surface
+    /// that results is a full page with its own content process — invisible to
+    /// a tab-only instrument, and invisible in the reassuring direction: the
+    /// records simply stop, which reads as "nothing was playing".
+    #[test]
+    fn the_shim_is_injected_on_both_the_tab_and_the_popup_paths() {
+        let injections = surface_source()
+            .matches(".with_initialization_script_for_main_only(MEDIA_TRACE_SHIM_JS, false)")
+            .count();
+        assert_eq!(
+            injections, 2,
+            "the media probe must be injected on BOTH surface build paths (tab and popup); \
+             found {injections}"
+        );
+    }
+
+    /// ⛔ ALL FRAMES, and the `false` is the whole assertion.
+    ///
+    /// `with_initialization_script_for_main_only(js, true)` means main frame
+    /// only, which is right for the shims around this one — a close request or
+    /// a theme colour belongs to the top document. A player does not: an
+    /// embedded one lives in an iframe, which is the single most common shape
+    /// for video on the web. Flipping this to `true` would leave the probe
+    /// silent on the majority case while every test that only checks
+    /// "is it injected" stays green.
+    #[test]
+    fn the_shim_reaches_every_frame_because_players_live_in_iframes() {
+        assert!(
+            !surface_source()
+                .contains(".with_initialization_script_for_main_only(MEDIA_TRACE_SHIM_JS, true)"),
+            "the media probe must be injected for ALL frames (`false`): a player in an \
+             iframe is the common case, and main-frame-only goes silent on it without erroring"
+        );
+    }
+
+    /// ⛔ The page may not name its own surface, and the host must not let it.
+    ///
+    /// Same reasoning as the contract's `pid`: an emitter that could set its
+    /// own identifier could set another's, and here the identifier is what the
+    /// shell joins to a (row, tab). A batch that carried its own `surfaceId`
+    /// would let any page attribute its records to any tab in the window — and
+    /// the resulting trace would look perfectly well-formed.
+    #[test]
+    fn the_surface_id_is_stamped_by_the_host_not_read_from_the_message() {
+        let source = surface_source();
+        let start = source
+            .find(r#"if message.get("type").and_then(|kind| kind.as_str()) == Some("trace")"#)
+            .expect("the trace branch is gone from the surface message channel");
+        let branch = &source[start..start + 700];
+        assert!(
+            branch.contains("surface_id,"),
+            "the trace branch must stamp the handler's own `surface_id`"
+        );
+        for smuggled in ["surfaceId", "surface_id\")", "get(\"surface"] {
+            assert!(
+                !branch.contains(smuggled),
+                "the trace branch must never read a surface id out of the page's message \
+                 (`{smuggled}`) — a page that can name its own tab can name another's"
+            );
+        }
+    }
+
+    /// The three drain rules, asserted on the code that implements them.
+    ///
+    /// ⛔ `emit` doing I/O is the failure that froze the app once already
+    /// through the older `debug` channel: a per-record path pays a lock and a
+    /// write on the very thread whose stalls the probe exists to explain, and
+    /// an instrument that perturbs what it measures does not return a noisy
+    /// reading, it returns a reading of itself.
+    #[test]
+    fn emit_does_no_io_and_the_timer_self_suspends() {
+        let emit_start = MEDIA_TRACE_SHIM_JS
+            .find("function emit(")
+            .expect("emit() is gone");
+        let emit_end = MEDIA_TRACE_SHIM_JS[emit_start..]
+            .find("\n  }")
+            .expect("emit() body is unterminated")
+            + emit_start;
+        let emit_body = &MEDIA_TRACE_SHIM_JS[emit_start..emit_end];
+        assert!(
+            !emit_body.contains("postMessage"),
+            "emit() must append to the ring and return — the drain does the I/O"
+        );
+        assert!(
+            emit_body.contains("ring.push"),
+            "emit() must append to the ring"
+        );
+        // Self-suspending: the only place a timer is armed is `schedule`, and
+        // it arms nothing when one is already pending. An always-on interval
+        // would wake an idle page forever to report that nothing happened.
+        assert!(
+            MEDIA_TRACE_SHIM_JS.contains("if (flushTimer !== null) { return; }"),
+            "the flush timer must not stack — an idle page schedules nothing"
+        );
+    }
+
+    /// ⛔ The frame counter, and why it may not be the obvious one.
+    ///
+    /// `getVideoPlaybackQuality()` is what every article reaches for. Measured
+    /// on this engine against a playing stream, two reads five seconds apart
+    /// returned `totalVideoFrames` 101 then 66 — it went BACKWARDS, so it is a
+    /// windowed counter wearing a cumulative name, and `droppedVideoFrames`
+    /// read from it is 0 forever because a counter that resets never
+    /// accumulates a drop. Two investigations were misled by exactly that
+    /// before the probe existed.
+    #[test]
+    fn frames_are_counted_with_rvfc_and_never_with_the_resetting_counter() {
+        assert!(
+            MEDIA_TRACE_SHIM_JS.contains("requestVideoFrameCallback"),
+            "presented frames must come from rVFC"
+        );
+        assert!(
+            !MEDIA_TRACE_SHIM_JS.contains("getVideoPlaybackQuality"),
+            "getVideoPlaybackQuality() is windowed on this engine and resets; a record \
+             built from it reports 0 dropped frames through a visible shortfall"
+        );
+    }
+
+    /// ⛔ A window's span is MEASURED, never the nominal interval.
+    ///
+    /// The interval overruns whenever the UI thread is busy — which is exactly
+    /// the trace someone reads after an incident. A consumer dividing by the
+    /// constant computes a rate wrong by the whole overrun, and it is wrong
+    /// most when it matters most.
+    #[test]
+    fn a_playback_window_reports_the_span_it_actually_covered() {
+        assert!(
+            MEDIA_TRACE_SHIM_JS.contains("window_ms: Math.round(t1 - st.t0)"),
+            "window_ms must be the measured span between the window's own two reads"
+        );
+        assert!(
+            !MEDIA_TRACE_SHIM_JS.contains("window_ms: WINDOW_MS"),
+            "window_ms must never be the nominal interval"
+        );
+    }
+}
