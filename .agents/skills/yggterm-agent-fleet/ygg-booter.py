@@ -1386,6 +1386,21 @@ def cmd_subscribe(args):
         #    override in either direction.
         "kind": getattr(args, "kind", None)
         or ("task" if uuid == own_uuid() else "monitor"),
+        # ⛔⛔ NOT A LIFETIME BOOT COUNT, DESPITE THE NAME. This is the run of
+        # CONSECUTIVE boots the row has not answered: any progress resets it to
+        # zero ("progress clears the stall counter" in the tick loop), a refused
+        # or rate-limited attempt is refunded, and it escalates at MAX_BOOTS.
+        # ⇒ **`boots: 0` IS THE HEALTHY STATE**, and a rising value is the
+        # alarm.
+        #
+        # ⛔ THEREFORE COUNTING `boots > 0` ACROSS SUBSCRIBERS MEASURES ROWS
+        # THAT ARE FAILING TO ANSWER, NOT ROWS THAT HAVE EVER BEEN WOKEN — the
+        # two readings run in opposite directions. Measured 2026-08-21: a census
+        # found 2 of 23 live records above zero and concluded the fleet wake path
+        # was dead, while this file's own log held 341 successful boots across 98
+        # distinct rows, and the seat doing the counting had been woken by that
+        # path minutes earlier. ⇒ **The log is the history; this field is a
+        # gauge. For "does waking work", read the log.**
         "boots": 0,
         # The run of consecutive refusals for ONE reason, or absent when nothing
         # is standing in the way. Kept apart from `boots` because a refusal is
@@ -1627,6 +1642,8 @@ def fleet_state(args):
             "note": s.get("note") or "",
             "age_h": round((now - s["subscribed_at"]) / 3600, 2),
             "max_hours": s.get("max_hours"),
+            # ⛔ Consecutive UNANSWERED boots, not a lifetime count — zero is
+            # healthy. See the field's definition in the subscribe record.
             "boots": s.get("boots", 0),
             "escalated": bool(s.get("escalated")),
             # ⛔ A ROW REFUSED EVERY TICK IS INDISTINGUISHABLE FROM A HEALTHY ONE
