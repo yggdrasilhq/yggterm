@@ -107,6 +107,57 @@ guard being taught this distinction already, and the two may simply have diverge
 read `composer_held_draft`. It must be false. Then type one character into it and read again: it
 must be true. Both halves, or the fix is a way of never seeing a draft.
 
+## ⛔⛔ [11.0] A FINISHED LANE HAD NO WAY TO BE RETIRED, SO NOBODY EVER RETIRED ONE
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Owner-reported 2026-08-21: "MOST of your sub sessions are sitting stalled … THIS IS AN
+ORCHESTRATOR BUG of not folding and taking care of its spawns."* He was right, and the
+negligence had a mechanism rather than being simple inattention.
+
+**The root.** Retiring a row means four planes — remove the row, move the MONITOR's
+subscribers off it, disarm the BOOTER, reap the agent PROCESS — because `session remove`
+reports the request rather than the effect and routinely delists a row whose agent keeps
+running. All four existed, in exactly one place: inside `ygg-claim.sh --replace`, **as a side
+effect of a successor claiming the seat.** ⇒ The fleet had a `replace` and no `fold`. A lane
+that finished and stood down with nobody coming after it had no path to being retired at all,
+and every orchestrator that wanted to tidy up had to re-assemble four planes from primitives.
+
+**Measured when it was finally looked at:** 34 seated rows, of which **17 had no agent process
+anywhere** and several more had announced they were done and were still seated — one rendering
+a blank viewport with `0 user · 0 assistant`. The owner closed one by hand. Live sessions fell
+from 59 to 40 once they were folded, and six lane worktrees nothing was standing in were
+removed with them.
+
+**Fixed by `ygg-fold.py`** (`sweep` / `row` / `worktrees`), wired into the hourly watcher.
+Three properties in it are load-bearing and must survive any edit:
+
+* **Liveness is asked of the host named in the row's own uri.** Reading the local `/proc` is
+  right only when the sweep runs where the agents run; anywhere else every row reads DEAD, and
+  with `--apply` that is not a wrong report, it is the whole fleet reaped in one pass. An
+  unreachable host raises rather than returning an empty set.
+* **FINISHED is an AND of a weak predicate and a strong one, both read in the OPENING of the
+  last message.** Searching the body called a live monitor finished (it opened "Holding as
+  monitor" and discussed another lane completing later on). The veto for a row declaring
+  itself still watching reads the same window, after whole-message matching vetoed a lane that
+  had opened by standing down and merely quoted the booter's "a monitor is never finished".
+* **Rows a person uses are never folded**, from the same per-host never-arm list the booter
+  honours. Folding one of those is worse than typing into it.
+
+⚠ **Two refusals in the watcher wiring were learned by breaking them on the first run**, and
+both are recorded because either would recur: `--dry-run` passed `--apply` down and folded a
+live row during a rehearsal, and an unscoped sweep reaped a row belonging to **another
+campaign** (idle nearly five hours and genuinely finished — which is what makes it a bad
+precedent rather than an obvious error; its fold note is in `relay/folded/`). A dry run is now
+dry all the way down, and an orchestrator folds its own spawns and nobody else's.
+
+**Live proof owed:** one unattended hourly tick that folds something correctly, and one that
+correctly folds nothing.
+
+**Still open inside this, and NOT fixed:** a lane that finishes without saying so. `FINISHED`
+needs the row to announce it; a lane that simply stops is `WORKING` forever. The honest signal
+would be the monitor's stall verdict, which is a different plane and a different entry.
+
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
 **Status:** OPEN
