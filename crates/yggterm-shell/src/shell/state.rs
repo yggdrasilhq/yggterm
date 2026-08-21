@@ -248,6 +248,10 @@ use yggui::prose::{ProseInk, ProseTokens};
 use yggui::dpad::{DPAD_CSS, DpadAction, DpadPalette, DpadPlacement, ScrollDpad};
 // The floating bar that replaced the docked header — find, the match stepper
 // and the light switch, costing no layout.
+use yggui::command_palette::{
+    CommandPalette, CommandPaletteItem, CommandPalettePalette, PaletteMove,
+    YGGUI_COMMAND_PALETTE_CSS, palette_index_after,
+};
 use yggui::pill_toolbar::{PILL_TOOLBAR_CSS, PillStep, PillToolbar, PillToolbarPalette};
 use yggui::split_button::{
     SPLIT_BUTTON_CSS, SplitButton, SplitButtonItem, SplitButtonPalette,
@@ -16193,6 +16197,71 @@ async fn materialize_declared_web_surface(
 /// prefix bare hosts with a scheme (http for loopback dev servers, https
 /// otherwise), and send anything that doesn't look like a host to a web
 /// search. Returns None for empty or non-http-scheme input.
+/// The id the palette's first row carries: the thing plain Enter on the draft
+/// would do. A reserved word rather than a URL, because what it resolves to
+/// depends on the draft and is decided at accept time, not at render time.
+const WEB_OMNIBOX_PALETTE_GO_ID: &str = "go";
+
+/// The rows the omnibox palette offers, in order.
+///
+/// Row 0 is always what plain Enter does — go to a URL, or search for the text —
+/// so the palette never opens with nothing selectable and the user's own typing
+/// is always the first answer. History matches follow.
+///
+/// Pure over (draft, suggestions), so the rows the palette DRAWS and the target
+/// [`web_omnibox_palette_target`] resolves are derived from one input by two
+/// functions that cannot come to disagree about what row 3 was.
+fn web_omnibox_palette_items(
+    draft: &str,
+    suggestions: &[(String, String)],
+) -> Vec<CommandPaletteItem> {
+    let trimmed = draft.trim();
+    // "Go to X" only when the draft really is an address: `web_surface_address_to_url`
+    // will happily turn any text into a search URL, and labelling that "Go to"
+    // would promise navigation for what is actually a search.
+    let go_label = match web_surface_address_to_url(trimmed) {
+        Some(url)
+            if !url.contains("{q}")
+                && (url == trimmed
+                    || url == format!("https://{trimmed}")
+                    || url == format!("http://{trimmed}")) =>
+        {
+            format!("Go to {url}")
+        }
+        _ => format!("Search for \"{trimmed}\""),
+    };
+    let mut items = vec![CommandPaletteItem::new(WEB_OMNIBOX_PALETTE_GO_ID, go_label).hint("Enter")];
+    items.extend(suggestions.iter().map(|(url, title)| {
+        // The TITLE leads and the URL is the quieter half — a history row the
+        // user recognizes by its page name, not by its query string. A row with
+        // no title has only its URL, so the URL leads there instead of leaving
+        // the label empty.
+        if title.trim().is_empty() {
+            CommandPaletteItem::new(format!("url:{url}"), url.clone()).hint("History")
+        } else {
+            CommandPaletteItem::new(format!("url:{url}"), title.clone())
+                .detail(url.clone())
+                .hint("History")
+        }
+    }));
+    items
+}
+
+/// What accepting a palette row NAVIGATES to.
+///
+/// `None` means the row named nothing reachable — an empty draft on the go row,
+/// or an id from a stale render — and the caller does nothing rather than
+/// navigating somewhere it invented.
+fn web_omnibox_palette_target(id: &str, draft: &str) -> Option<String> {
+    if let Some(url) = id.strip_prefix("url:") {
+        return (!url.is_empty()).then(|| url.to_string());
+    }
+    if id == WEB_OMNIBOX_PALETTE_GO_ID {
+        return web_surface_address_to_url(draft.trim());
+    }
+    None
+}
+
 fn web_surface_address_to_url(input: &str) -> Option<String> {
     let input = input.trim();
     if input.is_empty() {
@@ -16833,10 +16902,15 @@ struct ShellState {
     suppress_sidebar_autoscroll_until_ms: u64,
     pending_delete: Option<PendingDeleteDialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
-    /// The user asked to leave vertical tabs while folders exist. The classic tab
-    /// bar cannot draw a folder, so the modal says what will happen before the
-    /// organization disappears behind an overflow menu.
+    /// The user asked to leave vertical tabs while ROW GROUPS exist. The classic
+    /// tab bar is a single strip and cannot draw a tree, so the modal says what
+    /// will happen before the organization disappears behind an overflow menu.
     pending_classic_tabs_switch: bool,
+    /// The omnibox is raised as the centred palette. The GATED reader
+    /// ([`ShellState::web_command_palette_open`]), never a second flag: the
+    /// render pass, the modal precedence and the transient cover all take this
+    /// one field, so they cannot come to disagree about whether it is up.
+    web_command_palette_open: bool,
     /// `(rail row id, draft name)` while a tab-tree row is being renamed —
     /// [`web_tab_row_id`], so a FOLDER and a TAB rename through one field. A
     /// second `Option<u64>` beside it for tabs would be a second answer to
@@ -17663,6 +17737,7 @@ struct RenderSnapshot {
     pending_media_capture: Option<PendingMediaCaptureDialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
     pending_classic_tabs_switch: bool,
+    web_command_palette_open: bool,
     web_tab_rename: Option<(String, String)>,
     row_drag: Option<RowDragGesture>,
     web_tab_overflow_open: bool,
@@ -19252,6 +19327,7 @@ impl ShellState {
             pending_media_capture: None,
             copy_edit_dialog: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             row_drag_click_suppressed_until_ms: 0,
@@ -20259,6 +20335,7 @@ impl ShellState {
             pending_media_capture: self.pending_media_capture.clone(),
             copy_edit_dialog: self.copy_edit_dialog.clone(),
             pending_classic_tabs_switch: self.pending_classic_tabs_switch,
+            web_command_palette_open: self.web_command_palette_open(),
             web_tab_rename: self.web_tab_rename.clone(),
             row_drag: self.row_drag.clone(),
             // The GATED reader, never the raw toggle: the render pass, the modal
@@ -21844,6 +21921,7 @@ impl ShellState {
             // browsing session is invisible unless the reconciler stashes the
             // surface first. This one is ALWAYS raised over a web surface.
             self.pending_classic_tabs_switch,
+            self.web_command_palette_open(),
             // …and so are the classic strip's two dropdowns, for the same
             // reason and with no geometry available to dodge it.
             strip_dropdown_over_viewport(
@@ -22573,6 +22651,19 @@ impl ShellState {
             surface.address_suggestion_index = Some(next as usize);
         }
     }
+    /// Select a suggestion row by INDEX.
+    ///
+    /// The absolute form, for a caller that has already worked out where the
+    /// selection lands — the palette does, through `yggui::palette_index_after`,
+    /// which is the ONE owner of the wraparound rule for every libyggterm app.
+    /// [`ShellState::web_surface_move_address_suggestion`] stays the delta form
+    /// the inline handlers use; both write the same field, and neither invents a
+    /// second answer to "what does Down do at the bottom".
+    fn web_surface_set_address_suggestion(&mut self, session_path: &str, index: usize) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            surface.address_suggestion_index = Some(index);
+        }
+    }
     /// Commit a resolved navigation onto a tab. `history_index` Some = a
     /// back/forward step to that stack position; None = a new navigation
     /// pushed after the current position (dropping any forward entries).
@@ -23073,6 +23164,18 @@ impl ShellState {
         self.server
             .active_session_path()
             .is_some_and(|session| self.has_live_web_surface(session, now_ms))
+    }
+    /// Is the omnibox raised as the centred palette?
+    ///
+    /// Derived from the ONE fact that means "the user is editing the address"
+    /// — the active surface holds a draft — rather than from a second open/shut
+    /// flag beside it. A flag would be a separate answer to a question
+    /// `address_draft` already answers, and the two would drift the first time
+    /// something cleared the draft without clearing the flag, leaving a palette
+    /// on screen with nothing in it.
+    fn web_command_palette_open(&self) -> bool {
+        self.active_web_surface()
+            .is_some_and(|surface| surface.picker.is_none() && surface.address_draft.is_some())
     }
     /// Does the active surface hold any ROW GROUP at all?
     ///
@@ -43399,6 +43502,11 @@ fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
         TopModal::Fido2 => &[("Esc", "dismiss")],
         TopModal::Delete => &[("Enter", "delete"), ("Esc", "cancel")],
         TopModal::ClassicTabsSwitch => &[("Enter", "switch"), ("Esc", "cancel")],
+        // ⛔ Enter and the arrows are NOT advertised, and are not dispatched
+        // here either: the palette's own field owns them, and it is focused for
+        // as long as the palette is up. Advertising a key this dispatcher does
+        // not act on is the species of lie the ALT layer exists to end.
+        TopModal::CommandPalette => &[("↑↓", "choose"), ("Enter", "go"), ("Esc", "close")],
         TopModal::StripDropdown => &[("Esc", "close")],
     }
 }
@@ -43502,6 +43610,22 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
                     shell.confirm_classic_tabs_switch();
                 }
             });
+            true
+        }
+        TopModal::CommandPalette => {
+            // ⛔ Escape only. Enter belongs to the palette's own field, which
+            // holds the keyboard the whole time the palette is up — acting on
+            // it HERE too would run the selected row twice, once per owner.
+            // Returning true still swallows it, so the page beneath never sees
+            // a key the user aimed at the palette.
+            if dismiss {
+                let session = state.with(|shell| shell.active_web_surface_session());
+                if let Some(session) = session {
+                    state.with_mut_counted(|shell| {
+                        shell.web_surface_set_address_draft(&session, None)
+                    });
+                }
+            }
             true
         }
         TopModal::StripDropdown => {
@@ -45290,6 +45414,17 @@ enum TopModal {
     Fido2,
     Delete,
     CopyEdit,
+    /// The OMNIBOX raised as a centred command palette. Raised BY THE USER from
+    /// a rail they were already in, so it sits with the other user-raised
+    /// surfaces — under anything a PAGE can raise (a passkey ceremony, a camera
+    /// ask), because those arrive at a moment the user did not choose and the
+    /// keys must belong to the thing granting hardware.
+    ///
+    /// ⛔ It has to be in this list at all because a native web surface draws
+    /// above ALL DOM: a palette raised over a browsing session is invisible
+    /// unless the reconciler stashes the surface first, which is the same reason
+    /// the classic-tabs dialog and the strip dropdowns are here.
+    CommandPalette,
     ClassicTabsSwitch,
     /// A dropdown anchored on the CLASSIC STRIP — the strip's profile badge and
     /// the folder-overflow menu. Bottom of the precedence: any real dialog
@@ -45346,9 +45481,12 @@ impl TopModal {
         match self {
             // Editing surfaces: fields to type in, chips to pick, a slider to
             // nudge. Landing on the control is the beginning of the work.
+            // …and the palette is one: it opens ON a field, already focused,
+            // and typing is the whole interaction.
             TopModal::ThemeEditor
             | TopModal::CopyEdit
             | TopModal::LaunchFlags
+            | TopModal::CommandPalette
             | TopModal::CliInstall => ModalKeyboardMode::Form,
             // Command surfaces: pick one of a few actions and be done.
             TopModal::KeymapEditor
@@ -45376,6 +45514,7 @@ impl TopModal {
             TopModal::Delete => "delete",
             TopModal::CopyEdit => "copy-edit",
             TopModal::ClassicTabsSwitch => "classic-tabs-switch",
+            TopModal::CommandPalette => "command-palette",
             TopModal::StripDropdown => "strip-dropdown",
         }
     }
@@ -45394,6 +45533,7 @@ impl TopModal {
             TopModal::Delete => "Confirm",
             TopModal::CopyEdit => "Edit",
             TopModal::ClassicTabsSwitch => "Tabs",
+            TopModal::CommandPalette => "Palette",
             TopModal::StripDropdown => "Menu",
         }
     }
@@ -45429,6 +45569,7 @@ fn top_modal_of(
     delete: bool,
     copy_edit: bool,
     classic_tabs_switch: bool,
+    command_palette: bool,
     strip_dropdown: bool,
 ) -> Option<TopModal> {
     // The two editors are raised ABOVE the dialogs (z-index 500 / 98 against
@@ -45463,6 +45604,9 @@ fn top_modal_of(
     if classic_tabs_switch {
         return Some(TopModal::ClassicTabsSwitch);
     }
+    if command_palette {
+        return Some(TopModal::CommandPalette);
+    }
     if strip_dropdown {
         return Some(TopModal::StripDropdown);
     }
@@ -45481,6 +45625,7 @@ fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
         snapshot.pending_delete.is_some(),
         snapshot.copy_edit_dialog.is_some(),
         snapshot.pending_classic_tabs_switch,
+        snapshot.web_command_palette_open,
         strip_dropdown_over_viewport(
             snapshot.web_tab_overflow_open,
             snapshot
@@ -45573,6 +45718,10 @@ fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
         // now counts as a `top_modal` — every modal must open the cover or it
         // becomes a click-through window under glass (F.1 T10).
         || snapshot.web_tab_overflow_open
+        // …and so is the raised omnibox palette, for exactly the same reason.
+        // It is the one modal that is ALWAYS over a web surface, so leaving it
+        // out would make it a click-through window under glass every time.
+        || snapshot.web_command_palette_open
         || snapshot.pending_delete.is_some()
         || snapshot.pending_classic_tabs_switch
         || snapshot.copy_edit_dialog.is_some()

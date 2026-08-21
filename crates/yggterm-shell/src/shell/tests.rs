@@ -10158,7 +10158,7 @@ mod tests {
     #[test]
     fn the_cli_install_modal_owns_the_keys_when_it_is_the_only_one_up() {
         assert_eq!(
-            top_modal_of(false, false, false, true, false, false, false, false, false, false),
+            top_modal_of(false, false, false, true, false, false, false, false, false, false, false),
             Some(TopModal::CliInstall)
         );
         assert_eq!(TopModal::CliInstall.kind(), "cli-install");
@@ -10171,7 +10171,7 @@ mod tests {
     #[test]
     fn launch_flags_outranks_cli_install_when_both_are_flagged() {
         assert_eq!(
-            top_modal_of(false, false, true, true, false, false, false, false, false, false),
+            top_modal_of(false, false, true, true, false, false, false, false, false, false, false),
             Some(TopModal::LaunchFlags),
             "the deeper modal keeps the keys until it is dismissed"
         );
@@ -10207,46 +10207,46 @@ mod tests {
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, false),
+            top_modal_of(false, false, false, false, false, false, false, false, false, false, false),
             None
         );
         // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false, false, false, false, false, false),
+            top_modal_of(true, false, false, false, false, false, false, false, false, false, false),
             Some(TopModal::KeymapEditor)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false, false, false, false, false, false),
+            top_modal_of(false, true, false, false, false, false, false, false, false, false, false),
             Some(TopModal::ThemeEditor)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, false, false, false, false),
+            top_modal_of(false, false, false, false, true, false, false, false, false, false, false),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, false, false, false, false),
+            top_modal_of(false, false, false, false, false, true, false, false, false, false, false),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, false, false, false),
+            top_modal_of(false, false, false, false, false, false, true, false, false, false, false),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true, false, false),
+            top_modal_of(false, false, false, false, false, false, false, true, false, false, false),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true, false),
+            top_modal_of(false, false, false, false, false, false, false, false, true, false, false),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, true),
+            top_modal_of(false, false, false, false, false, false, false, false, false, false, true),
             Some(TopModal::StripDropdown)
         );
         // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
         // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, false, true, true, true, true, true, true),
+            top_modal_of(true, true, true, false, true, true, true, true, true, false, true),
             Some(TopModal::KeymapEditor)
         );
         // ⛔ A capture prompt outranks every dialog below the two editors. Both
@@ -10255,21 +10255,21 @@ mod tests {
         // keyboard reaches, or Escape would dismiss the wrong dialog and leave
         // the engine blocked on this one.
         assert_eq!(
-            top_modal_of(false, false, false, false, true, true, true, true, true, true),
+            top_modal_of(false, false, false, false, true, true, true, true, true, false, true),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, true, true, true, true),
+            top_modal_of(false, false, false, false, false, true, true, true, true, false, true),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, true, true, true),
+            top_modal_of(false, false, false, false, false, false, true, true, true, false, true),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true, true),
+            top_modal_of(false, false, false, false, false, false, false, false, true, false, true),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -42002,6 +42002,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -42928,6 +42929,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -43131,6 +43133,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -43334,6 +43337,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -43540,6 +43544,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -43750,6 +43755,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -43952,6 +43958,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44154,6 +44161,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44396,6 +44404,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44601,6 +44610,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -44844,6 +44854,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -45366,6 +45377,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
+            web_command_palette_open: false,
             web_tab_rename: None,
             row_drag: None,
             active_session_kind: None,
@@ -52465,6 +52477,140 @@ mod webtabs_menu_switcher_locks {
         tabs
     }
 
+    // ======================================================================
+    // THE OMNIBOX, RAISED AS A PALETTE (item 6)
+    // ======================================================================
+
+    /// Row 0 is ALWAYS what plain Enter does, so the palette never opens with
+    /// nothing selectable and the user's own typing is always the first answer.
+    #[test]
+    fn the_palettes_first_row_is_what_plain_enter_would_do() {
+        let rows = web_omnibox_palette_items("example.com", &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "go");
+        assert_eq!(
+            rows[0].label, "Go to https://example.com",
+            "an address is a place to GO"
+        );
+        // ⛔ Text that is not an address is a SEARCH, and the label must say so.
+        // `web_surface_address_to_url` will turn any text into a search URL, so
+        // a label that read "Go to …" for a phrase would promise navigation for
+        // something that is about to run a query.
+        let phrase = web_omnibox_palette_items("how tall is a giraffe", &[]);
+        assert_eq!(phrase[0].label, "Search for \"how tall is a giraffe\"");
+    }
+
+    /// A history row leads with the page's NAME, because that is what the user
+    /// recognizes; the URL is the quieter half beside it.
+    #[test]
+    fn a_history_row_leads_with_its_title_and_falls_back_to_its_url() {
+        let rows = web_omnibox_palette_items(
+            "rel",
+            &[
+                (
+                    "https://example.invalid/notes".to_string(),
+                    "Release notes".to_string(),
+                ),
+                ("https://example.invalid/bare".to_string(), String::new()),
+            ],
+        );
+        assert_eq!(rows.len(), 3, "the go row plus both matches");
+        assert_eq!(rows[1].label, "Release notes");
+        assert_eq!(rows[1].detail, "https://example.invalid/notes");
+        // No title, so the URL leads rather than the row drawing an empty label.
+        assert_eq!(rows[2].label, "https://example.invalid/bare");
+        assert!(rows[2].detail.is_empty());
+    }
+
+    /// The rows the palette DRAWS and the target an accept RESOLVES are two
+    /// derivations of one input, so a row must resolve to the URL its own id
+    /// names — and to nothing at all when the id is stale or the draft is empty.
+    #[test]
+    fn accepting_a_row_resolves_to_exactly_what_that_row_named() {
+        let rows = web_omnibox_palette_items(
+            "example.com",
+            &[(
+                "https://example.invalid/notes".to_string(),
+                "Release notes".to_string(),
+            )],
+        );
+        assert_eq!(
+            web_omnibox_palette_target(&rows[0].id, "example.com").as_deref(),
+            Some("https://example.com"),
+        );
+        assert_eq!(
+            web_omnibox_palette_target(&rows[1].id, "example.com").as_deref(),
+            Some("https://example.invalid/notes"),
+            "a history row goes to ITS url, not to whatever is in the field"
+        );
+        // Stale or empty resolves to nothing, and the caller does nothing —
+        // rather than navigating somewhere it invented.
+        assert_eq!(web_omnibox_palette_target("nonsense", "example.com"), None);
+        assert_eq!(web_omnibox_palette_target("url:", "example.com"), None);
+        assert_eq!(web_omnibox_palette_target("go", "   "), None);
+    }
+
+    /// ⛔ The palette is a `TopModal` or it is INVISIBLE: a native web surface
+    /// draws above all DOM, so a palette raised over a browsing session is
+    /// behind the page unless the reconciler stashes the surface first.
+    #[test]
+    fn the_raised_palette_is_a_modal_over_the_viewport() {
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        assert!(!shell.has_modal_over_viewport(), "nothing is up yet");
+
+        // Owner requirement: ANY route that focuses the input raises it — the
+        // raise keys on the DRAFT existing, not on which gesture made one.
+        shell.web_surface_begin_address_edit("local://ws");
+        assert_eq!(shell.top_modal(), Some(TopModal::CommandPalette));
+        assert!(
+            chrome_transient_over_viewport(&shell.snapshot()),
+            "an over-viewport modal MUST open the transient cover, or it is a \
+             click-through modal under glass"
+        );
+        assert_eq!(
+            render_top_modal(&shell.snapshot()),
+            shell.top_modal(),
+            "the render pass and the live state must not disagree about what is \
+             on top"
+        );
+
+        // Clearing the draft is what SHUTS it — one fact, not a second flag.
+        shell.web_surface_set_address_draft("local://ws", None);
+        assert_eq!(shell.top_modal(), None);
+    }
+
+    /// Escape dismisses through the shared modal dispatcher, like every other
+    /// dialog — and Enter is deliberately NOT acted on there, because the
+    /// palette's own field owns it and acting twice would run the row twice.
+    #[test]
+    fn the_modal_dispatcher_closes_the_palette_and_leaves_enter_to_the_field() {
+        let hints = modal_key_hints(TopModal::CommandPalette);
+        assert!(hints.iter().any(|(key, _)| *key == "Esc"));
+        let dispatch = function_body(&product_source(), "fn modal_key_dispatch(");
+        let arm = dispatch
+            .split("TopModal::CommandPalette => {")
+            .nth(1)
+            .expect("the palette has a dispatch arm");
+        let arm = &arm[..arm.find("TopModal::StripDropdown").unwrap_or(arm.len())];
+        assert!(
+            arm.contains("if dismiss {") && !arm.contains("} else {"),
+            "Enter must fall through to the palette's own field, not be acted \
+             on here as well:\n{arm}"
+        );
+    }
+
+    /// ⛔ ONE result surface. The inline dropdown under the small field is the
+    /// detached popover the palette replaced, and a rail that still drew it
+    /// would put both on screen at once.
+    #[test]
+    fn the_rail_no_longer_draws_a_second_result_list() {
+        let rail = function_body(&product_source(), "fn WebOmniboxBar(");
+        assert!(
+            !rail.contains("ws-sug-"),
+            "the rail is drawing suggestion rows of its own again:\n{rail}"
+        );
+    }
+
     /// The ROOT page of a row menu, with nothing on the undo stack — what a
     /// right-click shows. The extra arguments are spelled here once so a test
     /// that cares about neither does not restate them.
@@ -52541,6 +52687,18 @@ mod webtabs_menu_switcher_locks {
             tab.url = (*url).to_string();
             tab.history = vec![(*url).to_string()];
             tab.group_head = *head;
+        }
+        // ⛔ AND NO ADDRESS DRAFT. Every open above went through the blank,
+        // typing-ready path, which leaves the omnibox in EDIT mode — and an
+        // omnibox in edit mode raises the centred palette, which is a
+        // `TopModal`. This fixture describes a surface that already holds these
+        // tabs and is sitting still, not one the user is mid-address-edit in, so
+        // a palette standing over it would make every modal-precedence
+        // assertion in this module answer about the palette instead.
+        if let Some(surface) = shell.web_surfaces.get_mut("local://ws") {
+            surface.address_draft = None;
+            surface.address_typed_len = None;
+            surface.address_suggestion_index = None;
         }
         shell
     }

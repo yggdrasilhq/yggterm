@@ -349,11 +349,11 @@ fn WebOmniboxBar(
     let address_text = overlay.address_text.clone();
     let address_editing = overlay.address_editing;
     let suggestions = overlay.address_suggestions.clone();
-    let suggestion_index = overlay.address_suggestion_index;
-    // Dropdown rows: 0 = the synthesized go/search row (what plain Enter does),
-    // 1.. = history matches.
-    let dropdown_rows = if address_editing && !address_text.trim().is_empty() {
-        1 + suggestions.len()
+    // How many rows the PALETTE is offering, which is what the inline field's
+    // arrow keys have to step through — the palette and this field are two views
+    // of one selection, so the count must be the palette's, not a second tally.
+    let dropdown_rows = if address_editing {
+        web_omnibox_palette_items(&address_text, &suggestions).len()
     } else {
         0
     };
@@ -660,93 +660,13 @@ fn WebOmniboxBar(
                 "🕘"
             }
         }
-        // Omnibox dropdown: normal flow below the bar. Over the page this
-        // flow-push shrinks the [data-ws-page] rect (the native surface follows);
-        // in the rail it is just the top rows.
-        if dropdown_rows > 0 {
-            div {
-                style: format!(
-                    "display:flex; flex-direction:column; padding:2px 10px 8px; background:{background}; \
-                     border-bottom:1px solid rgba(127,127,127,0.25); user-select:none;",
-                ),
-                {
-                    let draft = address_text.trim().to_string();
-                    let go_label = match web_surface_address_to_url(&draft) {
-                        Some(url) if !url.contains("{q}")
-                            && (url == draft
-                                || url == format!("https://{draft}")
-                                || url == format!("http://{draft}")) => {
-                            format!("Go to {url}")
-                        }
-                        _ => format!("Search for \"{draft}\""),
-                    };
-                    let row_style = |selected: bool| {
-                        format!(
-                            "display:flex; align-items:center; gap:8px; padding:5px 12px; border-radius:8px; \
-                             cursor:pointer; font-size:12.5px; color:{}; background:{};",
-                            foreground,
-                            if selected { "rgba(127,127,127,0.22)".to_string() } else { "transparent".to_string() },
-                        )
-                    };
-                    let go_row_style = row_style(suggestion_index == Some(0));
-                    let commit_path = nav_path.clone();
-                    let commit_ssh = nav_ssh.clone();
-                    rsx! {
-                        div {
-                            style: "{go_row_style}",
-                            onclick: {
-                                let draft = draft.clone();
-                                move |_| {
-                                    let tab_id = state.with(|shell| {
-                                        shell.web_surfaces.get(&commit_path).map(|surface| surface.active_tab)
-                                    });
-                                    if let Some(tab_id) = tab_id
-                                        && let Some(url) = web_surface_address_to_url(&draft)
-                                    {
-                                        navigate_web_surface_tab(state, commit_path.clone(), tab_id, url, commit_ssh.clone(), None);
-                                    }
-                                }
-                            },
-                            span { style: "opacity:0.6; flex:0 0 auto;", "→" }
-                            span {
-                                style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                "{go_label}"
-                            }
-                        }
-                        for (row, (sug_url, sug_title)) in suggestions.iter().enumerate() {
-                            div {
-                                key: "ws-sug-{row}",
-                                style: row_style(suggestion_index == Some(row + 1)),
-                                onclick: {
-                                    let nav_path = nav_path.clone();
-                                    let nav_ssh = nav_ssh.clone();
-                                    let sug_url = sug_url.clone();
-                                    move |_| {
-                                        let tab_id = state.with(|shell| {
-                                            shell.web_surfaces.get(&nav_path).map(|surface| surface.active_tab)
-                                        });
-                                        if let Some(tab_id) = tab_id {
-                                            navigate_web_surface_tab(state, nav_path.clone(), tab_id, sug_url.clone(), nav_ssh.clone(), None);
-                                        }
-                                    }
-                                },
-                                span { style: "opacity:0.6; flex:0 0 auto;", "🕘" }
-                                if !sug_title.is_empty() {
-                                    span {
-                                        style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:0 1 auto;",
-                                        "{sug_title}"
-                                    }
-                                }
-                                span {
-                                    style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.55; flex:0 1 auto;",
-                                    "{sug_url}"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // ⛔ NO INLINE DROPDOWN. The results are the CENTRED PALETTE's
+        // (`TopModal::CommandPalette`, mounted with the other over-viewport
+        // modals), which is the owner requirement and DESIGN.md ▸ Search in
+        // chrome both: the result surface wraps the field itself into one
+        // continuous shell rather than hanging a popover under a small input.
+        // A second list drawn here would be that popover, back beside the thing
+        // that replaced it.
     }
 }
 /// The find bar's input. One bar at a time — only the ACTIVE session's surface
