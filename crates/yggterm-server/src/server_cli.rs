@@ -40,6 +40,7 @@
 //! deliberately NOT written, because "no fork has been found" is not the same
 //! claim as "no fork can exist", and the next verb should still be asked.
 
+use yggterm_core::screen_state::{RowScreenState, classify_screen};
 use anyhow::Context;
 use std::io::Read;
 
@@ -248,6 +249,107 @@ pub(crate) fn run_server_reorder_apply(
         && !update.skipped.is_empty()
     {
         anyhow::bail!("{}", update.summary());
+    }
+    Ok(())
+}
+
+/// `server screen <row>` — print a row's screen as PLAIN DECODED TEXT.
+///
+/// # Why this exists
+///
+/// Every instrument a spawner has is downstream of a WRITE, and a pty accepts
+/// bytes whether or not anything is consuming them. So `submitted:true`,
+/// `consuming_input:true` and a transcript that contains the brief are all
+/// equally true of a brief that was DELIVERED and one that is QUEUED behind a
+/// modal nobody has answered. The screen is the only surface on which those two
+/// differ — and until this verb, reading it meant unwrapping a JSON envelope
+/// around a raw escape-laden stream and writing a decoder, which three callers
+/// did separately and none did correctly. The one verification that works was
+/// the hardest one to use.
+///
+/// ⛔ NOT WRITTEN ANYWHERE, like `gate-screen`: a session's screen carries
+/// whatever a person typed, so it goes to this stdout and nowhere else.
+///
+/// # Shapes
+///
+/// * bare — the screen, one line per visible row, nothing else. Pipe it to
+///   `grep`; there is no envelope.
+/// * `--state` — the state line first, then the screen.
+/// * `--state-only` — just the state token, for `[ "$(…)" = ready ]`.
+/// * `--json` — the whole reading, for a program that wants the flags too.
+pub fn run_server_screen_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    if args.iter().any(|arg| arg == "--states") {
+        // The registry, printed. Takes no daemon and no row on purpose: an agent
+        // deciding whether it may type wants this at the moment it is deciding,
+        // and a listing that needed a live row would be unavailable exactly when
+        // the row is the thing in doubt.
+        for state in yggterm_core::screen_state::ALL_ROW_SCREEN_STATES {
+            println!("{}", state.slug());
+            println!("  may_type:    {}", state.may_type());
+            println!("  needs human: {}", state.needs_a_human());
+            println!("  remedy:      {}", state.remedy());
+            println!("  prohibition: {}", state.prohibition());
+        }
+        return Ok(());
+    }
+    let endpoint = cli_server_endpoint(store.home_dir());
+    let path = args.get(2).filter(|arg| !arg.starts_with("--"));
+    let sessions = crate::hot_restart_gate_screens(&endpoint, path.map(String::as_str), None)?;
+    let json = args.iter().any(|arg| arg == "--json");
+    let state_only = args.iter().any(|arg| arg == "--state-only");
+    let with_state = state_only || args.iter().any(|arg| arg == "--state");
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+    if sessions.is_empty() {
+        // ⛔ SAY WHICH QUESTION FAILED. "No screen" and "this daemon does not
+        // own that row" license opposite next steps, and a caller that cannot
+        // tell them apart concludes a live row is dead. The wording names the
+        // condition, never the topology — which daemon owns what is our
+        // bookkeeping, not the reader's.
+        if state_only {
+            println!("{}", RowScreenState::Unreadable.slug());
+        } else {
+            println!(
+                "unreadable: no session here matches{}. The row may be owned by \
+                 another daemon, or may have gone.",
+                path.map(|p| format!(" {p}")).unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+    for session in &sessions {
+        let rows = session.screen_plain_rows.as_deref();
+        let grid = rows.map(|rows| rows.join("\n"));
+        let state = classify_screen(grid.as_deref());
+        if state_only {
+            println!("{}", state.slug());
+            continue;
+        }
+        if sessions.len() > 1 {
+            println!("== {}", session.session_key);
+        }
+        if with_state {
+            println!("state: {}", state.slug());
+            println!("remedy: {}", state.remedy());
+            println!("prohibition: {}", state.prohibition());
+            println!("may_type: {}", state.may_type());
+            println!("--");
+        }
+        match rows {
+            // Trailing blank rows are dropped on the way OUT, not on the way
+            // in: the classifier wants the true grid, and a reader wants the
+            // screen without twenty empty lines after it.
+            Some(rows) => {
+                let last = rows.iter().rposition(|row| !row.trim().is_empty());
+                for row in rows.iter().take(last.map_or(0, |last| last + 1)) {
+                    println!("{row}");
+                }
+            }
+            None => println!("(screen unreadable)"),
+        }
     }
     Ok(())
 }
@@ -862,4 +964,40 @@ pub fn run_server_connect_cli(store: &SessionStore, args: &[String]) -> anyhow::
         ConnectPlacement::End
     };
     run_server_connect_apply(&endpoint, &path, view, placement)
+}
+
+#[cfg(test)]
+mod screen_verb_tests {
+    /// ⛔ THE VERB MUST BE REACHABLE FROM BOTH BINARIES, and only a source-level
+    /// check notices when it is not.
+    ///
+    /// The arg dispatcher exists twice — once per binary — and a consolidation
+    /// that rewrote one copy has silently dropped five verbs before now. The
+    /// handler stayed, its unit tests stayed and kept passing, and the verb was
+    /// simply absent from a built binary; the fleet's whole wake plane stopped
+    /// for an hour because `read-buffer` had disappeared exactly this way while
+    /// looking present in the source.
+    ///
+    /// Compiling proves a handler exists. Nothing but this proves it can be
+    /// CALLED.
+    #[test]
+    fn the_screen_verb_is_dispatched_by_both_binaries() {
+        for (binary, source) in [
+            ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),
+            (
+                "yggterm-headless",
+                include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains(r#"args[1] == "screen""#),
+                "`server screen` is not dispatched by {binary} — the handler \
+                 exists but nothing can reach it",
+            );
+            assert!(
+                source.contains("run_server_screen_cli"),
+                "{binary} matches the verb without calling its handler",
+            );
+        }
+    }
 }

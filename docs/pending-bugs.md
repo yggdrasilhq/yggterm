@@ -12,6 +12,61 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
+
+**Status:** OPEN
+
+Measured 2026-08-21 while a lane claimed its own row. `server app session outline
+<row> <seat>` returned, at the envelope level, `error: null` — and two levels
+down, `applied: false` with `daemon_message: "no live session for <row>"` and the
+row's stored `outline_prefix` unchanged. The row itself was live and listed, and
+`session rename` against the SAME path in the SAME second succeeded, so this is
+not a dead row.
+
+**Why it matters beyond one seat.** `ygg-claim.sh` treats the call as fire-and-
+forget and only notices via a later read-back, which it reports as "claim never
+verified" — naming the symptom (the seat is wrong) and not the cause (the write
+was refused, and said so, in a field nobody reads). A caller that checks `error`
+— the obvious field, and the one every other verb uses — concludes the seat was
+set.
+
+**Measured further.** The row is listed by `server app rows` under exactly the
+path the verb refuses (`kind: Session`, `full_path` identical to the argument),
+and the daemon's own `gate-screen` returns a live screen for that same uuid in
+the same minute. So "no live session" is not a statement about the pty — it is
+the app-control layer's answer about its own registry, while `session rename`
+against the identical path succeeds. Mechanism beyond that is UNCONFIRMED: the
+obvious candidate is that `rename` writes the row record while `outline` requires
+a session the GUI currently holds, but that was not verified.
+
+**Falsifies it:** a run where `applied:false` is accompanied by a non-null
+`error`, or where the seat lands while `applied` is false.
+
+## ⛔ [11.17] TWO BOOTER SCREEN TESTS READ LIVE MACHINE STATE AND FAIL ON A BUSY HOST
+
+**Status:** OPEN
+
+`tests/test_booter_screens.py` fails two cases on `origin/main` with no local
+changes (confirmed 2026-08-21 by running the pristine file):
+
+* *boot PROCEEDS on an ordinary screen* — the sandbox row never echoes the boot
+  text within the harness's 6 s window, so the write is judged not to have
+  landed. Time-dependent, and it fails on a loaded host.
+* *the monitor WAKES NOBODY while the attended list is unreadable* — the tick it
+  asserts on is suppressed for an unrelated reason: the run logs `⏸ QUOTA HOLD
+  (29m left) — all wakeups and escalations SUPPRESSED this tick`. The test is
+  reading the REAL quota-hold state of the machine it runs on, so it proves the
+  right outcome for the wrong reason when quota is clear and fails outright when
+  it is not.
+
+**The class, already recorded once:** a unit test that reads live user/machine
+state instead of a fixture. Both need their state injected rather than inherited;
+the second is not a product bug at all, which is worse — it spends a reader's
+attention on a false alarm every time the fleet is under quota.
+
+**Falsifies it:** both cases passing on a host that is under a quota hold and
+loaded.
+
 ## ⛔⛔ [11.0] A DAEMON BORN INSIDE AN AGENT SESSION MARKS EVERY CLI IT SPAWNS AS A CHILD — TRANSCRIPTS SILENTLY OFF, AND THE POISON IS HEREDITARY
 
 **Status:** OPEN

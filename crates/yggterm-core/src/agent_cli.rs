@@ -127,6 +127,58 @@ pub enum CliUpdate {
     SelfCommand(&'static [&'static str]),
 }
 
+/// How many populated rows from the bottom the FOOTER classifiers read.
+///
+/// Footer chrome (`esc to interrupt`, a limit-wait line, a picker's key hints)
+/// is by construction the last thing on the screen, so a shallow window is both
+/// sufficient and a guard against matching the same words in conversation text
+/// scrolled above.
+const SCREEN_FOOTER_WINDOW_ROWS: usize = 10;
+
+/// How many populated rows from the bottom the MODAL classifiers read.
+///
+/// A startup gate is drawn in the middle of an otherwise empty screen, so its
+/// text sits further from the bottom than any footer does.
+const SCREEN_MODAL_WINDOW_ROWS: usize = 24;
+
+/// Does any of the last `window` POPULATED rows carry one of `phrases`?
+///
+/// ⛔ **POPULATED, not "the last `window` rows".** The four callers this
+/// replaced each spelled `sample.lines().rev().take(10)`, which takes ten LINES
+/// and then discards the blank ones — so on any screen whose bottom rows are
+/// empty the window contains nothing but blanks and the classifier returns
+/// false for a screen that is entirely the thing it was looking for. Their own
+/// docstrings all said "the last ten non-empty lines", which is this; the code
+/// never did it. It went unnoticed for as long as it did because the only input
+/// anyone passed was the RAW screen, where a whole modal arrives as two long
+/// lines and there are no trailing blanks to eat the window — the two defects
+/// concealed each other, and feeding a correctly rendered grid to the old
+/// window would have silently blinded every classifier at once.
+fn screen_phrases_match(
+    sample: &str,
+    phrases: &'static [ScreenWorkingPhrase],
+    negations: &'static [&'static str],
+    window: usize,
+) -> bool {
+    sample
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(window)
+        .any(|line| {
+            let lower = line.to_ascii_lowercase();
+            if negations.iter().any(|deny| lower.contains(deny)) {
+                return false;
+            }
+            phrases.iter().any(|phrase| {
+                lower.contains(phrase.needle)
+                    && (phrase.also_any.is_empty()
+                        || phrase.also_any.iter().any(|also| lower.contains(also)))
+            })
+        })
+}
+
 /// One phrase that means "a turn is in flight", as read off this CLI's SCREEN.
 ///
 /// Distinct from [`AgentCliDescriptor::working_footer_hints`], which is scanned
@@ -673,6 +725,51 @@ pub struct AgentCliDescriptor {
     ///
     /// ⛔ EMPTY means UNMEASURED, the same law as `working_screen_phrases`.
     pub background_agent_hint_screen_phrases: &'static [ScreenWorkingPhrase],
+    /// Whole-SCREEN phrases meaning the CLI is holding a STARTUP GATE — a
+    /// first-run modal that stands BEFORE the composer exists, so the row is
+    /// not yet reading input at all.
+    ///
+    /// ⛔ THIS ONE IS INVISIBLE TO EVERY OTHER INSTRUMENT, which is what makes
+    /// it different. Measured 2026-08-21 on a row spawned into a directory this
+    /// CLI had not seen: `working`, `question_picker`, `limit_wait` and
+    /// `background_agent_hint` all read FALSE, `input-check` answered
+    /// `consuming_input:false, wedged:false`, and the process was alive and
+    /// ageing — the exact signature of a slow cold start, which is fixed by
+    /// waiting, while this one never clears without a keypress. A spawner that
+    /// cannot tell the two apart waits forever on a row that will never move.
+    ///
+    /// ⛔ A GATE IS NOT A PERMISSION PROMPT. A skip-permissions flag does not
+    /// skip it, because workspace trust is a different question from tool
+    /// permission; it fires per (CLI, directory) and per host, so a brand-new
+    /// worktree stops a row while every sibling checkout is fine.
+    ///
+    /// ⚠ These phrases are BODY text, not footer chrome — which is why this
+    /// classifier, unlike the four above, cannot be matched against the raw
+    /// screen. A gate is drawn with absolute cursor positioning, so its nine
+    /// visible rows arrive as two newline-delimited lines with the words of
+    /// adjacent rows fused; see [`AgentCliDescriptor::screen_shows_startup_gate`].
+    ///
+    /// ⛔ EMPTY means UNMEASURED, the same law as `working_screen_phrases`.
+    pub startup_gate_screen_phrases: &'static [ScreenWorkingPhrase],
+    /// Whole-SCREEN phrases meaning the CLI is holding a LIMIT/BILLING DIALOG
+    /// whose options are NOT equivalent.
+    ///
+    /// ⛔⛔ THE ONE STATE WHERE A WATCHDOG'S ENTER SPENDS MONEY. When the plan's
+    /// limit is reached the CLI parks on a numbered choice — wait, switch
+    /// account, or pay per token — and a lone carriage return does not "dismiss"
+    /// it: it SELECTS whatever is highlighted. A watchdog that presses Enter at
+    /// every prompt it meets will eventually change billing on the owner's
+    /// account, and nobody will have decided it.
+    ///
+    /// ⚠ These phrases OVERLAP `limit_wait_screen_phrases` by design — both
+    /// describe a row that has run out of quota. The difference is structural,
+    /// not lexical: a dialog carries a selection marker on a numbered option and
+    /// a footer does not, which is why the classifier pairs these phrases with
+    /// [`crate::screen_state::screen_has_selected_numbered_option`] rather than
+    /// trying to separate them by wording.
+    ///
+    /// ⛔ EMPTY means UNMEASURED, the same law as `working_screen_phrases`.
+    pub plan_limit_choice_screen_phrases: &'static [ScreenWorkingPhrase],
     /// How an existing session id is named on resume.
     pub resume_selector: ResumeSelector,
     /// Whether resuming into a known cwd passes it explicitly.
@@ -1058,86 +1155,90 @@ impl AgentCliDescriptor {
 
     /// Whether this CLI's SCREEN says a turn is in flight.
     ///
-    /// Window and folding match the matcher this replaced exactly: the last ten
-    /// non-empty lines, ASCII-lowercased, negations checked first.
+    /// Negations are checked first: they describe lines that FAKE a work
+    /// signal (codex's `Worked for 12s` completion summary contains the naive
+    /// `worked for` needle).
     pub fn screen_shows_working(&self, sample: &str) -> bool {
-        sample.lines().rev().take(10).any(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return false;
-            }
-            let lower = line.to_ascii_lowercase();
-            if self
-                .working_screen_negations
-                .iter()
-                .any(|deny| lower.contains(deny))
-            {
-                return false;
-            }
-            self.working_screen_phrases.iter().any(|phrase| {
-                lower.contains(phrase.needle)
-                    && (phrase.also_any.is_empty()
-                        || phrase.also_any.iter().any(|also| lower.contains(also)))
-            })
-        })
+        screen_phrases_match(
+            sample,
+            self.working_screen_phrases,
+            self.working_screen_negations,
+            SCREEN_FOOTER_WINDOW_ROWS,
+        )
     }
 
-    /// Whether this CLI's SCREEN says it is waiting on a usage limit — a
-    /// third state beside working/idle. Same window and folding as
-    /// [`Self::screen_shows_working`], and deliberately NOT subject to the
-    /// working negations: those describe lines that fake a WORK signal.
+    /// Whether this CLI's SCREEN says it is waiting on a usage limit — a third
+    /// state beside working/idle. Deliberately NOT subject to the working
+    /// negations: those describe lines that fake a WORK signal.
     pub fn screen_shows_limit_wait(&self, sample: &str) -> bool {
-        sample.lines().rev().take(10).any(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return false;
-            }
-            let lower = line.to_ascii_lowercase();
-            self.limit_wait_screen_phrases.iter().any(|phrase| {
-                lower.contains(phrase.needle)
-                    && (phrase.also_any.is_empty()
-                        || phrase.also_any.iter().any(|also| lower.contains(also)))
-            })
-        })
+        screen_phrases_match(
+            sample,
+            self.limit_wait_screen_phrases,
+            &[],
+            SCREEN_FOOTER_WINDOW_ROWS,
+        )
     }
 
     /// Whether this CLI's SCREEN is holding an OWNER-FACING QUESTION PICKER —
     /// the state in which typed text goes nowhere because the CLI is reading
-    /// navigation keys. Same window and folding as
-    /// [`Self::screen_shows_working`], and deliberately NOT subject to the
-    /// working negations: those describe lines that fake a WORK signal, and
-    /// this is not a work signal at all.
+    /// navigation keys.
     pub fn screen_shows_question_picker(&self, sample: &str) -> bool {
-        sample.lines().rev().take(10).any(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return false;
-            }
-            let lower = line.to_ascii_lowercase();
-            self.question_picker_screen_phrases.iter().any(|phrase| {
-                lower.contains(phrase.needle)
-                    && (phrase.also_any.is_empty()
-                        || phrase.also_any.iter().any(|also| lower.contains(also)))
-            })
-        })
+        screen_phrases_match(
+            sample,
+            self.question_picker_screen_phrases,
+            &[],
+            SCREEN_FOOTER_WINDOW_ROWS,
+        )
     }
 
     /// Whether this CLI's SCREEN is advertising a background agent, i.e. the
     /// dim composer line is CHROME and not a draft. See
     /// [`Self::background_agent_hint_screen_phrases`].
     pub fn screen_shows_background_agent_hint(&self, sample: &str) -> bool {
-        sample.lines().rev().take(10).any(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return false;
-            }
-            let lower = line.to_ascii_lowercase();
-            self.background_agent_hint_screen_phrases.iter().any(|phrase| {
-                lower.contains(phrase.needle)
-                    && (phrase.also_any.is_empty()
-                        || phrase.also_any.iter().any(|also| lower.contains(also)))
-            })
-        })
+        screen_phrases_match(
+            sample,
+            self.background_agent_hint_screen_phrases,
+            &[],
+            SCREEN_FOOTER_WINDOW_ROWS,
+        )
+    }
+
+    /// Whether this CLI's SCREEN is holding a STARTUP GATE — a first-run modal
+    /// standing before the composer exists. See
+    /// [`Self::startup_gate_screen_phrases`].
+    ///
+    /// ⛔ THIS ONE NEEDS A RENDERED GRID, not the raw screen. A gate is painted
+    /// with absolute cursor moves rather than newlines, so on the raw byte
+    /// stream its nine visible rows arrive as two `\n`-delimited lines with the
+    /// words of adjacent rows fused together. Feed it
+    /// `session_screen_plain_rows`, never `session_screen_snapshot`.
+    ///
+    /// ⚠ Its window is deeper than the footer classifiers' because a modal sits
+    /// in the MIDDLE of the screen with blank rows beneath it, while footer
+    /// chrome is by construction last.
+    pub fn screen_shows_startup_gate(&self, sample: &str) -> bool {
+        screen_phrases_match(
+            sample,
+            self.startup_gate_screen_phrases,
+            &[],
+            SCREEN_MODAL_WINDOW_ROWS,
+        )
+    }
+
+    /// Whether this CLI's SCREEN carries LIMIT/BILLING DIALOG wording. See
+    /// [`Self::plan_limit_choice_screen_phrases`].
+    ///
+    /// ⛔ NOT SUFFICIENT ON ITS OWN. This answers "are the money words present",
+    /// which prose about usage limits also satisfies. The state is only armed
+    /// when a selection marker also sits on a numbered option — see
+    /// [`crate::screen_state::classify_screen`].
+    pub fn screen_shows_plan_limit_choice(&self, sample: &str) -> bool {
+        screen_phrases_match(
+            sample,
+            self.plan_limit_choice_screen_phrases,
+            &[],
+            SCREEN_MODAL_WINDOW_ROWS,
+        )
     }
 
     /// Tokens for the CLI's own resume PICKER (no session id).
@@ -1458,6 +1559,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // `codex resume <id>` reopens the session's ORIGINAL cwd unless
         // re-rooted; the cwd tree's whole promise is that a row opens where the
@@ -1612,6 +1715,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // ⚠ Deliberately FALSE, preserving shipped behavior exactly: the
         // pre-descriptor builder gated `-C "$PWD"` on `SessionKind::Codex`
@@ -1761,6 +1866,59 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             needle: "\u{2190}",
             also_any: &["agent"],
         }],
+        // ⭐ MEASURED 2026-08-21 by spawning a row into a directory this CLI
+        // had never opened on this host. The gate heads itself
+        // `Quick safety check: Is this a project you created or one you trust?`
+        // and offers `❯ 1. Yes, I trust this folder` over `2. No, exit`, with
+        // `Enter to confirm · Esc to cancel` beneath. The heading is the whole
+        // test on its own — no other screen in this CLI carries it — and the
+        // option line is kept as a second, independent witness so a reworded
+        // heading cannot blind the classifier silently.
+        //
+        // ⛔ Neither phrase takes an `also_any` guard, deliberately. The gate
+        // paints each of these on its OWN visible row, so a same-line
+        // conjunction would demand an adjacency the screen does not have.
+        startup_gate_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "quick safety check",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "trust this folder",
+                also_any: &[],
+            },
+        ],
+        // The wording the fleet's watchdog has matched on since 2026-08-14,
+        // moved here from a python tuple so the daemon and the watcher cannot
+        // hold different ideas of what a billing dialog looks like. Every entry
+        // names the money question itself; the structural guard beside it is
+        // what keeps an ordinary sentence about limits from arming the state.
+        plan_limit_choice_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "session limit",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "usage limit",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "team account",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "api billing",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "pay per token",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "stop and wait",
+                also_any: &[],
+            },
+        ],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -1902,6 +2060,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         // `pi` takes `process.cwd()`; there is no `--cwd`, and `--session-dir`
         // relocates STORAGE, not the working directory.
@@ -2014,6 +2174,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -2105,6 +2267,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -2242,6 +2406,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         // ⭐ CONFIRMED 2026-08-08 against a real `kimi --help` on guihost (yggterm
         // provisioned it via uv the same day): `--session,--resume  -S,-r`. The
         // value was read from source at intake and is now MEASURED — recorded
@@ -2362,6 +2528,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         // ⭐ MEASURED 2026-08-08 on guihost, from `muse resume --help` on a real
         // install: `muse resume` / `muse resume --last` / `muse resume
         // <session-uuid>`. ⛔ The placeholder here said `Flag("--resume")`,
@@ -2507,6 +2675,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
         resume_selector: ResumeSelector::Flag("--conversation"),
@@ -2719,6 +2889,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
         resume_selector: ResumeSelector::Flag("--resume"),
         // grok takes the process cwd (`--cwd <CWD>` exists but the launch

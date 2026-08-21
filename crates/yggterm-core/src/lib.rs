@@ -62,6 +62,7 @@ pub mod row_set_outline;
 /// WHERE A ROW SITS — the owner's `0 / 1 / 1.1 / 2` sidebar outline, parsed and
 /// compared as integers per dotted segment. One owner for the sort key, so a
 /// verb can never report an order the sidebar does not draw.
+pub mod screen_state;
 pub mod session_outline;
 mod telemetry;
 /// How a text payload reaches a terminal composer — and why an agent CLI needs
@@ -1510,6 +1511,27 @@ pub fn screen_text_shows_agent_background_hint(sample: &str) -> bool {
     agent_cli::AGENT_CLIS
         .iter()
         .any(|descriptor| descriptor.screen_shows_background_agent_hint(sample))
+}
+
+/// Kind-agnostic union of every CLI's STARTUP-GATE phrases.
+///
+/// ⛔ FEED THIS A RENDERED GRID, not the raw pty stream. A gate is drawn with
+/// absolute cursor moves, so on the raw stream its rows arrive fused into one
+/// enormous line and the words of adjacent rows run together.
+pub fn screen_text_shows_agent_startup_gate(sample: &str) -> bool {
+    agent_cli::AGENT_CLIS
+        .iter()
+        .any(|descriptor| descriptor.screen_shows_startup_gate(sample))
+}
+
+/// Kind-agnostic union of every CLI's LIMIT/BILLING DIALOG wording.
+///
+/// ⛔ Presence of the wording is not the state — see
+/// [`screen_state::classify_screen`], which pairs it with the structural test.
+pub fn screen_text_shows_agent_plan_limit_choice(sample: &str) -> bool {
+    agent_cli::AGENT_CLIS
+        .iter()
+        .any(|descriptor| descriptor.screen_shows_plan_limit_choice(sample))
 }
 
 /// How long input may go unanswered before a row is worth pointing

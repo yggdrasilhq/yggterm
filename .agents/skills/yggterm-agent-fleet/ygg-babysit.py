@@ -253,6 +253,70 @@ def turn_state(path):
 
 
 
+#: A final turn shorter than this is short by ANY standard, so a session whose
+#: own turns are small does not get a lower bar than everyone else.
+CUT_SHORT_CEILING_CHARS = 160
+#: How far below its own typical turn a session's last one must fall.
+CUT_SHORT_FRACTION = 0.15
+#: Below this, a session has no habit to be out of character with.
+CUT_SHORT_MIN_TYPICAL_CHARS = 600
+#: Fewer prior turns than this and the median is not a habit, it is noise.
+CUT_SHORT_MIN_PRIOR_TURNS = 4
+
+
+def turn_cut_short(path):
+    """Did this session's LAST turn stop implausibly early? -> (bool, why).
+
+    ⭐ THE OWNER'S OWN CLASSIFIER, and nothing in the fleet computed it. He
+    kicked a stalled orchestrator on the grounds that *within five minutes it
+    stopped with one line of output, which seemed suspicious* — and he was
+    right: that row's turn had been cut by a daemon swap. A short reply followed
+    by silence, from a row that had been producing real turns, is a genuine
+    signal.
+
+    ⛔ IT IS NOT A SCREEN QUESTION, which is why it lives here and not beside
+    the screen classifiers. A cut turn leaves a row alive, at rest, at its
+    composer, with a perfectly ordinary screen; there is no frame to recognise.
+    The tell is the SHAPE OF THE OUTPUT compared with what this same session
+    normally produces — so the comparison is against the row's OWN history, not
+    against a fleet-wide constant that would be wrong for every session at once.
+
+    ⚠ Deliberately conservative, because the remedy is to type into a row. A
+    session with no established habit (too few turns, or short ones anyway)
+    returns False rather than guessing, and a legitimate short sign-off from a
+    session that normally writes essays is the one false positive this accepts —
+    it costs a `continue` into a finished row, which is noise, while the miss it
+    prevents costs a stalled campaign nobody notices."""
+    try:
+        rows = [json.loads(l) for l in path.open() if l.strip()]
+    except Exception:
+        return (False, "")
+    lengths = []
+    for r in rows:
+        if r.get("type") != "assistant":
+            continue
+        items = [c for c in (r.get("message", {}).get("content") or [])
+                 if isinstance(c, dict)]
+        # Only turns that ENDED count: a record carrying a tool_use is one step
+        # of a turn, and its text length says nothing about how much the turn
+        # produced in the end.
+        if any(c.get("type") == "tool_use" for c in items):
+            continue
+        text = " ".join(" ".join(c.get("text", "") for c in items
+                                 if c.get("type") == "text").split())
+        lengths.append(len(text))
+    if len(lengths) < CUT_SHORT_MIN_PRIOR_TURNS + 1:
+        return (False, "")
+    last, prior = lengths[-1], lengths[:-1][-10:]
+    typical = sorted(prior)[len(prior) // 2]
+    if typical < CUT_SHORT_MIN_TYPICAL_CHARS:
+        return (False, "")
+    if last > max(CUT_SHORT_CEILING_CHARS, int(typical * CUT_SHORT_FRACTION)):
+        return (False, "")
+    return (True, f"last turn {last} chars against a typical {typical} over "
+                  f"{len(prior)} turns — stopped far short of its own habit")
+
+
 def progress_marks(path):
     """How many turns in this transcript did REAL WORK.
 

@@ -2611,6 +2611,35 @@ pub struct HotRestartGateScreen {
     /// stuck draft at once, and two `\r` probes agreed with them.
     #[serde(default)]
     pub shows_background_agent_hint: bool,
+    /// Whether a first-run STARTUP GATE stands before the composer.
+    ///
+    /// ⛔ This is the state every other field on this struct reads as `false`,
+    /// which is what makes it dangerous: a gated row is indistinguishable from
+    /// a slow cold start on the readiness probe, and only one of the two is
+    /// fixed by waiting. serde(default) keeps older daemons' answers readable.
+    #[serde(default)]
+    pub shows_startup_gate: bool,
+    /// The single state name for this row, with its remedy and prohibition
+    /// resolved — the one field a caller should branch on.
+    ///
+    /// ⭐ Present so that no caller has to re-derive precedence from the
+    /// booleans above. Several of them are true at once (a question picker is
+    /// mid-turn, so `shows_agent_working` is true beside it) and getting the
+    /// order wrong is what reports a row that is ASKING THE OWNER A QUESTION as
+    /// ordinary busy work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// The RENDERED viewport, one entry per visible row.
+    ///
+    /// ⛔ Distinct from `screen_tail`, which is the raw escape-laden stream and
+    /// stays that way deliberately: a recognizer trained on how a screen is
+    /// DRAWN needs the escapes, and stripping them destroys the faint-SGR
+    /// discriminator that separates chrome from a person's typed draft. This
+    /// field is the other half — what a person SEES — so that phrase matching
+    /// and printing stop re-implementing a decoder per caller. `None` when the
+    /// screen could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_plain_rows: Option<Vec<String>>,
 }
 
 /// How much of the screen a gate-screen reading returns when the caller does not
@@ -7180,6 +7209,19 @@ impl DaemonRuntime {
             .map(|key| {
                 let runtime_path = self.terminal_runtime_key_for_path(key);
                 let screen = self.terminals.session_screen_snapshot(&runtime_path);
+                // ⛔ THE CLASSIFIERS READ THE RENDERED GRID, NOT THE RAW STREAM.
+                // `screen_snapshot` is the escape sequence that repaints the
+                // screen; a TUI draws with absolute cursor moves, so on that
+                // stream a modal's rows arrive fused into one enormous line and
+                // every line-shaped predicate answers a question about the
+                // painting rather than about the display. The raw stream is
+                // still returned as `screen_tail` because a reading of how a
+                // screen is DRAWN is a different and equally real question.
+                let grid = self
+                    .terminals
+                    .session_screen_plain_rows(&runtime_path)
+                    .map(|rows| rows.join("\n"));
+                let grid_text = grid.as_deref();
                 HotRestartGateScreen {
                     session_key: key.clone(),
                     blocker: blockers
@@ -7190,18 +7232,24 @@ impl DaemonRuntime {
                     // ⛔ The predicate is asked of the WHOLE screen, exactly as
                     // the gate asks it. Asking it of the tail would answer a
                     // question about this verb's formatting.
-                    shows_agent_working: screen
-                        .as_deref()
+                    shows_agent_working: grid_text
                         .is_some_and(yggterm_core::screen_text_shows_agent_working),
-                    shows_limit_wait: screen
-                        .as_deref()
+                    shows_limit_wait: grid_text
                         .is_some_and(yggterm_core::screen_text_shows_agent_limit_wait),
-                    shows_question_picker: screen
-                        .as_deref()
+                    shows_question_picker: grid_text
                         .is_some_and(yggterm_core::screen_text_shows_agent_question_picker),
-                    shows_background_agent_hint: screen
-                        .as_deref()
+                    shows_background_agent_hint: grid_text
                         .is_some_and(yggterm_core::screen_text_shows_agent_background_hint),
+                    shows_startup_gate: grid_text
+                        .is_some_and(yggterm_core::screen_text_shows_agent_startup_gate),
+                    state: Some(
+                        yggterm_core::screen_state::classify_screen(grid_text)
+                            .slug()
+                            .to_string(),
+                    ),
+                    screen_plain_rows: grid
+                        .as_deref()
+                        .map(|grid| grid.lines().map(str::to_string).collect()),
                     screen_tail: screen.map(|screen| gate_screen_tail(&screen, tail_lines)),
                 }
             })

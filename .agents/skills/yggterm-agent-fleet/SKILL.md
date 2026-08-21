@@ -352,15 +352,35 @@ yggterm server app terminal input-check "$ROW" --check-timeout-ms 20000
 yggterm server app terminal submit "$ROW" --stdin < brief.md
 #    → {"submitted": true, "waited_ms": N}
 
-# 4. ⛔ VERIFY BY TRANSCRIPT CONTENT. This is the only step that cannot lie.
+# 4. ⛔ VERIFY BY TRANSCRIPT CONTENT — but not for the first ~20 s (see step 5).
 grep -q 'PUT-A-DISTINCTIVE-TOKEN-IN-YOUR-BRIEF' \
      ~/.claude/projects/<cwd-slug>/<uuid>.jsonl
+
+# 5. ⛔⛔ READ THE SCREEN. Steps 2-4 are ALL downstream of the write, and a pty
+#    accepts bytes whether or not anything is consuming them — so a QUEUED brief
+#    and a DELIVERED one are byte-identical from here. This is the only step that
+#    can tell them apart.
+yggterm-headless server screen "cc-runtime://<uuid>" --state-only
+#    → `ready` (it is at its composer) · `startup_gate` (a modal is holding it,
+#      and no amount of waiting will clear it) · `question_picker` /
+#      `plan_limit_choice` (a PERSON is being asked; ⛔ type nothing) ·
+#      `working` · `limit_wait`. Add `--state` for the remedy and the
+#      prohibition, or drop the flag entirely to print the screen itself.
 ```
 
 ### Why step 4 is not optional
 
 **A transcript FILE exists the moment the CLI starts.** It tells you a process is
-running; it tells you nothing about what was delivered into it. A launch that
+running; it tells you nothing about what was delivered into it.
+
+⛔⛔ **AND IT IS NOT THERE IMMEDIATELY — MEASURED 2026-08-21, correcting what this
+file said before.** A brief submitted at 13:33:58 (`submitted:true`, 82 bytes,
+`consuming_input:true`) produced its transcript at **13:34:12.5 — 14.5 s later**,
+and the project directory did not exist at all until then. So a grep run straight
+after the submit returns a FALSE NEGATIVE, and "absent means the brief was
+dropped" is only true after the file has had time to appear. ⇒ Give it ~20 s
+before you believe an absence, and use step 5's screen read for the answer you
+actually wanted, which is whether anything is RUNNING. A launch that
 dropped its entire brief still produced a 28 KB transcript, and a reply field
 saying the launch was applied — because the ROW was born exactly as asked,
 holding nothing.
@@ -2816,9 +2836,12 @@ it governs permissions ONLY. It does not cover workspace trust (see 1), a
 first-run theme picker, or an auth/login prompt. **Any of those can hold a row,
 and all of them are navigable.**
 
-**6. The transcript is the only honest delivery receipt.** A transcript file
-exists the moment the CLI takes input, and not before — so *absent after ~60 s*
-means the brief did not land. Its *presence* proves nothing about **whose** brief
+**6. The transcript is the only honest delivery receipt — and it LAGS.** A
+transcript file exists once the CLI takes input, and not before, so *absent after
+~60 s* means the brief did not land. ⛔ But it is not immediate: measured
+2026-08-21, a successfully delivered brief's transcript appeared **14.5 s** after
+`submitted:true`, with no project directory before that. An absence inside the
+first ~20 s is evidence of nothing. Its *presence* proves nothing about **whose** brief
 it holds; that is what the ACK token is for. (§3.)
 
 ---
@@ -2870,6 +2893,29 @@ that could have said so was thrown away.
 ⇒ **THE ONLY VERIFICATION THAT HELD WAS THE SCREEN.** After any write meant to
 dismiss a gate, READ THE SCREEN BACK and confirm the gate is gone. Not the write's
 success, not readiness, not the transcript — the pixels.
+
+⭐ **AND THERE IS NOW A VERB FOR IT** (3.1.21). `server screen <row>` prints the
+row's screen as plain decoded text — one line per visible row, no JSON envelope,
+no per-caller decoder — and `--state-only` answers the question a spawner
+actually has:
+
+```sh
+yggterm-headless server screen "cc-runtime://<uuid>" --state-only   # → startup_gate
+yggterm-headless server screen "cc-runtime://<uuid>" --state        # + remedy + prohibition
+```
+
+⛔⛔ **AND THE REASON NOTHING CAUGHT THIS BEFORE, measured the same day: the state
+was invisible to EVERY classifier at once.** A live gate reads
+`working:false, question_picker:false, limit_wait:false, background_agent_hint:false`
+— not because the phrases were missing from the registry but because of HOW the
+screen arrives. The CLI paints its nine visible rows with **absolute cursor moves
+and no newlines between them**, and emits single spaces as cursor-forward, so on
+the raw stream the whole modal is TWO `\n`-delimited lines (one ~870 characters)
+and `quick safety check` **is not present as a substring at all**. Every
+line-shaped test — "the last N lines", "these two phrases on the same line" — was
+therefore answering a question about the PAINTING rather than about the display.
+⇒ The daemon now classifies from its own rendered vt100 grid, which is what the
+`startup_gate` state and the plain-text verb are both built on.
 
 ⚠ The Enter itself is still the right ACTION at this gate, and it is safe here for
 a reason worth stating rather than assuming: the highlight sits on the option that

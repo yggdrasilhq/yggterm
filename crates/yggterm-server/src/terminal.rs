@@ -1284,6 +1284,16 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.history_rows())
     }
 
+    /// The session's VISIBLE screen as plain-text rows — the rendered grid a
+    /// person sees, not the escape stream that paints it. See
+    /// `PtySessionRuntime::vt_screen_plain_rows` for why every screen
+    /// classifier reads this and not `session_screen_snapshot`.
+    pub fn session_screen_plain_rows(&self, key: &str) -> Option<Vec<String>> {
+        self.sessions
+            .get(key)
+            .map(|session| session.screen_plain_rows())
+    }
+
     /// The libyggterm declares the daemon has retained for this session (the
     /// app's latest `web-surface` / `sidebar` payloads). Empty for a plain
     /// shell, and empty again once the app emits its `close`.
@@ -2214,6 +2224,45 @@ impl TerminalScreenState {
     /// restart, and on attach we prepend this history before the
     /// formatted viewport so the user sees their real terminal history,
     /// not just the last frame.
+    /// The VISIBLE viewport as plain-text rows — one entry per screen row, in
+    /// top-to-bottom order, trailing blanks on each row trimmed.
+    ///
+    /// ⛔⛔ THIS IS WHAT A CLASSIFIER MUST READ, and `screen_snapshot` is not.
+    /// That one returns the vt100 FORMATTED state: the escape sequence stream
+    /// that repaints this screen. A TUI draws with absolute cursor moves rather
+    /// than newlines, so on that stream a modal's nine visible rows arrive as
+    /// TWO `\n`-delimited lines — measured 2026-08-21 on a first-run gate: 11
+    /// cursor-position moves, zero newlines between the rows they address, one
+    /// run of 870 characters. Every line-shaped question then answers about
+    /// something other than the screen: "the last N lines" is not a window over
+    /// the display, and "these two phrases on the SAME line" is either
+    /// trivially true or impossible depending only on how the CLI chose to
+    /// paint. Words of vertically adjacent rows also run together, so a needle
+    /// can straddle a seam that does not exist on screen.
+    ///
+    /// ⭐ The vt100 model has already done this work — it is the emulator whose
+    /// grid the GUI paints. Asking it for rows is both cheaper and more
+    /// faithful than any regex over the stream, and it is the same call
+    /// `vt_scrollback_plain_rows` makes for history.
+    ///
+    /// Blank rows are KEPT. A caller filtering them is choosing a window; a
+    /// reader printing the screen wants the shape a person would see.
+    fn vt_screen_plain_rows(&mut self) -> Vec<String> {
+        let screen = self.parser.screen_mut();
+        // Read the LIVE viewport, not wherever a previous reader left the
+        // scrollback offset, and put it back afterwards: this is a read-only
+        // question and must not move what anyone else is looking at.
+        let saved_offset = screen.scrollback();
+        screen.set_scrollback(0);
+        let (_, cols) = screen.size();
+        let rows: Vec<String> = screen
+            .rows(0, cols)
+            .map(|row| row.trim_end().to_string())
+            .collect();
+        screen.set_scrollback(saved_offset);
+        rows
+    }
+
     fn vt_scrollback_plain_rows(&mut self) -> Vec<String> {
         let screen = self.parser.screen_mut();
         let saved_offset = screen.scrollback();
@@ -3211,6 +3260,15 @@ impl PtySessionRuntime {
             .into_iter()
             .filter(|line| !line.is_empty())
             .collect()
+    }
+
+    /// The rendered viewport grid, one entry per visible row.
+    fn screen_plain_rows(&self) -> Vec<String> {
+        let mut screen_state = self
+            .screen_state
+            .lock()
+            .expect("pty screen state lock poisoned");
+        screen_state.vt_screen_plain_rows()
     }
 
     fn screen_snapshot_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
@@ -5533,6 +5591,89 @@ PY"#;
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
+    /// ⛔ THE WHOLE CHAIN, ON A REAL PTY, THROUGH THE CALL THE DAEMON MAKES.
+    ///
+    /// The fixture test above proves bytes -> grid -> classifier. This one
+    /// proves the part a unit test on a hand-built screen cannot: that
+    /// `TerminalManager::session_screen_plain_rows` — the exact method the
+    /// gate-screen reading calls — returns the rendered grid for a session that
+    /// really exists, with a real child process painting a real terminal.
+    ///
+    /// Worth its seconds because the mapping between "the model can render" and
+    /// "the daemon serves it" is precisely where this repository has lost
+    /// working code before: a handler that existed, compiled and passed its own
+    /// tests while nothing could reach it.
+    #[test]
+    fn the_manager_serves_a_rendered_grid_for_a_live_pty() {
+        let key = "local://screen-grid-test";
+        let mut manager = TerminalManager::new();
+        // Paint with ABSOLUTE CURSOR MOVES and no newlines between the rows —
+        // the drawing grammar that makes a modal illegible on the raw stream —
+        // then hold the pty open so the screen can be read.
+        manager
+            .ensure_session(
+                key,
+                "bash -lc 'printf \"\\033[2J\\033[3;2HQuick safety check: is this a project you trust?\
+                 \\033[5;2H1. Yes, I trust this folder\\033[7;2H2. No, exit\"; sleep 30'",
+                None,
+            )
+            .expect("spawn a pty for the grid test");
+        // ⛔ WAIT FOR CONTENT, THEN FOR QUIET. `settle_pty_output` alone returns
+        // instantly here: it asks whether output STOPPED changing, and before the
+        // child has written its first byte the answer is trivially yes. A quiet
+        // screen and a not-yet-started one are indistinguishable to it.
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = manager.session_screen_plain_rows(key).unwrap_or_default();
+            if rows
+                .iter()
+                .any(|row| row.to_ascii_lowercase().contains("quick safety check"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let runtime = manager
+            .sessions
+            .get(key)
+            .expect("the manager kept the session it just spawned");
+        settle_pty_output(runtime);
+        let rows = manager
+            .session_screen_plain_rows(key)
+            .expect("a live session must have a readable grid");
+        let _ = &rows;
+        let populated: Vec<&String> = rows.iter().filter(|row| !row.trim().is_empty()).collect();
+        assert!(
+            populated.len() >= 3,
+            "the three painted rows must arrive as three rows, got {populated:?}",
+        );
+        let joined = rows.join("\n");
+        assert!(
+            joined.to_ascii_lowercase().contains("quick safety check"),
+            "the grid must carry the words a person can see: {joined:?}",
+        );
+        assert_eq!(
+            yggterm_core::screen_state::classify_screen(Some(&joined)),
+            yggterm_core::screen_state::RowScreenState::StartupGate,
+            "the daemon's own call must name the state",
+        );
+
+        // ⛔ And the raw snapshot must NOT be legible, or the grid is buying
+        // nothing and this whole change is ceremony.
+        let raw = manager
+            .session_screen_snapshot(key)
+            .expect("a live session must have a raw screen too");
+        assert!(
+            raw.lines().count() < populated.len(),
+            "the raw stream must fuse rows the grid recovers: {} raw lines vs {} \
+             populated rows",
+            raw.lines().count(),
+            populated.len(),
+        );
+
+        manager.remove_session(key, None).ok();
+    }
+
     #[test]
     fn missing_session_reports_spawn_id_zero() {
         let manager = TerminalManager::new();
@@ -5540,6 +5681,69 @@ PY"#;
             manager.session_runtime_spawn_id("local://nope"),
             0,
             "no runtime => spawn id 0 (client guard fails open)"
+        );
+    }
+
+    /// ⛔⛔ THE RAW SCREEN DOES NOT CONTAIN THE WORDS ON IT, AND THE GRID DOES.
+    ///
+    /// Driven with the real bytes of a first-run gate (captured 2026-08-21,
+    /// identifying path replaced). The CLI paints its nine visible rows with
+    /// absolute cursor moves and emits single spaces as cursor-forward, so on
+    /// the raw stream:
+    ///
+    /// * the whole modal arrives as TWO `\n`-delimited lines, one of them ~870
+    ///   characters long — so "the last N lines" is not a window over the
+    ///   display, and "these two phrases on the same line" is meaningless;
+    /// * `quick safety check` is not present as a substring AT ALL, because the
+    ///   spaces between its words are escape sequences.
+    ///
+    /// Every screen classifier read `false` on the live row for exactly this
+    /// reason. Feeding them the rendered grid is the fix, and this test fails if
+    /// anyone points them back at the snapshot.
+    #[test]
+    fn a_gate_is_illegible_on_the_raw_screen_and_legible_on_the_grid() {
+        let mut state = TerminalScreenState::new(24, 120);
+        state.process(include_bytes!("../tests/fixtures/startup-gate-screen.bin"));
+
+        let raw = state.formatted.trim_matches('\0').to_string();
+        assert!(
+            !raw.to_ascii_lowercase().contains("quick safety check"),
+            "the raw stream must genuinely lack the phrase, or this test proves nothing",
+        );
+        assert!(
+            !yggterm_core::screen_text_shows_agent_startup_gate(&raw),
+            "the classifier must genuinely miss on the raw stream",
+        );
+
+        let grid = state.vt_screen_plain_rows();
+        let joined = grid.join("\n");
+        assert!(
+            joined.to_ascii_lowercase().contains("quick safety check"),
+            "the rendered grid must carry the words a person can see",
+        );
+        assert!(
+            yggterm_core::screen_text_shows_agent_startup_gate(&joined),
+            "the classifier must name the gate once it reads real rows",
+        );
+        assert_eq!(
+            yggterm_core::screen_state::classify_screen(Some(&joined)),
+            yggterm_core::screen_state::RowScreenState::StartupGate,
+        );
+
+        // The shape itself: many more visible rows than the raw stream has
+        // lines, which is the whole reason a line-based window was measuring
+        // something other than the screen.
+        let populated = grid.iter().filter(|row| !row.trim().is_empty()).count();
+        assert!(
+            populated >= 5,
+            "expected the modal's rows to survive rendering, got {populated}",
+        );
+        assert!(
+            populated > raw.lines().count(),
+            "the grid must recover rows the raw stream fused: {} populated rows \
+             vs {} raw lines",
+            populated,
+            raw.lines().count(),
         );
     }
 
