@@ -32,6 +32,10 @@ INTERVAL=3600
 #: because main moved under it. Two: a third attempt losing the same race means
 #: main advances faster than a build takes, and the answer to that is a human.
 DEPLOY_ATTEMPTS=2
+#: Which campaigns this watcher may fold. An orchestrator folds ITS OWN spawns;
+#: another campaign's row is that campaign's to retire, because it knows what the
+#: lane was for and this loop does not. Empty means fold nothing.
+FOLD_CAMPAIGNS="${YGG_FOLD_CAMPAIGNS:-11}"
 #: The repaint sweep OPENS every blank row, which takes over the window. Never on
 #: a timer; only when an operator asks for it and is watching.
 SWEEP=0
@@ -99,6 +103,7 @@ tick() {
   if [ -z "$churn" ]; then
     say "main is $main_sha but nothing since $running touches the build — not rolling, not restarting anything"
     reconcile_client "$live_host" "" "current build"
+    fold_sweep
     return 0
   fi
 
@@ -201,6 +206,46 @@ tick() {
   # restart by construction. The notification goes FIRST so the restart is never a
   # surprise, and the grace window is long enough to read it.
   reconcile_client "$live_host" "" "$ver"
+  fold_sweep
+}
+
+#: Fold what has finished, and remove the worktrees nothing is standing in.
+#:
+#: ⛔⛔ THIS IS HERE BECAUSE NOBODY WAS DOING IT, AND THE OWNER FOUND IT BEFORE ANY
+#: INSTRUMENT DID: seventeen dead rows and several finished-and-announced lanes
+#: still seated, one showing a blank viewport with no conversation at all, and he
+#: closed one by hand. The four planes a fold has to touch existed only inside
+#: `ygg-claim.sh --replace` — a side effect of a SUCCESSOR taking the seat — so a
+#: lane that finished with nobody coming after it had no path to being folded.
+#:
+#: ⚠ The idle threshold is deliberately far higher here than a person would use by
+#: hand. Unattended, the cost of folding a row that was merely pausing is somebody
+#: else's work; the cost of waiting another hour is a row in a list.
+fold_sweep() {
+  local fold="$REPO/.agents/skills/yggterm-agent-fleet/ygg-fold.py"
+  [ -x "$fold" ] || return 0
+
+  # ⛔⛔ TWO REFUSALS, AND BOTH WERE LEARNED BY BREAKING THEM ON THE FIRST RUN.
+  #
+  # 1. A DRY RUN MUST BE DRY ALL THE WAY DOWN. The first cut passed --apply
+  #    unconditionally, so `ygg-roll-watch.sh --dry-run` folded a live row. A
+  #    caller who asked for a rehearsal and got a mutation cannot trust the flag
+  #    again, and --dry-run is the only safe way anyone inspects this file.
+  # 2. AN ORCHESTRATOR FOLDS ITS OWN SPAWNS AND NOBODY ELSE'S. Unscoped, the same
+  #    run reaped a row belonging to a different campaign entirely — idle for
+  #    nearly five hours and genuinely finished, which is precisely what makes it
+  #    a bad precedent rather than an obvious error. Another campaign's row is
+  #    that campaign's to fold: it knows what its lane was for and this loop does
+  #    not. ⇒ Scope is explicit, and an empty scope does nothing at all.
+  local apply="--apply"
+  [ "$DRY" = 1 ] && apply=""
+  local campaign
+  for campaign in $FOLD_CAMPAIGNS; do
+    python3 "$fold" sweep --campaign "$campaign" $apply --finished-idle-min 45 2>&1 \
+      | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|[⛔✔🔒])' || true
+  done
+  python3 "$fold" worktrees $apply 2>&1 \
+    | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|✔)' || true
 }
 
 #: Bring the CLIENT onto whatever is on disk: notify, pause, restart, verify.
@@ -422,7 +467,7 @@ except Exception: print(0)" 2>/dev/null)"
 # already happened on the owner's machine — the latest possible moment and the one
 # where nobody is reading the log. `declare -F` costs nothing and turns a silent
 # hole into a refusal to start.
-for _fn in tick reconcile_client restart_gui repaint_sweep say; do
+for _fn in tick reconcile_client restart_gui repaint_sweep fold_sweep say; do
   declare -F "$_fn" >/dev/null || {
     printf 'ygg-roll-watch: ⛔ %s is not defined at the point the loop starts — a
 ' "$_fn" >&2
