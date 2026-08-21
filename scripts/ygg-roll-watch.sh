@@ -231,6 +231,14 @@ fold_sweep() {
   #    unconditionally, so `ygg-roll-watch.sh --dry-run` folded a live row. A
   #    caller who asked for a rehearsal and got a mutation cannot trust the flag
   #    again, and --dry-run is the only safe way anyone inspects this file.
+  # ⭐ --wake IS WHY THIS LOOP EXISTS AT ALL. Folding alone only ever removes rows
+  #   that ANNOUNCED they were done, and the common case is a lane that simply
+  #   stops: turn ended, composer empty, nothing in flight. Measured within an hour
+  #   of the first fold sweep — five of nine lanes stalled, three of them monitors
+  #   whose own last words asserted they were still watching. A stall is not a fold:
+  #   the remedy is ONE `continue`, once per stall, and never into a composer that
+  #   is holding text.
+  #
   # 2. AN ORCHESTRATOR FOLDS ITS OWN SPAWNS AND NOBODY ELSE'S. Unscoped, the same
   #    run reaped a row belonging to a different campaign entirely — idle for
   #    nearly five hours and genuinely finished, which is precisely what makes it
@@ -241,7 +249,7 @@ fold_sweep() {
   [ "$DRY" = 1 ] && apply=""
   local campaign
   for campaign in $FOLD_CAMPAIGNS; do
-    python3 "$fold" sweep --campaign "$campaign" $apply --finished-idle-min 45 2>&1 \
+    python3 "$fold" sweep --campaign "$campaign" $apply --wake --finished-idle-min 45 --stall-idle-min 40 2>&1 \
       | sed 's/^/  /' | tee -a "$LOG" | grep -E 'ygg-fold (—|[⛔✔🔒])' || true
   done
   python3 "$fold" worktrees $apply 2>&1 \
