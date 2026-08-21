@@ -11540,6 +11540,29 @@ console.log('ok');
             script.contains("screen_css") && script.contains("cell_css_height"),
             "the record must carry the geometry that maps a row to a pixel band"
         );
+        // The renderer's own state rides the same frame. The fault is
+        // intermittent (2 firings in ~15 attempts), so "run it again with more
+        // logging" costs an hour per question; the frame has to explain itself
+        // the once it fires.
+        assert!(
+            script.contains("renderer: rendererState"),
+            "the frame must carry the renderer state it was drawn under"
+        );
+        let renderer_at = script
+            .find("let rendererState")
+            .expect("the renderer read must exist");
+        assert!(
+            renderer_at < encode_at,
+            "the renderer state must be read before the pixels are encoded"
+        );
+        // MEASURED 2026-08-22: three live hosts, three atlas objects, ONE
+        // distinct atlas -- the WebGL addon hands every terminal with a matching
+        // config the SAME TextureAtlas, so an atlas op is never per-terminal.
+        // Losing this field would hide that coupling from every future frame.
+        assert!(
+            script.contains("atlas_index") && script.contains("distinct_atlases"),
+            "atlas sharing across hosts must be visible in the frame"
+        );
     }
     // Semi-hot reveal reconcile: the daemon-frame repaint must fire for a
     // settled (idle) screen and must NEVER fire over a working surface or an
