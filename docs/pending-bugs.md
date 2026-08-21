@@ -58,6 +58,55 @@ this entry wants, because without it nobody can ever tell these two apart.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔⛔ [11.0] `composer_held_draft` FIRES ON AN EMPTY COMPOSER, AND IT HAS JAMMED THE WAKE PLANE
+
+**Status:** OPEN
+
+*Measured 2026-08-21. This is not a cosmetic misread: it is why briefs cannot be delivered to
+several lanes, and why the booter has stopped being able to wake anything.*
+
+**Symptom.** `server app terminal input-check <row>` answers `composer_held_draft: true` for a
+row whose composer is **empty**. Read in the same minute, that row's rendered screen ends:
+
+```
+                                                              new tas…
+──────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent
+```
+
+Nothing after the `❯`. The row is idle at an ordinary prompt with a background agent running.
+
+**Why it is expensive rather than annoying.** The booter refuses to wake a row that holds a
+draft — correctly, because typing into somebody's half-written line is the defect this whole
+campaign exists to prevent. So a false positive makes the row **permanently unwakeable**: the
+booter captures the "draft", sends one clear, sees the same screen, and logs `residue survived
+the clear — refusing rather than typing more` followed by `SKIP:draft-race`, every cycle,
+forever. ⇒ **A loop whose exit depends on a condition it cannot change**, which this repo has
+already recorded as a bug class — except here the condition is not a draft at all, so no amount
+of clearing could ever satisfy it. Two lanes were unreachable when this was found, and a
+LEGENDARY brief could not be delivered.
+
+**Likely mechanism, NOT yet confirmed in code.** `terminal_composer_row_holds_draft`
+(`crates/yggterm-shell/src/terminal_observe.rs`) is a **line-shaped rule**: it takes the last
+line beginning with the CLI's composer marker and asks whether the first printable glyph after
+that marker was drawn faint. Correct on a grid. It is fed `terminal_snapshot_async`, and if that
+is the raw stream rather than the rendered rows, then a positioned-draw screen — which arrives
+as a few very long lines rather than as display rows — puts the *next* row's chrome after the
+marker on the same line, and that chrome is not faint. ⇒ **This is exactly the class 11.17
+fixed for the gate classifiers ("a screen does not contain the words on it; classify from the
+rendered grid"), still live in the draft detector.** The daemon now exposes
+`session_screen_plain_rows` for precisely this.
+
+⚠ **Confirm before fixing.** The alternative is that the faint-tracking walk is right and the
+`← 1 agent` background-agent chrome reaches it by another route; the CHANGELOG records the write
+guard being taught this distinction already, and the two may simply have diverged.
+
+**Falsifier:** take a row with a demonstrably empty composer and a running background agent, and
+read `composer_held_draft`. It must be false. Then type one character into it and read again: it
+must be true. Both halves, or the fix is a way of never seeing a draft.
+
 ## ⛔ [11.17] `session outline` ANSWERS `error: null` FOR A SEAT IT DID NOT SET
 
 **Status:** OPEN
