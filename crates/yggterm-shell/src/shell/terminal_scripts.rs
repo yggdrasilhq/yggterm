@@ -4484,6 +4484,7 @@ fn terminal_eval_script_with_canvas_renderer(
         let lastPerfEventAtMs = 0;
         let skippedPerfEventCount = 0;
         let terminalInputHotUntilMs = 0;
+        let visiblePaintDemandRescueCount = 0;
         let forcedRefreshCount = 0;
         let forcedAtlasClearCount = 0;
         let forcedRefreshSkippedCount = 0;
@@ -6902,6 +6903,23 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             forceTerminalRepaint(lastVisualTransitionReason);
         }};
+        // ⛔ ONE OWNER FOR "IS A REPAIR OWED". The pair was mirrored only where a
+        // demand was REFUSED, so after a grant the registry kept reporting the
+        // refused demand and its age — a field that says a repair is owed 27
+        // seconds after it was served. A reading that only updates on failure
+        // describes the last failure forever, which is worse than no reading.
+        const syncVisiblePaintDemandToHostEntry = () => {{
+            try {{
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                if (!entry) {{ return; }}
+                entry.pendingVisiblePaintForceFullRefresh =
+                    Boolean(pendingVisiblePaintForceFullRefresh);
+                entry.pendingVisiblePaintForceFullRefreshSinceMs =
+                    Number(pendingVisiblePaintForceFullRefreshSinceMs || 0);
+            }} catch (_error) {{}}
+        }};
         const forcedRefreshSkippedReasons = {{}};
         const recordVisiblePaintRefreshSkipped = (reason, forceFullRefresh) => {{
             forcedRefreshSkippedCount += 1;
@@ -6925,6 +6943,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     forcedRefreshSkippedReasons;
                 window.__yggtermXtermHosts[hostId].lastForcedRefreshSkipReason = skipReason;
             }}
+            syncVisiblePaintDemandToHostEntry();
             const now = Date.now();
             if (skipReason === 'input_hot' || now - lastVisiblePaintRefreshSkipPerfAtMs >= 1000) {{
                 lastVisiblePaintRefreshSkipPerfAtMs = now;
@@ -6953,6 +6972,13 @@ fn terminal_eval_script_with_canvas_renderer(
                 hostEntry.pendingVisiblePaintRecovery = true;
                 hostEntry.pendingVisiblePaintRecoveryUntilMs = now + waitMs;
             }}
+            // ⛔ WHETHER A REPAIR IS STILL OWED IS NOT THE SAME QUESTION AS
+            // WHETHER ONE WAS REFUSED. The skip counters say a demand was turned
+            // away; only the latch says whether it is still standing. A demand
+            // refused and then quietly lost, and one refused and still waiting,
+            // produce the same refusal count and opposite verdicts about the
+            // repair path.
+            syncVisiblePaintDemandToHostEntry();
             visiblePaintRecoveryTimer = window.setTimeout(() => {{
                 visiblePaintRecoveryTimer = null;
                 if (terminalInputHot()) {{
@@ -6999,6 +7025,7 @@ fn terminal_eval_script_with_canvas_renderer(
             if (pendingVisiblePaintForceFullRefresh && pendingVisiblePaintForceFullRefreshSinceMs === 0) {{
                 pendingVisiblePaintForceFullRefreshSinceMs = Date.now();
             }}
+            syncVisiblePaintDemandToHostEntry();
             // Daemon handover: every repaint here is a full-window blit on a
             // software-GL host, and the frame it would present is the re-resume
             // churn behind the veil. Drop the FRAME — never the demand: the
@@ -7108,6 +7135,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     ) {{
                         lastVisiblePaintFullRefreshAtMs = now;
                         pendingVisiblePaintForceFullRefreshSinceMs = 0;
+                        syncVisiblePaintDemandToHostEntry();
                         forcedRefreshCount += 1;
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                             window.__yggtermXtermHosts[hostId].forcedRefreshCount = forcedRefreshCount;
@@ -7919,6 +7947,58 @@ fn terminal_eval_script_with_canvas_renderer(
                     kind: 'debug',
                     message: `settle_follow_reassert host=${{hostId}} from=${{vy}} to=${{by}}`
                 }});
+            }} catch (_error) {{}}
+        }}, 1000);
+        // ⛔⛔ AN EXPIRY THAT ONLY FIRES WHEN SOMEONE ASKS AGAIN IS NOT AN EXPIRY.
+        //
+        // `VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS` was added so that a
+        // full-refresh demand a continuously-drawing TUI keeps refusing cannot
+        // be deferred forever -- "THE FIX FOR A CLAIM NOBODY CLEARS IS TO MAKE
+        // IT EXPIRE". But it was implemented as a BYPASS INSIDE THE GRANT
+        // CONDITION, so it is only ever evaluated if something re-enters
+        // `requestVisiblePaint`. The only thing that would is the single-slot
+        // recovery timer -- and that slot is cancelled by every later
+        // `scheduleVisiblePaintRecovery`, so it can be lost.
+        //
+        // ⇒ MEASURED in a sandbox, 2026-08-22, one host, no remount
+        // (`mounted_at` identical across both frames):
+        //     pending_full_refresh_demand : true, outstanding 43,154 ms
+        //     the deadline                : 1,500 ms  (28x overdue)
+        //     pending_recovery            : true, due 9,074 ms IN THE PAST
+        //     forced_refresh_skipped_count: 29 -> 29 across the window
+        //     forced_refresh_count        : 2 -> 2 across the window
+        // Both counters frozen means `requestVisiblePaint` was not re-entered
+        // even once, so the deadline was never evaluated. The host knew a repair
+        // was owed, said so in its own registry, and nothing ever served it --
+        // the row had not been repaired since it mounted.
+        //
+        // This is the missing timer. It costs nothing while no demand stands.
+        //
+        // ⛔ It deliberately does NOT override `input_hot`. That gate is the one
+        // the repair path uses to stay off the keyboard's back, and a full
+        // refresh clears the glyph atlas and redraws every row -- exactly the
+        // work that must not land mid-keystroke. The demand is served about a
+        // second after typing stops instead, which is the whole difference
+        // between "deferred" and "stranded".
+        const visiblePaintDemandWatchdog = window.setInterval(() => {{
+            try {{
+                if (!pendingVisiblePaintForceFullRefresh) {{ return; }}
+                if (handoverPaintSuspended) {{ return; }}
+                if (terminalInputHot()) {{ return; }}
+                const since = Number(pendingVisiblePaintForceFullRefreshSinceMs || 0);
+                if (since <= 0) {{ return; }}
+                const outstandingMs = Date.now() - since;
+                if (outstandingMs < VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS) {{ return; }}
+                visiblePaintDemandRescueCount += 1;
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].visiblePaintDemandRescueCount =
+                        visiblePaintDemandRescueCount;
+                }}
+                sendTerminalEvent({{
+                    kind: 'debug',
+                    message: `visible_paint_demand_rescue host=${{hostId}} outstanding_ms=${{outstandingMs}}`
+                }});
+                requestVisiblePaint(true);
             }} catch (_error) {{}}
         }}, 1000);
         const setInputEnabled = (enabled, focus, followPrompt = true, policySource = 'local') => {{
@@ -11631,6 +11711,9 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             try {{
                 window.clearInterval(settleFollowWatchdog);
+            }} catch (_error) {{}}
+            try {{
+                window.clearInterval(visiblePaintDemandWatchdog);
             }} catch (_error) {{}}
             try {{
                 if (visiblePaintRecoveryTimer !== null) {{

@@ -18,61 +18,185 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+## ⛔⛔ [11.0] THE CWD TREE'S SELECTION NEVER REACHES THE START PAGE, BECAUSE THE ACTIVE SESSION OVERWRITES IT
 
 **Status:** OPEN
 
-*Found 2026-08-22 while exercising the orchestration plane ACROSS CLIs. The row-identity
-half of this is fixed and gated; this is the other half, and it is a different fix.*
+*Reported 2026-08-22 with a screenshot: a folder highlighted in the cwd tree, the start page
+listing work from everywhere, and the folder's own count disagreeing with the header's.* ⛔ The screenshot is staged outside any repo — a faithful frame leaks
+by BACKGROUND and must never land in `~/gh`.
 
-**The measurement.** Eleven callsites across seven fleet verbs answer *"has this row ever
-written a word?"* with one hardcoded glob — the reference CLI's transcript store:
+Three separate things are true in that one frame, and only the middle one is a plain bug.
 
+### 1. ⚖ THE START PAGE RANKS BY SCOPE, IT DOES NOT FILTER — AND THAT IS A SETTLED CALL
+
+`startpage.rs` states it where the scope is applied: *"THE SCOPE RANKS, IT DOES NOT DROP"*,
+root-caused 2026-08-08. The predicates used to filter, and one page read three times with a
+different row selected answered **188, then 40, then 4** — a row outside the selected row's
+`{machine_key, cwd}` looked exactly like a row that had never existed. **The owner hit that while
+removing a delegate and going to the start page to respawn it.**
+
+⇒ "Show only this folder's sessions" is the behaviour that was deliberately removed after it bit
+him. Restoring it is his call to make, not a defect to quietly fix — and it is worth pairing with
+whatever would have saved him the first time: a visible statement that a scope is in force, and a
+way out of it, neither of which the page has today.
+
+### 2. ⛔ THE REAL DEFECT: A LIVE SESSION OVERWRITES WHAT THE USER CLICKED
+
+Whatever the scope then DOES with the selection, it is not reading the user's selection at all.
+The render snapshot builds its `selected_path` like this:
+
+```rust
+let selected_path = if let Some(active) = self.server.active_session() {
+    if active.source == SessionSource::LiveSsh
+        || active.session_path.starts_with("remote-session://")
+        || is_local_live_session_path(&active.session_path)
+    { Some(active.session_path.clone()) }          // <- the ACTIVE SESSION WINS
+    else { self.browser.selected_path()... }
+} else { self.browser.selected_path()... }
 ```
-ygg-spawn.py    proves the brief arrived        ygg-fold.py     harvest before retiring
-ygg-deliver.py  proves delivery, and REAPS      ygg-monitor.py  last prose, stall evidence (x3)
-ygg-babysit.py  liveness over ssh (x2)          ygg-booter.py   evidence marker
-```
 
-The registry declares a store for **every** registered CLI, and they do not share a
-layout: one keeps a SQLite database, another a per-session directory, another rollout
-files whose names decorate the id. A row of any of them has no file where these verbs
-look, so the glob returns empty — and **empty is not an error, it is an answer**, the
-same answer a row that has genuinely never done anything would give.
+`start_page_recent_scope` reads `snapshot.selected_row`, and startpage's own comment calls that
+*"(sidebar selection)"*. **It is not.** With any live agent row active — which on this fleet is
+always — the scope is derived from the ACTIVE SESSION's machine and cwd, and clicking a folder
+changes nothing about it.
 
-**Why that is worse than a false negative.** `ygg-deliver`'s reap test is *"has it ever
-written a word"*, and its own comment explains the asymmetry it is guarding: *"losing a
-working lane to a delivery timeout would be far worse than the debris this cleans up."*
-For a row outside the reference store that test can only ever answer no. ⇒ A working
-lane of any other CLI that is merely busy past the deadline is classified as never
-briefed and force-folded. The interlock is correctly reasoned and reads the wrong shelf.
+**Measured live, on the shipped build, in one reading:**
 
-⚠ **`ygg-booter` reasoned about exactly this and still missed it.** Its marker documents
-that an unreadable result must never be treated as fresh evidence, and picks the safe
-direction deliberately — but "unreadable" was imagined as a permissions or timing
-failure, never as *"this row belongs to a CLI that keeps its transcripts somewhere
-else."* The care was real and aimed one category short.
+| field | value |
+|---|---|
+| `browser.stored_selected_path` | a machine group — what the user last chose |
+| `browser.selected_path` | an unrelated live agent session |
+| `browser.selected_row` | that session's row |
 
-**⛔ The law that should have caught it already exists, and cannot see these files.**
-`no_store_path_literal_outside_the_agent_cli_registry` refuses exactly this hardcoding
-and is enforced in two Rust files by scanning their own source. The orchestration layer
-is Python and sits outside the fence, so the same literal that fails the build in one
-language is unreviewed in the other.
+⇒ **Two encodings of "what is selected", disagreeing at rest.** The folder row is not the
+problem: it carries everything the scope needs (a machine key, a `session_cwd` naming the folder, and
+`kind: Group`), and `remote_folder_cwd` parses its path correctly. The selection simply never
+arrives.
 
-**The fix, and why it is not a one-liner.** Ask the registry, which already knows each
-store's layout and how a session is recognised inside it — do not re-encode ten layouts
-in Python. Two supply lines are possible and the choice is the real work: a headless
-verb that resolves a row's transcript (one owner, needs a rolled binary before any host
-can use it), or a table generated from the registry and checked in beside the verbs with
-a Rust lock asserting it still matches (no deploy, one more artefact to keep honest).
-**Recommendation: the generated table**, because these verbs run on timers and on hosts
-mid-roll, and a resolver that needs the newest daemon to answer is unavailable exactly
-when a stalled fleet needs reading. ⚠ And a resolved path is not yet a readable
-transcript — one store is a SQLite database, so the ack-grep that proves delivery needs
-a per-store reader, not just a per-store path.
+⚠ **Fix the SELECTION, not the scope.** Whether the scope ends up ranking or filtering, it must
+first be given the row the user actually clicked. ⛔ And the override cannot just be deleted: it
+is what makes the sidebar follow the active session as work moves. Two concepts — *what is
+selected* and *what is active* — currently share one field, and that is the SSOT violation the
+owner named.
 
-**What would falsify it being fixed:** `ygg-deliver.py` proving delivery into a row of a
-non-reference CLI, and `ygg-monitor` reporting that row's last prose instead of silence.
+### 3. ⚠ THE TWO COUNTS WERE NEVER THE SAME QUESTION, AND NOTHING SAYS SO
+
+A machine row reading `⌄ 795` beside a header reading `857 shown`, on one screen. Measured the
+same night: the machine row's badge is its **descendant count** — the four machines listed 802,
+697, 679 and 18, the tree having grown between his frame and the reading — while the header counts
+**start-page candidates across every machine**, which is a different population entirely and includes stored sessions that are not tree
+rows. Neither number is wrong and neither is labelled, so the only available reading is that one
+of them is broken.
+
+⇒ Cheapest honest repair: say what each count counts. A badge that means "descendants on this
+machine" and a header that means "resumable work everywhere" can sit on one screen without
+contradiction the moment either admits which it is.
+
+---
+
+## ⛔ [11.26] `web <verb> --session` ADDRESSES A ROW AND SILENTLY ANSWERS ABOUT WHICHEVER TAB IS ACTIVE
+
+**Status:** OPEN
+
+Every `server app web` verb takes `--session <path>` and none takes a tab. Both
+resolvers (`resolve_live_web_surface`, `resolve_live_web_surface_handle`) read
+`surface.active_tab`, so a verb aimed at a session answers about whatever tab
+happens to be in front at the instant it runs.
+
+**Why this is a correctness bug and not a missing convenience.** It fails in the
+reassuring direction: there is no error, no warning, and a perfectly well-formed
+answer — about a different page than the caller meant. Measured while
+investigating a media defect: a probe sequence aimed at one tab followed the user
+onto another mid-investigation, and the only tell was that a later evaluation
+happened to throw `null is not an object` because the new page had no `<video>`.
+Had the new page also had one, the numbers would have been silently blended
+across two documents.
+
+A background tab is NOT out of reach — the surface table shows tabs in state
+`stashed` with `webview: true` and a live `native_id` — so inspecting one
+without bringing it to the front is possible today and simply has no verb.
+
+⛔ **The fix must echo, not just accept.** `#[serde(default)]` means an older GUI
+drops an unknown `tab` field without complaint and answers about the active tab
+— the same silent-wrong-answer this entry is about, reintroduced by the fix.
+`require_frame_echo` in `yggterm-server::lib` is the worked precedent: the
+response must echo `tab_resolved` and the CLI must hard-fail on its absence.
+
+Owner: whoever next touches the web verb surface. The record side of this is
+already solved — media probe records carry a host-stamped `(row, tab)` — so this
+is specifically about the imperative verbs.
+
+## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
+
+**Status:** OPEN
+
+*Narrowed three times, and what is left is now blocked on evidence rather than on work.*
+
+**Done, each shape taken off a real store and gated:** claude-code, codex and
+antigravity have their prose read AND their turn state classified — `TURN_ENDED` /
+`MIDTURN` / `RATE_LIMITED` — locally and over ssh. The remote probe is **generated
+from** the local classifier rather than transcribed beside it, so the machine watching
+a row and the machine holding it cannot drift.
+
+**What is left, and why none of it is typing:**
+
+- **muse** — investigated 2026-08-22: its records are a `payload_type`/`payload` event
+  stream, and across the six largest sessions the tail holds only `runtime.session`
+  (961), `tool_batch.effect.*` and `session.end` — task and command events, **no
+  conversational turn anywhere.** The `session.peer-history.sqlite3` beside it is a
+  line-offset index into that same file, not a second store. muse has been used here
+  as a task runner, not a chat.
+- **pi · grok-build** — no session on either host is large enough to hold a turn.
+- **qwen-code · opencode** — behind the credential gate in the entry below.
+- **codex-litellm** — rides the codex binary and should inherit its shapes, unverified
+  because no session exists.
+
+⛔ **Do not close any of these by reading a CLI's source.** A real store has already
+contradicted a documented layout once in this lane, and a wrong shape here does not
+stay cosmetic — it feeds a stall verdict. Two live examples of why the obvious guess
+is the wrong one: codex writes a `rate_limits` block into a routine `token_count`
+event on essentially every turn (**6,949 occurrences across 25 transcripts, present in
+39 of 40 files**), so a substring match for "rate_limit" would freeze the wake plane
+for every codex row; and antigravity's error records say the model API is
+*overloaded*, which clears on its own and is not an exhausted account.
+
+⇒ **The unblocker for all seven is the same: one real session on disk per CLI**, which
+is what the greeting run produces as a side effect.
+
+**What would falsify it being fixed:** `ygg-babysit` classifying a muse row as
+`TURN_ENDED` rather than `EMPTY`.
+
+## ⛔ [99.0] NO NON-REFERENCE CLI HAS EVER COMPLETED AN AUTHENTICATED SESSION HERE, SO THE GREETING RUN CANNOT BE VALIDATED
+
+**Status:** AWAITING A DECISION
+
+**Who decides:** the owner — it needs credentials only he holds, and it is listed in
+[`owner-attention.md`](owner-attention.md).
+
+**Measured 2026-08-22 across two hosts.** Of the ten registered CLIs, credentials are
+present for **codex, claude-code, muse and grok-build**; **qwen-code, opencode and
+antigravity have none**, and two others are unclear.
+
+⇒ This is what makes one registry claim untestable rather than wrong. `qwen-code` is
+store-authoritative with a live reader that requires a `.jsonl` transcript, and **27 qwen
+sessions across two hosts contain only `<id>.runtime.json` sidecars** — a pid/cwd marker
+with no title and no conversation, and zero `.jsonl` files. Every one of those sessions
+was an unauthenticated probe that never exchanged a message, so *"this store never writes
+a transcript"* and *"a transcript appears only once a session says something"* predict the
+identical disk, and nothing on these machines separates them.
+
+⛔ **Do not resolve this by reading the CLI's source and declaring it settled** — that is
+how the layout got into the registry in the first place, and a real store has already
+contradicted a documented layout once in this lane. **One authenticated exchange settles
+it**, and the same credential unblocks the greeting run for that CLI.
+
+**Recommendation:** authenticate `qwen-code` first — it is the only CLI whose registry
+declaration currently rests on an unmeasured store — then `opencode`. **Meanwhile the
+greeting run is not blocked**: codex ↔ claude-code exercises delivery across two genuinely
+different store layouts (a decorated file name against a plain one) and both are
+authenticated today.
 
 ## ⛔⛔⛔ [11.20] A ROLL TAKES A LIVE DAEMON'S SOCKET NAME AWAY, AND NOTHING CAN REACH IT AGAIN
 
@@ -131,6 +255,42 @@ lingering daemons retire, and while they linger their sessions stay split across
 
 ⛔ **And the daemons whose names were already taken cannot be rescued by this fix or any
 other.** Their sockets are unlinked; there is no path to them. They end when they end.
+
+## ⛔ [11.0] THE TWO SUPERVISION LOOPS HAVE NO UNIT, SO NOTHING RESTARTS THEM
+
+**Status:** OPEN
+
+`ygg-booter.py watch` and `ygg-monitor.py watch` are the fleet's supervision plane — the booter
+wakes a stalled row, the monitor escalates one that needs a decision. Measured 2026-08-22: both
+run as **bare `ppid 1` processes** started by sessions that ended hours earlier (one at 14:42 the
+previous day, the other at 20:56), and `systemctl --user list-units` knows neither of them.
+
+⇒ **If either dies, nothing brings it back and nothing says so.** This is the class that already
+cost this project a fleet-wide wake outage — a watchdog whose only staleness check ran at startup,
+the one moment it is least likely to be false — and the roll watcher was moved onto a systemd
+timer for exactly this reason. The other two never were.
+
+⚠ **Both are healthy right now** by the booter's own criterion (a live pid AND a log written
+within the window — it distinguishes those, having once reported a healthy watcher that ticked
+into `/dev/null` for 21 hours). This entry is about what happens when one is not.
+
+### ⛔ WHY THIS WAS FILED RATHER THAN FIXED ON THE SPOT
+
+A unit is not a drop-in here and the naive version is worse than the gap:
+
+- The booter already owns a **singleton guard** and a **self re-exec that keeps its pid**, so a
+  unit must agree with both. A `Restart=always` unit whose process exits 0 because the guard found
+  a live instance is a slow restart spin, not supervision.
+- Starting a unit while the bare instance still runs gives **two watchers**, and a watcher's job is
+  to type into rows. Double-waking a row is a worse failure than an unsupervised one — it is the
+  harm the whole never-type-over-a-person rule exists to prevent.
+- ⇒ The transition has to be one deliberate act: stop the bare process, start the unit, and prove
+  exactly one watcher is alive afterwards **by identity, not by count** — this fleet's own law,
+  and `pgrep -f` matches the shell asking the question.
+
+⭐ The shape that works is already proven next door: `ygg-roll-watch.timer`, hourly, `--once` per
+firing, pointed at the deploy checkout and **never a lane worktree**, because worktrees are
+reclaimed on schedule and a unit pointing into one breaks silently later.
 
 ## ⛔ [11.0] THE FLEET MEMORY INDEX IS OVER ITS LOAD LIMIT, SO SOME DOORS ARE INVISIBLE EVERY SESSION
 
@@ -651,11 +811,146 @@ The refreshing terminal re-rasterises glyphs on demand, so a cleared or grown at
 correctly for whoever repaints. The coupling is real and any future explanation has to sit beside
 it, but it is a **candidate, not an answer**.
 
-⚠ **What would justify acting on it:** a frame in which `renderer.atlas_shared` is true, a host
-other than the active one has a `last_atlas_clear_at_ms` close to the capture, and the active host
-shows `PARTIAL`. The frame now records all three (`docs/observability.md` §2.3b), so the next
-firing either shows that pattern or rules it out. **Do not "fix" the sharing defensively before
-then** — it is a behaviour change to the paint path with no measured benefit.
+### ⛔⛔ AND IT IS NOW REFUTED A THIRD TIME — the sharing is REAL and it is NOT the cause
+
+*This section closes the question the two experiments above left open. It also states why neither
+of them could have answered it, in either direction.*
+
+⛔ **THE METHOD FAULT IN BOTH EARLIER ARMS: THEY APPLIED THE REPAIR AS PART OF THE PROCEDURE.**
+Each was *"clear the shared atlas via another host, **then full-refresh the measured host**"* — and
+a forced full refresh is precisely the thing that repairs a partial paint. They measured a healed
+surface and recorded that it was healthy. **Neither could have produced a fault whatever the truth
+was**, so "100% of cells painted" was a property of the procedure, not a finding about the atlas.
+
+⭐ **AND A PLAIN-ASCII FIXTURE CANNOT TEST THIS AT ALL — it is the one provably safe case.**
+`TextureAtlas._doWarmUp()` rasterises codepoints **33..125 at DEFAULT fg/bg/ext**, in a fixed
+order, and `clearTexture()` ends by setting `_didWarmUp = false`, so the warm-up runs again after
+every clear — returning default-coloured ASCII **to the same slots it occupied before**. A
+co-owner's stale glyph coordinates for that range therefore stay valid *by construction*. The
+`region-repaint` fixture draws `#=+*` and `STATIC_nnn` at default colour, entirely inside the
+warmed range. ⇒ Anything this mechanism could corrupt has to lie OUTSIDE it: non-ASCII
+(box-drawing, powerline, `❯`, `✶`) and **any coloured or bold cell**, because fg/bg/ext are part of
+the glyph cache key and only the default triple is warmed. That is also a standing answer to *"why
+do plain shells never break"* — a plain shell is default-coloured ASCII.
+
+**The arm that removes both faults, 2026-08-22.** Victim: a static screen of **coloured non-ASCII**
+glyphs (`│─┼╬█▓▒░`, eight colours) plus a live repainting band. Peer: a **different** coloured
+non-ASCII set (`◆◇○●◎★☆♠♣♥`), revealed five times so its own forced refresh wipes and repacks the
+shared atlas. The victim's repair held off throughout — **not by luck, by `input_hot`** (below),
+which is the one gate with no deadline escape.
+
+| | peer | victim |
+|---|---:|---:|
+| forced refreshes GRANTED in the window | **9** | **0** |
+| atlas clears | 9 | 0 |
+| rows disagreeing with the buffer | — | **0 of 62** |
+
+⇒ **Nine real wipes of the shared atlas, the victim never once repaired, and the victim painted
+perfectly** — confirmed by `paint-diff` and by eye on a crop, because `paint-diff` reads ink and
+not glyph identity and would call a wrong-glyph cell `ok`.
+
+⭐ **The clears were REAL, and the counter that says so is not the obvious one.**
+`forced_atlas_clear_count` counts OUR call, and the addon's `clearTexture()` does nothing while the
+first page sits at its origin — so a run can report nine clears having wiped nothing, which would
+have "refuted" a cause it never applied. `page0_version` does not settle it either: `Page.clear()`
+bumps it, but **so does every glyph rasterised into the page** (it moved 1,088 → 8,573 across those
+nine clears). What settles it is the **fill cursor moving backwards** — `page0row` went `8,102` →
+`8,75`, and a page that is only being filled can never go down. Both fields are now in the frame.
+
+⇒ **The sharing stays a real coupling and stops being a suspect.** Do not re-derive it, do not
+"fix" it defensively, and do not spend another arm on it without a new mechanism to test.
+
+### ⛔⛔⛔ THE ROOT CAUSE OF "IT NEVER HEALS": THE DEADLINE IS A BYPASS, NOT A TIMER
+
+*Found 2026-08-22 while building a control for the atlas arm above. It explains the persistence of
+the symptom, which nothing in this entry previously did, and it is the reason the "healing" reading
+higher up is only true when something happens to poke the row.*
+
+**The repair has a deadline that cannot be reached.** `VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS`
+(1,500 ms) was added under the comment *"THE FIX FOR A CLAIM NOBODY CLEARS IS TO MAKE IT EXPIRE"*.
+It is implemented as `fullRefreshOverdue`, a term **inside the grant condition** — so it is only
+ever evaluated when something re-enters `requestVisiblePaint`. The only thing that would is the
+recovery timer, and that is a **single slot per host** which every later
+`scheduleVisiblePaintRecovery` cancels. When the slot is lost, the demand is stranded and the
+expiry never runs, because **an expiry that only fires when someone asks again is not an expiry.**
+
+**Measured — one sandbox host, coloured non-ASCII TUI fixture, no remount (`mounted_at` identical
+across both frames):**
+
+| reading | value |
+|---|---|
+| `pending_full_refresh_demand` | **true, outstanding 43,154 ms** |
+| the deadline it is measured against | 1,500 ms (**28x overdue**) |
+| `pending_recovery` | true, **due 9,074 ms IN THE PAST** |
+| `forced_refresh_skipped_count` across the window | 29 → **29** |
+| `forced_refresh_count` across the window | 2 → **2** |
+| `input_hot` at capture | cold for 5,157 ms |
+
+⚠ **One instrument caveat, stated because it decides whether that 43 s is real.** The
+`pending_full_refresh_demand` pair was first mirrored into the registry **only where a demand was
+REFUSED**, so after a grant it would keep reporting the refused demand and its age — a field that
+says a repair is owed long after it was served. It has since been given a single owner that
+follows the latch on grant, on raise and on refusal. **The 43 s reading above is unaffected: no
+grant occurred anywhere in that window (`forced_refresh_count` 2 → 2), so there was nothing for the
+stale path to misreport.** Frames captured before that fix must not be read across a grant.
+
+⇒ **Both counters frozen means `requestVisiblePaint` was not re-entered even once**, so the
+deadline was never evaluated. The demand's age was very nearly the host's whole lifetime: **that
+row had not been repaired since it mounted.** The client knew a repair was owed, recorded that it
+was owed, and nothing ever served it.
+
+⭐ **THIS REDIRECTS THE "BUILD A DETECTOR" CONCLUSION BELOW, AND IT IS THE CHEAPER HALF.** A
+divergence detector answers *"have the pixels and the buffer come apart"* — expensive, and it has
+to run constantly. But in this failure the client **already knows**: the latch is set, the demand
+is standing, and the only missing piece is something that re-enters the funnel. **Serve the demand
+you already have before building a detector to discover demands you don't.** A detector remains
+right for the other half — a hole opened with no event behind it raises no demand at all — but it
+is no longer the first thing to build.
+
+✅ **FIXED on this lane: `visiblePaintDemandWatchdog`** — a 1 s interval, the same idiom as
+`settleFollowWatchdog` beside it, which re-enters `requestVisiblePaint(true)` when a demand has
+stood past the deadline. It costs nothing while no demand is outstanding. **It deliberately does
+NOT override `input_hot`** (below): a full refresh clears the glyph atlas and redraws every row,
+which must not land mid-keystroke, so the demand is served about a second after typing stops
+instead. That is the whole difference between *deferred* and *stranded*.
+`visible_paint_demand_rescue_count` is in the frame — **non-zero means the recovery timer was lost
+and this caught it**, so the fault stays visible rather than being papered over by its own repair.
+
+### ⛔⛔ THE GATE WITH NO DEADLINE — TYPING DISABLES THE ONLY REPAIR THERE IS
+
+*A better match for the owner's own sentence than anything else measured here: "the TUI rendering
+is broken but typing has no issues." **Typing is not incidental to the symptom; typing is the
+suppressor.***
+
+Three gates can refuse a forced full refresh, and the deadline reaches only two of them:
+
+```js
+requestedForceFullRefresh && term.refresh && !inputHot
+  && (fullRefreshOverdue || (!recentFrameLikeWrite && !fullRefreshRateLimited))
+```
+
+`fullRefreshOverdue` bypasses `recentFrameLikeWrite` and `fullRefreshRateLimited`. **`!inputHot`
+sits outside the parenthesis as a hard AND, so no deadline reaches it.** Every keystroke re-arms it
+for 2,000 ms (`TERMINAL_INPUT_HOT_SUPPRESS_MS`), so anyone typing faster than once per two seconds
+holds the repair off for as long as they keep typing.
+
+**Paired measurement — same fixture, same peer, same five switch rounds, one variable:**
+
+| victim, 5 switch rounds | full refreshes GRANTED | refused `input_hot` |
+|---|---:|---:|
+| **while being typed into** (a keystroke every 700 ms) | **0** | **+9** |
+| **not being typed into** | **+7** | +0 |
+
+The peer row was driven identically in both arms, never typed into, and was granted 9. ⇒ **Typing
+took the victim's repair from seven grants to none**, and the 1,500 ms deadline elapsed ten times
+over inside that window without reaching it.
+
+⚠ **This is recorded as a measured asymmetry, NOT as a thing to "fix" by deleting the gate.** A
+granted refresh clears the shared glyph atlas and redraws every row; firing that mid-keystroke is
+plausibly an input-block source, and the input-block lane owns that call. The watchdog above takes
+the safe half — it serves the demand as soon as typing stops — and leaves the during-typing
+behaviour exactly as it was. **Whether the repair should ever pre-empt typing is an owner-facing
+trade and belongs to the input-block lane, with this table as its input.**
 
 ### ⭐⭐ WHAT THE INSTRUMENT MEASURED ON ITS FIRST REAL USE — the repair is refused ~4 times in 5
 
@@ -717,6 +1012,13 @@ and the buffer have come apart.
 well-tuned and should be reused rather than duplicated: the missing piece is a cheap in-page check
 that raises the EXISTING demand when coverage and content diverge. The same-frame read this entry
 delivers is the proof that such a comparison is available inside the webview at all.
+
+⚠ **AMENDED 2026-08-22 — this is still true and it is no longer FIRST.** Measured above: a demand
+already raised can stand for 43 seconds against a 1,500 ms deadline while nothing serves it, on a
+host that was never repaired after mounting. **Serving the demands the client already holds is
+cheaper than detecting new ones and was the larger share of the observed failure**; the watchdog
+that does it is on this lane. The detector still owns the other half — a hole opened with no event
+behind it raises no demand at all — so build it second, not first.
 
 ⚠ **Do NOT reason from the daemon's screen for this.** The daemon's vt100 grid is the source of
 truth for CONTENT and says nothing about what the client painted — that confusion is already a
@@ -896,6 +1198,41 @@ sitting immediately before it on the plane; and **every short-lived CLI process 
 activation** of its own.
 
 ⭐ Cost: **0.86% of records, 1.21% of trace bytes** in a switch-dense window.
+
+### ⭐ A SECOND CAPTURE, 2026-08-22 ON 3.1.39 — full payload, and a GEOMETRY LEAD
+
+Caught in the post-restart window of a routine roll, on a row nobody was driving. **Read the
+caveat first: a deploy re-resumes every live row, so this window is the one the deploy itself
+creates** — the standing warning against "deploying to measure" applies, and this is not evidence
+about the steady state. What it adds is a complete payload for the signature.
+
+```
+01:50:32  xterm_paint/mount_open   cols 80 · rows 24 · screen_in_host true · write_taps_installed true
+01:50:33  xterm_paint/settle       chars 23866 · rows 65 · rows_content_unpainted 28
+                                   frames 0 · rows_covered 0 · painted false
+                                   open_to_frame_ms null · document_hidden false · overshoot_ms 5
+01:50:35  xterm_paint/settle       recheck, deadline 4000 ms — identical: frames 0, rows_covered 0
+```
+
+⇒ **23,866 characters accepted, 28 rows holding content, zero frames, over at least four seconds,
+on a document that is not hidden.** `open_to_frame_ms: null` says no frame was ever produced
+rather than a slow one, and `blank_frames_before_write: 0` says it was not repainting an empty
+canvas either — it simply never ran.
+
+⭐ **AND THE MOUNT OPENED AT A DIFFERENT SIZE FROM THE ONE IT SETTLED AGAINST: `mount_open` reports
+80×24, `settle` reports 65 rows.** A coverage test asking whether 65 rows are covered on a surface
+built for 24 cannot complete by construction. ⚠ Stated as a LEAD, not a root: nothing here shows
+which of the two is stale, and 80×24 is also what an unsized terminal reports before its first
+resize, so the two readings may simply be the same surface a moment apart. **The falsifier is
+cheap** — join `mount_open` and `settle` on `host_id` across many mounts and ask whether the
+zero-frame ones are the ones whose geometry disagrees. ⛔ Segment by build first; a pooled trace
+spans several and the loud dead build wins.
+
+⚠ **It recovered.** By 01:52 the same host was flushing 6,613 and 7,089 characters and the app's
+own `screen_reconcile_skipped_working_surface` called it a working surface. ⇒ **A fault that
+stops on its own is not a fault that was fixed** — the same lesson the render loop taught — and a
+transient here is indistinguishable from the permanent case in every field except how long it
+lasts.
 
 ### ⛔⛔⛔ THE INSTRUMENT FOUND IT: A VISIBLE MOUNT HELD 41 ROWS OF TEXT AND RENDERED NOTHING
 
@@ -2280,6 +2617,41 @@ sits in plain sight and reads as two unrelated lines.
 ## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
 
 **Status:** OPEN
+
+### ⛔⛔ MEASURED 2026-08-22 — FIVE CHECKOUTS RUN A CLAIM SCRIPT THAT MINTS ABSURD SEATS, AND ONE OF THEM IS THE MAIN CHECKOUT
+
+The theory above has a live instance with a visible cost. `ygg-claim.sh` was fixed twice for a
+seat-poisoning bug — a cwd-tree row whose label is a digit string parsed as a major, so each claim
+handed out the previous absurd number plus one and the seat grew by one per claim for ever. The
+cure is two guards: only an ADDRESSABLE row (one with a `://` scheme) may join the pool, and a
+derived major past a sanity bound is refused rather than handed out.
+
+Census across every worktree, asking whether its copy carries both guards:
+
+| carries the fix | does NOT |
+|---|---|
+| 12 lane worktrees, including this one | **the main checkout**, plus 4 lane worktrees |
+
+⛔ **The main checkout is the worst of the five**, because it is where anyone lands who did not
+deliberately pick a worktree — and it is not even on `main`, it is parked on a lane branch from a
+different campaign.
+
+⇒ **Confirmed live the same night from a different seat**: one row announced its own seat as
+`6914978.0` in its first turn, while `rows` listed the same session under three different prefixes
+at once, depending on which scheme the listing used. A lane cannot be trusted to report its own
+seat, and this is one of the reasons why.
+
+⚠ ⛔ **DO NOT FIX THIS BY COPYING THE FILE INTO THE STALE CHECKOUTS.** They are live trees holding
+other lanes' uncommitted work; writing into one is how a session's work is destroyed by helping.
+The repair is a rebase, taken by whoever stands in that tree — and the main checkout needs
+returning to `main` by someone who first establishes that nobody is standing in it.
+
+⭐ **And the instrument gap is the general half.** The session-start audit reports staleness for
+exactly one script — the booter, and only the copy the live watcher is executing. Every other
+fleet script is unaudited, and a lane always runs the copy in its own worktree, so a fixed
+instrument reaches a lane only when somebody rebases that lane. **A stale instrument reports
+success in its own terms either way**, which is why this was found by a lane noticing an absurd
+seat rather than by anything designed to notice.
 
 ⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
 mentions it — collateral loss in a file rewrite, not a fix. This file's own rule is that an
@@ -20010,6 +20382,8 @@ fixing it.
 verb exists.
 
 ## ★★ WHO OWNS "IS THIS ROW WORKING?" — three tools, three answers
+
+**Status:** OPEN
 
 ### ⛔ 2026-08-07 — I BECAME THE FOURTH TOOL, ON THE OWNER'S OWN ROW
 

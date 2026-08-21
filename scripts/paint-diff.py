@@ -274,13 +274,36 @@ def main() -> int:
         for h in hosts:
             mark = "*" if h.get("is_active") else " "
             suppressed = (h.get("recent_frame_like_write_until_ms") or 0) > (renderer.get("now_ms") or 0)
+            # ⛔ `atlas_clears` counts OUR CALLS; `page0v` is the addon's own
+            # version counter, bumped once per REAL clear. They come apart when
+            # `clearTexture()`'s origin guard refuses, and an experiment that
+            # never applied its cause cannot refute it.
             print(f"  {mark} atlas#{h.get('atlas_index')} pages={h.get('atlas_pages')} "
+                  f"page0v={h.get('atlas_page0_version')} "
+                  f"page0row={h.get('atlas_page0_row_x')},{h.get('atlas_page0_row_y')} "
                   f"forced_refresh={h.get('forced_refresh_count')} "
                   f"atlas_clears={h.get('forced_atlas_clear_count')} "
                   f"repair={h.get('retained_write_paint_repair_count')} "
+                  f"rescued={h.get('visible_paint_demand_rescue_count')} "
                   f"refresh_SKIPPED={h.get('forced_refresh_skipped_count')}"
                   f"{' ' + repr(h.get('forced_refresh_skipped_reasons')) if h.get('forced_refresh_skipped_reasons') else ''} "
                   f"{'REFRESH-SUPPRESSED' if suppressed else ''}")
+            # ⛔ A REPAIR STILL OWED IS THE READING THE COUNTERS CANNOT GIVE.
+            # `input_hot` is the one gate with no deadline escape: `frame_like`
+            # and `rate_limited` are both bypassed once a demand goes overdue,
+            # so a demand outstanding while input is hot cannot run at all,
+            # however old it is.
+            now_ms = renderer.get("now_ms") or 0
+            if h.get("pending_full_refresh_demand"):
+                since = h.get("pending_full_refresh_since_ms") or 0
+                age = (now_ms - since) if since else 0
+                hot = (h.get("terminal_input_hot_until_ms") or 0) > now_ms
+                print(f"      -> a full refresh is STILL OWED to this host, outstanding {age} ms"
+                      f"{'  and INPUT IS HOT, which has no deadline escape' if hot else ''}")
+            elif (h.get("forced_refresh_skipped_reasons") or {}).get("input_hot"):
+                print(f"      -> no demand outstanding, but "
+                      f"{h['forced_refresh_skipped_reasons']['input_hot']} were refused for "
+                      f"input_hot and none of them is still standing")
     cur_char = buf.get("cursor_char") or ""
     print(f"cursor       row {cursor_y} col {cursor_x}  style={buf.get('cursor_style')!r}  cell holds {cur_char!r}")
     if cur_char.strip() and cursor_y >= 0 and 0 <= cursor_x < cols:
