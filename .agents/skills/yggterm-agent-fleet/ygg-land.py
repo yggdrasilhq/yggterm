@@ -25,6 +25,7 @@ USAGE
 ⛔ DRY BY DEFAULT. Landing rewrites the branch every other lane builds on.
 """
 import argparse
+import glob
 import os
 import subprocess
 import sys
@@ -180,6 +181,35 @@ def land_one(branch, apply_it, attempts=5):
     return False
 
 
+#: Files whose conflicts are ALWAYS both-wanted: an append-only log where each
+#: lane writes its own entry. ⛔ Never widen this to a file where two lanes can
+#: mean different things by the same line — a queue that lists what is OPEN is
+#: exactly such a file, and unioning it resurrects closed entries.
+APPEND_ONLY = ("CHANGELOG.md",)
+
+
+def _union_append_only_conflicts(wt):
+    """True when EVERY conflicted file is an append-only log, and they were
+    unioned. False if anything else is conflicted — then nothing is touched."""
+    out = subprocess.run(["git", "-C", wt, "diff", "--diff-filter=U", "--name-only"],
+                         capture_output=True, text=True, timeout=120).stdout.split()
+    if not out or any(f not in APPEND_ONLY for f in out):
+        return False
+    import re as _re
+    pat = _re.compile(r'<<<<<<< [^\n]*\n(.*?)\n?=======\n(.*?)\n?>>>>>>> [^\n]*\n', _re.S)
+    for f in out:
+        path = os.path.join(wt, f)
+        try:
+            text = open(path).read()
+        except Exception:
+            return False
+        # theirs first: the branch's entry is the newer writing on this file
+        text = pat.sub(lambda m: m.group(2) + "\n" + m.group(1) + "\n", text)
+        open(path, "w").write(text)
+        subprocess.run(["git", "-C", wt, "add", f], capture_output=True, timeout=120)
+    return True
+
+
 def _land_once(branch, apply_it, attempt, attempts, needs_check=True):
     ahead, behind = ahead_behind(branch)
     if ahead is None:
@@ -215,6 +245,22 @@ def _land_once(branch, apply_it, attempt, attempts, needs_check=True):
     try:
         r = subprocess.run(["git", "-C", wt, "merge", "--no-ff", branch,
                             "-m", f"land: {branch}"], capture_output=True, text=True, timeout=600)
+        if r.returncode != 0 and _union_append_only_conflicts(wt):
+            # ⛔⛔ AN APPEND-ONLY LOG IS NOT A SEMANTIC CONFLICT, AND TREATING IT
+            # AS ONE IS WHY WORK ROTS. Every lane writes its entry at the top of
+            # CHANGELOG.md, so two lanes landing on the same day ALWAYS collide
+            # there — and the verb then refused the whole merge and told the lane
+            # to rebase. Nobody rebases, so the branch sits, and the longer it
+            # sits the more it collides. Measured 2026-08-21: five branches
+            # blocked on nothing but this file, one of them carrying five
+            # delivered mandates the owner had been told were shipped.
+            #
+            # ⇒ Both entries are wanted, and the file's own shape says so. This
+            #   unions ONLY files whose every conflict is an append at the head,
+            #   and only for the allow-listed logs; anything else still refuses.
+            r = subprocess.run(["git", "-C", wt, "commit", "--no-edit"],
+                               capture_output=True, text=True, timeout=120)
+            log("  ⚠ append-only conflict in a changelog — UNIONED, both entries kept")
         if r.returncode != 0:
             log(f"  ⛔ merge conflict — NOT landed. The lane must rebase on main first:")
             for line in (r.stdout or "").strip().splitlines()[:6]:
@@ -338,6 +384,93 @@ def cmd_prune(a):
     return 0
 
 
+def cmd_reclaim(a):
+    """⛔⛔ THE THREE STEPS EXIST AND NOTHING RAN THEM IN ORDER, SO NOTHING EVER
+    COMPLETED.
+
+    Landing, reclaiming a worktree and deleting a branch are one chain, and each
+    step unblocks the next: a branch cannot be deleted while a worktree stands on
+    it, and a worktree cannot be reclaimed while it carries unlanded work. Run
+    separately — which is the only way they were ever run — each reports that it
+    is blocked by the state the previous step exists to clear, and everything
+    stays exactly where it was. Measured 2026-08-21: every landed branch in three
+    repos was "kept: a worktree is on it", indefinitely, while forty commits of
+    delivered work sat unlanded behind them.
+
+    ⇒ One verb, in the only order that converges: LAND → RECLAIM → PRUNE.
+
+    ⚖ It is conservative at every step and says what it skipped: a dirty tree is
+    somebody's work in progress, a tree with a process standing in it is a live
+    lane, and neither is touched.
+    """
+    log("① LAND — every branch carrying unlanded patches")
+    landed = 0
+    for b in lane_branches():
+        ahead, _ = ahead_behind(b)
+        if ahead:
+            if land_one(b, a.apply):
+                landed += 1
+    log(f"  landed {landed}")
+
+    log("② RECLAIM — worktrees with nothing unlanded, nothing dirty, nobody in them")
+    freed = []
+    for line in git("worktree", "list", "--porcelain").stdout.split("\n\n"):
+        path = branch = None
+        for l in line.splitlines():
+            if l.startswith("worktree "):
+                path = l.split(" ", 1)[1]
+            elif l.startswith("branch refs/heads/"):
+                branch = l.split("refs/heads/", 1)[1].strip()
+        if not path or path == REPO or not branch or not branch.startswith("lane/"):
+            continue
+        if not os.path.isdir(path):
+            continue
+        ahead, _ = ahead_behind(branch)
+        if ahead:
+            log(f"  · {os.path.basename(path)}: {ahead} unlanded — kept")
+            continue
+        dirty = subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=120).stdout.strip()
+        if dirty:
+            log(f"  · {os.path.basename(path)}: {len(dirty.splitlines())} uncommitted file(s) — "
+                f"KEPT, that is somebody's work in progress")
+            continue
+        users = _worktree_users(path)
+        if users:
+            log(f"  · {os.path.basename(path)}: {len(users)} process(es) standing in it — kept")
+            continue
+        if a.apply:
+            size = subprocess.run(["du", "-sh", path], capture_output=True,
+                                  text=True, timeout=300).stdout.split("\t")[0] or "?"
+            r = git("worktree", "remove", "--force", path)
+            if r.returncode == 0:
+                log(f"  ✔ reclaimed {os.path.basename(path)} ({size})")
+                freed.append(branch)
+            else:
+                log(f"  ⛔ {os.path.basename(path)}: {r.stderr.strip()[:90]}")
+        else:
+            log(f"  would reclaim {os.path.basename(path)} (branch {branch} fully landed)")
+            freed.append(branch)
+    log(f"  reclaimed {len(freed)}")
+
+    log("③ PRUNE — the branches those worktrees were holding")
+    a2 = argparse.Namespace(apply=a.apply)
+    return cmd_prune(a2)
+
+
+def _worktree_users(path):
+    """Pids whose cwd is inside the tree. Somebody standing in a directory keeps it."""
+    out = []
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            cwd = os.readlink(d + "/cwd")
+        except OSError:
+            continue
+        if cwd == path or cwd.startswith(path + "/"):
+            out.append(d)
+    return out
+
+
 def cmd_land(a):
     prune_scratch()
     targets = lane_branches() if a.all else [a.branch]
@@ -362,6 +495,10 @@ def main():
     ld.add_argument("branch", nargs="?")
     ld.add_argument("--all", action="store_true")
     ld.add_argument("--apply", action="store_true")
+    rc = sub.add_parser("reclaim",
+                        help="LAND → RECLAIM worktrees → PRUNE branches, in the only order "
+                             "that converges. The three steps block each other when run alone.")
+    rc.add_argument("--apply", action="store_true")
     pr = sub.add_parser("prune", help="delete lane branches whose patches are all in main")
     pr.add_argument("--apply", action="store_true")
     ld.add_argument("--stale-ok", action="store_true",
@@ -377,6 +514,8 @@ def main():
         return cmd_status(a)
     if a.cmd == "prune":
         return cmd_prune(a)
+    if a.cmd == "reclaim":
+        return cmd_reclaim(a)
     return cmd_land(a)
 
 

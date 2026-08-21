@@ -3016,6 +3016,198 @@ whose silence is indistinguishable from not having run is not a health check.
 
 ---
 
+## 10.5 ⛔⛔⛔ THE ORCHESTRATOR'S OWN FAILURE MODES — eight that shipped damage
+
+**Read this before the patterns below it.** Everything in section 10 is about
+running lanes well. This section is about the ways an orchestrator has actually
+destroyed work while believing it was tidying up. Each one is a real event, each
+one looked correct from the inside, and each is written with the complexity that
+made it survive — a steer stripped to its rule reads as obvious and gets skipped.
+
+⚖ **The common shape, stated once:** every failure below is a verb whose MODEL of
+its subject was wrong in a way its own output could not show. Not a bug in the
+step — a bug in what the step believed it was operating on.
+
+---
+
+### 1. Work rots on branches, and every report says it shipped
+
+**What happened.** Five delivered mandates — the largest features of a campaign —
+were reported CLOSED and live-proven, and each successor brief copied that forward
+from the one before. None of the commits was in the trunk. All five sat on one
+lane branch that had been unmergeable for a day. Across three repositories the
+total came to about forty commits of finished, tested, believed-shipped work.
+
+**Why it survived, and this is the part that matters.** Four separate mechanisms
+each looked reasonable alone:
+
+* **The status verb counted SHAs, not patches.** `rev-list --count` compares refs,
+  so a rebased branch reads as unlanded forever and a landed one can read as
+  ahead. The number was always wrong in both directions and never obviously so.
+  ⇒ `git cherry` compares patches. Use it.
+* **A merge conflict in an append-only CHANGELOG refused the whole land**, with
+  the advice *"the lane must rebase first"*. No lane ever rebases — it is working
+  on something else, and the message goes to a log nobody reads. The branch sits,
+  and the longer it sits the more it collides.
+* **The three cleanup steps blocked each other.** A branch cannot be deleted while
+  a worktree stands on it; a worktree cannot be reclaimed while it carries
+  unlanded work. Run separately — the only way they were ever run — each step
+  reports that it is blocked by the state the previous step exists to clear.
+  Nothing ever completed. ⇒ LAND → RECLAIM → PRUNE is ONE chain and must be one
+  verb.
+* **A relay brief is a claim, not a fact.** "Live-proven, pushed, 0/0" was true of
+  a branch and false of the trunk, and no reader checked which.
+
+⭐ **THE STEER.** Before believing any lane's report of what shipped, ask the
+trunk: `git cherry <trunk> <branch>` and `git branch -r --contains <sha>`. A
+campaign's real state is what is merged, and nothing else. **Run the reclaim chain
+every wave** — the cost of skipping it is invisible for days and then enormous.
+
+---
+
+### 2. A phantom row is a kill switch, and the safe procedure did not help
+
+**What happened.** Two rows existed for one session under different schemes; one
+was unusable and sat in the active seat. Removing it by its full, exact path
+terminated the OTHER row's live agent, mid-work.
+
+**The complexity.** The lane that found the duplicate had already written down
+this exact danger and recommended the mitigation — remove by full path, then read
+back that the twin survives. That was done. A code read beforehand confirmed the
+key resolution was exact. It resolved exactly, and then the close request
+downstream **discarded the resolved key and dispatched the session ID**, which the
+surviving row shared. The reply said `reaped_processes: []`, because the kill was
+asynchronous and had not happened yet when the reply was composed.
+
+⭐ **THE STEER.** A correct mitigation aimed at the wrong layer is not a
+mitigation. When two rows share an identity, **removing either is a destructive
+act on both** until proven otherwise — and the proof is a live process check five
+seconds later, not the verb's own reply. ⛔ Never read an empty "what I killed"
+field as "nothing was killed"; an async operation cannot populate it.
+
+---
+
+### 3. A row's value is not always its process
+
+**What happened.** A tidy-up verb folded a row that had no process, no transcript,
+and a working directory that no longer existed. It was a group header a person had
+hand-titled and deliberately kept for months as a reading list: the sessions were
+long deleted, and **the title was the whole artefact**. It cannot be restored —
+the session, its transcript and its directory are all gone.
+
+**The complexity.** Every signal the verb consulted said debris, and each was
+individually true. The verb's model — *a row's value is its process* — is right
+for a lane and exactly wrong for a bookmark, and nothing in the row distinguishes
+them except a field nobody was reading: the title's SOURCE. A hand-typed title is
+a person saying "I am keeping this".
+
+⭐ **THE STEER.** Before folding anything, ask whether a person NAMED it. Treat a
+manually-titled row as untouchable without an explicit force, and **fail closed**:
+if the keepsake list cannot be read, treat every row as kept. ⛔ And extract that
+list to a durable file — a bookmark that lives only in a running process's memory
+is one sweep away from gone.
+
+---
+
+### 4. Rows that were born and never briefed, and read as the busiest verdict
+
+**What happened.** Rows appeared, seated and numbered, that had never written a
+single transcript line. One had been sitting for over two hours. Every sweep
+classified them WORKING.
+
+**The three-part cause, and no part is sufficient alone.**
+
+* The spawn verb waited **30 seconds** for a new agent CLI to start consuming
+  input. A cold CLI takes longer. ⇒ **The ceiling only ever bit the UNATTENDED
+  path**, because a person running a spawn by hand simply re-runs it — which is
+  why it survived every test.
+* On that timeout the spawn exited and **left the row it had created**: seated,
+  briefed by nobody, holding a seat its predecessor still held. A failed spawn
+  that leaves debris is worse than one that cleans up.
+* The classifier, given a live process and no transcript, returned WORKING — the
+  busiest verdict it has — so the debris could never be folded or succeeded.
+
+⭐ **THE STEER.** Wait on a DEADLINE, generously: the machine that most needs an
+unattended respawn is the one already running twenty agents, and it starts the
+twenty-first slowly. A spawn that cannot deliver its brief must hand it to a
+deliver-when-ready verb, never exit with the row still standing. And **a live
+process with no transcript at all is the emptiest possible row** — give that its
+own verdict, or it is invisible forever.
+
+---
+
+### 5. A guard that fails closed in the one environment it was written for
+
+**What happened.** A concurrency lease was added so two agents could not deploy at
+once. From the moment it landed, **every scheduled deploy failed**, for hours,
+reporting `deploy REFUSED` while the trunk went on advancing and the fleet read as
+current at the last version that actually shipped.
+
+**The cause.** `HOLDER="${SESSION_ID##*/}"` followed by a default on the next
+line. Under `set -u`, that expansion on an UNSET variable is a fatal error, not an
+empty string — so the default could never run. Scheduled runs carry no session id.
+
+⭐ **THE STEER.** **Default first, then transform.** And a guard's first test must
+be the environment it was written FOR — here, the unattended one, which is the
+only environment nobody watches. ⛔ A deploy that reports "refused" hourly is not
+a working guard; it is an outage wearing a status message.
+
+---
+
+### 6. A corpse reads as the quietest possible working row
+
+**What happened.** A monitor escalated a session as *"idle 52 minutes — most likely
+FINISHED its scope; give it more work, relay it, or reap it"*. The process had
+been dead for 52 minutes. The idle clock was measuring time since death.
+
+**The complexity.** The verdict is derived from transcript age, and a transcript's
+mtime is when a row DIED, not when it last worked. The monitor already had a
+liveness probe — cheaper than the verdict it would have corrected — and simply did
+not consult it before offering three choices of which only one was possible.
+
+⭐ **THE STEER.** Any verdict that assumes a process exists to receive a decision
+must confirm the process first. ⛔ **Never derive liveness from a timestamp**;
+timestamps freeze at death, which is indistinguishable from concentration.
+
+---
+
+### 7. A census that is seat-scoped measures a fleet that excludes the problem
+
+**What happened.** Four live agents ran for hours producing nothing but
+documentation. Every census run against them reported a healthy campaign. **All
+four had no seat number**, and every census is seat-scoped — so nothing counted
+them, nothing escalated them, and nothing read their output.
+
+⭐ **THE STEER.** A scoped census answers "how are the rows I know about", never
+"how is the fleet". Periodically enumerate rows the scope EXCLUDES and ask why
+each is excluded. ⛔ And the scoping rule that protects a JUDGEMENT — whether a
+quiet lane is finished is its own campaign's call — must not be extended to
+liveness: a row with no process is not a judgement, and campaigns without an
+orchestrator of their own are otherwise watched by nothing.
+
+---
+
+### 8. The tidy-up ate the work in progress
+
+**What happened.** A resolved merge, held in a scratch worktree under `/tmp` while
+its tests ran, was removed by the orchestrator's own worktree sweep between two
+commands. The registration was gone; only the commit object survived.
+
+⭐ **THE STEER.** Do interruptible work in a DURABLE location, never in a
+directory another sweep owns — including your own. A sweep that checks for
+processes standing in a tree cannot see a job that is between commands. ⛔ And
+`finally` does not run on a kill: scratch trees leak, so prune them by owner-pid
+liveness rather than trusting cleanup to happen.
+
+---
+
+⚠ **What all eight cost, and why the list is written rather than summarised:** a
+live agent killed mid-work, a hand-kept bookmark destroyed permanently, four hours
+of deploys silently refused, three seats occupied by rows that had never been
+given anything, forty commits of finished work invisible for a day, and a resolved
+merge lost to the cleanup. Every one of these was performed BY the orchestration
+layer, in the course of doing its job correctly as it understood it.
+
 ## 11. ⭐⭐ PER-CLI NUANCES — the quirk register, and it is written to GROW
 
 **Every agent CLI has behaviour that is neither documented nor guessable, and that
