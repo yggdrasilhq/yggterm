@@ -358,25 +358,81 @@ mount-churn entry below — `preview_layer_style` and `terminal_layer_style` bot
 dim placeholder text positioned by a cursor-address escape. A real terminal draws the cell and
 inverts it; ours drew the block instead of the cell.
 
-### ⛔⛔ THE INSTRUMENT GAP THAT HAS KEPT THIS UNSOLVED — MEASURED, NOT GUESSED
+### ✅ THE INSTRUMENT NOW EXISTS — 2026-08-22, the same-frame paint record
 
-**A faithful screenshot takes 6,824 ms. A buffer read takes 116 ms.**
+*This section replaces the one that said the instrument had to be built first and that "until it
+exists, every claim here is two samples and a hope". It exists, and the claims below are one frame.*
 
-⇒ **On a live agent row the two can never be sequenced into one frame.** Every "the buffer says
-X but the screen shows Y" comparison ever made on a busy row has compared two moments seven
-seconds apart — which is why this class keeps producing readings that look like a contradiction
-and are partly just TIME. Caught red-handed doing it in this very investigation: a "simultaneous"
-pair came back `Nesting… 1m42s` in the buffer and `Whirring… 29s` in the pixels, two different
-turns.
+**The gap it closed, restated because the number is the argument.** A faithful screenshot costs
+**~6,824 ms**; a buffer read costs **~116 ms**. On a live agent row the two can never be sequenced
+into one frame, so every prior comparison in this class was two moments seven seconds apart — a
+"simultaneous" pair caught in this very investigation returned `Nesting… 1m42s` from the buffer
+beside `Whirring… 29s` from the pixels, two different turns of the same agent.
 
-⭐ **THEREFORE THE FIRST DELIVERABLE IS AN INSTRUMENT, NOT A FIX: capture the buffer INSIDE the
-webview, in the same frame as the composite.** The screenshot path already runs in the webview
-(`capture_backend: xterm_canvas_composite_over_dom`); having it emit the xterm buffer it
-composited from turns "the pixels disagree with the buffer" from an argument into a diff. Until
-that exists, every claim here is two samples and a hope.
+`server app screenshot` now writes **`<out.png>.paint-frame.json`** beside the PNG. The composite
+script reads the drawn host's xterm buffer in the **same synchronous JS turn** as the drawImage
+loop and `toDataURL`; xterm parses PTY bytes on its own task queue, which cannot interleave with
+synchronous script, so the sidecar text is exactly what those pixels were drawn from — one moment
+by construction. `scripts/paint-diff.py` turns the pair into per-CELL verdicts. Full contract and
+the three things it cannot see: `docs/observability.md` §2.3b.
 
-⇒ Then, and only then, the per-region question becomes answerable: for each CLI, which escape
-sequence in its breaking region is the one the client mis-renders.
+### ⭐⭐ REPRODUCED IN A SANDBOX, AND THE REGIONALITY IS EXPLAINED
+
+**The fixture.** `mock-tui --scenario region-repaint` draws a screen once, then repaints only a
+3-row band forever, with the `\x1b[?25l` framing every TUI emits. ⛔ That framing is load-bearing,
+not cosmetic: it is what arms the client's `recentFrameLikeWrite`, the discriminator that
+suppresses the forced full refresh for agent CLIs and leaves plain shells alone. A reproduction
+without it exercises the SHELL path and comes back green while reproducing nothing.
+
+**What one frame showed** (fresh sandbox GUI, 4 rows, 12 switches at 0.7 s):
+
+| | |
+|---|---|
+| cells the buffer held | 4,112 |
+| cells the pixels held | **760 (18%)** |
+| rows disagreeing | **47 of 51** |
+| rows correct | **0, 1, 2 — and only those** |
+
+⭐⭐ **ROWS 0–2 ARE THE LIVE REPAINTING BAND. THAT IS THE OWNER'S CLUE, MECHANICALLY.** The only
+rows that painted correctly were the ones the TUI redraws every frame; every row it leaves alone
+was broken. So the broken region is **whichever part of its screen that CLI does not repaint** —
+which is different for every CLI, and is exactly why one CLI's top breaks, another's middle, and
+another's bottom. Nothing about the renderer is regional; the TUI's own redraw pattern is.
+
+A crop of the frame confirms it by eye rather than by field: dense `#=+*` runs in the buffer came
+out as scattered glyph fragments and wrong glyphs — the stale-texture-atlas garble signature, not
+blank cells.
+
+**Two facts that bound it, and the second is the honest half:**
+
+- ⭐ **It heals.** Left alone with the churn stopped, the same row read **51/51 rows, 100% of cells**
+  twenty seconds later. The repair machinery (forced full refresh, 1500 ms deadline, 750 ms
+  rate-limit) does fire — the earlier reading of the code, that a hole "latches forever", is WRONG
+  and is corrected here rather than left to be inherited.
+- ⚠ **It is INTERMITTENT: 2 reproductions in ~15 attempts**, which is consistent with a race during
+  mount churn rather than a deterministic path. Both reproductions needed a **fresh GUI** — a warm
+  GUI did not reproduce under the same churn, and a second churn on an already-healed GUI never
+  did. Warm mounts, cold rows on a warm GUI, streaming vs idle, and switch gaps from 0.05 s to
+  0.7 s were all tried and all painted clean.
+
+⚠ **One control could not be settled and must not be assumed:** in both reproductions the broken
+row was also the FIRST row captured after the churn, so "which band is live" and "captured first"
+are confounded. A reversed-order run on a fresh GUI did not reproduce at all, so it separated
+nothing. **Do not quote the top/middle/bottom labels as a finding** — what IS established is
+live-band-correct / static-region-broken, which holds whichever band was live.
+
+### ⛔ THE CODE FINDING: EVERY REPAIR TRIGGER IS EVENT-DRIVEN, NOTHING DETECTS A DIVERGENCE
+
+`requestVisiblePaint(true)` — the only thing that repairs a partial paint — is raised from settled
+resize, reveal, retained write, focus, foreground and mount. **Every one of them is an event known
+in advance to be risky. None of them is a detector.** So a hole opened by a dropped frame on a
+visible, steady row raises no demand at all, and nothing in the client can notice that the pixels
+and the buffer have come apart.
+
+⇒ **The natural next step is a detector, not another repair.** The repair path is already
+well-tuned and should be reused rather than duplicated: the missing piece is a cheap in-page check
+that raises the EXISTING demand when coverage and content diverge. The same-frame read this entry
+delivers is the proof that such a comparison is available inside the webview at all.
 
 ⚠ **Do NOT reason from the daemon's screen for this.** The daemon's vt100 grid is the source of
 truth for CONTENT and says nothing about what the client painted — that confusion is already a

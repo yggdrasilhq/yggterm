@@ -11479,6 +11479,68 @@ console.log('ok');
             "the payload must report the active path alongside the drawn one"
         );
     }
+    /// ⛔⛔ THE SAME-FRAME GUARANTEE, WHICH IS THE WHOLE VALUE OF THE INSTRUMENT.
+    ///
+    /// A faithful screenshot costs ~6.8 s and a buffer read ~116 ms, so on a live
+    /// agent row the two can never be sequenced into one frame: every prior "the
+    /// buffer says X but the screen shows Y" reading on a busy row compared two
+    /// moments seven seconds apart, and part of the disagreement was TIME. The
+    /// composite therefore reads the buffer in the SAME synchronous turn as
+    /// `toDataURL` — xterm parses PTY bytes on its own task queue, which cannot
+    /// interleave with synchronous script, so the recorded text is exactly what
+    /// those pixels were drawn from.
+    ///
+    /// ⚠ The property is destroyed by anything that lets the event loop run
+    /// between the read and the encode — an `await`, a `setTimeout`, a `then`.
+    /// The result would still LOOK right (a buffer, a PNG, plausible numbers)
+    /// while quietly being two moments again, which is the exact failure this
+    /// instrument was built to end. A source scan, because it lives in an
+    /// embedded script; it scans for the DECISION, not for cosmetics.
+    #[test]
+    fn the_faithful_composite_reads_its_buffer_in_the_same_frame() {
+        let script = super::TERMINAL_CANVAS_COMPOSITE_SCRIPT;
+        assert!(
+            script.contains("readSameFrameBuffer"),
+            "the composite must capture the buffer it drew from"
+        );
+        assert!(
+            script.contains("buffer: sameFrameBuffer"),
+            "and must report it on the same payload as the pixels"
+        );
+        // Per CELL, never per string: `translateToString` trims trailing runs and
+        // gives a wide glyph one char across two cells, so a column index taken
+        // from the string does not address the cell the renderer drew.
+        assert!(
+            script.contains("ink_masks: inkMasks"),
+            "the diff unit is a cell mask, not a line of text"
+        );
+        // The read must sit BEFORE the encode, in one synchronous run.
+        let read_at = script
+            .find("const sameFrameBuffer")
+            .or_else(|| script.find("let sameFrameBuffer"))
+            .expect("the same-frame read must exist");
+        let encode_at = script
+            .find("out.toDataURL")
+            .expect("the composite must encode a PNG");
+        assert!(
+            read_at < encode_at,
+            "the buffer must be read before the pixels are encoded, in one turn"
+        );
+        let between = &script[read_at..encode_at];
+        for breaker in ["await ", "setTimeout", ".then("] {
+            assert!(
+                !between.contains(breaker),
+                "`{breaker}` between the buffer read and the encode lets the event \
+                 loop run, so the pixels and the text stop being one moment"
+            );
+        }
+        // Row -> pixel band. Without the geometry the two sides cannot be laid
+        // against each other and the diff degrades back into squinting.
+        assert!(
+            script.contains("screen_css") && script.contains("cell_css_height"),
+            "the record must carry the geometry that maps a row to a pixel band"
+        );
+    }
     // Semi-hot reveal reconcile: the daemon-frame repaint must fire for a
     // settled (idle) screen and must NEVER fire over a working surface or an
     // empty frame (recovery-churn-during-work trap).
