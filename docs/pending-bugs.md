@@ -19750,41 +19750,32 @@ reader knows the instrument's reach ended before the answer did.
 
 ---
 
-## ⚠ ITEM 3 (ROW GROUPS): DELIVERED IN CODE — LIVE PROOF OWED ON THE RAIL
+## ⚠ [11.1] TWO INSTRUMENTS THAT ANSWER A DIFFERENT QUESTION THAN THEIR NAME, FOUND FALSIFYING ROW GROUPS
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED. yggterm `72cf5b92` on
-`lane/dev/11.13-ychrome-ux`. 1963 shell tests pass.
+**Status:** OPEN. Both hit 2026-08-21 in `scripts/underglass-sandbox.sh`.
 
-Folders are retired. A group is headed by a TAB, so the rail has one kind of row,
-one rename, one drag source, one menu router and one id space. The migration call,
-the group persistence and the rail's group rendering landed in ONE commit, because
-each alone destroys what the other two protect (the reasons are in the commit
-message and in the doc comments at each site).
+Neither is a defect in the feature under test; both are traps for the NEXT lane
+that tries to falsify anything in the tab rail, which is why they are filed
+rather than left in a proof note.
 
-**Two failures found while building it, both in the reassuring direction, both
-locked:**
+1. ⛔ **`server app state ▸ web_surface_tabs.rows` is ID-ORDERED, not
+   draw-ordered.** Read as "the tab order" — which its shape invites — it
+   reported two freshly opened tabs as APPENDED to the end of the list. The rail
+   was drawing them at the TOP at that exact moment, which is the opposite
+   answer and the one the product promises. It is a per-tab webview/lease
+   diagnostic and the id order is fine for that; the name is what misleads.
+   ⇒ Judge placement from the rail or the tabs vector, never from this listing.
+   Wanted: either draw order, or a field saying which order this is.
 
-1. ⛔ **A head at root has no `group`** — nothing contains it — so a fresh-start
-   gate reading only that keeps a group's MEMBERS and drops the row that NAMES
-   it. The rule is *"has a head **or** is one"*.
-2. ⛔⛔ **A folder holding ONE tab loses its organization on the SECOND launch.**
-   It flattens to a head with no members, and a head with no members is not a
-   group — nothing points at it, so it mints no key. The launch that migrates it
-   keeps it (the store still said `folder`); the next one drops it. What survives
-   the flattening is the folder's LABEL, moved onto the head's `custom_title`, so
-   a NAMED row counts as organization. Locked by
-   `a_one_tab_folder_survives_the_second_launch_too`, which runs three launches
-   because the defect is invisible on the first.
-
-**Falsifies the fix (this is what is owed):** open a surface whose profile still
-has folders on disk, and screenshot the rail — the folder's tabs must appear as a
-GROUP under a head row carrying the folder's name, with a chevron that collapses
-it, and the store on disk must then hold `group_key`/`group` and no `folders`. A
-unit test cannot settle the rendering half.
-
-⚠ **The one lossy case is unchanged and is counted, not hidden:** a folder whose
-first tab already carried a user-given name keeps that name and drops the folder's
-label (`names_yielded_to_custom_title`).
+2. ⚠ **Synthetic BUTTON events do not reach the rail in the sandbox, though
+   pointer MOTION does.** `underglass-sandbox.sh click` and the app-control
+   `pointer click` verb both moved the cursor (the hovered row revealed its
+   verbs, so motion arrives and the DOM reacts) and neither selected a row nor
+   fired a row's disclosure control. Both report success. ⇒ Anything needing a
+   real click cannot currently be falsified on this rack; the collapsed-group
+   case was proven by SEEDING the state instead of clicking into it. Wanted:
+   either working button delivery, or a refusal, rather than an accepted call
+   that lands nowhere.
 
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
