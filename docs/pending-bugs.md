@@ -57,17 +57,18 @@ painted partially. Both are what "a mount begins with an empty surface" looks li
 rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
 filing three entries for one symptom chain is what made this look half-fixed once already.
 
-### ⭐ THE xterm.js HALF OF THE CHAIN NOW EXISTS — 2026-08-21, `xterm_paint`
+### ⭐ THE MOUNT→PAINT SPAN NOW EXISTS — 2026-08-21, `xterm_paint`
 
-*This section replaced the paragraph that said the tracing "does not exist yet". It did not
-exist; it does now, and leaving the old sentence standing would have routed the next reader
-away from the instrument built to serve this entry.*
+*This section replaced the paragraph that said the tracing "does not exist yet", which would
+otherwise have routed the next reader away from the instrument built to serve this entry.*
 
-The tracing asked for is END TO END — kernel call → daemon → client → **xterm.js layer** →
-pixel — and the xterm.js half was the gap: every measurement above stops at the Rust boundary,
-so "the mount began" and "the glyphs arrived" were the same event to every instrument in the
-project. **A mount begins with an empty surface**, so that gap is exactly where the ghost
-frames and the broken TUI paint live.
+⚠ **And it corrects that paragraph in the other direction too.** The xterm.js layer was NOT
+uninstrumented: `xterm_render/frame_gap` already carried `rows_painted` against `rows` and
+`frame_window` carried `full_canvas_frames`, and this probe is built on them rather than
+beside them. What did not exist is a probe that **spans the mount**. Every existing probe
+counts events in a running terminal; every native probe stops at the bridge; so "the mount
+began" and "the glyphs arrived" were the same event to all of them. **A mount begins with an
+empty surface**, which is exactly where the ghost frames and the broken TUI paint live.
 
 Three probes, `layer=xterm`, joined to the native half by `host_id` (which already encodes the
 mount epoch, so no second identity was introduced):
