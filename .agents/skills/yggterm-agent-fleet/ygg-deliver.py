@@ -74,6 +74,33 @@ def find_row(host, target):
     return None
 
 
+def _reap_if_never_briefed(uuid, uri, host, a):
+    """⛔⛔ A ROW THAT WAS NEVER BRIEFED MUST NOT OUTLIVE THE ATTEMPT TO BRIEF IT.
+
+    A spawn whose submit failed used to leave its row seated and empty — holding a
+    seat, counted as WORKING by every sweep because a live process with no
+    transcript is unclassifiable, and doing nothing at all. Three accumulated,
+    one alive for over two hours, and each new failure added another.
+
+    ⚖ THE TEST IS "HAS IT EVER WRITTEN A WORD", NOT "DID WE FAIL". A row that took
+    an earlier brief and is merely busy has a transcript and is never touched here
+    — losing a working lane to a delivery timeout would be far worse than the
+    debris this cleans up. Only a row with NO transcript at all is reaped, because
+    that row has, demonstrably, never been given anything to do.
+    """
+    if glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl")):
+        log("  the row has a transcript — it has been briefed before, so it STAYS")
+        return 6
+    fold = os.path.join(HERE, "ygg-fold.py")
+    if not os.path.exists(fold):
+        log(f"  ⚠ no fold verb here — row {uuid[:8]} is left seated and un-briefed")
+        return 6
+    log(f"  reaping {uuid[:8]}: it has never written a transcript, so it was never "
+        f"briefed and cannot become anything")
+    subprocess.run([fold, "row", uuid, "--force", "--apply"], timeout=300)
+    return 6
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -131,7 +158,7 @@ def main():
             why = "not consuming input yet (still starting up?)"
         if time.time() > deadline:
             log(f"⛔ {why} after {a.wait_min:g}m — NOT delivered")
-            return 5
+            return _reap_if_never_briefed(uuid, uri, host, a)
         log(f"{why} — waiting {POLL_S}s")
         time.sleep(POLL_S)
 
@@ -143,7 +170,7 @@ def main():
         # ⛔ NEVER RETRY. `submitted:false` means the row was mid-output, not that
         # it is unreachable, and a retry is a second write into the same composer.
         log(f"⛔ submitted:false ({reply.get('error')}) — NOT retried, by law")
-        return 6
+        return _reap_if_never_briefed(uuid, uri, host, a)
     log(f"submitted {data.get('bytes')}B, proving delivery from the transcript")
 
     if not ack:
