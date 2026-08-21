@@ -969,6 +969,195 @@ safe boundary, never mid-turn.
 **Falsifier:** start a daemon from inside an agent session, spawn a row through it,
 and read the row's `/proc/<pid>/environ` — no agent-session marker may appear, and the
 row's JSONL must exist and grow from turn one.
+## ⛔⛔ [11.13] THE FLEET WAKE PATH IS EFFECTIVELY DEAD — 196 BOOTS ABORTED, 2 ROWS EVER WOKEN
+
+Counted from one day of `booter.log`: **196 `⛔ ABORTING BOOT … boot text never appeared on
+screen after 6 s. Enter NOT sent`**, against exactly **two rows in the entire fleet that have
+ever recorded a boot** (`boots: 3` and `boots: 1`). Every other subscription, across every
+campaign, sits at `boots: 0`.
+
+**Two distinct failure modes, and both end with a row that does not wake.**
+1. **Abort before Enter.** The booter writes the boot text, then re-reads the rendered grid to
+   confirm it landed before sending Enter. The text never appears, so it refuses. ⭐ The GUARD
+   is working exactly as designed (`7d2fa0ea` — refuse rather than type blind); what it is
+   telling us is that **the write is not reaching the screen**.
+2. **Enter sent, no wake.** The one row with `boots: 3` was ESCALATED anyway —
+   *"did not wake after 3 boots"* — so even a completed boot did not resume it.
+
+⚠ **For the ABORT mode it is not the remote plane and not row visibility.** Booted and aborting
+rows have the identical `remote-cc://<machine>/<uuid>` shape, the same watcher host, and all read
+`hidden_by_collapse: None, expanded: True` in the listing. Whatever separates *those two* is not
+structural, and a fix aimed at the remote proxy would be aimed at nothing.
+
+⛔ **NARROWED 2026-08-21 — this sentence used to read "it is not row visibility" without
+qualification, and that generalisation is false.** It was drawn from rows that were all present in
+the GUI host's tree, which is the one population in which visibility cannot be the variable. A
+third mode was then measured directly: **a live, working session that is absent from the GUI host's
+tree entirely**, so nothing ever reaches the boot code at all — see the entry below. ⇒ The abort
+counts here are evidence about rows that ARE listed. They say nothing about rows that are not, and
+the fleet-wide `boots: 0` figure mixes both populations.
+
+**Why this outranks every individual stalled row.** The relay is built on the assumption that a
+session may land, defer, and be resumed. That assumption is currently false, so **any lane that
+hands over by standing by is a lane that stops** — with a brief written, a subscription live,
+and no error anywhere. Rows then escalate for being idle, which reads as a row problem and is
+not one.
+
+⇒ **Until this is fixed, a handover must SPAWN its successor, never defer to the booter**, and
+a brief must say so. ⇒ **The tell:** read `boots:` on the subscription. `0` after hours of
+quiet is this, not a quiet campaign. ⚠ Do not read "the row woke up" as evidence a boot
+landed — a human typing into a row looks identical from every instrument the fleet has.
+
+## ⛔⛔ [11.13] A LIVE, WORKING SESSION CAN BE ABSENT FROM THE GUI HOST'S ROW TREE — SO THE WATCHER LAPSES IT AND NOTHING CAN REACH IT
+
+⛔ **THIS ENTRY REPLACES A FALSIFIED MECHANISM. Re-measured 2026-08-21 16:45-16:50 against a
+session that was alive and writing while it was measured.** The previous text said a spawned row
+is auto-subscribed by BARE UUID, that the bare uuid "matches nothing" in the GUI host's listing,
+and — explicitly — that *"the row is visible in the listing the whole time; this is a key-matching
+failure, not a visibility one."* **All three are wrong.** What follows is what the instruments
+actually say. The lapse it described is real; the cause it named is not.
+
+### THE MEASUREMENT
+A delegate spawned onto a worker host was alive throughout: its process was up, and its transcript
+was growing to the second at every reading. In the same instant:
+
+| probe | answer |
+|---|---|
+| the **GUI host's** row tree (640 rows, 234 sessions, non-empty ⇒ it *did* answer) | the uuid appears **0 times in 878 KB** |
+| the **worker host's** own row tree | present, **9 hits**, path `remote-cc://<worker>/<uuid>` — the correct addressable form |
+| the OS | process alive, transcript age 0.0m, still growing |
+
+Of the **8** `remote-cc://<worker>/` sessions in the worker host's tree, **exactly one — this one —
+is missing from the GUI host's tree.** The other seven propagated. 22 of the 23 live sessions on
+that worker were listed on the GUI host; this was the twenty-third.
+
+⇒ **The row was created, with the right path, on the worker's plane, and never reached the GUI
+host's tree.** Intermittent propagation, not a systematic gap and not a naming gap.
+
+### WHY THE OLD MECHANISM CANNOT BE RIGHT — from the code, not from a guess
+1. **The presence check never sees the stored string.** The tick calls
+   `row_presence(host, uuid)` with the **uuid**, and `resolve_row_path` reduces any identifier with
+   `ident.rstrip("/").split("/")[-1]` — so a bare uuid and `scheme://host/<uuid>` **normalize to the
+   same key**. The stored form cannot decide presence.
+2. **It was subscribed with the FULL addressable path FIRST, and that failed too.** The log shows
+   the full `remote-cc://<worker>/<uuid>` form at the first subscribe, answered by
+   *"does not resolve to a live row on <gui-host> — subscribing anyway"*. A second subscribe 26 s
+   later stored the bare uuid. Both were absent for the same reason: the row was not there.
+3. The lapse then proceeded correctly — absent 1/3, 2/3, LAPSED — and `row_presence` behaved
+   exactly as designed. **The watchdog is not the defect here; it is the only thing that reported it.**
+
+### ⚠ THE BARE UUID IS STILL A REAL DEFECT — one layer down, and it is the SEND, not the check
+`boot()` passes the **raw stored `row` string** to `server terminal write '<row>'` and
+`server app terminal submit '<row>'` with no `resolve_row_path` in between. So a subscription
+holding a bare uuid addresses nothing **when a boot is finally attempted**, while every presence
+reading above it looks fine. ⇒ Worse, **re-subscribing DOWNGRADES a good record**: the first
+subscribe here stored the addressable path, the second overwrote it with the bare uuid. The
+documented "workaround" of re-subscribing can therefore make the send target worse while printing
+success.
+⇒ **Fix: resolve at subscribe time AND at send time**, and never overwrite a resolved path with an
+unresolved one.
+
+### WHY THIS BREAKS THE RELAY, SILENTLY
+1. ⛔ **The handover looks complete.** The spawn returns, the delegate reads its brief, ACKs, and
+   works — the initial prompt rides the spawn, so nothing about the first turn reveals the problem.
+2. ⛔ **The delegate is unreachable and unbootable from the moment it lands.** No row on the GUI
+   host means no steer, no correction, no boot, and **no seat in the sidebar** — the owner cannot
+   see that the work is running at all.
+3. ⛔ **It ends at the end of its first turn.** Whatever is not committed by then is stranded, and
+   the chain stops with every artefact present and no error anywhere.
+4. ⚠ **Invisible from inside the row:** a session cannot tell a watched subscription from an
+   unwatched one, nor a propagated row from an orphaned one. Both look like "I landed and stood by".
+
+### THE TELLS, AND THE ONLY SAFE HANDOVER UNTIL THIS IS FIXED
+- ⭐ **After spawning, read the GUI host's row tree for the new uuid — do not read the spawn's own
+  return value.** The spawn verb reports that it started a process, which is true and is not the
+  question. If the uuid is absent from the GUI host's tree, **the delegate is orphaned**: it will
+  work one turn and then be gone.
+- ⚠ `boots: 0` plus `LAPSED — absent from N consecutive row listings` on a session whose transcript
+  is still GROWING is this bug, and it is the opposite of what it reads like. A lapsed record is
+  evidence about the ROW TREE, never about whether the work is happening.
+- ⛔ **Do not hand a lane over by standing by.** Spawn, then verify the row on the GUI host, and
+  carry the standing order that the successor must spawn its own successor rather than defer.
+
+## ⛔⛔ [11.13] AN ABSENCE-LAPSE IS PERMANENT AND NEVER RE-CHECKED, SO ONE TRANSIENT LISTING GAP UNWATCHES A LIVE SESSION FOREVER
+
+**Status:** OPEN. Measured 2026-08-21 across the whole subscription set.
+
+A subscription that goes absent from the GUI host's row tree for `GONE_SIGHTINGS` consecutive
+readings is marked `lapsed`. The tick's very next act on that record is:
+
+```python
+if s.get("lapsed"):
+    # Already reported once; stay quiet but stay VISIBLE in `list`.
+    continue
+```
+
+⇒ **It is never looked at again.** Presence is not re-tested, so a row that comes BACK stays
+unwatched until a human re-subscribes it by hand — and nothing anywhere says the watchdog stopped
+watching a session that is plainly alive.
+
+### MEASURED, over all 12 lapsed subscriptions at one instant
+| bucket | count |
+|---|---|
+| genuinely gone — no process, no row, stale or missing transcript | 7 |
+| ⛔ **process ALIVE and the row is BACK in the GUI host's tree** | **5** |
+
+Two of those five lapsed specifically for **absence** and are now present again, transcripts 8 and
+26 minutes fresh. They are unwatched for no reason that is still true. (The other three lapsed on
+`max_hours`, which is a decision rather than an inference — see below.) A third case existed and
+was cleared by hand while measuring this.
+
+### ⚠ WHY THIS IS NOT THE RE-ARM HAZARD THE FILE ALREADY REFUSES
+`cmd_coverage` deliberately refuses to auto-arm, because *"an attestation-driven re-arm would
+resurrect rows that deliberately unsubscribed when their work finished."* **That reasoning does not
+reach this case, and the difference is the whole point.** An `unsubscribe` is a DECISION BY THE
+SUBSCRIBER. A lapse is an INFERENCE BY THE WATCHER — the subscription was never withdrawn, and the
+premise of the inference ("this row is not in the tree") is testable and currently false. Clearing
+it resurrects nobody's choice; it corrects the watcher's own stale reading.
+
+⇒ **Fix: on the tick, re-test presence for records lapsed by ABSENCE, and clear the lapse when the
+row resolves** — logging it as loudly as the lapse itself, since a silent re-arm is the other
+direction of the same failure. ⛔ Do **not** auto-clear a `max_hours` lapse: that one is an expiry
+someone chose, and the remedy for it is a deliberate re-subscribe.
+
+⚠ **The tell:** `list` shows `⛔ LAPSED … NOT WATCHED` beside a row whose transcript is growing.
+The two facts are printed by different instruments and nothing reconciles them, so the contradiction
+sits in plain sight and reads as two unrelated lines.
+
+## ⛔ [11.13] EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS
+
+⚠ **Re-filed.** This entry was deleted by `7977e978`, a commit about item 3 whose message never
+mentions it — collateral loss in a file rewrite, not a fix. This file's own rule is that an
+entry is deleted in the same commit as its VERIFIED FIX. Re-measured 2026-08-21 and still real.
+
+The fleet scripts live at `.agents/skills/yggterm-agent-fleet/*.py`, INSIDE the repo, so every
+git worktree has its own copy — and both the watcher and any agent invoking a verb resolve them
+by **RELATIVE** path. The live watcher's command line is literally
+`python3 .agents/skills/yggterm-agent-fleet/ygg-booter.py watch --host … --interval …`.
+
+⇒ **Which copy runs is decided by the process CWD**, which nobody chose. Measured: the running
+watcher sat in a worktree missing `7d2fa0ea` (*"the resolver named the wrong host, and the
+watchdog that types had no guards"*) — so the fleet's live watchdog was running the UNGUARDED
+version of the code that TYPES INTO ROWS.
+
+These scripts are the fleet's INSTRUMENTS: a lane on a stale copy gets stale answers ABOUT
+OTHER LANES and cannot tell, because the script reports success in its own terms either way.
+⚠ Same shape as the split install the daemon audit reports for the BINARIES — which is why the
+audit now also checks the scripts, and why that check took three tries to get right (see below).
+
+**Wanted:** either the audit check becomes shared tooling rather than one host's private hook,
+or the scripts stop being resolved relatively — one installed copy on PATH, in-repo tree as its
+source. ⛔ Never fix an instance by copying the file into another worktree: those are live
+checkouts holding other lanes' uncommitted work.
+
+⭐ **THREE WAYS A CHECKER IS CONFIDENTLY WRONG**, all hit while writing that check, all shipped
+looking fine: `sha1sum` of EMPTY input is a valid hash (guard the CONTENT, not the hash);
+`$( )` STRIPS TRAILING NEWLINES so a captured blob never matches the file it came from — which
+flagged every host, and *looked* right because the fleet genuinely carries drift; and
+`origin/main` is a LOCAL CACHE until fetched. ⛔ And the fourth, worst one: **"differs from
+main" is NOT "behind main"** — a watcher in a lane worktree legitimately carries unmerged work,
+so a hash comparison flags it every session for being AHEAD, which is how an audit teaches
+people to ignore it. The right question is `git log origin/main --not HEAD -- <path>`.
 
 ## [11.11] A COMPOSITOR-DRIVEN FULLSCREEN KEEPS ITS ROUNDED CORNERS, SO THEY COMPOSITE ONTO BLACK
 
@@ -2111,6 +2300,7 @@ declares it. That is why it is filed rather than half-shipped here.
 **Falsifier for the remaining half:** right-click a row on each host — exactly
 that host's installed apps, once each, and no terminal-invoked monitors or
 booters. The "once each" and "that host's" halves hold today.
+
 
 ## ⚠ [11.0] THE ROW CLI DEMANDS RITUAL THE DEFAULTS SHOULD OWN — the papercut backlog
 
@@ -22098,6 +22288,33 @@ reader knows the instrument's reach ended before the answer did.
 
 ---
 
+## ⚠ [11.1] TWO INSTRUMENTS THAT ANSWER A DIFFERENT QUESTION THAN THEIR NAME, FOUND FALSIFYING ROW GROUPS
+
+**Status:** OPEN. Both hit 2026-08-21 in `scripts/underglass-sandbox.sh`.
+
+Neither is a defect in the feature under test; both are traps for the NEXT lane
+that tries to falsify anything in the tab rail, which is why they are filed
+rather than left in a proof note.
+
+1. ⛔ **`server app state ▸ web_surface_tabs.rows` is ID-ORDERED, not
+   draw-ordered.** Read as "the tab order" — which its shape invites — it
+   reported two freshly opened tabs as APPENDED to the end of the list. The rail
+   was drawing them at the TOP at that exact moment, which is the opposite
+   answer and the one the product promises. It is a per-tab webview/lease
+   diagnostic and the id order is fine for that; the name is what misleads.
+   ⇒ Judge placement from the rail or the tabs vector, never from this listing.
+   Wanted: either draw order, or a field saying which order this is.
+
+2. ⚠ **Synthetic BUTTON events do not reach the rail in the sandbox, though
+   pointer MOTION does.** `underglass-sandbox.sh click` and the app-control
+   `pointer click` verb both moved the cursor (the hovered row revealed its
+   verbs, so motion arrives and the DOM reacts) and neither selected a row nor
+   fired a row's disclosure control. Both report success. ⇒ Anything needing a
+   real click cannot currently be falsified on this rack; the collapsed-group
+   case was proven by SEEDING the state instead of clicking into it. Wanted:
+   either working button delivery, or a refusal, rather than an accepted call
+   that lands nowhere.
+
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
 **Status:** OPEN
@@ -22167,7 +22384,46 @@ confirmation on the erasing form. Wanted: the no-argument form should RETURN the
 value (or refuse), and clearing should be an explicit flag (`--clear`). Until then the only
 safe read-back is a listing instrument, not the verb itself.
 
-## [19.1] `server app session outline` REPORTS `error: null` WHILE `applied: false`, SO A SEAT SILENTLY DOES NOT LAND
+## [19.1] A ROW CAN BE DISPLAYED BUT UNBOUND — EVERY MUTATING VERB THEN NO-OPS, AND `rename` REPORTS SUCCESS
+
+**Status:** OPEN — reproduced repeatedly 2026-08-21 on build 3.1.17, client and daemon agreeing.
+
+⭐ **THE STATE, which is the part worth naming:** the row renders in the sidebar, the metadata panel
+populates from its rollout file, and the session is plainly alive and working — **while the daemon
+holds no live-session binding for it.** The panel shows `Status: bootstrapping · working`. In that
+state the row is **readable but not writable**, and nothing in the UI says so.
+
+**Both mutating verbs fail, and they fail differently — the second is the dangerous one:**
+
+| verb | returns | actually happens |
+|---|---|---|
+| `session outline` | `applied:false`, `daemon_message:"no live session for …"`, **`error:null`** | nothing |
+| `session rename` | ⛔ **`accepted:true`, `reason:null`** | ⛔ **nothing** |
+
+⛔ **`rename` reports success for a write that never lands.** `outline` at least sets `applied:false`
+— but puts the reason in `data`, leaving the documented error channel null. ⇒ **A caller written to
+the obvious contract concludes both succeeded.**
+
+⚠ **And a read-back immediately after can still agree with the caller**, which is what makes this
+expensive: the claim script's verification printed the NEW title, and the row reverted to the old one
+later. The write appears to reach a view that a subsequent daemon reload discards.
+
+**Suspected trigger — a daemon restart under an in-place update.** At the time of these runs the
+daemon reported `Uptime 7m 18s` with `✓ Update installed · Restart to apply` pending, and the
+binary had been replaced on disk earlier the same session. Sessions that predate the restart appear
+not to be re-bound, while `Sessions: 7 owned · 7 total · 0 preserved` reports no loss.
+
+**What would falsify it:** the same verbs landing on a row whose session started *after* the current
+daemon, or a rebind making the identical calls succeed on this row.
+
+**Fixes, in priority order:**
+1. ⛔ `rename` must not return `accepted:true` when there is no live session.
+2. Any `applied:false` should carry a non-null `error`.
+3. A displayed-but-unbound row should be visibly marked, since it silently ignores every write.
+4. Re-bind surviving sessions across an in-place daemon restart, or report them as lost rather than
+   counting them in `owned`/`total`.
+
+## [19.1b] `session outline` — THE ORIGINAL NARROWER REPORT, KEPT FOR THE SCHEME CENSUS
 
 **Status:** OPEN
 
@@ -22209,11 +22465,34 @@ or neither does.
 after actually launching a third-party agent CLI as a work lane on 2026-08-21. It worked, but
 none of the fleet machinery reached it.
 
-**1. A third-party CLI session is invisible to the row plane.** It runs as an ordinary background
-process. It cannot be claimed, titled, seated, monitored for stalls, or messaged by any existing
-verb, and it does not appear in `server app rows`. ⇒ **Today the only way to supervise one is to
-poll files it writes.** Anything built on rows — the stall detector, the booter, succession —
-simply does not apply.
+**1. ⛔ CORRECTED 2026-08-21, SAME DAY — THE FIRST VERSION OF THIS ITEM WAS WRONG AND THE TRUE
+FINDING IS SHARPER.** It claimed a third-party CLI session "is invisible to the row plane… does not
+appear in `server app rows`". **False, and asserted without checking.** The listing carries a
+`remote-agy://` scheme with 11 rows and a `remote-muse://` scheme with 2. The plane models them.
+
+⭐ **What is actually broken is SEATING, and it splits perfectly by scheme.** Census of the live
+listing, 710 rows:
+
+| scheme | rows | seated (`outline_prefix` set) |
+|---|---:|---:|
+| `cc-runtime` | 13 | **8** |
+| `remote-cc` | 52 | 0 |
+| `remote-session` | 112 | 0 |
+| `local` | 87 | 0 |
+| `remote-agy` | 11 | **0** |
+| `remote-muse` | 2 | 0 |
+| (no scheme) | 433 | 0 |
+
+⇒ ⛔ **8 of 13 on one scheme; 0 of 697 on every other.** Seating is in practice a `cc-runtime`-only
+capability. A correctly-spawned foreign-CLI row would still take no seat, so the numbering scheme
+the fleet organises itself by **cannot address any non-native lane at all.**
+
+⚠ **And the second-order effect is what makes it deep rather than cosmetic:** an operator scanning
+the sidebar for "which lane is doing what" sees numbers only on native rows, so **foreign lanes are
+invisible to the very convention used to find work** — present in the data, absent from the map.
+
+⚠ Separately and still true: launching a foreign CLI as a bare background process creates **no row
+at all**. The scheme exists; nothing routes an ad-hoc launch into it.
 
 **2. Argument order silently changes what runs.** On the CLI tested, putting the print/non-
 interactive flag *before* the model selector caused **both** the model choice and the prompt
