@@ -2521,6 +2521,30 @@ is the same binary.
 actual credentials, because `HOME` stays the real one — which is the point, since
 that is what makes the store layouts genuine. Cap the population and reap it.
 
+## A ROW'S ADDRESS AND ITS SESSION ID ARE DIFFERENT QUESTIONS, AND THE WRONG ONE RETURNS `absent` (2026-08-22)
+
+`transcript_evidence` was asked about a codex row that had just been briefed, run two
+commands and reported its result. It answered **`absent`** — the input a reap destroys
+a row on. The row was fine; the question was wrong.
+
+    by the row ADDRESS   local://3a7c…   ->  absent
+    by session_id        01a0…           ->  found
+
+A row created by `terminal new` gets a yggterm uuid, and a CLI that mints its own
+session id writes its store under ITS id. For a while those are two different values,
+and the daemon reconciles them: the row's published `session_id` becomes the CLI's,
+while `full_path` keeps the address it was created with. ⇒ **The address is where to
+send bytes; `session_id` is what wrote the transcript.** `row_session_id()` in
+`ygg_rowarg` is the one owner of the second question and every fleet verb uses it —
+this was a hand-written probe reaching past it, which is the only way to get this
+wrong now.
+
+⛔ **The failure has no error in it.** A wrong id and an empty store produce the same
+`absent`, and `absent` is the one answer that authorises destruction. Whenever an
+evidence check answers `absent` about a row you have watched working, **suspect the
+identifier before the store** — the last near-miss of this shape was published as a
+finding before it was checked.
+
 ## A BRIEF IS A DOC, AND THIS ONE SAID A SECTION HERE DID NOT EXIST (2026-08-22)
 
 A relay brief warned that the field-guide section *"TEST A DAEMON RESTORE AGAINST
