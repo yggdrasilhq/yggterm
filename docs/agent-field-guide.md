@@ -2354,3 +2354,47 @@ small number reads as good news.
 ⭐ The under-report was caught only because two instruments were compared and disagreed.
 When a measurement is about to become a headline, take it twice by different means — a
 single instrument agreeing with your hopes is not a reading.
+
+## Which surface the viewport shows: three layers used to answer it, and only one now (2026-08-21)
+
+**Read this before touching `active_view_mode`, `normalize_active_view_mode`, or
+any snapshot-adoption path.** The question *"terminal or web view?"* had three
+independent answers, and the disagreement was user-visible: a GUI restart came up
+with a live agent terminal drawn as an empty chat panel.
+
+| Layer | What it used to answer | Now |
+|---|---|---|
+| The click path (`preferred_open_mode_for_row`) | "a Session row that supports a terminal opens as a terminal" — **correct, and always was** | unchanged; it is the model the other two were taught |
+| The daemon's restore | *adopted the persisted mode verbatim* — i.e. whatever mode some earlier daemon happened to be in | derives from the row: `YggtermServer::default_view_mode_for_session` |
+| The client's snapshot adoption | a CONTENT heuristic — coerce to Terminal only when the rendered surface was EMPTY | a capability rule (`startup_snapshot_should_show_terminal`), **startup only**, and it DECLARES the correction to the daemon |
+
+⛔ **The content heuristic is the interesting failure, because it looks like the
+same rule.** "Show the terminal when the web page has nothing on it" and "show the
+terminal because this row is a terminal" agree on every empty transcript and
+diverge on the first tool call. A live agent row whose preview held two activity
+blocks counted as *"has real content"* and kept the web page — over a running PTY.
+
+⚠ **Three rules a change here must keep:**
+
+1. **`Rendered` is a CHOICE, never an inheritance.** `set_view_mode` is the only
+   thing allowed to produce it for a terminal-capable row. Every path that
+   *adopts* a mode (restore, snapshot adoption, a departed neighbour) derives.
+2. **Kind is asked BEFORE capability.** `terminal_spec` returns a spec for a
+   recipe document, so capability-first would default every recipe to the
+   terminal that runs it instead of to the paper it is.
+3. **The startup coercion must stay startup-only, AND must write back.** Applied
+   to background refreshes it argues with the titlebar toggle seconds after the
+   user uses it. Applied without a write-back, the daemon keeps re-asserting its
+   own mode and the two re-fight it on every poll — which is what the previous
+   heuristic was quietly living with, and why it had to be weak enough to lose.
+
+**Falsifier, and it needs no live host:** write a `server-state.json` naming a
+live agent row with `"active_view_mode": "Rendered"`, start a daemon on a private
+`YGGTERM_HOME`, and read `server snapshot`. It must say `Terminal`. Run the same
+file against an older binary to see the other answer.
+
+⚠ **A freshly created row cannot reproduce the failing baseline.** Its preview is
+two SCAFFOLD blocks ("… stays attached", "Launch command prepared:"), which the
+old heuristic already treated as empty — so it coerced correctly and the sandbox
+comes up green on both arms. The discriminating input is a transcript of TOOL
+CALLS with no prose, and no exposed verb injects one into a live row.

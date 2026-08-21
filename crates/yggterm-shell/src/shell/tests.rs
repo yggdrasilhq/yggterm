@@ -2001,7 +2001,7 @@ mod tests {
     // materialized, and a payload with no url rebuilds nothing.
     #[test]
     fn a_retained_declare_only_rebuilds_an_http_surface() {
-        let good = declared_web_surface_open_from_payload(&json!({
+        let good = declared_web_surface_open_or_refusal(&json!({
             "session": "s",
             "url": "https://example.test/page",
             "title": "Example",
@@ -2022,12 +2022,12 @@ mod tests {
             json!({"session": "s", "url": 42}),
         ] {
             assert!(
-                declared_web_surface_open_from_payload(&hostile).is_none(),
+                declared_web_surface_open_or_refusal(&hostile).is_err(),
                 "must refuse to rebuild from {hostile}"
             );
         }
 
-        let plain = declared_web_surface_open_from_payload(&json!({
+        let plain = declared_web_surface_open_or_refusal(&json!({
             "session": "s",
             "url": "http://127.0.0.1:8080/",
         }))
@@ -12280,16 +12280,17 @@ console.log('ok');
 
     /// ★★ THE "OPEN AT THE NEWEST TURN" PIN MUST BE ABLE TO END.
     ///
-    /// `preview_latest_materialized_window` hard-pins the last
-    /// `PREVIEW_BLOCK_WINDOW` blocks and ignores scroll completely — which is
-    /// right for placing a reader on open and catastrophic as a steady state:
-    /// while it is selected, scrolling up cannot render an older turn, so a
-    /// 600-block transcript is a 24-block one. The flag that chose it was
-    /// derived from a request that is recomputed every render and stays `Some`
-    /// for as long as the session is hydrated, so it never turned off.
+    /// There used to be a second window here (`preview_latest_materialized_window`,
+    /// deleted 11.23) that hard-pinned the last `PREVIEW_BLOCK_WINDOW` blocks and
+    /// ignored scroll completely — right for placing a reader on open, and
+    /// catastrophic as a steady state: while it was selected, scrolling up could
+    /// not render an older turn, so a 600-block transcript was a 24-block one.
+    /// The flag that chose it came from a request recomputed every render, so it
+    /// never turned off.
     ///
-    /// This asserts the WINDOW's behaviour, not the flag's: pinned while the
-    /// pin is pending, scroll-driven once it has been applied.
+    /// The pin is a scroll POSITION now, applied once and then released, and
+    /// this asserts that: the key must not be content-derived, and the window
+    /// must be scroll-driven.
     #[test]
     fn the_latest_pin_yields_to_scroll_once_it_has_been_applied() {
         let blocks = (0..120)
@@ -12953,6 +12954,88 @@ console.log('ok');
     /// invariant is that CONSECUTIVE activity lands in ONE segment and that a
     /// prose block always breaks the run — a splitter that merged across prose
     /// would collect the whole session into a single card.
+    /// ⛔ THE BLANK PAGE MUST NAME ITSELF.
+    ///
+    /// The frame the owner restarted into was a chat panel holding a single
+    /// collapsed `Work · 2` group and nothing else. Every probe called that
+    /// surface healthy, and it WAS: it had faithfully rendered a transcript
+    /// with no prose in it. A page that has failed and a page that has nothing
+    /// to say were the same picture, so the person could not tell which they
+    /// were looking at.
+    #[test]
+    fn a_surface_holding_only_machine_work_says_it_has_nothing_to_read() {
+        let entry = |ix: usize, kind: PreviewBlockKind| PreviewRunEntry {
+            block_ix: ix,
+            display_timestamp: String::new(),
+            block: SessionPreviewBlock {
+                role: "ASSISTANT",
+                timestamp: "now".to_string(),
+                tone: PreviewTone::Assistant,
+                folded: kind != PreviewBlockKind::Message,
+                lines: vec!["x".to_string()],
+                kind,
+                activity: (kind != PreviewBlockKind::Message)
+                    .then(yggterm_server::PreviewActivity::default),
+            },
+        };
+        let run = |kinds: Vec<PreviewBlockKind>| {
+            vec![PreviewRun {
+                tone: PreviewTone::Assistant,
+                entries: kinds
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, kind)| entry(ix, kind))
+                    .collect(),
+            }]
+        };
+
+        // The reported frame: two tool calls, no answer.
+        assert!(preview_surface_has_nothing_to_read(
+            &run(vec![PreviewBlockKind::ToolCall, PreviewBlockKind::ToolCall]),
+            true,
+            false,
+            false,
+        ));
+        // Thinking is not reading matter either.
+        assert!(preview_surface_has_nothing_to_read(
+            &run(vec![PreviewBlockKind::Reasoning]),
+            true,
+            false,
+            false,
+        ));
+        // A transcript with nothing in it at all is still nothing to read.
+        assert!(preview_surface_has_nothing_to_read(&[], true, false, false));
+
+        // ⚠ Deliberately narrow. ONE prose block, or ANY rendered section, and
+        // the notice stands down — it must never hide something worth reading.
+        assert!(!preview_surface_has_nothing_to_read(
+            &run(vec![PreviewBlockKind::ToolCall, PreviewBlockKind::Message]),
+            true,
+            false,
+            false,
+        ));
+        assert!(!preview_surface_has_nothing_to_read(
+            &run(vec![PreviewBlockKind::ToolCall]),
+            false,
+            false,
+            false,
+        ));
+        // And it never stacks on top of a placeholder that already owns the
+        // page: three notices where one is due is its own kind of silence.
+        assert!(!preview_surface_has_nothing_to_read(
+            &run(vec![PreviewBlockKind::ToolCall]),
+            true,
+            true,
+            false,
+        ));
+        assert!(!preview_surface_has_nothing_to_read(
+            &run(vec![PreviewBlockKind::ToolCall]),
+            true,
+            false,
+            true,
+        ));
+    }
+
     #[test]
     fn an_assistant_run_collects_consecutive_work_and_never_swallows_prose() {
         let entry = |ix: usize, kind: PreviewBlockKind| PreviewRunEntry {
@@ -21564,18 +21647,12 @@ console.log('ok');
                 activity: None,
             });
         }
-        let latest_window = preview_latest_materialized_window(
-            &visible_preview_blocks(&session),
-            PREVIEW_MIN_VIEWPORT_HEIGHT_PX,
-            PREVIEW_MIN_VIEWPORT_HEIGHT_PX,
-        );
-        assert_eq!(
-            latest_window.end_index,
-            visible_preview_blocks(&session).len()
-        );
-        assert_eq!(latest_window.top_spacer_px, 0.0);
-        assert_eq!(latest_window.bottom_spacer_px, 0.0);
-        assert!(latest_window.start_index > 0);
+        // The hard-pinned "latest" window this used to assert over is GONE
+        // (`preview_latest_materialized_window`, 11.23): it selected
+        // `start = len - PREVIEW_BLOCK_WINDOW, end = len` and ignored scroll,
+        // so no reader could reach an older turn. Nothing computed it any more
+        // and the surface has been scroll-driven since. The pin is a scroll
+        // POSITION, which is what the rest of this test checks.
         let mounted_anchor_scroll = preview_latest_anchor_scroll_options();
         assert!(matches!(
             mounted_anchor_scroll.behavior,
@@ -23840,9 +23917,6 @@ console.log('ok');
         ));
         assert!(!looks_like_image_path(
             "remote-session://practice/019e3648-a76f-7ed3-ace2-1ae56c58d800.jpg"
-        ));
-        assert!(!local_image_path_exists(
-            "local://701cb151-58a8-4fe3-8194-451d8daa8192.png"
         ));
     }
     #[test]
@@ -49423,154 +49497,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         ));
     }
 
-    #[test]
-    fn remote_live_session_prompt_ready_replay_uses_server_snapshot_tail() {
-        let mut session = test_live_shell_session("remote-session://dev/abc123");
-        session.source = SessionSource::LiveSsh;
-        session.terminal_lines = vec![
-            "╭─────────────────────────────────────────────╮".to_string(),
-            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
-            "⚠ MCP startup incomplete (failed: codex_apps)\x1b[19;1H›\x1b[CUse /skills to list available skills\x1b[21;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[19;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
-        ];
-        session.status_line = "\x1b[19;1H›\x1b[CUse /skills to list available skills\x1b[21;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[19;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string();
 
-        assert!(
-            remote_live_session_prompt_ready_replay_text(&session).is_none(),
-            "managed live-session metadata is not a terminal replay source"
-        );
-    }
 
-    #[test]
-    fn daemon_snapshot_prompt_ready_replay_rejects_session_metadata() {
-        let mut session = test_live_shell_session("remote-session://dev/target");
-        session.source = SessionSource::LiveSsh;
-        session.kind = SessionKind::Codex;
-        session.host_label = "dev".to_string();
-        session.ssh_target = Some("dev".to_string());
-        session.remote_deploy_state = RemoteDeployState::Ready;
-        session.terminal_lines = vec![
-            "• The daemon owns this live PTY and the GUI mount is blank.".to_string(),
-            "\x1b[13;1H\x1b[48;2;57;57;57m\x1b[1m›\x1b[22m \x1b[2mReview current changes\x1b[22m\x1b[K"
-                .to_string(),
-            " \x1b[K\x1b[15;3H\x1b[38;2;246;226;183;49mgpt-5.5 xhigh\x1b[39;2m · \x1b[38;2;171;223;167;22m~/gh/yggterm\x1b[m"
-                .to_string(),
-        ];
-        session.status_line =
-            "\x1b[15;3Hgpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h"
-                .to_string();
-        let snapshot = snapshot_session_view_for_ui(session);
 
-        assert_eq!(
-            snapshot_session_prompt_ready_replay_text(&snapshot),
-            None,
-            "session metadata snapshots must not become terminal input truth"
-        );
-    }
 
-    #[test]
-    fn daemon_snapshot_prompt_ready_replay_rejects_fresh_start_scaffold() {
-        let mut session = test_live_shell_session("remote-session://dev/fresh");
-        session.source = SessionSource::LiveSsh;
-        session.kind = SessionKind::Codex;
-        session.host_label = "dev".to_string();
-        session.ssh_target = Some("dev".to_string());
-        session.remote_deploy_state = RemoteDeployState::Ready;
-        session.metadata.push(SessionMetadataEntry {
-            label: "Remote Launch Action",
-            value: "start-codex".to_string(),
-        });
-        session.terminal_lines = vec![
-            "$ exec codex".to_string(),
-            "Queue live shell session fresh".to_string(),
-            "Target: /home/user/gh/yggterm".to_string(),
-        ];
-        session.status_line = "ready".to_string();
-        let snapshot = snapshot_session_view_for_ui(session);
 
-        assert_eq!(snapshot_session_prompt_ready_replay_text(&snapshot), None);
-    }
 
-    #[test]
-    fn remote_live_session_prompt_ready_replay_can_be_selected_by_session_path() {
-        let mut target = test_live_shell_session("remote-session://dev/target");
-        target.source = SessionSource::LiveSsh;
-        target.terminal_lines = vec![
-            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
-            "╰─────────────────────────────────────────────╯\x1b[13;1H›\x1b[CImplement {feature}\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
-        ];
-        target.status_line = "\x1b[13;1H›\x1b[CImplement {feature}\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string();
-        let mut other = test_live_shell_session("remote-session://dev/other");
-        other.source = SessionSource::LiveSsh;
-        other.terminal_lines = vec!["plain stale card".to_string()];
-
-        let sessions = vec![other, target];
-        let replay = remote_live_session_prompt_ready_replay_text_for_session_path(
-            sessions.iter(),
-            "remote-session://dev/target",
-        );
-
-        assert!(
-            replay.is_none(),
-            "active recovery must wait for daemon PTY snapshots instead of server metadata"
-        );
-    }
-
-    #[test]
-    fn remote_live_session_prompt_ready_replay_does_not_require_codex_card() {
-        let mut session = test_live_shell_session("remote-session://dev/no-card");
-        session.source = SessionSource::LiveSsh;
-        session.terminal_lines = vec![
-            "\x1b[13;1H›\x1b[CReview current changes".to_string(),
-            "\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h"
-                .to_string(),
-        ];
-        session.status_line =
-            "\x1b[13;1H›\x1b[CReview current changes\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm"
-                .to_string();
-
-        assert!(
-            remote_live_session_prompt_ready_replay_text(&session).is_none(),
-            "managed live-session prompt/status metadata must not seed xterm without a real PTY snapshot"
-        );
-    }
-
-    #[test]
-    fn remote_live_session_prompt_ready_replay_rejects_stale_status_prose_with_prompt() {
-        let mut session = test_live_shell_session("remote-session://dev/stale-prose");
-        session.source = SessionSource::LiveSsh;
-        session.terminal_lines = vec![
-            "Killing the stale helper exposed another deterministic bug instead of hiding it: the 2.1.150 helper relaunched".to_string(),
-            "I added the missing runtime-key adoption: restored daemon Codex sessions now keep `codex-runtime://...`.".to_string(),
-        ];
-        session.status_line =
-            "\x1b[47;1H›\x1b[CImprove documentation in @filename\x1b[49;1H  gpt-5.5 xhigh · ~/gh/yggterm"
-                .to_string();
-
-        assert!(
-            remote_live_session_prompt_ready_replay_text(&session).is_none(),
-            "stale work-log prose plus a prompt row is not a live terminal frame"
-        );
-    }
-
-    #[test]
-    fn remote_live_session_prompt_ready_replay_accepts_cursor_addressed_default_prompt() {
-        let mut session = test_live_shell_session("remote-session://dev/default-prompt");
-        session.source = SessionSource::LiveSsh;
-        session.terminal_lines = vec![
-            "\x1b[?25h\x1b[m\x1b[H\x1b[J\x1b[2m╭─────────────────────────────────────────────╮".to_string(),
-            "│ >_ \x1b[1mOpenAI Codex\x1b[2m (v0.128.0)                  │".to_string(),
-            "│                                             │".to_string(),
-            "│ model:     \x1b[mgpt-5.5 xhigh\x1b[2m   \x1b[36;22m/model\x1b[39;2m to change │".to_string(),
-            "│ directory: \x1b[m~/gh/yggterm\x1b[2m                     │".to_string(),
-            "╰─────────────────────────────────────────────╯\x1b[8;1H\x1b[m  \x1b[1mTip:\x1b[m \x1b[3mNew\x1b[m Use \x1b[1m/fast\x1b[m to enable our fastest inference with increased plan usage.\x1b[10;1H\x1b[33m⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown.\x1b[13;1H\x1b[39;1m›\x1b[C\x1b[2mSummarize recent commits\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
-        ];
-        session.status_line = "╰─────────────────────────────────────────────╯\x1b[8;1H\x1b[m  \x1b[1mTip:\x1b[m \x1b[3mNew\x1b[m Use \x1b[1m/fast\x1b[m to enable our fastest inference with increased plan usage.\x1b[10;1H\x1b[33m⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown.\x1b[13;1H\x1b[39;1m›\x1b[C\x1b[2mSummarize recent commits\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string();
-
-        assert!(
-            remote_live_session_prompt_ready_replay_text(&session).is_none(),
-            "cursor-addressed managed metadata is not a PTY snapshot"
-        );
-    }
 
     #[test]
     fn app_control_terminal_input_preserves_remote_session_write_path() {
@@ -49619,69 +49551,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
 
-    #[test]
-    fn active_prompt_replay_does_not_fall_back_to_server_live_session_snapshot() {
-        let mut stale_active = test_live_shell_session("remote-session://dev/target");
-        stale_active.source = SessionSource::LiveSsh;
-        stale_active.terminal_lines = vec![
-            "╭─────────────────────────────────────────────╮".to_string(),
-            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
-            "│ directory: ~/gh/yggterm                     │".to_string(),
-        ];
-        stale_active.status_line.clear();
 
-        let mut current = stale_active.clone();
-        current.terminal_lines = vec![
-            "╭─────────────────────────────────────────────╮".to_string(),
-            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
-            "╰─────────────────────────────────────────────╯\x1b[13;1H›\x1b[CReview current changes\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
-        ];
-        current.status_line =
-            "\x1b[13;1H›\x1b[CReview current changes\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm"
-                .to_string();
-        let live_sessions = vec![current];
-
-        let replay = remote_live_session_prompt_ready_replay_text_for_active_session(
-            &stale_active,
-            live_sessions.iter(),
-            "remote-session://dev/target",
-        );
-
-        assert!(
-            replay.is_none(),
-            "server live-session prompt metadata must not seed xterm replay"
-        );
-    }
-
-    #[test]
-    fn active_replay_rejects_current_live_runtime_snapshot_metadata() {
-        let mut stale_active = test_live_shell_session("remote-session://dev/target");
-        stale_active.source = SessionSource::LiveSsh;
-        stale_active.terminal_lines = vec![
-            "YGGTERM_STALE_ACTIVE_COPY".to_string(),
-            "pi@dev:~/old$".to_string(),
-        ];
-        stale_active.status_line = "pi@dev:~/old$".to_string();
-
-        let mut current = stale_active.clone();
-        current.terminal_lines = vec![
-            "YGGTERM_RUNTIME_STREAM_SEQ_42".to_string(),
-            "pi@dev:~/gh/yggterm$".to_string(),
-        ];
-        current.status_line.clear();
-        let live_sessions = vec![current];
-
-        let replay = remote_live_session_prompt_ready_replay_text_for_active_session(
-            &stale_active,
-            live_sessions.iter(),
-            "remote-session://dev/target",
-        );
-
-        assert!(
-            replay.is_none(),
-            "terminal replay must come from daemon PTY bytes, not managed session metadata"
-        );
-    }
 
     #[test]
     fn active_recovery_snapshot_probe_is_disabled_for_xterm_fidelity() {
@@ -49721,43 +49591,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
 
-    #[test]
-    fn server_prompt_snapshot_replay_never_marks_terminal_ready() {
-        assert!(!server_prompt_snapshot_replay_should_start(
-            true, true, true, true, true
-        ));
-        assert!(!server_prompt_snapshot_replay_should_start(
-            true, true, true, false, true
-        ));
-        assert!(!server_prompt_snapshot_replay_should_start(
-            true, true, false, true, true
-        ));
-        assert!(!server_prompt_snapshot_replay_should_start(
-            true, true, false, false, true
-        ));
-        assert!(!server_prompt_snapshot_replay_should_start(
-            true, false, true, true, true
-        ));
-        assert!(!server_prompt_snapshot_replay_should_start(
-            false, true, true, true, true
-        ));
-        assert!(!server_prompt_snapshot_replay_should_start(
-            true, true, true, true, false
-        ));
-    }
 
-    #[test]
-    fn server_prompt_snapshot_replay_identity_tracks_recovery_attempts() {
-        let mount_identity = "remote-session://dev/abc123:7";
-        assert_eq!(
-            server_prompt_snapshot_replay_identity(mount_identity, 42, 11, Some("terminal-open-1")),
-            "server-snapshot-replay:remote-session://dev/abc123:7:42:11:terminal-open-1"
-        );
-        assert_ne!(
-            server_prompt_snapshot_replay_identity(mount_identity, 42, 11, Some("terminal-open-1")),
-            server_prompt_snapshot_replay_identity(mount_identity, 42, 11, Some("terminal-open-2"))
-        );
-    }
 
     #[test]
     fn remote_retained_surface_fault_invalidates_empty_and_idle_hosts() {
@@ -52131,136 +51965,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
         };
         assert_eq!(remote_resume_overlay_excerpt(&session), None);
     }
-    #[test]
-    fn remote_resume_overlay_seed_excerpt_uses_terminal_precis_when_preview_is_empty() {
-        let session = ManagedSessionView {
-            id: "abc".to_string(),
-            session_path: "remote-session://guihost/abc".to_string(),
-            title: "/home/user".to_string(),
-            kind: SessionKind::Codex,
-            host_label: "guihost".to_string(),
-            source: yggterm_server::SessionSource::LiveSsh,
-            backend: TerminalBackend::Xterm,
-            bridge_available: false,
-            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
-            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
-            launch_command: "codex".to_string(),
-            status_line: "ready".to_string(),
-            terminal_lines: Vec::new(),
-            rendered_sections: vec![yggterm_server::SessionRenderedSection {
-                title: "Analysis",
-                lines: vec![
-                    "This machine has ip 192.0.2.12. But I can ssh from 192.0.2.11 and the internet works."
-                        .to_string(),
-                ],
-            }],
-            preview: yggterm_server::SessionPreview {
-                older_available: false,
-                summary: vec![yggterm_server::SessionMetadataEntry {
-                    label: "Summary",
-                    value: "SSH terminal on guihost rooted at /home/user.".to_string(),
-                }],
-                blocks: Vec::new(),
-            },
-            metadata: Vec::new(),
-            terminal_process_id: None,
-            terminal_foreground_active: None,
-            terminal_window_id: None,
-            terminal_host_token: None,
-            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
-            embedded_surface_id: None,
-            embedded_surface_detail: None,
-            last_launch_error: None,
-            last_window_error: None,
-            ssh_target: Some("guihost".to_string()),
-            ssh_prefix: None,
-            stored_preview_hydrated: false,
-            working: None,
-            limit_wait: false,
-            awaiting_user_choice: false,
-            input_unanswered_ms: None,
-            agent_launch_options: Default::default(),
-            title_is_explicit: false,
-            outline_prefix: None,
-        };
-        assert_eq!(
-            remote_resume_overlay_seed_excerpt(&session).as_deref(),
-            Some(
-                "This machine has ip 192.0.2.12. But I can ssh from 192.0.2.11 and the internet works."
-            )
-        );
-        assert_eq!(remote_terminal_prefill_text(&session), None);
-    }
 
-    #[test]
-    fn remote_terminal_prefill_text_skips_fresh_start_codex_scaffold() {
-        let session = ManagedSessionView {
-            id: "fresh".to_string(),
-            session_path: "remote-session://dev/fresh".to_string(),
-            title: "Fresh Codex".to_string(),
-            kind: SessionKind::Codex,
-            host_label: "dev".to_string(),
-            source: yggterm_server::SessionSource::LiveSsh,
-            backend: TerminalBackend::Xterm,
-            bridge_available: false,
-            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
-            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
-            launch_command: "yggterm server remote start-codex fresh".to_string(),
-            status_line: "ready".to_string(),
-            terminal_lines: Vec::new(),
-            rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
-                older_available: false,
-                summary: vec![yggterm_server::SessionMetadataEntry {
-                    label: "Summary",
-                    value: "Local Codex terminal.".to_string(),
-                }],
-                blocks: vec![yggterm_server::SessionPreviewBlock {
-                    role: "USER",
-                    timestamp: "server:launch".to_string(),
-                    tone: PreviewTone::User,
-                    folded: false,
-                    lines: vec![
-                        "This Codex session stays attached to the daemon and opens inline in the main terminal viewport.".to_string(),
-                    ],
-                    kind: PreviewBlockKind::Message,
-                    activity: None,
-                }],
-            },
-            metadata: vec![yggterm_server::SessionMetadataEntry {
-                label: "Remote Launch Action",
-                value: "start-codex".to_string(),
-            }],
-            terminal_process_id: None,
-            terminal_foreground_active: None,
-            terminal_window_id: None,
-            terminal_host_token: None,
-            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
-            embedded_surface_id: None,
-            embedded_surface_detail: None,
-            last_launch_error: None,
-            last_window_error: None,
-            ssh_target: Some("dev".to_string()),
-            ssh_prefix: None,
-            stored_preview_hydrated: false,
-            working: None,
-            limit_wait: false,
-            awaiting_user_choice: false,
-            input_unanswered_ms: None,
-            agent_launch_options: Default::default(),
-            title_is_explicit: false,
-            outline_prefix: None,
-        };
-        assert_eq!(remote_terminal_prefill_text(&session), None);
-        assert_eq!(
-            remote_terminal_placeholder_text(&session, Some("Local Codex terminal.")),
-            None
-        );
-        assert_eq!(
-            remote_terminal_placeholder_text(&session, Some("Waiting on real remote output")),
-            None
-        );
-    }
 
     // XTERM-BUG: cwd-tree-expand-bypass (Bug2) — a live local agent session must not be
     // injected into the cwd tree under a COLLAPSED parent group (it bypasses the
@@ -52676,33 +52381,67 @@ Shared connection to 192.0.2.14 closed.\r\n";
         );
     }
 
-    // XTERM-BUG: idle-auto-webview (Bug7) — coerce an EMPTY Rendered webview to Terminal
-    // for a live terminal session (the auto/background re-assertion), but leave a Rendered
-    // surface with real content (the in-development codex web view) and non-live sessions alone.
+    /// A live agent row shows its TERMINAL on a restart, whatever its transcript
+    /// happens to hold.
+    ///
+    /// ⭐ The case that broke: this predicate used to take two booleans saying
+    /// whether the rendered surface was EMPTY, and only coerced when both were.
+    /// A running agent row with two tool-call blocks therefore counted as
+    /// "has real content" and kept the web page — which is what the owner
+    /// restarted into, a live terminal drawn as a chat panel holding one
+    /// collapsed work group. Capability decides now, so there is no amount of
+    /// transcript that can keep the terminal off screen.
     #[test]
-    fn auto_rendered_terminal_session_coerce_decision() {
+    fn startup_snapshot_shows_the_terminal_for_a_live_agent_row() {
         use yggterm_server::SessionSource;
-        // empty Rendered webview on a live session -> coerce to Terminal
-        assert!(auto_rendered_terminal_session_should_coerce(
-            WorkspaceViewMode::Rendered, SessionSource::LiveLocal, true, true
-        ));
-        assert!(auto_rendered_terminal_session_should_coerce(
-            WorkspaceViewMode::Rendered, SessionSource::LiveSsh, true, true
-        ));
-        // real web-view content present -> leave alone (don't break the in-dev web view)
-        assert!(!auto_rendered_terminal_session_should_coerce(
-            WorkspaceViewMode::Rendered, SessionSource::LiveLocal, false, true
-        ));
-        assert!(!auto_rendered_terminal_session_should_coerce(
-            WorkspaceViewMode::Rendered, SessionSource::LiveLocal, true, false
-        ));
-        // not Rendered, or non-live (stored/document) -> leave alone
-        assert!(!auto_rendered_terminal_session_should_coerce(
-            WorkspaceViewMode::Terminal, SessionSource::LiveLocal, true, true
-        ));
-        assert!(!auto_rendered_terminal_session_should_coerce(
-            WorkspaceViewMode::Rendered, SessionSource::Stored, true, true
-        ));
+        for source in [SessionSource::LiveLocal, SessionSource::LiveSsh] {
+            assert!(
+                startup_snapshot_should_show_terminal(
+                    WorkspaceViewMode::Rendered,
+                    source,
+                    SessionKind::ClaudeCode,
+                ),
+                "a live {source:?} agent row is a terminal row"
+            );
+        }
+        assert!(
+            startup_snapshot_should_show_terminal(
+                WorkspaceViewMode::Rendered,
+                SessionSource::LiveLocal,
+                SessionKind::Shell,
+            ),
+            "and so is a plain shell, which has nothing else to show"
+        );
+    }
+
+    /// The three things it must NOT touch.
+    #[test]
+    fn startup_snapshot_leaves_a_chosen_surface_alone() {
+        use yggterm_server::SessionSource;
+        assert!(
+            !startup_snapshot_should_show_terminal(
+                WorkspaceViewMode::Terminal,
+                SessionSource::LiveLocal,
+                SessionKind::ClaudeCode,
+            ),
+            "already showing the terminal"
+        );
+        assert!(
+            !startup_snapshot_should_show_terminal(
+                WorkspaceViewMode::Rendered,
+                SessionSource::LiveLocal,
+                SessionKind::Document,
+            ),
+            "a document IS its rendered thing, even when a recipe gives it a terminal"
+        );
+        assert!(
+            !startup_snapshot_should_show_terminal(
+                WorkspaceViewMode::Rendered,
+                SessionSource::Stored,
+                SessionKind::ClaudeCode,
+            ),
+            "a stored row has no runtime to hand over to"
+        );
     }
 
     #[test]
@@ -53350,24 +53089,6 @@ Updated at   Branch  Conversation\n\
     fn suppress_resume_output_allows_live_codex_prompt_surface() {
         assert!(!should_suppress_remote_resume_surface_output(
             true, false, false, true, false, false, true, true, false, false, false, false, false,
-        ));
-    }
-    #[test]
-    fn suppress_stale_remote_idle_after_server_prompt_blocks_card_overwrites() {
-        assert!(should_suppress_stale_remote_idle_after_server_prompt(
-            true, true, false, true, false, false, false,
-        ));
-        assert!(should_suppress_stale_remote_idle_after_server_prompt(
-            true, true, false, false, false, true, false,
-        ));
-        assert!(!should_suppress_stale_remote_idle_after_server_prompt(
-            true, false, false, true, false, false, false,
-        ));
-        assert!(!should_suppress_stale_remote_idle_after_server_prompt(
-            true, true, true, true, false, false, false,
-        ));
-        assert!(!should_suppress_stale_remote_idle_after_server_prompt(
-            false, true, false, true, false, false, false,
         ));
     }
     #[test]
