@@ -17857,14 +17857,22 @@ fn terminal_open_external_url(url: &str) -> bool {
     if !valid {
         return false;
     }
+    // ⛔ REAPED, NOT JUST LAUNCHED. `spawn()` alone left the browser launcher as
+    // a zombie under the GUI for as long as the GUI lived — one per clicked
+    // link, forever. `spawn_and_reap` is the same launch with the wait attached;
+    // see `yggterm_core::child_reaper` for the measurement that found this class.
     #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open").arg(trimmed).spawn();
+    let result = yggterm_core::child_reaper::spawn_and_reap(
+        std::process::Command::new("xdg-open").arg(trimmed),
+    );
     #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(trimmed).spawn();
+    let result = yggterm_core::child_reaper::spawn_and_reap(
+        std::process::Command::new("open").arg(trimmed),
+    );
     #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", "", trimmed])
-        .spawn();
+    let result = yggterm_core::child_reaper::spawn_and_reap(
+        std::process::Command::new("cmd").args(["/C", "start", "", trimmed]),
+    );
     result.is_ok()
 }
 

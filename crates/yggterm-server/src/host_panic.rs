@@ -471,10 +471,15 @@ pub fn notify_owner(home: &Path, incident: &ytrace::diagnosis::Incident) {
     if let Some(row) = incident.subject.as_deref() {
         cmd.args(["--session", row]);
     }
-    let _ = cmd
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    // ⛔ REAPED, NOT JUST LAUNCHED. This was `let _ = cmd.spawn()`, and a
+    // dropped `Child` is never waited on — so every fifteen-minute notification
+    // left a permanent zombie in the daemon's process table. Measured
+    // 2026-08-21: 79 of them under a daemon that had been up 19.9 hours, the
+    // oldest exactly as old as the daemon. See `yggterm_core::child_reaper`.
+    let _ = yggterm_core::child_reaper::spawn_and_reap(
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
 }
 
 fn short_reason(incident_id: &str) -> &str {
