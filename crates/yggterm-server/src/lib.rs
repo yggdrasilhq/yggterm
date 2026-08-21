@@ -157,7 +157,8 @@ pub use daemon::{
     release_profile_write_lock,
     current_client_identity, parse_client_role, set_client_identity,
     verify_shadow_client_can_attach,
-    DRAFT_REFUSAL_MESSAGE, DaemonCensusRow, DaemonSelectorKind, daemon_census,
+    DRAFT_REFUSAL_MESSAGE, DaemonCensusRow, DaemonNameVerdict, DaemonSelectorKind,
+    HostDaemonCensus, StrandedDaemonRow, daemon_census, daemon_coverage_verdict,
     format_daemon_census, format_daemon_census_with_queued_swap, resolve_daemon_endpoint_selector,
     terminal_submit_landed, terminal_submit_was_refused_for_line, terminal_write_guarded,
     terminal_write_guarded_full,
@@ -24053,11 +24054,15 @@ pub fn run_row_drafts() -> anyhow::Result<()> {
         // could not be read, so coverage is UNVERIFIED rather than complete.
         "daemon_processes_on_host": daemon_pids.as_ref().map(|pids| pids.len()),
         "daemons_running_but_never_reached": unreached,
-        "coverage": match daemon_pids.as_ref() {
-            None => "unverified — this host's process table could not be read",
-            Some(_) if unreached.is_empty() => "every daemon process on this host answered",
-            Some(_) => "INCOMPLETE — a daemon is running that this sweep never reached; its sessions are unexamined, not clean",
-        },
+        // ⛔ ONE WORDING, ONE OWNER. This verb and `server daemons` ask the same
+        // question of the same host, and the moment they phrase it differently a
+        // reader has to work out whether the difference is real. The nuance this
+        // sweep adds — an unasked daemon is not a CLEAN one — is in `answers`
+        // above, where it belongs, rather than in a second copy of the verdict.
+        "coverage": daemon::daemon_coverage_verdict(
+            daemon_pids.as_ref().map(|pids| pids.len()),
+            unreached.len(),
+        ),
         "daemons_or_rows_unable_to_answer": unable,
         "sessions_answered": answered_sessions,
         "drafts_present": drafted.len(),
