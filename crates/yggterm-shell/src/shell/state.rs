@@ -81681,10 +81681,18 @@ async fn process_pending_app_control_requests(
                     // first half a busy row mid-output would be called wedged,
                     // which is the false positive that would justify a reaper
                     // killing live work.
+                    // ⛔ AND THE THIRD HALF: the composer must have been READ.
+                    // `composer_held_draft` is tri-state, and an unreadable one
+                    // used to arrive here as `false` — so a row nobody could
+                    // read was called WEDGED, a positive claim, carrying a
+                    // remedy that RESTARTS it. A blind reading may not license a
+                    // restart of a live agent row.
                     "wedged": !verdict.consuming_input
                         && verdict.composer_shown
-                        && !verdict.composer_held_draft,
+                        && verdict.composer_held_draft == Some(false),
                     "composer_shown": verdict.composer_shown,
+                    // true · false · null — null is "nobody could say", which is
+                    // NOT permission and never was.
                     "composer_held_draft": verdict.composer_held_draft,
                     "waited_ms": verdict.waited_ms,
                     // ⛔ LIVENESS IS NOT PROGRESS, and this field exists because
@@ -81695,7 +81703,9 @@ async fn process_pending_app_control_requests(
                     "activity": verdict.activity.wire_name(),
                     "answers": "whether bytes reach this row, and what its CLI chrome says it is doing — NOT whether its work is finished or correct",
                     "reason": verdict.reason,
-                    "remedy": if !verdict.consuming_input && verdict.composer_shown && !verdict.composer_held_draft {
+                    "remedy": if !verdict.consuming_input
+                        && verdict.composer_shown
+                        && verdict.composer_held_draft == Some(false) {
                         Some("server terminal restart '<session>' clears the wedge with the transcript intact")
                     } else {
                         None
