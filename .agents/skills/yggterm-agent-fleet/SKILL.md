@@ -3268,6 +3268,24 @@ PASSES ANYWAY.** Measured 2026-08-22 spawning a successor onto the same machine
 - **Fix:** spawn WITHOUT `--no-activate`. The identical brief into an identical row then
   answers `consuming_input:true`, takes the submit, and grows its transcript from 38 KB to
   252 KB in sixty seconds with twenty assistant turns.
+- ⛔⛔ **CORRECTION, SAME DAY: `--no-activate` IS NOT THE ONLY CAUSE, AND THE TWO FAILURES NEED
+  OPPOSITE REMEDIES.** A later spawn WITHOUT `--no-activate` produced the same symptom at the
+  transcript — ACK present, **zero assistant entries**, no growth. It was a different fault,
+  and `input-check` is what tells them apart:
+
+  | | wedged resume | plain stall |
+  |---|---|---|
+  | `consuming_input` | **false** | **true** |
+  | `composer_shown` | false | true |
+  | screen | parked on *"Daemon PTY: request main viewport terminal stream"* | normal composer |
+  | `submit` / `send` | both **refused** | accepted |
+  | remedy | respawn without `--no-activate` | **one `continue`** — it woke in 4 turns |
+
+  ⇒ **Read `input-check` BEFORE choosing a remedy.** Respawning a merely-stalled row throws
+  away a live agent that one word would have started; sending `continue` to a wedged one
+  cannot be delivered at all. ⚠ The transcript symptom is IDENTICAL in both cases, which is
+  why the ACK check alone cannot route you — it tells you the brief arrived, and both of these
+  are failures *after* arrival.
 - ⛔ **So §3 step 4 is necessary and NOT sufficient.** The ACK token proves the brief was
   DELIVERED; it does not prove the agent ever RAN. A transcript that contains your token and
   nothing but `user`/metadata entries is a row that took your brief and died holding it.
