@@ -4043,6 +4043,50 @@ orchestrator sampling loop — pays for its readings in his typing latency. This
 large win left in the input lane and it needs no product change: it is a question of how often we
 ask, and whether a read has to cross the UI thread at all.
 
+### ⭐ STILL TRUE SEVEN BUILDS LATER — measured per build 2026-08-22, and the per-build split matters
+
+⛔ **Read this table by ROW, never summed.** A retained trace spans several builds and a fixed bug
+keeps testifying from the archive; two headlines were drawn from the pooled file this night and
+both were false. See the ytrace notes, *a trace file outlives the build that wrote it*.
+
+| build | window | `ui/block` incidents | rate | blocked total | worst |
+|---|---:|---:|---:|---:|---:|
+| 3.1.32 | 37 min | 64 | 1.73/min | 36.0 s | 5857 ms |
+| 3.1.33 | 19 min | 38 | 1.97/min | 16.4 s | 3533 ms |
+| 3.1.34 | 14 min | 40 | 2.86/min | 24.2 s | 3378 ms |
+| 3.1.35 | 49 min | 40 | 0.81/min | 34.8 s | 5812 ms |
+| 3.1.36 | 21 min | 34 | 1.66/min | 28.1 s | 5169 ms |
+| 3.1.37 | 10 min | 8 | 0.80/min | 6.2 s | 3338 ms |
+
+⇒ The class is not closed. On the newest build **3 of 8 blocks still follow `app_control/*`** —
+`request_begin` ×2 and `watchdog_spawned` ×1 — and the probe rate that produces them is
+**288 `describe_rows` requests in the first 22 minutes of that build, a sustained 10–27 per minute
+with a median gap of 1.6 s.** ⚠ n=8 on a 10-minute window: the rate is a reading, not a trend.
+
+⚠ **And the orchestrator sampling loop is part of the traffic it is measuring** — a census sweep, a
+spawn's input-check and a fold each cross this path. The instrument and the load remain the same
+traffic, which is what makes the fix a question of cadence and of whether a read must cross the UI
+thread at all, not of anyone probing less carefully.
+
+⛔ **The `ui/block` filter that reads correctly is `payload.incident == true`.** `payload.kind` is
+`"fault"`, and filtering on `kind == "incident"` — which is what a reader naturally tries, and what
+one campaign note still says — returns **zero** over a plane holding 235 of them. Every block is
+also written twice, once as the LLM-facing complaint record and once as a bare duration record, so
+an unfiltered count doubles.
+
+### ⭐ THE DECLARE PROBE'S CADENCE IS NOW EXACT — a correct negative, re-asked every minute, per row
+
+The fix direction *"a cached negative for the declare probe"* recorded elsewhere in this file now
+has its number. Over 3.5 h on the GUI host: **7,718 `app_declare/daemon_declare_absent` events
+across 45 distinct session paths — a median inter-arrival of 60.1 s per path**, i.e. one poll per
+row per minute, every minute, for an answer that has never once changed. The daemon side of the
+same ladder is **15,439 `terminal_app_declares` round trips**, and the pair costs **8.3% of the
+trace plane's bytes** on a plane whose retention is a byte budget everyone shares.
+
+⇒ It is not a fault and every individual answer is right; the SERIES is the defect. A plain agent
+row has no sidebar declare and never will, so the negative is cacheable until the row declares —
+and a declare arrives as an event the daemon already receives, so nothing needs polling at all.
+
 ⚠ **Partly self-inflicted, and it must be said.** A scan that reads every seated row one request
 at a time is the worst available shape, and one seat ran two of them the day this was measured.
 
