@@ -357,8 +357,17 @@ the name whenever the census cannot be read.
 
 ⭐⭐ **AND PREVENTION RESCUES NOBODY, SO THE DAEMON TAKES ITS NAME BACK.** An unlinked socket
 inode cannot be re-linked to a path by anything, so every daemon already stranded stays stranded
-under prevention alone — the memory finding said outright that they *"cannot be rescued by
-anything"*, and that is now false. A live daemon re-binds its own versioned name. Reclaiming it is
+under prevention alone. A live daemon re-binds its own versioned name instead.
+
+⚠⚠ **AND THE LIMIT ON THAT, STATED BEFORE IT IS BELIEVED.** The reclaim runs INSIDE the daemon
+whose name was taken, so it rescues a daemon that is itself running this build and nobody else.
+The memory finding says stranded daemons *"cannot be rescued by anything"* — that becomes false
+for daemons carrying the fix and stays TRUE for the ones already stranded today, which are running
+older binaries with no reclaim thread in them. ⇒ **The daemon measured on the build host at 29 h
+and 80 pty masters is not saved by this.** Its rows have to be moved or they die with it. What the
+fix guarantees is that the next generation of daemons cannot be put in that position, by either
+half: prevention stops a fixed daemon taking anyone's name, and the reclaim gets a fixed daemon's
+name back if an older one takes it. Reclaiming it is
 a complete cure because everything that looks for a daemon looks by name —
 `reachable_versioned_daemon_statuses` dials the versioned paths, the bridge resolver asks those
 daemons which one owns a runtime key, and the cross-daemon reconcile addresses siblings the same
