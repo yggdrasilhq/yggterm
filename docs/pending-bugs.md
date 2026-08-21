@@ -364,6 +364,46 @@ fleet, not the edge one. Additive and asked-for instead: the predecessor sets `p
 an older successor ignores an unknown field, and the successor answers **only when asked**, so an
 older predecessor never sees a line where it expects its ack.
 
+#### LIVE, 2026-08-22 — two real daemons of different builds, in a throwaway home
+
+*Nothing below touched the real daemon or the desktop GUI: every process ran under a private
+`YGGTERM_HOME`, and every kill was gated on `/proc/<pid>/environ` naming that same home.*
+
+**Both compatibility directions, each a full retirement sweep with a live `bash` on a real PTY:**
+
+| | predecessor | successor | result |
+|---|---|---|---|
+| new code asks, old peer cannot answer | new @ 3.1.30 | **pre-fix** @ 3.1.37 | `AllMoved { moved: 1 }` · `precommit:"one_silence"` · adopted, persisted, `bytes_stolen_after_park: 0` |
+| old peer never asks, new code must not volunteer | **pre-fix** @ 3.1.37 | new @ 3.1.38 | `AllMoved { moved: 1 }` · adopted, persisted, settled — **no "unreadable ack"**, which is the direction that fails silently |
+| both new | new @ 3.1.30 | new @ 3.1.38 | `AllMoved` · `precommit:"speaks"` — the step fires and changes nothing about a clean handover |
+
+⭐ `one_silence` rather than `silent` on a one-session sweep is the two-strike rule reporting
+honestly that it has not yet decided whether the peer is old or merely busy.
+
+**The refusal itself, asked of a live daemon that owned the contested key — and no descriptor was
+ever offered on any of these connections, so a refusal here provably landed while the master was
+still the sender's:**
+
+```text
+A. contested key, verdict asked  -> {"precommit":true,"proceed":false,"error":"refusing to adopt …"}
+B. VACANT key, verdict asked     -> {"precommit":true,"proceed":true}
+C. contested key, NOT asked      -> {"adopted":false,"error":"refusing to adopt …"}      ← an ACK, not a verdict
+```
+
+and the daemon's own trace for the three, in order:
+
+```text
+pty_handoff_refused {"before_commit": true,  "error": "refusing to adopt …"}
+pty_handoff_refused {"before_commit": false, "error": "receiving master fd: no ancillary data arrived — the fd did NOT travel"}
+pty_handoff_refused {"before_commit": true,  "error": "refusing to adopt …"}
+```
+
+⭐ **B is a negative control that earns its keep twice.** A vacant key proceeds, so the refusal in
+A is not a daemon refusing everything — and because the probe then never sent the fd, the
+descriptor-stage failure is booked `before_commit: false`, proving that counter is not simply
+`true` for everything that fails early. The daemon was alive with all four of its masters after
+all three refusals.
+
 **Regression locks** (`terminal.rs`, real socket, real `bash`, real `serve_handoff`):
 `a_refused_handoff_is_answered_before_the_descriptor_moves` — asserts `committed == false` AND
 that the predecessor's own master still makes its shell **evaluate** arithmetic afterwards;
@@ -385,12 +425,23 @@ own resume, and the wrapper correctly refuses to start a second one:
 second resume, which would corrupt the transcript. Waiting 24s so far.
 ```
 
-⇒ **That is the deadlock, and (a) is what supplies it with victims.** `probe_socket_occupancy`
-already exists to stop a name being taken from a daemon that merely failed to answer — but
-`refresh_legacy_server_socket_aliases` skips that probe entirely on its
-`versioned_socket_candidate_is_symlink` branch, so once a name has been taken ONCE it is
-re-pointed for ever and the daemon behind it can never get it back. **This half is not fixed here
-and needs its own lane.**
+⇒ **That is the deadlock, and (a) is what supplies it with victims.**
+
+⚠ **What is MEASURED and what is only INFERRED, kept apart on purpose.** Measured: the daemon is
+live, holds its masters, is bound to the inode that carried its versioned name, and that name is
+now a symlink to the newest daemon — so nothing can dial it. Also measured, by reading:
+`refresh_legacy_server_socket_aliases` runs `probe_socket_occupancy` before unlinking a real
+socket file, but its `versioned_socket_candidate_is_symlink` branch re-points a name with **no
+probe at all** — so once a name has become a symlink the daemon behind it can never reclaim it,
+even alive and answering.
+
+⛔ **NOT established: which path took the name the FIRST time.** The symlink branch perpetuates
+the loss; it is not proof of the theft, because a symlink is no longer anyone's bound socket by
+the time it is seen. The candidates are the non-symlink path (a probe that read
+`StructurallyAbsent` for a daemon that was merely slow — but that probe is exactly what
+`only_a_structurally_absent_socket_may_have_its_name_taken` guards), and a rename that happened
+before that guard shipped. **Whoever takes this half must settle that before building on it** —
+repeating an unmeasured root is how a lane spends itself on the wrong function.
 
 ### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 
