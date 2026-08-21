@@ -23112,3 +23112,35 @@ own the session says exactly that instead of returning an empty screen.
 **Falsified by:** a superseded daemon that is still reachable at its own socket path while it
 holds sessions, or a redirected screen read that reports "not my session" rather than an
 empty one.
+## [11.9] THE CLI-PRESENCE PROBE READS THE NON-LOGIN PATH, SO EVERY REMOTE MACHINE UNDERSTATES WHAT IT HAS
+
+**Status:** OPEN
+
+The Agent CLI installation matrix asks each machine "which agent CLIs are on your
+`PATH`" by running `server remote cli-presence` over ssh. That call is assembled by
+`run_remote_yggterm_command` -> `run_remote_binary_command_with_timeout`, which builds a
+bare `Command::new("ssh")` in `crates/yggterm-server/src/lib.rs`. No login shell.
+
+The LAUNCH path deliberately does the opposite. Every remote launch funnels through
+`assemble_remote_ssh_command` -> `login_shell_wrap` -> `exec bash -lc`, and the test
+`remote_launch_commands_run_under_login_shell_for_path_parity` asserts it. Its own
+comment gives the reason: the handoff must resolve the same CLI an interactive ssh
+would, "not the non-login PATH that shadows it". `login_shell_wrap` has exactly ONE
+call site, and the presence probe is not it.
+
+=> The two halves answer the same question against different `PATH`s, and the probe
+uses the one the launch path was explicitly built to reject.
+
+**Observed.** A machine that reports 10/10 when it probes itself locally reports 1/10
+when the GUI probes it over ssh -- same machine, same instant, and the rendered matrix
+faithfully shows the lower number. At that moment an agent CLI the matrix listed as
+missing on that machine was running a live session there, launched by yggterm itself.
+
+**Why it matters beyond a wrong number.** The matrix drives an install offer for
+third-party programs. Understated presence invites the user to install CLIs that are
+already installed.
+
+**The shape of the fix.** Route the presence probe through the same login-shell wrap
+the launch path uses, so one `PATH` answers both questions. **Falsified by:** probing a
+machine whose CLIs sit on a login-only `PATH` entry and seeing the matrix disagree with
+that machine's own local self-report.
