@@ -581,6 +581,14 @@ def harvest(row, verdict, why):
         if w.get("branch"):
             fh.write(f"* branch: {w['branch']} — {w.get('unlanded', 0)} unlanded, "
                      f"{w.get('dirty', 0)} uncommitted at fold time\n")
+        if w.get("wip_snapshot"):
+            # The note is what a successor reads. A forced fold's uncommitted
+            # work is invisible in `git log` until someone applies the snapshot,
+            # so the note has to say the snapshot exists or it may as well not.
+            fh.write(f"* ⚠ UNCOMMITTED WORK WAS SNAPSHOTTED, NOT COMMITTED: "
+                     f"{w['wip_snapshot']} — recover it with "
+                     f"`git stash apply <sha>` in that checkout, review it, and "
+                     f"commit it under this seat's name\n")
         if row.get("last"):
             fh.write(f"\nits last words:\n\n> {row['last']}\n")
     return path
@@ -749,7 +757,50 @@ def fold(row, verdict, why, host, apply_it, force=False):
         log(f"     That is work only its author can commit, and folding destroys it.")
         if not force:
             return False
-        log(f"     --force: folding anyway, and those {dirty} file(s) are being lost")
+        # ⛔⛔ AND UNDER --force IT MUST NOT SIMPLY ANNOUNCE THE LOSS.
+        #
+        # This branch used to log "those N file(s) are being lost" and reap. Two
+        # things were wrong with that, and the second is the dangerous one:
+        #
+        #  · it was FALSE — reaping a process does not delete a working tree, so
+        #    the files were still there and the operator was told they were not;
+        #  · a truthful-sounding loss notice is a reason to stop looking. The
+        #    one thing that could still rescue the work is somebody opening that
+        #    tree, and the message says there is nothing to open.
+        #
+        # Measured 2026-08-21: a fold forced at seat 11.25 printed that line over
+        # 1,184 lines of a lane's finished, compiling work — a whole new trace
+        # module among them — which survived only because the operator went and
+        # looked anyway.
+        #
+        # ⇒ Snapshot it. A WIP commit is authored by nobody and claims nothing;
+        #   it just means the next reader finds the work in `git log` instead of
+        #   in a tree they have to know to visit.
+        snap = subprocess.run(["git", "-C", cwd, "stash", "create"],
+                              capture_output=True, text=True, timeout=120)
+        sha = (snap.stdout or "").strip()
+        if sha:
+            # ⚠ `stash create` builds the commit and does NOT touch the stash
+            # stack or the working tree — deliberate: the stack is shared across
+            # every worktree on this machine and popping another session's entry
+            # is its own way to destroy work. Tag it so it survives gc and can
+            # be found by name.
+            #
+            # ⛔ A PLAIN REF, NOT A TAG. This fleet sets `tag.forceSignAnnotated`,
+            # which turns `git tag -f <name> <sha>` into an ANNOTATED tag and
+            # makes it die on `fatal: no tag message?` — a failure that reads
+            # like the sha was bad rather than like a config preference. A ref
+            # under refs/ pins the commit against gc just as well and cannot be
+            # reshaped by anybody's tag settings.
+            ref = f"refs/fold-wip/{row['uuid'][:8]}"
+            subprocess.run(["git", "-C", cwd, "update-ref", ref, sha],
+                           capture_output=True, text=True, timeout=120)
+            row["work"]["wip_snapshot"] = f"{ref} ({sha[:8]})"
+            log(f"     --force: snapshotted {dirty} uncommitted file(s) at {ref} ({sha[:8]})")
+            log(f"     recover with: git -C {cwd} stash apply {sha[:8]}")
+        else:
+            log(f"     ⛔ --force: could not snapshot {dirty} file(s) — they are "
+                f"UNCOMMITTED IN {cwd} and only that tree holds them")
     if unlanded and apply_it:
         # Committed work leaves the machine before the row does. Landing needs
         # guards this tool does not run, so it PUSHES and records the branch —
