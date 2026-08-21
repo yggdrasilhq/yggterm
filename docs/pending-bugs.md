@@ -375,12 +375,23 @@ own resume, and the wrapper correctly refuses to start a second one:
 second resume, which would corrupt the transcript. Waiting 24s so far.
 ```
 
-⇒ **That is the deadlock, and (a) is what supplies it with victims.** `probe_socket_occupancy`
-already exists to stop a name being taken from a daemon that merely failed to answer — but
-`refresh_legacy_server_socket_aliases` skips that probe entirely on its
-`versioned_socket_candidate_is_symlink` branch, so once a name has been taken ONCE it is
-re-pointed for ever and the daemon behind it can never get it back. **This half is not fixed here
-and needs its own lane.**
+⇒ **That is the deadlock, and (a) is what supplies it with victims.**
+
+⚠ **What is MEASURED and what is only INFERRED, kept apart on purpose.** Measured: the daemon is
+live, holds its masters, is bound to the inode that carried its versioned name, and that name is
+now a symlink to the newest daemon — so nothing can dial it. Also measured, by reading:
+`refresh_legacy_server_socket_aliases` runs `probe_socket_occupancy` before unlinking a real
+socket file, but its `versioned_socket_candidate_is_symlink` branch re-points a name with **no
+probe at all** — so once a name has become a symlink the daemon behind it can never reclaim it,
+even alive and answering.
+
+⛔ **NOT established: which path took the name the FIRST time.** The symlink branch perpetuates
+the loss; it is not proof of the theft, because a symlink is no longer anyone's bound socket by
+the time it is seen. The candidates are the non-symlink path (a probe that read
+`StructurallyAbsent` for a daemon that was merely slow — but that probe is exactly what
+`only_a_structurally_absent_socket_may_have_its_name_taken` guards), and a rename that happened
+before that guard shipped. **Whoever takes this half must settle that before building on it** —
+repeating an unmeasured root is how a lane spends itself on the wrong function.
 
 ### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 
