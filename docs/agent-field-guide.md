@@ -2088,3 +2088,32 @@ happened most recently before the block, so the most FREQUENT event wins by acci
 Across a sample it was `None` for half the blocks, with four different named
 activities splitting the rest — one payload read alone would have named a culprit that
 is not one.
+
+## Group incidents by `app_version` before comparing anything to a bar (2026-08-21)
+
+A fleet mid-roll has several builds emitting into ONE incident stream. So a window
+chosen by wall clock reports whatever mix of versions it happens to span, and
+attributes it to the version running now.
+
+⛔ **This is how a FIXED class reads as a live one.** Measured the same day, one class
+read **0.81/min** across a straddling two-hour window and **0.00/min** once split by
+emitter version — and a queue entry was edited to say the class was firing on the
+strength of the first number.
+
+```sh
+ytrace incidents --since 6h --json \
+  | python3 -c '...bucket by i["app_version"], and divide by that bucket's OWN span...'
+```
+
+Divide by the bucket's own first-to-last span, not by the window you asked for, or a
+version that only appears for two minutes reports an enormous rate.
+
+⚠ It cuts both ways, and both halves cost real time in one session:
+- proving an alarm **stopped** needs the emitter version, because the retiring daemon
+  keeps emitting for seconds after its successor binds;
+- proving one is **still firing** needs it too, because old builds in the window answer
+  for the new one.
+
+⇒ **A window that spans a roll describes the roll.** Check what the running build
+actually contains by ANCESTRY (`git merge-base --is-ancestor <fix> <release>`), never by
+comparing version strings — and then read only the window that build owns.
