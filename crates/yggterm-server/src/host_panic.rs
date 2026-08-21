@@ -456,10 +456,11 @@ pub fn local_host_label() -> String {
 /// ⭐ `--session` is what makes this an ADDRESS rather than an announcement: the
 /// card lands pointing at the row that caused the trouble, so the next action is
 /// one click away instead of a search.
-pub fn notify_owner(home: &Path, incident: &ytrace::diagnosis::Incident) {
-    let Some(binary) = installed_binary(home) else {
-        return;
-    };
+/// Returns the pid of the notification process, so a caller — or a lock — can
+/// name the thing that was launched instead of counting the population it
+/// landed in. `None` means no process was started.
+pub fn notify_owner(home: &Path, incident: &ytrace::diagnosis::Incident) -> Option<u32> {
+    let binary = installed_binary(home)?;
     let mut cmd = std::process::Command::new(binary);
     cmd.args(["server", "app", "notify"])
         .arg(format!("Client host: {}", short_reason(&incident.id)))
@@ -476,10 +477,11 @@ pub fn notify_owner(home: &Path, incident: &ytrace::diagnosis::Incident) {
     // left a permanent zombie in the daemon's process table. Measured
     // 2026-08-21: 79 of them under a daemon that had been up 19.9 hours, the
     // oldest exactly as old as the daemon. See `yggterm_platform::child_reaper`.
-    let _ = yggterm_platform::child_reaper::spawn_and_reap(
+    yggterm_platform::child_reaper::spawn_and_reap(
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
-    );
+    )
+    .ok()
 }
 
 fn short_reason(incident_id: &str) -> &str {
@@ -546,28 +548,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn notify_owner_reaps_the_notification_child() {
-        fn own_zombie_children() -> usize {
+        /// The state of one pid as a child of THIS process: `Some('Z')` for a
+        /// zombie we are still the parent of, `Some(other)` while it lives,
+        /// `None` once it is gone or was never ours.
+        fn state_of_our_child(pid: u32) -> Option<char> {
             let me = std::process::id();
-            let Ok(entries) = std::fs::read_dir("/proc") else {
-                return 0;
-            };
-            entries
-                .flatten()
-                .filter(|entry| {
-                    let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                        return false;
-                    };
-                    // `pid (comm) state ppid ...`, and comm may contain spaces
-                    // and parentheses, so split after the LAST ')'.
-                    let Some((_, rest)) = stat.rsplit_once(')') else {
-                        return false;
-                    };
-                    let mut fields = rest.split_whitespace();
-                    let state = fields.next().unwrap_or("");
-                    let ppid = fields.next().unwrap_or("");
-                    state == "Z" && ppid.parse::<u32>().ok() == Some(me)
-                })
-                .count()
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // `pid (comm) state ppid ...`, and comm may contain spaces and
+            // parentheses, so split after the LAST ')'.
+            let (_, rest) = stat.rsplit_once(')')?;
+            let mut fields = rest.split_whitespace();
+            let state = fields.next()?.chars().next()?;
+            let ppid: u32 = fields.next()?.parse().ok()?;
+            (ppid == me).then_some(state)
         }
 
         let home = std::env::temp_dir().join(format!("ygg-reaplock-{}", std::process::id()));
@@ -578,10 +571,6 @@ mod tests {
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("make the stub executable");
 
-        // Other tests in this binary may hold transient children of their own,
-        // so the claim is "this call adds no PERMANENT zombie", measured
-        // against a baseline rather than against zero.
-        let baseline = own_zombie_children();
         let incident = ytrace::diagnosis::Incident {
             id: "host_panic_memory".to_string(),
             kind: ytrace::diagnosis::IncidentKind::Resource,
@@ -593,23 +582,33 @@ mod tests {
             subject: None,
             suggested_queries: Vec::new(),
         };
-        notify_owner(&home, &incident);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut settled = false;
-        while std::time::Instant::now() < deadline {
-            if own_zombie_children() <= baseline {
-                settled = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let leaked = own_zombie_children();
+        let pid = notify_owner(&home, &incident);
         let _ = std::fs::remove_dir_all(&home);
-        assert!(
-            settled,
-            "notify_owner left a zombie behind: {leaked} zombie children against a \
-             baseline of {baseline}"
+
+        // ⛔ CONTROL FIRST. Without this the whole test passes when nothing was
+        // launched at all, which is the shape a reaping lock is most likely to
+        // rot into.
+        let pid = pid.expect("notify_owner must report the pid it launched");
+
+        // ⛔ ASK ABOUT THIS PID, NEVER COUNT THE POPULATION. The first version
+        // of this lock counted zombie children of the whole test process
+        // against a baseline snapshot — which passes alone and FAILS in the
+        // suite, because 1,200 sibling tests spawn and reap children of the
+        // same process throughout the window. A lock that goes red on its
+        // neighbours' work teaches people to re-run it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match state_of_our_child(pid) {
+                Some('Z') => std::thread::sleep(std::time::Duration::from_millis(20)),
+                // Gone: waited on and cleared, which is the whole claim.
+                None => return,
+                // Still running; the reaper thread is parked on it.
+                Some(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        panic!(
+            "notify_owner left pid {pid} as a zombie child for 15s — the Child was \
+             dropped instead of waited on",
         );
     }
 

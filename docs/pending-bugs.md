@@ -1225,11 +1225,23 @@ the codebase at once by turning them into `ECHILD`.
 
 ### The locks, and what each one can and cannot see
 
-⭐ **The daemon call site is a proven lock, not an assumed one.**
-`notify_owner_reaps_the_notification_child` drives the real production function
-against a stub binary in a fake home and counts zombie children of the test process.
-It was falsified by reverting `notify_owner` to `let _ = cmd.spawn()`, and it failed
-with *"left a zombie behind: 1 zombie children against a baseline of 0"*.
+⭐ **The daemon call site is a proven lock — but its first version was flaky in the
+one place that matters, and the reason is a law.** It drove the real production
+function against a stub binary in a fake home, then **counted zombie children of the
+whole test process against a baseline snapshot**. That passes when the test is run
+alone, which is how it was verified, and FAILS in the suite: *"left a zombie behind: 3
+zombie children against a baseline of 0"* — while `notify_owner` spawns exactly ONE
+child. The other two belonged to sibling tests, because 1,200 tests in one binary
+spawn and reap children of that same process throughout the fifteen-second window.
+
+⛔ **A lock that goes red on its neighbours' work is worse than no lock; it teaches
+people to re-run.** The cure is the campaign's own rule — **identify, do not count.**
+`notify_owner` now returns the pid it launched (useful in its own right: the function
+previously swallowed what it started), and the lock watches THAT pid until it is gone
+or fails it if it sits in `Z`. It asserts the pid was reported at all before it starts,
+so it cannot pass by nothing having been launched. Falsified by restoring the dropped
+`Child` while still reporting a pid: *"left pid 3725640 as a zombie child for 15s"*.
+Green in the full 1,223-test suite afterwards.
 
 ⭐ **The GUI call sites are locked structurally, because behaviourally they cannot
 be.** They shell out to `notify-send` and `ghostty` by name, so exercising them means
@@ -1246,9 +1258,18 @@ now assembled rather than written out.
 
 ⛔ **"The new daemon holds zero zombies" proves nothing on its own.** A daemon that
 never notified also holds zero, and the fifth daemon in the table above is exactly
-that case. The control is the daemon's own trace: replay its
-`daemon/heartbeat/panic` events at severity `error` through the fifteen-minute
-cooldown, and that count is how many notifications it really spawned.
+that case. The control has to establish that notifications actually happened.
+
+⭐ **The daemon now says so directly, which it did not before.** `notify_owner`
+returns the pid it launched and the watcher writes `daemon/heartbeat/notify_spawned`
+with that pid — so the count of real launches is READ, not inferred. Until this
+landed the only way to get it was to replay the `panic` events through the
+fifteen-minute cooldown in your head, which is inference, and inference was the
+weakest link in this very falsifier. ⚠ The event is written on the failure path too,
+with a null pid; **filter on `spawned`, not on the event's existence.**
+
+⇒ On a daemon that predates that event, the replay is still the fallback: take its
+`daemon/heartbeat/panic` events at severity `error` and apply the cooldown.
 
 ⇒ **On a daemon built from this commit:** notifications-spawned must be at least 3
 (so, past 46 minutes of uptime on a host under load) AND
@@ -1257,11 +1278,35 @@ probe against an older daemon on the same host still counts its accumulated pile
 Old daemons keep their zombies until they exit; that is expected and is not a failed
 fix.
 
-**Run green on an isolated daemon 2026-08-21** — a daemon built from this commit,
-started with its own `YGGTERM_HOME` so it could not touch the fleet, observed
-continuously through `/proc/<pid>/task/*/children` (an observer that spawns nothing,
-so it cannot contribute to the table it measures). RESULT PENDING IN THIS ENTRY UNTIL
-THE OBSERVATION WINDOW CLOSES — see the relay note if this line is still here.
+**RUN GREEN ON AN ISOLATED DAEMON 2026-08-21.** A daemon built from this commit,
+started with its own `YGGTERM_HOME` so it could not touch the fleet, watched
+continuously through `/proc/<pid>/task/*/children` — an observer that spawns nothing of
+its own, so it cannot contribute to the table it is measuring.
+
+| | |
+|---|---|
+| daemon uptime at the end of the window | **47.7 min** |
+| notifications it really spawned | **4** (15-minute spacing, first one at start) |
+| notification children caught in the act | **3** (the first predates the observer) |
+| longest any of them was seen in state `Z` | **never observed in `Z` at all** |
+| zombies the daemon holds | **0** |
+| other children observed in the same window | 41, of which 6 passed transiently through `Z` and every one cleared |
+
+Each notification child appeared at the same second its notification was decided
+(17:56:48.680, 18:11:50.067, 18:26:51.491), lived about seven tenths of a second, and
+disappeared. The four pre-fix daemons on the same host went on accumulating throughout
+the same window: 233 zombies between them at 17:47, 242 at 18:13.
+
+⭐ **The middle column is what makes this a proof rather than a quiet machine.** Each
+notification child was seen at the same second its notification was decided, lived
+under a second in state `S`, and disappeared — never once observed in `Z`, where the
+old code would have parked it forever. Against that, the four pre-fix daemons on the
+same host went on accumulating throughout.
+
+⇒ **Still owed:** the same probe against a ROLLED fleet daemon. The fix is on `main`;
+the installed binary predates it, and forcing a fleet roll to satisfy a falsifier is
+not a trade this lane gets to make while the machine is in use. The recipe is above and
+takes about thirty minutes of daemon uptime.
 
 **What remains open — and it is sharper than "nobody looked":** the codebase's only
 zombie awareness is `render_probe::process_still_running`, which excludes state `Z` so
@@ -1306,7 +1351,34 @@ daemon that has it on rather than showing in today's numbers.
 title generation must be attempted ONCE, not once per eligible pass — and must be attempted
 again the moment that transcript grows.
 
-### ⚠ STILL NOT FALSIFIABLE ON 3.1.18 — generation remains env-disabled on both daemons
+### ⭐ THE FALSIFIER HAS NOW BEEN RUN, BOTH HALVES, IN AN ISOLATED DAEMON
+
+*2026-08-21, a daemon built from this commit with generation ON, its own `YGGTERM_HOME`, an
+invented one-session corpus and an unreachable LLM endpoint so every generation fails — the
+arrangement no fleet daemon provides and the reason this sat unfalsifiable for two passes.*
+
+| what happened | generations |
+|---|---|
+| session appears, transcript static, chore ticks | **1** |
+| daemon killed and restarted, same static transcript, 2 more ticks | **0** |
+| one line appended to the transcript | **1**, on the very next scan |
+| 3 further ticks, transcript static again | **0** |
+
+⇒ Both halves hold, and the middle row is the stronger one: the ledger is in the store, not in
+process memory, so a restart does not hand a failed generation a fresh budget. Before this fix
+that same unchanged session re-paid a ~9.3s call on every eligible pass, forever.
+
+⚠ **The failing endpoint is the point, not a shortcut.** The defect only appears when generation
+FAILS — a success writes a real title and closes the gate by itself. Pointing the sandbox at an
+unreachable endpoint reproduces the exact condition and costs no tokens, where enabling
+generation against the real endpoint would have been both expensive and unable to show the bug.
+
+⛔ **A sandbox daemon is not free.** A fresh home has no managed-CLI sweep marker, so it reads as
+a never-swept machine and starts a full CLI install fan-out five minutes in — 1.6 GB before the
+measurement had even finished. Seed the marker. Recipe and the attribution mistake that nearly
+went into it: `docs/agent-field-guide.md` §"Prove a daemon gate in a sandbox home".
+
+### ⚠ NOT FALSIFIABLE ON THE FLEET ITSELF — generation remains env-disabled on both daemons
 
 Checked live 2026-08-21 on a build verified to contain the fix. `copy_generation/summary` shows
 7 spans in 2h (p50 10,027ms) and no title spans, consistent with generation being off in the
@@ -1378,8 +1450,27 @@ while `render/web_content` (16.6% of a core sustained) and `daemon_request/snaps
 10,081ms of lock-holding, 121 times in 2h) are the actual burn. Recorded so the next reader does
 not re-derive this.
 
+### ⭐ THE MEMO HAS NOW BEEN WATCHED HITTING, AND THE EARLIER ALL-MISS READING IS EXPLAINED
+
+*Observed 2026-08-21 in an isolated daemon on an invented one-session corpus, with generation
+enabled — the arrangement production never provides.*
+
+| scan | memo |
+|---|---|
+| first scan of the corpus in this process | `hits 0, misses 1` — correct, the memo starts empty |
+| second scan, corpus unchanged | **`hits 1, misses 0`** |
+| next scan, after one line was appended | `hits 0, misses 1`, row rebuilt |
+
+So the memo does work, and the live run that reported `hits: 0` everywhere was not measuring a
+broken memo. Two separate causes were stacked on it: in production no process ever reaches a
+second scan (already recorded above), and in the first isolated run a generation attempt landed
+between every pair of scans — **a title-store write drops the whole memo by design**, which the
+code says out loud and which is easy to misread as the memo failing. ⇒ **A memo whose
+invalidation is deliberate and wholesale cannot be judged by its hit rate alone; check what
+wrote to the store between the two scans first.**
+
 **What remains open:** only the cross-process half, and only if the corpus or the startup rate
-grows enough to matter. The in-process defect is fixed and unit-tested.
+grows enough to matter. The in-process defect is fixed, unit-tested, and now observed working.
 
 ## ⛔ [11.0] AN OWNER-FACING QUESTION PICKER READS AS "WORKING" AND EATS TYPED INPUT
 

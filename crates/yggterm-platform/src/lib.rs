@@ -1163,9 +1163,10 @@ mod tests {
             .collect();
         assert!(
             offenders.is_empty(),
-            "this crate must launch processes through child_reaper::spawn_and_reap, \
-             never by spawning here — a dropped Child is a zombie for the life of \
-             the daemon or GUI this crate is linked into:\n{}",
+            "lib.rs must launch processes through child_reaper::spawn_and_reap, never \
+             by spawning here — a dropped Child is a zombie for the life of the daemon \
+             or GUI this crate is linked into. ⚠ This check reads THIS FILE only; a new \
+             module in this crate is not covered and needs its own guard:\n{}",
             offenders.join("\n"),
         );
     }
