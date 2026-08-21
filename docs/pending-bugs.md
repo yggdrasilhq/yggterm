@@ -3148,6 +3148,36 @@ instrumentation is the missing instrument — measure WHICH component invalidate
 render granularity (sidebar/preview updates must not repaint the terminal viewport), signal
 coalescing (bound renders per second), and a cached negative for the declare probe.
 
+### ⛔ THE CACHED NEGATIVE IS NOT A LONGER CEILING — the backoff already exists and its ceiling is right
+
+Read before touching this: `restore_app_surfaces_tick` already backs off, `BASE 2.5 s` doubling to
+`CEILING 60 s`, keyed on the runtime token so a handover restarts the schedule. **The 60.1 s median
+inter-arrival measured across 45 session paths IS that ceiling** — the system is at its designed
+steady state, not missing a backoff.
+
+⛔ **And raising the ceiling is the wrong fix, for a reason that was live-caught.** A row exists
+before its app does: a `terminal new` followed by an app declares about five seconds after the row
+is born, and the ceiling exists so the client is still asking then. Its own comment records the
+2026-07-31 case where treating "no declare" as durable left a session with no contribution for its
+whole life, so every webview it built carried an empty policy. A longer ceiling also delays an app
+launched into a row that has been open for hours — the same defect with a slower fuse.
+
+**Two designs that do not trade the birth window away:**
+
+1. ⭐ **Ask once for the set, not once per row.** The per-session request has no bulk form, so N
+   live rows cost N round trips a minute forever. One request returning the session paths that hold
+   any declare replaces all of them, and the client then asks per session only for the few that
+   changed. ⚠ Needs a new request variant and therefore cross-version handling — an older daemon
+   cannot answer it, and a preserved owner must be proxied exactly as the per-session form already
+   is.
+2. **Gate the ask on new bytes.** A declare arrives as OSC in that row's own stream, so a row that
+   has produced no output since the last ask cannot have declared. ⚠ `ManagedSessionView` carries
+   no output marker today; adding one is a server-side change, which is what makes (1) and (2) the
+   same size rather than (2) being the cheap one.
+
+⛔ **Sequencing:** both touch `daemon.rs`, where seat 11.27 is landing the PTY-handoff commit-point
+fix. Do not open a second lane in that file concurrently — take this after 11.27 lands.
+
 **That instrument now exists and is always on.** Trace plane, `layer:"dioxus"`, probe
 `dioxus_render/component_window`. Read it in three steps: `root_renders` is the denominator, so a
 component whose `renders` equals it was memoized by nothing; `renders_unattributed` counts root
