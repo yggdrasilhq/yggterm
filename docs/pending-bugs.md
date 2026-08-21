@@ -977,9 +977,18 @@ now assembled rather than written out.
 
 ⛔ **"The new daemon holds zero zombies" proves nothing on its own.** A daemon that
 never notified also holds zero, and the fifth daemon in the table above is exactly
-that case. The control is the daemon's own trace: replay its
-`daemon/heartbeat/panic` events at severity `error` through the fifteen-minute
-cooldown, and that count is how many notifications it really spawned.
+that case. The control has to establish that notifications actually happened.
+
+⭐ **The daemon now says so directly, which it did not before.** `notify_owner`
+returns the pid it launched and the watcher writes `daemon/heartbeat/notify_spawned`
+with that pid — so the count of real launches is READ, not inferred. Until this
+landed the only way to get it was to replay the `panic` events through the
+fifteen-minute cooldown in your head, which is inference, and inference was the
+weakest link in this very falsifier. ⚠ The event is written on the failure path too,
+with a null pid; **filter on `spawned`, not on the event's existence.**
+
+⇒ On a daemon that predates that event, the replay is still the fallback: take its
+`daemon/heartbeat/panic` events at severity `error` and apply the cooldown.
 
 ⇒ **On a daemon built from this commit:** notifications-spawned must be at least 3
 (so, past 46 minutes of uptime on a host under load) AND
