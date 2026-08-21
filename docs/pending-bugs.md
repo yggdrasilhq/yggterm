@@ -319,6 +319,71 @@ fail once and stay failed.
 output, and count `terminal_mount/bootstrap_reset` events whose target is not the active
 row. It must be zero.
 
+## ⛔⛔⛔ [11.0] REMOVING ONE OF TWO ROWS THAT SHARE A SESSION ID KILLS THE OTHER'S RUNTIME, AND REPORTS THAT IT REAPED NOTHING
+
+**Status:** OPEN
+
+*Measured 2026-08-21 by doing it, on a live agent session that was working at the time.*
+
+The scheme-twin defect leaves two rows for one session — a correctly kinded agent row and a
+mis-kinded one — under **two different keys but one session id**. Removing the mis-kinded row
+**terminates the runtime of the correctly kinded one.**
+
+**What the verb reported:**
+
+```
+accepted: true
+message: "closed terminal runtime for remote-session://dev/<id>"
+live_processes: []
+reaped_processes: []          ⛔ it had just killed a live agent process
+```
+
+**What the trace says actually happened** — one event, and it names the mechanism:
+
+```
+session/explicit_remote_session_close_requested
+  { "path": "remote-session://dev/<id>", "session_id": "<id>",
+    "kind": "Codex", "force_after_seconds": 2 }
+```
+
+⇒ **The close is dispatched by SESSION ID, not by the row key that was named.** The key
+resolution earlier in the path is exact — `resolve_live_session_entry` finds the row asked for,
+and the exact-key branch wins before any id fallback — and then the close request throws that
+key away and asks the remote to close *the id*. The remote holds one runtime for that id, so
+the surviving row's process is what dies, two seconds later, by force.
+
+⛔ **This makes a phantom row not merely unclickable but a KILL SWITCH for the real session it
+shadows** — and the natural remedy for a phantom row is exactly the action that fires it.
+
+⚠ **`reaped_processes: []` is what makes this dangerous rather than merely wrong.** An operator
+reading the reply has positive confirmation that nothing was killed. The kill is asynchronous
+and remote (`force_after_seconds: 2`), so it has not happened when the reply is composed, and
+nothing revisits it. ⇒ **The reply cannot answer "what did this end"** and should not appear to.
+
+**Two fixes, and the first is not sufficient alone:**
+
+1. The close must be dispatched by the resolved KEY, so closing one row cannot reach a runtime
+   the caller did not name. A shared id is a legitimate state — dual presence is spec — so
+   id-dispatch is wrong even after the twin that produced it is gone.
+2. `reaped_processes` must either report the outcome or not be present. A field that reads empty
+   *because the work has not happened yet* is worse than no field.
+
+⛔⛔ **AND THE SAFE PROCEDURE WAS FOLLOWED. IT DID NOT HELP.** The lane that root-caused the
+twin declined to remove it for exactly this reason, wrote the danger down, and recommended the
+mitigation: *remove by full path, then read back that the other row survives.* That is what was
+done. The path resolution IS exact — `resolve_live_session_entry`'s exact-key branch matches
+before any id fallback, which a code read confirmed beforehand — and the close request
+**downstream of it** discards the resolved key and dispatches the id anyway. ⇒ **A correct
+mitigation aimed at the wrong layer.** The read-back then reported the kill correctly, but only
+after the fact.
+
+**Falsifier:** create two rows for one session id under different schemes, remove one, and
+confirm the other's process still exists five seconds later.
+
+⚠ **What it cost when it fired:** a working lane. Its committed work survived on its branch and
+was landed; the running context did not, and a successor was spawned from its transcript.
+Nothing was uncommitted at the time, which was luck rather than design.
+
 ## ⛔⛔⛔ [11.20] ONE ROW'S BILLING STATE DECIDED WHETHER THE WHOLE FLEET COULD BE WOKEN — FIXED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
