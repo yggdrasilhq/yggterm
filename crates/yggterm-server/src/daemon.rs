@@ -12501,8 +12501,8 @@ fn run_background_copy_chore(
         }
     }
     // Nothing changed ⇒ nothing to write. `persist` serializes the whole
-    // multi-MB server state under the write lock (p50 87 ms on the owner's
-    // laptop, 2108 calls in one retention window), and a tick that applied
+    // multi-MB server state under the write lock (p50 87 ms, 2108 calls in one
+    // retention window), and a tick that applied
     // nothing was paying that for an identical file.
     if applied > 0 {
         runtime.persist()?;
