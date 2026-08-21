@@ -577,6 +577,10 @@ def harvest(row, verdict, why):
         fh.write(f"* verdict: {verdict} ({why})\n")
         fh.write(f"* uri: {row['uri']}\n")
         fh.write(f"* title: {row['label']}\n")
+        w = row.get("work") or {}
+        if w.get("branch"):
+            fh.write(f"* branch: {w['branch']} — {w.get('unlanded', 0)} unlanded, "
+                     f"{w.get('dirty', 0)} uncommitted at fold time\n")
         if row.get("last"):
             fh.write(f"\nits last words:\n\n> {row['last']}\n")
     return path
@@ -707,8 +711,58 @@ def agent_pids(uuid):
     return out
 
 
-def fold(row, verdict, why, host, apply_it):
+def work_state(row):
+    """What this row's checkout still holds: (branch, unlanded, dirty, cwd).
+
+    ⛔⛔ THIS EXISTS BECAUSE FOLDING NEVER ASKED. `fold` harvested a row's last
+    WORDS into a note and reaped its process, and at no point looked at whether
+    the work those words describe had been taken. A lane's output is commits, not
+    prose — so a fold that reads the prose and kills the process is closing a
+    session, not folding a lane, and everything it was paid to produce stays on a
+    branch nobody lands.
+    """
+    cwd = (row.get("session_cwd") or "").strip()
+    if not cwd or not os.path.exists(os.path.join(cwd, ".git")):
+        return None, 0, 0, cwd
+    def g(*a):
+        return subprocess.run(["git", "-C", cwd, *a], capture_output=True,
+                              text=True, timeout=120)
+    br = g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    g("fetch", "-q", "origin")
+    c = g("cherry", "origin/main", "HEAD")
+    unlanded = len([l for l in c.stdout.splitlines() if l.startswith("+")]) if c.returncode == 0 else 0
+    dirty = len(g("status", "--porcelain").stdout.strip().splitlines())
+    return br, unlanded, dirty, cwd
+
+
+def fold(row, verdict, why, host, apply_it, force=False):
     uuid, uri = row["uuid"], row["uri"]
+
+    # ⛔⛔ TAKE THE WORK BEFORE TAKING THE ROW.
+    branch, unlanded, dirty, cwd = work_state(row)
+    row["work"] = {"branch": branch, "unlanded": unlanded, "dirty": dirty}
+    if dirty:
+        # Uncommitted files are work only their AUTHOR can commit — a message,
+        # a half-written test, an edit mid-thought. Nothing here may author it,
+        # and reaping the process is what makes it unrecoverable.
+        log(f"  ⛔ REFUSING TO FOLD: {dirty} uncommitted file(s) in {cwd}")
+        log(f"     That is work only its author can commit, and folding destroys it.")
+        if not force:
+            return False
+        log(f"     --force: folding anyway, and those {dirty} file(s) are being lost")
+    if unlanded and apply_it:
+        # Committed work leaves the machine before the row does. Landing needs
+        # guards this tool does not run, so it PUSHES and records the branch —
+        # the orchestrator lands it, and the harvest note says it is owed.
+        r = subprocess.run(["git", "-C", cwd, "push", "-q", "origin", f"HEAD:{branch}"],
+                           capture_output=True, text=True, timeout=300)
+        log(f"  {'pushed' if r.returncode == 0 else '⛔ COULD NOT PUSH'} {branch} "
+            f"— {unlanded} commit(s) still to land")
+        if r.returncode != 0 and not force:
+            log(f"     refusing to fold work that has not left this machine: "
+                f"{(r.stderr or '').strip()[:120]}")
+            return False
+
     note = harvest(row, verdict, why)
     log(f"  harvested → {os.path.relpath(note, os.path.expanduser('~'))}")
     if not apply_it:
@@ -1042,7 +1096,7 @@ def main():
         if verdict in ("DEAD", "FINISHED") or forced:
             if forced and verdict not in ("DEAD", "FINISHED"):
                 log(f"  --force: folding a {verdict} row on an operator's say-so")
-            if fold(row, verdict, why, host, a.apply):
+            if fold(row, verdict, why, host, a.apply, force=forced):
                 folded += 1
         elif verdict == "STALLED" and getattr(a, "wake", False):
             wake(row, host, a.apply)
