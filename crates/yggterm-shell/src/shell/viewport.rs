@@ -337,6 +337,14 @@ fn MainSurface(
                 rendered_sections.is_empty(),
                 false,
             );
+            // ⛔ Say which of the two blank pages this is. See
+            // `preview_surface_has_nothing_to_read`.
+            let show_nothing_to_read_notice = preview_surface_has_nothing_to_read(
+                &grouped_runs,
+                rendered_sections.is_empty(),
+                show_loading_placeholder,
+                show_failure_placeholder,
+            );
             let terminal_canvas_snapshot =
                 TerminalCanvasSnapshot::from_render_snapshot(snapshot.as_ref());
             rsx! {
@@ -644,6 +652,7 @@ fn MainSurface(
                                         show_loading_placeholder,
                                         preview_failure: preview_failure.clone(),
                                         show_failure_placeholder,
+                                        show_nothing_to_read_notice,
                                         preview_window: preview_window.clone(),
                                         visible_block_count: visible_blocks.len(),
                                         grouped_runs: grouped_runs.clone(),
@@ -995,6 +1004,7 @@ fn ConversationWebView(
     show_loading_placeholder: bool,
     preview_failure: Option<String>,
     show_failure_placeholder: bool,
+    show_nothing_to_read_notice: bool,
     preview_window: PreviewVirtualWindow,
     visible_block_count: usize,
     grouped_runs: Vec<PreviewRun>,
@@ -1056,6 +1066,12 @@ fn ConversationWebView(
                     session: session.clone(),
                     palette,
                     message,
+                }
+            }
+            if show_nothing_to_read_notice {
+                PreviewNothingToReadNotice {
+                    session: session.clone(),
+                    palette,
                 }
             }
             // The BEGINNING of what has been fetched. Both are here, above the
@@ -1297,6 +1313,61 @@ fn PreviewFailurePlaceholder(
                         style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:330px;", palette.muted),
                         "The session itself is still here. Yggterm will keep retrying quietly, and it will not paint stale content as if it were current."
                     }
+                }
+            }
+        }
+    }
+}
+/// The third blank page, named.
+///
+/// ⛔ **A SURFACE THAT RENDERED NOTHING AND A SURFACE THAT BROKE ARE THE SAME
+/// PICTURE.** A live agent row was on screen as a chat panel holding one
+/// collapsed work group and nothing else, and every probe agreed it was
+/// healthy — because it was. It had faithfully drawn a transcript that had no
+/// prose in it yet. The loading and failure placeholders each own their state;
+/// this owns "there is genuinely nothing to read here", so silence stops being
+/// the shared symptom of three different conditions.
+///
+/// ⚠ It states the fact and points at the surface that DOES have the content;
+/// it does not switch for the reader. This surface is reached by choosing it,
+/// and a page that bounced you out of it the moment it looked thin would be
+/// unusable on a session that is one turn old.
+#[component]
+fn PreviewNothingToReadNotice(session: ManagedSessionView, palette: Palette) -> Element {
+    let surface_noun = rendered_surface_noun(&session);
+    let has_terminal = yggterm_server::managed_session_supports_terminal_view(&session);
+    rsx! {
+        div {
+            "data-preview-nothing-to-read": "1",
+            style: "display:flex; align-items:center; justify-content:center; width:100%; min-height:220px;",
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; align-items:center; gap:10px; width:min(420px, 100%); \
+                     padding:22px; border-radius:14px; background:{}; box-shadow:inset 0 0 0 1px {};",
+                    palette.panel_alt, palette.border,
+                ),
+                div {
+                    style: format!(
+                        "font-size:11px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; color:{};",
+                        palette.muted,
+                    ),
+                    "Nothing to read yet"
+                }
+                div {
+                    style: format!("font-size:14px; font-weight:700; color:{}; text-align:center;", palette.text),
+                    "This {surface_noun} has no written turns"
+                }
+                div {
+                    style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center;", palette.muted),
+                    if has_terminal {
+                        "The session is real and its transcript so far is tool calls only. Its terminal has the live output — switch to it from the title bar."
+                    } else {
+                        "The session is real and its transcript so far is tool calls only. Written turns appear here as they arrive."
+                    }
+                }
+                div {
+                    style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center;", palette.muted),
+                    "{session.title}"
                 }
             }
         }
@@ -1814,32 +1885,6 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
     } else {
         candidates.into_iter().take(2).collect::<Vec<_>>().join(" ")
     }
-}
-fn terminal_resume_context_fallback(
-    snapshot: &RenderSnapshot,
-    session: &ManagedSessionView,
-) -> Option<(String, String)> {
-    let title = snapshot
-        .active_title
-        .clone()
-        .or_else(|| {
-            let title = session.title.trim();
-            (!title.is_empty()).then(|| title.to_string())
-        })
-        .map(|title| title.trim().to_string())
-        .filter(|title| !title.is_empty())?;
-    let summary = snapshot
-        .active_summary
-        .clone()
-        .or_else(|| snapshot.active_precis.clone())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            let precis = terminal_precis(session);
-            let trimmed = precis.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })?;
-    Some((title, summary))
 }
 fn preview_has_readable_resume_context(
     session: &ManagedSessionView,
@@ -2680,13 +2725,6 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
         }
     }
 }
-fn parse_numbered_preview_item(line: &str) -> Option<(usize, String)> {
-    let (number, text) = line.split_once(". ")?;
-    if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    Some((number.parse().ok()?, text.trim().to_string()))
-}
 fn extract_image_path_from_line(line: &str) -> Option<(String, Option<String>)> {
     let mut found_path = None::<String>;
     for token in line.split_whitespace() {
@@ -2703,31 +2741,6 @@ fn extract_image_path_from_line(line: &str) -> Option<(String, Option<String>)> 
     let residue = line.replace(&format!("@{path}"), "").replace(&path, "");
     let residue = residue.trim().trim_matches(':').trim().to_string();
     Some((path, (!residue.is_empty()).then_some(residue)))
-}
-fn extract_named_image_reference_from_line(line: &str) -> Option<(String, Option<String>)> {
-    let trimmed = line.trim();
-    if let Some(after) = trimmed.strip_prefix("<image name=[") {
-        let label_end = after.find("]>")?;
-        let label = format!("[{}]", after[..label_end].trim());
-        let mut residue = after[label_end + 2..].trim();
-        if let Some(stripped) = residue.strip_prefix("</image>") {
-            residue = stripped.trim();
-        }
-        if let Some(stripped) = residue.strip_prefix(&label) {
-            residue = stripped.trim();
-        }
-        return Some((label, (!residue.is_empty()).then_some(residue.to_string())));
-    }
-    if trimmed.starts_with("[Image #") {
-        let label_end = trimmed.find(']')?;
-        let label = trimmed[..=label_end].to_string();
-        let mut residue = trimmed[label_end + 1..].trim();
-        if let Some(stripped) = residue.strip_prefix("</image>") {
-            residue = stripped.trim();
-        }
-        return Some((label, (!residue.is_empty()).then_some(residue.to_string())));
-    }
-    None
 }
 fn looks_like_image_path(path: &str) -> bool {
     if looks_like_session_or_remote_uri(path) {
@@ -2749,9 +2762,6 @@ fn looks_like_session_or_remote_uri(path: &str) -> bool {
         || path.starts_with("remote-session:")
         || path.starts_with("codex-runtime:")
         || path.starts_with("ssh:")
-}
-fn local_image_path_exists(path: &str) -> bool {
-    looks_like_image_path(path) && Path::new(path).exists()
 }
 fn preview_block_excerpt(block: &SessionPreviewBlock, max_chars: usize) -> Option<String> {
     let mut parts = Vec::new();
@@ -3547,8 +3557,15 @@ fn TerminalCanvas(
         .map(|text| truncate_preview_excerpt(text, 240));
     let initial_resume_overlay_excerpt = remote_resume_overlay_excerpt(&session)
         .or_else(|| remote_resume_overlay_seed_excerpt(&session));
+    // ⛔ A REMOTE RESUME IS NEVER PREFILLED, AND THE CODE THAT SAID SO WAS AN
+    // EMPTY FUNCTION. `remote_terminal_placeholder_text` had been stubbed to
+    // `let _ = (session, active_summary); None` and left wired in, so this read
+    // as a real choice between two seeds while one arm was a constant. The
+    // remote surface is seeded by the daemon's authoritative screen, never by
+    // text this client assembled from a summary — writing our own guess into a
+    // PTY is how a stale excerpt ends up looking like live output.
     let terminal_placeholder = if is_remote_resume_session {
-        remote_terminal_placeholder_text(&session, snapshot.active_summary.as_deref())
+        None
     } else {
         local_terminal_prefill_text(&session)
     };
@@ -4372,220 +4389,24 @@ fn TerminalCanvas(
             ));
         });
     }
-    let server_prompt_replay = state.with(|shell| {
-        remote_live_session_prompt_ready_replay_text_for_active_session(
-            &session,
-            shell.server.live_sessions().iter(),
-            &session_path,
-        )
-    });
-    let (should_replay_server_prompt, latest_unready_attempt_id) = state.with(|shell| {
-        let latest_unready_attempt = shell
-            .latest_terminal_open_attempt_for_path(&session_path)
-            .filter(|attempt| !matches!(attempt.state, TerminalOpenAttemptState::Ready));
-        let latest_unready_attempt_id =
-            latest_unready_attempt.map(|attempt| attempt.attempt_id.clone());
-        let surface_mounted = latest_unready_attempt
-            .and_then(|attempt| attempt.surface_mounted_at_ms)
-            .is_some();
-        (
-            server_prompt_snapshot_replay_should_start(
-                is_remote_resume_session,
-                host_is_active_session,
-                shell.terminal_attach_in_flight.contains(&session_path),
-                latest_unready_attempt_id.is_some(),
-                surface_mounted,
-            ),
-            latest_unready_attempt_id,
-        )
-    });
-    if host_is_active_session && is_remote_resume_session && should_replay_server_prompt {
-        if let Some(replay) = server_prompt_replay.as_ref() {
-            let replay_identity = server_prompt_snapshot_replay_identity(
-                &mount_identity,
-                replay.len(),
-                session.status_line.len(),
-                latest_unready_attempt_id.as_deref(),
-            );
-            if should_replay_server_prompt
-                && *server_snapshot_replay_identity.borrow() != replay_identity
-            {
-                *server_snapshot_replay_identity.borrow_mut() = replay_identity;
-                let session_path_for_task = session_path.clone();
-                let replay_for_task = sanitize_terminal_replay_payload(replay);
-                let trace_home_for_task = trace_home.clone();
-                spawn(async move {
-                    if replay_for_task.trim().is_empty() {
-                        return;
-                    }
-                    let _ = document::eval(&terminal_replay_retained_data_script_for_session(
-                        &session_path_for_task,
-                        &replay_for_task,
-                        "server_prompt_snapshot",
-                        0,
-                    ));
-                    append_trace_event(
-                        &trace_home_for_task,
-                        "ui",
-                        "terminal_mount",
-                        "server_prompt_snapshot_replay",
-                        json!({
-                            "session_path": session_path_for_task.clone(),
-                            "bytes": replay_for_task.len(),
-                        }),
-                    );
-                    set_signal_if_changed(terminal_resume_surface_staged, true);
-                    set_signal_if_changed(terminal_has_meaningful_output, true);
-                    set_signal_if_changed(terminal_prompt_only, false);
-                    set_signal_if_changed(terminal_live_host_connected, true);
-                    set_signal_if_changed(terminal_overlay_dismissed, true);
-                    set_signal_if_changed(resume_overlay_failed, false);
-                    set_signal_if_changed(resume_overlay_timed_out, false);
-                    clear_terminal_resume_notification(state, &session_path_for_task);
-                    let _ = safe_shell_mut(
-                        state,
-                        "terminal_attach_server_prompt_snapshot_replay",
-                        |shell| {
-                            shell.retain_terminal_session_path(&session_path_for_task);
-                            shell
-                                .terminal_resume_ready_paths
-                                .insert(session_path_for_task.clone());
-                            shell
-                                .terminal_attach_in_flight
-                                .remove(&session_path_for_task);
-                            shell.mark_terminal_open_attempt_ready_for_session(
-                                &session_path_for_task,
-                                "server_prompt_snapshot_replay",
-                            );
-                            shell.maybe_finish_terminal_surface_request_for_session(
-                                &session_path_for_task,
-                            );
-                        },
-                    );
-                    maybe_spawn_missing_remote_machine_refreshes(state);
-                    maybe_spawn_missing_managed_cli_refreshes(state);
-                });
-            }
-        } else {
-            let replay_identity = format!(
-                "server-snapshot-replay-daemon:{mount_identity}:{}",
-                latest_unready_attempt_id
-                    .as_deref()
-                    .unwrap_or("no-unready-attempt")
-            );
-            if *server_snapshot_replay_identity.borrow() != replay_identity {
-                *server_snapshot_replay_identity.borrow_mut() = replay_identity;
-                let endpoint_for_task = endpoint.clone();
-                let session_path_for_task = session_path.clone();
-                let trace_home_for_task = trace_home.clone();
-                spawn(async move {
-                    for attempt in 1_u64..=60 {
-                        let still_recovering = state.with(|shell| {
-                            shell.server.active_view_mode() == WorkspaceViewMode::Terminal
-                                && shell.server.active_session_path()
-                                    == Some(session_path_for_task.as_str())
-                                && shell
-                                    .latest_terminal_open_attempt_for_path(&session_path_for_task)
-                                    .is_some_and(|attempt| {
-                                        !matches!(attempt.state, TerminalOpenAttemptState::Ready)
-                                    })
-                        });
-                        if !still_recovering {
-                            break;
-                        }
-                        match daemon_snapshot_async(endpoint_for_task.clone(), &trace_home_for_task)
-                            .await
-                        {
-                            Ok(snapshot) => {
-                                if let Some(snapshot_text) =
-                                    snapshot_session_prompt_ready_replay_text_for_session_path(
-                                        snapshot.live_sessions.iter(),
-                                        &session_path_for_task,
-                                    )
-                                {
-                                    let snapshot_text =
-                                        sanitize_terminal_replay_payload(&snapshot_text);
-                                    if snapshot_text.trim().is_empty() {
-                                        continue;
-                                    }
-                                    let _ = document::eval(
-                                        &terminal_replay_retained_data_script_for_session(
-                                            &session_path_for_task,
-                                            &snapshot_text,
-                                            "daemon_server_prompt_snapshot",
-                                            0,
-                                        ),
-                                    );
-                                    append_trace_event(
-                                        &trace_home_for_task,
-                                        "ui",
-                                        "terminal_mount",
-                                        "daemon_server_prompt_snapshot_replay",
-                                        json!({
-                                            "session_path": session_path_for_task.clone(),
-                                            "attempt": attempt,
-                                            "bytes": snapshot_text.len(),
-                                        }),
-                                    );
-                                    set_signal_if_changed(terminal_resume_surface_staged, true);
-                                    set_signal_if_changed(terminal_has_meaningful_output, true);
-                                    set_signal_if_changed(terminal_prompt_only, false);
-                                    set_signal_if_changed(terminal_live_host_connected, true);
-                                    set_signal_if_changed(terminal_overlay_dismissed, true);
-                                    set_signal_if_changed(resume_overlay_failed, false);
-                                    set_signal_if_changed(resume_overlay_timed_out, false);
-                                    clear_terminal_resume_notification(
-                                        state,
-                                        &session_path_for_task,
-                                    );
-                                    let _ = safe_shell_mut(
-                                        state,
-                                        "terminal_attach_daemon_server_prompt_snapshot_replay",
-                                        |shell| {
-                                            shell.retain_terminal_session_path(
-                                                &session_path_for_task,
-                                            );
-                                            shell
-                                                .terminal_resume_ready_paths
-                                                .insert(session_path_for_task.clone());
-                                            shell
-                                                .terminal_attach_in_flight
-                                                .remove(&session_path_for_task);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path_for_task,
-                                                "daemon_server_prompt_snapshot_replay",
-                                            );
-                                            shell
-                                                .maybe_finish_terminal_surface_request_for_session(
-                                                    &session_path_for_task,
-                                                );
-                                        },
-                                    );
-                                    maybe_spawn_missing_remote_machine_refreshes(state);
-                                    maybe_spawn_missing_managed_cli_refreshes(state);
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                append_trace_event(
-                                    &trace_home_for_task,
-                                    "ui",
-                                    "terminal_mount",
-                                    "daemon_server_prompt_snapshot_replay_error",
-                                    json!({
-                                        "session_path": session_path_for_task.clone(),
-                                        "attempt": attempt,
-                                        "error": error.to_string(),
-                                    }),
-                                );
-                            }
-                        }
-                        sleep(Duration::from_millis(if attempt < 8 { 750 } else { 1_500 })).await;
-                    }
-                });
-            }
-        }
-    }
+    // ⛔ REMOVED: THE SERVER-PROMPT SNAPSHOT REPLAY (~213 lines, 11.23).
+    //
+    // It read a "prompt ready" replay payload for the row, and if it got one,
+    // painted it into the terminal surface and declared the resume ready. Both
+    // readers — the live-session one and the daemon-snapshot one — had been
+    // stubbed to `None` unconditionally (`let _ = session; None`) and left in
+    // place with every caller intact. So the `Some` arm was unreachable, and
+    // the `None` arm spawned a RETRY LOOP that woke on a 750 ms/1.5 s ladder
+    // for up to nine daemon round trips per remote-resume mount, to feed a
+    // function that returns `None`.
+    //
+    // ⚠ That is the shape worth remembering: neutering a function to `None`
+    // rather than removing it does not delete the code path, it makes the path
+    // INVISIBLE. Nothing warns, the compiler is satisfied, the work still runs,
+    // and the only symptom is a machine doing something expensive for no
+    // reason. The remote-resume surface is seeded by
+    // `terminal_reveal_seed_allows_authoritative_screen` and the bootstrap
+    // path; this was never the thing that made it work.
     let (should_start_recovery_snapshot_probe, latest_unready_attempt_id) = state.with(|shell| {
         let latest_unready_attempt = shell
             .latest_terminal_open_attempt_for_path(&session_path)
@@ -11221,45 +11042,14 @@ fn TerminalCanvas(
                                 {
                                     remote_resume_codex_rejected_surface_observed = true;
                                 }
-                                let server_prompt_snapshot_available =
-                                    if is_remote_resume_session
-                                        && (saw_generic_idle_output
-                                            || tail_generic_idle_output
-                                            || saw_generic_idle_footer_output
-                                            || tail_generic_idle_footer_output)
-                                    {
-                                        state.with(|shell| {
-                                            remote_live_session_prompt_ready_replay_text_for_session_path(
-                                                shell.server.live_sessions().iter(),
-                                                &session_path,
-                                            )
-                                            .is_some()
-                                        })
-                                    } else {
-                                        false
-                                    };
-                                let suppress_stale_idle_after_server_prompt =
-                                    should_suppress_stale_remote_idle_after_server_prompt(
-                                        is_remote_resume_session,
-                                        server_prompt_snapshot_available,
-                                        saw_codex_prompt_surface,
-                                        saw_generic_idle_output,
-                                        tail_generic_idle_output,
-                                        saw_generic_idle_footer_output,
-                                        tail_generic_idle_footer_output,
-                                    );
-                                if suppress_stale_idle_after_server_prompt {
-                                    append_trace_event(
-                                        &trace_home,
-                                        "ui",
-                                        "terminal_mount",
-                                        "suppress_stale_idle_after_server_prompt",
-                                        json!({
-                                            "session_path": session_path.clone(),
-                                            "cursor": cursor,
-                                        }),
-                                    );
-                                }
+                                // ⛔ REMOVED with the server-prompt snapshot
+                                // replay: the extra suppression term here was
+                                // gated on `server_prompt_snapshot_available`,
+                                // which asked a reader stubbed to `None` and so
+                                // was ALWAYS false. It contributed nothing to
+                                // `suppress_resume_control_only_output` and its
+                                // trace event had never once been emitted —
+                                // which is exactly why nobody noticed.
                                 let suppress_resume_control_only_output =
                                     should_suppress_remote_resume_surface_output(
                                         is_remote_resume_session,
@@ -11275,8 +11065,7 @@ fn TerminalCanvas(
                                         tail_generic_idle_footer_output,
                                         saw_prompt_only_surface,
                                         saw_transcript_browser_output,
-                                    ) || saw_local_codex_scaffold
-                                        || suppress_stale_idle_after_server_prompt;
+                                    ) || saw_local_codex_scaffold;
                                 let forward_terminal_protocol_only_output = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_requires_terminal_emulator_forward);
@@ -15474,23 +15263,6 @@ fn should_suppress_remote_resume_surface_output(
                             || saw_generic_idle_footer_output
                             || tail_generic_idle_footer_output)))))
 }
-fn should_suppress_stale_remote_idle_after_server_prompt(
-    is_remote_resume_session: bool,
-    server_prompt_snapshot_available: bool,
-    saw_codex_prompt_surface: bool,
-    saw_generic_idle_output: bool,
-    tail_generic_idle_output: bool,
-    saw_generic_idle_footer_output: bool,
-    tail_generic_idle_footer_output: bool,
-) -> bool {
-    is_remote_resume_session
-        && server_prompt_snapshot_available
-        && !saw_codex_prompt_surface
-        && (saw_generic_idle_output
-            || tail_generic_idle_output
-            || saw_generic_idle_footer_output
-            || tail_generic_idle_footer_output)
-}
 fn terminal_chunk_requires_terminal_emulator_forward(data: &str) -> bool {
     !terminal_chunk_is_transport_error(data)
         && !terminal_chunk_has_visible_output(data)
@@ -15726,76 +15498,6 @@ fn format_terminal_prefill_text(text: &str) -> String {
     } else {
         format!("{trimmed}\r\n")
     }
-}
-fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> {
-    let _ = session;
-    None
-}
-fn remote_terminal_placeholder_text(
-    session: &ManagedSessionView,
-    active_summary: Option<&str>,
-) -> Option<String> {
-    let _ = (session, active_summary);
-    None
-}
-fn remote_live_session_prompt_ready_replay_text(session: &ManagedSessionView) -> Option<String> {
-    let _ = session;
-    None
-}
-fn remote_live_session_prompt_ready_replay_text_for_session_path<'a>(
-    sessions: impl Iterator<Item = &'a ManagedSessionView>,
-    session_path: &str,
-) -> Option<String> {
-    sessions
-        .filter(|session| session.session_path == session_path)
-        .find_map(remote_live_session_prompt_ready_replay_text)
-}
-fn snapshot_session_prompt_ready_replay_text(session: &SnapshotSessionView) -> Option<String> {
-    let _ = session;
-    None
-}
-fn snapshot_session_prompt_ready_replay_text_for_session_path<'a>(
-    sessions: impl Iterator<Item = &'a SnapshotSessionView>,
-    session_path: &str,
-) -> Option<String> {
-    sessions
-        .filter(|session| session.session_path == session_path)
-        .find_map(snapshot_session_prompt_ready_replay_text)
-}
-fn remote_live_session_prompt_ready_replay_text_for_active_session<'a>(
-    active_session: &ManagedSessionView,
-    live_sessions: impl Iterator<Item = &'a ManagedSessionView>,
-    session_path: &str,
-) -> Option<String> {
-    remote_live_session_prompt_ready_replay_text_for_session_path(live_sessions, session_path)
-        .or_else(|| remote_live_session_prompt_ready_replay_text(active_session))
-}
-fn remote_terminal_prefill_text_before_2_1_103(session: &ManagedSessionView) -> Option<String> {
-    if remote_session_starts_new_agent(session) {
-        return None;
-    }
-    remote_resume_overlay_excerpt(session)
-        .or_else(|| remote_resume_overlay_seed_excerpt(session))
-        .or_else(|| terminal_loading_notice_text(session))
-        .map(|text| {
-            let trimmed = text.trim_end();
-            if trimmed.ends_with('\n') || trimmed.ends_with('\r') {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}\r\n")
-            }
-        })
-}
-fn remote_terminal_placeholder_text_before_2_1_103(
-    session: &ManagedSessionView,
-    active_summary: Option<&str>,
-) -> Option<String> {
-    remote_terminal_prefill_text_before_2_1_103(session).or_else(|| {
-        active_summary
-            .map(str::trim)
-            .filter(|text| terminal_resume_excerpt_is_meaningful(text))
-            .map(format_terminal_prefill_text)
-    })
 }
 /// Whether this remote agent row is a FRESH START rather than a resume.
 ///
@@ -17694,27 +17396,6 @@ fn terminal_reset_command(title: &str, theme: &TerminalTheme) -> TerminalJsComma
         minimum_contrast_ratio: terminal_minimum_contrast_ratio(theme),
         font_size: theme.font_size,
     }
-}
-fn terminal_loading_notice_text(session: &ManagedSessionView) -> Option<String> {
-    if !session.session_path.starts_with("remote-session://") {
-        return None;
-    }
-    let mut lines = vec!["Resuming live Codex session...".to_string()];
-    if !session.host_label.trim().is_empty() {
-        lines.push(format!("Host: {}", session.host_label.trim()));
-    }
-    let cwd = metadata_value(session, "Cwd");
-    if !cwd.trim().is_empty() {
-        lines.push(format!("Workspace: {}", cwd.trim()));
-    }
-    match session.remote_deploy_state {
-        RemoteDeployState::NotRequired => {}
-        RemoteDeployState::Planned => lines.push("Deploy: planned".to_string()),
-        RemoteDeployState::CopyingBinary => lines.push("Deploy: copying yggterm".to_string()),
-        RemoteDeployState::Ready => lines.push("Deploy: ready".to_string()),
-    }
-    lines.push("Waiting for the remote terminal to paint...".to_string());
-    Some(format!("{}\r\n", lines.join("\r\n")))
 }
 fn local_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> {
     if session.session_path.starts_with("remote-session://")

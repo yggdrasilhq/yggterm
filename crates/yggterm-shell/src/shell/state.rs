@@ -5953,13 +5953,6 @@ const WEB_SURFACE_STALE_AFTER_MS: u64 = 15_000;
 /// suspended instead of silently freezing (fg within the window recovers
 /// instantly) — and a truly dead app's surface still closes on its own.
 const SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS: u64 = 2 * WEB_SURFACE_STALE_AFTER_MS;
-/// How long after a DELIBERATE close (✕ / suspend / the app's own close OSC) a
-/// heartbeat is still barred from recreating the surface — long enough to cover
-/// the app's own close OSC arriving after the GUI sent Ctrl+C, short enough that
-/// a live app which ignored the Ctrl+C gets its surface back rather than being
-/// stuck as a bare terminal. A GUI restart forgets the record entirely, so it
-/// never blocks the post-restart rebuild.
-const WEB_SURFACE_CLOSE_GHOST_GRACE_MS: u64 = 5_000;
 /// Reconcile cadence while any surface exists; geometry follows layout
 /// changes (sidebar resize, window resize, tab/session switch) within a tick.
 const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
@@ -6569,62 +6562,6 @@ fn web_surface_recent_reaps(key: &(String, u64), now_ms: u64) -> u32 {
         .unwrap_or(0)
 }
 
-/// ⛔ **Reclaim that keeps destroying a page which keeps coming back is not
-/// reclaim — it is a treadmill, and it COSTS memory rather than saving it.**
-///
-/// Measured on the live host: swap was full, so every backgrounded surface got
-/// the 5 s pressured hold, was destroyed, was immediately re-opened by whatever
-/// still wanted it, and was destroyed again — **166 `background_hold_expired`
-/// closes against 166 re-opens in fifteen minutes**, about eleven cycles a
-/// minute. Each cycle allocated a *fresh* WebKit web process (one of them
-/// ballooned to 3.9 GB), each re-open composited a full-size webview, and the
-/// user could not keep keyboard focus long enough to type a sentence. The
-/// pressure the reaper was reacting to was in large part the pressure the
-/// reaper was creating.
-///
-/// So a surface that has been reaped `WEB_SURFACE_THRASH_REOPEN_LIMIT` times in
-/// the window is, by demonstration, wanted: something re-creates it the moment
-/// it dies. Reclaiming it is the one thing guaranteed not to help. It keeps the
-/// unpressured hold so it can settle, and reclaim goes back to targeting
-/// surfaces that actually STAY backgrounded — which is where the memory it was
-/// after has always been.
-///
-/// `configured_hold_ms` is the user's configured hold, read ONCE per pass by the
-/// caller — this function is pure so the whole reclaim plan can be driven by a
-/// test without a config file on disk.
-/// Which tab's `ssh -N -D` tunnel a tab should reach the host through.
-///
-/// ONE TUNNEL PER SESSION, NOT PER TAB. Reuse used to be keyed on the TAB, and
-/// `web_surface_new_tab` mints `socks_port: None`, so every new tab spawned its
-/// own: N ssh children on the GUI host, N handshakes, N sshds and N listening
-/// loopback ports on the remote — which trips the remote's MaxStartups long
-/// before anything on this side notices.
-///
-/// Pure and total so the decision can be locked at the CALL SITE: the reconcile
-/// loop passes what it actually holds, and reverting the loop's wiring changes
-/// this function's observed input rather than hiding behind a helper the test
-/// calls directly.
-///
-/// Returns the donor TAB ID, or `None` when there is nothing to adopt (a local
-/// session has no tunnel at all, and the caller must fall through to real
-/// resolution rather than assume one).
-fn web_surface_socks_egress_donor(tabs: &[(u64, Option<u16>)], tab_id: u64) -> Option<u64> {
-    // The tab's own tunnel always wins: nothing to adopt, and re-spawning would
-    // churn the port and force a webview destroy+recreate.
-    if tabs
-        .iter()
-        .any(|(id, port)| *id == tab_id && port.is_some())
-    {
-        return Some(tab_id);
-    }
-    // Otherwise the lowest tab id holding a live tunnel. Deterministic on the
-    // ID, never on strip order — tab order is user-mutable (drag, filing) and
-    // egress must not follow chrome layout.
-    tabs.iter()
-        .filter(|(_, port)| port.is_some())
-        .map(|(id, _)| *id)
-        .min()
-}
 
 /// THE destroy clock for one backgrounded surface, or `None` for "no clock".
 ///
@@ -14313,16 +14250,6 @@ struct DeclaredWebSurfaceOpen {
     claimed_session: Option<String>,
 }
 
-/// Read a retained declare payload as an open, or refuse it.
-///
-/// The daemon retains whatever an app wrote to its own stdout, so this is a
-/// TRUST BOUNDARY as real as the client-side forwarder's: only an allowed URL
-/// scheme may be materialized (never `file:`/`javascript:`), and a payload
-/// without a url describes nothing to rebuild. Pure so the refusal is testable
-/// without a live surface.
-fn declared_web_surface_open_from_payload(payload: &Value) -> Option<DeclaredWebSurfaceOpen> {
-    declared_web_surface_open_or_refusal(payload).ok()
-}
 
 /// Why a retained declare could not become a surface.
 ///
@@ -14347,8 +14274,12 @@ fn url_scheme_label(url: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// The refusing half of [`declared_web_surface_open_from_payload`], pure and
-/// testable.
+/// THE declared-open gate: what a retained OSC payload is allowed to rebuild.
+///
+/// It used to have an `.ok()` wrapper (`declared_web_surface_open_from_payload`)
+/// that every caller had stopped using and every test still called — so the
+/// scheme refusals below were only ever exercised through a function nothing
+/// shipped. The wrapper is gone and the tests point here.
 ///
 /// ⛔ The scheme gate is NOT widened here and must not be. This payload is
 /// retained by the daemon from whatever the app wrote to its own stdout, and
@@ -15970,15 +15901,6 @@ struct ShellState {
     /// wanted-until epoch ms. The reconciler creates the session's surfaces
     /// straight into the soft stash while a request is standing.
     web_surface_headless_wanted: HashMap<String, u64>,
-    /// Session paths this GUI DELIBERATELY closed (✕ / suspend / the app's own
-    /// close OSC), with the time it happened. The heartbeat guard consults this
-    /// so a racing heartbeat right after a close cannot resurrect a ghost
-    /// overlay — BUT it lives only in this GUI process, so after a GUI restart
-    /// it is empty and a live app's heartbeat is allowed to REBUILD the surface
-    /// the restart tore down (the "ychrome comes back as a bare terminal after a
-    /// restart" bug: the daemon replays the vt100 screen on re-attach, never the
-    /// consumed OSC `open`, and heartbeats alone used to refuse to recreate).
-    web_surface_deliberate_close_ms: HashMap<String, u64>,
     /// Sidebar contributions declared by libyggterm apps, keyed by GUI
     /// session_path (OSC 7717 `sidebar;declare`). SSOT for which app panes the
     /// rail offers; entries expire when the app's declares stop, exactly like a
@@ -17439,124 +17361,78 @@ fn clear_stored_only_active_session(snapshot: &mut ServerUiSnapshot) {
     snapshot.active_view_mode = WorkspaceViewMode::Rendered;
 }
 
-// XTERM-BUG: idle-auto-webview (Bug7)
-// The daemon persists active_view_mode=Rendered and re-applies it on every snapshot
-// adoption (incl. periodic background refreshes). For a LIVE terminal/agent session
-// whose Rendered surface has NO real content (no rendered_sections AND no preview
-// blocks — the pre-alpha webview would show only its placeholder), that is never a
-// desired auto-state: an idle GUI flips to the empty webview on a hostless/transient
-// session. Coerce it back to Terminal. A session with REAL web-view content (preview
-// blocks / rendered_sections) is left untouched, so the in-development codex web view
-// is not disturbed; non-live (Stored/Document) sessions are also left alone (only
-// LiveLocal/LiveSsh require a terminal runtime).
-//
-// FIX 2026-08-18: fresh live sessions synthesize 2 placeholder preview blocks
-// ("This Grok session stays attached..." + "Launch command prepared:") so raw
-// `is_empty()` is false and the coerce never fired — a brand-new Grok/Opencode/
-// Muse row showed the bugged webview (synthetic intro + search bar) instead of
-// its terminal until real transcript content arrived. Treat scaffold-only preview
-// and placeholder rendered_sections as EMPTY for this judgement.
-fn snapshot_preview_blocks_effectively_empty(preview: &SnapshotPreview) -> bool {
-    if preview.blocks.is_empty() {
-        return true;
-    }
-    preview.blocks.iter().all(|block| {
-        // Snapshot blocks lack the managed `preview_block_is_scaffold_only` helper,
-        // so check the same predicate inline: every non-empty line is scaffold.
-        let block_is_scaffold = {
-            let mut saw_line = false;
-            let mut all_scaffold = true;
-            for line in &block.lines {
-                let t = line.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                saw_line = true;
-                if !is_preview_scaffold_line(t) {
-                    all_scaffold = false;
-                    break;
-                }
-            }
-            saw_line && all_scaffold
-        };
-        block_is_scaffold
-            || preview_text_looks_like_loading_placeholder(&block.lines.join("\n"))
-            || block.lines.iter().all(|line| {
-                let t = line.trim();
-                t.is_empty() || is_preview_scaffold_line(t)
-            })
-    })
-}
-fn snapshot_rendered_sections_effectively_empty(sections: &[SnapshotRenderedSection]) -> bool {
-    if sections.is_empty() {
-        return true;
-    }
-    sections.iter().all(|section| {
-        is_placeholder_rendered_section_title(&section.title)
-            || section.lines.iter().all(|line| {
-                let t = line.trim();
-                t.is_empty() || is_preview_scaffold_line(t)
-            })
-            || preview_text_looks_like_loading_placeholder(&section.lines.join("\n"))
-    })
-}
-// Kept for the managed-session path (used elsewhere); the snapshot path above is
-// the one the auto-webview sanitizer actually calls.
-fn preview_blocks_effectively_empty(preview: &SessionPreview) -> bool {
-    if preview.blocks.is_empty() {
-        return true;
-    }
-    preview.blocks.iter().all(|block| {
-        preview_block_is_scaffold_only(block)
-            || preview_text_looks_like_loading_placeholder(&block.lines.join("\n"))
-            || block.lines.iter().all(|line| {
-                let t = line.trim();
-                t.is_empty() || is_preview_scaffold_line(t)
-            })
-    })
-}
-fn rendered_sections_effectively_empty(sections: &[SessionRenderedSection]) -> bool {
-    if sections.is_empty() {
-        return true;
-    }
-    sections.iter().all(|section| {
-        is_placeholder_rendered_section_title(&section.title)
-            || !rendered_section_has_readable_preview_content(section)
-    })
-}
-fn auto_rendered_terminal_session_should_coerce(
+/// Whether a startup snapshot is putting a WEB SURFACE over a terminal row.
+///
+/// ⭐ **A CAPABILITY RULE, WHERE A CONTENT HEURISTIC USED TO BE.** The old
+/// version of this asked whether the rendered surface had anything worth
+/// showing — coerce to `Terminal` only when the transcript was empty — which
+/// is the product thesis stated backwards: it showed the terminal when the web
+/// page would have been *embarrassing*, rather than because the row is a
+/// terminal. So a live agent row with two tool-call blocks in its transcript
+/// sailed through, and a restart put a running agent on screen as a chat panel
+/// holding one collapsed work group.
+///
+/// The rule now matches the one the CLICK path has always used
+/// (`preferred_open_mode_for_row`) and the one the daemon derives
+/// (`YggtermServer::default_view_mode_for_session`): what the row IS decides.
+///
+/// ⛔ **STARTUP ONLY**, and every caller must gate it on `was_initial_sync`.
+/// Applied to a background refresh it would undo the titlebar toggle on the
+/// next poll — the user asks for the transcript, the daemon records it, and
+/// two seconds later the client argues. `Rendered` is a choice; this function
+/// only refuses to INHERIT one.
+fn startup_snapshot_should_show_terminal(
     view_mode: WorkspaceViewMode,
     source: SessionSource,
-    rendered_sections_empty: bool,
-    preview_blocks_empty: bool,
+    kind: SessionKind,
 ) -> bool {
     view_mode == WorkspaceViewMode::Rendered
         && matches!(source, SessionSource::LiveLocal | SessionSource::LiveSsh)
-        && rendered_sections_empty
-        && preview_blocks_empty
+        // A document IS its rendered thing, even when a recipe gives it a
+        // terminal to run in.
+        && kind != SessionKind::Document
 }
-fn sanitize_auto_rendered_terminal_session(snapshot: &mut ServerUiSnapshot) -> bool {
+
+/// The mode a startup snapshot SHOULD be carrying, or `None` if it is correct.
+///
+/// Pure, so the declare below and the local adoption below that cannot drift:
+/// one rule, two enforcement points, no second encoding of the question.
+fn startup_view_mode_correction(snapshot: &ServerUiSnapshot) -> Option<WorkspaceViewMode> {
     if snapshot.active_view_mode != WorkspaceViewMode::Rendered {
-        return false;
+        return None;
     }
-    let coerce = match snapshot.active_session.as_ref() {
-        Some(session) => auto_rendered_terminal_session_should_coerce(
-            WorkspaceViewMode::Rendered,
+    match snapshot.active_session.as_ref() {
+        Some(session) => startup_snapshot_should_show_terminal(
+            snapshot.active_view_mode,
             session.source,
-            snapshot_rendered_sections_effectively_empty(&session.rendered_sections),
-            snapshot_preview_blocks_effectively_empty(&session.preview),
-        ),
-        // STRAND: active_session_path set without an active_session, showing the empty
-        // webview placeholder (the live auto-webview bug). The start page is
-        // path=None+session=None (leave it); path=Some + session=None + Rendered is the
-        // hostless/transient strand → coerce to Terminal (a blank terminal that mounts
-        // when the runtime settles beats the pre-alpha webview).
-        None => snapshot.active_session_path.is_some(),
-    };
-    if !coerce {
-        return false;
+            session.kind,
+        )
+        .then_some(WorkspaceViewMode::Terminal),
+        // STRAND: a path with no session behind it, which renders as the empty
+        // web placeholder. The start page is path=None + session=None and is
+        // left alone; path=Some + session=None is the hostless/transient strand,
+        // where a blank terminal that mounts when the runtime settles beats a
+        // web page that never will.
+        None => snapshot
+            .active_session_path
+            .is_some()
+            .then_some(WorkspaceViewMode::Terminal),
     }
-    snapshot.active_view_mode = WorkspaceViewMode::Terminal;
+}
+
+/// Apply [`startup_view_mode_correction`] to a snapshot the client is adopting.
+///
+/// ⛔ The daemon is the OWNER of the workspace's mode, so this is the fallback
+/// half: `initial_server_sync` declares the correction to the daemon first, and
+/// this only keeps the first painted frame honest if that declare could not be
+/// made (a shadow viewer, or a daemon that refused). Without the declare the
+/// two would disagree forever and every background refresh would re-fight it —
+/// which is what the Bug7 comment this replaces was describing.
+fn sanitize_startup_view_mode(snapshot: &mut ServerUiSnapshot) -> bool {
+    let Some(mode) = startup_view_mode_correction(snapshot) else {
+        return false;
+    };
+    snapshot.active_view_mode = mode;
     true
 }
 
@@ -17955,33 +17831,6 @@ fn active_remote_recovery_snapshot_probe_should_start(
         surface_mounted,
     );
     false
-}
-fn server_prompt_snapshot_replay_should_start(
-    is_remote_resume_session: bool,
-    host_is_active_session: bool,
-    attach_in_flight: bool,
-    has_unready_open_attempt: bool,
-    surface_mounted: bool,
-) -> bool {
-    let _ = (
-        is_remote_resume_session,
-        host_is_active_session,
-        attach_in_flight,
-        has_unready_open_attempt,
-        surface_mounted,
-    );
-    false
-}
-fn server_prompt_snapshot_replay_identity(
-    mount_identity: &str,
-    replay_len: usize,
-    status_line_len: usize,
-    latest_unready_attempt_id: Option<&str>,
-) -> String {
-    format!(
-        "server-snapshot-replay:{mount_identity}:{replay_len}:{status_line_len}:{}",
-        latest_unready_attempt_id.unwrap_or("no-unready-attempt")
-    )
 }
 fn active_recovery_snapshot_probe_key(
     mount_identity: &str,
@@ -18663,7 +18512,6 @@ impl ShellState {
             web_surfaces: HashMap::new(),
             web_profiles_root: web_surface_profiles_root(),
             web_surface_headless_wanted: HashMap::new(),
-            web_surface_deliberate_close_ms: HashMap::new(),
             sidebar_contributions: HashMap::new(),
             app_pane_schema: None,
             app_pane_values: HashMap::new(),
@@ -20133,9 +19981,6 @@ impl ShellState {
             });
             next_tab_id += 1;
         }
-        // The surface is live again: forget any prior deliberate-close record so
-        // it neither lingers nor blocks a future heartbeat rebuild.
-        self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
@@ -20252,7 +20097,6 @@ impl ShellState {
             // The app tab is nobody's child.
             opener: None,
         };
-        self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
@@ -20290,12 +20134,16 @@ impl ShellState {
         }
     }
     fn close_web_surface(&mut self, session_path: &str) -> bool {
-        // Record the deliberate close so a heartbeat racing in right after it
-        // cannot resurrect a ghost overlay (see `web_surface_deliberate_close_ms`).
-        // This map is process-local, so a GUI restart forgets it and lets a live
-        // app's heartbeat rebuild the surface.
-        self.web_surface_deliberate_close_ms
-            .insert(session_path.to_string(), current_millis());
+        // ⛔ THE GHOST-OVERLAY GUARD IS NOT IN FORCE, and this used to look like
+        // it was. A `web_surface_deliberate_close_ms` map was stamped here so a
+        // heartbeat racing in right after a close could be refused — but the
+        // predicate that consulted it had no callers, so the map was written,
+        // cleared and never once read. Nothing gates a rebuild today: a
+        // heartbeat arriving just after the user closes a surface recreates it.
+        // Removed rather than left as a store column that decides nothing;
+        // re-arming the refusal is a queue item, because the same bar is what
+        // once stopped a live app's surface coming back after a GUI restart and
+        // choosing between the two needs the web-surface owner.
         let closed = if let Some(removed) = self.web_surfaces.remove(session_path) {
             kill_web_surface_forward(&removed);
             true
@@ -20308,15 +20156,6 @@ impl ShellState {
             self.prune_web_view_panes();
         }
         closed
-    }
-    /// True while a heartbeat must NOT recreate a gone surface: the GUI closed it
-    /// deliberately within the last few seconds and the app's own close OSC may
-    /// still be in flight. Outside that window (and always after a GUI restart,
-    /// which forgets the record) a heartbeat MAY rebuild the surface.
-    fn web_surface_recently_deliberately_closed(&self, session_path: &str, now_ms: u64) -> bool {
-        self.web_surface_deliberate_close_ms
-            .get(session_path)
-            .is_some_and(|closed_at| now_ms.saturating_sub(*closed_at) < WEB_SURFACE_CLOSE_GHOST_GRACE_MS)
     }
     fn sweep_stale_web_surfaces(&mut self, now_ms: u64) {
         // The stale sweep is a DEAD-APP detector: an app whose OSC heartbeats
@@ -27287,9 +27126,12 @@ impl ShellState {
                 {
                     clear_stored_only_active_session(&mut snapshot);
                 }
-                // XTERM-BUG: idle-auto-webview (Bug7) — don't adopt an empty Rendered
-                // webview for a live terminal session (daemon re-asserts it on refresh).
-                sanitize_auto_rendered_terminal_session(&mut snapshot);
+                // ⛔ STARTUP ONLY: refuse to INHERIT a web surface over a live
+                // terminal row. On a background refresh this would argue with
+                // the titlebar toggle two seconds after the user used it.
+                if was_initial_sync {
+                    sanitize_startup_view_mode(&mut snapshot);
+                }
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -27384,7 +27226,9 @@ impl ShellState {
         match result {
             Ok((snapshot, message)) => {
                 let mut snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
-                sanitize_auto_rendered_terminal_session(&mut snapshot);
+                if was_initial_sync {
+                    sanitize_startup_view_mode(&mut snapshot);
+                }
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -27453,9 +27297,12 @@ impl ShellState {
                 {
                     clear_stored_only_active_session(&mut snapshot);
                 }
-                // XTERM-BUG: idle-auto-webview (Bug7) — don't adopt an empty Rendered
-                // webview for a live terminal session (daemon re-asserts it on refresh).
-                sanitize_auto_rendered_terminal_session(&mut snapshot);
+                // ⛔ STARTUP ONLY: refuse to INHERIT a web surface over a live
+                // terminal row. On a background refresh this would argue with
+                // the titlebar toggle two seconds after the user used it.
+                if was_initial_sync {
+                    sanitize_startup_view_mode(&mut snapshot);
+                }
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -33025,22 +32872,6 @@ fn terminal_host_surface_text<'a>(
         host_health_cursor_line_text
     }
 }
-fn retained_remote_surface_has_non_prompt_text(
-    host_health_cursor_line_text: &str,
-    host_health_text_tail: &str,
-) -> bool {
-    let host_surface_text =
-        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
-    let trimmed = host_surface_text.trim();
-    !trimmed.is_empty()
-        && !terminal_surface_has_prompt_ready_text(host_surface_text)
-        && !terminal_chunk_is_transport_error(host_surface_text)
-        && !terminal_chunk_is_loading_placeholder(host_surface_text)
-        && !terminal_chunk_is_transcript_browser(host_surface_text)
-        && !terminal_chunk_is_saved_transcript_prefill(host_surface_text)
-        && !terminal_chunk_is_low_signal_terminal_noise(host_surface_text)
-        && !terminal_chunk_is_codex_resume_instruction(host_surface_text)
-}
 fn retained_remote_surface_should_wait_for_prompt_ready(
     _is_remote_resume_session: bool,
     _poisoned_by_retry: bool,
@@ -33113,30 +32944,6 @@ fn remote_resume_blank_host_snapshot_is_replayable(snapshot: &str) -> bool {
         && !terminal_chunk_is_saved_transcript_prefill(trimmed)
         && !terminal_chunk_is_low_signal_terminal_noise(trimmed)
         && !terminal_chunk_is_codex_resume_instruction(trimmed)
-}
-fn remote_resume_snapshot_is_replayable_for_session(
-    snapshot: &str,
-    remote_starting_agent_session: bool,
-    codex_like_session: bool,
-) -> bool {
-    if codex_like_session && terminal_replay_snapshot_has_cursor_addressed_scrollback_risk(snapshot)
-    {
-        return false;
-    }
-    if !remote_resume_blank_host_snapshot_is_replayable(snapshot) {
-        return false;
-    }
-    let trimmed = snapshot.trim();
-    if remote_starting_agent_session {
-        return terminal_chunk_is_codex_prompt_surface(trimmed)
-            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed);
-    }
-    if codex_like_session {
-        return terminal_chunk_is_codex_prompt_surface(trimmed)
-            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
-            || terminal_chunk_has_codex_prompt_output(trimmed);
-    }
-    true
 }
 
 fn remote_resume_screen_snapshot_is_replayable_for_blank_host(
@@ -37421,6 +37228,40 @@ pub fn initial_server_sync(
         restart_daemon(&endpoint)?;
         snapshot = daemon_snapshot(&endpoint)?.0;
         runtime = status(&endpoint).ok();
+    }
+    // ⭐ DECLARE THE SURFACE, DO NOT JUST PAINT IT.
+    //
+    // A GUI restart does not restart the daemon, so the mode the daemon is
+    // holding survives us — and if we only corrected it locally, the daemon
+    // would re-assert `Rendered` on the next background refresh and the client
+    // would flip the user's viewport back to the web page. That standoff ran
+    // for months behind a content heuristic weak enough to lose it quietly.
+    // One owner: tell the daemon, adopt what it hands back.
+    //
+    // ⛔ A shadow viewer never writes (same rule as the terminal-identity sync
+    // above): it is a second pair of eyes on someone else's session, and a
+    // read-only client that changes the mode changes it for THEM.
+    if !client_is_shadow_viewer()
+        && let Some(mode) = startup_view_mode_correction(&snapshot)
+    {
+        let declared = daemon_set_view_mode(&endpoint, mode);
+        if let Some(home) = trace_home.as_ref() {
+            append_trace_event(
+                home,
+                "startup",
+                "gui",
+                "startup_view_mode_declared",
+                json!({
+                    "mode": format!("{mode:?}"),
+                    "active_session_path": snapshot.active_session_path.as_deref(),
+                    "ok": declared.is_ok(),
+                    "error": declared.as_ref().err().map(ToString::to_string),
+                }),
+            );
+        }
+        if let Ok((declared_snapshot, _)) = declared {
+            snapshot = declared_snapshot;
+        }
     }
     let detail = match &endpoint {
         #[cfg(unix)]
@@ -44273,6 +44114,80 @@ fn remote_preview_should_auto_sync(session: &ManagedSessionView) -> bool {
     }
     true
 }
+/// Whether the rendered surface is about to paint a page with nothing to READ.
+///
+/// ⛔ **A BLANK SURFACE AND A BROKEN ONE LOOK IDENTICAL, AND THIS CAMPAIGN HAS
+/// PAID FOR THAT MORE THAN ONCE.** The frame that produced this: a live agent
+/// row drawn as a chat panel holding a single collapsed `Work · 2` group and
+/// nothing else. Every instrument said the surface was fine, because it WAS
+/// fine — it had faithfully rendered a transcript with no prose in it. What
+/// the person saw was a page that had failed.
+///
+/// Tool calls and reasoning are not reading matter: a surface whose entire
+/// content is machine work has no answer on it, and must say which of the two
+/// it is rather than leave the reader to guess. The loading and failure
+/// placeholders already own their states; this owns the third.
+///
+/// ⚠ Deliberately narrow — it is false the moment ANY prose block or ANY
+/// rendered section exists, so it can never hide a transcript that has
+/// something to say.
+fn retained_remote_surface_has_non_prompt_text(
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+) -> bool {
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
+    let trimmed = host_surface_text.trim();
+    !trimmed.is_empty()
+        && !terminal_surface_has_prompt_ready_text(host_surface_text)
+        && !terminal_chunk_is_transport_error(host_surface_text)
+        && !terminal_chunk_is_loading_placeholder(host_surface_text)
+        && !terminal_chunk_is_transcript_browser(host_surface_text)
+        && !terminal_chunk_is_saved_transcript_prefill(host_surface_text)
+        && !terminal_chunk_is_low_signal_terminal_noise(host_surface_text)
+        && !terminal_chunk_is_codex_resume_instruction(host_surface_text)
+}
+fn remote_resume_snapshot_is_replayable_for_session(
+    snapshot: &str,
+    remote_starting_agent_session: bool,
+    codex_like_session: bool,
+) -> bool {
+    if codex_like_session && terminal_replay_snapshot_has_cursor_addressed_scrollback_risk(snapshot)
+    {
+        return false;
+    }
+    if !remote_resume_blank_host_snapshot_is_replayable(snapshot) {
+        return false;
+    }
+    let trimmed = snapshot.trim();
+    if remote_starting_agent_session {
+        return terminal_chunk_is_codex_prompt_surface(trimmed)
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed);
+    }
+    if codex_like_session {
+        return terminal_chunk_is_codex_prompt_surface(trimmed)
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
+            || terminal_chunk_has_codex_prompt_output(trimmed);
+    }
+    true
+}
+fn preview_surface_has_nothing_to_read(
+    runs: &[PreviewRun],
+    rendered_sections_empty: bool,
+    loading_placeholder_visible: bool,
+    failure_placeholder_visible: bool,
+) -> bool {
+    if loading_placeholder_visible || failure_placeholder_visible {
+        return false;
+    }
+    if !rendered_sections_empty {
+        return false;
+    }
+    !runs
+        .iter()
+        .flat_map(|run| run.entries.iter())
+        .any(|entry| !preview_block_is_activity(&entry.block))
+}
 fn preview_should_show_blocking_failure_placeholder(
     preview_failure_present: bool,
     grouped_runs_empty: bool,
@@ -46716,14 +46631,6 @@ fn sidebar_merge_cache() -> &'static Mutex<SidebarMergeCache> {
 fn sidebar_search_cache() -> &'static Mutex<SidebarSearchCache> {
     SIDEBAR_SEARCH_CACHE.get_or_init(|| Mutex::new(SidebarSearchCache::default()))
 }
-fn preview_content_cache_key(lines: &[String]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for line in lines {
-        line.hash(&mut hasher);
-        0xff_u8.hash(&mut hasher);
-    }
-    hasher.finish()
-}
 fn preview_run_cache_key(rows: &[(usize, SessionPreviewBlock)]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for (raw_index, block) in rows {
@@ -47542,30 +47449,6 @@ fn preview_virtual_window(
         viewport_height_px,
         scroll_height_px,
         overscan_px,
-    }
-}
-fn preview_latest_materialized_window(
-    blocks: &[SessionPreviewBlock],
-    viewport_height_px: f64,
-    scroll_height_px: f64,
-) -> PreviewVirtualWindow {
-    let total_height_px = blocks
-        .iter()
-        .map(estimate_preview_block_height)
-        .sum::<f64>();
-    let start_index = blocks.len().saturating_sub(PREVIEW_BLOCK_WINDOW);
-    PreviewVirtualWindow {
-        start_index,
-        end_index: blocks.len(),
-        top_spacer_px: 0.0,
-        bottom_spacer_px: 0.0,
-        total_height_px,
-        scroll_top_px: 0.0,
-        viewport_height_px: viewport_height_px.max(PREVIEW_MIN_VIEWPORT_HEIGHT_PX),
-        scroll_height_px: scroll_height_px
-            .max(total_height_px)
-            .max(PREVIEW_MIN_VIEWPORT_HEIGHT_PX),
-        overscan_px: 0.0,
     }
 }
 fn preview_should_pin_latest_on_open(
@@ -72061,7 +71944,7 @@ mod web_do_verb_tests {
             "data:text/html,<script>1</script>",
         ] {
             assert!(
-                declared_web_surface_open_from_payload(&json!({ "url": url })).is_none(),
+                declared_web_surface_open_or_refusal(&json!({ "url": url })).is_err(),
                 "{url} must never materialize from a PTY-authored declare"
             );
         }
@@ -73551,44 +73434,6 @@ mod web_do_verb_tests {
         assert!(!web_surface_reap_due(999_999_000, stashed, None, None, false));
     }
 
-    /// ONE TUNNEL PER SESSION, NOT PER TAB. `ssh -N -D` is the session's egress:
-    /// every tab of a surface reaches the same host through it. Reuse used to be
-    /// keyed on the TAB, and `web_surface_new_tab` mints `socks_port: None`, so
-    /// each new tab spawned its own — N ssh children on the GUI host, N
-    /// handshakes, N sshds on the remote and N listening loopback ports, which
-    /// trips the remote's MaxStartups long before anything here notices.
-    #[test]
-    fn a_new_tab_adopts_the_sessions_socks_egress() {
-        // The tab's own tunnel always wins: nothing to adopt, and re-spawning
-        // would churn the port and force a webview destroy+recreate.
-        assert_eq!(
-            web_surface_socks_egress_donor(&[(1, Some(1080)), (2, Some(1081))], 2),
-            Some(2)
-        );
-        // A fresh tab (socks_port None) borrows the session's live tunnel
-        // instead of spawning a second one.
-        assert_eq!(
-            web_surface_socks_egress_donor(&[(1, Some(1080)), (7, None)], 7),
-            Some(1)
-        );
-        // Deterministic on the TAB ID, not on strip order — tab order is
-        // user-mutable (drag, filing) and egress must not follow chrome layout.
-        assert_eq!(
-            web_surface_socks_egress_donor(&[(9, Some(1090)), (3, Some(1030)), (7, None)], 7),
-            Some(3)
-        );
-        assert_eq!(
-            web_surface_socks_egress_donor(&[(3, Some(1030)), (9, Some(1090)), (7, None)], 7),
-            Some(3)
-        );
-        // A LOCAL session has no tunnel at all: nothing to adopt, and the
-        // caller must fall through to real resolution rather than assume one.
-        assert_eq!(
-            web_surface_socks_egress_donor(&[(1, None), (2, None)], 2),
-            None
-        );
-        assert_eq!(web_surface_socks_egress_donor(&[], 1), None);
-    }
 
     /// The refcount that makes sharing safe. With one tunnel serving N tabs,
     /// closing ANY tab used to kill it — severing egress for every sibling still

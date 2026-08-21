@@ -3772,7 +3772,12 @@ fn snapshot_document_has_terminal_recipe(session: &SnapshotSessionView) -> bool 
             .any(|section| section.title == "Replay Commands" && !section.lines.is_empty())
 }
 
-fn managed_session_supports_terminal_view(session: &ManagedSessionView) -> bool {
+/// Whether this row has a terminal at all.
+///
+/// `pub` because the shell asks the same question and must not answer it
+/// itself: one owner, or the client and the daemon can disagree about whether
+/// a row even HAS the surface the workspace is choosing between.
+pub fn managed_session_supports_terminal_view(session: &ManagedSessionView) -> bool {
     match session.kind {
         // Twin of `snapshot_session_supports_terminal_view` — same rule, other
         // row shape.
@@ -4821,6 +4826,48 @@ impl YggtermServer {
     pub fn active_session_supports_terminal(&self) -> bool {
         self.active_session_path()
             .is_some_and(|path| self.session_supports_terminal(path))
+    }
+
+    /// The surface a session shows when nobody has ASKED for the other one.
+    ///
+    /// ⭐ **THE PRODUCT THESIS, WRITTEN AS CODE.** yggterm exists to hand a
+    /// person the terminal of the session they opened; the rendered transcript
+    /// is a surface they opt INTO for a row that has one. So `Rendered` is a
+    /// CHOICE, and never a state that a restart, a snapshot adoption or a
+    /// departed neighbour can leave behind. [`Self::set_view_mode`] stays the
+    /// only way to overrule this, which is what keeps the titlebar toggle
+    /// working while the adopt paths stop guessing.
+    ///
+    /// ⛔ It answers KIND FIRST, not capability. A `Document` **is** its
+    /// rendered thing (yedit's paper), and a recipe document has a terminal
+    /// spec as well — `terminal_spec` hands one back through
+    /// `recipe_terminal_spec`. Asked the other way round, every recipe would
+    /// default to the terminal that runs it instead of to the paper it is.
+    ///
+    /// ⚠ There was no such rule anywhere before, in any layer.
+    /// [`Self::normalize_active_view_mode`] ends every arm in `Rendered`, so
+    /// nothing said *"the active row IS a terminal session, therefore show the
+    /// terminal"* — and a restart put a live agent terminal on screen as an
+    /// empty web page.
+    pub fn default_view_mode_for_session(&self, path: &str) -> WorkspaceViewMode {
+        if self.session_for_path(path).map(|session| session.kind) == Some(SessionKind::Document) {
+            return WorkspaceViewMode::Rendered;
+        }
+        if self.session_supports_terminal(path) {
+            return WorkspaceViewMode::Terminal;
+        }
+        WorkspaceViewMode::Rendered
+    }
+
+    /// [`Self::default_view_mode_for_session`] for whatever is active now.
+    ///
+    /// No active session is the start page, which is a rendered surface by
+    /// construction — the same answer [`Self::show_start_page`] writes.
+    pub fn default_view_mode_for_active_session(&self) -> WorkspaceViewMode {
+        match self.active_session_path.as_deref() {
+            Some(path) => self.default_view_mode_for_session(path),
+            None => WorkspaceViewMode::Rendered,
+        }
     }
 
     /// Text to WRITE INTO the PTY to stop it — only for a session that has no
@@ -7358,6 +7405,12 @@ impl YggtermServer {
                 } else {
                     path
                 };
+            // A row the scan no longer holds is restored as a PREVIEW STUB, not
+            // as a session: it carries a resume command, so it would answer
+            // "yes" to `session_supports_terminal` while there is nothing on
+            // the far end to attach to. It keeps `Rendered` for that reason,
+            // and is the one active row whose surface is NOT derived below.
+            let mut active_is_synthesized_preview = false;
             if !self.sessions.contains_key(&active_path)
                 && let Some(session) = synthesize_remote_active_preview_session(
                     &active_path,
@@ -7367,6 +7420,7 @@ impl YggtermServer {
                     self.ghostty_host.bridge_enabled,
                 )
             {
+                active_is_synthesized_preview = true;
                 if self.active_view_mode == WorkspaceViewMode::Terminal {
                     self.active_view_mode = WorkspaceViewMode::Rendered;
                 }
@@ -7379,6 +7433,14 @@ impl YggtermServer {
                     && !existing.stored_preview_hydrated
                 {
                     let _ = self.refresh_stored_session_preview(&active_path, &existing);
+                }
+                // ⭐ DERIVE THE SURFACE, DO NOT INHERIT IT. The persisted mode
+                // above is the mode some earlier daemon happened to be in, and
+                // adopting it is how a live agent terminal came back from a
+                // restart as an empty web page. What the row IS decides;
+                // `set_view_mode` is still the only thing that can overrule it.
+                if !active_is_synthesized_preview {
+                    self.active_view_mode = self.default_view_mode_for_session(&active_path);
                 }
                 if launch_active_terminal
                     && self.active_view_mode == WorkspaceViewMode::Terminal
@@ -13291,116 +13353,10 @@ fn remote_resume_seed_snapshot_prefill(bytes: &[u8]) -> Option<String> {
     }
 }
 
-fn remote_resume_prefill_has_scrollback(prefill: &str) -> bool {
-    prefill
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-        >= 40
-}
 
-fn remote_preview_payload_terminal_prefill(payload: &RemotePreviewPayload) -> Option<String> {
-    let _ = payload;
-    return None;
-}
 
-fn remote_preview_payload_terminal_prefill_before_2_1_103(
-    payload: &RemotePreviewPayload,
-) -> Option<String> {
-    let mut lines = Vec::new();
-    for block in &payload.preview.blocks {
-        let content = block
-            .lines
-            .iter()
-            .map(|line| line.trim_end())
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>();
-        if content.is_empty() {
-            continue;
-        }
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines.push(match block.role.as_str() {
-            "user" => "›".to_string(),
-            "assistant" => "•".to_string(),
-            other => format!("{other}:"),
-        });
-        lines.extend(content.into_iter().map(ToOwned::to_owned));
-    }
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
-    }
-    if lines.is_empty() {
-        return None;
-    }
-    Some(format!("{}\r\n", lines.join("\r\n")))
-}
 
-fn fetch_remote_saved_codex_session_path_over_ssh(
-    ssh_target: &str,
-    exec_prefix: Option<&str>,
-    session_id: &str,
-) -> anyhow::Result<Option<String>> {
-    let inner = format!(
-        r#"root="${{CODEX_HOME:-$HOME/.codex}}/sessions"
-[ -d "$root" ] || exit 0
-target={session_id}
-exact=$(find "$root" -type f -name "*$target*.jsonl" -print -quit 2>/dev/null || true)
-if [ -n "$exact" ]; then
-  printf '%s' "$exact"
-  exit 0
-fi
-find "$root" -type f -name '*.jsonl' -print 2>/dev/null | while IFS= read -r path; do
-  if grep -Fq -- "$target" "$path" 2>/dev/null; then
-    printf '%s' "$path"
-    exit 0
-  fi
-done"#,
-        session_id = shell_single_quote(session_id),
-    );
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg("ConnectTimeout=5");
-    cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg(ssh_target)
-        .arg(remote_shell_command(exec_prefix, &inner))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = cmd
-        .output()
-        .with_context(|| format!("finding remote saved Codex session on {ssh_target}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "remote saved-session lookup failed for {}: {}",
-            ssh_target,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!path.is_empty()).then_some(path))
-}
 
-fn fetch_remote_saved_codex_prefill_over_ssh(
-    ssh_target: &str,
-    exec_prefix: Option<&str>,
-    session_id: &str,
-) -> anyhow::Result<Option<String>> {
-    let Some(path) =
-        fetch_remote_saved_codex_session_path_over_ssh(ssh_target, exec_prefix, session_id)?
-    else {
-        return Ok(None);
-    };
-    let output = run_remote_yggterm_command(
-        ssh_target,
-        exec_prefix,
-        &["server", "remote", "preview", &path],
-        None,
-    )?;
-    let payload: RemotePreviewPayload =
-        serde_json::from_str(&output).context("invalid remote preview payload")?;
-    Ok(remote_preview_payload_terminal_prefill(&payload)
-        .map(|prefill| format!("\x1b[2J\x1b[H{prefill}")))
-}
 
 fn remote_saved_session_match_fragments(session_id: &str) -> anyhow::Result<Vec<String>> {
     let mut files = Vec::new();
@@ -13458,15 +13414,6 @@ fn remote_saved_session_cwd(session_id: &str) -> anyhow::Result<Option<String>> 
     Ok(None)
 }
 
-fn remote_snapshot_matches_saved_session(
-    session_id: &str,
-    snapshot: &[u8],
-) -> anyhow::Result<bool> {
-    let fragments = remote_saved_session_match_fragments(session_id)?;
-    Ok(remote_snapshot_matches_saved_session_fragments(
-        &fragments, snapshot, true,
-    ))
-}
 
 fn remote_snapshot_matches_saved_session_strict(
     session_id: &str,
@@ -38036,45 +37983,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_preview_payload_terminal_prefill_is_disabled_for_live_terminal() {
-        let payload = RemotePreviewPayload {
-            title_hint: None,
-            cached_summary: None,
-            preview: SnapshotPreview {
-                older_available: false,
-                summary: Vec::new(),
-                blocks: vec![
-                    SnapshotPreviewBlock {
-                        role: "user".to_string(),
-                        timestamp: "now".to_string(),
-                        tone: PreviewTone::User,
-                        folded: false,
-                        lines: vec!["Investigate the remote terminal.".to_string()],
-                        kind: PreviewBlockKind::Message,
-                        activity: None,
-                    },
-                    SnapshotPreviewBlock {
-                        role: "assistant".to_string(),
-                        timestamp: "now".to_string(),
-                        tone: PreviewTone::Assistant,
-                        folded: false,
-                        lines: (1..=45)
-                            .map(|line| format!("Recovered transcript line {line:03}"))
-                            .collect(),
-                        kind: PreviewBlockKind::Message,
-                        activity: None,
-                    },
-                ],
-            },
-            rendered_sections: Vec::new(),
-        };
-        assert_eq!(
-            super::remote_preview_payload_terminal_prefill(&payload),
-            None
-        );
-    }
-
-    #[test]
     fn terminal_scroll_probe_requires_actual_movement_when_scrollback_can_move() {
         let before = json!({
             "viewport_y": 124,
@@ -42749,6 +42657,101 @@ terminal_window_id: None,
 
         assert_eq!(server.live_sessions().len(), 1);
         assert!(server.sessions.contains_key("local://old-shell"));
+    }
+
+    /// ⛔ THE RESTART THAT LANDED ON A WEB SURFACE OVER A LIVE TERMINAL ROW.
+    ///
+    /// The persisted mode is the mode SOME EARLIER DAEMON happened to be in.
+    /// Restore used to adopt it verbatim, so a workspace that had been left on
+    /// the transcript came back with a running agent drawn as a web page —
+    /// while its own metadata rail said `Claude Code · running · PTY 173 x 65`.
+    /// The row's capability decides now, and `Rendered` is a thing only
+    /// `set_view_mode` can produce for a terminal-capable row.
+    #[test]
+    fn restore_derives_the_terminal_surface_for_a_live_agent_row() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some("local://agent-row".to_string()),
+                // The whole point: the file says Rendered.
+                active_view_mode: WorkspaceViewMode::Rendered,
+                ssh_targets: Vec::new(),
+                remote_machines: Vec::new(),
+                stored_sessions: Vec::new(),
+                live_sessions: vec![PersistedLiveSession {
+                    app_launch: None,
+                    key: "local://agent-row".to_string(),
+                    id: "agent-row".to_string(),
+                    title: "Live agent row".to_string(),
+                    kind: SessionKind::ClaudeCode,
+                    keep_alive: true,
+                    ssh_target: "localhost".to_string(),
+                    prefix: None,
+                    cwd: Some("/home/user".to_string()),
+                    remote_launch_action: None,
+                    storage_path: None,
+                    restore_reason: None,
+                    created_by: None,
+                    ephemeral: None,
+                    agent_launch_options: Default::default(),
+                    title_is_explicit: false,
+                    outline_prefix: None,
+                }],
+                session_pty_grids: Vec::new(),
+            },
+            None,
+        );
+
+        assert_eq!(
+            server.active_session_path(),
+            Some("local://agent-row"),
+            "the row still restores as the active one"
+        );
+        assert_eq!(
+            server.active_view_mode(),
+            WorkspaceViewMode::Terminal,
+            "and it comes back as a terminal, not as the web surface the file named"
+        );
+    }
+
+    /// The other half of the same rule: a document is not dragged to a terminal.
+    ///
+    /// `terminal_spec` hands back a spec for a recipe document, so asking
+    /// capability BEFORE kind would default every recipe to the terminal that
+    /// runs it rather than to the paper it is.
+    #[test]
+    fn default_view_mode_keeps_a_document_on_its_rendered_surface() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session_with_launch_options(
+            SessionKind::Document,
+            None,
+            Some("A note"),
+            &AgentLaunchOptions::default(),
+        );
+        assert_eq!(
+            server.default_view_mode_for_session(&path),
+            WorkspaceViewMode::Rendered,
+        );
+
+        let shell = server.start_local_session_with_launch_options(
+            SessionKind::Shell,
+            None,
+            Some("A shell"),
+            &AgentLaunchOptions::default(),
+        );
+        assert_eq!(
+            server.default_view_mode_for_session(&shell),
+            WorkspaceViewMode::Terminal,
+            "and everything that runs in a PTY defaults to the PTY"
+        );
     }
 
     #[test]
