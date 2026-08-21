@@ -769,11 +769,23 @@ Measured 2026-08-21 on the laptop, same host, same home, same window: `ytrace
 query --category input --since 90m` returned **zero rows** while `tail --category
 input --since 2h --lines 25000` returned **18,336 events**; and the heartbeat's
 `ui_blocks_per_min` (computed through the same `ytrace::query::summarize`)
-reported **242.6/min** where the incident files hold ~1/min. Two disagreements,
-opposite directions, one shared layer. Until `summarize` is root-caused:
-**events come from `tail --lines N` (plus the newest-timestamp check above) or
-the notebooks; a `query`/`summarize` count or rate is not evidence.** This also
-taints any consumer of `summarize` — `host_panic` density fields included.
+reported **242.6/min** where the incident files hold ~1/min.
+
+**The inflated direction is ROOT-CAUSED AND FIXED (`29fe1440`, same day):**
+`summarize`'s `since_ms` is an ABSOLUTE epoch cutoff and the `host_panic`
+caller handed it a window LENGTH (300 000) — "everything after 1970-01-01
+00:05" — so the density was the lifetime count over five minutes. Both values
+`u128`, both honestly milliseconds; only the values could catch it (the field
+repeated IDENTICALLY across heartbeats, which a rate cannot do).
+
+**Still open, and it belongs to the ytrace crate, not this repo:** the
+zero-rows direction (the CLI's own query path finding nothing where `tail`
+finds thousands), and the sibling defect the fix commit files — the memory arm
+alarms on swap USED, a LEVEL nothing is obliged to reclaim, so 7.5 GiB of
+residue keeps `host_panic_memory` firing forever on a healed host. Until those
+land: **events come from `tail --lines N` (plus the newest-timestamp check
+above) or the notebooks; a `query`/`summarize` count or rate is not
+evidence.**
 
 ### ⛔⛔ A WEBVIEW FLUSH-GATE TIMEOUT IS NOT EVIDENCE THE UI IS STALE
 
