@@ -409,15 +409,27 @@ $ yggterm-headless server status --endpoint <home>/server-<stranded-version>.soc
 PTY masters and has been alive 29 h. That empty answer is exactly why the GUI concludes the row
 has no session and launches a fresh resume, which the wrapper then correctly refuses.
 
-#### ⛔⛔ AND THE INSTRUMENT YOU WOULD REACH FOR IS BLIND TO IT
+#### ⛔⛔ TWO VERBS, ONE HOST, CONTRADICTORY PICTURES — and the working one is already in-tree
 
-`server daemons --json` reported **one** daemon on a host running two. It enumerates versioned
-socket NAMES and dials them, so a daemon with no name left is invisible to it *by construction* —
-the same family as every other entry here. **`scripts/daemon-name-census.py` asks the kernel
-instead** (`/proc/net/unix` for the bind table, `/proc/*/fd` for the holder) and exits non-zero
-when any live daemon has lost its name. ⚠ Its proper home is `server daemons`; it lives in
-`scripts/` only because that verb cannot see what it measures, and it should be folded in and
-deleted once the verb learns to ask the kernel.
+*An earlier revision of this section said "the instrument you would reach for is blind to it".
+That over-claims: **one** verb is blind and **another already sees it**, which is a far more
+useful fact because it means the mechanism does not need inventing.*
+
+| verb | what it reports on a host running two daemons |
+|---|---|
+| `server daemons --json` | **1 daemon** — it enumerates versioned socket NAMES and dials them, and a stranded daemon has no name left to enumerate |
+| `server rows drafts` | `daemon_processes_on_host: 2`, `daemons_seen: 1`, **`daemons_running_but_never_reached: [<stranded pid>]`**, and it downgrades its own verdict to `coverage: INCOMPLETE` |
+
+⇒ **`daemon_process_pids(home)` is the mechanism that sees it** — a `/proc` scan scoped by home,
+already correct, already carrying its own `⛔ None IS "COULD NOT ASK", NEVER "THERE ARE NONE"`
+warning. It has **exactly one caller**. ⇒ **The fix for the instrument half is to teach
+`server daemons` to consult it**, not to write anything new.
+
+**`scripts/daemon-name-census.py`** adds the one thing the process scan does not: the
+name-resolution check — *is the path this daemon is bound to still resolving to this daemon?* —
+and exits non-zero when any live daemon has lost its name. ⚠ **Both belong inside
+`server daemons`; fold them in and delete the script.** Two answers to one question is what this
+repo forbids, and right now there are three.
 
 ### ⚠ SCOPE, MEASURED RATHER THAN REPEATED
 

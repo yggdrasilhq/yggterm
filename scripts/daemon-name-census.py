@@ -19,9 +19,16 @@ only unreachable. That is why a stranded daemon looks healthy from the inside
 and absent from the outside, and why every session it owns answers "no session
 here matches" from every other daemon on the host.
 
-⚠ THIS SCRIPT'S PROPER HOME IS `server daemons`. It lives here because that verb
-cannot see what it measures; fold it in when the verb learns to ask the kernel,
-and delete this — two answers to one question is exactly what this repo forbids.
+⚠ THIS SCRIPT'S PROPER HOME IS `server daemons`, AND HALF OF IT ALREADY EXISTS.
+`daemon_process_pids(home)` in `daemon.rs` is the same `/proc` scan, is already
+correct, and already carries the `None is "could not ask"` warning — but it has
+exactly ONE caller (the drafts sweep), which is why `server rows drafts` reports
+`daemons_running_but_never_reached` while `server daemons` reports one daemon on
+the same host. What this adds on top is only the NAME-RESOLUTION check: is the
+path a daemon is bound to still resolving to that daemon?
+
+⇒ Fold BOTH into `server daemons` and delete this file. Two answers to one
+question is what this repo forbids, and at the moment there are three.
 
 Usage:  scripts/daemon-name-census.py [YGGTERM_HOME]
 Exit 1 if any live daemon has lost its name, so a watcher can gate on it.
