@@ -200,6 +200,7 @@ restart_gui() {  # host expected_md5
   now="$(ssh -n "$host" 'for g in $(pgrep -x yggterm); do x=$(readlink /proc/$g/exe); case "$x" in "$HOME/.local/bin/"*) md5sum /proc/$g/exe | cut -c1-10;; esac; done' 2>/dev/null | head -1)"
   if [ "$now" = "$want" ]; then
     say "✅ GUI on $host restarted onto $now — client and daemon now match"
+    repaint_sweep "$host"
   else
     say "⛔ GUI on $host reads $now, expected $want — RESTART DID NOT TAKE. Left for a human."
     ssh -n "$host" "~/.local/bin/yggterm-headless server app notify 'yggterm: automatic restart failed' \
@@ -213,3 +214,66 @@ while :; do
   [ "$ONCE" = 1 ] && break
   sleep "$INTERVAL"
 done
+
+#: ⛔⛔ A CLIENT RESTART RE-MOUNTS EVERY ROW, AND SOME COME UP BLANK.
+#:
+#: This is the honest cost of the auto-restart above, and it must be paid here
+#: rather than by the person looking at the window. Owner-reported minutes after
+#: the restart shipped: *"input bugs are getting fancier by deleting the UI
+#: itself"* — a row whose viewport was not stale or garbled but EMPTY, on a
+#: client and daemon that matched, with the row reading `running · idle`. The
+#: re-mount races the seed and the surface lands with nothing in it.
+#:
+#: ⚖ The restart is still right — a backdated client against a new daemon is the
+#: skew a user must never face, and that is the owner's ruling. But shipping a
+#: restart on a timer while the blank-mount path is only partly fixed moves a
+#: known defect from rare to routine, and pretending otherwise would be dishonest
+#: about what this file does.
+#:
+#: ⭐ THE REPAIR IS PROVEN AND IT TYPES NOTHING. `sessions restore` re-attaches a
+#: row and the screen begins painting on the very next read — measured live today
+#: on a row that had been invisible for half an hour. So the sweep is safe to run
+#: unconditionally: it cannot reach a composer, and re-attaching an already-healthy
+#: row is a no-op.
+#:
+#: ⚠ A row that is legitimately EMPTY is indistinguishable from one that failed to
+#: seed, so this deliberately restores on emptiness alone rather than trying to be
+#: clever. The cost of a wrong restore is one redundant re-attach; the cost of
+#: missing one is a window the owner cannot use.
+repaint_sweep() {  # host
+  local host="$1" blanks=0 fixed=0
+  local rows
+  rows="$(ssh -n "$host" '~/.local/bin/yggterm-headless server app rows --json 2>/dev/null' \
+          | python3 -c "import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+for r in (d.get('data') or {}).get('rows') or []:
+    p=r.get('full_path') or ''
+    if r.get('outline_prefix') and '://' in p: print(p)" 2>/dev/null)"
+  [ -n "$rows" ] || { say "repaint sweep: no seated rows to check"; return 0; }
+  for row in $rows; do
+    local chars
+    chars="$(ssh -n "$host" "~/.local/bin/yggterm-headless server app terminal read-buffer '$row' --mode screen 2>/dev/null" \
+             | python3 -c "import json,sys
+try: print((json.load(sys.stdin).get('data') or {}).get('nonblank_line_count') or 0)
+except Exception: print(-1)" 2>/dev/null)"
+    # -1 is BLIND (the read itself failed) and 0 is EMPTY. Both are a surface the
+    # owner cannot use, and both are repaired by the same non-typing re-attach.
+    if [ "${chars:-0}" = "0" ] || [ "${chars:-0}" = "-1" ]; then
+      blanks=$((blanks + 1))
+      ssh -n "$host" "~/.local/bin/yggterm-headless server app sessions restore '$row'" >/dev/null 2>&1
+      sleep 1
+      local after
+      after="$(ssh -n "$host" "~/.local/bin/yggterm-headless server app terminal read-buffer '$row' --mode screen 2>/dev/null" \
+               | python3 -c "import json,sys
+try: print((json.load(sys.stdin).get('data') or {}).get('nonblank_line_count') or 0)
+except Exception: print(0)" 2>/dev/null)"
+      [ "${after:-0}" -gt 0 ] 2>/dev/null && fixed=$((fixed + 1))
+    fi
+  done
+  if [ "$blanks" -gt 0 ]; then
+    say "repaint sweep: $blanks blank/unreadable surface(s) after the restart, $fixed repainted by re-attach"
+  else
+    say "repaint sweep: every seated row painted after the restart"
+  fi
+}
