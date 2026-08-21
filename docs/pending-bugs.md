@@ -19750,84 +19750,41 @@ reader knows the instrument's reach ended before the answer did.
 
 ---
 
-## ⛔ ITEM 3 (ROW GROUPS): THE MIGRATION IS BUILT AND TESTED BUT DELIBERATELY NOT CALLED
+## ⚠ ITEM 3 (ROW GROUPS): DELIVERED IN CODE — LIVE PROOF OWED ON THE RAIL
 
-**Status:** OPEN, half delivered. yggterm `79253196` on `lane/dev/11.13-ychrome-ux`.
+**Status:** FIXED IN CODE — LIVE PROOF OWED. yggterm `72cf5b92` on
+`lane/dev/11.13-ychrome-ux`. 1963 shell tests pass.
 
-`WebSurfaceTab::group_head` and `migrate_web_tab_folders_into_row_groups` exist, with 8
-tests covering the failure modes (lossless name transfer, the untouchable app tab, empty
-folders, a cycle in the stored `parent`, a dangling head, and the no-op case). What is NOT
-done is the other 560 call sites, and the migration is **not wired into the restore path on
-purpose**. It was wired, the suite objected, and the objection was right twice over.
+Folders are retired. A group is headed by a TAB, so the rail has one kind of row,
+one rename, one drag source, one menu router and one id space. The migration call,
+the group persistence and the rail's group rendering landed in ONE commit, because
+each alone destroys what the other two protect (the reasons are in the commit
+message and in the doc comments at each site).
 
-**Two ordering constraints, either of which silently destroys a user's arrangement.**
+**Two failures found while building it, both in the reassuring direction, both
+locked:**
 
-1. ⛔ **The save schema cannot hold a group yet, and TAB IDS ARE PER-RUN.** `SavedWebTab` has
-   no `group_head`, and `next_tab_id` reassigns ids on every restore — so persisting a raw
-   head id would point at a different tab next launch. Migrate-then-save as things stand
-   writes "no folders, no groups": the folder is gone from disk AND the grouping was never
-   written, which is the whole organization destroyed on first launch of the new binary,
-   with no way back. ⇒ Persist the head's **INDEX within the saved list** and map it back to
-   the new id on restore; a raw id is only meaningful inside one run.
-2. ⛔ **The rail still draws `folders`.** Migrating on load before the rail can render groups
-   empties `folders` and `tab.folder`, so every group renders as loose tabs — the user sees
-   their folders DELETED, which is indistinguishable from the bug. ⇒ The migration call and
-   the rail's group rendering must land in the SAME change.
+1. ⛔ **A head at root has no `group`** — nothing contains it — so a fresh-start
+   gate reading only that keeps a group's MEMBERS and drops the row that NAMES
+   it. The rule is *"has a head **or** is one"*.
+2. ⛔⛔ **A folder holding ONE tab loses its organization on the SECOND launch.**
+   It flattens to a head with no members, and a head with no members is not a
+   group — nothing points at it, so it mints no key. The launch that migrates it
+   keeps it (the store still said `folder`); the next one drops it. What survives
+   the flattening is the folder's LABEL, moved onto the head's `custom_title`, so
+   a NAMED row counts as organization. Locked by
+   `a_one_tab_folder_survives_the_second_launch_too`, which runs three launches
+   because the defect is invisible on the first.
 
-⚠ **This is why it is filed rather than half-shipped.** A migration that is merely present
-is inert; a migration that is called one commit too early is unrecoverable, and it fails on
-the user's real profile at launch rather than in a test.
+**Falsifies the fix (this is what is owed):** open a surface whose profile still
+has folders on disk, and screenshot the rail — the folder's tabs must appear as a
+GROUP under a head row carrying the folder's name, with a chevron that collapses
+it, and the store on disk must then hold `group_key`/`group` and no `folders`. A
+unit test cannot settle the rendering half.
 
-⛔ **THE GATE IS `tabs_to_open`, NOT `web_tab_is_saved`** — checked against the tree, because
-the obvious-sounding one is the wrong one. `web_tab_is_saved` no longer consults `folder` at
-all: every non-app tab with a URL is saved. What the folder actually governs is what comes
-BACK on a fresh start — `restore || tab.folder.is_some() || (reattach && app_tab)`.
-
-⛔⛔ **AND THE NAIVE TRANSLATION SILENTLY DELETES EVERY GROUP HEAD.** Under folders, a
-group's head row was itself IN the folder, so `folder.is_some()` covered it. Under row
-groups a head at root has **`group_head: None`** — it points at nothing, because nothing
-contains it. So `tab.group_head.is_some()` as the new rule keeps a group's MEMBERS across a
-fresh start and drops the row that NAMES the group, leaving the user's organization headless
-and its label gone. ⇒ The rule has to be *"has a head **or** is one"*: `tab.group_head
-.is_some() || tabs.iter().any(|other| other.group_head == Some(tab.id))`.
-⚠ It fails in the reassuring direction — most tabs survive, so it reads as working.
-
-⛔ **Ids are per-run, so the filter and the pointer interact.** `tabs_to_open` FILTERS, which
-renumbers positions; a persisted head index must be remapped after filtering, and a member
-whose head was filtered out becomes a dangling pointer. `order_web_tabs_by_group` already
-draws a dangling head at root rather than dropping the tab, so that case is survivable — but
-only if the remap happens at all.
-
-## ⛔ EVERY WORKTREE SHIPS ITS OWN COPY OF THE FLEET SCRIPTS, AND NOTHING AUDITS THEM
-
-**Status:** OPEN. Measured 2026-08-21 while fixing `ygg-booter.py`.
-
-The fleet scripts live at `.agents/skills/yggterm-agent-fleet/*.py`, **inside the repo**, so
-every git worktree has its own copy. Both the watcher daemon and any agent invoking a verb
-resolve them by **RELATIVE** path — the live watcher's command line is literally
-`python3 .agents/skills/yggterm-agent-fleet/ygg-booter.py watch --host … --interval 300`.
-
-⇒ **Which copy runs is decided by the process's CWD**, not by anything anyone chose. When a
-fix to a fleet script lands on one lane's branch, it is live for sessions standing in that
-worktree and nowhere else. Measured right after committing a booter fix: 1 of 5 worktrees had
-it; the running watcher was in a worktree that did not, and neither did three other lanes.
-
-**Why this is worse than ordinary branch propagation.** These scripts are the fleet's
-INSTRUMENTS — the thing every lane uses to decide whether a row is alive, to defer a boot, to
-claim a seat. A lane running a stale copy gets stale *answers about other lanes*, and it has
-no way to tell: the script reports success in its own terms either way. A behavioural fix to
-an instrument is invisible to the sessions that most need it.
-
-⚠ **Same shape as the split install the daemon audit already reports for the binaries** ("do
-NOT trust one path's `--version` as the host's version; fix the deploy to write every copy").
-The audit covers `yggterm`/`yggterm-headless` and **does not cover the scripts**, so this half
-fails silently.
-
-**What is wanted:** either the audit grows a check that every worktree's fleet scripts agree
-(cheap: hash them and report disagreement, the way the binary audit does), or the scripts stop
-being resolved relatively — a single installed copy on PATH, with the in-repo tree as its
-source. ⛔ Do NOT "fix" an instance by copying the file into other worktrees: they are live
-checkouts holding other lanes' uncommitted work.
+⚠ **The one lossy case is unchanged and is counted, not hidden:** a folder whose
+first tab already carried a user-given name keeps that name and drops the folder's
+label (`names_yielded_to_custom_title`).
 
 ## ⛔ A REBASE HELPER STASHED A LIVE SESSION'S UNCOMMITTED WORK, AND THE TREE THEN LOOKED INNOCENT
 
