@@ -67,6 +67,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ygg_host import resolve_gui_host  # noqa: E402
 from ygg_rowarg import add_row_argument, bare_uuid, resolve_row, row_session_id  # noqa: E402
+import ygg_transcript  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 STATE = Path.home() / ".yggterm" / "relay"
@@ -290,20 +291,17 @@ def _last_prose(uuid):
     """The row's last assistant text, read from its transcript. ⛔ Never ASK the
     row — that is a wake, and this runs on a timer."""
     import glob as _g
-    hits = _g.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
+    # ⛔ Every declared store. ⚠ Finding the FILE is fixed here; PARSING a record
+    #    is still shaped for the reference CLI, so another CLI's transcript is
+    #    located and then read as empty prose rather than as silence — a smaller
+    #    and now visible failure, filed separately.
+    hits = ygg_transcript.transcript_paths(uuid)
     if not hits:
         return ""
-    try:
-        recs = [json.loads(l) for l in open(hits[0], errors="replace") if l.strip()]
-    except Exception:
-        return ""
-    for rec in reversed(recs):
-        if rec.get("type") != "assistant":
-            continue
-        for blk in (rec.get("message") or {}).get("content") or []:
-            if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text", "").strip():
-                return blk["text"].strip()
-    return ""
+    # ⛔⛔ BOUNDED. This used to parse the WHOLE file, which was survivable only
+    #    while it could see one CLI's store. The largest transcript on this fleet
+    #    is 1,481 MB — 274x the p95 — and this runs on a TIMER.
+    return ygg_transcript.last_prose(hits[0])
 
 
 def cli_process(uuid, host=None):
@@ -1631,7 +1629,7 @@ def _transcript_for(uuid, host=None):
         # delivered", a false alarm about a healthy row on its very first run.
         # ⇒ A space-free format needs no quoting and cannot be broken this way.
         r = _run(host, ["sh", "-c",
-                        f"ls -t ~/.claude/projects/*/{uuid}.jsonl 2>/dev/null | head -1 | "
+                        f"{ygg_transcript.remote_find_command(uuid)} | head -1 | "
                         f"xargs -r stat -c %s..%Y"], timeout=20)
         if r and r.stdout.strip():
             try:
@@ -1640,8 +1638,7 @@ def _transcript_for(uuid, host=None):
             except Exception:
                 return None
         return None
-    import glob
-    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
+    hits = ygg_transcript.transcript_paths(uuid)
     if not hits:
         return None
     p = max(hits, key=os.path.getmtime)

@@ -39,6 +39,10 @@ import subprocess
 import sys
 import time
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_transcript  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 RELAY = os.path.expanduser("~/.yggterm/relay")
 YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
@@ -343,22 +347,17 @@ def already_woken_for_this_stall(uuid, mtime):
 
 
 def transcript_of(uuid):
-    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
-    return hits[0] if hits else None
+    # ⛔ Asked before a row is retired, to take its work first. Answering from one
+    #    CLI's store meant a lane of any other CLI looked like it had produced
+    #    nothing worth harvesting.
+    return ygg_transcript.transcript_of(uuid)
 
 
 def last_assistant_text(path):
-    try:
-        recs = [json.loads(l) for l in open(path) if l.strip()]
-    except Exception:
-        return ""
-    for rec in reversed(recs):
-        if rec.get("type") != "assistant":
-            continue
-        for blk in (rec.get("message") or {}).get("content") or []:
-            if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text", "").strip():
-                return blk["text"].strip()
-    return ""
+    # ⛔⛔ BOUNDED — see ygg_transcript.TAIL_BYTES. Reading a whole transcript is
+    #    only survivable while the biggest one you can reach is small, and that
+    #    stopped being true when the lookup learned every CLI's store.
+    return ygg_transcript.last_prose(path)
 
 
 _MANUAL_TITLES = None
