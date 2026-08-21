@@ -71,7 +71,12 @@ fi
 
 # ── 1. The seed re-asks instead of leaving a black canvas ────────────────────
 say "1. blank viewport: the seed re-asks, and refuses in words if it cannot"
-todo "restart the GUI DURING a daemon adoption, then open a retained remote row"
+# ⭐ THIS ARM NEEDS NO STAGING WHEN IT FOLLOWS A ROLL. A fleet deploy restarts
+# the GUI while daemons adopt — which IS the condition that produced the
+# 13-minute blank. So after a roll, do not stage anything: just read the trace
+# for the window the storm already created.
+todo "after a ROLL this is already staged — the deploy's own adoption is the repro."
+echo "      (otherwise: restart the GUI DURING a daemon adoption, then open a retained remote row)"
 echo "      the shapes, in order, on the row that came up blank:"
 echo "        ytrace ... terminal_mount/retained_rehydrate_empty       (the answer that used to end it)"
 echo "        ytrace ... terminal_mount/retained_rehydrate_retry_scheduled  (delay_ms 2500 → 60000)"
