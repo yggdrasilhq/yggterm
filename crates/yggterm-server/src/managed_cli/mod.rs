@@ -4138,7 +4138,7 @@ fn login_shell_path_dirs() -> Vec<PathBuf> {
 /// no login-shell `PATH` carries it — otherwise `grok` was reported absent and
 /// required a `~/.local/bin/grok` symlink that then broke `grok update`'s
 /// `npm i -g` (EEXIST).
-fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
     let managed_dir = ManagedCliPaths::resolve()
         .ok()
         .map(|paths| paths.bin_dir);

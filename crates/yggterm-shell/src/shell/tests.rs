@@ -26345,13 +26345,19 @@ mod tests {
             HashMap::from([(session.session_path.clone(), "0000000".to_string())]);
 
         let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
-        assert_eq!(label, "New Muse Code Session");
+        // ⭐ AND IT NAMES THE MACHINE, off the row's OWN path. This read
+        // `New Muse Code Session` until 2026-08-21 — the same string on every
+        // host in a fleet, for a row plane whose whole job is to span hosts.
+        // The birth rule is one rule now (`new_session_birth_title`), so a
+        // scanned row that has said nothing reads exactly like the live row the
+        // daemon would mint for it.
+        assert_eq!(label, "New devhost Muse Code");
 
         // Once a turn exists the placeholder is no longer the truth, and the
         // ordinary chain takes over again.
         session.user_message_count = 1;
         let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
-        assert_ne!(label, "New Muse Code Session");
+        assert_ne!(label, "New devhost Muse Code");
     }
 
     #[test]
@@ -27359,10 +27365,13 @@ mod tests {
                 assert_eq!(ssh_target, "pi@dev");
                 assert_eq!(prefix.as_deref(), Some("cd /srv"));
                 assert_eq!(cwd.as_deref(), Some("/home/user/gh/yggterm"));
-                // The birth name says WHAT THE NEW ROW IS. It used to be
-                // `"{spawner label} shell"`, which named the row the context
-                // menu was opened on.
-                assert_eq!(title_hint.as_deref(), Some("New Terminal"));
+                // ⛔ NO HINT AT ALL, and that is the fix. The birth name is
+                // `New {machine} Terminal` and only the DAEMON knows which
+                // machine the row is landing on, so a hint composed here is a
+                // second answer to a question that has an owner. The shell used
+                // to compose `New Terminal` (no machine) and before that
+                // `"{spawner label} shell"` (the row the menu was opened on).
+                assert_eq!(title_hint, None);
             }
             other => panic!("expected remote launch context, got {other:?}"),
         }
@@ -27570,7 +27579,10 @@ mod tests {
                 // Shell", and the session spawned from it used to be born
                 // "Samplenotes Shell codex" — a near-copy of its spawner's
                 // title, two rows apart in the sidebar and barely separable.
-                assert_eq!(title_hint.as_deref(), Some("New Codex Session"));
+                // The cure is now the ABSENCE of a hint: the daemon composes
+                // `New {machine} Codex`, which names neither the spawner nor a
+                // machine the shell had to guess at.
+                assert_eq!(title_hint, None);
             }
             other => panic!("expected remote Codex launch context, got {other:?}"),
         }
@@ -42941,6 +42953,77 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             busy.reason
         );
     }
+    /// ⛔ EVERY AGENT CLI'S DOT READS THE DAEMON, NOT A HEURISTIC — and the arm
+    /// that decides is derived from the registry, not hand-listed.
+    ///
+    /// Owner-reported 2026-08-21: an Antigravity row sat perfectly still while
+    /// its own metadata rail read `running · working` and the CLI printed
+    /// `Running command… esc to cancel`. The daemon had computed `working` from
+    /// that CLI's own measured phrases and was right; the SIDEBAR asked
+    /// `matches!(kind, Codex | CodexLiteLlm | ClaudeCode)` and dropped the other
+    /// seven registered CLIs into the screen-text heuristics below it, where an
+    /// active agy row resolves to idle.
+    ///
+    /// Driven off the registry so an eleventh CLI cannot be added into silence.
+    #[test]
+    fn every_agent_cli_blinks_off_the_daemon_working_flag() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let kind = descriptor.kind;
+            for (working, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+                let path = "remote-session://example-host/working-arm";
+                let mut shell =
+                    ShellState::new(test_shell_bootstrap_with_active_session(path));
+                let mut session = test_live_shell_session(path);
+                session.id = "working-arm".to_string();
+                session.kind = kind;
+                session.source = SessionSource::LiveSsh;
+                session.working = working;
+                // The heuristic fall-through the hand-list used to reach reads
+                // these, and reads them WRONG for an agent CLI. Pinned to the
+                // shape that most tempts it: a running row whose last captured
+                // frame looks like a quiet prompt.
+                session.terminal_foreground_active = Some(false);
+                session.launch_phase = yggterm_server::TerminalLaunchPhase::Running;
+                shell.server.apply_snapshot(ServerUiSnapshot {
+                    active_session_path: Some(path.to_string()),
+                    active_session: Some(snapshot_session_view_for_ui(session.clone())),
+                    active_view_mode: WorkspaceViewMode::Terminal,
+                    remote_machines: Vec::new(),
+                    ssh_targets: Vec::new(),
+                    live_sessions: vec![snapshot_session_view_for_ui(session)],
+                    apps: Vec::new(),
+                });
+                shell.needs_initial_server_sync = false;
+                shell.browser.select_path(path.to_string());
+
+                let snapshot = shell.snapshot();
+                let row = snapshot
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        normalize_live_session_path(&row.full_path)
+                            == normalize_live_session_path(path)
+                    })
+                    .expect("live session row");
+                let busy = sidebar_row_busy_state(&snapshot, row);
+                assert_eq!(
+                    busy.visible,
+                    expected,
+                    "{:?} with working={working:?} rendered {:?}: an agent row's \
+                     dot is the daemon's flag, never a screen heuristic",
+                    kind,
+                    busy.reason,
+                );
+                if expected {
+                    assert_eq!(
+                        busy.reason, "agent_working_daemon",
+                        "{kind:?} blinked for the wrong reason",
+                    );
+                }
+            }
+        }
+    }
+
     // ⛔ THE PRECEDENCE IS THE WHOLE FIX. A row holding an owner question is
     // MID-TURN, so the daemon answers `working: Some(true)` truthfully — and a
     // dot that reads only `working` therefore reports ordinary busy work on a
