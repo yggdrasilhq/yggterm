@@ -2828,6 +2828,15 @@ fn DocumentSurfaceBody(
 fn AppPaneRailBody(
     snapshot: SharedSnapshot,
     pane_id: String,
+    /// Draw the APP-RAISED MODAL's schema instead of the rail's, without its
+    /// rail header (the dialog card draws its own title, subtitle and ✕).
+    ///
+    /// ⛔ ONE renderer for both on purpose. The widget vocabulary is the
+    /// platform's contract with every app; a second copy of it for dialogs would
+    /// be a second thing to grow, and the two would diverge on the first widget
+    /// somebody added to only one of them.
+    #[props(default = false)]
+    modal: bool,
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
     /// `(pane id, action, moved row id, the pane's new row order)` — fired
     /// when a reorderable rail row is dropped somewhere that changes the order.
@@ -2894,15 +2903,26 @@ fn AppPaneRailBody(
         standard_transition(&["background-color", "border-color"]),
         red = DESTRUCTIVE_RED,
     );
-    let pane_state = snapshot
-        .app_pane_schema
-        .as_ref()
-        .filter(|state| state.pane_id == pane_id);
+    let pane_state = if modal {
+        snapshot.app_pane_modal.as_ref().map(|dialog| &dialog.pane)
+    } else {
+        snapshot
+            .app_pane_schema
+            .as_ref()
+            .filter(|state| state.pane_id == pane_id)
+    };
     let value_epochs = pane_state
         .map(|state| state.value_epochs.clone())
         .unwrap_or_default();
     let schema = pane_state.map(|state| state.schema.clone());
-    let error = snapshot.app_pane_error.clone();
+    // A modal's content arrived WITH the action reply that raised it — there is
+    // no fetch of its own that could have failed, so the rail's fetch error is
+    // not this dialog's to report.
+    let error = if modal {
+        None
+    } else {
+        snapshot.app_pane_error.clone()
+    };
     let title = schema
         .as_ref()
         .map(|schema| schema.title.clone())
@@ -2929,7 +2949,9 @@ fn AppPaneRailBody(
         .unwrap_or_default();
 
     rsx! {
-        RailHeader { title: title, color: palette.text.to_string() }
+        if !modal {
+            RailHeader { title: title, color: palette.text.to_string() }
+        }
         RailScrollBody {
             content: rsx!{
             div {
