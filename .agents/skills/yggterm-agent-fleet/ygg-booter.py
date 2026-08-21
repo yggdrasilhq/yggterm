@@ -180,6 +180,49 @@ MIN_BOOT_AFTER_SECS = 60
 MAX_BOOTS = 3
 DEFAULT_INTERVAL = 300
 
+# ⛔⛔ A REFUSAL THAT REPEATS FOR THE SAME REASON IS A CONDITION, AND A CONDITION
+# MUST BE VISIBLE IN STATE. Measured 2026-08-21 across four campaigns: four rows
+# sat permanently unbootable for DAYS while every instrument read healthy. The
+# refusal was correct each time and the refund is correct too — the row was never
+# asked, so charging it a wake would be a lie — but a refund means `boots` never
+# rises, so the row can never reach MAX_BOOTS and can therefore NEVER escalate.
+# The only record of the standing condition was one log line per tick, in a log
+# nobody tails.
+#
+# ⚖ THE SILENCE IS THE DEFECT, NOT THE REFUSAL. So a run of identical refusals is
+# counted on the subscription itself (`standing_refusal`), surfaced by `list` and
+# `status`, and escalated exactly ONCE per condition — while the refusal decision
+# and the refund are left exactly as they were.
+#
+# ⚠ WHY 12 AND NOT MAX_BOOTS. A draft or a choice prompt is a real thing in front
+# of a real row and waiting is the right answer; escalating at three ticks (15 min)
+# would page a human about an owner who stepped away from a half-typed sentence.
+# Twelve ticks is an hour at the default interval — long enough that a genuine
+# owner-facing prompt lives its natural life, short enough that "days" is
+# impossible.
+STANDING_REFUSAL_TICKS = 12
+
+# How many consecutive identical refusals before a human is told, per reason.
+# ⛔ `None` means NEVER, and every None states its reason here rather than
+# leaving the absence to be read as an oversight — which is exactly how the
+# missing entry below became a crash.
+STANDING_REFUSAL_ESCALATE_AFTER = {
+    # OUR OWN INSTRUMENT failing, and it does not clear itself: if the verb the
+    # guard reads with is missing from the running build, the screen is
+    # unreadable on every tick from now until someone is told. Bounded tight.
+    "refused-screen-unreadable": MAX_BOOTS,
+    # Observations of the ROW. Each clears itself when the row moves on — except
+    # when nothing can move it, which is the case this exists for.
+    "refused-draft": STANDING_REFUSAL_TICKS,
+    "refused-choice-prompt": STANDING_REFUSAL_TICKS,
+    "refused-draft-race": STANDING_REFUSAL_TICKS,
+    # ⛔ NEVER, and deliberately: a limit wait is self-resolving by construction
+    # (the CLI's own auto-continue is armed) and a human cannot grant quota, so
+    # paging one buys nothing. Same argument as the fleet-wide RATE-LIMITED
+    # hold. It is still COUNTED and still shown, so the wait is never invisible.
+    "refused-limit-wait": None,
+}
+
 # ⭐⭐ HOW LONG THE FLEET HOLDS AFTER SEEING A 429 (reported 2026-08-13: "during a
 # rate-limited window, subscribers kept being booted").
 #
@@ -1344,10 +1387,11 @@ def cmd_subscribe(args):
         "kind": getattr(args, "kind", None)
         or ("task" if uuid == own_uuid() else "monitor"),
         "boots": 0,
-        # Consecutive ticks refused because WE could not read the screen. Kept
-        # apart from `boots` because it counts a failure of our instrument, not
-        # an observation about the row -- see the escalation in the tick loop.
-        "blind_skips": 0,
+        # The run of consecutive refusals for ONE reason, or absent when nothing
+        # is standing in the way. Kept apart from `boots` because a refusal is
+        # not a wake: the row was never asked. See `note_standing_refusal` and
+        # the escalation in the tick loop.
+        "standing_refusal": None,
         "last_size": 0,
         "escalated": False,
     }
@@ -1400,6 +1444,35 @@ def update_sub(uuid, rec):
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(rec, indent=1))
     return True
+
+
+def clear_standing_refusal(s):
+    """The row moved (or was actually booted), so nothing is standing in the way.
+
+    ⛔ ONE OWNER. This also drops the pre-2026-08-21 `blind_skips` /
+    `blind_escalated` pair, which counted exactly one of the five refusals and is
+    now expressed through `standing_refusal` like every other. Leaving both would
+    be two encodings of "how long has this row been refused", and the older one
+    would keep answering for the single reason it knew about."""
+    s.pop("standing_refusal", None)
+    s.pop("blind_skips", None)
+    s.pop("blind_escalated", None)
+
+
+def note_standing_refusal(s, via):
+    """Advance — or start — the run of consecutive refusals for THIS reason.
+
+    A DIFFERENT reason restarts the run rather than extending it: "refused twelve
+    times" is only a condition if it is twelve times for the same thing. A row
+    that alternates between a draft and a choice prompt is a row someone is
+    using, and it should not accumulate toward an escalation."""
+    rec = s.get("standing_refusal") or {}
+    if rec.get("reason") != via:
+        rec = {"reason": via, "since": int(time.time()), "ticks": 0, "escalated": False}
+    rec["ticks"] = rec.get("ticks", 0) + 1
+    rec["last"] = int(time.time())
+    s["standing_refusal"] = rec
+    return rec
 
 
 def boot_after_for(s):
@@ -1556,6 +1629,11 @@ def fleet_state(args):
             "max_hours": s.get("max_hours"),
             "boots": s.get("boots", 0),
             "escalated": bool(s.get("escalated")),
+            # ⛔ A ROW REFUSED EVERY TICK IS INDISTINGUISHABLE FROM A HEALTHY ONE
+            # WITHOUT THIS. `boots` cannot rise (the refusal is refunded, and
+            # rightly), so every other field here reads exactly as it would for a
+            # row that has simply never needed a boot.
+            "standing_refusal": s.get("standing_refusal"),
             # WHEN this row is next at risk of a boot, which is the thing a human
             # actually wants ("who is due") — not the raw window it was set to.
             "boot_window_secs": win,
@@ -2974,9 +3052,8 @@ def tick(args):
         elif state in ("WORKING", "JUST_ENDED"):
             s["boots"] = 0                     # progress clears the stall counter
             s["escalated"] = False
-            # The row moved, so whatever we could not read no longer strands it.
-            s["blind_skips"] = 0
-            s["blind_escalated"] = False
+            # The row moved, so whatever was standing in the way no longer is.
+            clear_standing_refusal(s)
         elif state == "UNREACHABLE":
             action = "CANNOT-SEE"              # never a verdict about the row
         elif state == "NO_TRANSCRIPT":
@@ -2996,8 +3073,7 @@ def tick(args):
         elif state == "IDLE" and c["age"] >= (boot_after := boot_after_for(s)[0]):
             if grew:
                 s["boots"] = 0                 # it worked since last tick
-                s["blind_skips"] = 0
-                s["blind_escalated"] = False
+                clear_standing_refusal(s)
             if rl:
                 # ⛔ A BOOT INTO AN EXHAUSTED QUOTA IS REFUSED BEFORE THE AGENT
                 #    RUNS. It spends the wake, changes nothing, and — because the
@@ -3053,56 +3129,91 @@ def tick(args):
                     #    which is true of a draft, a choice prompt, and an
                     #    unreadable screen alike.
                     s["boots"] -= 1
+                    # ⛔⛔ `.get`, NOT `[via]`, AND THE DEFAULT IS DERIVED — this
+                    #    lookup used to be an exhaustive dict over a set defined
+                    #    two thousand lines away in `boot()`, and it DRIFTED: a
+                    #    fifth refusal (`refused-limit-wait`) was added to the
+                    #    membership test above without being added here, so the
+                    #    first limit-waiting row to come due would raise KeyError
+                    #    out of the per-row loop, out of `tick()`, past the
+                    #    `finally` that removes the pidfile, and kill the watcher
+                    #    for the whole host. Latent, never fired, and it would
+                    #    have fired on the ordinary event of a session running out
+                    #    of quota. ⇒ A label is cosmetic; never let one be able to
+                    #    stop the loop that types.
                     action = {"refused-draft": "SKIP:drafting",
                               "refused-choice-prompt": "SKIP:choice-prompt",
                               "refused-screen-unreadable": "SKIP:blind",
-                              "refused-draft-race": "SKIP:draft-race"}[via]
+                              "refused-draft-race": "SKIP:draft-race",
+                              "refused-limit-wait": "SKIP:limit-wait",
+                              }.get(via, f"SKIP:{via.removeprefix('refused-')}")
                     # ⛔⛔ THE MIRROR IMAGE OF THE DOUBLE-CHARGE ABOVE, AND IT IS
                     #    WORSE: a refund means `boots` never rises, so the row
                     #    can never reach MAX_BOOTS, so it can NEVER ESCALATE. A
-                    #    row refused forever is a row silent forever, and
-                    #    `SKIP:blind` is invisible to every instrument except
-                    #    this log line. Measured 2026-08-14: a lane slept
-                    #    through a hard external deadline while the watchdog
-                    #    refused it every tick and told nobody.
+                    #    row refused forever is a row silent forever, and the
+                    #    condition was invisible to every instrument except this
+                    #    log line. Measured 2026-08-14: a lane slept through a
+                    #    hard external deadline while the watchdog refused it
+                    #    every tick and told nobody. Measured again 2026-08-21,
+                    #    the other reason and the expensive one: FOUR rows across
+                    #    four campaigns stood refused for DAYS on boot-text
+                    #    residue — a condition that cannot clear itself, because
+                    #    the only thing that could clear it is the boot being
+                    #    refused.
                     #
                     # ⚖ THE REFUND STAYS CORRECT — the row was never asked, so
                     #   charging it a wake would be a lie. What was missing is
                     #   that the SILENCE is the defect, not the refusal.
                     #
-                    # ⭐ WHY ONLY THIS ONE OF THE THREE ESCALATES. A draft and a
-                    #   choice prompt are OBSERVATIONS OF THE ROW: something is
-                    #   genuinely in front of it, waiting is the right answer,
-                    #   and the condition clears itself when the row moves on.
-                    #   An unreadable screen is an observation of OUR OWN
-                    #   INSTRUMENT, and it does not clear itself — if the verb
-                    #   the guard reads with is missing from the running build,
-                    #   it is unreadable on every tick from now until someone is
-                    #   told. So it is bounded in time and then escalated.
+                    # ⇒ So the run is counted on the subscription, where `list`
+                    #   and `status` can show it, and told to a human exactly
+                    #   once per condition. The refusal itself is untouched: this
+                    #   arm still does NOT type. "Blind is not clear" remains the
+                    #   right rule for WRITING into a row.
                     #
-                    # ⛔ It still does NOT type. "Blind is not clear" remains the
-                    #   right rule for WRITING into a row; relaxing that is the
-                    #   owner's call and is logged for him, not taken here.
-                    if via == "refused-screen-unreadable":
-                        s["blind_skips"] = s.get("blind_skips", 0) + 1
-                        if s["blind_skips"] >= MAX_BOOTS and not s.get("blind_escalated"):
-                            rc = max(rc, 4)
-                            escalate(host, row,
-                                     f"screen unreadable for {s['blind_skips']} ticks "
-                                     f"({c['age']/60:.0f} min idle) — the guard cannot rule "
-                                     f"out a waiting prompt, so it will not boot this row. "
-                                     f"This is our instrument failing, not the row: check "
-                                     f"that the running build still exposes the screen-read "
-                                     f"verb. The row is NOT being woken by anything.")
-                            s["blind_escalated"] = True
-                            action = "SKIP:blind→ESCALATED"
-                    else:
-                        s["blind_skips"] = 0
+                    # ⭐ THE THRESHOLD DIFFERS BY REASON, and the reasons are not
+                    #   symmetric. An unreadable screen is an observation of OUR
+                    #   OWN INSTRUMENT and does not clear itself, so it stays
+                    #   bounded tight at MAX_BOOTS. A draft or a choice prompt is
+                    #   an observation of the ROW — something is genuinely in
+                    #   front of it and waiting is usually right — so it gets an
+                    #   hour before anyone is paged. A limit wait is exempt
+                    #   entirely and says so in the table.
+                    rec = note_standing_refusal(s, via)
+                    after = STANDING_REFUSAL_ESCALATE_AFTER.get(
+                        via, STANDING_REFUSAL_TICKS)
+                    if after is not None and rec["ticks"] >= after and not rec["escalated"]:
+                        rc = max(rc, 4)
+                        held = (time.time() - rec["since"]) / 60
+                        if via == "refused-screen-unreadable":
+                            why = (f"screen unreadable for {rec['ticks']} ticks "
+                                   f"({c['age']/60:.0f} min idle) — the guard cannot rule "
+                                   f"out a waiting prompt, so it will not boot this row. "
+                                   f"This is our instrument failing, not the row: check "
+                                   f"that the running build still exposes the screen-read "
+                                   f"verb.")
+                        else:
+                            why = (f"refused {rec['ticks']} consecutive ticks for the same "
+                                   f"reason ({via}) over {held:.0f} min — the refusal is "
+                                   f"correct and is NOT being relaxed; the standing "
+                                   f"condition is the defect. Nothing clears this by "
+                                   f"itself: the row is alive, is not being woken, and no "
+                                   f"counter rises to say so. For boot-text residue try "
+                                   f"`ygg-unwedge.sh`.")
+                        escalate(host, row, why + " The row is NOT being woken by anything.")
+                        rec["escalated"] = True
+                        action = f"{action}→ESCALATED"
                 else:
                     # Say WHICH door delivered it. A watchdog that reports
                     # "booted" without saying how cannot be debugged when it
                     # silently stops.
                     action = f"BOOT#{s['boots']}:{via or 'NOT-DELIVERED'}"
+                    # The write went through, so nothing is standing in the way
+                    # any more — a run of refusals ended by a delivered boot must
+                    # not keep counting toward an escalation about a condition
+                    # that is over.
+                    if via:
+                        clear_standing_refusal(s)
                     # ⭐ A deferral covers ONE wait. Once the boot it was
                     # protecting has fired, the reason for it is over — leaving
                     # it set would silently widen the window for everything that
