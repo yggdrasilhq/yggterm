@@ -57,12 +57,83 @@ painted partially. Both are what "a mount begins with an empty surface" looks li
 rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
 filing three entries for one symptom chain is what made this look half-fixed once already.
 
-**The tracing the owner asked for is END TO END and it does not exist yet:** kernel call →
-daemon → client → **xterm.js layer** → pixel. The xterm.js half is the gap; every measurement
-in this entry stops at the Rust boundary, so "the mount began" and "the glyphs arrived" are
-currently the same event as far as any instrument here can tell. ⇒ Until a probe spans that
-boundary, a partially-painted frame and a fully-painted one are indistinguishable, and no
-amount of daemon-side tracing closes it.
+### ⭐ THE xterm.js HALF OF THE CHAIN NOW EXISTS — 2026-08-21, `xterm_paint`
+
+*This section replaced the paragraph that said the tracing "does not exist yet". It did not
+exist; it does now, and leaving the old sentence standing would have routed the next reader
+away from the instrument built to serve this entry.*
+
+The tracing asked for is END TO END — kernel call → daemon → client → **xterm.js layer** →
+pixel — and the xterm.js half was the gap: every measurement above stops at the Rust boundary,
+so "the mount began" and "the glyphs arrived" were the same event to every instrument in the
+project. **A mount begins with an empty surface**, so that gap is exactly where the ghost
+frames and the broken TUI paint live.
+
+Three probes, `layer=xterm`, joined to the native half by `host_id` (which already encodes the
+mount epoch, so no second identity was introduced):
+
+| probe | says |
+|---|---|
+| `xterm_paint/mount_open` | the surface exists and is BLANK — the anchor |
+| `xterm_paint/first_frame` | open → first glyphs, split into write / parse / frame |
+| `xterm_paint/settle` | **did this mount paint**: rows covered against rows holding content |
+
+⛔⛔ **A FRAME COUNT IS NOT A PAINT** — the renderer repaints only dirty rows, so a mount that
+painted two rows and stopped has frames, a render window and a healthy frame-gap profile.
+`rows_content_unpainted` is the field: rows the terminal holds text on that no frame since the
+mount has covered. Positive means the screen is showing less than the session contains, which
+is what broken TUI paint is from the inside. The test is sound only because it is scoped to a
+MOUNT — the surface started blank, so every row with text must be painted at least once.
+
+⇒ **A partially-painted frame and a fully-painted one are now distinguishable in the trace,
+without a screenshot.** Read the whole chain with `scripts/paint-chain.py`; the columns and the
+traps are in `docs/observability.md` §2.3.
+
+#### What the instrument read on its first run — and the two things it separated
+
+Sandbox, headless compositor, six surface builds across three local shells. ⚠ These are shell
+sessions on one machine, not the owner's agent rows; the numbers below are the instrument
+working, not a characterisation of his GUI.
+
+| | cold build (first reveal) | rebuild (switch back) |
+|---|---:|---:|
+| `open → first byte` | 411 / 427 / 556 ms | 35 / 39 / 40 ms |
+| blank frames before any byte | 3 / 5 / 5 | 0 / 0 / 0 |
+| `write → parse` | 5–10 ms | — (sync path) |
+| `parse → frame` | 5–18 ms | — |
+| `write → frame` | 10 / 13 / 28 ms | 23 / 24 / 25 ms |
+| rows covered | 62/62, complete | 62/62, complete |
+
+⭐ **THE SEPARATION IS THE RESULT, not the totals.** On a cold build the empty-surface window is
+**97% spent waiting for BYTES and 3% painting them** — and the native half of the same chain says
+why: `terminal_mount/first_output` landed 391 ms after `mount_open`, and the canvas accepted those
+bytes 36 ms later. So that 427 ms is the SESSION starting up, not yggterm being slow to paint, and
+the 36 ms is the bridge hop. Before this probe those three costs were one number.
+
+⚠ **No switch in this run produced a partial or an unpainted mount.** Six of six painted every row
+they held. That is a clean sandbox, not an exoneration: the symptom is reported on a machine with
+~30 agent rows under orchestrator churn, and the instrument exists so the next occurrence is a
+reading rather than an impression.
+
+#### ⛔⛔ AND ONE THING THE INSTRUMENT FOUND ON THE WAY: `host_id` IS NOT ONE SURFACE
+
+Each of the three rows built its terminal surface **twice** — two `terminal_mount/begin` events and
+two `xterm_paint/mount_open` records twelve seconds apart — **both on `mount_epoch: 1`**, with
+`terminal_mount/mount_epoch_reused` sitting between them saying so.
+
+⇒ `host_id` is `<host>-m<mount_epoch>`, so **any count keyed on it collapses repeated surface
+builds into one.** That includes the "5 full terminal mounts / 3 distinct rows" table at the top of
+this entry: those numbers count `begin` events, which is right, but anything that later joins them
+by host id — including the first cut of `scripts/paint-chain.py` — silently kept only the LAST
+build per row. A second build painting badly would have vanished into the first build's clean
+record, which is the churn's own signature being hidden by the instrument sent to measure it.
+`paint-chain.py` now segments on `begin` and labels rebuilds `…#b1`. **Anything else keyed on
+`host_id` in this entry's chain should be re-checked the same way.**
+
+⚠ **WHAT IS STILL MISSING, so nobody reads the above as the whole ask.** The activation ORIGIN
+— user gesture vs app-driven switch — is still not recorded, and it is still the measurement
+that would settle whether the *active session* changes on its own (see the paragraph below).
+That is a native-side event, not an xterm one, and this probe does not supply it.
 
 ⭐ **This is what the `ytop` Legendary Bugs notebook is for** (seat 11.21): the Top shelf
 carrying the kernel/process half and the Dash shelf the yggterm half, so the chain is visible
