@@ -85,12 +85,34 @@ cmdline_of() { ( tr '\0' ' ' < "/proc/$1/cmdline" ) 2>/dev/null || true; }
 # GUI, a daemon, a supervisor — that cannot happen, because those are not
 # invoked with the search pattern as an argument. A caller searching for
 # something that IS spelled like its own invocation must not use this.
+#
+# ⛔⛔ AND A THIRD FALSE POSITIVE THE CMDLINE-IDENTITY RULE CANNOT SEE: THE CALL
+# THAT ARRIVED OVER THE NETWORK. Run this over `ssh <host>` while standing ON
+# that same host — which is the normal shape of a fleet query, and the shape
+# every agent session here uses — and the `ssh` client process is on the target
+# host too, carrying the pattern in its argv. It is not an ancestor of the
+# remote-side script (sshd starts a fresh tree), it is not a descendant, and its
+# bytes are nobody else's, so all three existing tests pass it through.
+#
+# ⇒ Measured 2026-08-21, and it gave a WRONG ANSWER IN BOTH DIRECTIONS in one
+#   session: rows with no agent at all reported `pids=2` and rows with a live
+#   agent reported `pids=4`, the constant 2 being the caller's own shell and its
+#   ssh. A count inflated by a fixed amount is the worst kind of wrong, because
+#   the differences still look right and the absolute numbers quietly are not —
+#   "this row has processes" was read off a search that had found only itself.
+#
+# ⭐ The guard is NOT another shell blacklist: it is THIS SCRIPT'S OWN NAME. A
+#   command line containing it can only be a copy of the search that is running,
+#   because nothing this tool is ever asked to find is invoked by its name. That
+#   is the same principle as the byte-identity rule — "it can only be there
+#   because I am running" — applied where lineage cannot reach.
 match() {
     local pattern="$1"
     local mine="" pid
     for pid in $(ancestors); do
         mine+="$(cmdline_of "$pid")"$'\n'
     done
+    local self; self="$(basename "$0")"
     local found=1
     for pid in $(pgrep -f -- "$pattern" 2>/dev/null || true); do
         local cmd
@@ -100,6 +122,9 @@ match() {
         if grep -qxF -- "$cmd" <<<"$mine"; then
             continue
         fi
+        # The network-delivered copy of this very query: an ssh client, a wrapper
+        # shell, an xargs — whatever carried it, it names this script.
+        case "$cmd" in *"$self"*) continue;; esac
         echo "$pid"
         found=0
     done
