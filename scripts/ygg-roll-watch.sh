@@ -10,7 +10,7 @@
 # that may be mid-task, out of context, or gone. The gap is not technical, it is
 # that "somebody decides to run it" is not a mechanism.
 #
-#   scripts/ygg-roll-watch.sh [--interval 3600] [--once] [--dry-run]
+#   scripts/ygg-roll-watch.sh [--interval 3600] [--once] [--dry-run] [--sweep]
 #
 # ⭐ WHAT IT DELIBERATELY WILL NOT DO: restart the GUI. Every other step here is
 # invisible to the person using the machine — a build on a build host, binaries
@@ -32,12 +32,16 @@ INTERVAL=3600
 #: because main moved under it. Two: a third attempt losing the same race means
 #: main advances faster than a build takes, and the answer to that is a human.
 DEPLOY_ATTEMPTS=2
+#: The repaint sweep OPENS every blank row, which takes over the window. Never on
+#: a timer; only when an operator asks for it and is watching.
+SWEEP=0
 ONCE=0
 DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --interval) INTERVAL="$2"; shift 2;;
     --once) ONCE=1; shift;;
+    --sweep) SWEEP=1; shift;;
     --dry-run) DRY=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
@@ -262,7 +266,32 @@ restart_gui() {  # host expected_md5
   now="$(ssh -n "$host" 'for g in $(pgrep -x yggterm); do x=$(readlink /proc/$g/exe); case "$x" in "$HOME/.local/bin/"*) md5sum /proc/$g/exe | cut -c1-10;; esac; done' 2>/dev/null | head -1)"
   if [ "$now" = "$want" ]; then
     say "✅ GUI on $host restarted onto $now — client and daemon now match"
-    repaint_sweep "$host"
+    # ⛔⛔⛔ THE REPAINT SWEEP IS NOT CALLED HERE ANY MORE, AND MUST NOT BE PUT BACK.
+    # It was added on the reasoning that `sessions restore` TYPES NOTHING and is
+    # therefore safe to run unconditionally. The typing half is true. The
+    # conclusion is not, and the gap between them cost the owner several minutes
+    # of an unusable machine: `sessions restore` is the RECOVERY verb, and it opens
+    # a session "through the same path a manual drag takes" — so sweeping 34 rows
+    # opens 34 sessions in a row. Reported live, 2026-08-21, in these words: the
+    # window blinking, changing session and beeping every three to five seconds,
+    # for minutes, until it could be typed into at all.
+    #
+    # ⇒ NOT TYPING IS ONE SAFETY PROPERTY AND NOT DRIVING THE VIEW IS ANOTHER. A
+    #   remedy that steals the active session is an interruption whether or not it
+    #   writes a byte, and an automation is the worst possible chooser of when to
+    #   take somebody's screen away. This is the second time in one day that
+    #   something correct in isolation was wrong in composition, on this same file.
+    #
+    # ⚠ AND THE MEASUREMENT IT WAS BUILT ON IS ITSELF IN DOUBT — see the queue
+    #   entry. `read-buffer` on a row the client has not mounted may report an
+    #   empty surface because nothing has been mounted yet, not because a mount
+    #   failed; opening the row is then what "repairs" it, which would make the
+    #   sweep a device for visiting rows and calling the visit a cure. Settle that
+    #   before any sweep is automated again.
+    #
+    # `--sweep` still runs it by hand, for an operator who is looking at the screen
+    # and has decided to spend it.
+    [ "$SWEEP" = 1 ] && repaint_sweep "$host"
   else
     say "⛔ GUI on $host reads $now, expected $want — RESTART DID NOT TAKE. Left for a human."
     ssh -n "$host" "~/.local/bin/yggterm-headless server app notify 'yggterm: automatic restart failed' \
