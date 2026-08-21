@@ -21680,3 +21680,37 @@ render path then does no I/O and both columns answer the same question by constr
 **Falsified by:** starting the GUI from an environment whose `PATH` omits the managed CLI
 bin dir, then comparing its `This machine` count against what another host's matrix reports
 for that same machine over ssh. Equal counts falsify the divergence; unequal counts are it.
+
+## [11.9] THE JOB THAT LANDS EVERY LANE'S WORK IS ITSELF A LOOP NOBODY RESTARTS
+
+**Status:** OPEN
+
+`scripts/ygg-roll-watch.sh` is what carries merged work from `main` onto the machine
+someone is actually using: it builds, bumps, deploys and reconciles the client. Its own
+header names the gap it exists to close — a version bump falls to a seat "that may be
+mid-task, out of context, or gone", and *"somebody decides to run it" is not a mechanism.*
+
+**It is started by somebody deciding to run it.** There is no cron entry, no timer and no
+supervisor for it anywhere; it is a foreground loop that lives and dies with whatever
+session launched it.
+
+**Observed.** It came up on a 3600 s interval, completed exactly one cycle, and stopped
+about seventy minutes later when its launching session ended. Two hours after that, `main`
+carried **44 commits past the version deployed on the machine running the app**, including
+fixes whose lanes had already reported them as shipped. Nothing anywhere said so.
+
+**Why it matters more than a missed deploy.** The failure is silent and it inverts a lane's
+own reporting. A lane lands a fix, sees it merged, and correctly believes the mechanism will
+carry it; the mechanism is absent, and the only way to discover that is to go looking for a
+process nobody thinks to check. Every lane pays the same discovery cost separately, and the
+"is it shipped" question has no owner in between.
+
+**The shape of the fix.** Supervise it the way the other recurring jobs on these machines are
+already supervised, so its lifetime does not depend on a session; and give "when did a roll
+last complete" a surface, so its absence is reported rather than inferred. ⚠ Note before
+automating it further: the loop notifies and then RESTARTS the client, by an owner ruling that
+reversed its original refusal to do so — so a supervisor is a decision about when someone's
+window may be restarted, not merely about uptime.
+
+**Falsified by:** finding a supervisor that brings it back after its launching session exits,
+or any surface that reports how long it has been since a roll completed.
