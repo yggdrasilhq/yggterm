@@ -461,6 +461,36 @@ shows `PARTIAL`. The frame now records all three (`docs/observability.md` §2.3b
 firing either shows that pattern or rules it out. **Do not "fix" the sharing defensively before
 then** — it is a behaviour change to the paint path with no measured benefit.
 
+### ⭐⭐ WHAT THE INSTRUMENT MEASURED ON ITS FIRST REAL USE — the repair is refused ~4 times in 5
+
+One frame, three hosts running a TUI fixture under switch churn for ~30 s:
+
+| host | full refreshes GRANTED | REFUSED | refusal reasons |
+|---|---:|---:|---|
+| active | 7 | **31** | `rate_limited` 23, `frame_like` 8 |
+| other | 6 | 29 | `rate_limited` 18, `frame_like` 11 |
+| other | 7 | 22 | `rate_limited` 15, `frame_like` 7 |
+
+⇒ **~82 demands raised, ~20 granted.** The repair that is the only thing which fixes a partial
+paint is refused about four times in five, on a fixture doing nothing more exotic than emitting
+hide-cursor before each frame.
+
+⚠ **AND IT CORRECTS THE STORY THE CODE COMMENT TELLS.** That comment names
+`!recentFrameLikeWrite` as "an AGENT-CLI-ONLY suppression … the owner's discriminator, in one
+boolean". Measured, the dominant refusal is **`rate_limited` (56 of 82), not `frame_like` (26)** —
+the 750 ms floor refuses more than twice as often as the agent-CLI gate. The two are not
+equivalent: a `rate_limited` refusal lapses in 750 ms and is re-armed, whereas `frame_like` is
+re-armed by every TUI frame and only escapes via the 1500 ms deadline. **Anyone reasoning about
+this suppression from the comment alone will weight the wrong gate.**
+
+⛔ **AND EVERY GRANTED REFRESH WIPES THE SHARED ATLAS.** `atlas_clears` equals `forced_refresh` on
+all three hosts, so ~20 wipes of the one texture all three are drawing from, inside 30 seconds —
+see the shared-atlas section above for why that is a coupling and not yet a proven cause.
+
+⛔⛔ **NONE OF THIS IS IN THE TRACE.** ~82 refusals, ~20 granted refreshes and ~20 shared-atlas
+wipes, and the probes for them emitted nothing (§4.2b). Every number in this table came from
+counters read in the frame.
+
 ### ⛔⛔ AND THE TRACE CANNOT ANSWER WHETHER THE REPAIR RAN — the probe shares the fault's own gate
 
 **GUI host, 2026-08-22: `xterm_forced_refresh` and `xterm_forced_refresh_skipped` appear ZERO
