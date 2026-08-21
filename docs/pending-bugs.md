@@ -329,6 +329,49 @@ client — the scrollback comes back, the row drives, and nothing reports a wait
 control: the CLI's pid must be the SAME one before and after, or something started a second
 resume.
 
+## ⛔⛔ [11.26] THE SANDBOX HARNESS FILLS A RAM DISK AND THEN REPORTS CLEAN RESULTS IT NEVER RENDERED
+
+**Status:** OPEN
+
+⛔⛔ **THE DANGEROUS HALF IS NOT THE LEAK, IT IS THE SHAPE OF THE FAILURE.** A reproduction loop
+of eight trials ran to completion and printed a clean verdict for every one of them. **No GUI had
+started in any of them.** `underglass-sandbox.sh start` failed, `env` then found no
+`wayland-display`, every app-control call returned nothing, the diff parsed nothing, and the loop
+reported *"not caught in 8 trials"* — a sentence that reads as evidence of absence and was
+produced by a harness that rendered no pixels at all. Had that line been believed, the honest
+conclusion "this fault is rarer than we thought" would have been recorded from a run that tested
+nothing.
+
+**The mechanism, measured 2026-08-22.** `underglass-sandbox.sh stop` **preserves the sandbox home
+by design** (the header says so — "sandbox home is preserved for inspection"). Nothing ever reaps
+them. They accumulate under `$XDG_RUNTIME_DIR`, which is a **tmpfs — RAM, not disk**. Found: **48
+dead sandbox homes holding a 51 GB tmpfs at 100% full**, several at 2.4–2.9 GB each, the oldest
+weeks old and belonging to lanes long since landed. `start` then dies with
+`cat: write error: No space left on device` and returns **rc=0**.
+
+⚠ **And it is a SHARED host, so this is other people's failure too.** Three sandboxes were LIVE at
+the time, owned by other sessions (their compositors still running). A blanket cleanup would have
+killed live work; the reap has to check `sway.pid` liveness per directory and skip anything whose
+compositor answers. 48 dead homes were reaped this way and 33 GB returned, with the three live
+ones untouched.
+
+**What it wants, in order of value:**
+
+1. ⭐ **`start` must FAIL LOUDLY.** Returning rc=0 having written no display file is the whole
+   defect — every caller downstream then measures nothing and says so in the language of success.
+   A missing `wayland-display` after `start` is an error, not a state.
+2. **`stop` should reap by default**, with `--keep` for the inspection case the header describes.
+   Preserving by default is backwards: the inspection case is rare and deliberate, the leak is
+   automatic and invisible.
+3. **A liveness-checked sweeper** — skip any directory whose `sway.pid` is alive, because the host
+   is shared.
+4. ⚠ **Callers must not `eval "$(sandbox env)"` in a loop.** It exports `HOME`, so the next
+   iteration's `start` runs against the previous trial's sandbox home. The script header already
+   warns about the `HOME` export; it does not say that a LOOP is where it bites.
+
+⇒ Filed from the 11.26 lane, which lost a full reproduction run to it. It belongs to whoever owns
+the sandbox harness, not to the paint bug.
+
 ## ⛔⛔⛔ [11.26] LEGENDARY — THE TUI PAINTS WRONG WHILE THE BUFFER IS CORRECT, AND EACH CLI BREAKS IN A DIFFERENT REGION
 
 **Status:** OPEN
@@ -416,17 +459,118 @@ blank cells.
   twenty seconds later. The repair machinery (forced full refresh, 1500 ms deadline, 750 ms
   rate-limit) does fire — the earlier reading of the code, that a hole "latches forever", is WRONG
   and is corrected here rather than left to be inherited.
-- ⚠ **It is INTERMITTENT: 2 reproductions in ~15 attempts**, which is consistent with a race during
+- ⚠ **It is INTERMITTENT: 2 reproductions in ~23 attempts**, which is consistent with a race during
   mount churn rather than a deterministic path. Both reproductions needed a **fresh GUI** — a warm
   GUI did not reproduce under the same churn, and a second churn on an already-healed GUI never
   did. Warm mounts, cold rows on a warm GUI, streaming vs idle, and switch gaps from 0.05 s to
   0.7 s were all tried and all painted clean.
+
+⭐ **THE MOST PROMISING UNTESTED LEAD — MEMORY PRESSURE, stated as a correlation and NOT a cause.**
+Both firings happened while `$XDG_RUNTIME_DIR` — **a tmpfs, i.e. RAM** — was at **51 GB / 100%
+full** from 48 leaked sandbox homes (see the harness entry above). After 33 GB was reclaimed, **8
+further trials with a verified-working harness reproduced nothing.** A machine with tens of GB of
+RAM held by a tmpfs is exactly the condition under which a compositor evicts GPU textures, and a
+stale glyph atlas is what the captured frame looked like.
+
+⚠ **This is a before/after correlation confounded with everything else that changed, and it is
+recorded as a lead, not a finding.** The test that would settle it: fill the tmpfs to near
+capacity, then run `hunt.sh`. ⛔ **It must be run on a host with NO other live sandboxes** — the
+runtime dir is shared, three other sessions had live compositors in it during this work, and
+filling it would take their work down. That constraint is why this lane did not run the test.
+
+⇒ If it holds, this bug is a *memory-pressure* symptom and joins the resource-watch lane rather
+than being purely a renderer defect — and it would explain why the owner, on a laptop, sees
+constantly what a sandbox reproduces twice in twenty-three tries.
 
 ⚠ **One control could not be settled and must not be assumed:** in both reproductions the broken
 row was also the FIRST row captured after the churn, so "which band is live" and "captured first"
 are confounded. A reversed-order run on a fresh GUI did not reproduce at all, so it separated
 nothing. **Do not quote the top/middle/bottom labels as a finding** — what IS established is
 live-band-correct / static-region-broken, which holds whichever band was live.
+
+### ⛔⛔ EVERY TERMINAL SHARES ONE GLYPH ATLAS — measured, and NOT the cause
+
+**Measured live, 2026-08-22:** three terminal hosts returned **three atlas objects and ONE distinct
+atlas**, which grew to **7 pages under all three at once**. The WebGL addon keeps a module-level
+cache (`acquireTextureAtlas`) and hands every terminal whose font, theme and DPR match the **same
+`TextureAtlas`**, tracking them in an `ownedBy` list. Every yggterm row matches, so **every row
+shares one atlas.**
+
+⇒ **An atlas operation is therefore never per-terminal, and the addon's own clear says so:**
+
+```js
+clearTextureAtlas(){ this._charAtlas?.clearTexture(); this._clearModel(!0); this._requestRedrawViewport(); }
+```
+
+It wipes the **shared** texture, then clears only **this** renderer's glyph model and redraws only
+**this** viewport. Every other owner keeps a model pointing into a texture that was just wiped. We
+call this per-host on the forced-refresh funnel — i.e. on every switch-in, foreground and reveal.
+
+⛔⛔ **AND IT IS NOT THE PROVEN CAUSE OF THE GARBLE. Two direct tests refuted it — do not
+re-derive them, and do not quote the sharing as the root cause:**
+
+| experiment | result |
+|---|---|
+| clear the shared atlas via another host, then full-refresh the measured host | **100% of cells painted** — clean |
+| flood the atlas to 7 pages from another host, then full-refresh the measured host | **100% of cells painted** — clean |
+
+The refreshing terminal re-rasterises glyphs on demand, so a cleared or grown atlas is handled
+correctly for whoever repaints. The coupling is real and any future explanation has to sit beside
+it, but it is a **candidate, not an answer**.
+
+⚠ **What would justify acting on it:** a frame in which `renderer.atlas_shared` is true, a host
+other than the active one has a `last_atlas_clear_at_ms` close to the capture, and the active host
+shows `PARTIAL`. The frame now records all three (`docs/observability.md` §2.3b), so the next
+firing either shows that pattern or rules it out. **Do not "fix" the sharing defensively before
+then** — it is a behaviour change to the paint path with no measured benefit.
+
+### ⭐⭐ WHAT THE INSTRUMENT MEASURED ON ITS FIRST REAL USE — the repair is refused ~4 times in 5
+
+One frame, three hosts running a TUI fixture under switch churn for ~30 s:
+
+| host | full refreshes GRANTED | REFUSED | refusal reasons |
+|---|---:|---:|---|
+| active | 7 | **31** | `rate_limited` 23, `frame_like` 8 |
+| other | 6 | 29 | `rate_limited` 18, `frame_like` 11 |
+| other | 7 | 22 | `rate_limited` 15, `frame_like` 7 |
+
+⇒ **~82 demands raised, ~20 granted.** The repair that is the only thing which fixes a partial
+paint is refused about four times in five, on a fixture doing nothing more exotic than emitting
+hide-cursor before each frame.
+
+⚠ **AND IT CORRECTS THE STORY THE CODE COMMENT TELLS.** That comment names
+`!recentFrameLikeWrite` as "an AGENT-CLI-ONLY suppression … the owner's discriminator, in one
+boolean". Measured, the dominant refusal is **`rate_limited` (56 of 82), not `frame_like` (26)** —
+the 750 ms floor refuses more than twice as often as the agent-CLI gate. The two are not
+equivalent: a `rate_limited` refusal lapses in 750 ms and is re-armed, whereas `frame_like` is
+re-armed by every TUI frame and only escapes via the 1500 ms deadline. **Anyone reasoning about
+this suppression from the comment alone will weight the wrong gate.**
+
+⛔ **AND EVERY GRANTED REFRESH WIPES THE SHARED ATLAS.** `atlas_clears` equals `forced_refresh` on
+all three hosts, so ~20 wipes of the one texture all three are drawing from, inside 30 seconds —
+see the shared-atlas section above for why that is a coupling and not yet a proven cause.
+
+⛔⛔ **NONE OF THIS IS IN THE TRACE.** ~82 refusals, ~20 granted refreshes and ~20 shared-atlas
+wipes, and the probes for them emitted nothing (§4.2b). Every number in this table came from
+counters read in the frame.
+
+### ⛔⛔ AND THE TRACE CANNOT ANSWER WHETHER THE REPAIR RAN — the probe shares the fault's own gate
+
+**GUI host, 2026-08-22: `xterm_forced_refresh` and `xterm_forced_refresh_skipped` appear ZERO
+times across the three newest trace files; `xterm_render` appears 3,872 times in the same files.**
+(The query was checked against that control first.)
+
+Both probes are throttled by `recentFrameLikeWrite` — **the same flag that suppresses the forced
+refresh**, armed by the hide-cursor every TUI emits before every redraw, so always hot for an agent
+CLI. Four hot probes also share one rate-limit slot, and `xterm_write_flush` eats it first.
+
+⇒ **"The repair was suppressed all window" and "no repair was ever demanded" are the same reading
+in the trace: nothing.** Any past conclusion drawn from a zero on these two probes is void.
+
+⭐ **Worked around without touching the throttle:** the host keeps monotonic counters no
+rate-limit can erase, and the same-frame record now reads them directly, so a captured frame
+carries the true repair-vs-suppression balance even when the trace carries none. Detail:
+`docs/observability.md` §4.2b.
 
 ### ⛔ THE CODE FINDING: EVERY REPAIR TRIGGER IS EVENT-DRIVEN, NOTHING DETECTS A DIVERGENCE
 
