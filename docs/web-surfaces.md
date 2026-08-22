@@ -496,6 +496,7 @@ Agent-control screenshots deliberately do not replace the human's clipboard.
 - ✅ **Regression locks cover intelligent full-page preparation/restoration and
   independent save/copy accounting**
   (`full_page_screenshots_prepare_the_real_scroll_extent_and_restore_it`,
+  `full_page_transaction_materializes_a_dominant_inner_scrollport_without_page_drift`,
   `page_screenshot_save_and_clipboard_copy_are_independently_accounted`).
 - ⚠ **NOT proven end-to-end: clicking one of the four entries in the GUI.**
   A GTK popup menu is not reachable from any injection path we have — the `do`

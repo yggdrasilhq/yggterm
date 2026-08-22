@@ -174,7 +174,7 @@ document. Human-menu captures then publish the exact saved PNG to the retained
 native system-clipboard owner; save and copy outcomes are reported separately.
 `server app web screenshot` uses the same full-page preparation but deliberately
 does not clobber the human's clipboard. When changing any of this, update
-`docs/web-surfaces.md` and keep both screenshot regression locks green.
+`docs/web-surfaces.md` and keep all screenshot regression locks green.
 
 ## Building a libyggterm app — quick-and-dirty to heavyweight
 
