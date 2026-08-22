@@ -383,10 +383,12 @@ pub fn append_foreign_trace_batch(
         records.truncate(MAX_FOREIGN_BATCH_RECORDS);
     }
 
-    // Attribution hint for the UI-block watchdog, once for the batch rather
-    // than once per record: the watchdog wants to know what ran before a stall,
-    // and N identical notes for one drain is noise, not attribution.
-    crate::ui_block::note_activity("trace/foreign_batch");
+    // Attribution kept OFF the UI thread: the outer caller (viewport.rs)
+    // now drains on `spawn_blocking`, so noting activity here would
+    // attribute a background batch to a UI stall. The watchdog's
+    // last_activity must be the UI work that actually preceded the gap,
+    // not the background trace write that happened to run during it.
+    // Intentionally no `note_activity` here.
 
     let mut buffer: Vec<u8> = Vec::with_capacity(records.len() * 256);
     let mut mirrored: Vec<(String, String, String, Value)> = Vec::with_capacity(records.len());

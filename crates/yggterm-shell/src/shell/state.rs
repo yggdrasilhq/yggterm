@@ -28421,7 +28421,9 @@ impl ShellState {
         // switching among them reuses the live host (no remount). Disabled by
         // YGGTERM_DISABLE_HOT_PREMOUNT.
         let premount_paths = if limit_to_active_session && hot_premount_enabled() {
-            self.note_terminal_activation_mru(session_path);
+            if active_terminal_path.as_deref() == Some(session_path) {
+                self.note_terminal_activation_mru(session_path);
+            }
             self.compute_hot_premount_keep_set(active_terminal_path.as_deref())
         } else {
             HashSet::new()
