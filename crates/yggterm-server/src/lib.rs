@@ -28873,6 +28873,11 @@ pub struct LocalAgentCliIdentity {
     pub cwd: String,
     /// Absolute path of the open transcript on this machine.
     pub storage_path: String,
+    /// The yggterm row id this runtime was born under, when a host-resident
+    /// daemon can state the exact alias. Codex mints its real id after birth;
+    /// the remote GUI must join on this alias instead of guessing by cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birth_session_id: Option<String>,
 }
 
 /// Enumerates Codex / Claude Code processes currently running on THIS machine
@@ -28887,7 +28892,17 @@ pub struct LocalAgentCliIdentity {
 /// across every PID rather than descending from one PTY root.
 #[cfg(target_os = "linux")]
 pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
-    for identity in enumerate_local_agent_cli_identities() {
+    let mut identities = enumerate_local_agent_cli_identities();
+    if let Ok(home) = resolve_yggterm_home() {
+        let birth_aliases = local_codex_runtime_birth_aliases(&home);
+        for identity in &mut identities {
+            if identity.kind != "codex" {
+                continue;
+            }
+            identity.birth_session_id = birth_aliases.get(&identity.session_id).cloned();
+        }
+    }
+    for identity in identities {
         write_stdout_line_strict(&serde_json::to_string(&identity)?)?;
     }
     Ok(())
@@ -28925,6 +28940,7 @@ fn enumerate_local_agent_cli_identities() -> Vec<LocalAgentCliIdentity> {
                 session_id,
                 cwd,
                 storage_path: storage_path.display().to_string(),
+                birth_session_id: None,
             });
         }
         if let Some(storage_path) = claude_code_storage_path_from_process_fds(pid)
@@ -28936,12 +28952,51 @@ fn enumerate_local_agent_cli_identities() -> Vec<LocalAgentCliIdentity> {
                 session_id,
                 cwd,
                 storage_path: storage_path.display().to_string(),
+                birth_session_id: None,
             });
         }
     }
     // Deterministic order so the SSH output (and any tests) are stable.
     identities.sort_by(|a, b| (&a.kind, &a.session_id).cmp(&(&b.kind, &b.session_id)));
     identities
+}
+
+/// Exact synthetic-id -> real-id aliases already known by this host's daemon.
+///
+/// The remote Codex owner is the SSOT for this relation: its `UUID` metadata
+/// preserves the row id received in `start-codex`, while `Codex Session` is
+/// replaced with the transcript id discovered from the owned PTY process tree.
+/// Exporting that pair lets the GUI host rebind the SSH wrapper without the old
+/// cwd guess, which fails whenever Codex retains the original checkout cwd
+/// while yggterm launched the resumed session in a worktree.
+fn local_codex_runtime_birth_aliases(yggterm_home: &Path) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for (endpoint, runtime_status) in daemon::reachable_versioned_daemon_statuses(yggterm_home) {
+        if runtime_status.server_version != daemon::SERVER_PROTOCOL_VERSION {
+            continue;
+        }
+        let Ok((snapshot, _message)) = daemon::snapshot(&endpoint) else {
+            continue;
+        };
+        let active = snapshot.active_session.into_iter();
+        for session in active.chain(snapshot.live_sessions.into_iter()) {
+            if session.kind != SessionKind::Codex {
+                continue;
+            }
+            let Some(real_id) = snapshot_metadata_value(&session, "Codex Session")
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(birth_id) = snapshot_metadata_value(&session, "UUID")
+                .filter(|value| !value.trim().is_empty() && value != &real_id)
+            else {
+                continue;
+            };
+            aliases.entry(real_id).or_insert(birth_id);
+        }
+    }
+    aliases
 }
 
 fn live_remote_runtime_codex_session_ids(yggterm_home: &Path) -> HashSet<String> {

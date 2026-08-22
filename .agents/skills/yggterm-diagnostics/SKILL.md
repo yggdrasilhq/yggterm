@@ -90,10 +90,10 @@ are profiling).
 - `server perf-incidents [--list] [--json]` — the durable snapshots of "the app went
   hot", grouped by trigger and ranked by count. `span_cpu_hot` is a CPU-time span past
   1.2 cores; `span_busy`/`span_stall` are wall-clock triggers.
-- `cargo run -p yggterm-core --example render_top -- <gui-pid> 15000` — LIVE per-process
-  render cost of the GUI tree: cores, PSS and **`gpu_ms`** per role. Every number is a
-  delta between two samples. (Being promoted to `server render-top`; until then the
-  example is the reader.)
+- `server render-top --interval-ms 15000 --json` — LIVE per-process render cost of
+  the registered GUI tree: cores, PSS and **`gpu_ms`** per role. Every number is a
+  delta between two samples. Use the example reader only for an unregistered test
+  process: `cargo run -p yggterm-core --example render_top -- <gui-pid> 15000`.
 
 - `server snapshot` — the daemon view. `active_session` (and `live_sessions[]`) carry
   per-session `launch_phase`, `remote_deploy_state`, **`pty_cols`/`pty_rows`** (the SQUISH
@@ -123,7 +123,13 @@ are profiling).
 - `server app state` — the active session + `active_terminal_hosts[]`: `cols`/`rows`,
   `base_y`, `viewport_y`, `scrollback_intent`, `retained_replay_source`, `text_tail`,
   `xterm_session_snapshot_nonblank_line_count`, `window_focused`/`document_focused`;
-  plus `active_view_mode` and **`session_view_contract_violations`**.
+  plus `active_view_mode` and **`session_view_contract_violations`**. For web CPU,
+  read `web_surface_tabs.rows[]` as two planes: `state` is the reconciler's applied
+  intent; `engine_hidden`, `engine_widget_visible`, `engine_widget_mapped`, and
+  `web_process_responsive` are read back from the WebKit host. Any nonzero
+  `engine_visibility_mismatches` / `widget_visibility_mismatches` means the hide
+  request and engine state disagree. Never use `state: "stashed"` alone as proof
+  that the page is hidden.
 - `server app terminal probe-scroll <path> --lines 0` — the **`viewport_force_log`**
   ring (every viewport move: reason/target/base/before/after/noop) + per-host counters
   (e.g. `settleSelfHealCount`). **THE reliable instrument for scroll/jump/lock bugs** —
@@ -160,7 +166,22 @@ are profiling).
   means NOTHING was armed, with the daemon's reason alongside.
 - `server trace tail` — the event trace (daemon + `ui` events). Time-order it to see a
   reveal/reconcile/replay sequence. (Rotates — grep `~/.yggterm/trace/*.jsonl` for older.)
-- `server app rows` — browser/sidebar rows (kind, label, full_path).
+- `server app rows` — browser/sidebar rows. For every agent row, read
+  `session_kind` + `session_kind_source`, `title_quality`, `icon_kind` +
+  `expected_icon_kind`, and `icon_matches_session_kind`. These are the FINAL
+  GUI projection facts after title enrichment; do not infer CLI kind from the
+  path or treat Codex's historical `icon_kind:"session"` as a mismatch. Audit
+  uniqueness by `(full_path,presence)`, not `full_path`: one `live_rail` and one
+  `cwd_tree` occurrence is required dual presence, while two of either is a
+  per-view defect.
+- `ytrace tail --category cli --since 30m --json` — the universal CLI chain:
+  `birth`, `launch`, `identity_poll`, `title`/`title_sweep`,
+  `projection`/`projection_sweep`, `restore`. `identity_poll` separates
+  discovery from joining: identities seen with zero exact-alias and cwd
+  candidates is a failed join; `newly_exhausted > 0` means the row will remain
+  on its birth id without another state change. `projection` carries no title
+  text, only title quality and kind/icon agreement; the sweep names every
+  registered CLI even when its row count is zero.
 - `server app session <remove|delete> <path>` — delete a session (e.g. a phantom).
 - `server app screenshot [out.png]` — app capture. **Since v2.8.46, when the active view
   is a terminal and the canvas renderer is on, this composites the xterm canvas layers

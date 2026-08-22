@@ -300,7 +300,40 @@ visible rather than silent.
 
 What is left of Fault 4 once the spec is respected is a **PTY-lifecycle** question, not a row-count one — and its "next `open` spawns a NEW session" half was Fault 3 all along: the reopen resumed a phantom id, so the CLI made a new session and the old PTY had nothing to reattach to. Re-measure the tear-on-switch behaviour against the Fault-3 fix before treating any of it as a separate defect.
 
-**What Claude does right (copy this):** `Slug cc` (historical `remote-cc://` / `cc-runtime://`), `binary "claude"`, `resume_selector_token "--resume"`, `store_globs &[".claude/projects/*/*.jsonl"]` (filename IS id, no DB), `TitleAuthority::Store` (`custom-title > ai-title`), `re_roots_with_cwd:false`, `id_assigned_at_birth:true` — yggterm hands CC the row uuid at birth and CC names the transcript after it, so row→store mapping is an identity function. **That is the property the self-minting CLIs lack, and the whole of Fault 3.** Codex hiccups are only viewport (CUF `/x1b[?25l` latching, SIGWINCH nudge) — titles/resume are fine.
+**What Claude does right (copy this):** `Slug cc` (historical `remote-cc://` / `cc-runtime://`), `binary "claude"`, `resume_selector_token "--resume"`, `store_globs &[".claude/projects/*/*.jsonl"]` (filename IS id, no DB), `TitleAuthority::Store` (`custom-title > ai-title`), `re_roots_with_cwd:false`, `id_assigned_at_birth:true` — yggterm hands CC the row uuid at birth and CC names the transcript after it, so row→store mapping is an identity function. **That is the property the self-minting CLIs lack, and the whole of Fault 3.**
+
+**⛔ CORRECTED 2026-08-22 — Codex titles/resume were not fine.** Two live
+remote Codex rows on the live GUI host still carried version-4 birth UUIDs; neither id
+existed among the remote machine's 798 scanned durable sessions. The remote
+identity verb successfully found three running Codex identities, but exact cwd
+matching found zero for both rows: the rows were launched in a worktree while
+Codex's transcripts retained another checkout cwd. After twelve polls the join
+silently stopped. The host-resident daemon already held the exact relation:
+each owned Codex runtime had a version-7 real `Codex Session`, a `Storage`
+path, and the original version-4 id preserved as `UUID`. The remote identity
+wire now exports that owner-reported `birth_session_id`; the GUI-host poll joins
+on it first and uses cwd only as a compatibility fallback. `cli/identity_poll`
+states discovery, exact-alias candidates, cwd candidates, rebinds and exhausted
+rows, while `cli/projection` catches the resulting birth placeholder at the
+last GUI stage. This is the remote twin of Fault 3, and it also prevents a cold
+restore from resuming the phantom version-4 id with `--require-existing`.
+
+The first live projection read exposed an observer defect too: eleven active
+agent paths were each reported twice with `presence:"live_rail"` (seven Claude
+Code, two Codex, two Antigravity). The product rows were the required rail + cwd
+dual presence; `server app rows` had guessed presence from a path set, so the
+cwd occurrence inherited the rail label and alternated authoritative/inferred
+trace edges for one key. Presence now comes from the concrete row index inside
+the Live Sessions region. Per-view uniqueness is audited by
+`(full_path,presence)`, never by session identity alone.
+
+After that witness correction, the live all-registry sweep reported zero icon
+mismatches and named the remaining title debt without exposing title text: six
+Codex short hashes, one Muse short hash, and one low-signal Claude Code row.
+Antigravity and Grok Build were clean in the projected sample. Codex LiteLLM,
+Kimi, OpenCode, Pi, and Qwen Code had zero projected rows, which is stated as
+absence rather than misreported as success; those CLIs still need an active
+birth/launch/restore specimen before their integration can be graded.
 
 ### Issue Heading 13: Input latency — keystroke → PTY register → PTY render (flush out latency bugs)
 
@@ -373,7 +406,7 @@ the stall.
 
 ### Issue Heading 15: Codex / codex-litellm exemplar — wiring hiccups vs Claude gold (like Muse)
 
-*Why codex.* `codex` (`codex` binary, `remote-session://` historical `remote-codex://` + `codex-runtime://`, `codex resume <id>`) and `codex-litellm` (`codex-litellm` binary, local-only `codex-litellm://`, `id_assigned_at_birth` same) are *workable* per matrix (`TitleAuthority::Generated` via `SessionTitleStore` heuristic/litellm, store `~/.codex/sessions/**/rollout-*.jsonl` id inside file, `re_roots_with_cwd:true` for `codex`, `false` for `litellm`). Their faults are viewport, not title/resume: (1) **Geometry squish** — daemon re-creates PTY at default `120×36` after hot-update re-resume, `last_sent_terminal_resize_*` is stale-equal to live grid, so no `Resize` fires and `codex` renders squished; fix is `viewport.rs:9837` re-resume squish repair (`last_sent_* = 0` + `spawn_terminal_startup_resize_repair`) now emits `ytrace cli/codex_geometry` (`stale_cols/rows`, `live_cols/rows`, `kind: codex_squish_repair`) for Dash. (2) **Differential CUF spaces** — `CUF` cursor-forward skips leave stale `bg` artifacts; mitigated by full screen replay on reveal (same `muse`/`codex` path, `ytrace` `terminal_mount` already). (3) **Middle desync on rapid switch** — `codex` status bar truncation if `SIGWINCH` not nudged; `terminal_write_should_frame_budget` / `terminal_write_bridge` already gates, now `ytrace` `cli/codex_geometry` covers it. `claude` gold has no squish because its Ink engine re-anchors absolute `CUP` on switch; `codex` needs the explicit resize repair — that is the hiccup to copy for any TUI that expects full width.
+*Why codex.* `codex` (`codex` binary, `remote-session://` historical `remote-codex://` + `codex-runtime://`, `codex resume <id>`) and `codex-litellm` (`codex-litellm` binary, local-only `codex-litellm://`, `id_assigned_at_birth` same) are *workable* per matrix (`TitleAuthority::Generated` via `SessionTitleStore` heuristic/litellm, store `~/.codex/sessions/**/rollout-*.jsonl` id inside file, `re_roots_with_cwd:true` for `codex`, `false` for `litellm`). Their measured faults are: (1) **Remote identity/title/resume drift** — the GUI-host wrapper is born with a version-4 UUID while the target-host daemon discovers Codex's version-7 transcript id. Joining those rows by transcript cwd fails for worktrees, leaving the birth title and a cold-restore command aimed at a nonexistent id. The target daemon's `UUID` → `Codex Session` pair is authoritative; `local-codex-identities` now carries it as `birth_session_id`, the poll matches it before cwd, and `cli/identity_poll` + `cli/projection` make every failed edge visible. (2) **Geometry squish** — daemon re-creates PTY at default `120×36` after hot-update re-resume, `last_sent_terminal_resize_*` is stale-equal to live grid, so no `Resize` fires and `codex` renders squished; fix is `viewport.rs:9837` re-resume squish repair (`last_sent_* = 0` + `spawn_terminal_startup_resize_repair`) now emits `ytrace cli/codex_geometry` (`stale_cols/rows`, `live_cols/rows`, `kind: codex_squish_repair`) for Dash. (3) **Differential CUF spaces** — `CUF` cursor-forward skips leave stale `bg` artifacts; mitigated by full screen replay on reveal (same `muse`/`codex` path, `ytrace` `terminal_mount` already). (4) **Middle desync on rapid switch** — `codex` status bar truncation if `SIGWINCH` not nudged; `terminal_write_should_frame_budget` / `terminal_write_bridge` already gates, now `ytrace` `cli/codex_geometry` covers it. `claude` gold has no identity indirection and its Ink engine re-anchors absolute `CUP` on switch.
 
 **Checklist for any new CLI (add to `spec-adding-an-agent-cli.md` steps 1–9):** 1) `SessionKind` variant, 2) `AGENT_CLIS` descriptor (+ `TitleAuthority`, `store_globs`, `id_assigned_at_birth`, `resume_selector_token`, `re_roots_with_cwd`), 3) `SESSION_PATH_SCHEMES` (`remote-<slug>://` + `<slug>-runtime://`), 4) `cargo check` exhaustive matches, 5) catch-alls `rg SessionKind::(Codex|ClaudeCode)`, 6) `agent_arm_matrix` two arms (Local `local://` + Remote `remote-<slug>://`), 7) surfaces (icon/menu/KeyTips free), 8) provisioning `install`/`update`, 9) **title lifecycle** — the birth name is automatic (`New {machine} {display_name}`, from `new_session_birth_title`; nothing per-CLI to add), then either `heuristic`/`litellm` via `SessionTitleStore` for a `Generated` CLI + its fallback list, or `read_live_store_title` for a `Store` one — ⛔ a `Store` CLI without that hook can never be titled at all, 10) **resume id** (if `id_assigned_at_birth:false`, implement store→row mapping), 11) `spec-cli-integration-verification.md` oracles (`check-startpage.py`/`check-titles.py`/`check-cwdtree.py` must `0` on every fleet host + faithful 1920×1200 screenshot).
 

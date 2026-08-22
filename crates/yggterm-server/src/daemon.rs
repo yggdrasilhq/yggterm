@@ -13291,15 +13291,26 @@ fn normalize_cwd_for_identity_match(cwd: &str) -> String {
 }
 
 /// Matches the Codex processes running on one machine to the live remote-Codex
-/// rows that need rebinding, pairing by normalized cwd. Pure (no IO) so the
-/// matching policy is unit-testable. A running identity is paired only when its
-/// real session id differs from the row's synthesized id and has not already
-/// been claimed by an earlier row at the same cwd, so two rows in the same cwd
-/// never collapse onto one transcript.
+/// rows that need rebinding. An owner-reported birth alias is authoritative;
+/// normalized cwd remains the compatibility fallback for older remote binaries.
+/// Pure (no IO) so the matching policy is unit-testable. A running identity is
+/// paired only when its real session id differs from the row's synthesized id
+/// and has not already been claimed, so two rows never collapse onto one
+/// transcript.
 fn match_codex_identities_to_targets(
     group: &[crate::RemoteCodexIdentityPollTarget],
     identities: &[crate::LocalAgentCliIdentity],
 ) -> Vec<(String, CodexRuntimeProcessIdentity)> {
+    let by_birth_id: HashMap<&str, &crate::LocalAgentCliIdentity> = identities
+        .iter()
+        .filter(|identity| identity.kind == "codex")
+        .filter_map(|identity| {
+            identity
+                .birth_session_id
+                .as_deref()
+                .map(|birth_id| (birth_id, identity))
+        })
+        .collect();
     let mut by_cwd: HashMap<String, Vec<&crate::LocalAgentCliIdentity>> = HashMap::new();
     for identity in identities
         .iter()
@@ -13313,12 +13324,29 @@ fn match_codex_identities_to_targets(
     let mut claimed: HashSet<String> = HashSet::new();
     let mut rebinds = Vec::new();
     for target in group {
-        let Some(candidates) = by_cwd.get(&normalize_cwd_for_identity_match(&target.cwd)) else {
-            continue;
-        };
-        let Some(identity) = candidates.iter().find(|identity| {
-            identity.session_id != target.current_id && !claimed.contains(&identity.session_id)
-        }) else {
+        // Exact owner-reported alias first. The previous cwd-only join fails
+        // for worktrees: Codex's transcript retains the checkout cwd it was
+        // born in while the yggterm wrapper correctly re-roots the resumed TUI
+        // into another worktree. The remote daemon already owns the precise
+        // synthetic UUID -> real transcript relation; use it before heuristics.
+        let identity = by_birth_id
+            .get(target.current_id.as_str())
+            .copied()
+            .filter(|identity| {
+                identity.session_id != target.current_id
+                    && !claimed.contains(&identity.session_id)
+            })
+            .or_else(|| {
+                by_cwd
+                    .get(&normalize_cwd_for_identity_match(&target.cwd))?
+                    .iter()
+                    .copied()
+                    .find(|identity| {
+                        identity.session_id != target.current_id
+                            && !claimed.contains(&identity.session_id)
+                    })
+            });
+        let Some(identity) = identity else {
             continue;
         };
         claimed.insert(identity.session_id.clone());
@@ -13337,8 +13365,9 @@ fn match_codex_identities_to_targets(
 /// One tick of the remote-Codex identity poll
 /// (`[[finding-uuidv4-codex-session-drift]]` Stage 2). For each live remote
 /// Codex row still carrying a synthesized UUIDv4 id, SSH-queries the owning
-/// machine for its running Codex processes, matches by cwd, and rebinds the row
-/// to the real CLI session id through the same SSOT path the local rebind uses
+/// machine for its running Codex processes, matches the owner's exact birth
+/// alias (with cwd only as an old-binary fallback), and rebinds the row to the
+/// real CLI session id through the same SSOT path the local rebind uses
 /// (`apply_codex_runtime_identity_to_live_session`). Self-limiting: a row drops
 /// out as soon as it is rebound, and `attempts` abandons rows that never match.
 /// Returns the number of rows rebound this tick.
@@ -13371,6 +13400,7 @@ fn run_remote_codex_identity_poll_chore(
     if targets.is_empty() {
         return Ok(0);
     }
+    let target_rows = targets.len();
 
     // Query each machine once.
     let mut machines: HashMap<(String, Option<String>), Vec<crate::RemoteCodexIdentityPollTarget>> =
@@ -13383,6 +13413,11 @@ fn run_remote_codex_identity_poll_chore(
     }
 
     let mut rebinds: Vec<(String, CodexRuntimeProcessIdentity)> = Vec::new();
+    let mut query_failures = 0usize;
+    let mut identities_seen = 0usize;
+    let mut identities_with_birth_alias = 0usize;
+    let mut exact_alias_candidates = 0usize;
+    let mut cwd_candidates = 0usize;
     for ((ssh_target, ssh_prefix), group) in &machines {
         // Count the attempt for every row we are about to poll, regardless of outcome.
         for target in group {
@@ -13392,12 +13427,67 @@ fn run_remote_codex_identity_poll_chore(
         {
             Ok(identities) => identities,
             Err(error) => {
+                query_failures += 1;
                 warn!(ssh_target = %ssh_target, error = %error, "remote codex identity poll failed");
                 continue;
             }
         };
+        identities_seen += identities.len();
+        identities_with_birth_alias += identities
+            .iter()
+            .filter(|identity| identity.kind == "codex" && identity.birth_session_id.is_some())
+            .count();
+        exact_alias_candidates += group
+            .iter()
+            .filter(|target| {
+                identities.iter().any(|identity| {
+                    identity.kind == "codex"
+                        && identity.birth_session_id.as_deref()
+                            == Some(target.current_id.as_str())
+                })
+            })
+            .count();
+        cwd_candidates += group
+            .iter()
+            .filter(|target| {
+                identities.iter().any(|identity| {
+                    identity.kind == "codex"
+                        && normalize_cwd_for_identity_match(&identity.cwd)
+                            == normalize_cwd_for_identity_match(&target.cwd)
+                })
+            })
+            .count();
         rebinds.extend(match_codex_identities_to_targets(group, &identities));
     }
+
+    let rebound_keys = rebinds
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect::<HashSet<_>>();
+    let newly_exhausted = machines
+        .values()
+        .flatten()
+        .filter(|target| {
+            attempts.get(&target.key).copied().unwrap_or(0)
+                == REMOTE_CODEX_IDENTITY_POLL_MAX_ATTEMPTS
+                && !rebound_keys.contains(target.key.as_str())
+        })
+        .count();
+    yggterm_core::cli_plane::emit_identity_poll(
+        "daemon",
+        SessionKind::Codex,
+        yggterm_core::cli_plane::CliIdentityPollStats {
+            target_rows,
+            machines_queried: machines.len(),
+            query_failures,
+            identities_seen,
+            identities_with_birth_alias,
+            exact_alias_candidates,
+            cwd_candidates,
+            rebinds: rebinds.len(),
+            newly_exhausted,
+        },
+    );
 
     if rebinds.is_empty() {
         return Ok(0);
@@ -26910,7 +27000,17 @@ mod tests {
             session_id: session_id.to_string(),
             cwd: cwd.to_string(),
             storage_path: format!("/home/user/.codex/sessions/{session_id}.jsonl"),
+            birth_session_id: None,
         }
+    }
+
+    #[test]
+    fn identity_wire_accepts_an_older_remote_without_birth_alias() {
+        let identity: LocalAgentCliIdentity = serde_json::from_str(
+            r#"{"kind":"codex","session_id":"019ce5d8-c94c-7b62-ae19-3818ae400b65","cwd":"/home/user/proj","storage_path":"/home/user/.codex/sessions/example.jsonl"}"#,
+        )
+        .expect("older identity wire");
+        assert_eq!(identity.birth_session_id, None);
     }
 
     #[test]
@@ -26940,6 +27040,28 @@ mod tests {
             match_codex_identities_to_targets(&targets, &identities).len(),
             1
         );
+    }
+
+    /// Live reproduction, reduced: the row was launched in a worktree, while
+    /// Codex's transcript retained its original checkout cwd. Cwd matching
+    /// found zero candidates even though the remote daemon already held the
+    /// exact birth UUID -> real transcript alias.
+    #[test]
+    fn owner_reported_birth_alias_rebinds_when_transcript_cwd_differs() {
+        let synth = "11111111-2222-4333-8444-555555555555";
+        let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
+        let targets = vec![poll_target(
+            "remote-session://dev/example",
+            "/home/user/proj--worktree",
+            synth,
+        )];
+        let mut identity = codex_identity(real, "/home/user/proj");
+        identity.birth_session_id = Some(synth.to_string());
+
+        let rebinds = match_codex_identities_to_targets(&targets, &[identity]);
+
+        assert_eq!(rebinds.len(), 1);
+        assert_eq!(rebinds[0].1.session_id, real);
     }
 
     #[test]
@@ -27002,6 +27124,7 @@ mod tests {
             session_id: "019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             cwd: "/home/user".to_string(),
             storage_path: "/home/user/.claude/projects/x/y.jsonl".to_string(),
+            birth_session_id: None,
         }];
         assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
     }
