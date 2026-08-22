@@ -9970,7 +9970,12 @@ mod web_surface_reclaim_locks {
             .iter()
             .position(|line| line.trim() == "fn web_surface_tick_settled(")
             .expect("the tick-end helper is gone — move this lock with it");
-        let body = code_lines(&product[settled..settled + 12]);
+        let settled_end = product[settled..]
+            .iter()
+            .position(|line| line.trim() == "fn publish_web_surface_native_ids(")
+            .map(|offset| settled + offset)
+            .expect("the tick-end helper's publication owner moved — move this lock with it");
+        let body = code_lines(&product[settled..settled_end]);
         let sweep = body
             .iter()
             .position(|line| *line == "desktop.prune_web_surface_contexts();")
