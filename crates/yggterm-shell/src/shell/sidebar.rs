@@ -1179,11 +1179,13 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
                 // The two shipped strings are HISTORICAL and stay: `"session"`
                 // for the codex family (it predates there being a second CLI)
                 // and `"claude-code"`. Every new CLI reports its `slug`.
-                if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(kind) {
-                    return match kind {
-                        SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
-                        _ => descriptor.slug,
-                    };
+                // ⛔ The mapping itself lives in the registry beside the slugs it
+                //    departs from — `row_icon_kind`. It was restated here, and the
+                //    fleet's Python restated it a THIRD time as plain slug
+                //    equality, which is how the codex family stopped being
+                //    recognisable by its own mark.
+                if let Some(icon) = yggterm_core::agent_cli::row_icon_kind(kind) {
+                    return icon;
                 }
                 return match kind {
                     SessionKind::Shell | SessionKind::SshShell => "terminal",

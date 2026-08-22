@@ -593,6 +593,14 @@ mod tests {
                 sessions: 1,
                 contexts: 1,
             },
+            WebSurfaceRuntimeCounts {
+                present: 3,
+                engine_hidden: 2,
+                widget_visible: 1,
+                mapped: 1,
+                web_process_responsive: 3,
+                ..Default::default()
+            },
         );
 
         // The legacy keys keep their meaning — guihost's log already carries them
@@ -613,11 +621,44 @@ mod tests {
         // ONE engine context. When these two track each other, every tab is
         // paying for its own process pool, network process and cookie jar.
         assert_eq!(context.get("web_surface_contexts"), Some(&json!(1)));
+        assert_eq!(context.get("web_surface_engines_present"), Some(&json!(3)));
+        assert_eq!(context.get("web_surface_engines_hidden"), Some(&json!(2)));
+        assert_eq!(
+            context.get("web_surface_engine_widgets_visible"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            context.get("web_surface_engine_visibility_mismatches"),
+            Some(&json!(0))
+        );
         // The physical fact, not `effective_window_focused()` — which would
         // read `true` here purely because app-control holds the override.
         assert_eq!(context.get("window_focused"), Some(&json!(false)));
         assert_eq!(context.get("app_control_backgrounded"), Some(&json!(true)));
         assert_eq!(context.get("force_foreground"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn web_surface_runtime_counts_expose_a_stash_that_never_reached_webkit() {
+        let counts = web_surface_runtime_counts([(
+            false,
+            dioxus::desktop::SurfaceLiveness {
+                present: true,
+                // The reconciler says hidden, but both the host latch and GTK
+                // still say visible/mapped: exactly the formerly invisible
+                // angry-fan failure class.
+                engine_hidden: false,
+                widget_visible: true,
+                mapped: true,
+                web_process_responsive: true,
+            },
+        )]);
+
+        assert_eq!(counts.present, 1);
+        assert_eq!(counts.engine_hidden, 0);
+        assert_eq!(counts.widget_visible, 1);
+        assert_eq!(counts.engine_visibility_mismatches, 1);
+        assert_eq!(counts.widget_visibility_mismatches, 1);
     }
 
     #[test]
@@ -10070,6 +10111,62 @@ console.log('ok');
         );
         assert!(
             script.contains("window.clearInterval(settleFollowWatchdog);"),
+            "watchdog must be cleared on cleanup (no leaked intervals)"
+        );
+    }
+    /// ⛔⛔ AN EXPIRY THAT ONLY FIRES WHEN SOMEONE ASKS AGAIN IS NOT AN EXPIRY.
+    ///
+    /// The 1,500 ms full-refresh deadline is a term INSIDE the grant condition,
+    /// so it is only evaluated when something re-enters `requestVisiblePaint`.
+    /// The only thing that would is a single-slot recovery timer that every later
+    /// `scheduleVisiblePaintRecovery` cancels — and when that slot is lost the
+    /// demand is stranded with the expiry never running. Measured in a sandbox
+    /// on one host with no remount: a demand outstanding 43,154 ms against the
+    /// 1,500 ms deadline, `pending_recovery` due 9,074 ms in the PAST, and both
+    /// `forced_refresh_count` and `forced_refresh_skipped_count` frozen across
+    /// the window — the funnel was not re-entered once, and that row had not been
+    /// repaired since it mounted.
+    ///
+    /// ⛔ The watchdog must NOT override `input_hot`. A granted refresh clears the
+    /// shared glyph atlas and redraws every row; landing that mid-keystroke is
+    /// plausibly an input-block source, and that trade belongs to the input-block
+    /// lane. Serving the demand a second after typing stops is the whole
+    /// difference between "deferred" and "stranded".
+    #[test]
+    fn terminal_eval_script_serves_a_stranded_full_refresh_demand() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const visiblePaintDemandWatchdog = window.setInterval(() => {"),
+            "the deadline needs a timer that re-enters the funnel, not only a bypass"
+        );
+        let ix = script
+            .find("const visiblePaintDemandWatchdog")
+            .expect("demand watchdog present");
+        let body = &script[ix..ix + 1400];
+        assert!(
+            body.contains("if (!pendingVisiblePaintForceFullRefresh) { return; }"),
+            "it must cost nothing while no repair is owed"
+        );
+        assert!(
+            body.contains("if (terminalInputHot()) { return; }"),
+            "it must never pre-empt typing — that gate is the input-block lane's call"
+        );
+        assert!(
+            body.contains("outstandingMs < VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS"),
+            "it must serve the EXISTING deadline rather than inventing a second one"
+        );
+        assert!(
+            body.contains("requestVisiblePaint(true)"),
+            "the rescue goes through the existing repair funnel, never a duplicate"
+        );
+        assert!(
+            body.contains("visiblePaintDemandRescueCount += 1"),
+            "a rescue must be countable, or the underlying loss becomes invisible \
+             the moment it is repaired"
+        );
+        assert!(
+            script.contains("window.clearInterval(visiblePaintDemandWatchdog);"),
             "watchdog must be cleared on cleanup (no leaked intervals)"
         );
     }
@@ -22655,6 +22752,75 @@ console.log('ok');
             payload.starts_with(" snapshot.rows.iter()"),
             "the payload must iterate the list this function built; got: {}",
             &payload[..payload.len().min(60)]
+        );
+    }
+
+    /// A healthy store/title chore is not proof that the GUI used its answer.
+    /// Lock the last projection witness into the data verb so a CLI can be
+    /// audited without parsing labels or inferring kind from a path.
+    #[test]
+    fn the_rows_verb_exposes_and_traces_final_cli_projection_quality() {
+        let describer = SHELL_SOURCE
+            .split("fn describe_app_rows_snapshot(")
+            .nth(1)
+            .expect("the rows describer exists");
+        let body = &describer[..describer.find("\n}").expect("body ends")];
+        for field in [
+            "session_kind",
+            "session_kind_source",
+            "title_quality",
+            "expected_icon_kind",
+            "icon_matches_session_kind",
+        ] {
+            assert!(
+                body.contains(&format!("\"{field}\"")),
+                "server app rows lost the {field} projection fact"
+            );
+        }
+        assert!(
+            body.contains("cli_plane::emit_projection_snapshot(\"shell\", &cli_projections)"),
+            "the app-control read must put the same final projection on ytrace"
+        );
+    }
+
+    /// Presence belongs to a row occurrence, not to the session identity. An
+    /// active agent has the same path in both required views, so a path-set
+    /// lookup labels both `live_rail` and manufactures a per-view duplicate in
+    /// the diagnostic output.
+    #[test]
+    fn rows_presence_distinguishes_the_two_views_of_one_live_session() {
+        let path = "remote-session://build-box/11111111-2222-4333-8444-eeeeeeeeee01";
+        let rows = vec![
+            split_test_row(BrowserRowKind::Group, "__live_sessions__", 0),
+            split_test_row(BrowserRowKind::Session, path, 1),
+            split_test_row(BrowserRowKind::Group, "__remote_machine__build-box", 0),
+            split_test_row(BrowserRowKind::Session, path, 2),
+        ];
+        let live_indices = live_sidebar_session_row_indices(&rows);
+        let live_paths = HashSet::from([path.to_string()]);
+
+        assert_eq!(live_indices, HashSet::from([1]));
+        assert_eq!(
+            sidebar_row_presence(1, &rows[1], &live_indices, &live_paths),
+            "live_rail"
+        );
+        assert_eq!(
+            sidebar_row_presence(3, &rows[3], &live_indices, &live_paths),
+            "cwd_tree"
+        );
+
+        let describer = SHELL_SOURCE
+            .split("fn describe_app_rows_snapshot(")
+            .nth(1)
+            .expect("the rows describer exists");
+        let body = &describer[..describer.find("\n}").expect("body ends")];
+        assert!(
+            body.contains("live_sidebar_session_row_indices(&snapshot.rows)"),
+            "the rows verb regressed from occurrence truth to a path-set guess"
+        );
+        assert!(
+            !body.contains("live_rail_paths.contains(&row.full_path)"),
+            "identity cannot distinguish a rail row from its cwd-tree twin"
         );
     }
 

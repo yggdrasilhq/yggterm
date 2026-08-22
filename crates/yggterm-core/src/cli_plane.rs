@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::SessionKind;
-use crate::agent_cli::agent_cli_descriptor;
+use crate::agent_cli::{AGENT_CLIS, agent_cli_descriptor, row_icon_kind};
 use crate::agent_scheme;
 
 /// The one category every event in this module is filed under. One filter,
@@ -77,6 +77,11 @@ pub const CLI_PLANE_CATEGORY: &str = "cli";
 /// with nothing to say. One minute distinguishes them at a cost of ~60 small
 /// events an hour.
 const SWEEP_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// The GUI projection is larger than a title-chore sweep because it names all
+/// registered CLIs, including zeroes. Twenty minutes keeps an unchanged audit
+/// alive without making the observer part of the heat problem it is measuring.
+const PROJECTION_SWEEP_HEARTBEAT: Duration = Duration::from_secs(20 * 60);
 
 /// The slug an unregistered kind reports. Never a CLI name — a row whose kind
 /// no descriptor serves is a finding, and giving it a plausible slug would hide
@@ -330,6 +335,284 @@ fn sweep_state() -> &'static Mutex<HashMap<CliTitleChore, (BTreeMap<&'static str
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// What the GUI actually put in an agent row's title slot.
+///
+/// This is deliberately a classification, never the title text: the trace can
+/// answer whether Codex ended at a birth placeholder or a short hash without
+/// copying the user's work into the observability plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliRenderedTitleQuality {
+    Usable,
+    Empty,
+    BirthPlaceholder,
+    ShortHash,
+    RawPath,
+    GenericPlaceholder,
+    LowSignal,
+}
+
+impl CliRenderedTitleQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Usable => "usable",
+            Self::Empty => "empty",
+            Self::BirthPlaceholder => "birth_placeholder",
+            Self::ShortHash => "short_hash",
+            Self::RawPath => "raw_path",
+            Self::GenericPlaceholder => "generic_placeholder",
+            Self::LowSignal => "low_signal",
+        }
+    }
+
+    pub fn is_usable(self) -> bool {
+        self == Self::Usable
+    }
+}
+
+fn title_has_short_hash_shape(title: &str) -> bool {
+    let words = title.split_whitespace().collect::<Vec<_>>();
+    let is_short_hash = |word: &str| {
+        (word.len() == 7 || word.len() == 8)
+            && word.chars().all(|ch| ch.is_ascii_hexdigit())
+    };
+    is_short_hash(title)
+        || (words.len() >= 2
+            && words[0].eq_ignore_ascii_case("remote")
+            && words.last().is_some_and(|word| is_short_hash(word)))
+        || (words.len() >= 2
+            && is_short_hash(words[0])
+            && (words[1] == "-" || words[1] == "·" || words[1].starts_with('/')))
+}
+
+/// Classify a rendered row title with the same title-law recognizers that
+/// decide whether it may be kept. The more specific shapes run first so a
+/// sweep says *how* a row failed rather than reducing every defect to
+/// `generic_placeholder`.
+pub fn classify_rendered_title(title: &str) -> CliRenderedTitleQuality {
+    let title = title.trim();
+    if title.is_empty() {
+        return CliRenderedTitleQuality::Empty;
+    }
+    if crate::agent_cli::is_new_row_birth_title(title) {
+        return CliRenderedTitleQuality::BirthPlaceholder;
+    }
+    if title.starts_with('/')
+        || title.contains("/home/")
+        || title.to_ascii_lowercase().starts_with("c:\\")
+    {
+        return CliRenderedTitleQuality::RawPath;
+    }
+    if title_has_short_hash_shape(title) {
+        return CliRenderedTitleQuality::ShortHash;
+    }
+    if crate::looks_like_generated_fallback_title(title) {
+        return CliRenderedTitleQuality::GenericPlaceholder;
+    }
+    if crate::looks_like_low_signal_generated_copy(title) {
+        return CliRenderedTitleQuality::LowSignal;
+    }
+    CliRenderedTitleQuality::Usable
+}
+
+/// The final projection facts for one agent row. These inputs come from the
+/// GUI row builder, after live-title enrichment: the point whose absence from
+/// the CLI plane allowed healthy title chores and a broken sidebar to coexist.
+pub struct CliProjectionObservation<'a> {
+    pub session_path: &'a str,
+    pub kind: SessionKind,
+    pub rendered_title: &'a str,
+    pub icon_kind: &'a str,
+    pub kind_source: &'a str,
+    pub presence: &'a str,
+    pub live_member: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliProjectionInspection {
+    pub slug: &'static str,
+    pub title_quality: CliRenderedTitleQuality,
+    pub expected_icon_kind: &'static str,
+    pub icon_matches_kind: bool,
+}
+
+/// Inspect one final GUI projection without emitting. App-control publishes
+/// this answer on each row; the sweep below publishes the bounded trace view.
+pub fn inspect_projection(
+    kind: SessionKind,
+    rendered_title: &str,
+    icon_kind: &str,
+) -> CliProjectionInspection {
+    let expected_icon_kind = row_icon_kind(kind).unwrap_or(UNREGISTERED_SLUG);
+    CliProjectionInspection {
+        slug: slug_of(kind),
+        title_quality: classify_rendered_title(rendered_title),
+        expected_icon_kind,
+        icon_matches_kind: icon_kind == expected_icon_kind,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+struct ProjectionSlugCounts {
+    projected_rows: usize,
+    unique_sessions: usize,
+    usable_titles: usize,
+    empty_titles: usize,
+    birth_placeholders: usize,
+    short_hash_titles: usize,
+    raw_path_titles: usize,
+    generic_placeholders: usize,
+    low_signal_titles: usize,
+    icon_mismatches: usize,
+    authoritative_kind_rows: usize,
+    inferred_kind_rows: usize,
+}
+
+fn empty_projection_counts() -> BTreeMap<&'static str, ProjectionSlugCounts> {
+    AGENT_CLIS
+        .iter()
+        .map(|descriptor| (descriptor.slug, ProjectionSlugCounts::default()))
+        .collect()
+}
+
+fn projection_sweep_payload(
+    projected_rows: usize,
+    rows_with_findings: usize,
+    counts: &BTreeMap<&'static str, ProjectionSlugCounts>,
+) -> Value {
+    json!({
+        "projected_rows": projected_rows,
+        "rows_with_findings": rows_with_findings,
+        "by_slug": counts,
+    })
+}
+
+fn projection_edge_state() -> &'static Mutex<HashMap<(String, String), String>> {
+    static STATE: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn projection_sweep_state() -> &'static Mutex<Option<(String, Instant)>> {
+    static STATE: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Emit the GUI end of the CLI plane.
+///
+/// Initial healthy rows are represented only by the aggregate. A bad row emits
+/// an edge immediately; when that exact row becomes healthy, the changed edge
+/// emits once more so the trace records the recovery. The aggregate includes
+/// every registered CLI even at zero, preventing an unintegrated CLI from
+/// looking healthy merely because it never projected a row.
+pub fn emit_projection_snapshot(component: &str, rows: &[CliProjectionObservation<'_>]) {
+    let mut counts = empty_projection_counts();
+    let mut unique_sessions = BTreeMap::<&'static str, HashSet<&str>>::new();
+    let mut seen_edges = HashSet::<(String, String)>::new();
+    let mut rows_with_findings = 0usize;
+
+    for row in rows {
+        let inspection = inspect_projection(row.kind, row.rendered_title, row.icon_kind);
+        let slug_counts = counts.entry(inspection.slug).or_default();
+        slug_counts.projected_rows += 1;
+        unique_sessions
+            .entry(inspection.slug)
+            .or_default()
+            .insert(row.session_path);
+        match inspection.title_quality {
+            CliRenderedTitleQuality::Usable => slug_counts.usable_titles += 1,
+            CliRenderedTitleQuality::Empty => slug_counts.empty_titles += 1,
+            CliRenderedTitleQuality::BirthPlaceholder => slug_counts.birth_placeholders += 1,
+            CliRenderedTitleQuality::ShortHash => slug_counts.short_hash_titles += 1,
+            CliRenderedTitleQuality::RawPath => slug_counts.raw_path_titles += 1,
+            CliRenderedTitleQuality::GenericPlaceholder => slug_counts.generic_placeholders += 1,
+            CliRenderedTitleQuality::LowSignal => slug_counts.low_signal_titles += 1,
+        }
+        if !inspection.icon_matches_kind {
+            slug_counts.icon_mismatches += 1;
+        }
+        if row.kind_source == "authoritative" {
+            slug_counts.authoritative_kind_rows += 1;
+        } else {
+            slug_counts.inferred_kind_rows += 1;
+        }
+
+        let finding = !inspection.title_quality.is_usable() || !inspection.icon_matches_kind;
+        if finding {
+            rows_with_findings += 1;
+        }
+        let key = (row.session_path.to_string(), row.presence.to_string());
+        seen_edges.insert(key.clone());
+        let signature = format!(
+            "{}|{}|{}|{}|{}",
+            inspection.title_quality.label(),
+            inspection.icon_matches_kind,
+            row.kind_source,
+            row.live_member,
+            inspection.slug,
+        );
+        let (changed, had_previous) = match projection_edge_state().lock() {
+            Ok(mut state) => {
+                let previous = state.insert(key, signature.clone());
+                (previous.as_deref() != Some(signature.as_str()), previous.is_some())
+            }
+            Err(_) => (true, false),
+        };
+        if changed && (finding || had_previous) {
+            crate::perf::ytrace_emit_event(
+                component,
+                CLI_PLANE_CATEGORY,
+                "projection",
+                json!({
+                    "session_path": row.session_path,
+                    "slug": inspection.slug,
+                    "kind": format!("{:?}", row.kind),
+                    "kind_source": row.kind_source,
+                    "presence": row.presence,
+                    "live_member": row.live_member,
+                    "title_quality": inspection.title_quality.label(),
+                    "icon_kind": row.icon_kind,
+                    "expected_icon_kind": inspection.expected_icon_kind,
+                    "icon_matches_kind": inspection.icon_matches_kind,
+                    "finding": finding,
+                }),
+            );
+        }
+    }
+
+    for (slug, sessions) in unique_sessions {
+        if let Some(slug_counts) = counts.get_mut(slug) {
+            slug_counts.unique_sessions = sessions.len();
+        }
+    }
+    if let Ok(mut state) = projection_edge_state().lock() {
+        state.retain(|key, _| seen_edges.contains(key));
+    }
+
+    let payload = projection_sweep_payload(rows.len(), rows_with_findings, &counts);
+    let signature = serde_json::to_string(&payload).unwrap_or_default();
+    let due = match projection_sweep_state().lock() {
+        Ok(mut state) => {
+            let now = Instant::now();
+            let due = state.as_ref().is_none_or(|(previous, at)| {
+                previous != &signature
+                    || now.duration_since(*at) >= PROJECTION_SWEEP_HEARTBEAT
+            });
+            if due {
+                *state = Some((signature, now));
+            }
+            due
+        }
+        Err(_) => true,
+    };
+    if due {
+        crate::perf::ytrace_emit_event(
+            component,
+            CLI_PLANE_CATEGORY,
+            "projection_sweep",
+            payload,
+        );
+    }
+}
+
 /// A row was created for an agent CLI.
 ///
 /// Answers, in one record: which descriptor resolved, how the row is keyed and
@@ -459,6 +742,52 @@ pub fn emit_launch(component: &str, kind: SessionKind, shape: CliInvocationShape
         "launch",
         launch_payload(kind, shape),
     );
+}
+
+/// One bounded identity-rebind poll for a CLI whose real transcript id is
+/// learned after row birth. Counts only: cwd and ids are already present on the
+/// birth/projection edges, while this event's job is to explain why the join
+/// did or did not move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliIdentityPollStats {
+    pub target_rows: usize,
+    pub machines_queried: usize,
+    pub query_failures: usize,
+    pub identities_seen: usize,
+    pub identities_with_birth_alias: usize,
+    pub exact_alias_candidates: usize,
+    pub cwd_candidates: usize,
+    pub rebinds: usize,
+    pub newly_exhausted: usize,
+}
+
+pub fn emit_identity_poll(
+    component: &str,
+    kind: SessionKind,
+    stats: CliIdentityPollStats,
+) {
+    crate::perf::ytrace_emit_event(
+        component,
+        CLI_PLANE_CATEGORY,
+        "identity_poll",
+        identity_poll_payload(kind, stats),
+    );
+}
+
+fn identity_poll_payload(kind: SessionKind, stats: CliIdentityPollStats) -> Value {
+    json!({
+        "slug": slug_of(kind),
+        "kind": format!("{kind:?}"),
+        "target_rows": stats.target_rows,
+        "machines_queried": stats.machines_queried,
+        "query_failures": stats.query_failures,
+        "identities_seen": stats.identities_seen,
+        "identities_with_birth_alias": stats.identities_with_birth_alias,
+        "exact_alias_candidates": stats.exact_alias_candidates,
+        "cwd_candidates": stats.cwd_candidates,
+        "rebinds": stats.rebinds,
+        "newly_exhausted": stats.newly_exhausted,
+    })
 }
 
 fn launch_payload(kind: SessionKind, shape: CliInvocationShape<'_>) -> Value {
@@ -639,6 +968,87 @@ mod tests {
         assert!(!scheme.kind_agrees);
     }
 
+    /// The user's visible failure: the title chore can report a healthy tick
+    /// while the final Codex row is still wearing its birth name. The GUI
+    /// projection plane must call that state out explicitly.
+    #[test]
+    fn a_machine_named_codex_birth_title_is_a_projection_finding() {
+        assert_eq!(
+            classify_rendered_title("New devhost Codex"),
+            CliRenderedTitleQuality::BirthPlaceholder
+        );
+        let inspection = inspect_projection(SessionKind::Codex, "New devhost Codex", "session");
+        assert!(!inspection.title_quality.is_usable());
+        assert!(inspection.icon_matches_kind);
+    }
+
+    #[test]
+    fn projection_quality_names_short_hashes_and_raw_paths_separately() {
+        assert_eq!(
+            classify_rendered_title("a8f6dbd1"),
+            CliRenderedTitleQuality::ShortHash
+        );
+        assert_eq!(
+            classify_rendered_title("/home/user/projects/example"),
+            CliRenderedTitleQuality::RawPath
+        );
+        assert_eq!(
+            classify_rendered_title("Investigate terminal heat"),
+            CliRenderedTitleQuality::Usable
+        );
+    }
+
+    /// Codex's historical `session` wire icon is intentional. The detector
+    /// compares against registry policy, not slug equality, while still
+    /// catching a row that actually projects the terminal icon.
+    #[test]
+    fn projection_icon_agreement_uses_the_registrys_legacy_mapping() {
+        assert!(
+            inspect_projection(SessionKind::Codex, "Investigate terminal heat", "session")
+                .icon_matches_kind
+        );
+        assert!(
+            !inspect_projection(SessionKind::Codex, "Investigate terminal heat", "terminal")
+                .icon_matches_kind
+        );
+    }
+
+    #[test]
+    fn projection_sweeps_name_every_registered_cli_even_at_zero() {
+        let counts = empty_projection_counts();
+        assert_eq!(counts.len(), AGENT_CLIS.len());
+        for descriptor in AGENT_CLIS {
+            assert!(
+                counts.contains_key(descriptor.slug),
+                "{} disappeared from the projection plane",
+                descriptor.slug
+            );
+        }
+    }
+
+    #[test]
+    fn identity_poll_distinguishes_alias_failure_from_cwd_failure() {
+        let payload = identity_poll_payload(
+            SessionKind::Codex,
+            CliIdentityPollStats {
+                target_rows: 2,
+                machines_queried: 1,
+                query_failures: 0,
+                identities_seen: 3,
+                identities_with_birth_alias: 0,
+                exact_alias_candidates: 0,
+                cwd_candidates: 0,
+                rebinds: 0,
+                newly_exhausted: 2,
+            },
+        );
+        assert_eq!(payload["slug"], serde_json::json!("codex"));
+        assert_eq!(payload["identities_seen"], serde_json::json!(3));
+        assert_eq!(payload["exact_alias_candidates"], serde_json::json!(0));
+        assert_eq!(payload["cwd_candidates"], serde_json::json!(0));
+        assert_eq!(payload["newly_exhausted"], serde_json::json!(2));
+    }
+
     /// The registry decides `id_origin`, so a CLI added tomorrow reports the
     /// truth without touching this module.
     #[test]
@@ -736,7 +1146,8 @@ mod tests {
     /// continuously forever. With every row's outcome unchanged — the normal
     /// case, since a title is picked up once and then stays — an edge-triggered
     /// chore emits nothing per row, and the whole recurring cost of this module
-    /// is one heartbeat sweep per chore.
+    /// is one heartbeat sweep per title chore plus the slower final-projection
+    /// heartbeat.
     #[test]
     fn the_cli_plane_states_its_share_of_the_trace_byte_budget() {
         let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -749,8 +1160,33 @@ mod tests {
         let sweep_bytes = serde_json::to_string(&sweep).expect("payload serialises").len()
             + LINE_ENVELOPE_BYTES;
 
-        let sweeps_per_hour = 2 * (3600 / SWEEP_HEARTBEAT.as_secs() as usize);
-        let steady_bytes_per_hour = sweeps_per_hour * sweep_bytes;
+        let title_sweeps_per_hour = 2 * (3600 / SWEEP_HEARTBEAT.as_secs() as usize);
+        let mut projection_counts = empty_projection_counts();
+        for counts in projection_counts.values_mut() {
+            *counts = ProjectionSlugCounts {
+                projected_rows: 7,
+                unique_sessions: 5,
+                usable_titles: 2,
+                empty_titles: 1,
+                birth_placeholders: 1,
+                short_hash_titles: 1,
+                raw_path_titles: 1,
+                generic_placeholders: 1,
+                low_signal_titles: 0,
+                icon_mismatches: 1,
+                authoritative_kind_rows: 4,
+                inferred_kind_rows: 3,
+            };
+        }
+        let projection_sweep = projection_sweep_payload(70, 50, &projection_counts);
+        let projection_sweep_bytes = serde_json::to_string(&projection_sweep)
+            .expect("projection payload serialises")
+            .len()
+            + LINE_ENVELOPE_BYTES;
+        let projection_sweeps_per_hour =
+            3600 / PROJECTION_SWEEP_HEARTBEAT.as_secs() as usize;
+        let steady_bytes_per_hour = title_sweeps_per_hour * sweep_bytes
+            + projection_sweeps_per_hour * projection_sweep_bytes;
 
         // The measured plane, over the window this was calibrated against.
         const PLANE_KIB_PER_MIN: usize = 87;
@@ -792,7 +1228,26 @@ mod tests {
             SessionKind::ClaudeCode,
         )
         .expect("an agent row is on this plane");
-        for (name, payload) in [("birth", &birth), ("launch", &launch), ("restore", &restore)] {
+        let identity_poll = identity_poll_payload(
+            SessionKind::Codex,
+            CliIdentityPollStats {
+                target_rows: 7,
+                machines_queried: 2,
+                query_failures: 1,
+                identities_seen: 9,
+                identities_with_birth_alias: 5,
+                exact_alias_candidates: 4,
+                cwd_candidates: 3,
+                rebinds: 4,
+                newly_exhausted: 1,
+            },
+        );
+        for (name, payload) in [
+            ("birth", &birth),
+            ("launch", &launch),
+            ("restore", &restore),
+            ("identity_poll", &identity_poll),
+        ] {
             let bytes =
                 serde_json::to_string(payload).expect("payload serialises").len() + LINE_ENVELOPE_BYTES;
             assert!(

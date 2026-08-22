@@ -9970,7 +9970,12 @@ mod web_surface_reclaim_locks {
             .iter()
             .position(|line| line.trim() == "fn web_surface_tick_settled(")
             .expect("the tick-end helper is gone — move this lock with it");
-        let body = code_lines(&product[settled..settled + 12]);
+        let settled_end = product[settled..]
+            .iter()
+            .position(|line| line.trim() == "fn publish_web_surface_native_ids(")
+            .map(|offset| settled + offset)
+            .expect("the tick-end helper's publication owner moved — move this lock with it");
+        let body = code_lines(&product[settled..settled_end]);
         let sweep = body
             .iter()
             .position(|line| *line == "desktop.prune_web_surface_contexts();")
@@ -10169,12 +10174,43 @@ mod web_surface_reclaim_locks {
         assert!(rows[4].split_pinned);
 
         let counts = web_surface_applied_counts(&handles, 1);
-        let payload = web_surface_tab_report_json(&rows, counts);
+        let runtime_by_native_id = HashMap::from([
+            (
+                800,
+                dioxus::desktop::SurfaceLiveness {
+                    present: true,
+                    engine_hidden: false,
+                    widget_visible: true,
+                    mapped: true,
+                    web_process_responsive: true,
+                },
+            ),
+            (
+                801,
+                dioxus::desktop::SurfaceLiveness {
+                    present: true,
+                    engine_hidden: true,
+                    widget_visible: false,
+                    mapped: false,
+                    web_process_responsive: true,
+                },
+            ),
+        ]);
+        let payload = web_surface_tab_report_json(&rows, counts, &runtime_by_native_id);
         assert_eq!(payload["tabs"], json!(5));
         assert_eq!(payload["views"], json!(2));
         assert_eq!(payload["tabs_without_webview"], json!(3));
         assert_eq!(payload["contexts"], json!(1));
         assert_eq!(payload["view_sessions"], json!(1));
+        assert_eq!(payload["engines_hidden"], json!(1));
+        assert_eq!(payload["engine_widgets_visible"], json!(1));
+        assert_eq!(payload["engine_visibility_mismatches"], json!(0));
+        assert_eq!(payload["widget_visibility_mismatches"], json!(0));
+        assert_eq!(payload["rows"][1]["engine_hidden"], json!(true));
+        assert_eq!(
+            payload["rows"][1]["engine_visibility_matches_applied"],
+            json!(true)
+        );
         assert_eq!(payload["rows"][2]["webview"], json!(false));
         assert_eq!(payload["rows"][2]["state"], json!("no_webview"));
         let rss = payload["per_tab_rss"]
@@ -11400,6 +11436,50 @@ struct WebSurfaceAppliedCounts {
     contexts: usize,
 }
 
+/// Runtime facts read back from the WebKit host after reconciliation.
+///
+/// These are deliberately separate from [`WebSurfaceAppliedCounts`]. The
+/// latter is the reconciler's intended/applied registry; this one is the GTK
+/// observer. Keeping both in the same sample is what exposes a hide request
+/// that did not become a hidden widget instead of documenting the request as
+/// if it were engine truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WebSurfaceRuntimeCounts {
+    present: usize,
+    missing: usize,
+    engine_hidden: usize,
+    widget_visible: usize,
+    mapped: usize,
+    web_process_responsive: usize,
+    engine_visibility_mismatches: usize,
+    widget_visibility_mismatches: usize,
+    visible_unmapped: usize,
+}
+
+fn web_surface_runtime_counts<I>(facts: I) -> WebSurfaceRuntimeCounts
+where
+    I: IntoIterator<Item = (bool, dioxus::desktop::SurfaceLiveness)>,
+{
+    let mut counts = WebSurfaceRuntimeCounts::default();
+    for (applied_visible, liveness) in facts {
+        if !liveness.present {
+            counts.missing += 1;
+            continue;
+        }
+        counts.present += 1;
+        counts.engine_hidden += usize::from(liveness.engine_hidden);
+        counts.widget_visible += usize::from(liveness.widget_visible);
+        counts.mapped += usize::from(liveness.mapped);
+        counts.web_process_responsive += usize::from(liveness.web_process_responsive);
+        counts.engine_visibility_mismatches +=
+            usize::from(applied_visible != !liveness.engine_hidden);
+        counts.widget_visibility_mismatches +=
+            usize::from(applied_visible != liveness.widget_visible);
+        counts.visible_unmapped += usize::from(applied_visible && !liveness.mapped);
+    }
+    counts
+}
+
 fn web_surface_applied_counts(
     handles: &HashMap<(String, u64), WebSurfaceHandle>,
     contexts: usize,
@@ -11422,6 +11502,13 @@ fn web_surface_applied_counts(
 static WEB_SURFACE_CONTEXT_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Runtime WebKit facts published by the GTK-main-thread reconciler for the
+/// off-thread render probe. A mutex is intentional: these fields describe one
+/// observation and must not be torn across reconcile ticks.
+static WEB_SURFACE_RUNTIME_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<WebSurfaceRuntimeCounts>,
+> = std::sync::OnceLock::new();
+
 /// Counts from the reconciler's own publication — never recomputed from
 /// `ShellState`, which does not know what was actually realized.
 fn published_web_surface_counts() -> WebSurfaceAppliedCounts {
@@ -11430,6 +11517,13 @@ fn published_web_surface_counts() -> WebSurfaceAppliedCounts {
         .get()
         .and_then(|registry| registry.lock().ok())
         .map(|handles| web_surface_applied_counts(&handles, contexts))
+        .unwrap_or_default()
+}
+
+fn published_web_surface_runtime_counts() -> WebSurfaceRuntimeCounts {
+    WEB_SURFACE_RUNTIME_COUNTS
+        .get()
+        .and_then(|counts| counts.lock().ok().map(|counts| *counts))
         .unwrap_or_default()
 }
 
@@ -11560,7 +11654,13 @@ const WEB_SURFACE_PER_TAB_RSS_NOTE: &str =
 fn web_surface_tab_report_json(
     rows: &[WebSurfaceTabReportRow],
     counts: WebSurfaceAppliedCounts,
+    runtime_by_native_id: &HashMap<u64, dioxus::desktop::SurfaceLiveness>,
 ) -> Value {
+    let runtime_counts = web_surface_runtime_counts(rows.iter().filter_map(|row| {
+        let native_id = row.native_id?;
+        let liveness = *runtime_by_native_id.get(&native_id)?;
+        Some((row.state == WebSurfaceTabState::Visible, liveness))
+    }));
     json!({
         "tabs": rows.len(),
         "views": counts.total,
@@ -11568,6 +11668,15 @@ fn web_surface_tab_report_json(
         "views_stashed": counts.stashed,
         "view_sessions": counts.sessions,
         "contexts": counts.contexts,
+        "engines_present": runtime_counts.present,
+        "engines_missing": runtime_counts.missing,
+        "engines_hidden": runtime_counts.engine_hidden,
+        "engine_widgets_visible": runtime_counts.widget_visible,
+        "engine_widgets_mapped": runtime_counts.mapped,
+        "web_processes_responsive": runtime_counts.web_process_responsive,
+        "engine_visibility_mismatches": runtime_counts.engine_visibility_mismatches,
+        "widget_visibility_mismatches": runtime_counts.widget_visibility_mismatches,
+        "visible_unmapped": runtime_counts.visible_unmapped,
         // The number the lane is judged on: tabs the user has, minus webviews
         // they are paying for.
         "tabs_without_webview": rows
@@ -11577,7 +11686,12 @@ fn web_surface_tab_report_json(
         "per_tab_rss": WEB_SURFACE_PER_TAB_RSS_NOTE,
         "rows": rows
             .iter()
-            .map(|row| json!({
+            .map(|row| {
+                let runtime = row
+                    .native_id
+                    .and_then(|native_id| runtime_by_native_id.get(&native_id));
+                let applied_visible = row.state == WebSurfaceTabState::Visible;
+                json!({
                 "session_path": row.session_path,
                 "tab_id": row.tab_id,
                 "state": row.state.label(),
@@ -11590,7 +11704,18 @@ fn web_surface_tab_report_json(
                 "active_tab": row.active_tab,
                 "split_pinned": row.split_pinned,
                 "leased": row.leased,
-            }))
+                "engine_present": runtime.map(|runtime| runtime.present),
+                "engine_hidden": runtime.map(|runtime| runtime.engine_hidden),
+                "engine_widget_visible": runtime.map(|runtime| runtime.widget_visible),
+                "engine_widget_mapped": runtime.map(|runtime| runtime.mapped),
+                "web_process_responsive": runtime.map(|runtime| runtime.web_process_responsive),
+                "engine_visibility_matches_applied": runtime.map(|runtime| {
+                    runtime.present
+                        && applied_visible == !runtime.engine_hidden
+                        && applied_visible == runtime.widget_visible
+                        && (!applied_visible || runtime.mapped)
+                }),
+            })})
             .collect::<Vec<_>>(),
     })
 }
@@ -11615,7 +11740,11 @@ fn web_surface_tabs_desired(shell: &ShellState, now_ms: u64) -> Vec<WebSurfaceTa
 
 /// The per-tab listing as app-control sees it (`server app state` →
 /// `web_surface_tabs`).
-fn describe_web_surface_tabs(shell: &ShellState, now_ms: u64) -> Value {
+fn describe_web_surface_tabs(
+    shell: &ShellState,
+    desktop: &dioxus::desktop::DesktopContext,
+    now_ms: u64,
+) -> Value {
     let desired = web_surface_tabs_desired(shell, now_ms);
     let contexts = WEB_SURFACE_CONTEXT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     // Copy the registry out and RELEASE its lock before building the report:
@@ -11629,7 +11758,16 @@ fn describe_web_surface_tabs(shell: &ShellState, now_ms: u64) -> Value {
         .unwrap_or_default();
     let rows = web_surface_tab_report(now_ms, &desired, &handles);
     let counts = web_surface_applied_counts(&handles, contexts);
-    web_surface_tab_report_json(&rows, counts)
+    let runtime_by_native_id = handles
+        .values()
+        .map(|handle| {
+            (
+                handle.native_id,
+                desktop.web_surface_liveness(handle.native_id),
+            )
+        })
+        .collect();
+    web_surface_tab_report_json(&rows, counts, &runtime_by_native_id)
 }
 /// Monotonic, process-wide, never reused. Global rather than per-(session,tab)
 /// so a generation identifies an incarnation on its own — a stale handle can
@@ -11695,6 +11833,18 @@ fn web_surface_tick_settled(
     applied: &HashMap<(String, u64), AppliedWebSurface>,
 ) {
     desktop.prune_web_surface_contexts();
+    let runtime_counts = web_surface_runtime_counts(applied.values().map(|entry| {
+        (
+            entry.visible,
+            desktop.web_surface_liveness(entry.native_id),
+        )
+    }));
+    if let Ok(mut published) = WEB_SURFACE_RUNTIME_COUNTS
+        .get_or_init(Default::default)
+        .lock()
+    {
+        *published = runtime_counts;
+    }
     publish_web_surface_native_ids(applied, desktop.web_surface_context_count());
 }
 
@@ -36447,6 +36597,7 @@ fn render_probe_shell_context(shell: &ShellState) -> RenderProbeShellContext {
 fn render_probe_context(
     shell: &RenderProbeShellContext,
     surfaces: WebSurfaceAppliedCounts,
+    runtime: WebSurfaceRuntimeCounts,
 ) -> Value {
     json!({
         "web_surfaces": shell.web_surface_sessions,
@@ -36457,6 +36608,15 @@ fn render_probe_context(
         "web_surface_views_stashed": surfaces.stashed,
         "web_surface_view_sessions": surfaces.sessions,
         "web_surface_contexts": surfaces.contexts,
+        "web_surface_engines_present": runtime.present,
+        "web_surface_engines_missing": runtime.missing,
+        "web_surface_engines_hidden": runtime.engine_hidden,
+        "web_surface_engine_widgets_visible": runtime.widget_visible,
+        "web_surface_engine_widgets_mapped": runtime.mapped,
+        "web_surface_web_processes_responsive": runtime.web_process_responsive,
+        "web_surface_engine_visibility_mismatches": runtime.engine_visibility_mismatches,
+        "web_surface_widget_visibility_mismatches": runtime.widget_visibility_mismatches,
+        "web_surface_visible_unmapped": runtime.visible_unmapped,
         "window_focused": shell.window_focused,
         "force_foreground": shell.force_foreground,
         "app_control_backgrounded": shell.app_control_backgrounded,
@@ -36503,6 +36663,7 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             // own lock, and nesting it under the signal read is how a deadlock
             // gets built by accident.
             let surfaces = published_web_surface_counts();
+            let runtime = published_web_surface_runtime_counts();
             // Cheap atomic; the profiling toggle can flip at runtime and an off
             // profiler should cost nothing at all.
             if !yggterm_core::perf_profiling_enabled() {
@@ -36530,7 +36691,7 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             yggterm_core::render_probe::emit_render_role_events(
                 &perf_home,
                 &rollups,
-                &render_probe_context(&shell_context, surfaces),
+                &render_probe_context(&shell_context, surfaces, runtime),
             );
         }
     });
@@ -56704,9 +56865,23 @@ fn live_session_drop_target(
 }
 
 fn live_sidebar_session_paths(rows: &[BrowserRow]) -> HashSet<String> {
-    let mut paths = HashSet::new();
+    live_sidebar_session_row_indices(rows)
+        .into_iter()
+        .filter_map(|index| rows.get(index))
+        .map(|row| normalize_live_session_path(&row.full_path))
+        .collect()
+}
+
+/// Which concrete row occurrences sit inside the Live Sessions region.
+///
+/// A path set cannot answer this: an active agent legitimately has the same
+/// `full_path` in the live rail and its cwd folder. Using identity as location
+/// labelled both occurrences `live_rail`, producing per-view duplicates in the
+/// diagnostic plane even though the product tree was correctly dual-present.
+fn live_sidebar_session_row_indices(rows: &[BrowserRow]) -> HashSet<usize> {
+    let mut indices = HashSet::new();
     let mut in_live_group = false;
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         if row.full_path == "__live_sessions__" {
             in_live_group = true;
             continue;
@@ -56715,10 +56890,27 @@ fn live_sidebar_session_paths(rows: &[BrowserRow]) -> HashSet<String> {
             break;
         }
         if in_live_group && row.kind == BrowserRowKind::Session {
-            paths.insert(normalize_live_session_path(&row.full_path));
+            indices.insert(index);
         }
     }
-    paths
+    indices
+}
+
+fn sidebar_row_presence(
+    index: usize,
+    row: &BrowserRow,
+    live_rail_row_indices: &HashSet<usize>,
+    live_paths: &HashSet<String>,
+) -> &'static str {
+    if live_rail_row_indices.contains(&index) {
+        "live_rail"
+    } else if live_paths.contains(&row.full_path)
+        || live_paths.contains(&normalize_live_session_path(&row.full_path))
+    {
+        "cwd_tree"
+    } else {
+        "row"
+    }
 }
 
 fn live_session_reordered_paths_for_drop(
@@ -59013,7 +59205,7 @@ fn describe_app_state_snapshot(
         // than guessed. Carries its own honesty note about per-tab RSS — WebKit
         // pools web processes per WebContext, so bytes are not attributable to a
         // tab and this listing does not invent them.
-        "web_surface_tabs": describe_web_surface_tabs(&shell, notification_now_ms),
+        "web_surface_tabs": describe_web_surface_tabs(&shell, desktop, notification_now_ms),
         "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
         "active_session_terminal_foreground_active": snapshot.active_session.as_ref().and_then(|session| session.terminal_foreground_active),
         "active_title": snapshot.active_title.clone(),
@@ -59907,7 +60099,63 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     snapshot.rows = app_control_rows_with_every_set_open(&shell);
     // The Live Sessions rail's own rows, so a row can say which of its two
     // legitimate presences it is.
-    let live_rail_paths = live_sidebar_session_paths(&snapshot.rows);
+    let live_rail_row_indices = live_sidebar_session_row_indices(&snapshot.rows);
+    let live_paths = snapshot
+        .live_sessions
+        .iter()
+        .flat_map(|session| {
+            [
+                session.session_path.clone(),
+                normalize_live_session_path(&session.session_path),
+            ]
+        })
+        .collect::<HashSet<_>>();
+    // The existing CLI plane ends at the title chores. Inspect the FINAL row
+    // projection too: a chore can be healthy while the sidebar still renders a
+    // birth placeholder or an icon for a different kind. `server app rows` is
+    // already an explicit diagnostic read, so this bounded edge/sweep emission
+    // adds no render-loop work.
+    let cli_projections = snapshot
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let kind = row_session_kind(row)?;
+            if !kind.is_agent() {
+                return None;
+            }
+            let live_member = live_paths.contains(&row.full_path)
+                || live_paths.contains(&normalize_live_session_path(&row.full_path));
+            let presence = sidebar_row_presence(index, row, &live_rail_row_indices, &live_paths);
+            let icon_kind = {
+                let base = tree_icon_kind(row);
+                if base == "terminal"
+                    && snapshot.live_sessions.iter().any(|session| {
+                        session.session_path == row.full_path
+                            && session.kind == SessionKind::ClaudeCode
+                    })
+                {
+                    "claude-code"
+                } else {
+                    base
+                }
+            };
+            Some(yggterm_core::cli_plane::CliProjectionObservation {
+                session_path: &row.full_path,
+                kind,
+                rendered_title: row.session_title.as_deref().unwrap_or(&row.label),
+                icon_kind,
+                kind_source: if row.session_kind.is_some() {
+                    "authoritative"
+                } else {
+                    "inferred"
+                },
+                presence,
+                live_member,
+            })
+        })
+        .collect::<Vec<_>>();
+    yggterm_core::cli_plane::emit_projection_snapshot("shell", &cli_projections);
     // **"THIS ROW IS GONE" MADE VISIBLE.** The tombstone plane is the one
     // record that the user CLOSED a row, and until now it could only be
     // consulted from inside the daemon. Everything that rebuilds a set of rows
@@ -59934,7 +60182,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
         .unwrap_or_default();
     json!({
         "row_count": snapshot.rows.len(),
-        "rows": snapshot.rows.iter().map(|row| {
+        "rows": snapshot.rows.iter().enumerate().map(|(index, row)| {
             let machine = remote_machine_for_sidebar_row(&shell, row);
             let busy_state = sidebar_row_busy_state(&snapshot, row);
             let busy = busy_state.visible;
@@ -59944,17 +60192,30 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
             // in the other direction. Separate question, separate field.
             let input_unanswered_ms = sidebar_row_session_for_icon(&snapshot, row)
                 .and_then(|session| session.input_unanswered_ms);
-            let live_member = snapshot.live_sessions.iter().any(|session| {
-                normalize_live_session_path(&session.session_path)
-                    == normalize_live_session_path(&row.full_path)
-                    || session.session_path == row.full_path
-            });
+            let live_member = live_paths.contains(&row.full_path)
+                || live_paths.contains(&normalize_live_session_path(&row.full_path));
             let live_keep_alive = snapshot.live_sessions.iter().any(|session| {
                 live_session_keep_alive(session)
                     && (normalize_live_session_path(&session.session_path)
                         == normalize_live_session_path(&row.full_path)
                         || session.session_path == row.full_path)
             });
+            let icon_kind = {
+                let base = tree_icon_kind(row);
+                if base == "terminal" && snapshot.live_sessions.iter().any(|s| s.session_path == row.full_path && s.kind == SessionKind::ClaudeCode) {
+                    "claude-code"
+                } else {
+                    base
+                }
+            };
+            let session_kind = row_session_kind(row);
+            let cli_projection = session_kind
+                .filter(|kind| kind.is_agent())
+                .map(|kind| yggterm_core::cli_plane::inspect_projection(
+                    kind,
+                    row.session_title.as_deref().unwrap_or(&row.label),
+                    icon_kind,
+                ));
             json!({
                 "path": row.full_path,
                 "full_path": row.full_path,
@@ -59982,13 +60243,12 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 // duplicated row, and at least one concluded the answer could
                 // not be trusted in either direction. The instrument states its
                 // subject rather than leaving the caller to infer it.
-                "presence": if live_rail_paths.contains(&row.full_path) {
-                    "live_rail"
-                } else if live_member {
-                    "cwd_tree"
-                } else {
-                    "row"
-                },
+                "presence": sidebar_row_presence(
+                    index,
+                    row,
+                    &live_rail_row_indices,
+                    &live_paths,
+                ),
                 "selected": shell.selected_tree_paths.contains(&row.full_path),
                 "session_id": row.session_id,
                 "session_cwd": row.session_cwd,
@@ -60015,14 +60275,15 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "wedge_suspected": yggterm_core::input_unanswered_suggests_wedge(
                     input_unanswered_ms,
                 ),
-                "icon_kind": ({
-                    let base = tree_icon_kind(row);
-                    if base == "terminal" && snapshot.live_sessions.iter().any(|s| s.session_path == row.full_path && s.kind == SessionKind::ClaudeCode) {
-                        Some("claude-code")
-                    } else {
-                        Some(base)
-                    }
-                }),
+                // Final CLI projection truth, after live-title enrichment. The
+                // title itself already appears above; these classifications let
+                // an audit find every broken CLI without parsing private text.
+                "session_kind": session_kind.map(yggterm_core::agent_cli::session_kind_label),
+                "session_kind_source": session_kind.map(|_| if row.session_kind.is_some() { "authoritative" } else { "inferred" }),
+                "title_quality": cli_projection.map(|projection| projection.title_quality.label()),
+                "expected_icon_kind": cli_projection.map(|projection| projection.expected_icon_kind),
+                "icon_matches_session_kind": cli_projection.map(|projection| projection.icon_matches_kind),
+                "icon_kind": icon_kind,
                 "icon_text": tree_icon_glyph(row),
                 "live_member": live_member,
                 "live_keep_alive": live_keep_alive,
@@ -75654,6 +75915,8 @@ async fn web_surface_liveness_probe(
             "tabs": tabs,
             "handle": false,
             "present": false,
+            "engine_hidden": false,
+            "engine_widget_visible": false,
             "mapped": false,
             "web_process_responsive": false,
             "eval_ok": false,
@@ -75676,6 +75939,8 @@ async fn web_surface_liveness_probe(
         "handle": true,
         "generation": handle.generation,
         "present": liveness.present,
+        "engine_hidden": liveness.engine_hidden,
+        "engine_widget_visible": liveness.widget_visible,
         "mapped": liveness.mapped,
         "web_process_responsive": liveness.web_process_responsive,
         "eval_ok": eval_ok,
@@ -78933,10 +79198,35 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             if (!atlas) { return { index: -1, pages: null }; }
                             let index = atlases.indexOf(atlas);
                             if (index < 0) { atlases.push(atlas); index = atlases.length - 1; }
+                            // ⛔ A CLEAR COUNTER COUNTS CALLS, NOT CLEARS.
+                            // `forced_atlas_clear_count` is incremented by OUR
+                            // funnel the moment it calls the addon; the addon's
+                            // own `clearTexture()` opens with
+                            //   if (0 !== pages[0].currentRow.x || 0 !== ...y)
+                            // and does NOTHING when the first page is still at
+                            // its origin. So a run can report N atlas clears and
+                            // have wiped nothing at all -- and an experiment
+                            // built on it would "refute" a cause it never
+                            // applied, which is the same failure shape as a
+                            // harness reporting clean results it never rendered.
+                            // `page0_row_x/y` is the fill cursor the guard reads,
+                            // and it is the honest witness: a page that is only
+                            // being filled can never go DOWN, so a backwards move
+                            // is a clear reporting itself. ⚠ `page0_version` is
+                            // NOT a clear counter -- `Page.clear()` bumps it, but
+                            // so does every glyph rasterised into the page, and
+                            // one run moved it 1,088 -> 8,573 across nine clears.
+                            // It says the page is live, not that it was wiped.
+                            const page0 = (atlas._pages || [])[0] || null;
                             return {
                                 index,
                                 pages: (atlas._pages || []).length,
                                 active_pages: (atlas._activePages || []).length,
+                                page0_row_x: page0 && page0.currentRow
+                                    ? Number(page0.currentRow.x || 0) : -1,
+                                page0_row_y: page0 && page0.currentRow
+                                    ? Number(page0.currentRow.y || 0) : -1,
+                                page0_version: page0 ? Number(page0.version || 0) : -1,
                             };
                         } catch (_e) { return { index: -1, pages: null }; }
                     };
@@ -78951,6 +79241,9 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             atlas_index: atlas.index,
                             atlas_pages: atlas.pages,
                             atlas_active_pages: atlas.active_pages,
+                            atlas_page0_row_x: atlas.page0_row_x,
+                            atlas_page0_row_y: atlas.page0_row_y,
+                            atlas_page0_version: atlas.page0_version,
                             mounted_at: Number(e.mountedAt || 0),
                             // The repair funnel's own counters. A forced refresh
                             // that never fired and one that fired and did not help
@@ -78999,6 +79292,31 @@ const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
                             // COULD have run for this host.
                             recent_frame_like_write_until_ms:
                                 Number(e.recentFrameLikeWriteUntilMs || 0),
+                            // Is a repair still OWED to this host? A refusal count
+                            // cannot answer it: a demand refused and still standing
+                            // and one refused and lost look identical in the
+                            // counters and mean opposite things about the repair
+                            // path.
+                            pending_full_refresh_demand:
+                                Boolean(e.pendingVisiblePaintForceFullRefresh),
+                            pending_full_refresh_since_ms:
+                                Number(e.pendingVisiblePaintForceFullRefreshSinceMs || 0),
+                            // How many times the demand watchdog had to rescue a
+                            // stranded repair. Non-zero means the recovery timer
+                            // was lost and the deadline was never evaluated -- the
+                            // fault this counter exists to make visible.
+                            visible_paint_demand_rescue_count:
+                                Number(e.visiblePaintDemandRescueCount || 0),
+                            pending_recovery: Boolean(e.pendingVisiblePaintRecovery),
+                            pending_recovery_until_ms:
+                                Number(e.pendingVisiblePaintRecoveryUntilMs || 0),
+                            // The gate with no deadline. `frame_like` and
+                            // `rate_limited` are both bypassed once a demand is
+                            // overdue; `input_hot` is a hard AND with no escape,
+                            // so while this is in the future the repair cannot run
+                            // however old the demand is.
+                            terminal_input_hot_until_ms:
+                                Number(e.terminalInputHotUntilMs || 0),
                         });
                     }
                     const indices = hosts.map((h) => h.atlas_index).filter((i) => i >= 0);
