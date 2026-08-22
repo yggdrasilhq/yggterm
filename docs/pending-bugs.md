@@ -22465,7 +22465,9 @@ time out.
 
 ## ★★★ AN UNREVEALED AGENT SURFACE REPORTS visibilityState: "visible", SO
 
-**Status:** OPEN — controlled A/B complete; live-host mismatch readback still owed
+**Status:** OPEN
+
+Controlled A/B is complete; live-host mismatch readback is still owed.
 
 **★★★ AN UNREVEALED AGENT SURFACE REPORTS `visibilityState: "visible"`, SO
 ITS PAGE ANIMATES AT FULL RATE AND THE GUI COMPOSITES IT — measured
