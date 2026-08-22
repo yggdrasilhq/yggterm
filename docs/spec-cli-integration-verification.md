@@ -72,6 +72,32 @@ Same shape, same files, title-specific rank:
 * Checker: `scripts/check-titles.py` — per-host `find` as above, plus for each `session_id` query `~/.yggterm/session-titles.db` (`SELECT title FROM session_titles WHERE session_id=?`) to get generated copy, then compare `effective_title` = store title else generated. ⚠ **Corrected 2026-08-20:** this used to say *for Muse expect store `None`* — it is not. That CLI's `session-index.db` has a `title` column and it holds the **first prompt, verbatim, never updated**, so the oracle must expect a store value there and expect it to be a CLAMPED label (`AgentCliDescriptor::store_entry`, first sentence then a 72-char word-boundary cut) rather than the paragraph on disk. For antigravity expect store present.
 * Fleet truth: titles are the row the GUI *paints*; the checker proves the GUI's `effective_title` vs raw stores.
 
+**Final-projection addendum (2026-08-22).** `server titles ls` proves the
+per-host durable scan; it does not prove that a live remote wrapper is keyed to
+the durable row or that the GUI used the answer. `server app rows` is the last
+witness and must expose, for every agent row, `session_kind`,
+`session_kind_source`, `title_quality`, `icon_kind`, `expected_icon_kind`, and
+`icon_matches_session_kind`. The same classification is emitted on the
+`category:"cli"` plane as edge-triggered `projection` findings/recoveries plus
+an all-registry `projection_sweep`. A green title verification therefore means:
+
+1. the host's `titles ls` agrees with its raw store oracle;
+2. every live wrapper id joins a durable id on the host that owns the CLI; and
+3. the final projection is `title_quality:"usable"` with the registry's icon.
+
+The two required presences of one active session share a path. The witness must
+derive `presence` from the row's actual position, never from a set of live
+paths; otherwise both copies report `live_rail` and manufacture a per-view
+duplicate. Acceptance therefore also requires at most one `(full_path,
+presence)` row while permitting one rail plus one cwd-tree row.
+
+For a CLI that mints its id after birth, cwd is not an identity oracle. A resume
+may be re-rooted into a worktree while the transcript retains its original cwd.
+The owning daemon's birth-id → real-id relation is authoritative; remote Codex
+exports it as `birth_session_id`, and `cli/identity_poll` reports exact-alias
+candidates separately from cwd candidates. `identities_seen > 0` with both
+candidate counts at zero is a failed join, not an empty store.
+
 * Sweep verb: `server titles sweep [--dry-run] [--limit N] [--prune] [--kind <slug>] [--json]` — the ACT half of the same answer. It classifies every durable row with the SAME recognizer `ls` reports through (`looks_like_generated_fallback_title`), resolves the bad ones store-first then by generation, stops the moment the endpoint refuses (a report that kept going would blame the sessions for the endpoint), and with `--prune` forgets copy for sessions that exist nowhere — never younger than 7 days, never while the daemon is unreachable, because a live row's copy is keyed by its runtime id and would otherwise read as an orphan.
 
 **Acceptance:** `check-titles.py` `0` on every fleet host with no `verb has X ids not in manual` and no `title mismatch` where both present.
@@ -105,7 +131,9 @@ No CLI-derived UI change (startpage, titles, resume, cwd tree) ships without:
 
 1. `server <area> ls --json` green on the host, and
 2. `scripts/check-<area>.py --verbose` `0` on that host, and
-3. `cargo test -p yggterm-core -p yggterm-server --lib` + `cargo test -p yggterm-shell --lib -- start_page` green.
+3. `server app rows` has no non-usable agent projection and no icon mismatch,
+   and
+4. `cargo test -p yggterm-core -p yggterm-server --lib` + `cargo test -p yggterm-shell --lib -- start_page` green.
 
 The verb+checker pair is the harness `docs/integration-testing.md` Phase A asks for, but below the full GUI — deterministic, no network, no timing luck.
 
