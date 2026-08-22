@@ -434,9 +434,10 @@ given and relays the id that was clicked, and it knows what none of them mean.
 Adding an entry is a row in `WEB_PAGE_MENU_ITEMS` plus an arm at
 `dispatch_web_page_menu`; nothing in `web_surface.rs` changes.
 
-Four entries, which are the ychrome engine's four `/engine/shot` regions in the
-same words — a human clicking "full page" and an agent sending `region=full`
-must get the same picture:
+Four entries, using the ychrome engine's four `/engine/shot` region names. The
+shared vocabulary does not mean the detached engine owns these captures: the
+GUI host owns the visible page, and a human clicking "full page" and an agent
+sending `server app web screenshot` must get the same picture:
 
 - **Screenshot visible area** — `SnapshotRegion::Visible`
 - **Screenshot full page** — `SnapshotRegion::FullDocument`
@@ -452,14 +453,33 @@ every step, repeats every `position: fixed` header once per tile, and leaves
 the page scrolled where the user did not put it. The element and area crops are
 cut from the pixels that one snapshot produced, never a second one.
 
+`FULL_DOCUMENT` can only paint the document the page has actually laid out.
+Before a full-page capture, the shell therefore walks the authoritative scroll
+owner one viewport at a time with a 120 ms settle (capped at 60 steps) so lazy
+content receives real event-loop turns. If the root document is only one
+viewport tall but a large inner `overflow-y` scrollport holds substantially
+more content, that dominant scrollport is the owner: it is hydrated, expanded
+into ordinary document flow for the one native snapshot, and then its inline
+styles and both root/inner scroll positions are restored. The human menu and
+`server app web screenshot` call the same preparation and restoration path.
+
+This does **not** define a composite of several independent inner scrollports,
+does not chase an infinite feed past the 60-step cap, and cannot expand a
+cross-origin iframe's private document from the top page. Those are adjacent
+capture products, not claims made by "Screenshot full page".
+
 ⚠ **The CSS→device scale is measured, not assumed** — the caller hands in the
 CSS width its rect was measured against and the scale is the snapshot's real
 width divided by it. A crop computed from the wrong ratio produces a plausible
 image of the wrong part of the page, which looking at the image cannot reveal.
 
-Captures land in `~/.yggterm/screenshots/`, the same directory the agent
-control plane writes `server app screenshot` to, and the toast names the size
-and the path.
+Human-menu captures land in `~/.yggterm/screenshots/`, the same directory the
+agent control plane writes captures to. After the PNG is written, the shell
+reads those exact bytes and publishes the image through the retained native
+system-clipboard owner. Saving and copying are independent effects: the toast
+says **Saved and Copied** only when both succeed, and says **Saved; Copy
+Failed** when the file exists but native clipboard publication failed.
+Agent-control screenshots deliberately do not replace the human's clipboard.
 
 ### What is PROVEN, and what is not (2026-08-01)
 
@@ -469,8 +489,15 @@ and the path.
 - ✅ **`snapshot_region` works on the GUI plane** — `server app web screenshot`
   now routes through it and answered `capture_faithful: true` with a real
   1076x965 PNG.
-- ✅ **All four capture regions, with faithful pixels read back**, on the
-  ychrome engine's identical implementation (`ychrome ctl shot region=…`).
+- ✅ **All four native region/crop primitives, with faithful pixels read back**,
+  on the detached ychrome engine (`ychrome ctl shot region=…`). Its explicit
+  `prescroll=true` is a detached-engine option; it is not the GUI host's
+  automatic dominant-scroll-owner policy.
+- ✅ **Regression locks cover intelligent full-page preparation/restoration and
+  independent save/copy accounting**
+  (`full_page_screenshots_prepare_the_real_scroll_extent_and_restore_it`,
+  `full_page_transaction_materializes_a_dominant_inner_scrollport_without_page_drift`,
+  `page_screenshot_save_and_clipboard_copy_are_independently_accounted`).
 - ⚠ **NOT proven end-to-end: clicking one of the four entries in the GUI.**
   A GTK popup menu is not reachable from any injection path we have — the `do`
   verb delivers GDK events to the *webview widget*, and the shadow's headless
