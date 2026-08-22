@@ -3518,7 +3518,11 @@ globalThis.scrollTo = function (x, y) { scrollX = x; scrollY = y; html.scrollLef
             r#"{harness}
 const begin = JSON.parse({begin});
 inner.attr = 'color:green';
+inner.scrollTop = 999;
+scrollY = 888;
 const materialized = JSON.parse({materialize});
+const innerAtSnapshot = inner.scrollTop;
+const rootAtSnapshot = scrollY;
 inner.scrollTop = 999;
 scrollY = 888;
 const restored = JSON.parse({restore});
@@ -3527,6 +3531,8 @@ JSON.stringify({{
   materialized_kind: materialized.target_kind,
   restored: restored.restored,
   inline_style: inner.attr,
+  inner_at_snapshot: innerAtSnapshot,
+  root_at_snapshot: rootAtSnapshot,
   inner_scroll_top: inner.scrollTop,
   root_scroll_y: scrollY,
   transaction_gone: typeof window.__yggtermFullShot === 'undefined'
@@ -3555,6 +3561,14 @@ JSON.stringify({{
             answer["inline_style"], "color:green",
             "restoration must preserve a lazy loader's inline-style change"
         );
+        assert_eq!(
+            answer["inner_at_snapshot"], 125,
+            "the native snapshot must see the inner scrollport at the user's position"
+        );
+        assert_eq!(
+            answer["root_at_snapshot"], 17,
+            "fixed content must be painted at the user's root scroll position"
+        );
         assert_eq!(answer["inner_scroll_top"], 125);
         assert_eq!(answer["root_scroll_y"], 17);
         assert_eq!(answer["transaction_gone"], true);
@@ -3582,6 +3596,37 @@ JSON.stringify({{
                 && source.contains("Screenshot Saved; Copy Failed"),
             "the toast must distinguish total success from save-only partial success"
         );
+
+        let outcome = |clipboard_error: Option<&str>, restore_error: Option<&str>| {
+            WebShotCaptureOutcome {
+                path: "/home/user/.yggterm/screenshots/page-full-1.png".to_string(),
+                width: 1000,
+                height: 2400,
+                clipboard_error: clipboard_error.map(str::to_string),
+                restore_error: restore_error.map(str::to_string),
+            }
+        };
+        let (tone, title, _) = web_shot_notification(&outcome(None, None));
+        assert!(matches!(tone, NotificationTone::Success));
+        assert_eq!(title, "Screenshot Saved and Copied");
+
+        let (tone, title, message) =
+            web_shot_notification(&outcome(Some("clipboard unavailable"), None));
+        assert!(matches!(tone, NotificationTone::Warning));
+        assert_eq!(title, "Screenshot Saved; Copy Failed");
+        assert!(message.contains("clipboard unavailable"));
+
+        let (_, title, message) =
+            web_shot_notification(&outcome(None, Some("surface navigated")));
+        assert_eq!(title, "Screenshot Saved and Copied; Page Restore Failed");
+        assert!(message.contains("surface navigated"));
+
+        let (_, title, message) = web_shot_notification(&outcome(
+            Some("clipboard unavailable"),
+            Some("surface navigated"),
+        ));
+        assert_eq!(title, "Screenshot Saved; Copy and Page Restore Failed");
+        assert!(message.contains("clipboard unavailable") && message.contains("surface navigated"));
     }
 
     /// The terminus SERVES every id the table claims.

@@ -19548,6 +19548,11 @@ fn web_shot_full_scroll_js(y: f64) -> String {
 const WEB_SHOT_FULL_MATERIALIZE_JS: &str = r#"(() => {
   const shot = window.__yggtermFullShot;
   if (!shot || !shot.active || !shot.target) return JSON.stringify({ ok: false, error: 'no full-page capture' });
+  // Lazy pixels stay loaded after the walk. Put the viewport back BEFORE the
+  // snapshot so fixed/sticky content is painted at the position the user left
+  // it, not at the bottom reached by hydration.
+  if (shot.target_kind === 'inner') shot.target.scrollTo(shot.target_x, shot.target_y);
+  window.scrollTo(shot.root_x, shot.root_y);
   if (shot.target_kind !== 'inner') {
     return JSON.stringify({ ok: true, target_kind: 'document', document_h: shot.root.scrollHeight || 0 });
   }
@@ -19718,6 +19723,39 @@ struct WebShotCaptureOutcome {
     restore_error: Option<String>,
 }
 
+fn web_shot_notification(
+    outcome: &WebShotCaptureOutcome,
+) -> (NotificationTone, &'static str, String) {
+    let dimensions_and_path = format!(
+        "{}x{} · {}",
+        outcome.width, outcome.height, outcome.path
+    );
+    match (&outcome.clipboard_error, &outcome.restore_error) {
+        (None, None) => (
+            NotificationTone::Success,
+            "Screenshot Saved and Copied",
+            dimensions_and_path,
+        ),
+        (Some(copy_error), None) => (
+            NotificationTone::Warning,
+            "Screenshot Saved; Copy Failed",
+            format!("{dimensions_and_path} · {copy_error}"),
+        ),
+        (None, Some(restore_error)) => (
+            NotificationTone::Warning,
+            "Screenshot Saved and Copied; Page Restore Failed",
+            format!("{dimensions_and_path} · {restore_error}"),
+        ),
+        (Some(copy_error), Some(restore_error)) => (
+            NotificationTone::Warning,
+            "Screenshot Saved; Copy and Page Restore Failed",
+            format!(
+                "{dimensions_and_path} · copy: {copy_error} · restore: {restore_error}"
+            ),
+        ),
+    }
+}
+
 /// Where a screenshot the USER asked for lands.
 ///
 /// The same directory the agent control plane writes captures to, because they
@@ -19804,34 +19842,8 @@ fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
         let mut state = state;
         state.with_mut_counted(|shell| match outcome {
             Ok(outcome) => {
-                let dimensions_and_path = format!(
-                    "{}x{} · {}",
-                    outcome.width, outcome.height, outcome.path
-                );
-                match (&outcome.clipboard_error, &outcome.restore_error) {
-                    (None, None) => shell.push_notification(
-                        NotificationTone::Success,
-                        "Screenshot Saved and Copied",
-                        dimensions_and_path,
-                    ),
-                    (Some(copy_error), None) => shell.push_notification(
-                        NotificationTone::Warning,
-                        "Screenshot Saved; Copy Failed",
-                        format!("{dimensions_and_path} · {copy_error}"),
-                    ),
-                    (None, Some(restore_error)) => shell.push_notification(
-                        NotificationTone::Warning,
-                        "Screenshot Saved and Copied; Page Restore Failed",
-                        format!("{dimensions_and_path} · {restore_error}"),
-                    ),
-                    (Some(copy_error), Some(restore_error)) => shell.push_notification(
-                        NotificationTone::Warning,
-                        "Screenshot Saved; Copy and Page Restore Failed",
-                        format!(
-                            "{dimensions_and_path} · copy: {copy_error} · restore: {restore_error}"
-                        ),
-                    ),
-                }
+                let (tone, title, message) = web_shot_notification(&outcome);
+                shell.push_notification(tone, title, message);
             }
             // Named, never swallowed: a capture that silently did nothing is
             // discovered later, in a directory that does not have the file.
@@ -19865,16 +19877,23 @@ async fn capture_web_page(
     if let Some(preparation) = preparation.as_ref()
         && preparation.report["ok"].as_bool() != Some(true)
     {
-        if preparation.active {
-            let _ = web_shot_restore_full_page(desktop, native_id).await;
+        let restore_error = if preparation.active {
+            web_shot_restore_full_page(desktop, native_id)
+                .await
+                .err()
+        } else {
+            None
+        };
+        let reason = preparation.report["error"]
+            .as_str()
+            .or_else(|| preparation.report["materialized"]["error"].as_str())
+            .unwrap_or("the page could not expose its full scroll extent");
+        if let Some(restore_error) = restore_error {
+            return Err(format!(
+                "full-page preparation failed: {reason}; page restore also failed: {restore_error}"
+            ));
         }
-        return Err(format!(
-            "full-page preparation failed: {}",
-            preparation.report["error"]
-                .as_str()
-                .or_else(|| preparation.report["materialized"]["error"].as_str())
-                .unwrap_or("the page could not expose its full scroll extent")
-        ));
+        return Err(format!("full-page preparation failed: {reason}"));
     }
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(i32, i32), String>>();
     let start = desktop.snapshot_web_surface_region(native_id, region, crop, path.clone(), move |outcome| {
@@ -19896,7 +19915,17 @@ async fn capture_web_page(
     } else {
         None
     };
-    let (width, height) = capture?;
+    let (width, height) = match capture {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            return Err(match restore_error {
+                Some(restore_error) => {
+                    format!("{error}; page restore also failed: {restore_error}")
+                }
+                None => error,
+            });
+        }
+    };
 
     // The file is the pixel authority. Seed the native clipboard from THOSE
     // exact bytes after the write completes, rather than encoding a second
