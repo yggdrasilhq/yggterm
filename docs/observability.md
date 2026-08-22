@@ -74,6 +74,50 @@ sampling policy and clock are attached before the first emission:
 `resource_governor.rs:59` registers three more from the daemon: `row_resource/{hot,oom}` (cpu) and
 `daemon/resource_governor` (wall).
 
+Every `render/*` sample carries both web-surface planes. The reconciler plane is
+`web_surface_views_{visible,stashed}`. The engine readback plane is
+`web_surface_engines_{present,missing,hidden}`,
+`web_surface_engine_widgets_{visible,mapped}` and
+`web_surface_web_processes_responsive`. The two explicit disagreement gauges are
+`web_surface_engine_visibility_mismatches` and
+`web_surface_widget_visibility_mismatches`. A stashed count is a request; only the
+engine fields establish whether WebKit actually received it. The same per-surface
+facts are exposed by `server app state` under `web_surface_tabs.rows[]`.
+
+### 2.1a The universal CLI plane
+
+`category:"cli"` is the cross-CLI lifecycle, not the legacy five registered
+fault probes in the table above. Read it with:
+
+```bash
+ytrace tail --category cli --since 30m --json
+```
+
+Its shared grammar is `birth` → `launch` → `identity_poll` → `title` /
+`title_sweep` → `projection` / `projection_sweep` → `restore`.
+
+* `identity_poll` explains a self-minted-id join without exposing cwd or title:
+  `target_rows`, `identities_seen`, `identities_with_birth_alias`,
+  `exact_alias_candidates`, `cwd_candidates`, `rebinds`, and
+  `newly_exhausted`. An identity count above zero with both candidate counts at
+  zero means discovery worked and the join failed.
+* `projection` is the GUI end of the chain. Initial healthy rows stay in the
+  aggregate; a bad edge and its recovery emit once per row/presence. It reports
+  `title_quality`, `kind_source`, `icon_kind`, `expected_icon_kind`, and
+  `icon_matches_kind`, never the rendered title text. Presence is taken from
+  the concrete row occurrence inside/outside the Live Sessions region, not from
+  its session path: the required live-rail and cwd-tree copies share identity.
+* `projection_sweep` names every `AGENT_CLIS` slug including zero rows. Its
+  unchanged heartbeat is twenty minutes because the all-CLI payload is larger;
+  any count change emits immediately. The byte-budget lock in `cli_plane.rs`
+  keeps the whole CLI plane below 1% of the measured live trace rate.
+
+The on-demand row witness carries the same final facts under `server app rows`:
+`session_kind`, `session_kind_source`, `title_quality`,
+`expected_icon_kind`, and `icon_matches_session_kind`. These fields describe
+the projection after live-title enrichment. They do not replace the store or
+daemon as title/identity authority.
+
 ### 2.2 Observed — and the gap is the point
 
 ⭐ **Registration is not emission.** A probe is registered at provider construction; whether it ever
@@ -146,6 +190,29 @@ bars, footers, selected rows — is mostly cells that are STYLED and EMPTY. A te
 differ from the terminal background" calls every one of them a ghost and reports a screen full of
 faults on a perfectly painted terminal. A cell holding a glyph has internal contrast; a cell
 holding a flat colour has none, whatever colour it is.
+
+⛔⛔ **`atlas_clears` COUNTS OUR CALLS, NOT THE ADDON'S CLEARS — read `page0v` beside it.**
+`forced_atlas_clear_count` is incremented by our own refresh funnel at the moment it calls the
+addon. `TextureAtlas.clearTexture()` then opens with a guard — it does nothing at all while the
+first page is still at its origin — so a run can report N atlas clears having wiped nothing. An
+experiment built on that number would "refute" a cause it never applied, which is the same failure
+shape as a harness reporting clean results it never rendered. The frame now also carries
+`atlas_page0_row_x/y` — the fill cursor, which is what the guard reads — and `atlas_page0_version`.
+
+⚠ **Read those two correctly, because the obvious reading of the version is wrong.**
+`Page.version` is bumped by `Page.clear()` **and by every glyph rasterised into the page**, so it
+is a "this page changed" counter, not a clear counter: one run here moved it 1,088 → 8,573 across
+nine atlas clears. The evidence that a clear actually RAN is the fill cursor **moving backwards** —
+`page0row` went `8,102` → `8,75`, and a page that is only being filled can never go down.
+**A refutation of anything atlas-shaped is only valid if the fill cursor was seen to reset.**
+
+⭐ **AND THE WARMED RANGE DECIDES WHETHER A FIXTURE CAN TEST THE ATLAS AT ALL.** `_doWarmUp()`
+rasterises codepoints **33..125 at DEFAULT fg/bg/ext** in a fixed order, and `clearTexture()` sets
+`_didWarmUp = false` so it runs again after every clear — returning default-coloured ASCII to the
+same slots. A co-owner's stale glyph coordinates for that range therefore stay valid **by
+construction**. Any fixture drawn in plain default-coloured ASCII is testing the one case where
+atlas sharing is provably harmless; a fixture meant to exercise it has to draw outside the warmed
+set — non-ASCII, or any coloured or bold cell, since fg/bg/ext are part of the cache key.
 
 ⚠ **What it cannot see, so that nothing is built on it:** it does not read the glyphs, so a cell
 painted with the WRONG character reads `ok` — it answers "was something drawn here", not "was it

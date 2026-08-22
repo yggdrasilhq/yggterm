@@ -1369,6 +1369,8 @@ impl DesktopService {
                 .map(|host| host.surface_liveness(id))
                 .unwrap_or(crate::web_surface::SurfaceLiveness {
                     present: false,
+                    engine_hidden: false,
+                    widget_visible: false,
                     mapped: false,
                     web_process_responsive: false,
                 });
@@ -1383,6 +1385,8 @@ impl DesktopService {
             let _ = id;
             crate::web_surface::SurfaceLiveness {
                 present: false,
+                engine_hidden: false,
+                widget_visible: false,
                 mapped: false,
                 web_process_responsive: false,
             }
