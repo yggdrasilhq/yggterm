@@ -4281,12 +4281,17 @@ impl EvalFailure {
     }
 }
 
-/// Three separate facts about a surface, deliberately not collapsed into a
-/// single "alive" boolean — see [`WebSurfaceHost::surface_liveness`].
+/// Separate facts about a surface, deliberately not collapsed into a single
+/// "alive" or "visible" boolean — see [`WebSurfaceHost::surface_liveness`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceLiveness {
     /// The host still holds an entry for this surface id.
     pub present: bool,
+    /// The engine-hidden latch written by the web-surface host. This is the
+    /// host's applied throttle state, not an inference from shell visibility.
+    pub engine_hidden: bool,
+    /// GTK's actual `visible` property for the inner WebKit widget.
+    pub widget_visible: bool,
     /// The engine webview widget is realized and mapped.
     pub mapped: bool,
     /// The engine believes its web content process is answering.
@@ -5752,6 +5757,8 @@ impl WebSurfaceHost {
     /// separate facts and they must not be collapsed:
     ///
     /// - `present`: we still hold the surface entry.
+    /// - `engine_hidden`: the host's applied throttle latch.
+    /// - `widget_visible`: GTK's actual visibility property for the WebKit widget.
     /// - `mapped`: the widget is realized and mapped (injection needs this).
     /// - `web_process_responsive`: the engine's own view of its content
     ///   process.
@@ -5768,6 +5775,8 @@ impl WebSurfaceHost {
         let Some(surface) = surfaces.get(&id) else {
             return SurfaceLiveness {
                 present: false,
+                engine_hidden: false,
+                widget_visible: false,
                 mapped: false,
                 web_process_responsive: false,
             };
@@ -5775,6 +5784,8 @@ impl WebSurfaceHost {
         let webkit = surface.webview.webview();
         SurfaceLiveness {
             present: true,
+            engine_hidden: surface.engine_hidden.get(),
+            widget_visible: gtk::prelude::WidgetExt::is_visible(&webkit),
             mapped: gtk::prelude::WidgetExt::is_mapped(&webkit),
             web_process_responsive: webkit.is_web_process_responsive(),
         }

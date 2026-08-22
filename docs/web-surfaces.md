@@ -190,6 +190,12 @@ which is the wrong end of the question, since most tabs SHOULD be missing from
 it. `tabs_without_webview` is the number the lane is judged on. The render probe
 carries the same pair per sample (`web_surface_tabs` against
 `web_surface_views` / `web_surface_view_sessions` / `web_surface_contexts`).
+It also carries the engine readback plane. Per row, `engine_hidden`,
+`engine_widget_visible`, `engine_widget_mapped`, and
+`web_process_responsive` come from the WebKit host rather than the reconciler.
+The aggregate mismatch counters answer whether a `state: "stashed"` request
+actually became a hidden widget. Never infer document visibility from `state`
+alone.
 
 ⚠ **There is no per-tab RSS, and the payload says so in words.** WebKitGTK pools
 web processes per `WebContext` and every tab of one profile shares that context,

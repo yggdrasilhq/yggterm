@@ -28,8 +28,8 @@
 #            second session to use the harness, having cost it a false start.
 #   stop     tear everything down (sandbox home is preserved for inspection)
 #   reap     delete DEAD sandbox homes, skipping any whose compositor is alive.
-#            The homes sit in a tmpfs -- RAM -- and nothing else ever frees
-#            them; 48 leaked ones once filled it and made `start` fail silently.
+#            Homes/logs live on disk under ~/.yggterm/scratchpad/underglass;
+#            only Wayland/Sway sockets use the compositor-mandated runtime dir.
 #
 # start options:
 #   --under-glass 0|1   arm or disarm Phase F under-glass (default 1)
@@ -102,7 +102,8 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
   export DBUS_SESSION_BUS_ADDRESS
 fi
 
-RUN_DIR="$XDG_RUNTIME_DIR/yggterm-uglass/$NAME"
+SCRATCH_ROOT="${YGGTERM_UNDERGLASS_SCRATCH_ROOT:-$HOME/.yggterm/scratchpad/underglass}"
+RUN_DIR="$SCRATCH_ROOT/$NAME"
 SANDBOX_HOME="$RUN_DIR/home"
 CONF="$RUN_DIR/sway.conf"
 LOG="$RUN_DIR/sway.log"
@@ -334,7 +335,10 @@ EOF
     # YGGTERM_HOME read from each process's OWN environment, so it can only ever
     # match this sandbox and never another agent's real daemon.
     for pid in $(pgrep -f yggterm 2>/dev/null || true); do
-      home="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -m1 '^YGGTERM_HOME=' || true)"
+      # Redirect stderr BEFORE opening /proc/$pid/environ. On hidepid hosts an
+      # unreadable environ fails during redirection; putting `2>/dev/null`
+      # afterwards lets bash print one warning per foreign process.
+      home="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | grep -m1 '^YGGTERM_HOME=' || true)"
       case "$home" in
         "YGGTERM_HOME=$SANDBOX_HOME/.yggterm") kill "$pid" 2>/dev/null || true ;;
       esac
@@ -354,17 +358,16 @@ EOF
     echo "sandbox '$NAME' stopped (home preserved at $SANDBOX_HOME; \`reap\` frees it)"
     ;;
   reap)
-    # ⛔ THE HOMES LIVE IN A tmpfs -- RAM, NOT DISK -- AND NOTHING EVER REAPED
-    # THEM. 48 dead ones once held a 51 GB runtime dir at 100% full, after which
-    # `start` failed and the whole harness reported clean results it never
-    # rendered. `stop` preserves by design (the inspection case), so the reaping
-    # has to be its own verb.
+    # `stop` preserves the disk-backed home for inspection, so reaping remains
+    # an explicit verb. Never put these homes back under XDG_RUNTIME_DIR: page
+    # caches and profiles are large enough to turn a diagnostic into RAM/swap
+    # pressure — the resource being diagnosed.
     # ⛔ AND THE HOST IS SHARED: another session's sandbox may be LIVE in this
-    # same runtime dir, so every directory is liveness-checked on its OWN
+    # same scratch root, so every directory is liveness-checked on its OWN
     # compositor pid and skipped if it answers. A blanket rm here takes down
     # work that is not yours.
     reaped=0; kept=0
-    for d in "$XDG_RUNTIME_DIR"/yggterm-uglass/*/; do
+    for d in "$SCRATCH_ROOT"/*/; do
       [ -d "$d" ] || continue
       name="$(basename "$d")"
       pidf="$d/sway.pid"
@@ -388,7 +391,7 @@ EOF
       reaped=$((reaped + 1))
     done
     echo "reaped $reaped dead sandbox home(s), kept $kept live"
-    df -h "$XDG_RUNTIME_DIR" | tail -1
+    df -h "$SCRATCH_ROOT" | tail -1
     ;;
   *)
     echo "usage: $0 <start|capture|burst|cursor|click|scroll|backend|env|stop|reap> [args] [--name id] [--size WxH] [--under-glass 0|1] [--env K=V] [--xwayland]" >&2

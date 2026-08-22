@@ -22467,6 +22467,8 @@ time out.
 
 **Status:** OPEN
 
+Controlled A/B is complete; live-host mismatch readback is still owed.
+
 **★★★ AN UNREVEALED AGENT SURFACE REPORTS `visibilityState: "visible"`, SO
 ITS PAGE ANIMATES AT FULL RATE AND THE GUI COMPOSITES IT — measured
 2026-07-26 night, and this is very likely THE mechanism behind every
@@ -22507,6 +22509,41 @@ arm on 3.0.59 still costs 1.567 cores.** What is still missing is the controlled
 comparison (same surfaces, throttle forced on vs off) and the identity of pid
 2886588's surface — capture `engine_visible` from the trace for each surface
 before assuming it is the same unrevealed-surface mechanism.
+
+**2026-08-22: THE CONTROLLED SAME-PAGE A/B IS NOW DONE, AND THE LIVE OBSERVER
+LIE IS REPRODUCED.** On the live GUI host running 3.1.42, a 15.1 s `/proc`
+delta measured **2.683
+cores total** (GUI 0.600, WebKit content 2.074) while app state called all nine
+realized views `stashed`. That field was only the reconciler's requested state;
+it published no GTK/WebKit readback, so it could not establish that any engine
+was actually hidden. Later the same GUI had zero realized views and fell to
+**0.205 cores total**, isolating the residual heat to the realized-view regime.
+
+The instrumented Wayland-native under-glass arm then held the page and process
+generation fixed and changed only whether the same heavy animation was shown:
+
+```
+same page visible:  2.166 cores total, 2.066 WebKit, 6804 GPU-ms / 15.1 s
+same page stashed:  0.068 cores total, 0.032 WebKit,   24 GPU-ms / 15.1 s
+```
+
+While stashed, the page read `visibilityState:"hidden"`, its rAF counter moved
+**0 frames in 5 s**, and host readback agreed on all five facts: engine-hidden,
+GTK widget not visible, widget not mapped, process responsive, zero visibility
+mismatches. Reveal restored visible + mapped and a faithful native frame showed
+the animation intact. ⇒ The throttle mechanism works and is worth roughly two
+cores on the fixed fixture. The remaining live-host question is now precise: deploy
+the readback fields, catch the next hot/stashed window, and ask whether
+`engine_visibility_mismatches` or `widget_visibility_mismatches` is nonzero.
+Do not add another throttle path unless that observation names the failed edge.
+
+**2026-08-22 post-deploy readback:** the instrument is live. The sampled window
+held three tabs, one realized view, and that view was intentionally visible;
+engine/widget truth agreed (`present`, visible, mapped, responsive) with both
+mismatch counters zero. A 15.0 s process-tree delta measured **0.284 cores
+total** (GUI 0.124, WebKit 0.153) and **94 GPU-ms**. This is the healthy control,
+not closure: there was no realized stashed view in that window, so the next hot
+window still has to supply the failing edge.
 
 **Why it is a product bug, not the page's fault:** every browser throttles
 `requestAnimationFrame`, CSS animations and timers on a hidden page — that is
