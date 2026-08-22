@@ -8942,13 +8942,44 @@ impl DaemonRuntime {
         self.prune_unrepresented_preserved_owners("live_session_removed");
         self.persist()?;
         if let Some((machine, session_id, kind)) = remote_target {
-            spawn_explicit_remote_session_shutdown(
-                self.store.home_dir(),
-                path,
-                machine,
-                session_id,
-                kind,
-            );
+            // LEGENDARY fix: dispatch by resolved KEY, not by session_id.
+            // If another live row still holds the same (machine, session_id)
+            // — the scheme-twin case — closing one row must not kill the
+            // surviving row's remote runtime. Check remaining live sessions
+            // for a twin before asking the remote to terminate.
+            let twin_still_live = self.server.live_sessions().iter().any(|sess| {
+                if let Some((other_machine, other_session_id, _)) =
+                    self.server.remote_agent_pty_target_for_path(&sess.session_path)
+                {
+                    other_session_id == session_id
+                        && other_machine.machine_key == machine.machine_key
+                } else {
+                    false
+                }
+            });
+            if !twin_still_live {
+                spawn_explicit_remote_session_shutdown(
+                    self.store.home_dir(),
+                    path,
+                    machine,
+                    session_id,
+                    kind,
+                );
+            } else {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "session",
+                    "explicit_remote_session_close_suppressed_twin_survives",
+                    serde_json::json!({
+                        "path": path,
+                        "machine_key": machine.machine_key,
+                        "session_id": session_id,
+                        "kind": format!("{kind:?}"),
+                        "reason": "another live row still holds same (machine,session_id) — dispatch by KEY, not ID",
+                    }),
+                );
+            }
         }
         Ok(ClosedLiveRow {
             removed_terminal,
