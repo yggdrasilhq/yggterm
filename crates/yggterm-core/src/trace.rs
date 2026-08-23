@@ -43,11 +43,49 @@ const EVENT_TRACE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// transparent compression this costs far less disk than it reserves — the same
 /// 247.9 MiB of trace occupied 17 MiB on disk when measured — but the cap is
 /// counted in logical bytes, so it binds either way.
+///
+/// 10 GiB in dev mode (2026-08-23): when `YGGTERM_DEV=1` or `~/.yggterm/config/dev-mode`
+/// contains `1` (fleet dev hosts), the generation budget is
+/// `10 GiB` so investigations have a full day+ window for legendary-bug chords
+/// (`web/policy × render × zfs_delay`). Else `1 GiB`. See `ytop` spec §5.0/§8 Phase 6.
+#[allow(dead_code)]
 const EVENT_TRACE_RETENTION: JsonlRetention = JsonlRetention {
     live_max_bytes: EVENT_TRACE_MAX_BYTES,
     generations_max_bytes: 1024 * 1024 * 1024,
     max_age_ms: DIAGNOSTIC_RETENTION_MAX_AGE_MS,
 };
+
+fn is_dev_mode() -> bool {
+    if std::env::var("YGGTERM_DEV")
+        .map(|v| v == "1" || v.to_ascii_lowercase() == "true")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".yggterm/config/dev-mode");
+        if let Ok(c) = std::fs::read_to_string(p) {
+            let t = c.trim().to_ascii_lowercase();
+            if t == "1" || t == "true" || t == "yes" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn event_trace_retention() -> JsonlRetention {
+    let generations_max_bytes = if is_dev_mode() {
+        10 * 1024 * 1024 * 1024
+    } else {
+        1024 * 1024 * 1024
+    };
+    JsonlRetention {
+        live_max_bytes: EVENT_TRACE_MAX_BYTES,
+        generations_max_bytes,
+        max_age_ms: DIAGNOSTIC_RETENTION_MAX_AGE_MS,
+    }
+}
 
 /// One line of the trace plane.
 ///
@@ -273,7 +311,7 @@ fn write_trace_line(home: &Path, line: &[u8]) {
         // First write through this process: sweep expired generations once so
         // the "at most 3 days" cap holds even across idle stretches where the
         // live file never reaches the rotation size.
-        prune_jsonl_generations(&path, EVENT_TRACE_RETENTION, now_epoch_ms());
+        prune_jsonl_generations(&path, event_trace_retention(), now_epoch_ms());
         match open_trace_writer(&path) {
             Some(writer) => {
                 writers.insert(path.clone(), writer);
@@ -292,7 +330,7 @@ fn write_trace_line(home: &Path, line: &[u8]) {
         // Close the handle before renaming the inode, otherwise we would keep
         // appending to the rotated-away file.
         writers.remove(&path);
-        rotate_jsonl_with_retention(&path, EVENT_TRACE_RETENTION, now_epoch_ms());
+        rotate_jsonl_with_retention(&path, event_trace_retention(), now_epoch_ms());
         let _ = fs::create_dir_all(home);
         match open_trace_writer(&path) {
             Some(writer) => {
