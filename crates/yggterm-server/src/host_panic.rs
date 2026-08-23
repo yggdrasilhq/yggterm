@@ -190,7 +190,7 @@ pub fn memory_pressure() -> (Option<f64>, Option<f64>) {
 pub fn runtime_tmpfs_bytes() -> Option<u64> {
     let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
     fn walk(path: &Path, depth: u32) -> u64 {
-        if depth > 6 {
+        if depth > 12 {
             return 0;
         }
         let Ok(entries) = std::fs::read_dir(path) else {

@@ -3542,7 +3542,7 @@ fn install_npm_isolated(
 /// which over-states the disk actually returned by **5.5×**, because `_cacache`
 /// deduplicates by content hash and the figure counts index entries rather than
 /// unique bytes. Quote `du`, never npm's summary line.
-const NPM_CACHE_GC_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const NPM_CACHE_GC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Garbage-collect the shared npm cache, at most once per
 /// [`NPM_CACHE_GC_INTERVAL`].
@@ -3565,6 +3565,50 @@ fn gc_npm_cache_if_due(paths: &ManagedCliPaths, npm: &Path) {
         Err(_) => true,
     };
     if !due {
+        return;
+    }
+    // Size-triggered GC: if cache exceeds 500 MiB, collect immediately
+    // regardless of interval — weekly alone left 7.3G on tmpfs (18G total
+    // in /run/user/3001/yggterm-uglass). Measured verify reclaimed 5.7G.
+    let cache_size_bytes = fs::read_dir(&paths.cache_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    // Walk _cacache for more accurate size if small dir check undercounts
+    let du_size = if cache_size_bytes < 500 * 1024 * 1024 {
+        // Quick du via metadata walk depth 3 for _cacache
+        fn du(path: &std::path::Path, depth: u32) -> u64 {
+            if depth > 4 {
+                return 0;
+            }
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return 0;
+            };
+            let mut total = 0;
+            for e in entries.flatten() {
+                if let Ok(m) = e.metadata() {
+                    if m.is_file() {
+                        total += m.len();
+                    } else if m.is_dir() {
+                        total += du(&e.path(), depth + 1);
+                    }
+                }
+            }
+            total
+        }
+        du(&paths.cache_dir, 0)
+    } else {
+        cache_size_bytes
+    };
+    let size_triggered = du_size > 500 * 1024 * 1024;
+    if size_triggered {
+        // Size trigger bypasses interval — tmpfs leak must be bounded promptly
+    } else if !due {
         return;
     }
     // Written BEFORE the run, not after. The collection is slow (61 s on a 9 GB
