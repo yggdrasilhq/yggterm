@@ -83,6 +83,39 @@ const DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS: u64 = 2_000;
 /// on disk is the single source of truth — uglass must symlink to it.
 /// This runs at daemon startup (idempotent) and on every background-copy
 /// chore tick where the host npm exists.
+fn check_cli_integration_gaps() {
+    // File the three 99.1 CLI gaps that ytrace watched codex for but not the other nine.
+    // Runs at daemon startup (file-first, Dash reads it). Each is pure diagnosis,
+    // same bus Dash and LLM read. `AGENT_CLIS` is the SSOT, not a hand-list.
+    let descriptors = yggterm_core::agent_cli::AGENT_CLIS;
+    let total = descriptors.len();
+    let mut unmeasured_gates = 0;
+    let mut marker_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for desc in descriptors {
+        if desc.startup_gate_screen_phrases.is_empty() {
+            unmeasured_gates += 1;
+        }
+        let marker = desc.composer_marker.to_string();
+        *marker_counts.entry(marker).or_insert(0) += 1;
+    }
+    let shared_max = marker_counts.values().copied().max().unwrap_or(0);
+    let sample = ytrace::diagnosis::CliIntegrationSample {
+        total_clis: total,
+        unmeasured_startup_gates: unmeasured_gates,
+        shared_composer_marker_count: shared_max,
+        reap_destroyed_briefed_row: false, // set true when reap actually ate a briefed row; file via caller
+    };
+    let provider = yggterm_core::perf::ytrace_provider();
+    if let Some(inc) = ytrace::diagnosis::diagnose_cli_startup_gate(&sample) {
+        provider.incident("cli", "cli", "startup_gate_unmeasured", ytrace::diagnosis::incident_payload(&inc));
+    }
+    if let Some(inc) = ytrace::diagnosis::diagnose_cli_composer_marker(&sample) {
+        provider.incident("cli", "cli", "composer_marker_unmeasured", ytrace::diagnosis::incident_payload(&inc));
+    }
+    // transcript lag is not a static count — file only when reap actually destroys a briefed row.
+    // The caller (reap path) should call diagnose_cli_transcript_lag with true when it happens.
+}
+
 fn dedup_uglass_npm_prefixes() {
     let host_npm = match crate::resolve_yggterm_home() {
         Ok(home) => home.join("npm"),
@@ -977,7 +1010,29 @@ fn drain_unix_client_outcomes(
                     *start_migration_drain = true;
                 }
             }
-            Err(error) => warn!(error=%format!("{error:#}"), "daemon request failed"),
+            Err(error) => {
+                let msg = format!("{error:#}");
+                warn!(error=%msg, "daemon request failed");
+                if msg.contains("Broken pipe") || msg.contains("closed connection") {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        let _ = home; // keep home for future use, silence unused
+                        if let Some(incident) = ytrace::diagnosis::diagnose_daemon_disconnect(
+                            &ytrace::diagnosis::DaemonDisconnectSample {
+                                last_activity: None,
+                                cli_slug: None,
+                            },
+                        ) {
+                            let payload = ytrace::diagnosis::incident_payload(&incident);
+                            yggterm_core::perf::ytrace_provider().incident(
+                                "daemon",
+                                "daemon",
+                                "client_disconnected",
+                                payload,
+                            );
+                        }
+                    }
+                }
+            },
         }
     }
     should_shutdown
@@ -20322,6 +20377,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     // uglass home is not an error, and a failed symlink is not a daemon
     // start failure.
     dedup_uglass_npm_prefixes();
+    check_cli_integration_gaps();
     let last_activity_ms = Arc::new(AtomicU64::new(current_millis_u64()));
     let idle_shutdown_ms = daemon_idle_shutdown_ms();
     let terminal_idle_trim_after_ms = daemon_terminal_idle_trim_after_ms();
@@ -20965,7 +21021,19 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                                 }
                             }
                             Err(error) => {
-                                warn!(error=%format!("{error:#}"), "daemon request failed")
+                                let msg = format!("{error:#}");
+                                warn!(error=%msg, "daemon request failed");
+                                if msg.contains("Broken pipe") || msg.contains("closed connection") {
+                                    if let Ok(home) = crate::resolve_yggterm_home() {
+                                        let _ = home;
+                                        if let Some(incident) = ytrace::diagnosis::diagnose_daemon_disconnect(
+                                            &ytrace::diagnosis::DaemonDisconnectSample { last_activity: None, cli_slug: None },
+                                        ) {
+                                            let payload = ytrace::diagnosis::incident_payload(&incident);
+                                            yggterm_core::perf::ytrace_provider().incident("daemon", "daemon", "client_disconnected", payload);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
