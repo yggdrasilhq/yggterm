@@ -198,7 +198,16 @@ pub fn runtime_tmpfs_bytes() -> Option<u64> {
         };
         let mut total = 0;
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
+            // ⛔ symlink_metadata, not metadata: uglass isolation used to hold
+            // 1.5G npm prefixes under /run/user/3001/yggterm-uglass/*/home on
+            // tmpfs (6.7G total → 2.4G after deduplicating via symlink to
+            // ~/.yggterm/npm on disk, -4.3G 2026-08-23). A symlink to
+            // /home must not be counted as tmpfs RAM — metadata follows the
+            // link and would count 1.3G of disk as RAM. Skip symlinks entirely.
+            let Ok(meta) = entry.path().symlink_metadata() else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_file() {
                 total += meta.len();
             } else if meta.is_dir() {
