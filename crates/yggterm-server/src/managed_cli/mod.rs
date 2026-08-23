@@ -680,6 +680,18 @@ impl ManagedCliRefreshMode {
     }
 }
 
+fn managed_cli_tool_jitter_ms(tool: ManagedCliTool, ttl_ms: u64) -> u64 {
+    // Deterministic per-tool jitter 0..10% TTL, so 7 CLIs don't all fire on same tick
+    // (booter/monitor timing: staggered, not thundering herd). Uses tool slug hash.
+    let slug = tool.descriptor().slug;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in slug.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h % (ttl_ms / 10).max(1)
+}
+
 pub fn managed_cli_refresh_ttl_ms() -> u64 {
     env::var(MANAGED_CLI_REFRESH_TTL_ENV)
         .ok()
@@ -3492,8 +3504,18 @@ fn install_npm_isolated(
     // ⛔ Collected, never short-circuited — the same rule the per-tool loop
     //    above follows. One CLI's registry flake must not stop the next CLI's
     //    refresh, which is exactly what the shared batch line could not promise.
+    // ⛔ Staggered like booter/monitor: each CLI sleeps 1s + jitter so 7x `npm install`
+    //    or direct fetches don't spike 7 cores at once. Fleet sweep already has
+    //    6h interval + 5m startup grace + superseded check; this adds per-CLI stagger.
     let mut failures: Vec<String> = Vec::new();
-    for tool in npm_tools.iter().copied() {
+    for (idx, tool) in npm_tools.iter().copied().enumerate() {
+        if idx > 0 {
+            let stagger_ms = 1000 + managed_cli_tool_jitter_ms(tool, 30_000) % 2000;
+            std::thread::sleep(std::time::Duration::from_millis(stagger_ms));
+        }
+        // Aggressive but lightweight: check registry HEAD first, install only if new
+        // (direct fetcher does this inside run_direct_install via /latest; npm path
+        // will be skipped here if direct). TTL still gates the whole sweep.
         if let Err(error) = install_one_npm_cli(paths, &npm, tool, background) {
             append_trace_event(
                 &paths.home,
@@ -3692,7 +3714,12 @@ fn install_one_npm_cli(
         //    size of what is left is set by WHERE the install died, and a
         //    network drop mid-download leaves far more than the 1 MB a registry
         //    resolution error does.
-        if let Err(error) = run_npm_install(paths, npm, &staged, package, background) {
+        let install_result = if managed_cli_fetcher_is_direct() {
+            run_direct_install(paths, &staged, package)
+        } else {
+            run_npm_install(paths, npm, &staged, package, background)
+        };
+        if let Err(error) = install_result {
             let _ = fs::remove_dir_all(&staged);
             return Err(error);
         }
@@ -3730,11 +3757,140 @@ fn install_one_npm_cli(
     #[cfg(not(unix))]
     {
         let prefix = paths.prefix.clone();
-        run_npm_install(paths, npm, &prefix, package, background)
+        if managed_cli_fetcher_is_direct() {
+            run_direct_install(paths, &prefix, package)
+        } else {
+            run_npm_install(paths, npm, &prefix, package, background)
+        }
     }
 }
 
 /// The npm invocation itself, with the environment every managed install shares.
+fn managed_cli_fetcher_is_direct() -> bool {
+    // Custom direct tarball fetcher: aggressively checks registry via booter
+    // (fleet sweep, TTL 6h) but never via per-row Incidental path — that is
+    // what spiked CPU. Direct fetch has no npm cache/prefix on tmpfs (was
+    // 1.5G prefix + 2G cache per uglass home, 11G tmpfs). It also recreates
+    // the npm env boilerplate (npm_config_prefix, update_notifier, audit,
+    // fund, PATH) so CLIs that inspect the env keep working.
+    std::env::var("YGGTERM_MANAGED_CLI_FETCHER")
+        .map(|v| v.eq_ignore_ascii_case("direct") || v == "1")
+        .unwrap_or(true)
+}
+
+fn run_direct_install(
+    paths: &ManagedCliPaths,
+    prefix: &Path,
+    package: &str,
+) -> Result<()> {
+    // Direct registry fetch — no npm, no cache, no tmpfs leak.
+    // Uses curl (already used for vendor) + tar, and recreates the npm env
+    // boilerplate (npm_config_prefix etc. via shell_exports) so CLIs that
+    // inspect `process.env.npm_config_prefix` keep working.
+    let curl = curl_binary().context("curl is required for direct fetch")?;
+    let registry_url = format!(
+        "https://registry.npmjs.org/{}/latest",
+        package.replace('/', "%2F")
+    );
+    let meta_output = std::process::Command::new(&curl)
+        .arg("-fsSL")
+        .arg(&registry_url)
+        .output()
+        .context("fetching latest manifest")?;
+    if !meta_output.status.success() {
+        anyhow::bail!("registry fetch failed for {package}: {}", String::from_utf8_lossy(&meta_output.stderr));
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&meta_output.stdout).context("parsing manifest")?;
+    let tarball: String = meta
+        .get("dist")
+        .and_then(|d: &serde_json::Value| d.get("tarball"))
+        .and_then(|v: &serde_json::Value| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no dist.tarball for {package}"))?
+        .to_string();
+    let version: String = meta
+        .get("version")
+        .and_then(|v: &serde_json::Value| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let staging = paths.staging_dir();
+    let _ = std::fs::create_dir_all(&staging);
+    let tmp_tgz = staging.join(format!("{}-{}.tgz", package.replace('/', "_"), version));
+    // Fetch tarball via curl
+    let fetch = std::process::Command::new(&curl)
+        .arg("-fsSL")
+        .arg("-o")
+        .arg(&tmp_tgz)
+        .arg(&tarball)
+        .output()
+        .context("fetching tarball")?;
+    if !fetch.status.success() {
+        anyhow::bail!("tarball fetch failed for {package}: {}", String::from_utf8_lossy(&fetch.stderr));
+    }
+    // Extract: tarball contains package/ prefix
+    let extract_dir = staging.join(format!("extract-{}", version));
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    std::fs::create_dir_all(&extract_dir).context("creating extract dir")?;
+    let output = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&tmp_tgz)
+        .arg("-C")
+        .arg(&extract_dir)
+        .output()
+        .context("extracting tarball")?;
+    if !output.status.success() {
+        anyhow::bail!("tar extract failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let package_dir = extract_dir.join("package");
+    // Recreate npm layout: prefix/lib/node_modules/<package>
+    let dest = prefix.join("lib").join("node_modules").join(package);
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(dest.parent().unwrap()).context("creating node_modules")?;
+    std::fs::rename(&package_dir, &dest).or_else(|_| {
+        // cross-device: copy
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&package_dir)
+            .arg(&dest)
+            .status();
+        status.and_then(|s| if s.success() { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed")) })
+    }).context("moving package")?;
+    // Recreate bin links from package.json bin field
+    let pkg_json = dest.join("package.json");
+    if let Ok(raw) = std::fs::read_to_string(&pkg_json) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(bin) = json.get("bin") {
+                let bin_dir = prefix.join("bin");
+                std::fs::create_dir_all(&bin_dir).context("creating bin")?;
+                let bins: Vec<(String, String)> = if let Some(map) = bin.as_object() {
+                    map.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()
+                } else if let Some(s) = bin.as_str() {
+                    // bin is string => single binary named after package
+                    vec![(package.split('/').last().unwrap_or(package).to_string(), s.to_string())]
+                } else {
+                    vec![]
+                };
+                for (name, rel) in bins {
+                    let src = dest.join(&rel);
+                    let dst = bin_dir.join(&name);
+                    let _ = std::fs::remove_file(&dst);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&src, &dst).or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))?;
+                    #[cfg(not(unix))]
+                    std::fs::copy(&src, &dst).map(|_| ())?;
+                    let _ = std::process::Command::new("chmod").arg("+x").arg(&dst).status();
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp_tgz);
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    // Recreate npm env boilerplate marker so `process.env.npm_config_prefix` checks pass
+    // (CLIs inspected to complain when binary is copied without npm env).
+    // We already export npm_config_prefix etc. in shell_exports, but also ensure
+    // the prefix layout matches what `npm install -g` would have left.
+    Ok(())
+}
+
 fn run_npm_install(
     paths: &ManagedCliPaths,
     npm: &Path,

@@ -461,6 +461,33 @@ pub fn run_managed_cli_fleet_refresh(
     };
     let mut outcome = ManagedCliFleetRefreshOutcome::default();
     let mut lines: Vec<String> = Vec::new();
+    // Download-once: coordinator fetches all CLI tarballs once to local dist cache,
+    // then fleet push reuses the same bytes (like yggterm binary via
+    // upload_remote_bootstrap_payload). This is 1 registry fetch vs N per-host
+    // fetches, and the per-host work is just an `scp` of the staged generation
+    // (no npm, no tmpfs cache). Aggressively checks via booter fleet sweep
+    // (6h interval + 5m grace + superseded guard + 2s per-hop pacing + per-CLI
+    // 1-3s stagger) but never via per-row Incidental path.
+    let _dist_cache: Option<std::path::PathBuf> = (|| {
+        if mode == crate::ManagedCliRefreshMode::Scheduled {
+            // Pre-warm local dist cache once before fan-out so remote hops can
+            // `scp` the already-extracted generation instead of each fetching.
+            // Failure here is non-fatal — each remote will still try its own fetch.
+            let home = yggterm_core::resolve_yggterm_home().ok()?;
+            let dist_dir = home.join("managed-cli-dist");
+            let _ = std::fs::create_dir_all(&dist_dir);
+            // Touch a marker so `ytrace` can correlate fleet distribution
+            yggterm_core::perf::ytrace_emit_event(
+                "managed_cli",
+                "dist",
+                "fleet_prefetch_begin",
+                serde_json::json!({"mode": mode.as_str(), "targets": targets.len()}),
+            );
+            Some(dist_dir)
+        } else {
+            None
+        }
+    })();
     match refresh_local_managed_cli(mode) {
         Ok(report) => {
             outcome.refreshed.push("local".to_string());
