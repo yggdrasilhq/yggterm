@@ -22,11 +22,25 @@ pub(crate) fn ui_telemetry_should_record(
     payload_text: &str,
     now_ms: u64,
 ) -> bool {
+    let throttle_ms = if event == "preview_debug" {
+        30_000
+    } else {
+        UI_TELEMETRY_DUPLICATE_THROTTLE_MS
+    };
     if let Some((last_payload, last_ms)) = recent_ui_telemetry.get(event)
         && last_payload == payload_text
-        && now_ms.saturating_sub(*last_ms) < UI_TELEMETRY_DUPLICATE_THROTTLE_MS
+        && now_ms.saturating_sub(*last_ms) < throttle_ms
     {
         return false;
+    }
+    // Also rate-limit preview_debug even when payload differs — it was the sole
+    // 1s stall source (ytrace ui/block 32 samples p95 1111ms, all preview_debug)
+    if event == "preview_debug" {
+        if let Some((_, last_ms)) = recent_ui_telemetry.get(event)
+            && now_ms.saturating_sub(*last_ms) < 10_000
+        {
+            return false;
+        }
     }
     recent_ui_telemetry.insert(event.to_string(), (payload_text.to_string(), now_ms));
     true
@@ -42,11 +56,16 @@ pub(crate) fn append_ui_telemetry_event(event: &str, payload: Value) {
         "event": event,
         "payload": payload,
     });
-    if let Ok(store) = SessionStore::open_or_init() {
-        let path = store.home_dir().join(UI_TELEMETRY_FILENAME);
-        append_retained_jsonl_record(&path, UI_TELEMETRY_RETENTION, &telemetry);
-        append_trace_event(store.home_dir(), "ui", "ui_telemetry", event, telemetry);
-    }
+    let event_owned = event.to_string();
+    // Offload file I/O off the UI thread — ytrace ui/block showed 1s stalls
+    // with last_activity preview_debug due to synchronous append on UI thread.
+    std::thread::spawn(move || {
+        if let Ok(store) = SessionStore::open_or_init() {
+            let path = store.home_dir().join(UI_TELEMETRY_FILENAME);
+            append_retained_jsonl_record(&path, UI_TELEMETRY_RETENTION, &telemetry);
+            append_trace_event(store.home_dir(), "ui", "ui_telemetry", &event_owned, telemetry);
+        }
+    });
 }
 
 #[cfg(test)]
