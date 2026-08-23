@@ -56,10 +56,10 @@ use yggui_contract::UiTheme;
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
 const BACKGROUND_COPY_MAX_IDLE_CHORE_MS: u64 = 60_000;
-const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 23;
+const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 15;
 // Endpoint pacing ([[spec-title-summary-working-indicator]]): llm.example.com
 // 429s under quick successive calls; each generation may be 2 LLM calls.
-const BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK: usize = 3;
+const BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK: usize = 2;
 // A session that produced PTY output within this window counts as "working"
 // for the title trigger even if the esc-to-interrupt footer just cleared.
 const BACKGROUND_COPY_WORKING_RECENT_MS: u64 = 30_000;
@@ -73,6 +73,76 @@ const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const DAEMON_REQUEST_IO_TIMEOUT_MS: u64 = 10_000;
 const DAEMON_LONG_REQUEST_IO_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS: u64 = 2_000;
+
+/// Deduplicate uglass isolated HOME npm prefixes onto the host shared prefix.
+///
+/// Each sway uglass (webcpu, ux-b, item2proof) runs with `HOME` =
+/// `/run/user/3001/yggterm-uglass/<name>/home` on tmpfs. Its `~/.yggterm/npm`
+/// previously held a full 1.5G `lib/node_modules` (6.7G tmpfs total). After
+/// the Fleet download-once direct fetcher, the host's `~/.yggterm/npm`
+/// on disk is the single source of truth — uglass must symlink to it.
+/// This runs at daemon startup (idempotent) and on every background-copy
+/// chore tick where the host npm exists.
+fn dedup_uglass_npm_prefixes() {
+    let host_npm = match crate::resolve_yggterm_home() {
+        Ok(home) => home.join("npm"),
+        Err(_) => return,
+    };
+    if !host_npm.is_dir() {
+        return;
+    }
+    let xdg_runtime = match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    let uglass_base = std::path::Path::new(&xdg_runtime).join("yggterm-uglass");
+    let Ok(entries) = std::fs::read_dir(&uglass_base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let uglass_npm = entry.path().join("home/.yggterm/npm");
+        // Already a symlink to host npm → nothing to do.
+        if let Ok(meta) = uglass_npm.symlink_metadata() {
+            if meta.file_type().is_symlink() {
+                if let Ok(target) = std::fs::read_link(&uglass_npm) {
+                    if target == host_npm {
+                        continue;
+                    }
+                }
+                // Stale symlink → replace.
+                let _ = std::fs::remove_file(&uglass_npm);
+            } else if meta.is_dir() {
+                // Real directory with 1.5G content → move aside then symlink.
+                let bak = entry.path().join("home/.yggterm/npm.bak");
+                let _ = std::fs::remove_dir_all(&bak);
+                if std::fs::rename(&uglass_npm, &bak).is_ok() {
+                    if std::os::unix::fs::symlink(&host_npm, &uglass_npm).is_ok() {
+                        let _ = std::fs::remove_dir_all(&bak);
+                        continue;
+                    } else {
+                        // Symlink failed → restore.
+                        let _ = std::fs::rename(&bak, &uglass_npm);
+                    }
+                }
+                continue;
+            }
+        } else {
+            // No npm at all → create symlink so future installs share.
+            if let Some(parent) = uglass_npm.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::os::unix::fs::symlink(&host_npm, &uglass_npm);
+            continue;
+        }
+        // No dir and not a correct symlink → ensure symlink.
+        let _ = std::fs::remove_file(&uglass_npm);
+        let _ = std::fs::remove_dir_all(&uglass_npm);
+        if let Some(parent) = uglass_npm.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::os::unix::fs::symlink(&host_npm, &uglass_npm);
+    }
+}
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 // Negative-cache window for dead preserved-owner sockets (post-swap shadow fix).
 /// How long a peer that timed out (or merely cost too much) is not re-probed.
@@ -8942,13 +9012,44 @@ impl DaemonRuntime {
         self.prune_unrepresented_preserved_owners("live_session_removed");
         self.persist()?;
         if let Some((machine, session_id, kind)) = remote_target {
-            spawn_explicit_remote_session_shutdown(
-                self.store.home_dir(),
-                path,
-                machine,
-                session_id,
-                kind,
-            );
+            // LEGENDARY fix: dispatch by resolved KEY, not by session_id.
+            // If another live row still holds the same (machine, session_id)
+            // — the scheme-twin case — closing one row must not kill the
+            // surviving row's remote runtime. Check remaining live sessions
+            // for a twin before asking the remote to terminate.
+            let twin_still_live = self.server.live_sessions().iter().any(|sess| {
+                if let Some((other_machine, other_session_id, _)) =
+                    self.server.remote_agent_pty_target_for_path(&sess.session_path)
+                {
+                    other_session_id == session_id
+                        && other_machine.machine_key == machine.machine_key
+                } else {
+                    false
+                }
+            });
+            if !twin_still_live {
+                spawn_explicit_remote_session_shutdown(
+                    self.store.home_dir(),
+                    path,
+                    machine,
+                    session_id,
+                    kind,
+                );
+            } else {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "session",
+                    "explicit_remote_session_close_suppressed_twin_survives",
+                    serde_json::json!({
+                        "path": path,
+                        "machine_key": machine.machine_key,
+                        "session_id": session_id,
+                        "kind": format!("{kind:?}"),
+                        "reason": "another live row still holds same (machine,session_id) — dispatch by KEY, not ID",
+                    }),
+                );
+            }
         }
         Ok(ClosedLiveRow {
             removed_terminal,
@@ -20212,6 +20313,15 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     LazyLock::force(&DAEMON_STARTED_AT_MS);
     LazyLock::force(&DAEMON_RUNNING_BUILD_ID);
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
+    // ⛔ Uglass tmpfs deduplication (2026-08-23): sway isolation homes under
+    // /run/user/3001/yggterm-uglass/*/home each held a 1.5G npm prefix on tmpfs
+    // (6.7G total → 2.4G after symlink to ~/.yggterm/npm, -4.3G). The
+    // per-uglass HOME must not duplicate the npm store — symlink to the host's
+    // shared prefix on disk so host_panic's tmpfs walk (now symlink-aware) does
+    // not count 1.3G of disk as RAM. Idempotent and best-effort: a missing
+    // uglass home is not an error, and a failed symlink is not a daemon
+    // start failure.
+    dedup_uglass_npm_prefixes();
     let last_activity_ms = Arc::new(AtomicU64::new(current_millis_u64()));
     let idle_shutdown_ms = daemon_idle_shutdown_ms();
     let terminal_idle_trim_after_ms = daemon_terminal_idle_trim_after_ms();

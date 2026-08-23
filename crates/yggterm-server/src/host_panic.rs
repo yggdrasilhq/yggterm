@@ -190,7 +190,7 @@ pub fn memory_pressure() -> (Option<f64>, Option<f64>) {
 pub fn runtime_tmpfs_bytes() -> Option<u64> {
     let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
     fn walk(path: &Path, depth: u32) -> u64 {
-        if depth > 6 {
+        if depth > 12 {
             return 0;
         }
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -198,7 +198,16 @@ pub fn runtime_tmpfs_bytes() -> Option<u64> {
         };
         let mut total = 0;
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
+            // ⛔ symlink_metadata, not metadata: uglass isolation used to hold
+            // 1.5G npm prefixes under /run/user/3001/yggterm-uglass/*/home on
+            // tmpfs (6.7G total → 2.4G after deduplicating via symlink to
+            // ~/.yggterm/npm on disk, -4.3G 2026-08-23). A symlink to
+            // /home must not be counted as tmpfs RAM — metadata follows the
+            // link and would count 1.3G of disk as RAM. Skip symlinks entirely.
+            let Ok(meta) = entry.path().symlink_metadata() else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_file() {
                 total += meta.len();
             } else if meta.is_dir() {

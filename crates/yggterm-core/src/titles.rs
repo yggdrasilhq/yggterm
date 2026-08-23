@@ -1101,13 +1101,13 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
     }
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(8))
         .build()
         .context("failed to build LiteLLM client")?;
     let body = serde_json::json!({
         "model": settings.interface_llm_model,
         "temperature": 0.2,
-        "max_tokens": 768,
+        "max_tokens": 64,
         "messages": [
             {
                 "role": "system",
@@ -1182,7 +1182,7 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
     }
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(8))
         .build()
         .context("failed to build LiteLLM client")?;
     let body = serde_json::json!({
@@ -1277,7 +1277,7 @@ pub fn request_generated_short_name(settings: &AppSettings, text: &str) -> Resul
     let context: String = text.chars().take(6000).collect();
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(8))
         .build()
         .context("failed to build LiteLLM client")?;
     let body = serde_json::json!({
