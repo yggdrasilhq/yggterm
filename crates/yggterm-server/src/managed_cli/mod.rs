@@ -3580,7 +3580,7 @@ fn gc_npm_cache_if_due(paths: &ManagedCliPaths, npm: &Path) {
         })
         .unwrap_or(0);
     // Walk _cacache for more accurate size if small dir check undercounts
-    let du_size = if cache_size_bytes < 500 * 1024 * 1024 {
+    let du_size = if cache_size_bytes < 100 * 1024 * 1024 {
         // Quick du via metadata walk depth 3 for _cacache
         fn du(path: &std::path::Path, depth: u32) -> u64 {
             if depth > 4 {
@@ -3605,7 +3605,7 @@ fn gc_npm_cache_if_due(paths: &ManagedCliPaths, npm: &Path) {
     } else {
         cache_size_bytes
     };
-    let size_triggered = du_size > 500 * 1024 * 1024;
+    let size_triggered = du_size > 100 * 1024 * 1024;
     if size_triggered {
         // Size trigger bypasses interval — tmpfs leak must be bounded promptly
     } else if !due {
@@ -3618,14 +3618,30 @@ fn gc_npm_cache_if_due(paths: &ManagedCliPaths, npm: &Path) {
     let _ = fs::write(&marker, b"");
 
     let started = std::time::Instant::now();
-    let output = Command::new(npm)
-        .env("npm_config_cache", &paths.cache_dir)
-        .env("npm_config_update_notifier", "false")
-        .arg("cache")
-        .arg("verify")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+    // When size-triggered, use `clean --force` to reclaim fully (verify left 2G
+    // per uglass home, still above 128M threshold — 11G total). Periodic 1d
+    // verify keeps hot entries; size trigger does full clean for tmpfs bound.
+    let use_clean_force = size_triggered;
+    let output = if use_clean_force {
+        Command::new(npm)
+            .env("npm_config_cache", &paths.cache_dir)
+            .env("npm_config_update_notifier", "false")
+            .arg("cache")
+            .arg("clean")
+            .arg("--force")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+    } else {
+        Command::new(npm)
+            .env("npm_config_cache", &paths.cache_dir)
+            .env("npm_config_update_notifier", "false")
+            .arg("cache")
+            .arg("verify")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+    };
     append_trace_event(
         &paths.home,
         "managed_cli",
