@@ -30437,11 +30437,11 @@ mod tests {
                 crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
                 yggui_contract::UiTheme::ZedLight,
             );
-            server.start_local_session(crate::SessionKind::Muse, Some("/home/user/proj"), None);
+            server.start_local_session(crate::SessionKind::GrokBuild, Some("/home/user/proj"), None);
             server.live_sessions()[0].clone()
         };
-        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(crate::SessionKind::Muse)
-            .expect("Muse is registered");
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(crate::SessionKind::GrokBuild)
+            .expect("GrokBuild is registered");
         assert!(
             descriptor.read_live_store_title.is_none(),
             "this test describes the UNMEASURED case; wire Muse's reader and \
