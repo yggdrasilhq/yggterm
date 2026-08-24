@@ -100,8 +100,9 @@ CLI_STORES = [
 # stay per-script on purpose: the oracle must not import the Rust descriptors).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ygg_scan_truth import (  # noqa: E402
-    agy_durable_rows, muse_noise_ids, condense_store_title,
+    agy_durable_rows, opencode_durable_rows, kimi_durable_rows, muse_noise_ids, condense_store_title,
 )
+
 
 
 def fleet_hosts():
@@ -254,6 +255,27 @@ def manual_walk_on_host(host):
             "mtime": 0,
             "parsed": {"session_id": row["id"], "cwd": row["cwd"], "title": row["title"]},
         })
+
+    for row in opencode_durable_rows(run_on_host, host, home):
+        sessions.append({
+            "host": host,
+            "cli": "opencode",
+            "kind": "opencode",
+            "path": row.get("path") or f"{home}/.local/share/opencode/opencode.db",
+            "mtime": row.get("mtime", 0),
+            "parsed": {"session_id": row["id"], "cwd": row["cwd"], "title": row.get("title")},
+        })
+
+    for row in kimi_durable_rows(run_on_host, host, home):
+        sessions.append({
+            "host": host,
+            "cli": "kimi",
+            "kind": "kimi",
+            "path": row.get("path") or f"{home}/.kimi/kimi.json",
+            "mtime": row.get("mtime", 0),
+            "parsed": {"session_id": row["id"], "cwd": row["cwd"], "title": row.get("title")},
+        })
+
 
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions, None

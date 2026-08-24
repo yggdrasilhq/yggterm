@@ -914,7 +914,18 @@ fn record_managed_cli_probe_span(
             }))
             .collect::<Vec<_>>(),
     }));
+    for (tool, probe) in probes {
+        let tool_perf = PerfSpan::start(home, "cli", &format!("refresh_managed_{}_probe", tool.binary_name()));
+        tool_perf.finish(serde_json::json!({
+            "phase": phase,
+            "tool": tool.binary_name(),
+            "available": probe.available,
+            "source": probe.source,
+            "version": probe.version,
+        }));
+    }
 }
+
 
 fn managed_cli_refresh_skip_remaining_ms(
     before: &[(ManagedCliTool, ToolProbe)],
@@ -4858,6 +4869,7 @@ pub(crate) fn refresh_local_managed_cli(
     ) {
         install_attempted = true;
         let install_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex_install");
+        let install_all_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_all_install");
         // ⭐ EVERY tool goes in. `install_latest` partitions by method — only
         // the npm ones share a batch — so a uv or vendor CLI can no longer poison
         // codex and claude's refresh, and no longer has to be filtered out to
@@ -4868,14 +4880,23 @@ pub(crate) fn refresh_local_managed_cli(
             .copied()
             .filter(|tool| provision_step_is_runnable(&paths, *tool))
             .collect::<Vec<_>>();
+        for tool in &installable {
+            let tool_perf = PerfSpan::start(&paths.home, "cli", &format!("refresh_managed_{}_install", tool.binary_name()));
+            tool_perf.finish(serde_json::json!({
+                "background": background,
+                "tool": tool.binary_name(),
+            }));
+        }
         if let Err(error) = install_latest(&paths, &installable, background) {
             install_error = Some(error.to_string());
         }
-        install_perf.finish(serde_json::json!({
+        let install_payload = serde_json::json!({
             "background": background,
             "success": install_error.is_none(),
             "tool_count": tools.len(),
-        }));
+        });
+        install_perf.finish(install_payload.clone());
+        install_all_perf.finish(install_payload);
     }
     let after = if skipped_recently || install_deferred {
         before.clone()
@@ -4936,16 +4957,12 @@ pub(crate) fn refresh_local_managed_cli(
                     tool,
                     before_probe,
                     after_probe,
-                    "error",
-                    format!("{} refresh failed: {error}", tool.display_name()),
+                    "failed",
+                    format!("Managed refresh failed: {error}"),
                 )
             } else if !provision_step_is_runnable(&paths, tool) {
-                // ⚠ Per-tool, and it NAMES the missing provisioner. The single
-                // "npm is unavailable" sentence this replaces was wrong twice
-                // over on a uv CLI: npm's absence is not why kimi is missing,
-                // and npm's presence would not have fixed it.
-                let action = if after_probe.available { "system_fallback" } else { "unavailable" };
                 let source = tool.package_name();
+                let action = if after_probe.available { "system_fallback" } else { "unavailable" };
                 let detail = if after_probe.available {
                     format!(
                         "Yggterm cannot provision {} on this machine (needs {source}), so it kept using the existing binary from PATH.",
@@ -4990,6 +5007,17 @@ pub(crate) fn refresh_local_managed_cli(
             }
         })
         .collect::<Vec<_>>();
+
+    for status in &statuses {
+        let tool_perf = PerfSpan::start(&paths.home, "cli", &format!("refresh_managed_{}", status.binary_name));
+        tool_perf.finish(serde_json::json!({
+            "action": status.action.clone(),
+            "available": status.available,
+            "version_before": status.version_before.clone(),
+            "version_after": status.version_after.clone(),
+        }));
+    }
+
 
     perf.finish(serde_json::json!({
         "background": background,
