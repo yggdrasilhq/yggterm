@@ -20111,7 +20111,7 @@ fn run_socket_sweep_chore_if_due(_home_dir: &Path, _now_ms: u64) {}
 /// Matches the per-machine refresh TTL: a shorter cadence would be work the TTL
 /// throws away, a longer one would leave a machine the owner has not opened
 /// stale for longer than the product's own idea of stale.
-const MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS: u64 = 6 * 60 * 60_000;
+const MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS: u64 = 2 * 60 * 60_000; // 2h — matches refresh TTL for frequent daily checks
 const ENV_YGGTERM_MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS: &str =
     "YGGTERM_MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS";
 const MANAGED_CLI_FLEET_SWEEP_MARKER_NAME: &str = "managed-cli-fleet-sweep";

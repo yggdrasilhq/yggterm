@@ -1830,6 +1830,12 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "reorder" {
         return yggterm_server::server_cli::run_server_reorder_cli(&store, &args);
     }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "drop-runtime" {
+        return yggterm_server::server_cli::run_server_drop_runtime_cli(&store, &args);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "remove" {
+        return yggterm_server::server_cli::run_server_remove_session_cli(&store, &args);
+    }
     if args.as_slice() == ["server", "shutdown"] {
         let endpoint = cli_server_endpoint(store.home_dir());
         if let Some(message) = shutdown(&endpoint)? {

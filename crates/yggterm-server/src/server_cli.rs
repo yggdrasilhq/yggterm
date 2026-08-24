@@ -644,11 +644,20 @@ fn connect_session_kind_for_path(path: &str) -> yggterm_core::SessionKind {
     if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(path) {
         return kind;
     }
+    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_row(path, "") {
+        return kind;
+    }
+    if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_for_store_path(path) {
+        return descriptor.kind;
+    }
     if path.contains("/.claude/projects/") {
         return yggterm_core::SessionKind::ClaudeCode;
     }
     if path.contains("/.local/share/muse/sessions/") {
         return yggterm_core::SessionKind::Muse;
+    }
+    if path.contains("/.gemini/antigravity-cli/") {
+        return yggterm_core::SessionKind::Antigravity;
     }
     yggterm_core::SessionKind::Codex
 }
@@ -965,6 +974,36 @@ pub fn run_server_connect_cli(store: &SessionStore, args: &[String]) -> anyhow::
     };
     run_server_connect_apply(&endpoint, &path, view, placement)
 }
+
+/// `server drop-runtime <key>` — drop a terminal runtime from daemon memory.
+pub fn run_server_drop_runtime_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    let key = args.get(2).ok_or_else(|| anyhow::anyhow!("missing runtime key for server drop-runtime"))?;
+    ensure_local_server_ready_for_cli(store)?;
+    let endpoint = cli_server_endpoint(store.home_dir());
+    let res = crate::daemon::drop_terminal_runtime(&endpoint, key, Some("cli-drop"))?;
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "dropped": true,
+        "runtime_key": key,
+        "result": res,
+    }))?);
+    Ok(())
+}
+
+/// `server remove <key>` — remove a session row completely from daemon.
+pub fn run_server_remove_session_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    let key = args.get(2).ok_or_else(|| anyhow::anyhow!("missing session key for server remove"))?;
+    ensure_local_server_ready_for_cli(store)?;
+    let endpoint = cli_server_endpoint(store.home_dir());
+    let (snapshot, msg) = crate::remove_session(&endpoint, key)?;
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "removed": true,
+        "session_path": key,
+        "message": msg,
+        "live_session_count": snapshot.live_sessions.len(),
+    }))?);
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod screen_verb_tests {

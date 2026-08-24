@@ -137,6 +137,8 @@ pub(crate) fn title_is_low_signal_for_copy(title: &str, cwd: &str) -> bool {
     trimmed.is_empty()
         || looks_like_generated_fallback_title(trimmed)
         || (!cwd.is_empty() && trimmed == cwd)
+        || (trimmed.starts_with('/') && trimmed.contains('/'))
+        || trimmed.starts_with("~/")
 }
 
 pub(crate) fn title_needs_generation_from_visible_titles(

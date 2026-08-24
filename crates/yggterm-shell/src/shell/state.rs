@@ -53619,6 +53619,10 @@ fn live_session_derived_label(
         && target != "local-codex"
         && target != "local-codex-litellm"
         && target != session.host_label
+        && !target.starts_with('/')
+        && !target.starts_with('~')
+        && target != metadata_value(session, "Cwd")
+        && yggterm_core::agent_cli_descriptor(session.kind).is_none()
     {
         return target;
     }
@@ -53853,7 +53857,7 @@ fn enrich_sidebar_rows_with_live_titles(
             && !title_looks_like_abbreviated_shell_label(direct_title)
         {
             title_by_path.insert(session.session_path.clone(), direct_title.to_string());
-            if matches!(session.source, SessionSource::LiveSsh) {
+            if matches!(session.source, SessionSource::LiveSsh | SessionSource::LiveLocal) {
                 remote_live_direct_title_paths.insert(session.session_path.clone());
             }
             continue;

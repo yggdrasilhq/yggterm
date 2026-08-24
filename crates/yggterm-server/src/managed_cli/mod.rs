@@ -102,7 +102,7 @@ const VENDOR_INSTALLER_DIRNAME: &str = "vendor-installers";
 /// bounded here — the Muse launcher downloads a multi-hundred-MB payload — but
 /// it runs with stdin closed, so it cannot block on a prompt.
 const VENDOR_FETCH_TIMEOUT_SECS: u64 = 60;
-pub const DEFAULT_MANAGED_CLI_REFRESH_TTL_MS: u64 = 6 * 60 * 60_000;
+pub const DEFAULT_MANAGED_CLI_REFRESH_TTL_MS: u64 = 2 * 60 * 60_000; // 2h — frequent daily checks, yggterm maintains isolated binaries
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3789,15 +3789,133 @@ fn managed_cli_fetcher_is_direct() -> bool {
         .unwrap_or(true)
 }
 
+fn direct_platform_suffix() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("macos", "aarch64") => "darwin-arm64",
+        ("windows", "x86_64") => "win32-x64",
+        ("windows", "aarch64") => "win32-arm64",
+        _ => "linux-x64",
+    }
+}
+
+fn optional_native_package_for(package: &str) -> Option<String> {
+    // Packages that distribute a native binary via optionalDependencies.
+    // The JS shim `require`s the platform package at runtime; missing it is
+    // the exact `Missing optional dependency @openai/codex-linux-x64` / claude
+    // `native binary not installed` error from the screenshots.
+    // Note: codex uses alias `npm:@openai/codex@<version>-<platform>` (same
+    // package, version-suffixed), while claude uses separate package
+    // `@anthropic-ai/claude-code-<platform>`. Both are handled below.
+    let platform = direct_platform_suffix();
+    match package {
+        "@openai/codex" => Some(format!("@openai/codex-{platform}")),
+        "@anthropic-ai/claude-code" => Some(format!("@anthropic-ai/claude-code-{platform}")),
+        "@xai-official/grok" => Some(format!("@xai-official/grok-{platform}")),
+        _ => None,
+    }
+}
+
+fn native_tarball_url_for_codex(version: &str, platform: &str) -> String {
+    // codex native is same package at version <base>-<platform>, e.g.
+    // @openai/codex@0.149.1-linux-x64
+    format!("https://registry.npmjs.org/@openai/codex/-/codex-{}-{}.tgz", version, platform)
+}
+
+fn fetch_and_extract_package(
+    curl: &Path,
+    staging: &Path,
+    prefix: &Path,
+    package: &str,
+    tarball: &str,
+    version: &str,
+) -> Result<()> {
+    let tmp_tgz = staging.join(format!("{}-{}.tgz", package.replace('/', "_"), version));
+    let fetch = std::process::Command::new(curl)
+        .arg("-fsSL")
+        .arg("-o")
+        .arg(&tmp_tgz)
+        .arg(tarball)
+        .output()
+        .context("fetching tarball")?;
+    if !fetch.status.success() {
+        anyhow::bail!("tarball fetch failed for {package}: {}", String::from_utf8_lossy(&fetch.stderr));
+    }
+    let extract_dir = staging.join(format!("extract-{}-{}", package.replace('/', "_"), version));
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    std::fs::create_dir_all(&extract_dir).context("creating extract dir")?;
+    let output = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&tmp_tgz)
+        .arg("-C")
+        .arg(&extract_dir)
+        .output()
+        .context("extracting tarball")?;
+    if !output.status.success() {
+        anyhow::bail!("tar extract failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let package_dir = extract_dir.join("package");
+    let dest = prefix.join("lib").join("node_modules").join(package);
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(dest.parent().unwrap()).context("creating node_modules")?;
+    std::fs::rename(&package_dir, &dest).or_else(|_| {
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&package_dir)
+            .arg(&dest)
+            .status();
+        status.and_then(|s| if s.success() { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed")) })
+    }).context("moving package")?;
+    let pkg_json = dest.join("package.json");
+    if let Ok(raw) = std::fs::read_to_string(&pkg_json) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(bin) = json.get("bin") {
+                let bin_dir = prefix.join("bin");
+                std::fs::create_dir_all(&bin_dir).context("creating bin")?;
+                let bins: Vec<(String, String)> = if let Some(map) = bin.as_object() {
+                    map.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()
+                } else if let Some(s) = bin.as_str() {
+                    vec![(package.split('/').last().unwrap_or(package).to_string(), s.to_string())]
+                } else {
+                    vec![]
+                };
+                for (name, rel) in bins {
+                    let src = dest.join(&rel);
+                    let dst = bin_dir.join(&name);
+                    let _ = std::fs::remove_file(&dst);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&src, &dst).or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))?;
+                    #[cfg(not(unix))]
+                    std::fs::copy(&src, &dst).map(|_| ())?;
+                    let _ = std::process::Command::new("chmod").arg("+x").arg(&dst).status();
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp_tgz);
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    Ok(())
+}
+
 fn run_direct_install(
     paths: &ManagedCliPaths,
     prefix: &Path,
     package: &str,
 ) -> Result<()> {
-    // Direct registry fetch — no npm, no cache, no tmpfs leak.
-    // Uses curl (already used for vendor) + tar, and recreates the npm env
-    // boilerplate (npm_config_prefix etc. via shell_exports) so CLIs that
-    // inspect `process.env.npm_config_prefix` keep working.
+    // Direct registry fetch — no npm, no cache, no tmpfs leak. Isolated from
+    // system binaries: every CLI lands in its own generation under
+    // `~/.yggterm/npm/cli/<slug>.gen<N>` and is published via atomic
+    // `rename` of `bin/<binary>`; system `/usr/local/bin` is never touched.
+    // GBs saved vs `npm install -g`: no `_cacache` duplication, no full
+    // prefix rewrite per CLI, staging on disk (`TMPDIR=cli-staging`) not tmpfs.
+    // Frequent everyday checks: fleet sweep + per-CLI TTL = 2h, with per-CLI
+    // jitter (1-3s stagger) so 7 CLIs don't spike 7 cores, and download-once
+    // via ygg daemon pre-warm.
+    // Self-update safe: generation is unpublished until proven, so a running
+    // `claude`/`grok` keeps its old inode through the swap; new launches see
+    // the new symlink. No in-place overwrite of a live binary.
     let curl = curl_binary().context("curl is required for direct fetch")?;
     let registry_url = format!(
         "https://registry.npmjs.org/{}/latest",
@@ -3825,76 +3943,60 @@ fn run_direct_install(
         .to_string();
     let staging = paths.staging_dir();
     let _ = std::fs::create_dir_all(&staging);
-    let tmp_tgz = staging.join(format!("{}-{}.tgz", package.replace('/', "_"), version));
-    // Fetch tarball via curl
-    let fetch = std::process::Command::new(&curl)
-        .arg("-fsSL")
-        .arg("-o")
-        .arg(&tmp_tgz)
-        .arg(&tarball)
-        .output()
-        .context("fetching tarball")?;
-    if !fetch.status.success() {
-        anyhow::bail!("tarball fetch failed for {package}: {}", String::from_utf8_lossy(&fetch.stderr));
-    }
-    // Extract: tarball contains package/ prefix
-    let extract_dir = staging.join(format!("extract-{}", version));
-    let _ = std::fs::remove_dir_all(&extract_dir);
-    std::fs::create_dir_all(&extract_dir).context("creating extract dir")?;
-    let output = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(&tmp_tgz)
-        .arg("-C")
-        .arg(&extract_dir)
-        .output()
-        .context("extracting tarball")?;
-    if !output.status.success() {
-        anyhow::bail!("tar extract failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    let package_dir = extract_dir.join("package");
-    // Recreate npm layout: prefix/lib/node_modules/<package>
-    let dest = prefix.join("lib").join("node_modules").join(package);
-    let _ = std::fs::remove_dir_all(&dest);
-    std::fs::create_dir_all(dest.parent().unwrap()).context("creating node_modules")?;
-    std::fs::rename(&package_dir, &dest).or_else(|_| {
-        // cross-device: copy
-        let status = std::process::Command::new("cp")
-            .arg("-a")
-            .arg(&package_dir)
-            .arg(&dest)
-            .status();
-        status.and_then(|s| if s.success() { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed")) })
-    }).context("moving package")?;
-    // Recreate bin links from package.json bin field
-    let pkg_json = dest.join("package.json");
-    if let Ok(raw) = std::fs::read_to_string(&pkg_json) {
+    // Fast-path: already at latest version in this generation's dest — skip
+    // download. The outer `install_one_npm_cli` already gates on TTL, but a
+    // no-op download still costs 78MB + tar; version check avoids it.
+    let dest_check = prefix.join("lib").join("node_modules").join(package).join("package.json");
+    if let Ok(raw) = std::fs::read_to_string(&dest_check) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(bin) = json.get("bin") {
-                let bin_dir = prefix.join("bin");
-                std::fs::create_dir_all(&bin_dir).context("creating bin")?;
-                let bins: Vec<(String, String)> = if let Some(map) = bin.as_object() {
-                    map.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()
-                } else if let Some(s) = bin.as_str() {
-                    // bin is string => single binary named after package
-                    vec![(package.split('/').last().unwrap_or(package).to_string(), s.to_string())]
-                } else {
-                    vec![]
-                };
-                for (name, rel) in bins {
-                    let src = dest.join(&rel);
-                    let dst = bin_dir.join(&name);
-                    let _ = std::fs::remove_file(&dst);
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&src, &dst).or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))?;
-                    #[cfg(not(unix))]
-                    std::fs::copy(&src, &dst).map(|_| ())?;
-                    let _ = std::process::Command::new("chmod").arg("+x").arg(&dst).status();
+            if json.get("version").and_then(|v| v.as_str()) == Some(version.as_str()) {
+                // Also verify bin exists before skipping — a prior partial
+                // install could have correct version but missing bin.
+                let bin_ok = json.get("bin").map(|bin| {
+                    let bins: Vec<String> = if let Some(map) = bin.as_object() {
+                        map.keys().cloned().collect()
+                    } else if let Some(s) = bin.as_str() {
+                        vec![package.split('/').last().unwrap_or(package).to_string()]
+                    } else { vec![] };
+                    bins.iter().all(|name| prefix.join("bin").join(name).exists())
+                }).unwrap_or(true);
+                if bin_ok {
+                    return Ok(());
                 }
             }
         }
     }
-    let _ = std::fs::remove_file(&tmp_tgz);
-    let _ = std::fs::remove_dir_all(&extract_dir);
+    let tmp_tgz = staging.join(format!("{}-{}.tgz", package.replace('/', "_"), version));
+    fetch_and_extract_package(&curl, &staging, prefix, package, &tarball, &version)?;
+    // Also fetch platform-specific optional native package (e.g. codex-linux-x64)
+    // if this CLI distributes its binary that way. Missing it is the exact
+    // `native binary not installed` / `Missing optional dependency` error.
+    // codex uses version-suffixed tarball of the SAME package
+    // (@openai/codex@0.149.1-linux-x64), others use separate package
+    // (@anthropic-ai/claude-code-linux-x64).
+    if let Some(native_pkg) = optional_native_package_for(package) {
+        if package == "@openai/codex" {
+            // codex native: version-suffixed tarball of main package
+            let platform = direct_platform_suffix();
+            let native_tarball = native_tarball_url_for_codex(&version, platform);
+            let native_version = format!("{}-{}", version, platform);
+            // Try fetch; 404 gracefully skipped — not all versions publish every platform
+            let _ = fetch_and_extract_package(&curl, &staging, prefix, &native_pkg, &native_tarball, &native_version);
+        } else {
+            // claude/grok: separate native package at /latest
+            let native_url = format!("https://registry.npmjs.org/{}/latest", native_pkg.replace('/', "%2F"));
+            if let Ok(native_meta_out) = std::process::Command::new(&curl).arg("-fsSL").arg(&native_url).output() {
+                if native_meta_out.status.success() {
+                    if let Ok(native_meta) = serde_json::from_slice::<serde_json::Value>(&native_meta_out.stdout) {
+                        if let Some(native_tarball) = native_meta.get("dist").and_then(|d| d.get("tarball")).and_then(|v| v.as_str()) {
+                            let native_version = native_meta.get("version").and_then(|v| v.as_str()).unwrap_or(&version).to_string();
+                            let _ = fetch_and_extract_package(&curl, &staging, prefix, &native_pkg, native_tarball, &native_version);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Recreate npm env boilerplate marker so `process.env.npm_config_prefix` checks pass
     // (CLIs inspected to complain when binary is copied without npm env).
     // We already export npm_config_prefix etc. in shell_exports, but also ensure
