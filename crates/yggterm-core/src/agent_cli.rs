@@ -2935,8 +2935,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_selector: ResumeSelector::Flag("--conversation"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
-        composer_marker: '\u{276f}',
-        composer_footer_hints: &["esc", "ctrl", "enter", "tab"],
+        composer_marker: '>',
+        composer_footer_hints: &["shortcuts", "esc", "ctrl", "enter", "tab", "gemini", "?"],
         working_footer_hints: &[
             "esc to cancel",
             "esc to interrupt",
