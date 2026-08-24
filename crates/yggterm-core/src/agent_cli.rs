@@ -2876,8 +2876,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             root: ".local/share/muse/sessions",
             file_name: ".session.lock",
         }),
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        read_live_store_title: Some(read_muse_live_store_title),
+        remote_live_store_title: Some(MUSE_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
@@ -3724,6 +3724,81 @@ fn read_antigravity_live_store_title(home: &Path, session_id: &str) -> Option<St
         .flatten()
 }
 
+/// [`AgentCliDescriptor::read_live_store_title`] for Muse.
+/// Looks in `~/.local/share/muse/session-index.db` (sessions table: workspace_root, title, updated_at_us)
+/// and falls back to `~/.local/share/muse/sessions/**/<session_id>/session.jsonl`.
+fn read_muse_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    let db_path = home.join(".local/share/muse/session-index.db");
+    if db_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT title, workspace_root FROM sessions WHERE session_id=?1",
+            ) {
+                if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
+                    if let Ok(Some(row)) = rows.next() {
+                        let title: Option<String> = row.get(0).ok();
+                        let ws: Option<String> = row.get(1).ok();
+                        let ws = ws.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                        let title = title
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty() && s != session_id)
+                            .filter(|s| !crate::looks_like_generated_fallback_title(s))
+                            .filter(|s| !crate::looks_like_low_signal_generated_copy(s));
+                        let title = match (&ws, &title) {
+                            (Some(ws), Some(t)) if t == ws => None,
+                            _ => title,
+                        };
+                        if let Some(t) = title {
+                            return Some(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let sessions_root = home.join(".local/share/muse/sessions");
+    if sessions_root.exists() {
+        if let Some(jsonl_path) = find_muse_session_jsonl_in(&sessions_root, session_id, 0) {
+            if let Some(t) = muse_title_from_session_jsonl(&jsonl_path) {
+                if !crate::looks_like_generated_fallback_title(&t)
+                    && !crate::looks_like_low_signal_generated_copy(&t)
+                {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_muse_session_jsonl_in(dir: &Path, session_id: &str, depth: usize) -> Option<PathBuf> {
+    if depth > 4 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some(session_id) {
+                let jsonl = path.join("session.jsonl");
+                if jsonl.exists() {
+                    return Some(jsonl);
+                }
+            }
+            if let Some(found) = find_muse_session_jsonl_in(&path, session_id, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// The ssh probe for Claude Code — the shape every other CLI's probe follows.
 ///
 /// Head (512 KB) catches the early `ai-title`; the tail window catches a late
@@ -4094,6 +4169,135 @@ fn first_agy_prompt_line_candidate(candidates: &[String]) -> Option<String> {
         .iter()
         .find_map(|candidate| clean_agy_prompt_first_line(candidate))
 }
+
+const MUSE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: MUSE_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobsAndCliHomeFiles(&["session-index.db"]),
+    choose: first_muse_title_candidate,
+};
+
+fn first_muse_title_candidate(candidates: &[String]) -> Option<String> {
+    candidates.iter().find_map(|candidate| {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty()
+            || crate::looks_like_generated_fallback_title(trimmed)
+            || crate::looks_like_low_signal_generated_copy(trimmed)
+            || trimmed.starts_with('/')
+        {
+            None
+        } else {
+            crate::best_effort_title_from_context(trimmed).or_else(|| {
+                let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+                if !first_line.is_empty() && first_line.len() <= 120 {
+                    Some(first_line.to_string())
+                } else {
+                    Some(trimmed.chars().take(80).collect())
+                }
+            })
+        }
+    })
+}
+
+const MUSE_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sqlite3, sys
+from pathlib import Path
+
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+locators = [value for value in argv[:split] if value.strip()]
+ids = [value for value in argv[split + 1:] if value.strip()]
+if not locators or not ids:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+candidates = {session_id: [] for session_id in ids}
+
+def offer(session_id, value):
+    if session_id in candidates and value and str(value).strip():
+        candidates[session_id].append(str(value).strip())
+
+def read_db(path):
+    if not path.exists():
+        return
+    for uri in (f'file:{path}?mode=ro', f'file:{path}?immutable=1'):
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+            break
+        except Exception:
+            conn = None
+    if conn is None:
+        return
+    try:
+        placeholders = ','.join('?' * len(ids))
+        rows = conn.execute(
+            'SELECT session_id, title, workspace_root FROM sessions '
+            'WHERE session_id IN (%s);' % placeholders, ids).fetchall()
+        for session_id, title, ws in rows:
+            if title and title.strip() and title.strip() != session_id and title.strip() != (ws or '').strip():
+                offer(session_id, title)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def read_jsonl(path):
+    session_id = path.parent.name
+    if session_id not in wanted:
+        return
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as handle:
+            for index, line in enumerate(handle):
+                if index > 64:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                pt = record.get('payload_type', '')
+                if pt in ('runtime.user_intent.accepted', 'runtime.user_intent.materialized'):
+                    payload = record.get('payload') or {}
+                    msgs = payload.get('model_messages') or []
+                    if msgs:
+                        content = msgs[0].get('content') or []
+                        if content and content[0].get('text'):
+                            text = content[0]['text'].strip()
+                            first_line = text.splitlines()[0].strip() if text else ''
+                            if first_line:
+                                offer(session_id, first_line[:100])
+                                return
+    except Exception:
+        pass
+
+for locator in locators:
+    if any(character in locator for character in '*?['):
+        try:
+            matches = sorted(home.glob(locator))
+        except Exception:
+            continue
+        for match in matches:
+            if match.name == 'session.jsonl':
+                read_jsonl(match)
+        continue
+    path = home / locator
+    if not path.exists():
+        continue
+    if path.suffix == '.db':
+        read_db(path)
+
+for session_id in ids:
+    found = candidates.get(session_id) or []
+    if found:
+        print(json.dumps({'session_id': session_id, 'candidates': found}, ensure_ascii=False))
+"#;
+
 
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
@@ -7246,5 +7450,42 @@ mod tests {
         assert!(!crate::screen_text_shows_agent_question_picker(
             " nothing here is a picker\n"
         ));
+    }
+
+    #[test]
+    fn muse_live_store_title_reads_index_and_jsonl() {
+        let home = std::env::temp_dir().join(format!("ygg-muse-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let muse_dir = home.join(".local/share/muse");
+        std::fs::create_dir_all(&muse_dir).unwrap();
+        let db_path = muse_dir.join("session-index.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, workspace_root TEXT, title TEXT, updated_at_us INTEGER);",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, workspace_root, title, updated_at_us) VALUES (?1, ?2, ?3, ?4);",
+            rusqlite::params![
+                "test-muse-uuid-1",
+                "/home/user/proj",
+                "Refactor Database Layer",
+                1700000000000000i64,
+            ],
+        ).unwrap();
+
+        let title = read_muse_live_store_title(&home, "test-muse-uuid-1");
+        assert_eq!(title.as_deref(), Some("Refactor Database Layer"));
+
+        // Fallback test: session not in DB but has session.jsonl
+        let session_dir = muse_dir.join("sessions/2026/08/24/test-muse-uuid-2");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let jsonl_path = session_dir.join("session.jsonl");
+        let jsonl_content = r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"Fix yggterm sidebar live titles"}]}]}}"#;
+        std::fs::write(&jsonl_path, jsonl_content).unwrap();
+
+        let title2 = read_muse_live_store_title(&home, "test-muse-uuid-2");
+        assert_eq!(title2.as_deref(), Some("Fix Yggterm Sidebar Live Titles"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

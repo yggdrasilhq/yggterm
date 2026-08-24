@@ -1177,14 +1177,21 @@ pub(crate) fn restored_live_row_key(live: &PersistedLiveSession) -> Option<Strin
             session_id,
         ));
     }
-    if !live_row_rekeys_onto_local_runtime(&live.key, &live.ssh_target, live.kind) {
+    let kind = if let Some(storage_path) = live.storage_path.as_deref()
+        && let Some(correct_kind) = yggterm_core::agent_scheme::session_kind_for_row(storage_path, "")
+    {
+        correct_kind
+    } else {
+        live.kind
+    };
+    if !live_row_rekeys_onto_local_runtime(&live.key, &live.ssh_target, kind) {
         return Some(live.key.clone());
     }
     let storage_path = live
         .storage_path
         .clone()
         .or_else(|| is_local_codex_storage_session_path(&live.key).then(|| live.key.clone()));
-    restored_local_runtime_id(&live.key, &live.id, live.kind, storage_path.as_deref())
+    restored_local_runtime_id(&live.key, &live.id, kind, storage_path.as_deref())
         .map(|id| canonical_local_live_runtime_key(&live.key, &id))
 }
 
@@ -1436,11 +1443,18 @@ fn persisted_live_session_from_managed(
             && local_live_session_kind_is_recoverable(session.kind))
         .then(|| "localhost".to_string())
     });
+    let resolved_kind = if let Some(storage_path) = storage_path.as_deref()
+        && let Some(correct_kind) = yggterm_core::agent_scheme::session_kind_for_row(storage_path, "")
+    {
+        correct_kind
+    } else {
+        session.kind
+    };
     ssh_target.map(|ssh_target| PersistedLiveSession {
         key: key.to_string(),
         id: session.id.clone(),
         title: session.title.clone(),
-        kind: session.kind,
+        kind: resolved_kind,
         keep_alive,
         ssh_target,
         prefix: session.ssh_prefix.clone(),
@@ -4518,6 +4532,22 @@ impl YggtermServer {
                 StoredPreviewHydrationMode::Eager,
             )
         });
+        if !was_missing && (entry.kind != kind || entry.source == SessionSource::Stored) {
+            entry.kind = kind;
+            let resolved_session_id = session_id
+                .map(ToOwned::to_owned)
+                .or_else(|| agent_store_session_id_for_path(path))
+                .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
+            let resolved_cwd = cwd
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| session_preview_cwd(path));
+            entry.launch_command = stored_session_launch_command_for_locality(
+                kind,
+                &resolved_cwd,
+                &resolved_session_id,
+                !session_path_is_remote(path),
+            );
+        }
         entry.kind = kind;
         entry.backend = self.backend;
         if kind == SessionKind::SshShell || path.starts_with("ssh://") {
@@ -7810,7 +7840,43 @@ impl YggtermServer {
     pub fn focus_live_session(&mut self, key: &str, origin: ActivationOrigin) {
         let resolved_key = self.resolve_live_session_key(key);
         if let Some(resolved_key) = resolved_key {
-            self.set_active_session_path(Some(resolved_key), origin);
+            let mut new_key = None;
+            if let Some(session) = self.sessions.get_mut(&resolved_key) {
+                if let Some(storage_path) = session_metadata_value(session, "Storage") {
+                    if let Some(correct_kind) = yggterm_core::agent_scheme::session_kind_for_row(&storage_path, "") {
+                        if session.kind != correct_kind {
+                            session.kind = correct_kind;
+                            let cwd = session_metadata_value(session, "Cwd").unwrap_or_else(local_default_cwd);
+                            session.launch_command = stored_session_launch_command_for_locality(
+                                correct_kind,
+                                &cwd,
+                                &session.id,
+                                !session_path_is_remote(&storage_path),
+                            );
+                            if session.session_path.starts_with("codex-runtime://") {
+                                session.session_path = format!("local://{}", session.id);
+                                new_key = Some(session.session_path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let target_key = if let Some(new_key) = new_key {
+                if let Some(session) = self.sessions.remove(&resolved_key) {
+                    self.sessions.insert(new_key.clone(), session);
+                    for o in &mut self.live_session_order {
+                        if *o == resolved_key {
+                            *o = new_key.clone();
+                        }
+                    }
+                    new_key
+                } else {
+                    resolved_key
+                }
+            } else {
+                resolved_key
+            };
+            self.set_active_session_path(Some(target_key), origin);
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
         } else if let Some((machine_key, session_id, kind)) =
@@ -10434,11 +10500,22 @@ impl YggtermServer {
                     .unwrap_or_else(|| remote_scanned_session_path(&machine_key, session_id));
                 (machine_key, session_id.to_string(), normalized_live_key, agent_kind)
             });
+        let normalized_kind = if let Some((_, _, _, agent_kind)) = remote_scanned_key.as_ref() {
+            *agent_kind
+        } else if let Some(storage_path) = storage_path.as_deref()
+            && let Some(correct_kind) = yggterm_core::agent_scheme::session_kind_for_row(storage_path, "")
+        {
+            correct_kind
+        } else if kind == SessionKind::SshShell {
+            SessionKind::Codex
+        } else {
+            kind
+        };
         let restored_local_id =
-            restored_local_runtime_id(&key, &id, kind, storage_path.as_deref())
+            restored_local_runtime_id(&key, &id, normalized_kind, storage_path.as_deref())
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
         let rekeys_onto_local_runtime =
-            live_row_rekeys_onto_local_runtime(&key, &ssh_target, kind);
+            live_row_rekeys_onto_local_runtime(&key, &ssh_target, normalized_kind);
         // The key this row lands under is `restored_live_row_key`'s answer —
         // the same function every cross-daemon judgement about the row asks.
         // It declines only when the id had to be minted just now, which is the
@@ -10449,13 +10526,6 @@ impl YggtermServer {
             restored_local_id
         } else {
             id
-        };
-        let normalized_kind = if let Some((_, _, _, agent_kind)) = remote_scanned_key.as_ref() {
-            *agent_kind
-        } else if kind == SessionKind::SshShell {
-            SessionKind::Codex
-        } else {
-            kind
         };
         let target = SshConnectTarget {
             label: ssh_target
@@ -10800,6 +10870,7 @@ impl YggtermServer {
             }
         }
         if let Some(session) = self.sessions.get_mut(&key) {
+            session.kind = normalized_kind;
             let _ = refresh_restored_remote_runtime_codex_launch_command(&key, session);
             if let Some(storage_path) = storage_path.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
@@ -10971,11 +11042,7 @@ impl YggtermServer {
         if session_id.is_empty() {
             session_id = Uuid::new_v4().to_string();
         }
-        let mut key = local_live_runtime_key(&session_id);
-        if self.sessions.contains_key(&key) {
-            session_id = Uuid::new_v4().to_string();
-            key = local_live_runtime_key(&session_id);
-        }
+        let key = local_live_runtime_key(&session_id);
         let cwd = session_metadata_value(&stored, "Cwd").unwrap_or_else(local_default_cwd);
         let target = local_session_target(stored.kind, Some(&cwd));
         let mut live = build_live_session(
@@ -10991,7 +11058,12 @@ impl YggtermServer {
         if !stored.title.trim().is_empty() {
             live.title = stored.title.clone();
         }
-        live.launch_command = stored.launch_command.clone();
+        live.launch_command = stored_session_launch_command_for_locality(
+            stored.kind,
+            &cwd,
+            &session_id,
+            true,
+        );
         live.preview = stored.preview.clone();
         live.rendered_sections = stored.rendered_sections.clone();
         live.terminal_lines = vec![
@@ -22280,7 +22352,7 @@ fn ensure_remote_managed_cli(
 /// How long a CONFIRMED-present remote CLI stays cached before the launch path
 /// asks that machine again. Long on purpose: a CLI that is installed does not
 /// disappear, and every miss here costs an SSH ROUND TRIP.
-const REMOTE_MANAGED_CLI_ENSURE_TTL_MS: u64 = 6 * 60 * 60_000;
+const REMOTE_MANAGED_CLI_ENSURE_TTL_MS: u64 = 2 * 60 * 60_000; // 2h — matches managed refresh for frequent checks
 
 /// How long an ABSENT-or-failed answer stays cached.
 ///
@@ -28981,6 +29053,25 @@ fn enumerate_local_agent_cli_identities() -> Vec<LocalAgentCliIdentity> {
                 storage_path: storage_path.display().to_string(),
                 birth_session_id: None,
             });
+        }
+        if let Some(home) = dirs::home_dir() {
+            for kind in [SessionKind::Muse, SessionKind::Antigravity] {
+                if let Some(descriptor) = agent_cli_descriptor(kind) {
+                    if let Some(session_id) = agent_session_identity_from_process_fds(descriptor, &home, pid) {
+                        let kind_slug = session_kind_label(kind).to_string();
+                        if seen.insert((kind_slug.clone(), session_id.clone())) {
+                            let cwd = local_default_cwd();
+                            identities.push(LocalAgentCliIdentity {
+                                kind: kind_slug,
+                                session_id,
+                                cwd,
+                                storage_path: String::new(),
+                                birth_session_id: None,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
     // Deterministic order so the SSH output (and any tests) are stable.

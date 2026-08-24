@@ -1272,6 +1272,12 @@ fn main() -> Result<()> {
         // ONE owner, both binaries — `yggterm_server::server_cli`.
         return yggterm_server::server_cli::run_server_reorder_cli(&store, &args);
     }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "drop-runtime" {
+        return yggterm_server::server_cli::run_server_drop_runtime_cli(&store, &args);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "remove" {
+        return yggterm_server::server_cli::run_server_remove_session_cli(&store, &args);
+    }
     // ⛔ THE LAST THREE `server` DIVERGENCES, AND THEY WERE ACCIDENTAL TOO.
     // These three were read as deploy/relay machinery that belonged to the
     // headless CLI by design — the one real fork this surface was said to

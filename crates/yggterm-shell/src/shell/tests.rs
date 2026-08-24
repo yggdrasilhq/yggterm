@@ -27697,6 +27697,162 @@ console.log('ok');
         assert_eq!(rows[0].label, "htop smoke proof");
         assert_eq!(rows[0].session_title.as_deref(), Some("htop smoke proof"));
     }
+
+    #[test]
+    fn enrich_sidebar_rows_with_live_titles_updates_antigravity_and_muse_live_local_sessions() {
+        let live_sessions = vec![
+            ManagedSessionView {
+                id: "agy-live-1".to_string(),
+                session_path: "local://agy-live-1".to_string(),
+                title: "Are all phases implemented?".to_string(),
+                kind: SessionKind::Antigravity,
+                host_label: "local-antigravity".to_string(),
+                source: yggterm_server::SessionSource::LiveLocal,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: RemoteDeployState::NotRequired,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    older_available: false,
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![
+                    SessionMetadataEntry {
+                        label: "Cwd",
+                        value: "/home/user/gh/yggterm".to_string(),
+                    },
+                    SessionMetadataEntry {
+                        label: "Target",
+                        value: "/home/user/gh/yggterm".to_string(),
+                    },
+                ],
+                terminal_process_id: None,
+                terminal_foreground_active: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+                working: None,
+                limit_wait: false,
+                awaiting_user_choice: false,
+                input_unanswered_ms: None,
+                agent_launch_options: Default::default(),
+                title_is_explicit: false,
+                outline_prefix: None,
+            },
+            ManagedSessionView {
+                id: "muse-live-1".to_string(),
+                session_path: "local://muse-live-1".to_string(),
+                title: "Refactor Database Layer".to_string(),
+                kind: SessionKind::Muse,
+                host_label: "local-muse".to_string(),
+                source: yggterm_server::SessionSource::LiveLocal,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: RemoteDeployState::NotRequired,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    older_available: false,
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![
+                    SessionMetadataEntry {
+                        label: "Cwd",
+                        value: "/home/user/proj".to_string(),
+                    },
+                ],
+                terminal_process_id: None,
+                terminal_foreground_active: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+                working: None,
+                limit_wait: false,
+                awaiting_user_choice: false,
+                input_unanswered_ms: None,
+                agent_launch_options: Default::default(),
+                title_is_explicit: false,
+                outline_prefix: None,
+            },
+        ];
+        let mut rows = vec![
+            BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: "local://agy-live-1".to_string(),
+                label: "/home/user/gh/yggterm".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: None,
+                depth: 2,
+                host_label: "local-antigravity".to_string(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some("agy-live-1".to_string()),
+                session_cwd: Some("/home/user/gh/yggterm".to_string()),
+                session_kind: Some(SessionKind::Antigravity),
+            },
+            BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: "local://muse-live-1".to_string(),
+                label: "/home/user/proj".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: None,
+                depth: 2,
+                host_label: "local-muse".to_string(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some("muse-live-1".to_string()),
+                session_cwd: Some("/home/user/proj".to_string()),
+                session_kind: Some(SessionKind::Muse),
+            },
+        ];
+
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(rows[0].label, "Are all phases implemented?");
+        assert_eq!(
+            rows[0].session_title.as_deref(),
+            Some("Are all phases implemented?")
+        );
+        assert_eq!(rows[1].label, "Refactor Database Layer");
+        assert_eq!(
+            rows[1].session_title.as_deref(),
+            Some("Refactor Database Layer")
+        );
+    }
+
     #[test]
     fn merged_sidebar_rows_do_not_promote_live_documents_into_live_sessions() {
         let rows = merged_sidebar_rows(
