@@ -45,6 +45,8 @@ CLI_STORES = [
     {"slug": "antigravity", "globs": [], "exclude": ["-shm", "-wal"], "kind": "antigravity", "glyph": "A_", "color": "#1557b0"},
     {"slug": "grok", "globs": [".grok/sessions/*/*/summary.json"], "exclude": [], "kind": "grok-build", "glyph": "G_", "color": "#000000"},
     {"slug": "muse", "globs": [".local/share/muse/sessions/**/session.jsonl"], "exclude": ["/subagent/", "/tool-outputs/"], "kind": "muse", "glyph": "M_", "color": "#86198f"},
+    {"slug": "opencode", "globs": [], "exclude": [], "kind": "opencode", "glyph": "OC_", "color": "#4338ca"},
+    {"slug": "kimi", "globs": [], "exclude": [], "kind": "kimi", "glyph": "K_", "color": "#1e40af"},
 ]
 
 KIND_TO_GLYPH = {c["kind"]: c["glyph"] for c in CLI_STORES}
@@ -56,8 +58,9 @@ KIND_TO_COLOR = {c["kind"]: c["color"] for c in CLI_STORES}
 # stay per-script on purpose: the oracle must not import the Rust descriptors).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ygg_scan_truth import (  # noqa: E402
-    agy_durable_rows, muse_noise_ids, locally_backed_ids,
+    agy_durable_rows, opencode_durable_rows, kimi_durable_rows, muse_noise_ids, locally_backed_ids,
 )
+
 
 
 def fleet_hosts():
@@ -183,7 +186,6 @@ def parse_cwd_from_file(host, path, cli_slug):
         out, _ = run_on_host(host, cmd)
         if out and out.strip():
             try:
-                import json
                 uris = json.loads(out.strip())
                 for u in uris:
                     if isinstance(u, str):
@@ -192,6 +194,7 @@ def parse_cwd_from_file(host, path, cli_slug):
                             return p, None
             except:
                 pass
+
         # Fallback to history.jsonl
         hcmd = f"grep -F '\"{session_id}\"' {shlex.quote(home)}/.gemini/antigravity-cli/history.jsonl 2>/dev/null | head -n 1"
         hout, _ = run_on_host(host, hcmd)
@@ -280,17 +283,34 @@ def parse_cwd_from_file(host, path, cli_slug):
                     return cwd.rstrip("/") if cwd != "/" else "/", None
             except: continue
         return None, None
+    elif cli_slug == "grok":
+        cmd = f"cat {shlex.quote(path)} 2>/dev/null | head -c 4000"
+        out, _ = run_on_host(host, cmd)
+        try:
+            data = json.loads(out)
+            info = data.get("info", {}) if isinstance(data, dict) else {}
+            cwd = info.get("cwd") or data.get("cwd")
+            sid = info.get("id") or data.get("sessionId")
+            title = info.get("title")
+            return (cwd, title, sid)
+        except Exception as e:
+            return None, None, None
     else:
-        # pi/qwen/grok/antigravity: minimal
+        # pi/qwen/antigravity: minimal
         cmd = f"head -n 5 {shlex.quote(path)} 2>/dev/null | head -c 8000"
         out, _ = run_on_host(host, cmd)
         for line in out.splitlines():
             try:
                 j=json.loads(line)
-                if j.get("cwd") or j.get("info", {}).get("cwd"):
-                    return j.get("cwd") or j.get("info", {}).get("cwd"), None
-            except: continue
-        return None, None
+                cwd = j.get("cwd") or j.get("info", {}).get("cwd")
+                sid = j.get("id") or j.get("sessionId") or j.get("info", {}).get("id")
+                if cwd or sid:
+                    return (cwd, None, sid)
+            except Exception as e:
+                continue
+        return None, None, None
+
+
 
 
 def manual_walk_on_host(host):
@@ -329,7 +349,10 @@ def manual_walk_on_host(host):
                     mtime = int(stat_out.strip())
                 except:
                     mtime = 0
-                cwd, title = parse_cwd_from_file(host, f, cli["slug"])
+                parsed_res = parse_cwd_from_file(host, f, cli["slug"])
+                cwd = parsed_res[0] if parsed_res else None
+                title = parsed_res[1] if parsed_res and len(parsed_res) > 1 else None
+                sid_parsed = parsed_res[2] if parsed_res and len(parsed_res) > 2 else None
                 if cli["slug"] == "muse" and cwd is None and title is None:
                     # skipped subagent fallback already; skip if no cwd
                     # Use home as fallback like Rust does, so include with home cwd
@@ -340,8 +363,7 @@ def manual_walk_on_host(host):
                 if cli["slug"] == "muse":
                     session_id = Path(f).parent.name
                 elif cli["slug"] == "grok":
-                    # grok: .grok/sessions/<encoded-cwd>/<uuid>/summary.json -> id is parent dir
-                    session_id = Path(f).parent.name
+                    session_id = sid_parsed or Path(f).parent.name
                 elif cli["slug"] == "antigravity" and f.endswith("transcript.jsonl"):
                     parts = Path(f).parts
                     if ".system_generated" in parts:
@@ -349,6 +371,8 @@ def manual_walk_on_host(host):
                         session_id = parts[idx - 1]
                     else:
                         session_id = Path(f).parent.parent.parent.name
+                elif sid_parsed:
+                    session_id = sid_parsed
                 else:
                     session_id = Path(f).stem
                     if cli["slug"] == "claude-code" and session_id.startswith("agent-"):
@@ -360,6 +384,9 @@ def manual_walk_on_host(host):
                             parts = session_id.split("-")
                             if len(parts) >= 5:
                                 session_id = "-".join(parts[-5:])
+                    elif "_" in session_id:
+                        session_id = session_id.split("_", 1)[-1]
+
                 sessions.append({
                     "host": host,
                     "cli": cli["slug"],
@@ -385,6 +412,31 @@ def manual_walk_on_host(host):
             "session_id": row["id"],
             "glyph": "A_",
         })
+
+    for row in opencode_durable_rows(run_on_host, host, home):
+        sessions.append({
+            "host": host,
+            "cli": "opencode",
+            "kind": "opencode",
+            "path": row.get("path") or f"{home}/.local/share/opencode/opencode.db",
+            "cwd": row["cwd"],
+            "mtime": row.get("mtime", 0),
+            "session_id": row["id"],
+            "glyph": "OC_",
+        })
+
+    for row in kimi_durable_rows(run_on_host, host, home):
+        sessions.append({
+            "host": host,
+            "cli": "kimi",
+            "kind": "kimi",
+            "path": row.get("path") or f"{home}/.kimi/kimi.json",
+            "cwd": row["cwd"],
+            "mtime": row.get("mtime", 0),
+            "session_id": row["id"],
+            "glyph": "K_",
+        })
+
 
     # A zero-prompt muse placeholder is skipped by the scan, so the oracle must
     # skip it too. ⚠ These have real files behind them; this set is for skipping,

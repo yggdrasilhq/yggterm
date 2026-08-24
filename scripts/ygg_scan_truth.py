@@ -144,6 +144,89 @@ def muse_noise_ids(run_on_host, host):
     return set(ids or [])
 
 
+_OPENCODE_DUMP = r"""
+import json, os, sqlite3
+home = os.path.expanduser("~")
+db = os.path.join(home, ".local/share/opencode/opencode.db")
+rows = []
+if os.path.exists(db):
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+        for sid, directory, title, tu, tc in conn.execute(
+            "select id, directory, title, time_updated, time_created from session"
+        ):
+            if not sid or not sid.strip():
+                continue
+            rows.append({
+                "id": sid.strip(),
+                "cwd": directory.strip() if (directory and directory.strip()) else home,
+                "title": (title or "").strip() or None,
+                "mtime": (tu * 1000) if tu else ((tc * 1000) if tc else 0),
+                "path": db,
+            })
+    except Exception:
+        rows = []
+print(json.dumps(rows))
+"""
+
+_KIMI_DUMP = r"""
+import json, os, hashlib
+home = os.path.expanduser("~")
+kimi_json = os.path.join(home, ".kimi/kimi.json")
+sessions_root = os.path.join(home, ".kimi/sessions")
+md5_to_cwd = {}
+if os.path.exists(kimi_json):
+    try:
+        with open(kimi_json, "r") as f:
+            v = json.load(f)
+            for wd in v.get("work_dirs", []):
+                p = wd.get("path")
+                if p:
+                    md5_to_cwd[hashlib.md5(p.encode("utf-8")).hexdigest()] = p
+    except Exception:
+        pass
+rows = []
+if os.path.isdir(sessions_root):
+    try:
+        for bucket in os.listdir(sessions_root):
+            b_path = os.path.join(sessions_root, bucket)
+            if not os.path.isdir(b_path):
+                continue
+            cwd = md5_to_cwd.get(bucket, home)
+            for sid in os.listdir(b_path):
+                s_path = os.path.join(b_path, sid)
+                ctx = os.path.join(s_path, "context.jsonl")
+                if os.path.exists(ctx):
+                    try:
+                        mtime = int(os.path.getmtime(ctx) * 1000)
+                    except Exception:
+                        mtime = 0
+                    rows.append({
+                        "id": sid,
+                        "cwd": cwd,
+                        "title": None,
+                        "mtime": mtime,
+                        "path": ctx,
+                    })
+    except Exception:
+        rows = []
+print(json.dumps(rows))
+"""
+
+
+def opencode_durable_rows(run_on_host, host, home):
+    """The opencode sessions from SQLite opencode.db."""
+    rows = _run_python(run_on_host, host, _OPENCODE_DUMP)
+    return rows or []
+
+
+def kimi_durable_rows(run_on_host, host, home):
+    """The kimi sessions from ~/.kimi/sessions/."""
+    rows = _run_python(run_on_host, host, _KIMI_DUMP)
+    return rows or []
+
+
+
 _EXISTS_DUMP = r"""
 import json, os, sys
 paths = json.loads(sys.stdin.read())
