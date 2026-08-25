@@ -19793,10 +19793,15 @@ impl ShellState {
         let own_version = current_version();
         let status = self.latest_runtime_status.as_ref()?.clone();
         let daemon_version = status.server_version.trim().to_string();
-        if daemon_version.is_empty() || daemon_version == own_version {
+        if daemon_version.is_empty() {
             return None;
         }
-        if !Self::is_version_newer(&daemon_version, &own_version) {
+        // Same version but daemon has a newer build on disk (hot_restart_pending) — treat as skew too.
+        let is_same_version_newer_build = daemon_version == own_version && status.hot_restart_pending;
+        if daemon_version == own_version && !is_same_version_newer_build {
+            return None;
+        }
+        if !is_same_version_newer_build && !Self::is_version_newer(&daemon_version, &own_version) {
             if self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version) {
                 self.version_convergence_last_seen_daemon_version = Some(daemon_version.clone());
                 if let Ok(home) = resolve_yggterm_home() {
@@ -19827,7 +19832,7 @@ impl ShellState {
                     json!({
                         "own_version": own_version,
                         "newest_seen": daemon_version,
-                        "source": "daemon",
+                        "source": if is_same_version_newer_build { "daemon_pending" } else { "daemon" },
                         "server_pid": status.server_pid,
                     }),
                 );
