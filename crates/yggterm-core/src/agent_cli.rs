@@ -3318,54 +3318,61 @@ fn muse_title_from_session_jsonl(path: &Path) -> Option<String> {
     // zero prompts; the old 64-line ceiling made the durable row untitled.
     for line in reader.lines().flatten() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-            // Muse's user prompt lives in payload.model_messages[0].content[0].text
-            // under payload_type runtime.user_intent.accepted / materialized.
+            // Muse's user prompt lives under payload.model_messages[*].content[*].text
+            // for payload_type runtime.user_intent.accepted / materialized. Do not
+            // stop at the first accepted envelope: a launch-purpose envelope can
+            // be low-signal while the next accepted envelope is the real task.
             let pt = value.get("payload_type").and_then(|v| v.as_str()).unwrap_or("");
             if pt == "runtime.user_intent.accepted" || pt == "runtime.user_intent.materialized" {
-                if let Some(text) = value
+                let model_texts = value
                     .get("payload")
                     .and_then(|p| p.get("model_messages"))
                     .and_then(|m| m.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|msg| msg.get("content"))
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|c| c.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        if let Some(title) = crate::best_effort_title_from_context(trimmed) {
-                            return Some(title);
-                        }
-                        // Fallback: first line
-                        let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
-                        if !first_line.is_empty() && first_line.len() <= 120 {
-                            return Some(first_line.to_string());
-                        }
-                        return Some(trimmed.chars().take(80).collect());
+                    .into_iter()
+                    .flat_map(|messages| messages.iter())
+                    .filter_map(|message| message.get("content").and_then(|c| c.as_array()))
+                    .flat_map(|content| content.iter())
+                    .filter_map(|content| content.get("text").and_then(|text| text.as_str()));
+                for text in model_texts {
+                    if let Some(title) = usable_muse_prompt_title(text) {
+                        return Some(title);
                     }
                 }
                 // Fallback inside refill_blocks
-                if let Some(text) = value
+                let refill_texts = value
                     .get("payload")
                     .and_then(|p| p.get("refill_blocks"))
                     .and_then(|r| r.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|b| b.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        if let Some(title) = crate::best_effort_title_from_context(trimmed) {
-                            return Some(title);
-                        }
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|block| block.get("text").and_then(|text| text.as_str()));
+                for text in refill_texts {
+                    if let Some(title) = usable_muse_prompt_title(text) {
+                        return Some(title);
                     }
                 }
             }
         }
     }
     None
+}
+
+fn usable_muse_prompt_title(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+    let condensed = crate::best_effort_title_from_context(trimmed).or_else(|| {
+        let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+        if !first_line.is_empty() && first_line.len() <= 120 {
+            Some(first_line.to_string())
+        } else {
+            Some(trimmed.chars().take(80).collect())
+        }
+    })?;
+    (!crate::looks_like_generated_fallback_title(&condensed)
+        && !crate::looks_like_low_signal_generated_copy(&condensed))
+        .then_some(condensed)
 }
 
 /// Codex keeps no title in its own transcript — the generated-copy store
@@ -4307,14 +4314,15 @@ def read_jsonl(path):
                 if pt in ('runtime.user_intent.accepted', 'runtime.user_intent.materialized'):
                     payload = record.get('payload') or {}
                     msgs = payload.get('model_messages') or []
-                    if msgs:
-                        content = msgs[0].get('content') or []
-                        if content and content[0].get('text'):
-                            text = content[0]['text'].strip()
-                            first_line = text.splitlines()[0].strip() if text else ''
-                            if first_line:
-                                offer(session_id, first_line[:100])
-                                return
+                    for message in msgs:
+                        for content in (message.get('content') or []):
+                            text = content.get('text')
+                            if text and str(text).strip():
+                                offer(session_id, str(text).strip())
+                    for block in (payload.get('refill_blocks') or []):
+                        text = block.get('text')
+                        if text and str(text).strip():
+                            offer(session_id, str(text).strip())
     except Exception:
         pass
 
@@ -7570,6 +7578,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An accepted Muse envelope is not automatically a usable title. A
+    /// launch-purpose envelope may precede the first real user task, so the
+    /// reader must continue after the title classifier rejects one candidate.
+    #[test]
+    fn muse_title_search_continues_after_low_signal_intent() {
+        let root = dirs::home_dir()
+            .unwrap()
+            .join(".yggterm/scratchpad")
+            .join(format!("muse-title-candidates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"New Muse Code Session"}]}]}}"#,
+                "\n",
+                r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"Repair persistent CLI row identity"}]}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            muse_title_from_session_jsonl(&transcript).as_deref(),
+            Some("Repair Persistent CLI Row Identity")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The ssh-side Muse reader used to stop after 65 records even though its
     /// local twin scans until the first accepted intent. Real Muse sessions
     /// have been measured with that intent hundreds of lifecycle records in,
@@ -7595,7 +7633,8 @@ mod tests {
             })
             .collect::<String>();
         records.push_str(
-            r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"Repair remote Muse title parity"}]}]}}
+            r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"New Muse Code Session"}]}]}}
+{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"Repair remote Muse title parity"}]}]}}
 "#,
         );
         std::fs::write(session_dir.join("session.jsonl"), records).unwrap();
