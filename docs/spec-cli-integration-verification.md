@@ -92,11 +92,74 @@ duplicate. Acceptance therefore also requires at most one `(full_path,
 presence)` row while permitting one rail plus one cwd-tree row.
 
 For a CLI that mints its id after birth, cwd is not an identity oracle. A resume
-may be re-rooted into a worktree while the transcript retains its original cwd.
-The owning daemon's birth-id → real-id relation is authoritative; remote Codex
-exports it as `birth_session_id`, and `cli/identity_poll` reports exact-alias
-candidates separately from cwd candidates. `identities_seen > 0` with both
-candidate counts at zero is a failed join, not an empty store.
+may be re-rooted into a worktree while the transcript retains its original cwd,
+and some process markers cannot report cwd at all. The owning daemon's
+`(kind, birth-id) → real-id` relation is authoritative; the historically named
+`local-codex-identities` wire exports it as `birth_session_id` for every measured
+self-minting CLI. `cli/identity_poll` reports exact-alias candidates separately
+from Codex-only compatibility cwd candidates. `identities_seen > 0` with both
+candidate counts at zero is a failed join, not an empty store. Acceptance also
+requires every rebound live wrapper to query title storage with its logical real
+id while retaining its birth-path I/O key.
+
+The liveness oracle is `cli/attachment_sweep`, not row paint. Every registered
+kind must appear in `per_kind`; a row in `Running`, `RemoteBootstrap`, or
+`BridgePending` must be either locally running or explicitly preserved by a
+live handoff owner. `exited_runtime + missing_runtime` must be zero at the
+release gate. `unbound_presence` is a separate identity/presence defect: it
+must be investigated and repaired, but must not be counted as proof that the
+observing daemon dropped a PTY. Remote row schemes are `not_expected` on the
+GUI-host daemon and are audited by their owning host. A restart blocked on child exit must answer within the client
+deadline, retain the old runtime key, emit `cli/attachment`, and never launch a
+second writer. Managed `--version` probes must emit `cli/version_probe` and
+finish or time out within their two-second metadata budget.
+
+The reverse direction is equally binding: every daemon-owned agent runtime key
+must be represented by one live row after a handoff. A `local://<birth>` row
+represents the descriptor's `<cli>-runtime://<birth>` seat, and a self-minting
+row also tries the rebound logical id. A descriptor that crosses with no row is
+recovered in place, without launching, and emits
+`cli/orphan_runtime_row_recovered`. The release gate compares the owning
+daemon's `owned_terminal_session_keys` against row representation; a successful
+descriptor transfer with an invisible PTY is a failure.
+
+A Muse row with `session-index.db.prompt_count = 0` is noise only when its
+transcript contains no accepted user intent. The shared startpage/cwdtree scan
+must include a real intent even when it occurs after more than 64 lifecycle
+records, and the ssh-side title probe must scan to the same accepted intent
+rather than applying a shorter record cap. The scan must derive Muse's index
+beside the scanned store rather than from the caller's HOME. A handoff launch
+classifier must not infer Pi from `/home/user/pi/...`; a path-only shell is no agent,
+while a later exact `agy` command is Antigravity. A wrong-kind row may be
+reclassified only when it is a non-explicit update placeholder with the same
+runtime birth id, and the trace reports `row_repair:reclassified`. `server
+update-daemons --force` must attempt a handoff even when the running and target
+semvers are equal.
+
+A remote title lookup that returns no candidate must remain unconfirmed. The
+release test covers a store miss before a self-minting CLI's identity rebind and
+requires the idle real-id row to be polled again. Only a positive store lookup
+(including one whose title already agrees with the row) may produce
+`skipped_title_settled` on later idle ticks.
+
+The title writer is tested with a sessions-map birth key and a distinct
+descriptor runtime `session_path`. Derived title, summary, explicit rename, and
+explicit-title protection must all reach the same row through either spelling.
+The live gate rejects a background tick that repeatedly proposes updates while
+applying zero unless `cli/title_apply_refused` names an intentional owner-title
+refusal.
+
+Muse remote-title tests feed a raw polite prompt (`Please ...`) and require the
+chooser to condense it before low-signal classification. A trace/store miss with
+`candidate_count > 0` is a chooser failure, while zero is genuine absence. The
+independent Python oracle likewise treats a zero-prompt DB row as noise only
+when its top-level transcript contains no accepted/materialized user intent.
+
+The Startpage oracle retains its 45-second deadline. Its faithful GUI witness
+path must use the resolved daemon endpoint and bounded direct app-control reads;
+it must not spawn a yggterm child, negotiate daemon readiness, or search `PATH`.
+`cli/startpage_observers/faithful_read.elapsed_ms` makes observer time distinct
+from durable-store scan time without exposing session content.
 
 * Sweep verb: `server titles sweep [--dry-run] [--limit N] [--prune] [--kind <slug>] [--json]` — the ACT half of the same answer. It classifies every durable row with the SAME recognizer `ls` reports through (`looks_like_generated_fallback_title`), resolves the bad ones store-first then by generation, stops the moment the endpoint refuses (a report that kept going would blame the sessions for the endpoint), and with `--prune` forgets copy for sessions that exist nowhere — never younger than 7 days, never while the daemon is unreachable, because a live row's copy is keyed by its runtime id and would otherwise read as an orphan.
 

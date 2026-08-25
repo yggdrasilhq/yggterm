@@ -50,7 +50,8 @@ and `~/.local/share/ytrace/yggterm` is a **stale orphan** left from before that 
 days old**, alongside a live stream in the yggterm home. It is well-formed, it parses, it has the
 right probe names, and it is silently out of date — a reader who globs `~/.local/share/ytrace/**`
 gets a confident answer about yesterday. **Never hand-resolve this path.** Ask the CLI
-(`ytrace query|tail|incidents|health`), which resolves it the one way the writer does.
+(`ytrace query|top|flame|timeseries|tail|incidents|health`) or Python `notebooks/ytrace_helpers.py`,
+which resolve it the one way the writer does.
 
 ---
 
@@ -58,7 +59,7 @@ gets a confident answer about yesterday. **Never hand-resolve this path.** Ask t
 
 ### 2.1 Declared
 
-`perf::ytrace_provider()` (`crates/yggterm-core/src/perf.rs:14`) pre-registers 33 probes so that
+`perf::ytrace_provider()` (`crates/yggterm-core/src/perf.rs:14`) pre-registers 37 probes so that
 sampling policy and clock are attached before the first emission:
 
 | Group | Probes | Clock | Sampling |
@@ -70,6 +71,7 @@ sampling policy and clock are attached before the first emission:
 | title lifecycle | `title/{untitled_session,resolve_attempt,llm_rescue,cli_store_hit,generation}` | wall | always |
 | input latency | `input/{keystroke,pty,render,loop_block,unconsumed}` | wall | always |
 | per-CLI wiring | `cli/{agy_title,agy_resume,codex_geometry,codex_resume,persisted_identity}` | wall | always |
+| web surface & sidebar | `web_surface/{liveness,lifecycle}`, `sidebar/liveness` | wall | always |
 
 `resource_governor.rs:59` registers three more from the daemon: `row_resource/{hot,oom}` (cpu) and
 `daemon/resource_governor` (wall).
@@ -99,8 +101,44 @@ Its shared grammar is `birth` → `launch` → `identity_poll` → `title` /
 * `identity_poll` explains a self-minted-id join without exposing cwd or title:
   `target_rows`, `identities_seen`, `identities_with_birth_alias`,
   `exact_alias_candidates`, `cwd_candidates`, `rebinds`, and
-  `newly_exhausted`. An identity count above zero with both candidate counts at
-  zero means discovery worked and the join failed.
+  `newly_exhausted`. It is emitted once per registered CLI kind considered in
+  the tick, even though each machine is queried only once. An identity count
+  above zero with both candidate counts at zero means discovery worked and the
+  join failed. `local_identity_bind` is the owning-daemon edge that confirms a
+  late CLI-minted id was persisted; it records kind and id origin, never cwd,
+  transcript path, or title.
+* `title` / `title_sweep` expose each registry CLI's local- and remote-store
+  outcome without title text. A remote `no_title_in_store` carries
+  `retry:"unconfirmed_until_store_title"`: a negative lookup is eventual
+  state, not confirmation, and remains eligible for the bounded idle retry.
+  `skipped_title_settled` is valid only after a positive store lookup for the
+  row's current logical id (or when the store already agrees with the row).
+  `title_apply_refused` identifies a proposal that reached the writer but did
+  not land, carrying only `row_resolved` and `owner_titled`; it exists to split
+  an intentional provenance refusal from an alias-resolution defect.
+  Remote misses also carry `candidate_count` and `probe_line_count`: the first
+  distinguishes an empty store from candidates rejected by title policy, and
+  neither field contains transcript or title content.
+* `attachment_sweep` is the cross-CLI liveness census. Every registered kind is
+  present even at zero, with `running`, `preserved`, `exited_runtime`,
+  `missing_runtime`, `unbound_presence`, and `not_expected` counts. Projected
+  remote rows are not expected on this daemon. A legacy/birth `local://` row
+  with no owner is reported separately as unbound presence: it is a visible
+  row-identity anomaly, but does not prove that this daemon dropped an owned
+  PTY. `attachment` records the rare bounded-restart refusal that deliberately
+  keeps the old runtime seated. `orphan_runtime_row_recovered` is the reverse
+  edge: a PTY descriptor crossed a handoff but no managed row represented its
+  key, so the successor restored addressable presence without launching a
+  process. It carries only CLI kind, runtime scheme, and identity origin.
+* `startpage_observers/faithful_read` proves the Startpage CLI's optional GUI
+  witnesses were read in-process. It reports browser-row count, daemon-snapshot
+  and app-state availability, elapsed milliseconds, and the bounded
+  app-control timeout. It never contains row identity or content. Absence means
+  the store-only fallback should answer; it must not trigger daemon startup.
+* `version_probe` proves managed metadata work is bounded (`completed`,
+  `timed_out`, or `failed`, with elapsed and ceiling). `runtime_conflict` and
+  `resume_refusal` classify CLI-owned resume errors; they never carry screen
+  samples, transcript content, cwd, or launch commands.
 * `projection` is the GUI end of the chain. Initial healthy rows stay in the
   aggregate; a bad edge and its recovery emit once per row/presence. It reports
   `title_quality`, `kind_source`, `icon_kind`, `expected_icon_kind`, and
@@ -621,6 +659,22 @@ There is no "declared but silent" report. §2.2 exists because the only way to n
 registration list against the observed stream. A notebook that queries `title/*` and gets zero rows
 cannot distinguish "the title path is healthy" from "the title path emits under another name" —
 which is the actual answer here (`copy_generation/title`).
+
+---
+
+### 4.5 CLI orphan-row repair outcomes
+
+`cli/orphan_runtime_row_recovered` is an edge event after a daemon accepts an
+already-live agent PTY. Its `row_repair` field separates a missing row restored
+as `recovered` from a narrow wrong-kind placeholder correction reported as
+`reclassified`. The event is content-free: kind, runtime scheme, id origin, and
+repair outcome are sufficient. It must not contain launch commands, transcript
+text, titles, or prompts.
+
+The classifier feeding this repair treats absolute paths as indivisible words;
+`/home/user/pi/...` is not evidence for the Pi CLI. A reclassification is permitted
+only for a derived update-restart placeholder with the same runtime birth id,
+so the event must never be interpreted as authority to rewrite ordinary rows.
 
 ---
 

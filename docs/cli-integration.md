@@ -111,6 +111,7 @@ The protocol system enforces uniform, structured compliance across all 10 regist
 ### Issue Heading 3: Live Birth & Transport Scheme Normalization
 * **Rule:** Connecting or focusing an agent session row must normalize the live key using `parse_remote_agent_session_path_with_kind` / `remote_agent_session_path` across all registered schemes (`remote-session://`, `remote-cc://`, `remote-muse://`, `remote-agy://`, `remote-pi://`, `remote-qwen://`, `remote-grok://`, `remote-opencode://`, `remote-kimi://`).
 * **Implementation:** `crates/yggterm-server/src/lib.rs` preserves `SessionSource::LiveSsh` with the target host and exact `SessionKind` (never falling back to local `SessionKind::Codex`).
+* **Restore invariant (2026-08-24):** `restored_live_row_key` must return the same normalized per-CLI scheme that `restore_live_session` inserts. Rebuilding a generic parsed remote key through the historical `remote_scanned_session_path` constructor silently turns every scheme into `remote-session://` during the pre-restore identity, tombstone, and active-path passes. `restore_live_session_preserves_every_registered_remote_agent_scheme` iterates `AGENT_CLIS` and locks both sides of that relation.
 
 ### Issue Heading 4: Restart Preservation & Server Restoration
 * **Rule:** GUI restart or daemon re-attach must faithfully restore all agent session rows without dropping them or re-keying them as plain local shells.
@@ -407,6 +408,266 @@ the stall.
 ### Issue Heading 15: Codex / codex-litellm exemplar — wiring hiccups vs Claude gold (like Muse)
 
 *Why codex.* `codex` (`codex` binary, `remote-session://` historical `remote-codex://` + `codex-runtime://`, `codex resume <id>`) and `codex-litellm` (`codex-litellm` binary, local-only `codex-litellm://`, `id_assigned_at_birth` same) are *workable* per matrix (`TitleAuthority::Generated` via `SessionTitleStore` heuristic/litellm, store `~/.codex/sessions/**/rollout-*.jsonl` id inside file, `re_roots_with_cwd:true` for `codex`, `false` for `litellm`). Their measured faults are: (1) **Remote identity/title/resume drift** — the GUI-host wrapper is born with a version-4 UUID while the target-host daemon discovers Codex's version-7 transcript id. Joining those rows by transcript cwd fails for worktrees, leaving the birth title and a cold-restore command aimed at a nonexistent id. The target daemon's `UUID` → `Codex Session` pair is authoritative; `local-codex-identities` now carries it as `birth_session_id`, the poll matches it before cwd, and `cli/identity_poll` + `cli/projection` make every failed edge visible. (2) **Geometry squish** — daemon re-creates PTY at default `120×36` after hot-update re-resume, `last_sent_terminal_resize_*` is stale-equal to live grid, so no `Resize` fires and `codex` renders squished; fix is `viewport.rs:9837` re-resume squish repair (`last_sent_* = 0` + `spawn_terminal_startup_resize_repair`) now emits `ytrace cli/codex_geometry` (`stale_cols/rows`, `live_cols/rows`, `kind: codex_squish_repair`) for Dash. (3) **Differential CUF spaces** — `CUF` cursor-forward skips leave stale `bg` artifacts; mitigated by full screen replay on reveal (same `muse`/`codex` path, `ytrace` `terminal_mount` already). (4) **Middle desync on rapid switch** — `codex` status bar truncation if `SIGWINCH` not nudged; `terminal_write_should_frame_budget` / `terminal_write_bridge` already gates, now `ytrace` `cli/codex_geometry` covers it. `claude` gold has no identity indirection and its Ink engine re-anchors absolute `CUP` on switch.
+
+### Issue Heading 16: Self-minting identity must be fleet-wide, and title copy must follow it
+
+**Measured failure (2026-08-24):** Codex, Muse, and Antigravity all launch before
+their CLI-owned durable id exists. The target daemon learned the real id from
+the process marker, but the `local-codex-identities` compatibility wire exported
+the owning daemon's birth-id alias only for Codex. The GUI daemon also selected
+only Codex rows for polling. Muse and Antigravity therefore kept a wrapper birth
+UUID as store lookup id, while their durable scanner produced a second row under
+the real id. The symptoms were raw-path or generic live titles, short-hash
+durable titles, and rows that disappeared after a daemon transition.
+
+**Rule:** `AgentCliDescriptor::id_assigned_at_birth == false` plus a measured
+identity source is the policy; no self-minting CLI gets a private identity
+lifecycle. The owning daemon overlays the real id in its snapshot, exports the
+exact `(kind, birth_id, real_id)` relation, and refreshes it on the bounded
+background chore because a marker may appear after the launch lifecycle pass.
+The GUI host polls each machine once, joins by `(kind, birth_id)`, persists the
+logical id, queries the store using that logical id, and targets generated copy
+at the existing birth-path live wrapper. Cwd fallback remains Codex-only for
+rolling compatibility; Muse and Antigravity must never be paired by a default
+cwd their marker cannot prove. A same-id store artifact is not proof that the
+birth wrapper is correctly bound: the bounded `/proc` marker check remains
+periodic and idempotent, because both Muse and Antigravity can create a phantom
+birth-id artifact before exposing their real CLI-owned id.
+
+Muse's `session-index.db` is title/cwd metadata, not transcript-existence truth.
+In particular, measured sessions retained `prompt_count = 0` and `New session`
+after real accepted user intents appeared hundreds of lifecycle records into a
+multi-megabyte JSONL. A zero counter may suppress only a transcript that itself
+contains no `runtime.user_intent.accepted`; title extraction searches beyond the
+startup prelude. The DB consulted by a scan is derived from that transcript's
+store root, never the scanning process's HOME.
+
+**Title coexistence:** `TitleAuthority::Store` still wins. Claude Code continues
+to read `custom-title` then `ai-title` from its JSONL and is never overwritten by
+Interface-LLM generation. Generated-authority CLIs get built-in Interface-LLM
+rescue by default; the historical background-copy environment variable is an
+explicit off switch, not the feature gate.
+
+**Observability:** `cli/local_identity_bind` records only path, kind, and id
+origin. Remote `cli/identity_poll` is emitted per CLI kind and separates exact
+alias candidates from the Codex compatibility cwd candidates. Title probes
+record title quality and presence, never title text.
+
+**Not covered:** this does not change a CLI's launch or resume syntax, infer an
+id for a CLI without a measured marker/transcript source, parse transcripts into
+the terminal viewport, or alter Claude Code's title mechanism. Rendering quirks
+and daemon PTY handoff safety remain their existing per-CLI and daemon contracts.
+
+### Issue Heading 17: A blocked restart must not detach the whole CLI fleet
+
+**Measured failure (2026-08-24):** a Codex child entered Linux uninterruptible
+sleep while the daemon handled `terminal_restart`. Restart held the global
+runtime lock, sent SIGKILL, and then waited for exit without a deadline. The
+request held the lock for 119.85 seconds; during that interval Codex, Muse, and
+Antigravity attach/ensure requests repeatedly hit their client deadlines and
+their rows appeared detached. A separate unbounded `codex --version` child also
+stopped the shared background identity/title chore.
+
+**Rule:** restart teardown may spend the existing graceful signal window, but
+after SIGKILL it gets only the bounded force-exit deadline. If the kernel still
+reports the child alive, the old runtime is put back in its seat and restart is
+refused; yggterm must not spawn a second writer. Managed-CLI version probes are
+metadata and have a two-second ceiling. A timed-out child is killed and handed
+to a detached reaper so waiting on a D-state process cannot stall the chore.
+
+The same preservation rule applies at daemon bind. A predecessor may leave the
+successor's versioned request name as a compatibility symlink back to itself.
+The successor may unlink that symlink and bind its own name only when the
+preserved-owner registry both contains runtimes and explicitly names the
+successor's version. Otherwise an answering alias remains an owner and is never
+taken. `cli/attachment` records the authorized alias release.
+
+`server update-daemons --force` must also bypass the same-version short circuit.
+A semver identifies a release, not a particular dirty/rebuilt inode; deployment
+of a fixed daemon under the current semver is exactly why the force flag exists.
+
+**Observability:** `cli/attachment_sweep` reports running, preserved,
+exited-runtime, missing-runtime, unbound-presence, and not-expected counts for
+every `AGENT_CLIS` descriptor, including Claude as the control. A projected
+remote row is not expected on the GUI-host daemon; a legacy/birth `local://`
+row with no owner is an unbound presence anomaly, not proof that this process
+dropped a PTY. `cli/attachment` records a bounded restart that left the live
+runtime seated. `cli/version_probe` records binary name, outcome, elapsed time,
+and ceiling. `cli/runtime_conflict` records the Codex active-writer refusal
+without copying terminal text or launch commands into ytrace.
+
+**Not covered:** these safeguards do not terminate an externally launched CLI,
+take over a CLI's own single-writer lock, declare an observer authoritative, or
+change Claude Code's store-owned title and resume behavior.
+
+### Issue Heading 18: Runtime-key aliases and rowless PTYs are one handoff invariant
+
+**Measured failure (2026-08-25):** a version handoff transferred all eleven PTY
+descriptors successfully, but the successor appeared to preserve only seven.
+The other four were still alive and readable. Muse and Antigravity rows were
+keyed `local://<birth>` while their terminal seats were keyed by the descriptor's
+`muse-runtime://<birth>` / `agy-runtime://<birth>` schemes, and the resolver
+tested only the Codex-shaped alias. Two additional PTYs had no managed row at
+all after earlier failed resolver/restart cycles. The result was an interactive
+process with no addressable sidebar presence, plus duplicate resumes when a row
+opened the empty spelling and launched a second writer.
+
+**Rule:** a live agent row represents both its row key and every runtime alias
+derived from its `AgentCliDescriptor`, using the birth id before the rebound CLI
+id. The terminal manager is authoritative about which spelling is actually
+seated. Read, write, resize, close, identity refresh, preservation, and
+attachment audit must all use that corrected resolver. No CLI gets a private
+alias branch.
+
+PTY handoff and row persistence are independent channels. Immediately after a
+successor adopts a descriptor, it checks whether any managed row represents the
+runtime key. If not, it reconstructs an agent row from the registered runtime
+scheme or an exact CLI executable token in the preserved launch command, the
+live process marker when available, and the preserved cwd. This is presence
+recovery only: it never launches or restarts the adopted process. Plain shells
+are not promoted. The temporary `untitled session` label stays under normal
+store/Interface-LLM title authority.
+
+**Observability:** `cli/orphan_runtime_row_recovered` is content-free and records
+kind, runtime scheme, and identity origin. The lifecycle trace also records the
+runtime and recovered row keys for handoff forensics. A handoff is green only
+when every owned agent runtime is represented after adoption, not merely when
+every descriptor crossed the socket.
+
+**Not covered:** this does not merge two already-running PTYs that point at the
+same CLI conversation, kill either writer, infer a plain `local://` shell as an
+agent without an exact executable token, or change Claude Code's store-owned
+title mechanism.
+
+### Issue Heading 19: Remote title readers and handoff classifiers must preserve CLI identity
+
+**Measured failure (2026-08-25):** two durable Muse sessions had accepted user
+intents and usable local titles, but their remote wrappers stayed named as raw
+cwd paths. The ssh-side Python reader stopped after 65 lifecycle records while
+the local Rust reader scanned until the first accepted intent. In the same
+handoff, an Antigravity PTY was reconstructed as Pi because the launch-command
+classifier split `/home/user/pi/...` into the registered executable word `pi` before
+it reached the actual `agy` command. Exact launch-word parsing removed that
+path bug but did not repair the live row: preserved launch metadata could still
+describe an older wrapper while the adopted PTY's root process was already
+`agy`.
+
+**Rule:** a remote store reader answers the same title question as its local
+reader. Muse scans until its first accepted/materialized user intent; startup
+record count is not an identity or title boundary. Agent inference from a
+preserved launch command recognizes exact command words in command order and
+does not tokenize path components into executable names. For an adopted generic
+`local://` runtime, the live process tree's exact `argv[0]` basename outranks
+preserved launch text; the descriptor-owned runtime scheme still outranks both.
+
+If an older daemon already synthesized the wrong kind, the successor may
+reclassify only a non-explicit generic placeholder whose runtime marker has the
+same birth id. The row is re-keyed to the correct descriptor scheme and its
+stale CLI metadata label is removed. The repair does not depend on a transient
+update-restore marker, because the corrupted row can persist after that marker
+is gone. Owner-titled and already-usable-title rows are never rewritten.
+
+**Observability:** `cli/orphan_runtime_row_recovered` carries `row_repair` as
+`recovered` or `reclassified`, plus kind, runtime scheme, kind origin
+(`runtime_scheme`, `live_process`, or `launch_word`), and id origin. Title pickup
+remains content-free and reports only the kind, match, and quality.
+
+**Not covered:** this does not infer an agent from a path-only shell command or
+from arbitrary process arguments, rewrite owner-set titles, merge multiple live
+writers, or alter Claude Code's store-owned title behavior.
+
+### Issue Heading 20: A remote-store miss is not title confirmation
+
+**Measured failure (2026-08-25):** a remote Muse wrapper was first queried with
+its yggterm birth UUID, before Muse exposed the real session UUID. The store
+correctly returned no title for that birth UUID, but the daemon inserted the
+`(wrapper path, UUID)` lookup into its confirmed set anyway. After identity
+rebind, the remote probe could return the title for the real UUID, yet the idle
+row was already classified `skipped_title_settled` and kept its raw cwd path.
+
+**Rule:** only a positive remote-store lookup is confirmation. `no_title_in_store`
+leaves the row eligible for a later bounded idle retry; the existing chore
+backoff limits the ssh cost. Confirmation remains keyed by both wrapper path and
+logical session id, so a birth-id miss can never suppress the first real-id
+lookup. Store agreement with the current row is positive and may settle it.
+
+**Observability:** the negative `cli/title` outcome carries
+`retry:"unconfirmed_until_store_title"`; a later positive lookup emits the
+normal content-free `picked_up` or `skipped_title_settled` outcome. The trace
+never contains the title text.
+
+**Not covered:** this does not invent a title when a CLI has no store signal,
+overwrite an owner-set title, change Claude Code's title authority, or make a
+store miss an error.
+
+### Issue Heading 21: Title writers must resolve runtime-key aliases too
+
+**Measured failure (2026-08-25):** the local Antigravity reader repeatedly
+found a usable store title and emitted `picked_up`, while every background tick
+reported `updates:1, applied:0`. The managed row was stored under its PTY birth
+key (`local://<birth>`) but exposed the descriptor-owned row path
+(`agy-runtime://<birth>`). Read, screen, and ownership paths resolved the alias;
+`set_session_title_hint` indexed the sessions map by the exposed spelling and
+silently found nothing.
+
+**Rule:** derived, passive, and explicit title writers, owner-title checks, and
+summary writers resolve the same row aliases as terminal/session readers before
+mutating state. The map key remains the PTY seat and the row path remains CLI
+identity; neither is rewritten merely to make a title land.
+
+**Observability:** a proposed title that does not land emits content-free
+`cli/title_apply_refused` with `row_resolved` and `owner_titled`. The existing
+`background_copy/tick` `updates` versus `applied` counts remain the aggregate
+oracle. Repeated `updates>0, applied=0` is a writer defect, not progress.
+
+**Not covered:** alias resolution does not merge duplicate rows, infer a CLI
+kind, re-key a PTY, override an explicit title, or change title precedence.
+
+### Issue Heading 22: Classify Muse after condensing its raw prompt
+
+**Measured failure (2026-08-25):** after the retry and real-id fixes, ytrace
+proved a remote Muse row was queried repeatedly under its correct UUID but
+still returned `no_title_in_store`. The ssh probe actually returned two
+candidates. Both began with polite prompt copy (`Please ...`), and the remote
+chooser rejected the raw sentence as a low-signal finished title before calling
+the condenser. The local durable reader condensed first and produced a usable
+title from the same transcript.
+
+**Rule:** Muse store candidates are title input, not necessarily titles.
+Condense each raw candidate first, then apply fallback/low-signal validation to
+the condensed result. Local and remote readers therefore answer the same
+question in the same order.
+
+**Observability:** remote `no_title_in_store` includes `candidate_count` and
+`probe_line_count`, never candidate text. Zero candidates means store absence;
+a positive count means the shared chooser rejected what the probe returned.
+
+**Not covered:** this does not accept raw prompt prose as the rendered title,
+weaken title-quality checks for other CLIs, or override Muse's store authority.
+
+### Issue Heading 23: Startpage observers must never start or hand off a daemon
+
+**Measured failure (2026-08-25):** `server startpage ls` took 80.9 seconds on
+the GUI host while `cwdtree ls` completed inside the 45-second oracle budget.
+The durable scan was shared. The extra time came from three nested shell
+commands used as GUI witnesses; `server snapshot` alone spent about 25 seconds
+trying to make a daemon reachable. A read-only Startpage diagnostic could
+therefore enter daemon startup/handoff machinery and perturb the PTY owner it
+was supposed only to observe.
+
+**Rule:** Startpage reads the resolved daemon endpoint in-process, as CwdTree
+and Titles do, and asks the already-running GUI directly through bounded
+read-only app-control requests. An absent/busy GUI falls back to store truth in
+at most one second. It never searches `PATH`, starts a child yggterm binary, or
+calls daemon readiness/startup from the faithful observer path.
+
+**Observability:** `cli/startpage_observers/faithful_read` records only browser
+row count, daemon-snapshot and app-state availability, elapsed milliseconds,
+and the app-control ceiling. It carries no row paths, ids, cwd, or titles.
+
+**Not covered:** this does not make GUI state authoritative, change Startpage
+ordering/scoping, increase the independent oracle timeout, or hide a slow
+durable-store scanner.
 
 **Checklist for any new CLI (add to `spec-adding-an-agent-cli.md` steps 1–9):** 1) `SessionKind` variant, 2) `AGENT_CLIS` descriptor (+ `TitleAuthority`, `store_globs`, `id_assigned_at_birth`, `resume_selector_token`, `re_roots_with_cwd`), 3) `SESSION_PATH_SCHEMES` (`remote-<slug>://` + `<slug>-runtime://`), 4) `cargo check` exhaustive matches, 5) catch-alls `rg SessionKind::(Codex|ClaudeCode)`, 6) `agent_arm_matrix` two arms (Local `local://` + Remote `remote-<slug>://`), 7) surfaces (icon/menu/KeyTips free), 8) provisioning `install`/`update`, 9) **title lifecycle** — the birth name is automatic (`New {machine} {display_name}`, from `new_session_birth_title`; nothing per-CLI to add), then either `heuristic`/`litellm` via `SessionTitleStore` for a `Generated` CLI + its fallback list, or `read_live_store_title` for a `Store` one — ⛔ a `Store` CLI without that hook can never be titled at all, 10) **resume id** (if `id_assigned_at_birth:false`, implement store→row mapping), 11) `spec-cli-integration-verification.md` oracles (`check-startpage.py`/`check-titles.py`/`check-cwdtree.py` must `0` on every fleet host + faithful 1920×1200 screenshot).
 

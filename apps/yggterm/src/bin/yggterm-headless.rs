@@ -430,6 +430,10 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
 /// deploy that must land. It does NOT bypass the idle gate, which now guards
 /// only the destructive cold-shutdown fallback — the handoff itself is
 /// ungated. See [[finding-hot-update-never-converges-idle-gate]].
+fn daemon_update_is_required(running_version: &str, target_version: &str, force: bool) -> bool {
+    force || running_version != target_version
+}
+
 fn run_update_all_daemons(store: &SessionStore, force: bool) -> Result<()> {
     let current_version = yggterm_server::SERVER_PROTOCOL_VERSION;
     let daemon_executable = std::env::current_exe().context("locating current executable")?;
@@ -437,7 +441,7 @@ fn run_update_all_daemons(store: &SessionStore, force: bool) -> Result<()> {
 
     for (endpoint, status) in yggterm_server::reachable_versioned_daemon_statuses(store.home_dir())
     {
-        if status.server_version == current_version {
+        if !daemon_update_is_required(&status.server_version, current_version, force) {
             results.push(serde_json::json!({
                 "pid": status.server_pid,
                 "version": status.server_version,
@@ -445,7 +449,7 @@ fn run_update_all_daemons(store: &SessionStore, force: bool) -> Result<()> {
             }));
             continue;
         }
-        let outcome = yggterm_server::hot_restart(
+        let outcome = hot_restart_detailed(
             &endpoint,
             &daemon_executable,
             Some(current_version),
@@ -455,15 +459,17 @@ fn run_update_all_daemons(store: &SessionStore, force: bool) -> Result<()> {
             } else {
                 "update_all"
             }),
+            force,
         );
         results.push(match outcome {
-            Ok(message) => serde_json::json!({
+            Ok(outcome) => serde_json::json!({
                 "pid": status.server_pid,
                 "version": status.server_version,
                 "target_version": current_version,
                 "owned_terminal_session_count": status.owned_terminal_session_count,
                 "action": "handoff_requested",
-                "message": message,
+                "message": outcome.message(),
+                "result": format!("{outcome:?}"),
             }),
             Err(error) => serde_json::json!({
                 "pid": status.server_pid,
@@ -2218,12 +2224,32 @@ mod tests {
     use super::{
         BuiltinCliCommand, builtin_cli_command_is_pure, cached_copy_hint_is_usable,
         classify_builtin_cli_command, cli_positional_args, command_reads_local_state_in_process,
-        gui_companion_executable_from_headless, normalize_monitor_args,
+        daemon_update_is_required, gui_companion_executable_from_headless, normalize_monitor_args,
         preferred_headless_executable, remote_session_title_fallback,
     };
     use std::path::PathBuf;
     use yggterm_core::{InstallChannel, InstallContext, UpdatePolicy};
     use yggterm_server::RemoteScannedSession;
+
+    #[test]
+    fn force_updates_a_rebuilt_daemon_with_the_same_semver() {
+        assert!(!daemon_update_is_required("3.1.50", "3.1.50", false));
+        assert!(daemon_update_is_required("3.1.50", "3.1.50", true));
+        assert!(daemon_update_is_required("3.1.49", "3.1.50", false));
+
+        let source = include_str!("yggterm-headless.rs");
+        let update_body = source
+            .split("fn run_update_all_daemons")
+            .nth(1)
+            .and_then(|tail| tail.split("fn discover_remote_machines_from_app_state").next())
+            .expect("update-all implementation");
+        assert!(update_body.contains("hot_restart_detailed("));
+        assert!(update_body.contains("            force,\n"));
+        assert!(
+            !update_body.contains("yggterm_server::hot_restart("),
+            "the legacy wrapper hard-codes force=false"
+        );
+    }
 
     /// The carve-out that keeps a local-log reader in THIS binary. It was an
     /// inline `matches!` with no test, and without `render-top` in it the new

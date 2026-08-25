@@ -1171,11 +1171,8 @@ fn restored_local_runtime_id(
 /// walks straight past the answer. One owner, used by restore itself, so the two
 /// cannot drift.
 pub(crate) fn restored_live_row_key(live: &PersistedLiveSession) -> Option<String> {
-    if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&live.key) {
-        return Some(remote_scanned_session_path(
-            &normalize_machine_key(raw_machine_key),
-            session_id,
-        ));
+    if let Some(normalized) = normalized_remote_row_key(&live.key) {
+        return Some(normalized);
     }
     let kind = if let Some(storage_path) = live.storage_path.as_deref()
         && let Some(correct_kind) = yggterm_core::agent_scheme::session_kind_for_row(storage_path, "")
@@ -3042,7 +3039,9 @@ fn stored_document_owns_runtime_uri(kind: SessionKind, path: &str) -> bool {
 }
 
 fn canonical_local_live_runtime_key(key: &str, session_id: &str) -> String {
-    if key.starts_with("codex-runtime://") {
+    if yggterm_core::agent_scheme::agent_runtime_key_schemes()
+        .any(|scheme| key.starts_with(scheme.prefix))
+    {
         return key.to_string();
     }
     local_runtime_id_from_key(key)
@@ -5045,7 +5044,223 @@ impl YggtermServer {
         managed_session_is_live_runtime_session(&resolved_key, &session)
             && (resolved_key == runtime_key
                 || session.session_path == runtime_key
-                || self.terminal_runtime_key_for_path(&resolved_key) == runtime_key)
+                || self.terminal_runtime_key_for_path(&resolved_key) == runtime_key
+                // Local agent rows and daemon PTYs deliberately have two
+                // spellings: `local://<birth>` in the row plane and the
+                // descriptor's `<cli>-runtime://<birth>` in the terminal
+                // plane. Codex happened to retain its runtime spelling; later
+                // CLIs were folded to `local://` and failed this representation
+                // test during handoff. Derive the alias from the descriptor.
+                || local_runtime_id_from_key(&resolved_key).is_some_and(|id| {
+                    remote_runtime_agent_session_key(session.kind, id).as_deref()
+                        == Some(runtime_key)
+                })
+                || local_runtime_id_from_key(&session.session_path).is_some_and(|id| {
+                    remote_runtime_agent_session_key(session.kind, id).as_deref()
+                        == Some(runtime_key)
+                })
+                || (!session.id.trim().is_empty()
+                    && remote_runtime_agent_session_key(session.kind, &session.id).as_deref()
+                        == Some(runtime_key)))
+    }
+
+    /// Recover the row half of an agent PTY that arrived through descriptor
+    /// handoff without any managed-session row representing it.
+    ///
+    /// The PTY is already authoritative and already adopted when this runs;
+    /// this method only restores its addressable presence. It never launches a
+    /// process. A generic temporary title is intentional: the normal background
+    /// title copier replaces it from the CLI store, while an invented transcript
+    /// title here would become a second title authority.
+    pub(crate) fn recover_owned_agent_runtime_row(
+        &mut self,
+        runtime_key: &str,
+        kind: SessionKind,
+        cli_session_id: Option<&str>,
+        launch_command: &str,
+        cwd: Option<&str>,
+        storage_path: Option<&Path>,
+    ) -> Option<(String, &'static str)> {
+        let descriptor = agent_cli_descriptor(kind)?;
+        let birth_id = local_runtime_id_from_key(runtime_key)?;
+        let session_id = cli_session_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(birth_id);
+
+        // A 3.1.52 orphan repair exposed a second half of this failure: the
+        // row DID exist, but an absolute `/home/user/pi/...` path in the saved
+        // launch command had been tokenized into the registered `pi` binary.
+        // That produced a synthetic Pi row in front of a still-running
+        // Antigravity PTY. A later handoff must repair that placeholder. The
+        // owner-title and title-quality guards protect ordinary rows; requiring
+        // an update-only restore marker does not, because a wrong-kind row can
+        // outlive the update that synthesized it and then persist without that
+        // transient marker.
+        let represented_row_key = self
+            .live_session_order
+            .iter()
+            .find(|row_key| {
+                local_runtime_id_from_key(row_key).is_some_and(|id| id == birth_id)
+                    || self.sessions.get(*row_key).is_some_and(|session| {
+                        local_runtime_id_from_key(&session.session_path)
+                            .is_some_and(|id| id == birth_id)
+                    })
+            })
+            .cloned();
+        if let Some(old_row_key) = represented_row_key {
+            let eligible = self.sessions.get(&old_row_key).is_some_and(|session| {
+                session.kind != kind
+                    && !session.title_is_explicit
+                    && (session.title.trim().eq_ignore_ascii_case("untitled session")
+                        || looks_like_generated_fallback_title(&session.title))
+                    && session_metadata_value(session, "Runtime Session")
+                        .as_deref()
+                        .and_then(local_runtime_id_from_key)
+                        .is_some_and(|id| id == birth_id)
+            });
+            if !eligible {
+                return None;
+            }
+
+            let repaired_row_key = remote_runtime_agent_session_key(kind, birth_id)
+                .unwrap_or_else(|| runtime_key.to_string());
+            if repaired_row_key != old_row_key && self.sessions.contains_key(&repaired_row_key) {
+                return None;
+            }
+            let mut session = self.sessions.remove(&old_row_key)?;
+            session.kind = kind;
+            session.id = session_id.to_string();
+            session.session_path = repaired_row_key.clone();
+            session.launch_command = launch_command.to_string();
+            session.launch_phase = TerminalLaunchPhase::Running;
+            session.last_launch_error = None;
+            session.status_line = describe_status_line(
+                session.backend,
+                self.theme,
+                session.source,
+                session.launch_phase,
+                session.remote_deploy_state,
+                session.bridge_available,
+            );
+            session.metadata.retain(|entry| {
+                !yggterm_core::agent_cli::AGENT_CLIS
+                    .iter()
+                    .any(|candidate| candidate.session_metadata_label == entry.label)
+            });
+            upsert_session_metadata(
+                &mut session.metadata,
+                descriptor.session_metadata_label,
+                session_id.to_string(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "UUID",
+                session_id.to_string(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Runtime Session",
+                runtime_key.to_string(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Runtime Ownership",
+                "yggterm daemon".to_string(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Launch",
+                user_visible_launch_command(launch_command),
+            );
+            if let Some(cwd) = cwd {
+                upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+            }
+            if let Some(storage_path) = storage_path {
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Storage",
+                    storage_path.display().to_string(),
+                );
+            }
+            self.sessions.insert(repaired_row_key.clone(), session);
+            for row_key in &mut self.live_session_order {
+                if row_key == &old_row_key {
+                    *row_key = repaired_row_key.clone();
+                }
+            }
+            if self.active_session_path.as_deref() == Some(old_row_key.as_str()) {
+                self.set_active_session_path(
+                    Some(repaired_row_key.clone()),
+                    ActivationOrigin::recovery("reclassify_owned_agent_runtime_row"),
+                );
+            }
+            if let Some(grid) = self.session_pty_grids.remove(&old_row_key) {
+                self.session_pty_grids
+                    .entry(repaired_row_key.clone())
+                    .or_insert(grid);
+            }
+            self.forget_preview_history_budget(&old_row_key);
+            return Some((repaired_row_key, "reclassified"));
+        }
+
+        if self.represents_terminal_runtime_key(runtime_key) {
+            return None;
+        }
+        self.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.to_string(),
+            id: session_id.to_string(),
+            title: "untitled session".to_string(),
+            kind,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: cwd.map(ToOwned::to_owned),
+            remote_launch_action: None,
+            storage_path: storage_path.map(|path| path.display().to_string()),
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        let row_key = self.live_session_row_key(runtime_key)?;
+        let session = self.sessions.get_mut(&row_key)?;
+        session.id = session_id.to_string();
+        session.launch_command = launch_command.to_string();
+        session.launch_phase = TerminalLaunchPhase::Running;
+        session.last_launch_error = None;
+        session.status_line = describe_status_line(
+            session.backend,
+            self.theme,
+            session.source,
+            session.launch_phase,
+            session.remote_deploy_state,
+            session.bridge_available,
+        );
+        upsert_session_metadata(
+            &mut session.metadata,
+            descriptor.session_metadata_label,
+            session_id.to_string(),
+        );
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Runtime Session",
+            runtime_key.to_string(),
+        );
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Runtime Ownership",
+            "yggterm daemon".to_string(),
+        );
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Launch",
+            user_visible_launch_command(launch_command),
+        );
+        Some((row_key, "recovered"))
     }
 
     pub fn terminal_spec(&self, path: &str) -> Option<(String, Option<String>)> {
@@ -5911,8 +6126,22 @@ impl YggtermServer {
         if self.session_title_is_explicit(session_path) {
             return false;
         }
+        // The map key is the PTY's birth/runtime seat, while the row's own
+        // `session_path` may be the descriptor's CLI runtime alias. Readers
+        // already resolve both; a writer that indexes the requested spelling
+        // directly turns a valid store pickup into `updates:1, applied:0` for
+        // the life of the row.
+        let row_key = self
+            .resolve_session_storage_key(session_path)
+            .map(str::to_string);
+        let resolved_path = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
+            .map(|session| session.session_path.clone());
         let mut applied = false;
-        if let Some(session) = self.sessions.get_mut(session_path)
+        if let Some(session) = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get_mut(key))
             && session.title != title
         {
             session.title = title.to_string();
@@ -5920,7 +6149,11 @@ impl YggtermServer {
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
-                if scanned.session_path == session_path {
+                if scanned.session_path == session_path
+                    || resolved_path
+                        .as_deref()
+                        .is_some_and(|path| scanned.session_path == path)
+                {
                     if scanned.title_hint != title {
                         scanned.title_hint = title.to_string();
                         applied = true;
@@ -5936,8 +6169,8 @@ impl YggtermServer {
     /// no provenance of its own, so the live row is the one owner of the
     /// answer — asking it here keeps the two copies from disagreeing.
     pub fn session_title_is_explicit(&self, session_path: &str) -> bool {
-        self.sessions
-            .get(session_path)
+        self.resolve_session_storage_key(session_path)
+            .and_then(|key| self.sessions.get(key))
             .is_some_and(ManagedSessionView::title_is_owner_set)
     }
 
@@ -5965,13 +6198,27 @@ impl YggtermServer {
         if title.is_empty() {
             return;
         }
-        if let Some(session) = self.sessions.get_mut(session_path) {
+        let row_key = self
+            .resolve_session_storage_key(session_path)
+            .map(str::to_string);
+        let resolved_path = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
+            .map(|session| session.session_path.clone());
+        if let Some(session) = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get_mut(key))
+        {
             session.title = title.to_string();
             session.title_is_explicit = true;
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
-                if scanned.session_path == session_path {
+                if scanned.session_path == session_path
+                    || resolved_path
+                        .as_deref()
+                        .is_some_and(|path| scanned.session_path == path)
+                {
                     scanned.title_hint = title.to_string();
                     // The mirror carries the provenance too, because it is the
                     // copy that survives the live row exiting — and that is
@@ -6026,7 +6273,16 @@ impl YggtermServer {
         if explicit {
             return false;
         }
-        if let Some(session) = self.sessions.get_mut(session_path)
+        let row_key = self
+            .resolve_session_storage_key(session_path)
+            .map(str::to_string);
+        let resolved_path = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
+            .map(|session| session.session_path.clone());
+        if let Some(session) = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get_mut(key))
             && passive_title_hint_can_update(&session.title, title, false, false)
         {
             session.title = title.to_string();
@@ -6034,7 +6290,11 @@ impl YggtermServer {
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
-                if scanned.session_path == session_path {
+                if scanned.session_path == session_path
+                    || resolved_path
+                        .as_deref()
+                        .is_some_and(|path| scanned.session_path == path)
+                {
                     if passive_title_hint_can_update(&scanned.title_hint, title, false, false) {
                         scanned.title_hint = title.to_string();
                         applied = true;
@@ -6072,7 +6332,17 @@ impl YggtermServer {
     /// and treating that as an authoritative absence would wipe a good summary
     /// on every refresh. Only a store scan knows the difference.
     pub fn apply_session_summary_hint(&mut self, session_path: &str, summary: Option<&str>) {
-        if let Some(session) = self.sessions.get_mut(session_path) {
+        let row_key = self
+            .resolve_session_storage_key(session_path)
+            .map(str::to_string);
+        let resolved_path = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
+            .map(|session| session.session_path.clone());
+        if let Some(session) = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get_mut(key))
+        {
             match summary {
                 Some(summary) => {
                     upsert_session_metadata(
@@ -6090,7 +6360,11 @@ impl YggtermServer {
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
-                if scanned.session_path == session_path {
+                if scanned.session_path == session_path
+                    || resolved_path
+                        .as_deref()
+                        .is_some_and(|path| scanned.session_path == path)
+                {
                     scanned.cached_summary = summary.map(ToOwned::to_owned);
                     return;
                 }
@@ -6779,14 +7053,15 @@ impl YggtermServer {
             .collect()
     }
 
-    /// Live rows whose CLI mints its own session id and whose CURRENT id its
-    /// store does not hold — i.e. rows still carrying the yggterm row uuid as a
-    /// phantom, which is what every muse/agy row does from birth.
+    /// Live rows whose CLI mints its own session id and whose owned process can
+    /// therefore correct the row's identity.
     ///
-    /// ⭐ Self-limiting by construction: the moment a row is rebound to a real
-    /// id the store vouches for it and it drops out of this list, so the poll
-    /// costs nothing on a settled fleet. `None` (unknowable) drops out too — a
-    /// row is only worth chasing when the store positively denies its id.
+    /// Do not use store membership as the gate. A failed resume can create an
+    /// empty artefact under the yggterm birth UUID while the running CLI has a
+    /// different conversation open. Treating that artefact as proof freezes
+    /// the wrong identity across every later restart. The owner-side resolution
+    /// is only a `/proc/<pid>/fd` readdir and `apply_*` is idempotent, so every
+    /// live self-minting row is cheap and safe to verify on each chore tick.
     pub(crate) fn live_agent_session_keys_needing_runtime_identity(&self) -> Vec<(String, SessionKind)> {
         self.live_session_order
             .iter()
@@ -6797,9 +7072,6 @@ impl YggtermServer {
                 }
                 let descriptor = agent_cli_descriptor(session.kind)?;
                 descriptor.live_session_marker?;
-                if local_agent_store_vouches_for_session(session.kind, &session.id) != Some(false) {
-                    return None;
-                }
                 Some((key.clone(), session.kind))
             })
             .collect()
@@ -6862,36 +7134,47 @@ impl YggtermServer {
             .collect()
     }
 
-    /// Live remote-Codex sessions that still carry a synthesized UUIDv4 id and
-    /// therefore need a real CLI session id discovered over SSH
-    /// (`[[finding-uuidv4-codex-session-drift]]` Stage 2). The local PTY-tree
-    /// walk used for local Codex/CC sessions cannot reach a remote machine, so
-    /// these are the rows the remote identity poll targets. A session drops out
-    /// of this list as soon as its id has been rebound to a real id, which makes
-    /// the poll self-limiting.
-    pub(crate) fn live_remote_codex_sessions_needing_identity_poll(
+    /// Live remote rows whose CLI mints its own id after yggterm creates the
+    /// row. The owning host can observe the real id from Codex's transcript or
+    /// the descriptor's measured live-session marker; the GUI host cannot, so
+    /// these are the rows the SSH identity poll targets.
+    ///
+    /// A row drops out when its logical id differs from the id still carried by
+    /// its remote wrapper path. That comparison works for UUID-minting CLIs
+    /// such as Muse and Antigravity too; a Codex-only UUIDv4 heuristic cannot.
+    pub(crate) fn live_remote_agent_sessions_needing_identity_poll(
         &self,
-    ) -> Vec<RemoteCodexIdentityPollTarget> {
+    ) -> Vec<RemoteAgentIdentityPollTarget> {
         self.live_session_order
             .iter()
             .filter_map(|key| {
                 let session = self.sessions.get(key)?;
-                if session.kind != SessionKind::Codex
-                    || !managed_session_is_live_runtime_session(key, session)
+                if !managed_session_is_live_runtime_session(key, session) {
+                    return None;
+                }
+                let descriptor = agent_cli_descriptor(session.kind)?;
+                if descriptor.id_assigned_at_birth
+                    || (session.kind != SessionKind::Codex
+                        && descriptor.live_session_marker.is_none())
                 {
+                    return None;
+                }
+                let (scheme_kind, _machine_key, path_session_id) =
+                    yggterm_core::agent_scheme::parse_remote_agent_session_path(
+                        &session.session_path,
+                    )?;
+                if scheme_kind != session.kind || path_session_id != session.id {
                     return None;
                 }
                 let ssh_target = session
                     .ssh_target
                     .as_deref()
                     .filter(|target| !is_loopback_ssh_target(target))?;
-                if !looks_like_synthesized_uuidv4_session_id(&session.id) {
-                    return None;
-                }
                 let cwd = session_metadata_value(session, "Cwd")
                     .filter(|value| !value.trim().is_empty())?;
-                Some(RemoteCodexIdentityPollTarget {
+                Some(RemoteAgentIdentityPollTarget {
                     key: key.clone(),
+                    kind: session.kind,
                     ssh_target: ssh_target.to_string(),
                     ssh_prefix: session.ssh_prefix.clone(),
                     cwd,
@@ -13056,13 +13339,15 @@ fn parse_remote_runtime_codex_session_key(path: &str) -> Option<&str> {
     path.strip_prefix("codex-runtime://")
 }
 
-/// A live remote-Codex row that needs its real CLI session id discovered over
-/// SSH. Produced by [`YggtermServer::live_remote_codex_sessions_needing_identity_poll`]
-/// and consumed by the daemon's remote identity-poll chore.
+/// A live remote self-minting agent row that needs its real CLI session id
+/// discovered over SSH. Produced by
+/// [`YggtermServer::live_remote_agent_sessions_needing_identity_poll`] and
+/// consumed by the daemon's remote identity-poll chore.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RemoteCodexIdentityPollTarget {
-    /// Session storage key (the `codex-runtime://<synth-id>` I/O key).
+pub(crate) struct RemoteAgentIdentityPollTarget {
+    /// Session storage key (the remote wrapper row / I/O key).
     pub key: String,
+    pub kind: SessionKind,
     pub ssh_target: String,
     pub ssh_prefix: Option<String>,
     pub cwd: String,
@@ -13092,7 +13377,8 @@ fn looks_like_synthesized_uuidv4_session_id(session_id: &str) -> bool {
 
 #[cfg(test)]
 mod synthesized_session_id_tests {
-    use super::looks_like_synthesized_uuidv4_session_id;
+    use super::{looks_like_synthesized_uuidv4_session_id, runtime_birth_alias};
+    use crate::SessionKind;
 
     #[test]
     fn random_uuidv4_is_synthesized() {
@@ -13123,6 +13409,33 @@ mod synthesized_session_id_tests {
         assert!(!looks_like_synthesized_uuidv4_session_id(
             "zzzzzzzz-2222-4333-8444-555555555555"
         ));
+    }
+
+    #[test]
+    fn runtime_key_exports_birth_aliases_for_measured_self_minting_clis() {
+        for (kind, path, real) in [
+            (
+                SessionKind::Codex,
+                "codex-runtime://11111111-2222-4333-8444-555555555555",
+                "019ce5d8-c94c-7b62-ae19-3818ae400b65",
+            ),
+            (
+                SessionKind::Muse,
+                "local://22222222-3333-4444-8555-666666666666",
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            ),
+            (
+                SessionKind::Antigravity,
+                "agy-runtime://33333333-4444-4555-8666-777777777777",
+                "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            ),
+        ] {
+            let ((slug, exported_real), birth) =
+                runtime_birth_alias(kind, path, real).expect("self-minting runtime alias");
+            assert_eq!(slug, yggterm_core::agent_cli::session_kind_label(kind));
+            assert_eq!(exported_real, real);
+            assert_eq!(birth, path.split_once("://").unwrap().1);
+        }
     }
 }
 
@@ -19492,12 +19805,13 @@ pub fn scan_remote_machine_sessions_for_target(
     scan_remote_machine_sessions(target)
 }
 
-/// SSH-invokes `yggterm server remote local-codex-identities` on a remote
-/// machine and parses the emitted [`LocalAgentCliIdentity`] JSON lines. Used by
-/// the daemon's remote-Codex identity-poll chore
-/// (`[[finding-uuidv4-codex-session-drift]]` Stage 2). Lines that fail to parse
-/// are skipped rather than aborting the whole poll, so a partially-upgraded
-/// remote binary degrades gracefully.
+/// SSH-invokes the historically named
+/// `yggterm server remote local-codex-identities` wire command and parses its
+/// [`LocalAgentCliIdentity`] JSON lines. The command now enumerates every
+/// measured agent CLI; retaining the verb preserves compatibility with older
+/// remote installations. Lines that fail to parse are skipped rather than
+/// aborting the whole poll, so a partially upgraded machine degrades
+/// gracefully.
 pub(crate) fn poll_remote_local_codex_identities(
     ssh_target: &str,
     ssh_prefix: Option<&str>,
@@ -28964,7 +29278,7 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
 /// `run_remote_local_codex_identities`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalAgentCliIdentity {
-    /// "codex" or "claude_code".
+    /// The registered CLI slug, for example "codex", "muse", or "antigravity".
     pub kind: String,
     /// Real CLI session id (the transcript basename), e.g. a Codex ULID.
     pub session_id: String,
@@ -28973,32 +29287,27 @@ pub struct LocalAgentCliIdentity {
     /// Absolute path of the open transcript on this machine.
     pub storage_path: String,
     /// The yggterm row id this runtime was born under, when a host-resident
-    /// daemon can state the exact alias. Codex mints its real id after birth;
-    /// the remote GUI must join on this alias instead of guessing by cwd.
+    /// daemon can state the exact alias. Self-minting CLIs acquire their real id
+    /// after birth; the remote GUI must join on this alias instead of guessing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub birth_session_id: Option<String>,
 }
 
-/// Enumerates Codex / Claude Code processes currently running on THIS machine
-/// and prints one [`LocalAgentCliIdentity`] JSON object per line.
-///
-/// Stage 2 of the UUIDv4-codex-session-drift fix
-/// (`[[finding-uuidv4-codex-session-drift]]`): the local daemon cannot walk a
-/// remote machine's process tree, so it SSH-invokes this command and rebinds
-/// live remote-Codex rows whose synthesized UUIDv4 id never matched the real
-/// CLI session id. Mirrors the local
-/// `codex_runtime_process_identity_from_root_pid` discovery, but enumerated
-/// across every PID rather than descending from one PTY root.
+/// Enumerates measured agent CLI processes currently running on THIS machine
+/// and prints one [`LocalAgentCliIdentity`] JSON object per line. The local
+/// daemon cannot walk a remote machine's process tree, so the GUI host invokes
+/// this command over SSH and rebinds each self-minting live row from its wrapper
+/// birth id to the real CLI session id. The process enumeration is generic; an
+/// exact birth alias is exported whenever the owning daemon can state it.
 #[cfg(target_os = "linux")]
 pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
     let mut identities = enumerate_local_agent_cli_identities();
     if let Ok(home) = resolve_yggterm_home() {
-        let birth_aliases = local_codex_runtime_birth_aliases(&home);
+        let birth_aliases = local_agent_runtime_birth_aliases(&home);
         for identity in &mut identities {
-            if identity.kind != "codex" {
-                continue;
-            }
-            identity.birth_session_id = birth_aliases.get(&identity.session_id).cloned();
+            identity.birth_session_id = birth_aliases
+                .get(&(identity.kind.clone(), identity.session_id.clone()))
+                .cloned();
         }
     }
     for identity in identities {
@@ -29087,7 +29396,28 @@ fn enumerate_local_agent_cli_identities() -> Vec<LocalAgentCliIdentity> {
 /// Exporting that pair lets the GUI host rebind the SSH wrapper without the old
 /// cwd guess, which fails whenever Codex retains the original checkout cwd
 /// while yggterm launched the resumed session in a worktree.
-fn local_codex_runtime_birth_aliases(yggterm_home: &Path) -> HashMap<String, String> {
+fn runtime_birth_alias(
+    kind: SessionKind,
+    runtime_path: &str,
+    real_id: &str,
+) -> Option<((String, String), String)> {
+    let descriptor = agent_cli_descriptor(kind)?;
+    if descriptor.id_assigned_at_birth || real_id.trim().is_empty() {
+        return None;
+    }
+    let birth_id = local_runtime_id_from_key(runtime_path)?;
+    if birth_id == real_id {
+        return None;
+    }
+    Some((
+        (session_kind_label(kind).to_string(), real_id.to_string()),
+        birth_id.to_string(),
+    ))
+}
+
+fn local_agent_runtime_birth_aliases(
+    yggterm_home: &Path,
+) -> HashMap<(String, String), String> {
     let mut aliases = HashMap::new();
     for (endpoint, runtime_status) in daemon::reachable_versioned_daemon_statuses(yggterm_home) {
         if runtime_status.server_version != daemon::SERVER_PROTOCOL_VERSION {
@@ -29098,20 +29428,17 @@ fn local_codex_runtime_birth_aliases(yggterm_home: &Path) -> HashMap<String, Str
         };
         let active = snapshot.active_session.into_iter();
         for session in active.chain(snapshot.live_sessions.into_iter()) {
-            if session.kind != SessionKind::Codex {
-                continue;
-            }
-            let Some(real_id) = snapshot_metadata_value(&session, "Codex Session")
+            let real_id = agent_cli_descriptor(session.kind)
+                .and_then(|descriptor| {
+                    snapshot_metadata_value(&session, descriptor.session_metadata_label)
+                })
                 .filter(|value| !value.trim().is_empty())
-            else {
-                continue;
-            };
-            let Some(birth_id) = snapshot_metadata_value(&session, "UUID")
-                .filter(|value| !value.trim().is_empty() && value != &real_id)
-            else {
-                continue;
-            };
-            aliases.entry(real_id).or_insert(birth_id);
+                .unwrap_or_else(|| session.id.clone());
+            if let Some((key, birth_id)) =
+                runtime_birth_alias(session.kind, &session.session_path, &real_id)
+            {
+                aliases.entry(key).or_insert(birth_id);
+            }
         }
     }
     aliases
@@ -41951,6 +42278,47 @@ terminal_window_id: None,
         );
     }
 
+    /// The title/store chore sees the row's authoritative CLI path, while the
+    /// sessions map can retain the PTY birth key across a daemon handoff. Both
+    /// spellings address one row; derived and explicit writers must agree with
+    /// the read-side resolver or every valid pickup is silently refused.
+    #[test]
+    fn title_and_summary_writers_resolve_cli_runtime_aliases() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let storage_key = server.start_local_session(
+            SessionKind::Antigravity,
+            Some("/home/user/proj"),
+            None,
+        );
+        let birth_id = server.sessions.get(&storage_key).expect("row").id.clone();
+        let alias = format!("agy-runtime://{birth_id}");
+        server
+            .sessions
+            .get_mut(&storage_key)
+            .expect("row")
+            .session_path = alias.clone();
+
+        assert!(server.set_session_title_hint(&alias, "Repair CLI title integration"));
+        server.set_session_summary_hint(&alias, "Alias-resolved summary");
+        let row = server.sessions.get(&storage_key).expect("row");
+        assert_eq!(row.title, "Repair CLI title integration");
+        assert!(row.metadata.iter().any(|entry| {
+            entry.label == "Summary" && entry.value == "Alias-resolved summary"
+        }));
+
+        server.set_session_title_explicit(&alias, "Owner title through alias");
+        assert!(server.session_title_is_explicit(&alias));
+        assert!(!server.set_session_title_hint(&alias, "Derived title must lose"));
+        assert_eq!(
+            server.sessions.get(&storage_key).expect("row").title,
+            "Owner title through alias"
+        );
+    }
+
     #[test]
     fn passive_title_hint_can_still_replace_placeholder_titles() {
         let mut server = YggtermServer::new(
@@ -43153,6 +43521,231 @@ terminal_window_id: None,
         assert!(
             !server.represents_terminal_runtime_key("remote-session://dev/non-kept-old"),
             "a stale hot-update owner key is not live truth unless current server state represents it"
+        );
+    }
+
+    #[test]
+    fn local_agent_rows_represent_every_descriptor_runtime_alias() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+
+        for (index, descriptor) in yggterm_core::agent_cli::AGENT_CLIS
+            .iter()
+            .filter(|descriptor| descriptor.runtime_key_scheme.is_some())
+            .enumerate()
+        {
+            let id = format!("00000000-0000-4000-8000-{index:012}");
+            let row_key = format!("local://{id}");
+            let runtime_key = format!(
+                "{}{}",
+                descriptor.runtime_key_scheme.expect("filtered above"),
+                id
+            );
+            server.restore_live_session(PersistedLiveSession {
+                app_launch: None,
+                key: row_key,
+                id,
+                title: "invented integration row".to_string(),
+                kind: descriptor.kind,
+                keep_alive: true,
+                ssh_target: "localhost".to_string(),
+                prefix: None,
+                cwd: Some("/home/user/project".to_string()),
+                remote_launch_action: None,
+                storage_path: None,
+                restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+                created_by: None,
+                ephemeral: None,
+                agent_launch_options: Default::default(),
+                title_is_explicit: false,
+                outline_prefix: None,
+            });
+            assert!(
+                server.represents_terminal_runtime_key(&runtime_key),
+                "{} row must represent its descriptor runtime alias {runtime_key}",
+                descriptor.slug
+            );
+        }
+    }
+
+    #[test]
+    fn restoring_a_registered_runtime_key_does_not_fold_it_to_local() {
+        let runtime_key = "muse-runtime://00000000-0000-4000-8000-000000000031";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.to_string(),
+            id: "00000000-0000-4000-8000-000000000099".to_string(),
+            title: "invented Muse row".to_string(),
+            kind: SessionKind::Muse,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/project".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+
+        assert!(server.live_session_order_keys().iter().any(|key| key == runtime_key));
+        assert!(server.represents_terminal_runtime_key(runtime_key));
+    }
+
+    #[test]
+    fn adopted_agent_runtime_without_a_row_recovers_presence_without_launching() {
+        let runtime_key = "agy-runtime://00000000-0000-4000-8000-000000000051";
+        let real_id = "00000000-0000-4000-8000-000000000052";
+        let launch = "agy --conversation 00000000-0000-4000-8000-000000000052";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+
+        let (row_key, repair) = server
+            .recover_owned_agent_runtime_row(
+                runtime_key,
+                SessionKind::Antigravity,
+                Some(real_id),
+                launch,
+                Some("/home/user/project"),
+                None,
+            )
+            .expect("an adopted agent PTY must regain a row");
+        assert_eq!(row_key, runtime_key);
+        assert_eq!(repair, "recovered");
+        let row = server
+            .snapshot()
+            .live_sessions
+            .into_iter()
+            .find(|row| row.session_path == runtime_key)
+            .expect("recovered row");
+        assert_eq!(row.id, real_id);
+        assert_eq!(row.kind, SessionKind::Antigravity);
+        assert_eq!(row.launch_command, launch);
+        assert_eq!(row.launch_phase, TerminalLaunchPhase::Running);
+        assert_eq!(row.title, "untitled session");
+        assert!(server.represents_terminal_runtime_key(runtime_key));
+        assert!(
+            server
+                .recover_owned_agent_runtime_row(
+                    runtime_key,
+                    SessionKind::Antigravity,
+                    Some(real_id),
+                    launch,
+                    Some("/home/user/project"),
+                    None,
+                )
+                .is_none(),
+            "recovery is additive and idempotent"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_wrong_kind_runtime_row_is_reclassified_but_an_owner_row_is_not() {
+        let runtime_key = "local://00000000-0000-4000-8000-000000000071";
+        let real_id = "00000000-0000-4000-8000-000000000072";
+        let launch = "agy --conversation 00000000-0000-4000-8000-000000000072";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+
+        let (wrong_key, first_repair) = server
+            .recover_owned_agent_runtime_row(
+                runtime_key,
+                SessionKind::Pi,
+                None,
+                "exec /bin/bash -i",
+                Some("/home/user/project"),
+                None,
+            )
+            .expect("fixture begins as the synthetic wrong-kind row");
+        assert_eq!(first_repair, "recovered");
+        assert_eq!(
+            server.sessions.get(&wrong_key).map(|row| row.kind),
+            Some(SessionKind::Pi)
+        );
+        server
+            .sessions
+            .get_mut(&wrong_key)
+            .expect("synthetic row")
+            .metadata
+            .retain(|entry| entry.label != RUNTIME_RESTORE_REASON_METADATA_LABEL);
+
+        let (repaired_key, second_repair) = server
+            .recover_owned_agent_runtime_row(
+                runtime_key,
+                SessionKind::Antigravity,
+                Some(real_id),
+                launch,
+                Some("/home/user/project"),
+                None,
+            )
+            .expect("the handoff must repair a persisted synthetic placeholder");
+        assert_eq!(second_repair, "reclassified");
+        assert_ne!(repaired_key, wrong_key);
+        assert!(!server.sessions.contains_key(&wrong_key));
+        let row = server.sessions.get(&repaired_key).expect("reclassified row");
+        assert_eq!(row.kind, SessionKind::Antigravity);
+        assert_eq!(row.id, real_id);
+        assert_eq!(row.session_path, repaired_key);
+        assert_eq!(row.launch_command, launch);
+        assert!(row.metadata.iter().any(|entry| {
+            entry.label == "Antigravity Session" && entry.value == real_id
+        }));
+        assert!(
+            !row.metadata
+                .iter()
+                .any(|entry| entry.label == "Pi Session"),
+            "the stale kind label must not survive reclassification"
+        );
+
+        let protected_runtime = "local://00000000-0000-4000-8000-000000000073";
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: protected_runtime.to_string(),
+            id: "00000000-0000-4000-8000-000000000073".to_string(),
+            title: "Owner named this row".to_string(),
+            kind: SessionKind::Pi,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/project".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: true,
+            outline_prefix: None,
+        });
+        assert!(
+            server
+                .recover_owned_agent_runtime_row(
+                    protected_runtime,
+                    SessionKind::Antigravity,
+                    None,
+                    "agy --conversation 00000000-0000-4000-8000-000000000073",
+                    Some("/home/user/project"),
+                    None,
+                )
+                .is_none(),
+            "a normal owner-titled row is not a recovery placeholder"
         );
     }
 
@@ -44884,6 +45477,77 @@ terminal_window_id: None,
         );
     }
 
+    /// A persisted remote row must keep the scheme that identifies its CLI.
+    /// Rebuilding every key through `remote-session://` turns Muse,
+    /// Antigravity, and the other wrappers into Codex rows during restore.
+    #[test]
+    fn restore_live_session_preserves_every_registered_remote_agent_scheme() {
+        let session_id = "00000000-0000-4000-8000-00000000c1a0";
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let Some(scheme) = descriptor.remote_row_scheme else {
+                continue;
+            };
+            let mut server = YggtermServer::new(
+                false,
+                GhosttyHostSupport::shadow("test".to_string(), false, false),
+                UiTheme::ZedLight,
+            );
+            server.remote_machines.push(RemoteMachineSnapshot {
+                cli_presence: Vec::new(),
+                apps: Vec::new(),
+                machine_key: "practice".to_string(),
+                label: "practice".to_string(),
+                ssh_target: "practice".to_string(),
+                prefix: None,
+                remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: Vec::new(),
+            });
+            let original = format!("{scheme}Practice/{session_id}");
+            let expected = yggterm_core::agent_scheme::remote_agent_session_path(
+                descriptor.kind,
+                "practice",
+                session_id,
+            );
+
+            let persisted = PersistedLiveSession {
+                app_launch: None,
+                key: original,
+                id: session_id.to_string(),
+                title: format!("Example {} Work", descriptor.display_name),
+                kind: descriptor.kind,
+                keep_alive: true,
+                ssh_target: "practice".to_string(),
+                prefix: None,
+                cwd: Some("/home/user/proj".to_string()),
+                remote_launch_action: None,
+                storage_path: None,
+                restore_reason: None,
+                created_by: None,
+                ephemeral: None,
+                agent_launch_options: Default::default(),
+                title_is_explicit: false,
+                outline_prefix: None,
+            };
+
+            assert_eq!(
+                super::restored_live_row_key(&persisted),
+                Some(expected.clone()),
+                "{} pre-restore identity must use the key the row will wear",
+                descriptor.display_name
+            );
+            server.restore_live_session(persisted);
+
+            assert!(
+                server.sessions.contains_key(&expected),
+                "{} restored under the wrong scheme; expected {expected}, got {:?}",
+                descriptor.display_name,
+                server.sessions.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn update_restart_persists_real_codex_identity_for_synthetic_runtime_key() {
         let runtime_key = "codex-runtime://synthetic-runtime";
@@ -45478,6 +46142,11 @@ terminal_window_id: None,
         // Idempotent: binding the same id twice is not a change, so the trace
         // records genuine rebinds rather than one line per persist per row.
         assert!(!server.apply_agent_runtime_session_id_to_live_session(runtime_key, minted));
+        assert_eq!(
+            server.live_agent_session_keys_needing_runtime_identity(),
+            vec![(runtime_key.to_string(), SessionKind::Muse)],
+            "a store artefact must not suppress owner-process identity verification"
+        );
 
         let persisted = server.persisted_state_for_update_restart();
         let live = persisted

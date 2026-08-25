@@ -3274,11 +3274,49 @@ fn modified_epoch_ms_of(path: &Path) -> u128 {
         .unwrap_or_default()
 }
 
+/// The Muse data directory owning a transcript (`.../muse` beside
+/// `session-index.db`).  Derive it from the path being scanned instead of the
+/// process HOME: fleet scans and fixtures can point at another user's store,
+/// and consulting our own index silently cross-wires the two stores.
+pub(crate) fn muse_data_root_from_session_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors().find_map(|ancestor| {
+        (ancestor.file_name()?.to_str()? == "sessions")
+            .then(|| ancestor.parent())
+            .flatten()
+            .filter(|parent| parent.file_name().and_then(|name| name.to_str()) == Some("muse"))
+            .map(Path::to_path_buf)
+    })
+}
+
+/// Whether the transcript itself proves that Muse accepted a user intent.
+/// This is stronger than `session-index.db.prompt_count`: live evidence shows
+/// that counter can remain zero after hundreds of records and real prompts.
+pub(crate) fn muse_session_contains_accepted_user_intent(path: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    BufReader::new(file).lines().flatten().any(|line| {
+        serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("payload_type")
+                    .and_then(|payload_type| payload_type.as_str())
+                    .map(|payload_type| payload_type == "runtime.user_intent.accepted")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn muse_title_from_session_jsonl(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
-    for line in reader.lines().flatten().take(64) {
+    // Do not cap this at the startup prelude.  A measured Muse transcript had
+    // its first real user intent at record 688 while the index still claimed
+    // zero prompts; the old 64-line ceiling made the durable row untitled.
+    for line in reader.lines().flatten() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
             // Muse's user prompt lives in payload.model_messages[0].content[0].text
             // under payload_type runtime.user_intent.accepted / materialized.
@@ -4179,22 +4217,25 @@ const MUSE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
 fn first_muse_title_candidate(candidates: &[String]) -> Option<String> {
     candidates.iter().find_map(|candidate| {
         let trimmed = candidate.trim();
-        if trimmed.is_empty()
-            || crate::looks_like_generated_fallback_title(trimmed)
-            || crate::looks_like_low_signal_generated_copy(trimmed)
-            || trimmed.starts_with('/')
-        {
-            None
-        } else {
-            crate::best_effort_title_from_context(trimmed).or_else(|| {
-                let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
-                if !first_line.is_empty() && first_line.len() <= 120 {
-                    Some(first_line.to_string())
-                } else {
-                    Some(trimmed.chars().take(80).collect())
-                }
-            })
+        if trimmed.is_empty() || trimmed.starts_with('/') {
+            return None;
         }
+        // Muse's store candidates are raw prompts as often as finished DB
+        // titles. A raw prompt beginning `please ...` is intentionally
+        // low-signal AS A TITLE, but it is excellent title input. The local
+        // durable reader condenses first; rejecting first made the ssh reader
+        // answer `no_title_in_store` for the same conversation.
+        let condensed = crate::best_effort_title_from_context(trimmed).or_else(|| {
+            let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+            if !first_line.is_empty() && first_line.len() <= 120 {
+                Some(first_line.to_string())
+            } else {
+                Some(trimmed.chars().take(80).collect())
+            }
+        })?;
+        (!crate::looks_like_generated_fallback_title(&condensed)
+            && !crate::looks_like_low_signal_generated_copy(&condensed))
+            .then_some(condensed)
     })
 }
 
@@ -4251,9 +4292,10 @@ def read_jsonl(path):
         return
     try:
         with open(path, encoding='utf-8', errors='ignore') as handle:
-            for index, line in enumerate(handle):
-                if index > 64:
-                    break
+            # Muse writes a large startup/lifecycle prelude before the first
+            # accepted user intent. The local reader deliberately scans until
+            # that intent; the remote reader must answer the same question.
+            for line in handle:
                 line = line.strip()
                 if not line:
                     continue
@@ -4658,12 +4700,18 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     if session_id.len() < 8 || !session_id.contains('-') {
         return None;
     }
-    let home = dirs::home_dir()?;
+    let data_root = muse_data_root_from_session_path(path)?;
+    let home = data_root
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some(".local"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(dirs::home_dir)?;
     // Prefer the SQLite index for cwd/title/mtime — it is the same source
     // `muse resume` lists from, and it contains the workspace_root and
     // already-extracted title without scanning multi-MB JSONL.
     let (db_cwd, db_title, db_updated_ms) = 'db_block: {
-        let db_path = home.join(".local/share/muse/session-index.db");
+        let db_path = data_root.join("session-index.db");
         if db_path.exists() {
             if let Ok(conn) = rusqlite::Connection::open_with_flags(
                 &db_path,
@@ -7487,5 +7535,122 @@ mod tests {
         let title2 = read_muse_live_store_title(&home, "test-muse-uuid-2");
         assert_eq!(title2.as_deref(), Some("Fix Yggterm Sidebar Live Titles"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Muse can emit hundreds of lifecycle records before the first accepted
+    /// user intent.  The index has been observed to keep `prompt_count = 0`
+    /// and `title = "New session"` even after that intent exists, so the
+    /// transcript must remain capable of proving that this is a real session.
+    #[test]
+    fn muse_title_search_reaches_past_startup_lifecycle_records() {
+        let root = dirs::home_dir()
+            .unwrap()
+            .join(".yggterm/scratchpad")
+            .join(format!("muse-title-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("session.jsonl");
+        let mut records = (0..80)
+            .map(|sequence| {
+                format!(
+                    "{{\"sequence\":{sequence},\"payload_type\":\"runtime.lifecycle\"}}\n"
+                )
+            })
+            .collect::<String>();
+        records.push_str(
+            r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"Repair durable Muse discovery"}]}]}}
+"#,
+        );
+        std::fs::write(&transcript, records).unwrap();
+
+        assert_eq!(
+            muse_title_from_session_jsonl(&transcript).as_deref(),
+            Some("Repair Durable Muse Discovery")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The ssh-side Muse reader used to stop after 65 records even though its
+    /// local twin scans until the first accepted intent. Real Muse sessions
+    /// have been measured with that intent hundreds of lifecycle records in,
+    /// so the same durable session was titled locally and left as a raw cwd in
+    /// a remote row. Exercise the actual Python probe, not a Rust paraphrase.
+    #[test]
+    fn remote_muse_title_search_reaches_past_startup_lifecycle_records() {
+        let root = dirs::home_dir()
+            .unwrap()
+            .join(".yggterm/scratchpad")
+            .join(format!("muse-remote-title-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session_id = "9f1c2e3a-4b5d-46e7-8f90-1a2b3c4d5e6f";
+        let session_dir = root
+            .join(".local/share/muse/sessions/2026/08/25")
+            .join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut records = (0..80)
+            .map(|sequence| {
+                format!(
+                    "{{\"sequence\":{sequence},\"payload_type\":\"runtime.lifecycle\"}}\n"
+                )
+            })
+            .collect::<String>();
+        records.push_str(
+            r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"Repair remote Muse title parity"}]}]}}
+"#,
+        );
+        std::fs::write(session_dir.join("session.jsonl"), records).unwrap();
+
+        let descriptor = agent_cli_descriptor(SessionKind::Muse).expect("Muse is registered");
+        let probe = descriptor
+            .remote_live_store_title
+            .expect("Muse declares a remote probe");
+        let mut args = descriptor.remote_store_title_locators();
+        args.push("--".to_string());
+        args.push(session_id.to_string());
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(probe.script)
+            .args(args)
+            .env("HOME", &root)
+            .output()
+            .expect("python3 is needed to exercise the remote Muse probe");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            output.status.success(),
+            "the probe script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let line = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .expect("the remote probe must answer for the deep Muse intent");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("JSON lines");
+        let candidates: Vec<String> = value["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .filter_map(|candidate| candidate.as_str().map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(
+            (probe.choose)(&candidates),
+            Some("Repair Muse Title Parity".to_string())
+        );
+    }
+
+    /// Muse stores raw prompts. `please ...` is low-signal only as a finished
+    /// title; it must first be condensed, exactly as the local durable reader
+    /// does, or the remote half rejects useful title input as store absence.
+    #[test]
+    fn muse_remote_title_condenses_before_classifying_prompt_copy() {
+        let candidates = vec![
+            "Please inspect the widget importer and continue tracing its dropped rows."
+                .to_string(),
+        ];
+        let chosen = super::first_muse_title_candidate(&candidates)
+            .expect("the raw prompt should condense to a usable title");
+        assert!(!chosen.to_ascii_lowercase().starts_with("please "));
+        assert!(!crate::looks_like_generated_fallback_title(&chosen));
+        assert!(!crate::looks_like_low_signal_generated_copy(&chosen));
     }
 }

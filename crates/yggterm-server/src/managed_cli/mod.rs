@@ -19,15 +19,15 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use yggterm_core::agent_cli::{AgentCliDescriptor, CliInstall, CliUpdate, agent_cli_descriptor};
 use yggterm_core::{
-    AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, SessionStore, append_trace_event,
+    AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, append_trace_event,
     resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
@@ -102,6 +102,10 @@ const VENDOR_INSTALLER_DIRNAME: &str = "vendor-installers";
 /// bounded here — the Muse launcher downloads a multi-hundred-MB payload — but
 /// it runs with stdin closed, so it cannot block on a prompt.
 const VENDOR_FETCH_TIMEOUT_SECS: u64 = 60;
+/// A CLI's `--version` is metadata, never a reason to stop identity, title,
+/// or attachment maintenance for the whole daemon. In particular a node
+/// process can remain in uninterruptible sleep under memory pressure.
+const MANAGED_CLI_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_MANAGED_CLI_REFRESH_TTL_MS: u64 = 2 * 60 * 60_000; // 2h — frequent daily checks, yggterm maintains isolated binaries
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,8 +802,7 @@ fn probe_tools(
 /// this reproduces the resolution a real launch performs, deliberately WITHOUT
 /// the managed prefix forced onto PATH.
 fn login_shell_resolved_cli(binary_name: &str) -> Option<(String, Option<String>)> {
-    let script =
-        format!("command -v {binary_name} || exit 1; {binary_name} --version 2>/dev/null | head -1");
+    let script = format!("command -v {binary_name} || exit 1");
     let output = Command::new("bash")
         .arg("-lc")
         .arg(script)
@@ -812,10 +815,7 @@ fn login_shell_resolved_cli(binary_name: &str) -> Option<(String, Option<String>
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     let path = lines.next()?.to_string();
-    let version = lines
-        .next()
-        .and_then(extract_semver_like_version)
-        .map(|version| version.to_string());
+    let version = run_version_command(Path::new(&path));
     Some((path, version))
 }
 
@@ -1444,6 +1444,20 @@ fn the_terminal_identity_env_has_exactly_one_test_guard() {
 mod tests {
     use super::*;
     use super::env_test_guard;
+
+    #[test]
+    fn metadata_subprocess_timeout_never_waits_for_the_child_reaper() {
+        let started = Instant::now();
+        let outcome = bounded_command_output(
+            Command::new("sh").args(["-c", "sleep 5"]),
+            Duration::from_millis(75),
+        );
+        assert_eq!(outcome, BoundedCommandOutput::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the caller must not join the detached child reaper"
+        );
+    }
 
     /// ⛔ The regression this pins is DESTRUCTIVE, not merely redundant: two
     /// `npm install -g` runs against one prefix were measured deleting the CLI
@@ -2815,14 +2829,89 @@ mod tests {
     }
 }
 
-fn run_version_command(binary_path: &Path) -> Option<String> {
-    let output = Command::new(binary_path).arg("--version").output().ok()?;
-    let combined = if output.stdout.is_empty() {
-        String::from_utf8_lossy(&output.stderr).to_string()
-    } else {
-        String::from_utf8_lossy(&output.stdout).to_string()
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedCommandOutput {
+    Completed { stdout: Vec<u8>, stderr: Vec<u8> },
+    TimedOut,
+    Failed,
+}
+
+/// Spawn a metadata probe with a hard wall-clock ceiling. On timeout the child
+/// is killed and handed to a detached reaper: `wait` itself may block forever
+/// for a task in Linux D state, so the daemon chore must never wait there.
+fn bounded_command_output(command: &mut Command, timeout: Duration) -> BoundedCommandOutput {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let Ok(mut child) = command.spawn() else {
+        return BoundedCommandOutput::Failed;
     };
-    extract_version_token(&combined)
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if child
+                    .stdout
+                    .take()
+                    .is_some_and(|mut pipe| pipe.read_to_end(&mut stdout).is_err())
+                    || child
+                        .stderr
+                        .take()
+                        .is_some_and(|mut pipe| pipe.read_to_end(&mut stderr).is_err())
+                {
+                    return BoundedCommandOutput::Failed;
+                }
+                return BoundedCommandOutput::Completed { stdout, stderr };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = std::thread::Builder::new()
+                    .name("yggterm-version-probe-reaper".to_string())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+                return BoundedCommandOutput::TimedOut;
+            }
+            Err(_) => return BoundedCommandOutput::Failed,
+        }
+    }
+}
+
+fn run_version_command(binary_path: &Path) -> Option<String> {
+    let started = Instant::now();
+    let outcome = bounded_command_output(
+        Command::new(binary_path).arg("--version"),
+        MANAGED_CLI_VERSION_PROBE_TIMEOUT,
+    );
+    let (outcome_name, output) = match outcome {
+        BoundedCommandOutput::Completed { stdout, stderr } => {
+            let output = if stdout.is_empty() { stderr } else { stdout };
+            ("completed", Some(output))
+        }
+        BoundedCommandOutput::TimedOut => ("timed_out", None),
+        BoundedCommandOutput::Failed => ("failed", None),
+    };
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "cli",
+            "version_probe",
+            serde_json::json!({
+                "binary": binary_path.file_name().and_then(|name| name.to_str()),
+                "outcome": outcome_name,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "timeout_ms": MANAGED_CLI_VERSION_PROBE_TIMEOUT.as_millis(),
+            }),
+        );
+    }
+    output.and_then(|bytes| extract_version_token(&String::from_utf8_lossy(&bytes)))
 }
 
 fn extract_version_token(text: &str) -> Option<String> {

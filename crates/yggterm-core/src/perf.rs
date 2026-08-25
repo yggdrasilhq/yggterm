@@ -1332,4 +1332,47 @@ mod tests {
             "cpu-ms without its interval cannot become a core fraction"
         );
     }
+
+    #[test]
+    fn web_surface_and_sidebar_liveness_probes_emit() {
+        // Verify probe registration and ytrace_emit_event for web_surface and sidebar liveness
+        ytrace_emit_event(
+            "web_surface",
+            "liveness",
+            "touch",
+            json!({
+                "session_path": "/home/user/proj:local:1",
+                "last_seen_ms": 1000,
+                "delta_ms": 500,
+            }),
+        );
+        ytrace_emit_event(
+            "web_surface",
+            "liveness",
+            "swept",
+            json!({
+                "session_path": "/home/user/proj:local:1",
+                "age_ms": 5000,
+                "threshold_ms": 4000,
+            }),
+        );
+        ytrace_emit_event(
+            "web_surface",
+            "lifecycle",
+            "closed",
+            json!({
+                "session_path": "/home/user/proj:local:1",
+            }),
+        );
+        ytrace_emit_event(
+            "sidebar",
+            "liveness",
+            "swept",
+            json!({
+                "session_path": "/home/user/proj:local:1",
+                "age_ms": 5000,
+            }),
+        );
+    }
 }
+

@@ -12,6 +12,7 @@ use crate::{
     PersistedLiveSession, PersistedStoredSession, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
+    TerminalLaunchPhase,
     active_client_instance_records, active_client_instance_records_for_endpoint_scope,
     claude_code_runtime_process_identity_from_root_pid,
     agent_runtime_session_id_from_root_pid, codex_runtime_process_identity_from_root_pid,
@@ -63,6 +64,65 @@ const BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK: usize = 2;
 // A session that produced PTY output within this window counts as "working"
 // for the title trigger even if the esc-to-interrupt footer just cleared.
 const BACKGROUND_COPY_WORKING_RECENT_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAttachmentState {
+    Running,
+    Preserved,
+    ExitedRuntime,
+    MissingRuntime,
+    /// A legacy/birth `local://` presence row with no runtime ownership.  It is
+    /// anomalous and visible to the user, but it is not proof that this daemon
+    /// dropped an owned PTY: old state can contain these rows indefinitely.
+    UnboundPresence,
+    NotExpected,
+}
+
+fn classify_agent_attachment(
+    expected: bool,
+    held_here: bool,
+    running_here: bool,
+    preserved_elsewhere: bool,
+) -> AgentAttachmentState {
+    if !expected {
+        AgentAttachmentState::NotExpected
+    } else if running_here {
+        AgentAttachmentState::Running
+    } else if preserved_elsewhere {
+        AgentAttachmentState::Preserved
+    } else if held_here {
+        AgentAttachmentState::ExitedRuntime
+    } else {
+        AgentAttachmentState::MissingRuntime
+    }
+}
+
+fn agent_presence_is_unbound(
+    session_path: &str,
+    runtime_key_scheme: Option<&str>,
+    held_here: bool,
+    preserved_elsewhere: bool,
+) -> bool {
+    runtime_key_scheme.is_some()
+        && session_path.trim_start().starts_with("local://")
+        && !held_here
+        && !preserved_elsewhere
+}
+
+fn agent_attachment_expected_on_this_daemon(
+    session_path: &str,
+    launch_phase: TerminalLaunchPhase,
+) -> bool {
+    let is_remote_row = yggterm_core::agent_scheme::remote_agent_row_schemes()
+        .any(|scheme| session_path.trim_start().starts_with(scheme.prefix));
+    !is_remote_row
+        && matches!(
+            launch_phase,
+            TerminalLaunchPhase::BridgePending
+                | TerminalLaunchPhase::RemoteBootstrap
+                | TerminalLaunchPhase::Running
+        )
+}
 const DAEMON_ACCEPT_POLL_MS: u64 = 1000;
 const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
 const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
@@ -197,12 +257,13 @@ const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
 const CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS: u64 = 60 * 60;
 const EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS: u64 = 2;
 const ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE: &str = "YGGTERM_ENABLE_BACKGROUND_COPY_CHORE";
-// Remote-Codex identity poll (`[[finding-uuidv4-codex-session-drift]]` Stage 2).
+// Remote self-minting-agent identity poll. The constant and environment names
+// retain "CODEX" for compatibility with existing installations.
 const REMOTE_CODEX_IDENTITY_POLL_MS: u64 = 8_000;
 const REMOTE_CODEX_IDENTITY_POLL_MAX_IDLE_MS: u64 = 60_000;
-// A remote-Codex row that never matches a running process (codex already
-// exited, cwd mismatch) is abandoned after this many SSH polls so the daemon
-// does not SSH a machine forever for an un-rebindable row.
+// A remote row that never matches a running process is abandoned after this
+// many SSH polls so the daemon does not query a machine forever for an
+// un-rebindable row.
 const REMOTE_CODEX_IDENTITY_POLL_MAX_ATTEMPTS: u32 = 12;
 const ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL: &str =
     "YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL";
@@ -481,6 +542,20 @@ fn server_version_is_strictly_newer(candidate: &str, mine: &str) -> bool {
         (Some(other), Some(own)) => other > own,
         _ => false,
     }
+}
+
+/// A version socket symlink may yield its name only to the successor explicitly
+/// named by the PTY handoff registry. Without this exception a predecessor's
+/// compatibility alias answers the successor's pre-bind ping, so the successor
+/// exits before opening the socket that would receive the preserved PTYs.
+fn handoff_alias_may_yield_to_successor(
+    path_is_symlink: bool,
+    expected_server_version: Option<&str>,
+    preserved_runtime_count: usize,
+) -> bool {
+    path_is_symlink
+        && preserved_runtime_count > 0
+        && expected_server_version == Some(SERVER_PROTOCOL_VERSION)
 }
 
 /// THE owner of the versioned socket name format. `socket_sweep` borrows it
@@ -1533,6 +1608,37 @@ fn runtime_key_prefers_requested_path(
     terminals_hold_path: bool,
 ) -> bool {
     path != resolved && !terminals_hold_resolved && terminals_hold_path
+}
+
+/// Every descriptor-owned runtime spelling a live local agent row may answer
+/// to. Self-minting CLIs keep the yggterm birth id in their row key and the real
+/// CLI id in `session.id`, so both are candidates; the terminal manager decides
+/// which one is actually live. Keeping this registry-derived is what gives Muse,
+/// Antigravity, Pi, Qwen, Grok, Kimi and OpenCode the same resolver Codex had.
+fn agent_runtime_alias_candidates(
+    kind: crate::SessionKind,
+    row_key: &str,
+    session_path: &str,
+    session_id: &str,
+) -> Vec<String> {
+    let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(kind) else {
+        return Vec::new();
+    };
+    let Some(scheme) = descriptor.runtime_key_scheme else {
+        return Vec::new();
+    };
+    let mut ids = Vec::<String>::new();
+    for candidate in [row_key, session_path] {
+        if let Some(id) = crate::local_runtime_id_from_key(candidate)
+            && !ids.iter().any(|known| known == id)
+        {
+            ids.push(id.to_string());
+        }
+    }
+    if !session_id.trim().is_empty() && !ids.iter().any(|known| known == session_id) {
+        ids.push(session_id.to_string());
+    }
+    ids.into_iter().map(|id| format!("{scheme}{id}")).collect()
 }
 
 /// [`DaemonRuntime::terminal_runtime_key_for_path`] for the free functions that
@@ -5940,6 +6046,34 @@ impl DaemonRuntime {
         }
     }
 
+    /// Overlay the real id of a self-minting CLI onto the snapshot returned by
+    /// the owning daemon. This is the remote identity wire's authoritative
+    /// join: the owner can walk its PTY process tree, while the GUI host only
+    /// knows the wrapper UUID it created.
+    fn overlay_agent_runtime_snapshot_session(&self, session: &mut SnapshotSessionView) {
+        let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) else {
+            return;
+        };
+        if descriptor.id_assigned_at_birth || descriptor.live_session_marker.is_none() {
+            return;
+        }
+        let Some(pid) = session.terminal_process_id else {
+            return;
+        };
+        let Some(real_id) = crate::agent_runtime_session_id_from_root_pid(session.kind, pid) else {
+            return;
+        };
+        if real_id == session.id {
+            return;
+        }
+        session.id = real_id.clone();
+        crate::upsert_snapshot_metadata(
+            &mut session.metadata,
+            descriptor.session_metadata_label,
+            real_id,
+        );
+    }
+
     fn codex_runtime_identity_for_pid(&self, pid: u32) -> Option<CodexRuntimeProcessIdentity> {
         self.codex_process_identity_cache
             .lock()
@@ -6096,6 +6230,16 @@ impl DaemonRuntime {
                         "session_id": session_id,
                     }),
                 );
+                yggterm_core::perf::ytrace_emit_event(
+                    "daemon",
+                    yggterm_core::cli_plane::CLI_PLANE_CATEGORY,
+                    "local_identity_bind",
+                    serde_json::json!({
+                        "session_path": key,
+                        "kind": yggterm_core::agent_cli::session_kind_label(kind),
+                        "id_origin": "cli_minted",
+                    }),
+                );
             }
         }
         bound
@@ -6159,10 +6303,12 @@ impl DaemonRuntime {
         let yggterm_home = resolve_yggterm_home().ok();
         if let Some(active_session) = snapshot.active_session.as_mut() {
             self.overlay_terminal_runtime_snapshot_session(active_session);
+            self.overlay_agent_runtime_snapshot_session(active_session);
             self.overlay_codex_runtime_snapshot_session(active_session, yggterm_home.as_deref());
         }
         for session in &mut snapshot.live_sessions {
             self.overlay_terminal_runtime_snapshot_session(session);
+            self.overlay_agent_runtime_snapshot_session(session);
             self.overlay_codex_runtime_snapshot_session(session, yggterm_home.as_deref());
             // ⛔ ONLY where this daemon has no answer of its own. A scrape of a
             // screen we own is the freshest truth there is; a proxied flag may
@@ -6202,13 +6348,25 @@ impl DaemonRuntime {
     /// name while the runtime sat there answering to its own.
     fn terminal_runtime_key_for_path(&self, path: &str) -> String {
         let resolved = self.server.terminal_runtime_key_for_path(path);
-        if runtime_key_prefers_requested_path(
-            path,
-            &resolved,
-            self.can_serve_runtime_key(&resolved),
-            self.can_serve_runtime_key(path),
-        ) {
-            return path.to_string();
+        let row = self.server.resolve_live_session_entry(path);
+        let aliases = row
+            .as_ref()
+            .map(|(row_key, session)| {
+                agent_runtime_alias_candidates(
+                    session.kind,
+                    row_key,
+                    &session.session_path,
+                    &session.id,
+                )
+            })
+            .unwrap_or_default();
+        for candidate in std::iter::once(resolved.as_str())
+            .chain(std::iter::once(path))
+            .chain(aliases.iter().map(String::as_str))
+        {
+            if self.can_serve_runtime_key(candidate) {
+                return candidate.to_string();
+            }
         }
         resolved
     }
@@ -12260,6 +12418,7 @@ fn collect_live_copy_candidates(
 
 fn collect_remote_copy_candidates(
     remote_machines: &[RemoteMachineSnapshot],
+    live_sessions: &[ManagedSessionView],
 ) -> Vec<BackgroundCopyCandidate> {
     let mut out = Vec::new();
     for machine in remote_machines {
@@ -12268,8 +12427,28 @@ fn collect_remote_copy_candidates(
         // than the whole scanned machine, once per candidate.
         let machine_ref = machine.routing_ref();
         for session in &machine.sessions {
+            let scanned_kind =
+                yggterm_core::agent_scheme::session_kind_for_path(&session.session_path);
+            let live_wrapper_path = scanned_kind.and_then(|scanned_kind| {
+                live_sessions.iter().find_map(|live| {
+                    let (live_kind, live_machine, _path_id) =
+                        yggterm_core::agent_scheme::parse_remote_agent_session_path(
+                            &live.session_path,
+                        )?;
+                    (live_kind == scanned_kind
+                        && background_machine_key(live_machine)
+                            == background_machine_key(&machine.machine_key)
+                        && live.id == session.session_id)
+                        .then(|| live.session_path.clone())
+                })
+            });
             out.push(BackgroundCopyCandidate {
-                session_path: session.session_path.clone(),
+                // A self-minting CLI's live wrapper keeps its birth UUID in
+                // the path after its logical id is rebound. Generated copy is
+                // keyed by the real durable id, but must land on that wrapper
+                // row rather than a second invisible scanned-path twin.
+                session_path: live_wrapper_path
+                    .unwrap_or_else(|| session.session_path.clone()),
                 session_id: session.session_id.clone(),
                 cwd: session.cwd.clone(),
                 title: session.title_hint.clone(),
@@ -12460,12 +12639,16 @@ fn collect_live_store_title_syncs_in(
             .expect("the skip classifier refuses a CLI with no reader");
         let stored = read_title(home, &session.id).map(|title| title.trim().to_string());
         let Some(title) = stored.filter(|title| !title.is_empty()) else {
-            sweep.record(
-                &session.session_path,
-                session.kind,
-                &session.id,
-                CliTitleOutcome::NoTitleInStore,
-                None,
+                sweep.record(
+                    &session.session_path,
+                    session.kind,
+                    &session.id,
+                    CliTitleOutcome::NoTitleInStore,
+                    // A self-minting row changing from its birth UUID to its
+                    // real CLI UUID is a new lookup edge even when both miss.
+                    // Without the id in the signature, ytrace suppresses the
+                    // one event that proves rebind happened.
+                    Some(&session.id),
                 // The id the store was asked about. A CLI that mints its own id
                 // is rebound by the identity poll, and a miss whose id is the
                 // row's birth uuid is a REBIND failure wearing a store
@@ -12492,8 +12675,8 @@ fn collect_live_store_title_syncs_in(
             CliTitleOutcome::PickedUp,
             Some(&title),
             serde_json::json!({
-                "previous_title": session.title,
-                "new_title": title,
+                "previous_title_quality": yggterm_core::cli_plane::classify_rendered_title(&session.title).label(),
+                "new_title_quality": yggterm_core::cli_plane::classify_rendered_title(&title).label(),
             }),
         );
         updates.push(BackgroundCopyUpdate {
@@ -12561,6 +12744,29 @@ struct RemoteTitlePollDecision {
     detail: serde_json::Value,
 }
 
+fn remote_title_confirmation_key(session_path: &str, session_id: &str) -> String {
+    format!("{session_path}\u{1f}{session_id}")
+}
+
+/// Remember only a POSITIVE store lookup.
+///
+/// A self-minting CLI starts under the wrapper's birth UUID and exposes its
+/// real conversation UUID later. A miss is therefore not a settled answer:
+/// the store may not exist yet, or the row may still be carrying the birth
+/// identity. Recording that miss used to strand Muse/Antigravity rows at a raw
+/// path forever, because the next idle tick was suppressed before it could ask
+/// with the real UUID.
+fn confirm_remote_title_lookup(
+    confirmed_paths: &mut HashSet<String>,
+    session_path: &str,
+    session_id: &str,
+    title_found: bool,
+) {
+    if title_found {
+        confirmed_paths.insert(remote_title_confirmation_key(session_path, session_id));
+    }
+}
+
 /// Which live REMOTE agent rows to poll for a title this tick, and why the rest
 /// were not — for EVERY registered CLI, not one.
 ///
@@ -12604,7 +12810,12 @@ fn remote_store_title_poll_decisions(
         let mut decision = RemoteTitlePollDecision {
             session_path: session.session_path.clone(),
             kind: session.kind,
-            session_id: session_id.to_string(),
+            // The row's logical id is rebound from the wrapper birth UUID to
+            // the CLI's real id. The path keeps addressing the existing PTY,
+            // but the remote store must be queried with the logical id.
+            session_id: (!session.id.trim().is_empty())
+                .then(|| session.id.clone())
+                .unwrap_or_else(|| session_id.to_string()),
             machine_key: machine_key.to_string(),
             skipped: None,
             // ⭐ The scheme's own CLI beside the row's. A row kinded one way and
@@ -12613,6 +12824,7 @@ fn remote_store_title_poll_decisions(
             // would be the WRONG CLI's.
             detail: serde_json::json!({
                 "scheme_kind": format!("{scheme_kind:?}"),
+                "path_id_matches_logical_id": session_id == session.id,
             }),
         };
         if descriptor.remote_live_store_title.is_none() {
@@ -12635,7 +12847,10 @@ fn remote_store_title_poll_decisions(
             continue;
         }
         if !working_paths.contains(&session.session_path)
-            && confirmed_paths.contains(&session.session_path)
+            && confirmed_paths.contains(&remote_title_confirmation_key(
+                &session.session_path,
+                &decision.session_id,
+            ))
         {
             decision.skipped = Some(CliTitleOutcome::SkippedTitleSettled);
             out.push(decision);
@@ -12755,6 +12970,7 @@ fn collect_remote_store_title_syncs(
         // title" in the remote script would put a second encoding of it on the
         // far side of an ssh hop, free to drift for a whole release.
         let mut titles: HashMap<String, String> = HashMap::new();
+        let mut candidate_counts: HashMap<String, usize> = HashMap::new();
         for line in &lines {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
@@ -12773,6 +12989,7 @@ fn collect_remote_store_title_syncs(
                         .collect()
                 })
                 .unwrap_or_default();
+            candidate_counts.insert(id.to_string(), candidates.len());
             if let Some(title) = (probe.choose)(&candidates) {
                 let title = title.trim().to_string();
                 if !title.is_empty() {
@@ -12781,26 +12998,47 @@ fn collect_remote_store_title_syncs(
             }
         }
         for row in rows {
-            confirmed_paths.insert(row.session_path.clone());
             let current = live_sessions
                 .iter()
                 .find(|session| session.session_path == row.session_path)
                 .map(|session| session.title.as_str())
                 .unwrap_or("");
             let Some(title) = titles.get(&row.session_id) else {
+                // A negative lookup is deliberately NOT confirmed. New stores
+                // and self-minted identities are eventually consistent; the
+                // chore's idle backoff bounds retries without freezing a miss
+                // into product truth.
+                confirm_remote_title_lookup(
+                    confirmed_paths,
+                    &row.session_path,
+                    &row.session_id,
+                    false,
+                );
                 sweep.record(
                     &row.session_path,
                     row.kind,
                     &row.session_id,
                     CliTitleOutcome::NoTitleInStore,
-                    None,
+                    Some(&row.session_id),
                     serde_json::json!({
                         "machine": machine_key,
                         "id_origin": CliIdOrigin::declared_for(row.kind).label(),
+                        "retry": "unconfirmed_until_store_title",
+                        // Splits a genuinely empty store (0) from candidates
+                        // rejected by the shared title predicate (>0), without
+                        // ever copying candidate/title text into ytrace.
+                        "candidate_count": candidate_counts.get(&row.session_id).copied().unwrap_or(0),
+                        "probe_line_count": lines.len(),
                     }),
                 );
                 continue;
             };
+            confirm_remote_title_lookup(
+                confirmed_paths,
+                &row.session_path,
+                &row.session_id,
+                true,
+            );
             if title.as_str() == current {
                 sweep.record(
                     &row.session_path,
@@ -12820,8 +13058,8 @@ fn collect_remote_store_title_syncs(
                 Some(title),
                 serde_json::json!({
                     "machine": machine_key,
-                    "previous_title": current,
-                    "new_title": title,
+                    "previous_title_quality": yggterm_core::cli_plane::classify_rendered_title(current).label(),
+                    "new_title_quality": yggterm_core::cli_plane::classify_rendered_title(title).label(),
                 }),
             );
             updates.push(BackgroundCopyUpdate {
@@ -12954,7 +13192,10 @@ fn build_background_copy_updates(
         collect_local_copy_candidates(local_root, &mut candidates);
     }
     collect_live_copy_candidates(store, live_sessions, working_paths, &mut candidates);
-    candidates.extend(collect_remote_copy_candidates(remote_machines));
+    candidates.extend(collect_remote_copy_candidates(
+        remote_machines,
+        live_sessions,
+    ));
 
     // ONE sqlite connection for the whole candidate loop. Each
     // `store.resolve_*_for_session_id` below is a one-shot arity that opens
@@ -13184,9 +13425,9 @@ fn build_background_copy_updates(
             let attempt_payload = serde_json::json!({
                 "session_path": candidate.session_path,
                 "session_id": candidate.session_id,
-                "candidate_title": candidate.title,
-                "stored_title": stored_title,
-                "generated_title": title.clone(),
+                "candidate_title_quality": yggterm_core::cli_plane::classify_rendered_title(&candidate.title).label(),
+                "stored_title_present": stored_title.is_some(),
+                "generated_title_present": title.is_some(),
                 "summary_missing": summary_missing,
                 "live_local_agent": candidate.live_local_agent,
             });
@@ -13208,7 +13449,7 @@ fn build_background_copy_updates(
                     "session_path": candidate.session_path,
                     "session_id": candidate.session_id,
                     "reason": "llm_and_heuristic_failed_or_no_context",
-                    "candidate_title": candidate.title,
+                    "candidate_title_quality": yggterm_core::cli_plane::classify_rendered_title(&candidate.title).label(),
                 });
                 yggterm_core::perf::ytrace_emit_event(
                     "daemon",
@@ -13249,6 +13490,100 @@ fn build_background_copy_updates(
     Ok(updates)
 }
 
+#[derive(Debug, Default, Serialize)]
+struct AgentAttachmentCounts {
+    live: usize,
+    running: usize,
+    preserved: usize,
+    exited_runtime: usize,
+    missing_runtime: usize,
+    unbound_presence: usize,
+    not_expected: usize,
+}
+
+fn empty_agent_attachment_counts() -> BTreeMap<String, AgentAttachmentCounts> {
+    yggterm_core::agent_cli::AGENT_CLIS
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.slug.to_string(),
+                AgentAttachmentCounts::default(),
+            )
+        })
+        .collect()
+}
+
+/// Observe every registered CLI through the same ownership/runtime contract.
+/// This is diagnosis only: the daemon/server state remains authoritative and
+/// the sweep never creates, removes, or retargets a row.
+fn collect_agent_attachment_sweep(runtime: &mut DaemonRuntime) -> serde_json::Value {
+    let mut per_kind = empty_agent_attachment_counts();
+    let live_sessions = runtime.server.live_sessions().to_vec();
+    for session in live_sessions {
+        let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) else {
+            continue;
+        };
+        let runtime_path = runtime.terminal_runtime_key_for_path(&session.session_path);
+        let held_here = runtime.terminals.holds_session(&runtime_path);
+        let running_here = runtime.terminals.has_session(&runtime_path);
+        let preserved_elsewhere = runtime
+            .preserved_terminal_owners
+            .owner_for_key(&runtime_path)
+            .is_some();
+        // A `remote-<cli>://host/...` row is GUI-side presence for a PTY owned
+        // by that host's daemon.  Counting it as missing here turns a healthy
+        // decentralized fleet into one false detach per remote row.  The
+        // owning host sees the corresponding `*-runtime://` row and audits it.
+        let expected = agent_attachment_expected_on_this_daemon(
+            &session.session_path,
+            session.launch_phase,
+        );
+        let state = if expected
+            && agent_presence_is_unbound(
+                &session.session_path,
+                descriptor.runtime_key_scheme,
+                held_here,
+                preserved_elsewhere,
+            )
+        {
+            AgentAttachmentState::UnboundPresence
+        } else {
+            classify_agent_attachment(
+                expected,
+                held_here,
+                running_here,
+                preserved_elsewhere,
+            )
+        };
+        let counts = per_kind
+            .get_mut(descriptor.slug)
+            .expect("every descriptor was seeded");
+        counts.live += 1;
+        match state {
+            AgentAttachmentState::Running => counts.running += 1,
+            AgentAttachmentState::Preserved => counts.preserved += 1,
+            AgentAttachmentState::ExitedRuntime => counts.exited_runtime += 1,
+            AgentAttachmentState::MissingRuntime => counts.missing_runtime += 1,
+            AgentAttachmentState::UnboundPresence => counts.unbound_presence += 1,
+            AgentAttachmentState::NotExpected => counts.not_expected += 1,
+        }
+    }
+    let detached = per_kind
+        .values()
+        .map(|counts| counts.exited_runtime + counts.missing_runtime)
+        .sum::<usize>();
+    let unbound_presence = per_kind
+        .values()
+        .map(|counts| counts.unbound_presence)
+        .sum::<usize>();
+    serde_json::json!({
+        "registered_kinds": yggterm_core::agent_cli::AGENT_CLIS.len(),
+        "detached": detached,
+        "unbound_presence": unbound_presence,
+        "per_kind": per_kind,
+    })
+}
+
 fn run_background_copy_chore(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     generation_enabled: bool,
@@ -13263,8 +13598,18 @@ fn run_background_copy_chore(
         perf_home,
         working_paths,
         mid_turn_paths,
+        attachment_sweep,
     ) = {
-        let runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
+        let mut runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
+        // Identity is learned only after these CLIs open their measured marker
+        // on the first turn. A lifecycle-only refresh can therefore miss it
+        // forever on an otherwise idle row. Ride the existing bounded chore so
+        // the owner persists the real id before any crash or cold restore.
+        let local_identity_rebinds =
+            runtime.refresh_live_agent_runtime_session_ids_for_persistence();
+        if local_identity_rebinds > 0 {
+            runtime.persist()?;
+        }
         let settings = runtime.store.load_settings().unwrap_or_default();
         // Eventual propagation of a GUI profiling toggle into the daemon's gate.
         yggterm_core::set_perf_profiling_enabled(settings.perf_profiling_enabled);
@@ -13300,6 +13645,7 @@ fn run_background_copy_chore(
                 working_paths.insert(session.session_path.clone());
             }
         }
+        let attachment_sweep = collect_agent_attachment_sweep(&mut runtime);
         (
             runtime.store.clone(),
             settings,
@@ -13309,6 +13655,7 @@ fn run_background_copy_chore(
             runtime.store.home_dir().to_path_buf(),
             working_paths,
             mid_turn_paths,
+            attachment_sweep,
         )
     };
     // A `PerfGuard`, not a `PerfSpan`: the tree load and the update build
@@ -13316,6 +13663,13 @@ fn run_background_copy_chore(
     // is precisely the run worth a duration — an explicit `finish` at the
     // bottom is the one that never runs on those.
     let mut perf = yggterm_core::PerfGuard::new(&perf_home, "daemon", "background_copy_chore");
+    append_trace_event(
+        &perf_home,
+        "daemon",
+        "cli",
+        "attachment_sweep",
+        attachment_sweep,
+    );
     // The local cwd-tree scan walks every codex + Claude Code transcript on
     // this machine. It used to run INSIDE the read block above, which held
     // the daemon runtime lock across a multi-second disk walk and blocked
@@ -13395,12 +13749,25 @@ fn run_background_copy_chore(
     // refusal path stops re-arming the cadence by construction.
     let mut applied = 0usize;
     for update in &updates {
-        if let Some(title) = update.title.as_deref()
-            && runtime
+        if let Some(title) = update.title.as_deref() {
+            if runtime
                 .server
                 .set_session_title_hint(&update.session_path, title)
-        {
-            applied += 1;
+            {
+                applied += 1;
+            } else {
+                append_trace_event(
+                    runtime.store.home_dir(),
+                    "daemon",
+                    "cli",
+                    "title_apply_refused",
+                    serde_json::json!({
+                        "session_path": update.session_path,
+                        "row_resolved": runtime.server.live_session_path(&update.session_path).is_some(),
+                        "owner_titled": runtime.server.session_title_is_explicit(&update.session_path),
+                    }),
+                );
+            }
         }
         if let Some(summary) = update.summary.as_deref() {
             runtime
@@ -13428,9 +13795,22 @@ fn run_background_copy_chore(
     Ok(applied)
 }
 
-fn remote_codex_identity_poll_enabled() -> bool {
+fn env_value_is_truthy(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn remote_agent_identity_poll_enabled_from_env(value: Option<&str>) -> bool {
     // Default ON; an explicit truthy disable env opts out.
-    !daemon_background_copy_chore_enabled_from_env(
+    !env_value_is_truthy(value)
+}
+
+fn remote_codex_identity_poll_enabled() -> bool {
+    // Keep the historical environment variable name for compatibility. The
+    // poll now covers every registered self-minting CLI, not only Codex.
+    remote_agent_identity_poll_enabled_from_env(
         std::env::var(ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL)
             .ok()
             .as_deref(),
@@ -13446,97 +13826,98 @@ fn normalize_cwd_for_identity_match(cwd: &str) -> String {
     }
 }
 
-/// Matches the Codex processes running on one machine to the live remote-Codex
-/// rows that need rebinding. An owner-reported birth alias is authoritative;
-/// normalized cwd remains the compatibility fallback for older remote binaries.
+/// Matches self-minting agent processes on one machine to their live remote
+/// rows. An owner-reported birth alias is authoritative; normalized cwd remains
+/// a Codex-only compatibility fallback for older remote binaries.
 /// Pure (no IO) so the matching policy is unit-testable. A running identity is
 /// paired only when its real session id differs from the row's synthesized id
 /// and has not already been claimed, so two rows never collapse onto one
 /// transcript.
-fn match_codex_identities_to_targets(
-    group: &[crate::RemoteCodexIdentityPollTarget],
+fn match_agent_identities_to_targets(
+    group: &[crate::RemoteAgentIdentityPollTarget],
     identities: &[crate::LocalAgentCliIdentity],
-) -> Vec<(String, CodexRuntimeProcessIdentity)> {
-    let by_birth_id: HashMap<&str, &crate::LocalAgentCliIdentity> = identities
+) -> Vec<(String, SessionKind, crate::LocalAgentCliIdentity)> {
+    let by_birth_id: HashMap<(&str, &str), &crate::LocalAgentCliIdentity> = identities
         .iter()
-        .filter(|identity| identity.kind == "codex")
         .filter_map(|identity| {
             identity
                 .birth_session_id
                 .as_deref()
-                .map(|birth_id| (birth_id, identity))
+                .map(|birth_id| ((identity.kind.as_str(), birth_id), identity))
         })
         .collect();
-    let mut by_cwd: HashMap<String, Vec<&crate::LocalAgentCliIdentity>> = HashMap::new();
-    for identity in identities
-        .iter()
-        .filter(|identity| identity.kind == "codex")
-    {
+    let mut by_cwd: HashMap<(String, String), Vec<&crate::LocalAgentCliIdentity>> = HashMap::new();
+    for identity in identities {
         by_cwd
-            .entry(normalize_cwd_for_identity_match(&identity.cwd))
+            .entry((
+                identity.kind.clone(),
+                normalize_cwd_for_identity_match(&identity.cwd),
+            ))
             .or_default()
             .push(identity);
     }
-    let mut claimed: HashSet<String> = HashSet::new();
+    let mut claimed: HashSet<(String, String)> = HashSet::new();
     let mut rebinds = Vec::new();
     for target in group {
+        let kind_slug = yggterm_core::agent_cli::session_kind_label(target.kind);
         // Exact owner-reported alias first. The previous cwd-only join fails
         // for worktrees: Codex's transcript retains the checkout cwd it was
         // born in while the yggterm wrapper correctly re-roots the resumed TUI
         // into another worktree. The remote daemon already owns the precise
         // synthetic UUID -> real transcript relation; use it before heuristics.
         let identity = by_birth_id
-            .get(target.current_id.as_str())
+            .get(&(kind_slug, target.current_id.as_str()))
             .copied()
             .filter(|identity| {
                 identity.session_id != target.current_id
-                    && !claimed.contains(&identity.session_id)
+                    && !claimed.contains(&(identity.kind.clone(), identity.session_id.clone()))
             })
             .or_else(|| {
+                // Only Codex publishes a trustworthy cwd in this wire. Muse
+                // and Antigravity are intentionally alias-only: their process
+                // marker enumerator cannot derive cwd, and pairing two rows by
+                // the host's default directory would cross-wire sessions.
+                if target.kind != SessionKind::Codex {
+                    return None;
+                }
                 by_cwd
-                    .get(&normalize_cwd_for_identity_match(&target.cwd))?
+                    .get(&(
+                        kind_slug.to_string(),
+                        normalize_cwd_for_identity_match(&target.cwd),
+                    ))?
                     .iter()
                     .copied()
                     .find(|identity| {
                         identity.session_id != target.current_id
-                            && !claimed.contains(&identity.session_id)
+                            && !claimed
+                                .contains(&(identity.kind.clone(), identity.session_id.clone()))
                     })
             });
         let Some(identity) = identity else {
             continue;
         };
-        claimed.insert(identity.session_id.clone());
-        rebinds.push((
-            target.key.clone(),
-            CodexRuntimeProcessIdentity {
-                storage_path: PathBuf::from(&identity.storage_path),
-                session_id: identity.session_id.clone(),
-                cwd: identity.cwd.clone(),
-            },
-        ));
+        claimed.insert((identity.kind.clone(), identity.session_id.clone()));
+        rebinds.push((target.key.clone(), target.kind, identity.clone()));
     }
     rebinds
 }
 
-/// One tick of the remote-Codex identity poll
-/// (`[[finding-uuidv4-codex-session-drift]]` Stage 2). For each live remote
-/// Codex row still carrying a synthesized UUIDv4 id, SSH-queries the owning
-/// machine for its running Codex processes, matches the owner's exact birth
-/// alias (with cwd only as an old-binary fallback), and rebinds the row to the
-/// real CLI session id through the same SSOT path the local rebind uses
-/// (`apply_codex_runtime_identity_to_live_session`). Self-limiting: a row drops
-/// out as soon as it is rebound, and `attempts` abandons rows that never match.
+/// One tick of the remote self-minting-agent identity poll. SSH queries each
+/// owner once, matches exact birth aliases for Codex, Muse, and Antigravity,
+/// and emits one `cli/identity_poll` aggregate per kind. Codex retains cwd as a
+/// compatibility fallback; CLIs whose identity wire cannot report cwd never
+/// guess with it.
 /// Returns the number of rows rebound this tick.
-fn run_remote_codex_identity_poll_chore(
+fn run_remote_agent_identity_poll_chore(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     attempts: &mut HashMap<String, u32>,
 ) -> Result<usize> {
     let (targets, yggterm_home) = {
-        let runtime = lock_daemon_runtime(runtime, "remote_codex_identity_poll_read");
+        let runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_read");
         (
             runtime
                 .server
-                .live_remote_codex_sessions_needing_identity_poll(),
+                .live_remote_agent_sessions_needing_identity_poll(),
             resolve_yggterm_home().ok(),
         )
     };
@@ -13546,7 +13927,7 @@ fn run_remote_codex_identity_poll_chore(
     attempts.retain(|key, _| live_keys.contains(key));
 
     // Skip rows that have exhausted their attempt budget (un-rebindable).
-    let targets: Vec<crate::RemoteCodexIdentityPollTarget> = targets
+    let targets: Vec<crate::RemoteAgentIdentityPollTarget> = targets
         .into_iter()
         .filter(|target| {
             attempts.get(&target.key).copied().unwrap_or(0)
@@ -13556,10 +13937,8 @@ fn run_remote_codex_identity_poll_chore(
     if targets.is_empty() {
         return Ok(0);
     }
-    let target_rows = targets.len();
-
     // Query each machine once.
-    let mut machines: HashMap<(String, Option<String>), Vec<crate::RemoteCodexIdentityPollTarget>> =
+    let mut machines: HashMap<(String, Option<String>), Vec<crate::RemoteAgentIdentityPollTarget>> =
         HashMap::new();
     for target in targets {
         machines
@@ -13568,13 +13947,32 @@ fn run_remote_codex_identity_poll_chore(
             .push(target);
     }
 
-    let mut rebinds: Vec<(String, CodexRuntimeProcessIdentity)> = Vec::new();
-    let mut query_failures = 0usize;
-    let mut identities_seen = 0usize;
-    let mut identities_with_birth_alias = 0usize;
-    let mut exact_alias_candidates = 0usize;
-    let mut cwd_candidates = 0usize;
+    let mut rebinds: Vec<(String, SessionKind, crate::LocalAgentCliIdentity)> = Vec::new();
+    let mut stats: HashMap<SessionKind, yggterm_core::cli_plane::CliIdentityPollStats> =
+        HashMap::new();
+    for target in machines.values().flatten() {
+        stats
+            .entry(target.kind)
+            .or_insert(yggterm_core::cli_plane::CliIdentityPollStats {
+                target_rows: 0,
+                machines_queried: 0,
+                query_failures: 0,
+                identities_seen: 0,
+                identities_with_birth_alias: 0,
+                exact_alias_candidates: 0,
+                cwd_candidates: 0,
+                rebinds: 0,
+                newly_exhausted: 0,
+            })
+            .target_rows += 1;
+    }
     for ((ssh_target, ssh_prefix), group) in &machines {
+        let kinds = group.iter().map(|target| target.kind).collect::<HashSet<_>>();
+        for kind in &kinds {
+            if let Some(kind_stats) = stats.get_mut(kind) {
+                kind_stats.machines_queried += 1;
+            }
+        }
         // Count the attempt for every row we are about to poll, regardless of outcome.
         for target in group {
             *attempts.entry(target.key.clone()).or_insert(0) += 1;
@@ -13583,44 +13981,60 @@ fn run_remote_codex_identity_poll_chore(
         {
             Ok(identities) => identities,
             Err(error) => {
-                query_failures += 1;
-                warn!(ssh_target = %ssh_target, error = %error, "remote codex identity poll failed");
+                for kind in kinds {
+                    if let Some(kind_stats) = stats.get_mut(&kind) {
+                        kind_stats.query_failures += 1;
+                    }
+                }
+                warn!(ssh_target = %ssh_target, error = %error, "remote agent identity poll failed");
                 continue;
             }
         };
-        identities_seen += identities.len();
-        identities_with_birth_alias += identities
-            .iter()
-            .filter(|identity| identity.kind == "codex" && identity.birth_session_id.is_some())
-            .count();
-        exact_alias_candidates += group
-            .iter()
-            .filter(|target| {
-                identities.iter().any(|identity| {
-                    identity.kind == "codex"
-                        && identity.birth_session_id.as_deref()
+        for kind in kinds {
+            let kind_slug = yggterm_core::agent_cli::session_kind_label(kind);
+            let kind_identities = identities
+                .iter()
+                .filter(|identity| identity.kind == kind_slug)
+                .collect::<Vec<_>>();
+            let Some(kind_stats) = stats.get_mut(&kind) else {
+                continue;
+            };
+            kind_stats.identities_seen += kind_identities.len();
+            kind_stats.identities_with_birth_alias += kind_identities
+                .iter()
+                .filter(|identity| identity.birth_session_id.is_some())
+                .count();
+            kind_stats.exact_alias_candidates += group
+                .iter()
+                .filter(|target| target.kind == kind)
+                .filter(|target| {
+                    kind_identities.iter().any(|identity| {
+                        identity.birth_session_id.as_deref()
                             == Some(target.current_id.as_str())
+                    })
                 })
-            })
-            .count();
-        cwd_candidates += group
-            .iter()
-            .filter(|target| {
-                identities.iter().any(|identity| {
-                    identity.kind == "codex"
-                        && normalize_cwd_for_identity_match(&identity.cwd)
-                            == normalize_cwd_for_identity_match(&target.cwd)
-                })
-            })
-            .count();
-        rebinds.extend(match_codex_identities_to_targets(group, &identities));
+                .count();
+            if kind == SessionKind::Codex {
+                kind_stats.cwd_candidates += group
+                    .iter()
+                    .filter(|target| target.kind == kind)
+                    .filter(|target| {
+                        kind_identities.iter().any(|identity| {
+                            normalize_cwd_for_identity_match(&identity.cwd)
+                                == normalize_cwd_for_identity_match(&target.cwd)
+                        })
+                    })
+                    .count();
+            }
+        }
+        rebinds.extend(match_agent_identities_to_targets(group, &identities));
     }
 
     let rebound_keys = rebinds
         .iter()
-        .map(|(key, _)| key.as_str())
+        .map(|(key, _, _)| key.as_str())
         .collect::<HashSet<_>>();
-    let newly_exhausted = machines
+    for target in machines
         .values()
         .flatten()
         .filter(|target| {
@@ -13628,47 +14042,57 @@ fn run_remote_codex_identity_poll_chore(
                 == REMOTE_CODEX_IDENTITY_POLL_MAX_ATTEMPTS
                 && !rebound_keys.contains(target.key.as_str())
         })
-        .count();
-    yggterm_core::cli_plane::emit_identity_poll(
-        "daemon",
-        SessionKind::Codex,
-        yggterm_core::cli_plane::CliIdentityPollStats {
-            target_rows,
-            machines_queried: machines.len(),
-            query_failures,
-            identities_seen,
-            identities_with_birth_alias,
-            exact_alias_candidates,
-            cwd_candidates,
-            rebinds: rebinds.len(),
-            newly_exhausted,
-        },
-    );
+    {
+        if let Some(kind_stats) = stats.get_mut(&target.kind) {
+            kind_stats.newly_exhausted += 1;
+        }
+    }
+    for (_, kind, _) in &rebinds {
+        if let Some(kind_stats) = stats.get_mut(kind) {
+            kind_stats.rebinds += 1;
+        }
+    }
+    let mut stats = stats.into_iter().collect::<Vec<_>>();
+    stats.sort_by_key(|(kind, _)| yggterm_core::agent_cli::session_kind_label(*kind));
+    for (kind, kind_stats) in stats {
+        yggterm_core::cli_plane::emit_identity_poll("daemon", kind, kind_stats);
+    }
 
     if rebinds.is_empty() {
         return Ok(0);
     }
 
     let mut applied = 0usize;
-    let mut runtime = lock_daemon_runtime(runtime, "remote_codex_identity_poll_apply");
-    for (key, identity) in &rebinds {
-        if runtime.server.apply_codex_runtime_identity_to_live_session(
-            key,
-            identity,
-            yggterm_home.as_deref(),
-        ) {
+    let mut runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_apply");
+    for (key, kind, identity) in &rebinds {
+        let changed = if *kind == SessionKind::Codex {
+            runtime.server.apply_codex_runtime_identity_to_live_session(
+                key,
+                &CodexRuntimeProcessIdentity {
+                    storage_path: PathBuf::from(&identity.storage_path),
+                    session_id: identity.session_id.clone(),
+                    cwd: identity.cwd.clone(),
+                },
+                yggterm_home.as_deref(),
+            )
+        } else {
+            runtime
+                .server
+                .apply_agent_runtime_session_id_to_live_session(key, &identity.session_id)
+        };
+        if changed {
             applied += 1;
             attempts.remove(key);
             append_trace_event(
                 runtime.store.home_dir(),
                 "daemon",
                 "persistence",
-                "remote_codex_runtime_identity_refreshed",
+                "remote_agent_runtime_identity_refreshed",
                 serde_json::json!({
                     "session_path": key,
-                    "codex_session_id": identity.session_id,
-                    "storage_path": identity.storage_path.display().to_string(),
-                    "cwd": identity.cwd,
+                    "kind": yggterm_core::agent_cli::session_kind_label(*kind),
+                    "session_id": identity.session_id,
+                    "storage_path_present": !identity.storage_path.trim().is_empty(),
                 }),
             );
         }
@@ -13680,12 +14104,10 @@ fn run_remote_codex_identity_poll_chore(
 }
 
 fn daemon_background_copy_chore_enabled_from_env(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    // Title rescue is a built-in product measure, not a harness opt-in. Keep
+    // the historical ENABLE variable as an explicit override so constrained
+    // hosts can still turn generation off with any non-truthy value.
+    value.map_or(true, |value| env_value_is_truthy(Some(value)))
 }
 
 fn daemon_background_copy_chore_enabled() -> bool {
@@ -15436,6 +15858,124 @@ pub(crate) fn classify_handoff_sweep(
 /// commit point — so its PTY stays where it is and the old lingering behaviour
 /// applies. Degrading to "no handoff" must never take the daemon down with it.
 #[cfg(target_os = "linux")]
+fn agent_kind_from_process_args(args: &[String]) -> Option<crate::SessionKind> {
+    let executable = args.first().map(|arg| crate::command_arg_basename(arg))?;
+    yggterm_core::agent_cli::AGENT_CLIS
+        .iter()
+        .find(|descriptor| descriptor.binary_name == executable)
+        .map(|descriptor| descriptor.kind)
+}
+
+#[cfg(target_os = "linux")]
+fn agent_kind_from_process_tree(root_pid: u32) -> Option<crate::SessionKind> {
+    const MAX_PROCESS_TREE_NODES: usize = 256;
+
+    let mut pending = vec![root_pid];
+    let mut seen = HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if seen.len() >= MAX_PROCESS_TREE_NODES || !seen.insert(pid) {
+            continue;
+        }
+        if let Some(args) = crate::linux_proc_cmdline_args(pid)
+            && let Some(kind) = agent_kind_from_process_args(&args)
+        {
+            return Some(kind);
+        }
+        pending.extend(crate::linux_proc_child_pids(pid));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn agent_kind_from_runtime_or_launch(
+    runtime_key: &str,
+    root_pid: Option<u32>,
+    launch_command: &str,
+) -> Option<(crate::SessionKind, &'static str)> {
+    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(runtime_key) {
+        return Some((kind, "runtime_scheme"));
+    }
+    // The adopted PTY and its current process tree are the authority for what
+    // is actually running. `launch_command` is preserved metadata and may
+    // contain an old wrapper, cwd, or another CLI name from an earlier restore.
+    if let Some(kind) = root_pid.and_then(agent_kind_from_process_tree) {
+        return Some((kind, "live_process"));
+    }
+    // Preserve `/` while finding shell words. Splitting it made an ordinary
+    // wrapper path such as `/home/user/pi/project` advertise the registered
+    // `pi` CLI before the scanner ever reached the real `agy` command later in
+    // the launch string. Walk the words in command order as well: the managed
+    // executable precedes model/argument values that might share another
+    // CLI's short name.
+    launch_command
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
+        })
+        .filter(|token| !token.is_empty() && !token.contains('/'))
+        .find_map(|token| {
+            yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .find(|descriptor| descriptor.binary_name == token)
+                .map(|descriptor| (descriptor.kind, "launch_word"))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn recover_missing_row_for_adopted_agent_runtime(
+    runtime: &mut DaemonRuntime,
+    metadata: &crate::pty_handoff::HandoffMetadata,
+) -> Option<(
+    String,
+    crate::SessionKind,
+    &'static str,
+    &'static str,
+    &'static str,
+)> {
+    let (kind, kind_origin) = agent_kind_from_runtime_or_launch(
+        &metadata.runtime_key,
+        Some(metadata.shell_pid),
+        &metadata.launch_command,
+    )?;
+    let mut storage_path = None::<PathBuf>;
+    let mut identity_cwd = None::<String>;
+    let mut id_origin = "runtime_key";
+    let cli_session_id = match kind {
+        crate::SessionKind::Codex => {
+            crate::codex_runtime_process_identity_from_root_pid(metadata.shell_pid).map(|identity| {
+                storage_path = Some(identity.storage_path);
+                identity_cwd = Some(identity.cwd);
+                id_origin = "open_store";
+                identity.session_id
+            })
+        }
+        crate::SessionKind::ClaudeCode => {
+            crate::claude_code_runtime_process_identity_from_root_pid(metadata.shell_pid).map(
+                |resolution| {
+                    storage_path = Some(resolution.identity.storage_path);
+                    identity_cwd = Some(resolution.identity.cwd);
+                    id_origin = "cli_registry_or_open_store";
+                    resolution.identity.session_id
+                },
+            )
+        }
+        _ => crate::agent_runtime_session_id_from_root_pid(kind, metadata.shell_pid).map(|id| {
+            id_origin = "live_session_marker";
+            id
+        }),
+    };
+    let cwd = metadata.cwd.as_deref().or(identity_cwd.as_deref());
+    let (row_key, row_repair) = runtime.server.recover_owned_agent_runtime_row(
+        &metadata.runtime_key,
+        kind,
+        cli_session_id.as_deref(),
+        &metadata.launch_command,
+        cwd,
+        storage_path.as_deref(),
+    )?;
+    Some((row_key, kind, kind_origin, id_origin, row_repair))
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>>) {
     use std::os::unix::net::UnixListener;
 
@@ -15514,6 +16054,48 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                                 Some(metadata.screen.as_str()),
                             )
                             .map_err(|error| format!("{error:#}"))?;
+                        // The descriptor is now safely seated. Make sure its
+                        // addressable row crossed as well. State persistence and
+                        // PTY transfer are independent channels; a missing row
+                        // must not turn an adopted, interactive CLI into an
+                        // invisible orphan. This repairs presence only and never
+                        // launches or restarts the process we just adopted.
+                        let recovered_row =
+                            recover_missing_row_for_adopted_agent_runtime(&mut rt, metadata);
+                        if let Some((row_key, kind, kind_origin, id_origin, row_repair)) =
+                            recovered_row.as_ref()
+                        {
+                            yggterm_core::perf::ytrace_emit_event(
+                                "daemon",
+                                yggterm_core::cli_plane::CLI_PLANE_CATEGORY,
+                                "orphan_runtime_row_recovered",
+                                serde_json::json!({
+                                    "kind": yggterm_core::agent_cli::session_kind_label(*kind),
+                                    "runtime_scheme": metadata
+                                        .runtime_key
+                                        .split_once("://")
+                                        .map(|(scheme, _)| scheme)
+                                        .unwrap_or("unknown"),
+                                    "kind_origin": kind_origin,
+                                    "id_origin": id_origin,
+                                    "row_repair": row_repair,
+                                }),
+                            );
+                            append_trace_event(
+                                &home_dir,
+                                "daemon",
+                                "lifecycle",
+                                "pty_handoff_runtime_row_recovered",
+                                serde_json::json!({
+                                    "runtime_key": metadata.runtime_key,
+                                    "row_key": row_key,
+                                    "kind": format!("{kind:?}"),
+                                    "kind_origin": kind_origin,
+                                    "id_origin": id_origin,
+                                    "row_repair": row_repair,
+                                }),
+                            );
+                        }
                         // ⛔⛔ PERSIST NOW, NOT ON THE NEXT ROUTINE TICK.
                         // During a handover the PREDECESSOR's routine
                         // persistence is muted for ever
@@ -15541,6 +16123,7 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                                 "cols": metadata.cols,
                                 "rows": metadata.rows,
                                 "screen_bytes": metadata.screen.len(),
+                                "row_recovered": recovered_row.is_some(),
                                 // A failure here means the row is live but
                                 // unrecoverable, which is worth seeing before
                                 // someone kills a daemon.
@@ -20572,12 +21155,11 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         ),
         Err(error) => warn!(error=%error, "failed to initialize remote runtime registry"),
     }
-    // The chore thread ALWAYS runs: the CC title sync inside it is a cheap
-    // JSONL read that every daemon (local GUI host and remote host daemons
-    // alike) must perform — CC's JSONL is the title SSOT. Only the LLM
-    // title/summary GENERATION half stays behind the env opt-in. (The whole
-    // chore used to sit behind this env, which nothing set — so the CC title
-    // sync shipped as dead code; root cause of "CC titles never update".)
+    // The chore thread ALWAYS runs: store-title sync is cheap and every daemon
+    // (local GUI host and remote host daemons alike) must perform it. Claude
+    // Code's JSONL remains its title SSOT. Interface-LLM rescue is built in;
+    // the historical ENABLE env is retained as an explicit off switch because
+    // older installations may already set it to false.
     {
         let generation_enabled = daemon_background_copy_chore_enabled();
         if !generation_enabled {
@@ -20715,7 +21297,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             let mut sleep_ms = REMOTE_CODEX_IDENTITY_POLL_MS;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-                match run_remote_codex_identity_poll_chore(&runtime, &mut attempts) {
+                match run_remote_agent_identity_poll_chore(&runtime, &mut attempts) {
                     Ok(rebinds) if rebinds > 0 => {
                         mark_daemon_activity(&last_activity_ms);
                         sleep_ms = REMOTE_CODEX_IDENTITY_POLL_MS;
@@ -20727,7 +21309,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     Err(error) => {
                         sleep_ms = (sleep_ms.saturating_mul(2))
                             .min(REMOTE_CODEX_IDENTITY_POLL_MAX_IDLE_MS);
-                        warn!(error = %error, "daemon remote codex identity poll chore failed");
+                        warn!(error = %error, "daemon remote agent identity poll chore failed");
                     }
                 }
             }
@@ -20736,7 +21318,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         append_trace_event(
             &home_dir,
             "daemon",
-            "remote_codex_identity_poll",
+            "remote_agent_identity_poll",
             "disabled",
             serde_json::json!({
                 "env": ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL,
@@ -20787,7 +21369,22 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             // above): a unix-socket endpoint cannot reach this point unlocked.
             unreachable!("unix daemon serving path reached without the bind lock");
         };
+        let handoff_alias_yields = fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+            && {
+                let runtime = lock_daemon_runtime(&runtime, "run_daemon_handoff_alias_gate");
+                handoff_alias_may_yield_to_successor(
+                    true,
+                    runtime
+                        .preserved_terminal_owners
+                        .expected_server_version
+                        .as_deref(),
+                    runtime.preserved_terminal_owners.entries.len(),
+                )
+            };
         if server_socket_path_lexists(path)
+            && !handoff_alias_yields
             && ping(&ServerEndpoint::UnixSocket(path.clone())).is_ok()
         {
             append_trace_event(
@@ -20805,6 +21402,18 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 "existing yggterm daemon answered before bind"
             );
             return Ok(());
+        }
+        if handoff_alias_yields {
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "cli",
+                "attachment",
+                serde_json::json!({
+                    "state": "handoff_alias_released_for_successor",
+                    "target_version": SERVER_PROTOCOL_VERSION,
+                }),
+            );
         }
         if server_socket_path_lexists(path) {
             match fs::remove_file(path) {
@@ -23695,6 +24304,194 @@ mod tests {
     use crate::live_row_tombstones::LiveRowTombstones;
     #[cfg(unix)]
     use super::{ServerEndpoint, owner_endpoint_label, sibling_endpoints_from_census};
+
+    #[test]
+    fn attachment_classifier_distinguishes_preserved_exited_and_missing_rows() {
+        use super::{AgentAttachmentState, classify_agent_attachment};
+
+        assert_eq!(
+            classify_agent_attachment(true, true, true, false),
+            AgentAttachmentState::Running
+        );
+        assert_eq!(
+            classify_agent_attachment(true, false, false, true),
+            AgentAttachmentState::Preserved
+        );
+        assert_eq!(
+            classify_agent_attachment(true, true, false, false),
+            AgentAttachmentState::ExitedRuntime
+        );
+        assert_eq!(
+            classify_agent_attachment(true, false, false, false),
+            AgentAttachmentState::MissingRuntime
+        );
+        assert_eq!(
+            classify_agent_attachment(false, false, false, false),
+            AgentAttachmentState::NotExpected
+        );
+    }
+
+    #[test]
+    fn attachment_sweep_does_not_call_remote_presence_locally_detached() {
+        use super::{agent_attachment_expected_on_this_daemon, agent_presence_is_unbound};
+
+        assert!(!agent_attachment_expected_on_this_daemon(
+            "remote-muse://worker/session-id",
+            crate::TerminalLaunchPhase::Running,
+        ));
+        assert!(agent_attachment_expected_on_this_daemon(
+            "muse-runtime://session-id",
+            crate::TerminalLaunchPhase::Running,
+        ));
+        assert!(agent_presence_is_unbound(
+            "local://legacy-birth-id",
+            Some("muse-runtime://"),
+            false,
+            false,
+        ));
+        assert!(!agent_presence_is_unbound(
+            "muse-runtime://real-session-id",
+            Some("muse-runtime://"),
+            false,
+            false,
+        ));
+        assert!(!agent_presence_is_unbound(
+            "local://live-birth-id",
+            Some("muse-runtime://"),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn attachment_sweep_seeds_every_registered_cli_including_claude_control() {
+        let counts = super::empty_agent_attachment_counts();
+        assert_eq!(counts.len(), yggterm_core::agent_cli::AGENT_CLIS.len());
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            assert!(counts.contains_key(descriptor.slug), "missing {}", descriptor.slug);
+        }
+    }
+
+    #[test]
+    fn runtime_alias_candidates_cover_every_registered_runtime_scheme() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS
+            .iter()
+            .filter(|descriptor| descriptor.runtime_key_scheme.is_some())
+        {
+            let aliases = super::agent_runtime_alias_candidates(
+                descriptor.kind,
+                "local://00000000-0000-4000-8000-000000000041",
+                "local://00000000-0000-4000-8000-000000000041",
+                "00000000-0000-4000-8000-000000000042",
+            );
+            let scheme = descriptor.runtime_key_scheme.expect("filtered above");
+            assert_eq!(
+                aliases,
+                vec![
+                    format!("{scheme}00000000-0000-4000-8000-000000000041"),
+                    format!("{scheme}00000000-0000-4000-8000-000000000042"),
+                ],
+                "{} must try both the row birth id and the rebound CLI id",
+                descriptor.slug
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn handoff_runtime_kind_comes_from_scheme_or_exact_launch_token() {
+        assert_eq!(
+            super::agent_kind_from_runtime_or_launch(
+                "muse-runtime://00000000-0000-4000-8000-000000000061",
+                None,
+                "ignored"
+            ),
+            Some((crate::SessionKind::Muse, "runtime_scheme"))
+        );
+        assert_eq!(
+            super::agent_kind_from_runtime_or_launch(
+                "local://00000000-0000-4000-8000-000000000062",
+                None,
+                "agy --conversation 00000000-0000-4000-8000-000000000063"
+            ),
+            Some((crate::SessionKind::Antigravity, "launch_word"))
+        );
+        assert_eq!(
+            super::agent_kind_from_runtime_or_launch(
+                "local://00000000-0000-4000-8000-000000000064",
+                None,
+                "/bin/bash --noprofile --norc"
+            ),
+            None,
+            "a plain shell must not be promoted into an agent row"
+        );
+        assert_eq!(
+            super::agent_kind_from_runtime_or_launch(
+                "local://00000000-0000-4000-8000-000000000065",
+                None,
+                "cd '/home/user/pi/project' && export YGGTERM_SESSION_ID=probe && agy \
+                 --conversation 00000000-0000-4000-8000-000000000066"
+            ),
+            Some((crate::SessionKind::Antigravity, "launch_word")),
+            "a home-directory path must not turn an Antigravity process into Pi"
+        );
+        assert_eq!(
+            super::agent_kind_from_runtime_or_launch(
+                "local://00000000-0000-4000-8000-000000000067",
+                None,
+                "cd /home/user/pi/project && exec /bin/bash -i"
+            ),
+            None,
+            "the path component `pi` is not an executable token"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_process_argv0_identifies_the_cli_without_reading_path_arguments() {
+        let args = vec![
+            "agy".to_string(),
+            "--cwd".to_string(),
+            "/home/user/pi/project".to_string(),
+        ];
+        assert_eq!(
+            super::agent_kind_from_process_args(&args),
+            Some(crate::SessionKind::Antigravity)
+        );
+
+        let wrapper = vec![
+            "/bin/bash".to_string(),
+            "-lc".to_string(),
+            "cd /home/user/pi/project".to_string(),
+        ];
+        assert_eq!(super::agent_kind_from_process_args(&wrapper), None);
+    }
+
+    #[test]
+    fn only_an_authorized_handoff_alias_yields_the_successors_socket_name() {
+        use super::handoff_alias_may_yield_to_successor;
+
+        assert!(handoff_alias_may_yield_to_successor(
+            true,
+            Some(super::SERVER_PROTOCOL_VERSION),
+            3,
+        ));
+        assert!(!handoff_alias_may_yield_to_successor(
+            false,
+            Some(super::SERVER_PROTOCOL_VERSION),
+            3,
+        ));
+        assert!(!handoff_alias_may_yield_to_successor(
+            true,
+            Some("1.2.3"),
+            3,
+        ));
+        assert!(!handoff_alias_may_yield_to_successor(
+            true,
+            Some(super::SERVER_PROTOCOL_VERSION),
+            0,
+        ));
+    }
 
     /// The live case, fed to the guard exactly as it occurred: GUI 3.0.96
     /// promising itself as the handoff target while
@@ -27159,12 +27956,13 @@ mod tests {
     use super::orphan_daemon_reap_applies_to_home;
     use super::terminal_launch_command_for_path;
     use super::write_persisted_state;
-    use super::{match_codex_identities_to_targets, normalize_cwd_for_identity_match};
-    use crate::{LocalAgentCliIdentity, RemoteCodexIdentityPollTarget};
+    use super::{match_agent_identities_to_targets, normalize_cwd_for_identity_match};
+    use crate::{LocalAgentCliIdentity, RemoteAgentIdentityPollTarget};
 
-    fn poll_target(key: &str, cwd: &str, current_id: &str) -> RemoteCodexIdentityPollTarget {
-        RemoteCodexIdentityPollTarget {
+    fn poll_target(key: &str, cwd: &str, current_id: &str) -> RemoteAgentIdentityPollTarget {
+        RemoteAgentIdentityPollTarget {
             key: key.to_string(),
+            kind: SessionKind::Codex,
             ssh_target: "guihost".to_string(),
             ssh_prefix: None,
             cwd: cwd.to_string(),
@@ -27197,10 +27995,10 @@ mod tests {
         let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
         let targets = vec![poll_target("codex-runtime://abc", "/home/user", synth)];
         let identities = vec![codex_identity(real, "/home/user")];
-        let rebinds = match_codex_identities_to_targets(&targets, &identities);
+        let rebinds = match_agent_identities_to_targets(&targets, &identities);
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].0, "codex-runtime://abc");
-        assert_eq!(rebinds[0].1.session_id, real);
+        assert_eq!(rebinds[0].2.session_id, real);
     }
 
     #[test]
@@ -27215,7 +28013,7 @@ mod tests {
             "/home/user/proj",
         )];
         assert_eq!(
-            match_codex_identities_to_targets(&targets, &identities).len(),
+            match_agent_identities_to_targets(&targets, &identities).len(),
             1
         );
     }
@@ -27236,10 +28034,10 @@ mod tests {
         let mut identity = codex_identity(real, "/home/user/proj");
         identity.birth_session_id = Some(synth.to_string());
 
-        let rebinds = match_codex_identities_to_targets(&targets, &[identity]);
+        let rebinds = match_agent_identities_to_targets(&targets, &[identity]);
 
         assert_eq!(rebinds.len(), 1);
-        assert_eq!(rebinds[0].1.session_id, real);
+        assert_eq!(rebinds[0].2.session_id, real);
     }
 
     #[test]
@@ -27248,7 +28046,7 @@ mod tests {
         // Row already carries the real id — nothing to rebind.
         let targets = vec![poll_target("k", "/home/user", id)];
         let identities = vec![codex_identity(id, "/home/user")];
-        assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
     }
 
     #[test]
@@ -27263,11 +28061,11 @@ mod tests {
             codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/user"),
             codex_identity("019bbbbbbbbb-bbbb-bbbb-bbbbbbbbbbbb", "/home/user"),
         ];
-        let rebinds = match_codex_identities_to_targets(&targets, &identities);
+        let rebinds = match_agent_identities_to_targets(&targets, &identities);
         assert_eq!(rebinds.len(), 2);
         let bound: HashSet<String> = rebinds
             .iter()
-            .map(|(_, id)| id.session_id.clone())
+            .map(|(_, _, id)| id.session_id.clone())
             .collect();
         assert_eq!(
             bound.len(),
@@ -27287,7 +28085,7 @@ mod tests {
             "019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "/home/user",
         )];
-        assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
     }
 
     #[test]
@@ -27304,7 +28102,33 @@ mod tests {
             storage_path: "/home/user/.claude/projects/x/y.jsonl".to_string(),
             birth_session_id: None,
         }];
-        assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
+    }
+
+    #[test]
+    fn muse_requires_the_owner_alias_and_never_guesses_from_default_cwd() {
+        let birth = "11111111-2222-4333-8444-555555555555";
+        let real = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut target = poll_target("remote-muse://guihost/birth", "/home/user/proj", birth);
+        target.kind = SessionKind::Muse;
+        let mut identity = LocalAgentCliIdentity {
+            kind: "muse".to_string(),
+            session_id: real.to_string(),
+            cwd: "/home/user".to_string(),
+            storage_path: String::new(),
+            birth_session_id: None,
+        };
+
+        assert!(
+            match_agent_identities_to_targets(&[target.clone()], &[identity.clone()]).is_empty(),
+            "Muse's placeholder cwd must never cross-wire two rows"
+        );
+
+        identity.birth_session_id = Some(birth.to_string());
+        let rebinds = match_agent_identities_to_targets(&[target], &[identity]);
+        assert_eq!(rebinds.len(), 1);
+        assert_eq!(rebinds[0].1, SessionKind::Muse);
+        assert_eq!(rebinds[0].2.session_id, real);
     }
 
     #[test]
@@ -29258,15 +30082,37 @@ mod tests {
     }
 
     #[test]
-    fn daemon_background_copy_chore_is_explicit_opt_in() {
-        assert!(!daemon_background_copy_chore_enabled_from_env(None));
+    fn daemon_background_copy_chore_is_builtin_with_an_explicit_off_switch() {
+        assert!(daemon_background_copy_chore_enabled_from_env(None));
         assert!(!daemon_background_copy_chore_enabled_from_env(Some("")));
         assert!(!daemon_background_copy_chore_enabled_from_env(Some(
             "false"
         )));
+        assert!(!daemon_background_copy_chore_enabled_from_env(Some("0")));
+        assert!(!daemon_background_copy_chore_enabled_from_env(Some("off")));
         assert!(daemon_background_copy_chore_enabled_from_env(Some("1")));
         assert!(daemon_background_copy_chore_enabled_from_env(Some("true")));
         assert!(daemon_background_copy_chore_enabled_from_env(Some(" YES ")));
+    }
+
+    #[test]
+    fn remote_agent_identity_poll_is_builtin_with_an_explicit_disable_switch() {
+        assert!(super::remote_agent_identity_poll_enabled_from_env(None));
+        assert!(super::remote_agent_identity_poll_enabled_from_env(Some("")));
+        assert!(super::remote_agent_identity_poll_enabled_from_env(Some(
+            "false"
+        )));
+        assert!(super::remote_agent_identity_poll_enabled_from_env(Some("0")));
+        assert!(super::remote_agent_identity_poll_enabled_from_env(Some("off")));
+        assert!(!super::remote_agent_identity_poll_enabled_from_env(Some(
+            "1"
+        )));
+        assert!(!super::remote_agent_identity_poll_enabled_from_env(Some(
+            "true"
+        )));
+        assert!(!super::remote_agent_identity_poll_enabled_from_env(Some(
+            " YES "
+        )));
     }
 
     #[test]
@@ -30283,13 +31129,78 @@ mod tests {
             "a CLI with no remote probe is skipped WITH A REASON, not dropped"
         );
         // Once confirmed, an idle row is no longer polled; a working row still is.
-        confirmed.insert("remote-cc://example-host/aaaa".to_string());
-        confirmed.insert("remote-cc://example-host/bbbb".to_string());
+        confirmed.insert(super::remote_title_confirmation_key(
+            "remote-cc://example-host/aaaa",
+            "aaaa",
+        ));
+        confirmed.insert(super::remote_title_confirmation_key(
+            "remote-cc://example-host/bbbb",
+            "bbbb",
+        ));
         let picked = super::remote_store_title_poll_decisions(&sessions, &working, &confirmed);
         assert_eq!(polled_paths(&picked), vec!["remote-cc://example-host/aaaa"]);
         assert_eq!(
             skip_outcome(&picked, "remote-cc://example-host/bbbb"),
             Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedTitleSettled)
+        );
+
+        // A self-minting row keeps the wrapper path but changes logical id.
+        // Confirmation of the birth UUID must not suppress the first lookup of
+        // the real id, or a miss before rebind freezes the launch title.
+        let mut rebound = make(
+            "remote-agy://example-host/birth",
+            "real-conversation",
+            crate::SessionKind::Antigravity,
+        );
+        rebound.title = "/home/user/proj".to_string();
+        let confirmed_birth = [super::remote_title_confirmation_key(
+            &rebound.session_path,
+            "birth",
+        )]
+        .into();
+        let picked = super::remote_store_title_poll_decisions(
+            &[rebound.clone()],
+            &std::collections::HashSet::new(),
+            &confirmed_birth,
+        );
+        assert_eq!(polled_paths(&picked), vec!["remote-agy://example-host/birth"]);
+        assert_eq!(picked[0].session_id, "real-conversation");
+
+        // ⛔ THE NEGATIVE-CACHE DEFECT. A wrapper can be polled before Muse or
+        // Antigravity has minted/advertised the conversation id. `no title`
+        // is not confirmation: after identity rebind, the next idle tick must
+        // still reach the store. A positive lookup is the only settled one.
+        let mut retry_confirmation = std::collections::HashSet::new();
+        super::confirm_remote_title_lookup(
+            &mut retry_confirmation,
+            &rebound.session_path,
+            &rebound.id,
+            false,
+        );
+        let picked = super::remote_store_title_poll_decisions(
+            &[rebound.clone()],
+            &std::collections::HashSet::new(),
+            &retry_confirmation,
+        );
+        assert_eq!(
+            polled_paths(&picked),
+            vec!["remote-agy://example-host/birth"],
+            "a store miss must remain eligible for the post-rebind retry"
+        );
+        super::confirm_remote_title_lookup(
+            &mut retry_confirmation,
+            &rebound.session_path,
+            &rebound.id,
+            true,
+        );
+        let picked = super::remote_store_title_poll_decisions(
+            &[rebound],
+            &std::collections::HashSet::new(),
+            &retry_confirmation,
+        );
+        assert!(
+            polled_paths(&picked).is_empty(),
+            "a positive store lookup may settle the idle row"
         );
 
         // ⛔ THE LIVELOCK LOCK. A row the owner titled is refused by
@@ -33677,7 +34588,7 @@ mod tests {
             ],
         }];
 
-        let candidates = collect_remote_copy_candidates(&machines);
+        let candidates = collect_remote_copy_candidates(&machines, &[]);
 
         assert_eq!(candidates.len(), 2);
         for candidate in candidates {
@@ -33693,6 +34604,68 @@ mod tests {
             assert_eq!(machine.prefix.as_deref(), Some("sudo -u pi"));
         }
         assert_eq!(machines[0].sessions.len(), 2);
+    }
+
+    #[test]
+    fn generated_copy_for_a_rebound_remote_agent_lands_on_its_live_wrapper() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let local_key = server.start_local_session(
+            SessionKind::Muse,
+            Some("/home/user/proj"),
+            Some("New session"),
+        );
+        let mut live_wrapper = server
+            .session_for_path(&local_key)
+            .expect("fixture row")
+            .clone();
+        live_wrapper.id = "8d3ff8e8-3a22-420d-a5d5-738790ee5701".to_string();
+        live_wrapper.session_path =
+            "remote-muse://example-host/43ce6f13-8441-4dc0-bc69-674f6472c40c".to_string();
+        live_wrapper.kind = SessionKind::Muse;
+
+        let machines = vec![RemoteMachineSnapshot {
+            cli_presence: Vec::new(),
+            apps: Vec::new(),
+            machine_key: "example-host".to_string(),
+            label: "example-host".to_string(),
+            ssh_target: "example-host".to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path:
+                    "remote-muse://example-host/8d3ff8e8-3a22-420d-a5d5-738790ee5701"
+                        .to_string(),
+                session_id: "8d3ff8e8-3a22-420d-a5d5-738790ee5701".to_string(),
+                cwd: "/home/user/proj".to_string(),
+                started_at: "2026-04-01T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 0,
+                title_hint: "New session".to_string(),
+                recent_context: "USER: diagnose the integration".to_string(),
+                cached_precis: None,
+                cached_summary: None,
+                live_runtime: true,
+                title_is_explicit: false,
+                storage_path: "/home/user/.muse/sessions/real.jsonl".to_string(),
+            }],
+        }];
+
+        let candidates = collect_remote_copy_candidates(&machines, &[live_wrapper.clone()]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, live_wrapper.id);
+        assert_eq!(
+            candidates[0].session_path, live_wrapper.session_path,
+            "the durable real id supplies generation context, but the update must target the live birth-path wrapper"
+        );
     }
 
     #[test]
@@ -33775,7 +34748,7 @@ mod tests {
             },
         ];
 
-        let candidates = collect_remote_copy_candidates(&machines);
+        let candidates = collect_remote_copy_candidates(&machines, &[]);
         let keys = candidates
             .into_iter()
             .map(|candidate| {

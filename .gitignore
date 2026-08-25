@@ -40,3 +40,7 @@ tools/xterm-harness/package-lock.json
 
 # Standalone dev probe: build artefacts only, the source is tracked.
 /scripts/cli-viewport-probe/target/
+
+# Notebook executed artifacts
+/notebooks/out/
+
