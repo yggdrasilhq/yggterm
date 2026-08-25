@@ -77,9 +77,38 @@ print(json.dumps(rows))
 
 _MUSE_NOISE_DUMP = r"""
 import json, os, sqlite3
+from pathlib import Path
 home = os.path.expanduser("~")
 db = os.path.join(home, ".local/share/muse/session-index.db")
 noise = []
+
+def transcript_has_intent(session_id):
+    root = Path(home) / ".local/share/muse/sessions"
+    try:
+        matches = root.glob("**/%s/session.jsonl" % session_id)
+        for path in matches:
+            # The durable row is the top-level Muse conversation. Subagents
+            # have their own accepted intents but are excluded by both oracles.
+            if "subagent" in path.parts or "tool-outputs" in path.parts:
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as handle:
+                    for line in handle:
+                        try:
+                            record = json.loads(line)
+                        except Exception:
+                            continue
+                        if record.get("payload_type") in (
+                            "runtime.user_intent.accepted",
+                            "runtime.user_intent.materialized",
+                        ):
+                            return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
 if os.path.exists(db):
     try:
         conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
@@ -87,7 +116,11 @@ if os.path.exists(db):
             "select session_id, prompt_count, title from sessions"
         ):
             t = (title or "").strip().lower()
-            if pc == 0 and t in ("", "new session", "new muse code session"):
+            # Muse's index can remain at zero/New session after real turns.
+            # The transcript is the evidence that decides whether this is
+            # noise; the DB counter is only a cheap candidate filter.
+            if (pc == 0 and t in ("", "new session", "new muse code session")
+                    and not transcript_has_intent(sid)):
                 noise.append(sid)
     except Exception:
         noise = []

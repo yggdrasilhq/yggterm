@@ -43,6 +43,11 @@ const INITIAL_ATTACH_TRAILING_NOISE_CHUNKS: usize = 16;
 const ATTACH_READY_MARKER: &str = "__YGGTERM_ATTACH_READY__\n";
 const TERMINAL_WRITE_QUEUE_CAPACITY: usize = 64;
 const TERMINAL_WRITE_FLUSH_ACK_TIMEOUT_MS: u64 = 1_500;
+/// A restart runs while the daemon owns its global runtime lock. Once SIGKILL
+/// has been sent, waiting indefinitely for an uninterruptible child freezes
+/// every other row on the daemon. Keep the old runtime seated if this deadline
+/// expires; a later ensure may replace it after the kernel reports it exited.
+const RESTART_FORCE_EXIT_WAIT: Duration = Duration::from_millis(500);
 const TERMINAL_PROTOCOL_MAX_PENDING_BYTES: usize = 256;
 const OSC_PALETTE_CODE: u16 = 4;
 const OSC_COLOR_FOREGROUND_CODE: u16 = 10;
@@ -1790,8 +1795,43 @@ impl TerminalManager {
         // `input-check` names the wedge correctly, recommends this verb, and
         // the verb answered "restarted" while the wedged CLI kept its PTY.
         let replaced_existing = if let Some(runtime) = self.sessions.remove(key) {
-            runtime.shutdown(stop_command)?;
-            true
+            match runtime.shutdown_for_restart(stop_command) {
+                Ok(true) => true,
+                Ok(false) => {
+                    self.sessions.insert(key.to_string(), runtime);
+                    trace_terminal_event(
+                        "restart_shutdown_blocked",
+                        serde_json::json!({
+                            "path": key,
+                            "reason": "child_still_alive_after_force_deadline",
+                            "force_exit_wait_ms": RESTART_FORCE_EXIT_WAIT.as_millis(),
+                        }),
+                    );
+                    if let Ok(home) = resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "server",
+                            "cli",
+                            "attachment",
+                            serde_json::json!({
+                                "kind": yggterm_core::agent_scheme::session_kind_for_path(key)
+                                    .map(yggterm_core::agent_cli::session_kind_label),
+                                "runtime_scheme": key.split("://").next(),
+                                "state": "restart_blocked_runtime_alive",
+                                "force_exit_wait_ms": RESTART_FORCE_EXIT_WAIT.as_millis(),
+                            }),
+                        );
+                    }
+                    bail!(
+                        "refusing to restart {key}: the existing runtime is still alive after \
+                         termination; it remains seated so no duplicate is spawned"
+                    );
+                }
+                Err(error) => {
+                    self.sessions.insert(key.to_string(), runtime);
+                    return Err(error);
+                }
+            }
         } else {
             trace_terminal_event(
                 "restart_replaced_nothing",
@@ -3932,6 +3972,38 @@ impl PtySessionRuntime {
         Ok(())
     }
 
+    /// Restart-only teardown: bounded because its caller holds the daemon-wide
+    /// runtime lock, and conservative because spawning before the old child is
+    /// confirmed gone creates two writers for one agent session.
+    fn shutdown_for_restart(&self, stop_command: Option<&str>) -> Result<bool> {
+        let mut child = self.child.lock().expect("pty child lock poisoned");
+        if let Some(command) = stop_command
+            && !command.is_empty()
+        {
+            let _ = self.write(command);
+            for _ in 0..2 {
+                if !child.is_running().context("checking terminal exit state")? {
+                    return Ok(true);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        } else if self.signal_child_to_exit(&mut child)? {
+            return Ok(true);
+        }
+
+        let _ = child.kill();
+        let started = Instant::now();
+        loop {
+            if !child.is_running().context("checking terminal exit state")? {
+                return Ok(true);
+            }
+            if started.elapsed() >= RESTART_FORCE_EXIT_WAIT {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn shutdown_with_force_after(
         self,
         stop_command: Option<&str>,
@@ -4127,6 +4199,18 @@ fn agent_session_error_in_line(line: &str) -> Option<AgentSessionErrorHit> {
     if normalized.contains("terminal session not found") {
         return None;
     }
+    // Codex's active-writer refusal is a multi-line paragraph and can exceed
+    // the generic terse-line ceiling below. Its leading verb and exact
+    // lock-manager phrase distinguish it from rendered conversation prose.
+    if normalized.contains("already has an active writer")
+        && (normalized.starts_with("failed to resume") || normalized.starts_with("error:"))
+    {
+        return Some(AgentSessionErrorHit {
+            pattern: "session_active_writer",
+            uuid: find_uuid_in_text(&normalized),
+            sample: truncate_terminal_trace_sample(&normalized),
+        });
+    }
     // The PTY stream we scan CONTAINS the agent's rendered conversation, so a plain
     // substring match fires on any prose that merely MENTIONS these errors — the
     // user typing "greeted with session already in use or does not exist", or the
@@ -4252,14 +4336,30 @@ fn ingest_app_declares(
 }
 
 fn record_agent_session_error(path: &str, launch_command: &str, hit: &AgentSessionErrorHit) {
-    let payload = serde_json::json!({
+    // ytrace is a content-free plane. The durable incident stream below keeps
+    // the diagnostic sample; the trace carries only classification and
+    // identity presence so dashboards cannot become a transcript side door.
+    let trace_payload = serde_json::json!({
         "path": path,
         "pattern": hit.pattern,
-        "uuid": hit.uuid,
-        "sample": hit.sample,
-        "launch_command": launch_command,
+        "uuid_present": hit.uuid.is_some(),
+        "kind": yggterm_core::agent_scheme::session_kind_for_path(path)
+            .map(yggterm_core::agent_cli::session_kind_label),
     });
-    trace_terminal_event("agent_session_error", payload.clone());
+    trace_terminal_event("agent_session_error", trace_payload.clone());
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "cli",
+            if hit.pattern == "session_active_writer" {
+                "runtime_conflict"
+            } else {
+                "resume_refusal"
+            },
+            trace_payload,
+        );
+    }
     if let Ok(home) = resolve_yggterm_home() {
         let record = serde_json::json!({
             "ts_ms": now_millis(),
@@ -8081,6 +8181,43 @@ line-two on the real screen\r\n\
             hits[0].uuid.as_deref(),
             Some("52317975-9c66-40ef-8028-901b6415250e")
         );
+    }
+
+    #[test]
+    fn agent_session_error_detects_codex_active_writer_paragraph() {
+        let hit = agent_session_error_in_line(
+            "Failed to resume thread 52317975-9c66-40ef-8028-901b6415250e because it already has an active writer in another terminal. Close that writer before resuming this conversation from a different client.",
+        )
+        .expect("the measured Codex duplicate-writer refusal must be visible to ytrace");
+        assert_eq!(hit.pattern, "session_active_writer");
+        assert_eq!(
+            hit.uuid.as_deref(),
+            Some("52317975-9c66-40ef-8028-901b6415250e")
+        );
+    }
+
+    #[test]
+    fn restart_teardown_is_bounded_and_keeps_a_live_runtime_seated() {
+        let source = include_str!("terminal.rs");
+        let helper = source
+            .split("fn shutdown_for_restart")
+            .nth(1)
+            .and_then(|tail| tail.split("fn shutdown_with_force_after").next())
+            .expect("restart-only teardown helper");
+        assert!(helper.contains("RESTART_FORCE_EXIT_WAIT"));
+        assert!(helper.contains("child.is_running()"));
+        assert!(
+            !helper.contains("wait_for_exit"),
+            "restart must not wait indefinitely while the daemon runtime lock is held"
+        );
+
+        let restart = source
+            .split("pub fn restart_session_with_size")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn remove_session").next())
+            .expect("restart implementation");
+        assert!(restart.contains("self.sessions.insert(key.to_string(), runtime)"));
+        assert!(restart.contains("refusing to restart"));
     }
 
     #[test]

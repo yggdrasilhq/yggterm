@@ -1666,6 +1666,14 @@ mod tests {
         ));
         assert!(looks_like_generated_fallback_title("Yggterm Shell"));
         assert!(looks_like_generated_fallback_title("Yggterm Codex"));
+        assert!(looks_like_generated_fallback_title(
+            "Codex Stays Attached Daemon Opens"
+        ));
+        assert!(looks_like_generated_fallback_title("Yggterm Muse Code"));
+        assert!(looks_like_generated_fallback_title("Yggterm Orch Shell"));
+        assert!(looks_like_generated_fallback_title(
+            "Yggterm Orch Muse Code"
+        ));
         assert!(looks_like_generated_fallback_title("User Home Codex"));
         assert!(looks_like_generated_fallback_title("Operator Home Shell"));
         assert!(looks_like_generated_fallback_title("Codex Session"));
@@ -3439,6 +3447,8 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "yggterm codex litellm"
             | "yggterm claude-code"
             | "yggterm claude code"
+            | "yggterm muse code"
+            | "yggterm orch shell"
             | "local claude-code"
             | "local claude code"
             | "local shell stay alive daemon"
@@ -3453,7 +3463,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "new terminal"
             | "new ychrome session"
             | "untitled session"
-    );
+    ) || (lower.contains("stays attached") && lower.contains("daemon"));
     let yggterm_generic_placeholder = matches!(
         lower.as_str(),
         "yggterm"
@@ -3467,6 +3477,13 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "yggterm session"
             | "yggterm terminal"
     );
+    let yggterm_orch_cli_placeholder = lower
+        .strip_prefix("yggterm orch ")
+        .is_some_and(|tail| {
+            crate::agent_cli::AGENT_CLIS
+                .iter()
+                .any(|descriptor| descriptor.display_name.eq_ignore_ascii_case(tail))
+        });
     let new_muse_placeholder = lower.starts_with("new muse code session")
         || lower.starts_with("new antigravity session")
         || lower == "new session";
@@ -3483,6 +3500,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         || local_or_new_placeholder
         || generic_runtime_title
         || yggterm_generic_placeholder
+        || yggterm_orch_cli_placeholder
         || new_muse_placeholder
         || looks_like_low_signal_generated_title(compact)
 }

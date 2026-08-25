@@ -20,8 +20,8 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
     let path_str = path.display().to_string();
     // Muse: a session with no prompts is noise.
     if path_str.contains("muse/sessions") {
-        if let Some(home) = dirs::home_dir() {
-            let db_path = home.join(".local/share/muse/session-index.db");
+        if let Some(data_root) = crate::agent_cli::muse_data_root_from_session_path(path) {
+            let db_path = data_root.join("session-index.db");
             if db_path.exists() {
                 if let Ok(conn) = rusqlite::Connection::open_with_flags(
                     &db_path,
@@ -43,7 +43,11 @@ pub fn is_noise_session_file(path: &std::path::Path) -> bool {
                                             || title_lower.is_empty()
                                             || title_lower == "new muse code session")
                                     {
-                                        return true;
+                                        // The index counter is an observer, not
+                                        // transcript truth. Muse has left it at
+                                        // zero for a multi-megabyte session whose
+                                        // first accepted intent was record 688.
+                                        return !crate::agent_cli::muse_session_contains_accepted_user_intent(path);
                                     }
                                 }
                             }
@@ -1124,6 +1128,66 @@ mod scan_truth_tests {
         }
         assert_eq!(std::fs::read(&muse_file).unwrap(), b"{\"schema_version\":1}\n");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The Muse index is eventually-consistent metadata, not the authority for
+    /// whether a transcript contains work.  A live 9.9 MB session was omitted
+    /// from both startpage and cwdtree because this counter remained zero.
+    #[test]
+    fn muse_transcript_intent_overrides_a_stale_zero_prompt_index() {
+        let home = dirs::home_dir()
+            .unwrap()
+            .join(".yggterm/scratchpad")
+            .join(format!("muse-scan-stale-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let muse_root = home.join(".local/share/muse");
+        let session_id = "9f1c2e3a-4b5d-46e7-8f90-1a2b3c4d5e6f";
+        let session_dir = muse_root
+            .join("sessions/2026/08/24")
+            .join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let transcript = session_dir.join("session.jsonl");
+        let mut records = (0..80)
+            .map(|sequence| {
+                format!(
+                    "{{\"sequence\":{sequence},\"payload_type\":\"runtime.lifecycle\"}}\n"
+                )
+            })
+            .collect::<String>();
+        records.push_str(
+            r#"{"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":[{"text":"Repair durable Muse discovery"}]}]}}
+"#,
+        );
+        std::fs::write(&transcript, records).unwrap();
+
+        let conn = rusqlite::Connection::open(muse_root.join("session-index.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, workspace_root TEXT, title TEXT, updated_at_us INTEGER, prompt_count INTEGER);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES (?1, ?2, 'New session', ?3, 0);",
+            rusqlite::params![session_id, "/home/user/proj", 1_787_586_190_925_000i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            !is_noise_session_file(&transcript),
+            "accepted transcript intent defeats the stale zero counter"
+        );
+        let rows = scan_all_durable_sessions(&home);
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == session_id)
+            .expect("the durable Muse session must reach both shared surfaces");
+        assert_eq!(row.cwd, "/home/user/proj");
+        assert_eq!(
+            row.effective_title.as_deref(),
+            Some("Repair Durable Muse Discovery")
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // A CLI cannot be scanned and simultaneously warned about as invisible.

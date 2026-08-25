@@ -176,7 +176,10 @@ are profiling).
   per-view defect.
 - `ytrace tail --category cli --since 30m --json` — the universal CLI chain:
   `birth`, `launch`, `identity_poll`, `title`/`title_sweep`,
-  `projection`/`projection_sweep`, `restore`. `identity_poll` separates
+  `projection`/`projection_sweep`, `restore`, plus the on-demand
+  `startpage_observers/faithful_read`. That Startpage event separates its
+  bounded GUI witnesses (`daemon_snapshot_available`, `app_state_available`,
+  `elapsed_ms`) from the durable scan and never starts a daemon. `identity_poll` separates
   discovery from joining: identities seen with zero exact-alias and cwd
   candidates is a failed join; `newly_exhausted > 0` means the row will remain
   on its birth id without another state change. `projection` carries no title

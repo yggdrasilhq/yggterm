@@ -6369,8 +6369,25 @@ fn navigate_web_surface_tab(
         });
     });
 }
-/// Heartbeats arrive every ~4s from a live app; 3 missed beats = gone.
-const WEB_SURFACE_STALE_AFTER_MS: u64 = 15_000;
+/// Heartbeats arrive every ~4s from a live app; allow generous headroom for idle read backoff and daemon reload.
+const WEB_SURFACE_STALE_AFTER_MS: u64 = 45_000;
+
+static STALE_DETECT_LAST_EMITTED_MS: std::sync::Mutex<Option<HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn should_emit_stale_detected(session_path: &str, now_ms: u64) -> bool {
+    let Ok(mut guard) = STALE_DETECT_LAST_EMITTED_MS.lock() else {
+        return false;
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(&last_emitted) = map.get(session_path) {
+        if now_ms.saturating_sub(last_emitted) < 30_000 {
+            return false;
+        }
+    }
+    map.insert(session_path.to_string(), now_ms);
+    true
+}
 /// How long a sidebar contribution outlives its last declare (while its
 /// session's reads are live) before the sweep tears it down. Deliberately
 /// LONGER than the stale window: between stale and expiry the document surface
@@ -21384,7 +21401,19 @@ impl ShellState {
     /// Refresh liveness for an existing surface (heartbeat without URL).
     fn touch_web_surface(&mut self, session_path: &str, now_ms: u64) -> bool {
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            let prev_seen_ms = surface.last_seen_ms;
             surface.last_seen_ms = now_ms;
+            yggterm_core::perf::ytrace_emit_event(
+                "web_surface",
+                "liveness",
+                "touch",
+                json!({
+                    "session_path": session_path,
+                    "last_seen_ms": now_ms,
+                    "prev_seen_ms": prev_seen_ms,
+                    "delta_ms": now_ms.saturating_sub(prev_seen_ms),
+                }),
+            );
             true
         } else {
             false
@@ -21411,6 +21440,14 @@ impl ShellState {
             // The surface owned the tab-id namespace; panes pinned to its
             // tabs die with it ([[campaign-libyggterm]] Phase 3).
             self.prune_web_view_panes();
+            yggterm_core::perf::ytrace_emit_event(
+                "web_surface",
+                "lifecycle",
+                "closed",
+                json!({
+                    "session_path": session_path,
+                }),
+            );
         }
         closed
     }
@@ -21448,9 +21485,22 @@ impl ShellState {
                 // background hold owns its lifetime.
                 return true;
             }
-            let live = now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
-                <= WEB_SURFACE_STALE_AFTER_MS;
+            let age_ms = now_ms.saturating_sub(surface.last_seen_ms.max(reads_since));
+            let live = age_ms <= WEB_SURFACE_STALE_AFTER_MS;
             if !live {
+                yggterm_core::perf::ytrace_emit_event(
+                    "web_surface",
+                    "liveness",
+                    "swept",
+                    json!({
+                        "session_path": session_path,
+                        "last_seen_ms": surface.last_seen_ms,
+                        "reads_since": reads_since,
+                        "now_ms": now_ms,
+                        "age_ms": age_ms,
+                        "threshold_ms": WEB_SURFACE_STALE_AFTER_MS,
+                    }),
+                );
                 kill_web_surface_forward(surface);
             }
             live
@@ -22297,9 +22347,22 @@ impl ShellState {
                 .last_seen_ms
                 .max(sidebar_ping_liveness_ms(session_path))
                 .max(reads_since);
-            let live = now_ms.saturating_sub(effective_last_seen)
-                <= SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS;
+            let age_ms = now_ms.saturating_sub(effective_last_seen);
+            let live = age_ms <= SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS;
             if !live {
+                yggterm_core::perf::ytrace_emit_event(
+                    "sidebar",
+                    "liveness",
+                    "swept",
+                    json!({
+                        "session_path": session_path,
+                        "last_seen_ms": contribution.last_seen_ms,
+                        "effective_last_seen": effective_last_seen,
+                        "now_ms": now_ms,
+                        "age_ms": age_ms,
+                        "threshold_ms": SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS,
+                    }),
+                );
                 kill_control_forward(contribution);
             }
             if !live {
@@ -22498,6 +22561,7 @@ impl ShellState {
             .get(session_path)
             .map(|contribution| contribution.control_url.clone())
     }
+
     /// The moment live OSC reads started for `session_path`, or 0 when it is
     /// not the reads-live session. `last_seen_ms` only moves while a session's
     /// declares are being READ — a backgrounded session's heartbeats pile up
@@ -22525,8 +22589,25 @@ impl ShellState {
         self.web_surfaces
             .get(session_path)
             .is_some_and(|surface| {
-                now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
-                    <= WEB_SURFACE_STALE_AFTER_MS
+                let age_ms = now_ms.saturating_sub(surface.last_seen_ms.max(reads_since));
+                let live = age_ms <= WEB_SURFACE_STALE_AFTER_MS;
+                if !live && reads_since > 0 && should_emit_stale_detected(session_path, now_ms) {
+                    yggterm_core::perf::ytrace_emit_event(
+                        "web_surface",
+                        "liveness",
+                        "stale_detected",
+                        json!({
+                            "session_path": session_path,
+                            "last_seen_ms": surface.last_seen_ms,
+                            "reads_since": reads_since,
+                            "now_ms": now_ms,
+                            "age_ms": age_ms,
+                            "threshold_ms": WEB_SURFACE_STALE_AFTER_MS,
+                            "probe": "has_live_web_surface",
+                        }),
+                    );
+                }
+                live
             })
     }
     /// True while a modal that must sit OVER the viewport is open. In LEGACY
@@ -23463,9 +23544,24 @@ impl ShellState {
         // `last_seen_ms` here showed the bare terminal for the 0–4s until the
         // first read heartbeat (user report 2026-07-19, the switch flash).
         let reads_since = self.session_reads_since(session_path, now_ms);
-        if now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
-            > WEB_SURFACE_STALE_AFTER_MS
-        {
+        let age_ms = now_ms.saturating_sub(surface.last_seen_ms.max(reads_since));
+        if age_ms > WEB_SURFACE_STALE_AFTER_MS {
+            if reads_since > 0 && should_emit_stale_detected(session_path, now_ms) {
+                yggterm_core::perf::ytrace_emit_event(
+                    "web_surface",
+                    "liveness",
+                    "stale_detected",
+                    json!({
+                        "session_path": session_path,
+                        "last_seen_ms": surface.last_seen_ms,
+                        "reads_since": reads_since,
+                        "now_ms": now_ms,
+                        "age_ms": age_ms,
+                        "threshold_ms": WEB_SURFACE_STALE_AFTER_MS,
+                        "probe": "web_surface_overlay_for_session",
+                    }),
+                );
+            }
             return None;
         }
         let active_tab_id = surface.active_tab;
