@@ -669,6 +669,36 @@ and the app-control ceiling. It carries no row paths, ids, cwd, or titles.
 ordering/scoping, increase the independent oracle timeout, or hide a slow
 durable-store scanner.
 
+### Issue Heading 24: Durable rows need conversation signal, not merely a file and UUID
+
+**Measured failure (2026-08-25):** after every live non-Claude row was attached
+and titled, the GUI still exposed nine dormant CwdTree rows as eight-character
+hashes: startup-only Codex rollouts, a lifecycle-only Muse transcript, a Muse
+transcript whose first accepted envelope was low-signal but whose next envelope
+held the task, an Antigravity conversation whose per-conversation DB was walked
+before its title-bearing brain transcript, and one real Codex conversation for
+which the configured generator returned an unshowable title.
+
+**Rule:** a startup-only transcript is scan noise and is skipped in memory,
+never removed. For an otherwise title-less Codex row, the shared transcript
+reader must find generation context; for Muse, the transcript must contain an
+accepted user intent. Muse title extraction examines every accepted envelope,
+message content item, and refill block until one condenses to a usable title.
+Antigravity projections with the same conversation id are merged: an existing
+store title keeps precedence, while a title-bearing transcript fills an absent
+title instead of losing to filesystem walk order.
+
+**Observability:** `cli/projection` remains the content-free rendered oracle:
+`short_hash`, `raw_path`, and generic-title counts must all be zero. The three
+independent Startpage, Titles, and CwdTree oracles still prove store parity; a
+noise row disappearing from all three is expected only when its source contains
+no conversation signal.
+
+**Not covered:** this does not delete or quarantine CLI store files, infer a
+title from startup instructions, replace an owner/store title, alter Claude
+Code authority, or hide a transcript that contains accepted user work merely
+because title generation is temporarily unavailable.
+
 **Checklist for any new CLI (add to `spec-adding-an-agent-cli.md` steps 1–9):** 1) `SessionKind` variant, 2) `AGENT_CLIS` descriptor (+ `TitleAuthority`, `store_globs`, `id_assigned_at_birth`, `resume_selector_token`, `re_roots_with_cwd`), 3) `SESSION_PATH_SCHEMES` (`remote-<slug>://` + `<slug>-runtime://`), 4) `cargo check` exhaustive matches, 5) catch-alls `rg SessionKind::(Codex|ClaudeCode)`, 6) `agent_arm_matrix` two arms (Local `local://` + Remote `remote-<slug>://`), 7) surfaces (icon/menu/KeyTips free), 8) provisioning `install`/`update`, 9) **title lifecycle** — the birth name is automatic (`New {machine} {display_name}`, from `new_session_birth_title`; nothing per-CLI to add), then either `heuristic`/`litellm` via `SessionTitleStore` for a `Generated` CLI + its fallback list, or `read_live_store_title` for a `Store` one — ⛔ a `Store` CLI without that hook can never be titled at all, 10) **resume id** (if `id_assigned_at_birth:false`, implement store→row mapping), 11) `spec-cli-integration-verification.md` oracles (`check-startpage.py`/`check-titles.py`/`check-cwdtree.py` must `0` on every fleet host + faithful 1920×1200 screenshot).
 
 ## 3. Inventory — which spec/doc now lives where

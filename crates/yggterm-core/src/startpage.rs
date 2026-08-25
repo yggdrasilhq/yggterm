@@ -641,15 +641,33 @@ fn scan_antigravity_sessions(
         if let Some(ids) = durable_ids.as_ref() {
             walked.retain(|row| ids.contains(&row.session_id));
         }
-        // ⛔ One conversation can have MORE THAN ONE file — a brain transcript and
-        // a legacy `.antigravitycli/<id>.json` both resolve to the same
-        // conversation id. `walk_and_collect` dedups by PATH, which cannot see
-        // that, so such a session was emitted twice and appeared twice inside a
-        // single cwd-tree group (measured: 4 sessions on one host). A session is
-        // identified by its id, not by the file it happens to be stored in.
-        let mut walked_ids = HashSet::new();
-        walked.retain(|row| walked_ids.insert(row.session_id.clone()));
-        out.append(&mut walked);
+        // ⛔ One conversation can have MORE THAN ONE file — its per-conversation
+        // DB, a brain transcript, and a legacy `.antigravitycli/<id>.json` all
+        // resolve to the same id. Deduping by first path made filesystem walk
+        // order title authority: the DB won before the title-bearing transcript.
+        // Merge by id and fill absent title/detail fields; an existing store
+        // title keeps precedence.
+        let mut merged = Vec::<StartpageDurableRow>::new();
+        let mut merged_indices = HashMap::<String, usize>::new();
+        for candidate in walked {
+            if let Some(index) = merged_indices.get(&candidate.session_id).copied() {
+                let current = &mut merged[index];
+                current.modified_epoch_ms = current.modified_epoch_ms.max(candidate.modified_epoch_ms);
+                if current.effective_title.is_none() && candidate.effective_title.is_some() {
+                    current.title = candidate.title;
+                    current.generated_title = candidate.generated_title;
+                    current.effective_title = candidate.effective_title;
+                    current.storage_path = candidate.storage_path;
+                }
+                if current.detail.is_none() {
+                    current.detail = candidate.detail;
+                }
+            } else {
+                merged_indices.insert(candidate.session_id.clone(), merged.len());
+                merged.push(candidate);
+            }
+        }
+        out.append(&mut merged);
     }
 
     if !db_path.exists() {
@@ -844,6 +862,28 @@ fn walk_and_collect(
                             row.effective_title = row.generated_title.clone();
                         }
                     }
+                }
+                // A transcript containing only startup metadata is not a
+                // durable conversation. It used to survive because it had
+                // bytes and a UUID, then both shared surfaces rendered that
+                // UUID as an eight-character title. Ask the CLI's measured
+                // reader only for otherwise title-less rows, so normal scans
+                // remain one read per file.
+                let contextless_noise = row.effective_title.is_none()
+                    && row.detail.is_none()
+                    && match descriptor.kind {
+                        crate::SessionKind::Codex | crate::SessionKind::CodexLiteLlm => {
+                            crate::titles::extract_tail_context(&path)
+                                .map(|context| context.trim().is_empty())
+                                .unwrap_or(false)
+                        }
+                        crate::SessionKind::Muse => {
+                            !crate::agent_cli::muse_session_contains_accepted_user_intent(&path)
+                        }
+                        _ => false,
+                    };
+                if contextless_noise {
+                    continue;
                 }
                 if let Some(stamp) = stamp {
                     let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
@@ -1079,14 +1119,25 @@ mod scan_truth_tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let id = "3f2a71c4-9b0e-4d6a-8c15-a7e30bd94f62";
-        summaries_db(&tmp, &[(id, r#"["file:///home/user/proj/sample"]"#, 9)]);
+        let db = summaries_db(&tmp, &[(id, r#"["file:///home/user/proj/sample"]"#, 9)]);
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "UPDATE conversation_summaries SET preview='' WHERE conversation_id=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+        drop(conn);
         // A brain transcript AND a legacy json, both naming the same conversation.
         let brain = tmp
             .join(".gemini/antigravity-cli/brain")
             .join(id)
             .join(".system_generated/logs");
         std::fs::create_dir_all(&brain).unwrap();
-        std::fs::write(brain.join("transcript_full.jsonl"), b"{\"type\":\"USER_INPUT\"}\n").unwrap();
+        std::fs::write(
+            brain.join("transcript_full.jsonl"),
+            b"{\"type\":\"USER_INPUT\",\"content\":\"Trace persistent Antigravity row identity\"}\n",
+        )
+        .unwrap();
         let legacy = tmp.join(".antigravitycli");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join(format!("{id}.json")), b"{}").unwrap();
@@ -1096,7 +1147,42 @@ mod scan_truth_tests {
         scan_antigravity_sessions(&tmp, &mut out, &mut seen);
         let hits = out.iter().filter(|r| r.session_id == id).count();
         assert_eq!(hits, 1, "one conversation is one row, got {hits}");
+        let row = out.iter().find(|row| row.session_id == id).unwrap();
+        assert_eq!(
+            row.effective_title.as_deref(),
+            Some("Trace persistent Antigravity row identity"),
+            "the transcript title must enrich the earlier per-conversation DB projection"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn codex_startup_only_transcript_is_not_a_durable_row() {
+        let home = dirs::home_dir()
+            .unwrap()
+            .join(".yggterm/scratchpad")
+            .join(format!("codex-startup-noise-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let sessions = home.join(".codex/sessions/2026/08/25");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let id = "019d5af1-65ea-7fb2-90c1-0123456789ab";
+        let transcript = sessions.join(format!("rollout-{id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/home/user/proj\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let rows = scan_all_durable_sessions(&home);
+        assert!(
+            rows.iter().all(|row| row.session_id != id),
+            "startup metadata alone must not surface as an eight-character title"
+        );
+        assert!(transcript.exists(), "classification must never delete the source");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // ⛔ THE HIGHEST-STAKES PROPERTY IN THIS FILE. Scanning classifies; it must
