@@ -453,7 +453,12 @@ impl RemoteRuntimeRegistry {
             "SELECT event_id, session_id, event_kind, from_state, to_state, detail, at, payload_json
              FROM runtime_events
              WHERE session_id = ?1
-             ORDER BY at DESC
+             -- RFC3339 carries subsecond precision, but two adjacent writes can
+             -- still receive the same clock value. `at` alone then lets SQLite
+             -- return registration after the transition that followed it.
+             -- `rowid` is the insertion sequence for this table and makes
+             -- newest-first truthful even across a tied wall-clock sample.
+             ORDER BY at DESC, rowid DESC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit as i64], |row| {
@@ -760,6 +765,33 @@ mod tests {
             events[0].to_state,
             Some(RemoteRuntimeSessionState::Interactive)
         );
+    }
+
+    #[test]
+    fn event_order_uses_insertion_sequence_when_wall_clock_ties() {
+        let registry = test_registry();
+        let tied_at = "2026-08-25T12:00:00Z";
+        for (event_id, event_kind) in [
+            ("event-older", "session_registered"),
+            ("event-newer", "state_transition"),
+        ] {
+            registry
+                .conn
+                .execute(
+                    "INSERT INTO runtime_events (
+                        event_id, session_id, event_kind, from_state, to_state,
+                        detail, at, payload_json
+                     ) VALUES (?1, 'session-tied', ?2, NULL, NULL, NULL, ?3, '{}')",
+                    params![event_id, event_kind, tied_at],
+                )
+                .expect("insert tied runtime event");
+        }
+
+        let events = registry
+            .list_events("session-tied", 10)
+            .expect("list tied events");
+        assert_eq!(events[0].event_id, "event-newer");
+        assert_eq!(events[1].event_id, "event-older");
     }
 
     #[test]
