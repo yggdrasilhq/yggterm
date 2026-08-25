@@ -17212,6 +17212,10 @@ struct ShellState {
     background_live_session_snapshot_skipped_input_hot_count: u64,
     background_live_session_snapshot_skipped_noop_count: u64,
     latest_runtime_status: Option<ServerRuntimeStatus>,
+    /// Version convergence — see `spec-bidirectional-version-convergence.md`.
+    version_convergence_last_seen_daemon_version: Option<String>,
+    version_convergence_last_notified_missing: Option<String>,
+    version_convergence_last_deferred_version: Option<String>,
     /// ⛔ THE owner of "a daemon handover is in progress, stop painting"
     /// (user-settled call #7). Driven from `latest_runtime_status` and nothing
     /// else; read through `handover_paint_suspended()`.
@@ -19590,6 +19594,9 @@ impl ShellState {
             background_live_session_snapshot_skipped_input_hot_count: 0,
             background_live_session_snapshot_skipped_noop_count: 0,
             latest_runtime_status: None,
+            version_convergence_last_seen_daemon_version: None,
+            version_convergence_last_notified_missing: None,
+            version_convergence_last_deferred_version: None,
             handover_gate: HandoverPaintGate::default(),
             working_flags_poll_started: false,
             drag_paths: Vec::new(),
@@ -19688,6 +19695,259 @@ impl ShellState {
         self.latest_runtime_status = runtime_status;
         self.observe_daemon_handover(current_millis());
     }
+
+    /// Version convergence — `spec-bidirectional-version-convergence.md`.
+    fn version_triple_for_convergence(version: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.trim().parse::<u64>().ok()?;
+        let minor = parts.next()?.trim().parse::<u64>().ok()?;
+        let patch = parts.next().unwrap_or("0").trim().parse::<u64>().ok()?;
+        Some((major, minor, patch))
+    }
+
+    fn is_version_newer(candidate: &str, current: &str) -> bool {
+        match (
+            Self::version_triple_for_convergence(candidate),
+            Self::version_triple_for_convergence(current),
+        ) {
+            (Some(c), Some(o)) => c > o,
+            _ => candidate.trim() > current.trim(),
+        }
+    }
+
+    fn installed_gui_executable_for_version(&self, version: &str) -> Option<PathBuf> {
+        if let Some(pending) = pending_restart_from_active_install_state_for_current_exe() {
+            if pending.version == version && pending.executable.is_file() {
+                return Some(pending.executable);
+            }
+        }
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok(ctx) = detect_install_context(&exe) {
+                if let Some(root) = ctx.managed_root {
+                    let p = root.join("versions").join(version).join("yggterm");
+                    if p.is_file() {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+        if let Ok(root) = yggterm_core::direct_install_root() {
+            let p = root.join("versions").join(version).join("yggterm");
+            if p.is_file() {
+                candidates.push(p);
+            }
+        }
+        if let Ok(home) = resolve_yggterm_home() {
+            let p = home.join("versions").join(version).join("yggterm");
+            if p.is_file() {
+                candidates.push(p);
+            }
+            let bin = home.join("bin").join("yggterm");
+            if bin.is_file() {
+                if let Some(declared) = yggterm_core::install_path_declared_version(&bin) {
+                    if declared == version {
+                        candidates.push(bin.clone());
+                    }
+                } else if candidates.is_empty() {
+                    if let Ok(out) = std::process::Command::new(&bin).arg("--version").output() {
+                        if let Ok(s) = String::from_utf8(out.stdout) {
+                            if s.trim() == version {
+                                candidates.push(bin.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(home).join(".local").join("bin").join("yggterm");
+            if p.is_file() && candidates.is_empty() {
+                if let Ok(out) = std::process::Command::new(&p).arg("--version").output() {
+                    if let Ok(s) = String::from_utf8(out.stdout) {
+                        if s.trim() == version {
+                            candidates.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        candidates.into_iter().next()
+    }
+
+    fn gui_has_pending_draft(&self) -> bool {
+        if let Some(status) = self.latest_runtime_status.as_ref() {
+            if let Some(drafts) = status.pending_input_drafts.as_ref() {
+                if drafts.iter().any(|d| d.has_pending_draft == Some(true)) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check version convergence and return a pending restart if we should restart now.
+    fn version_convergence_pending_restart(&mut self) -> Option<PendingUpdateRestart> {
+        let own_version = current_version();
+        let status = self.latest_runtime_status.as_ref()?.clone();
+        let daemon_version = status.server_version.trim().to_string();
+        if daemon_version.is_empty() || daemon_version == own_version {
+            return None;
+        }
+        if !Self::is_version_newer(&daemon_version, &own_version) {
+            if self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version) {
+                self.version_convergence_last_seen_daemon_version = Some(daemon_version.clone());
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "gui",
+                        "version_convergence",
+                        "downgrade_refused",
+                        json!({
+                            "own_version": own_version,
+                            "daemon_version": daemon_version,
+                            "server_pid": status.server_pid,
+                        }),
+                    );
+                }
+            }
+            return None;
+        }
+        let is_new_daemon = self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version);
+        if is_new_daemon {
+            self.version_convergence_last_seen_daemon_version = Some(daemon_version.clone());
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "gui",
+                    "version_convergence",
+                    "skew_detected",
+                    json!({
+                        "own_version": own_version,
+                        "newest_seen": daemon_version,
+                        "source": "daemon",
+                        "server_pid": status.server_pid,
+                    }),
+                );
+            }
+        }
+        let candidate_exe = match self.installed_gui_executable_for_version(&daemon_version) {
+            Some(p) => p,
+            None => {
+                if self.version_convergence_last_notified_missing.as_deref() != Some(&daemon_version) {
+                    self.version_convergence_last_notified_missing = Some(daemon_version.clone());
+                    let msg = format!(
+                        "Version {} is running on the daemon (pid {}) but no matching GUI binary was found on disk (looked in versions/{}/yggterm). Install the matching yggterm binary to converge.",
+                        daemon_version, status.server_pid, daemon_version
+                    );
+                    self.push_notification(
+                        NotificationTone::Warning,
+                        "Version Skew — Binary Missing",
+                        msg.clone(),
+                    );
+                    if let Ok(home) = resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "gui",
+                            "version_convergence",
+                            "binary_missing",
+                            json!({
+                                "own_version": own_version,
+                                "newest_seen": daemon_version,
+                                "server_pid": status.server_pid,
+                                "message": msg,
+                            }),
+                        );
+                    }
+                }
+                return None;
+            }
+        };
+        if let Some(declared) = yggterm_core::install_path_declared_version(&candidate_exe) {
+            if declared != daemon_version {
+                if self.version_convergence_last_notified_missing.as_deref() != Some(&daemon_version) {
+                    self.version_convergence_last_notified_missing = Some(daemon_version.clone());
+                    let msg = format!(
+                        "Binary at {} declares version {} but daemon is {}, refusing mismatch.",
+                        candidate_exe.display(),
+                        declared,
+                        daemon_version
+                    );
+                    self.push_notification(NotificationTone::Warning, "Version Mismatch", msg.clone());
+                    if let Ok(home) = resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "gui",
+                            "version_convergence",
+                            "binary_mismatch",
+                            json!({
+                                "own_version": own_version,
+                                "daemon_version": daemon_version,
+                                "declared": declared,
+                                "exe": candidate_exe.display().to_string(),
+                            }),
+                        );
+                    }
+                }
+                return None;
+            }
+        }
+        if !yggterm_core::handoff_target_is_usable(&own_version, &daemon_version, &candidate_exe) {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "gui",
+                    "version_convergence",
+                    "handoff_not_usable",
+                    json!({
+                        "own_version": own_version,
+                        "daemon_version": daemon_version,
+                        "exe": candidate_exe.display().to_string(),
+                    }),
+                );
+            }
+            return None;
+        }
+        if self.gui_has_pending_draft() {
+            if self.version_convergence_last_deferred_version.as_deref() != Some(&daemon_version) {
+                self.version_convergence_last_deferred_version = Some(daemon_version.clone());
+                let msg = format!(
+                    "Version {} available (daemon {}), but restart deferred — a terminal has an unsent draft. Will retry when draft is sent or cleared.",
+                    daemon_version, status.server_pid
+                );
+                self.push_notification(
+                    NotificationTone::Info,
+                    "Update Deferred — Draft Held",
+                    msg.clone(),
+                );
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "gui",
+                        "version_convergence",
+                        "restart_deferred",
+                        json!({
+                            "own_version": own_version,
+                            "newest_seen": daemon_version,
+                            "reason": "pending_input_draft",
+                            "server_pid": status.server_pid,
+                        }),
+                    );
+                }
+            }
+            return None;
+        }
+        self.version_convergence_last_deferred_version = None;
+        self.version_convergence_last_notified_missing = None;
+        Some(PendingUpdateRestart {
+            version: daemon_version.clone(),
+            executable: candidate_exe,
+        })
+    }
+
+
     /// Runtime keys of every terminal this client currently has a mounted host
     /// for — what it is actually painting, and therefore what a handover is
     /// allowed to veil. A shadow/read-only client mounts hosts the same way, so
@@ -36771,6 +37031,7 @@ fn spawn_initial_server_sync(
         )
         .ok()
         .unwrap_or(false);
+        maybe_trigger_version_convergence(state);
         if should_schedule_allocator_trim {
             schedule_allocator_trim_after(
                 state,
@@ -37073,6 +37334,61 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
 }
 fn close_window_after_update_restart(state: Signal<ShellState>) {
     close_window_preserving_live_sessions(state, Some("update-restart".to_string()));
+}
+
+/// Version convergence trigger — called when daemon status shows a newer version.
+/// Respects drafts guard and binary availability (spec-bidirectional-version-convergence.md).
+fn maybe_trigger_version_convergence(mut state: Signal<ShellState>) {
+    // WHOEVER is newer updates the other — but the daemon→client direction is the
+    // missing half. Client→daemon already exists (newer client spawns its own
+    // daemon and older drains). Here we only move CLIENT forward when DAEMON is
+    // newer; never backwards, never on equal.
+    let pending = state.with_mut_counted(|shell| shell.version_convergence_pending_restart());
+    let Some(update) = pending else {
+        return;
+    };
+    // Deduplicate: if we already have a pending_update_restart for this version and
+    // the restart is already in flight, don't re-trigger.
+    let already_pending = state.with(|shell| {
+        shell
+            .pending_update_restart
+            .as_ref()
+            .map(|p| p.version == update.version)
+            .unwrap_or(false)
+    });
+    if already_pending {
+        // Already queued — the existing restart will handle it.
+        return;
+    }
+    state.with_mut_counted(|shell| {
+        shell.pending_update_restart = Some(update.clone());
+        shell.last_action = format!("version convergence: restarting into {}", update.version);
+        shell.push_notification(
+            NotificationTone::Info,
+            "Version Convergence",
+            format!(
+                "Daemon is on {} while this GUI is on {} — restarting into {} now. Sessions stay alive.",
+                update.version,
+                current_version(),
+                update.version
+            ),
+        );
+    });
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "gui",
+            "version_convergence",
+            "restart_taken",
+            json!({
+                "own_version": current_version(),
+                "newest_seen": update.version,
+                "exe": update.executable.display().to_string(),
+            }),
+        );
+    }
+    // Reuse the existing self-restart path (gated on drafts already checked).
+    restart_into_pending_update(state);
 }
 
 fn mark_live_session_keep_alive_locally(
@@ -40522,6 +40838,9 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                         if let Some(runtime_status) = runtime_status {
                             shell.set_latest_runtime_status(Some(runtime_status));
                         }
+                        if let Some(pending) = shell.version_convergence_pending_restart() {
+                            shell.pending_update_restart = Some(pending.clone());
+                        }
                         let input_hot = current_millis() < terminal_input_hot_until_ms();
                         if input_hot
                             && !background_snapshot_changes_active_runtime_identity(
@@ -40583,6 +40902,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 }
             },
         );
+        maybe_trigger_version_convergence(state);
     });
 }
 
@@ -79534,6 +79854,7 @@ async fn refresh_runtime_status_for_app_control(
             let _ = safe_shell_mut(state, "app_control_refresh_runtime_status", |shell| {
                 shell.set_latest_runtime_status(Some(runtime_status));
             });
+            maybe_trigger_version_convergence(state);
             json!({
                 "ok": true,
                 "reason": reason,
