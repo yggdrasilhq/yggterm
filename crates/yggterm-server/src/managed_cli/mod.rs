@@ -2008,6 +2008,60 @@ mod tests {
         assert_eq!(extract_semver_like_version("tool 1.2"), None);
     }
 
+    /// The opencode shim health check: the vendor's error-shim text must NOT
+    /// pass, and a real ELF binary must. Without this, the direct fetcher's
+    /// fast path saw "bin exists, version matches" and kept a broken install
+    /// forever.
+    #[test]
+    fn the_opencode_error_shim_is_not_a_healthy_binary() {
+        let paths = provision_test_paths("opencode-shim");
+        let prefix = &paths.prefix;
+        let shim_dir = prefix
+            .join("lib")
+            .join("node_modules")
+            .join("opencode-ai")
+            .join("bin");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        let shim = shim_dir.join("opencode.exe");
+
+        // The broken state: a text file, exactly what the vendor ships as the
+        // placeholder shim.
+        std::fs::write(&shim, "echo \"Error: opencode-ai's postinstall script was not run.\"\n")
+            .expect("write shim");
+        assert!(
+            !direct_install_shim_is_healthy(prefix, "opencode-ai"),
+            "the error shim must not satisfy the fast path"
+        );
+        // A real ELF (any ELF header will do for the check).
+        std::fs::write(&shim, b"\x7fELF\x02\x01\x01\x00rest-of-binary").expect("write elf");
+        assert!(
+            direct_install_shim_is_healthy(prefix, "opencode-ai"),
+            "a real binary must satisfy the fast path"
+        );
+        // Other packages are never second-guessed.
+        assert!(direct_install_shim_is_healthy(prefix, "@openai/codex"));
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// The candidate list follows the vendor postinstall's preference order
+    /// for THIS platform, so a machine that cannot run the modern build gets
+    /// the baseline instead of a fatal install failure.
+    #[test]
+    fn opencode_native_candidates_prefer_glibc_then_baseline_then_musl() {
+        let candidates = opencode_native_package_candidates("1.18.23");
+        assert!(!candidates.is_empty(), "this test platform must have candidates");
+        assert_eq!(candidates[0].1, "1.18.23", "every candidate pins the CLI's version");
+        let names: Vec<&str> = candidates.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            names.iter().any(|name| name.contains("baseline")),
+            "the baseline fallback must be in the list: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| name.starts_with("opencode-")),
+            "candidates are the vendor's own platform packages: {names:?}"
+        );
+    }
+
     fn provision_test_paths(tag: &str) -> ManagedCliPaths {
         let tmp = std::env::temp_dir().join(format!(
             "ygg-provision-{tag}-{}-{}",
@@ -4148,6 +4202,158 @@ fn optional_native_package_for(package: &str) -> Option<String> {
     }
 }
 
+/// The platform packages `opencode-ai`'s own postinstall would pick from, in
+/// its preference order: glibc first, then the pre-AVX2 baseline build, then
+/// the musl builds (statically linked, they also run under glibc).
+///
+/// ⛔ WHY THIS EXISTS, MEASURED: the direct fetcher extracts tarballs and runs
+/// NO lifecycle scripts, and `opencode-ai`'s postinstall is not decoration —
+/// it copies the platform-native binary over the `bin/opencode.exe` JS shim,
+/// which otherwise stays a text file that prints "opencode-ai's postinstall
+/// script was not run" and exits. Every machine the direct fetcher provisioned
+/// had a present, published, launch-parity-resolvable opencode that died the
+/// moment a session started it. The npm path never saw this because npm runs
+/// the postinstall.
+fn opencode_native_package_candidates(version: &str) -> Vec<(String, String)> {
+    let platform = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "windows",
+        _ => return Vec::new(),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        _ => return Vec::new(),
+    };
+    let base = format!("opencode-{platform}-{arch}");
+    let version = version.to_string();
+    if platform == "linux" && arch == "x64" {
+        vec![
+            (base.clone(), version.clone()),
+            (format!("{base}-baseline"), version.clone()),
+            (format!("{base}-musl"), version.clone()),
+            (format!("{base}-baseline-musl"), version),
+        ]
+    } else if platform == "windows" && arch == "x64" {
+        vec![
+            (base.clone(), version.clone()),
+            (format!("{base}-baseline"), version),
+        ]
+    } else {
+        vec![(base, version)]
+    }
+}
+
+/// Fetch `opencode-ai`'s platform package and install its native binary over
+/// the JS error shim — exactly what the vendor postinstall does, minus npm.
+/// The first candidate whose binary answers `--version` wins; a candidate the
+/// registry does not publish (or whose binary will not run on this CPU) is
+/// skipped, never fatal.
+/// Whether the installed entry binary for `package` is a REAL executable
+/// rather than a vendor error shim. ⛔ The fast-path version check above reads
+/// only `package.json`, and opencode-ai's `bin/opencode.exe` EXISTS even when
+/// the install is broken — it is a text file that prints "postinstall script
+/// was not run" and exits. Without this health check, a broken opencode
+/// install would satisfy the fast path forever and never self-heal.
+fn direct_install_shim_is_healthy(prefix: &Path, package: &str) -> bool {
+    if package != "opencode-ai" {
+        return true;
+    }
+    let shim = prefix
+        .join("lib")
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    match fs::read(&shim) {
+        Ok(bytes) => bytes.starts_with(&[0x7f, b'E', b'L', b'F']),
+        Err(_) => false,
+    }
+}
+
+fn install_opencode_native_binary(
+    curl: &Path,
+    staging: &Path,
+    prefix: &Path,
+    version: &str,
+) -> Result<()> {
+    let shim = prefix
+        .join("lib")
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    let mut attempted: Vec<String> = Vec::new();
+    for (name, package_version) in opencode_native_package_candidates(version) {
+        attempted.push(name.clone());
+        let tarball_url = format!("https://registry.npmjs.org/{name}/-/{name}-{package_version}.tgz");
+        let tmp_tgz = staging.join(format!("{name}-{package_version}.tgz"));
+        let Ok(fetch) = std::process::Command::new(curl)
+            .arg("-fsSL")
+            .arg("-o")
+            .arg(&tmp_tgz)
+            .arg(&tarball_url)
+            .output()
+        else {
+            continue;
+        };
+        if !fetch.status.success() {
+            let _ = std::fs::remove_file(&tmp_tgz);
+            continue;
+        }
+        let extract_dir = staging.join(format!("extract-{name}-{package_version}"));
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        let Ok(extract) = std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg(&tmp_tgz)
+            .arg("-C")
+            .arg(&extract_dir)
+            .output()
+        else {
+            let _ = std::fs::remove_file(&tmp_tgz);
+            continue;
+        };
+        let _ = std::fs::remove_file(&tmp_tgz);
+        if !extract.status.success() {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            continue;
+        }
+        let native = extract_dir
+            .join("package")
+            .join("bin")
+            .join("opencode");
+        if !native.is_file() {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            continue;
+        }
+        // COPY, never link: the extract dir is swept below, and a symlink into
+        // it would dangle on the next refresh — the dangling-symlink failure
+        // mode the generation layout exists to prevent.
+        std::fs::create_dir_all(shim.parent().unwrap())
+            .with_context(|| format!("creating {}", shim.parent().unwrap().display()))?;
+        let _ = std::fs::remove_file(&shim);
+        std::fs::copy(&native, &shim)
+            .with_context(|| format!("installing {name}'s native binary over {}", shim.display()))?;
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        let _ = std::process::Command::new("chmod").arg("755").arg(&shim).status();
+        let mut probe = std::process::Command::new(&shim);
+        probe.arg("--version");
+        if matches!(
+            bounded_command_output(&mut probe, MANAGED_CLI_VERSION_PROBE_TIMEOUT),
+            BoundedCommandOutput::Completed { .. }
+        ) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "opencode-ai's native binary could not be installed from any of its platform \
+         packages (tried: {}); the JS shim at {} would fail at launch",
+        attempted.join(", "),
+        shim.display()
+    )
+}
+
 fn native_tarball_url_for_codex(version: &str, platform: &str) -> String {
     // codex native is same package at version <base>-<platform>, e.g.
     // @openai/codex@0.149.1-linux-x64
@@ -4290,7 +4496,7 @@ fn run_direct_install(
                     } else { vec![] };
                     bins.iter().all(|name| prefix.join("bin").join(name).exists())
                 }).unwrap_or(true);
-                if bin_ok {
+                if bin_ok && direct_install_shim_is_healthy(prefix, package) {
                     return Ok(());
                 }
             }
@@ -4326,6 +4532,16 @@ fn run_direct_install(
                 }
             }
         }
+    }
+    // opencode-ai ships its native binary via platform packages its OWN
+    // postinstall copies over the JS shim. The direct fetcher runs no scripts,
+    // so the shim would stay the "postinstall was not run" error text — do
+    // what the postinstall does, declaratively. Failure here must fail the
+    // install: a published shim that errors at launch is the exact
+    // "reports success, dies on use" defect the verify-before-publishing rule
+    // exists to keep off the wire.
+    if package == "opencode-ai" {
+        install_opencode_native_binary(&curl, &staging, prefix, &version)?;
     }
     // Recreate npm env boilerplate marker so `process.env.npm_config_prefix` checks pass
     // (CLIs inspected to complain when binary is copied without npm env).
