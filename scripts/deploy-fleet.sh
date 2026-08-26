@@ -40,7 +40,8 @@ FROM="target/release"
 # ⇒ `scripts/ygg-live-host.sh` is the repo's single owner of "where is the live
 #   GUI". Ask it. If it cannot answer, say so loudly rather than deploying to a
 #   short list that looks complete.
-HOSTS="dev $("$(dirname "$0")/ygg-live-host.sh" 2>/dev/null || true) oc"
+LIVE_HOST="$("$(dirname "$0")/ygg-live-host.sh" 2>/dev/null || true)"
+HOSTS="dev $LIVE_HOST oc"
 HOSTS="$(printf '%s\n' $HOSTS | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
 DRY=0
 ALLOW_BEHIND=0
@@ -67,10 +68,12 @@ done
 # ⇒ Measured cost: `deploy_fleet_guard`'s two ancestry tests passed `--hosts local`,
 # were refused before it was parsed, and sat RED long enough to be filed as a
 # known-failing pair — a real gate whose tests nobody could read.
-# ⚠ The refusal itself is CORRECT and stays: resolving to fewer than three hosts
-# silently skips the only host a UI change can be proven on. It simply must not
-# fire when the caller has already answered the question.
-if [ "$HOSTS_EXPLICIT" = 0 ] && [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
+# ⚠ The refusal itself is CORRECT and stays: failing to resolve the live host
+# silently skips the only host a UI change can be proven on. Count is not the
+# invariant: the live host may legitimately be one of the fixed fleet hosts
+# (for example `dev`), leaving two unique names after deduplication. Preserve the
+# resolver's answer and prove that exact answer remains in the deployment set.
+if [ "$HOSTS_EXPLICIT" = 0 ] && { [ -z "$LIVE_HOST" ] || ! printf '%s\n' $HOSTS | grep -Fxq "$LIVE_HOST"; }; then
   echo "deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing." >&2
   echo "  Deploying to '$HOSTS' would SKIP the only host a UI change can be proven on." >&2
   echo "  Pass --hosts explicitly if that is really what you want." >&2
