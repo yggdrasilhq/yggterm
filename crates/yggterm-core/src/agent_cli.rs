@@ -1698,6 +1698,20 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
 /// Every agent CLI yggterm can drive. Adding a CLI without a descriptor is
 /// impossible by construction: [`SessionKind::is_agent`] is derived from this
 /// table (see `session_kind.rs`).
+/// The npm dist-tag a CLI installs from, when the vendor's `latest` is not
+/// the line the owner chose. OpenCode's v2 binary ships on the `beta` tag
+/// while `latest` stays on the 1.x line (owner directive 2026-08-26), so the
+/// provisioner must resolve the tag, not assume the word "latest". A fn over
+/// [`SessionKind`] rather than a descriptor field: it is provisioning policy
+/// (revisable in one place) and adding a descriptor field would ripple
+/// through every registry literal.
+pub fn npm_dist_tag(kind: SessionKind) -> Option<&'static str> {
+    match kind {
+        SessionKind::OpenCode => Some("beta"),
+        _ => None,
+    }
+}
+
 pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::Codex,
