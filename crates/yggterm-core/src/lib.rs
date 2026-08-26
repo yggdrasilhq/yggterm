@@ -540,6 +540,13 @@ pub struct AppSettings {
     /// either nags a user who said no or installs for one who was never asked.
     #[serde(default)]
     pub agent_cli_install_consent: String,
+    /// Per-CLI desired state for THIS machine, keyed by descriptor slug:
+    /// `true` = the user wants the CLI (install it if missing), `false` = the
+    /// user does not want it (remove the yggterm-managed install). A slug
+    /// absent from the map means "wanted" — the recommend-every-CLI default —
+    /// so the map only ever carries EXPLICIT departures from that default.
+    #[serde(default)]
+    pub agent_cli_install_wanted: BTreeMap<String, bool>,
     pub default_agent_profile: AgentSessionProfile,
     pub in_app_notifications: bool,
     pub system_notifications: bool,
@@ -611,6 +618,7 @@ impl Default for AppSettings {
             interface_llm_model: String::new(),
             agent_cli_extra_args: default_agent_cli_extra_args(),
             agent_cli_install_consent: String::new(),
+            agent_cli_install_wanted: BTreeMap::new(),
             default_agent_profile: AgentSessionProfile::Codex,
             in_app_notifications: true,
             system_notifications: false,
@@ -1240,6 +1248,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.agent_cli_install_consent = serde_json::from_value(value.clone())
             .context("failed to parse agent_cli_install_consent")?;
     }
+    if let Some(value) = object.get("agent_cli_install_wanted") {
+        settings.agent_cli_install_wanted = serde_json::from_value(value.clone())
+            .context("failed to parse agent_cli_install_wanted")?;
+    }
     if let Some(value) = object.get("litellm_endpoint") {
         settings.litellm_endpoint =
             serde_json::from_value(value.clone()).context("failed to parse litellm_endpoint")?;
@@ -1417,6 +1429,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "ui_font_size": settings.ui_font_size,
         "prefer_ghostty_backend": settings.prefer_ghostty_backend,
         "agent_cli_install_consent": settings.agent_cli_install_consent,
+        "agent_cli_install_wanted": settings.agent_cli_install_wanted,
         "litellm_endpoint": settings.litellm_endpoint,
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,
@@ -4280,6 +4293,38 @@ mod tests {
         let round_tripped = parse_settings_value(&json).expect("parse settings");
 
         assert_eq!(round_tripped, original);
+    }
+
+    /// The CLI-installation modal's per-CLI selection survives a round trip,
+    /// and the DEFAULT is "wanted": an absent slug must read as wanted, so a
+    /// settings file written before this field existed behaves exactly like a
+    /// user who never expressed a preference.
+    #[test]
+    fn settings_round_trip_the_cli_install_wanted_map() {
+        let mut original = AppSettings::default();
+        original
+            .agent_cli_install_wanted
+            .insert("qwen-code".to_string(), false);
+        original
+            .agent_cli_install_wanted
+            .insert("codex".to_string(), true);
+
+        let json = serialize_settings_value(&original);
+        assert!(
+            json.get("agent_cli_install_wanted").is_some(),
+            "the map must serialize or a saved selection is lost on restart"
+        );
+        let round_tripped = parse_settings_value(&json).expect("parse settings");
+        assert_eq!(round_tripped, original);
+        assert_eq!(
+            round_tripped.agent_cli_install_wanted.get("qwen-code"),
+            Some(&false)
+        );
+
+        // A settings file from before the field existed parses to an EMPTY
+        // map — every slug defaults to wanted.
+        let legacy = parse_settings_value(&serde_json::json!({})).expect("parse legacy");
+        assert!(legacy.agent_cli_install_wanted.is_empty());
     }
 
     #[test]

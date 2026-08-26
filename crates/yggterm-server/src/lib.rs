@@ -225,6 +225,7 @@ use anyhow::Context;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
     current_time_ms, ensure_local_managed_cli, ensure_local_managed_cli_for_focus,
+    remove_local_managed_cli,
     local_agent_cli_missing_binary_refusal, managed_cli_shell_command, managed_cli_shell_command_full,
     managed_cli_shell_command_with_terminal_appearance,
     refresh_local_managed_cli,
@@ -317,6 +318,38 @@ pub fn refresh_local_managed_cli_now(mode: ManagedCliRefreshMode) -> anyhow::Res
         "local",
         &refresh_local_managed_cli(mode)?,
     ))
+}
+
+/// Install ONE agent CLI on THIS machine, by its descriptor slug — the row key
+/// the CLI-installation modal carries. Foreground semantics: a human asked for
+/// this tool by name, so the TTL is ignored and the install runs inline.
+pub fn install_managed_cli_tool_by_slug(slug: &str) -> anyhow::Result<String> {
+    let tool = managed_cli::managed_cli_tool_for_slug(slug)
+        .ok_or_else(|| anyhow::anyhow!("no registered agent CLI has slug {slug}"))?;
+    let status = ensure_local_managed_cli(tool)?;
+    Ok(format!("{}: {}", status.action, status.detail))
+}
+
+/// Remove ONE agent CLI from THIS machine, by its descriptor slug. Only
+/// user-local installs are removable; a system-path binary is refused BY PATH.
+pub fn remove_managed_cli_tool_by_slug(slug: &str) -> anyhow::Result<String> {
+    let tool = managed_cli::managed_cli_tool_for_slug(slug)
+        .ok_or_else(|| anyhow::anyhow!("no registered agent CLI has slug {slug}"))?;
+    let status = remove_local_managed_cli(tool)?;
+    Ok(format!("{}: {}", status.action, status.detail))
+}
+
+/// THIS machine's agent-CLI presence, resolved the way a LAUNCH resolves.
+///
+/// The modal's local column used to probe the GUI process's `PATH` on the
+/// render path — the weaker question (see `cli_install_machines`) — and a
+/// freshly installed or removed CLI could never flip its chip, because the
+/// managed bin dir a launch prepends is not in the desktop session's `PATH`.
+/// This is the daemon answering the local machine on the same wire the remotes
+/// already use. It costs a login-shell resolution per CLI, so it runs on the
+/// APPLY path and at shell start, never on render.
+pub fn local_cli_presence_now() -> Vec<yggterm_core::cli_install::CliPresenceReport> {
+    yggterm_core::cli_install::presence_report_with(cli_present_for_launch)
 }
 
 /// The literal `machine_key` that means *this machine and every connected
