@@ -2268,10 +2268,10 @@ mod tests {
         // FAILURE shapes never install.
         let broken_prefix = paths.prefix.join("gen-broken");
         let error = run_direct_install(&paths, &broken_prefix, "mock-broken", "latest")
-            .expect_err("a failing vendor script must fail the install");
+            .expect_err("a vendor script that leaves a dead binary must fail the install");
         assert!(
-            error.to_string().contains("postinstall"),
-            "the failure must name the script that failed: {error}"
+            error.to_string().contains("does not run"),
+            "the failure must come from the publish gate, naming the dead binary: {error}"
         );
         let missing_prefix = paths.prefix.join("gen-missing");
         let error = run_direct_install(&paths, &missing_prefix, "mock-missing-dep", "latest")
@@ -4635,9 +4635,9 @@ fn fetch_platform_optional_dependencies(
 /// makes for Muse's installer; NOT running it is a decision that every
 /// script-finalized CLI is broken forever. The boundary that remains: the
 /// scripts run from the package we extracted (never re-fetched), HOME intact,
-/// stdin closed, TMPDIR on disk, bounded wall clock — and the publish gate
-/// below refuses a binary that does not RUN, so a failed or lying script can
-/// never land as a working-looking install.
+/// stdin closed, TMPDIR on disk, bounded wall clock. Scripts are BEST-EFFORT
+/// — the publish gate, not the script's exit code, decides whether an
+/// install lands (see the gate and the measured grok case below).
 fn run_vendor_install_scripts(
     paths: &ManagedCliPaths,
     package_dir: &Path,
@@ -4670,32 +4670,67 @@ fn run_vendor_install_scripts(
         apply_provision_env(&mut command, paths);
         match bounded_command_output(&mut command, Duration::from_secs(300)) {
             BoundedCommandOutput::Completed { success, stderr, .. } => {
-                if !success {
-                    anyhow::bail!(
-                        "{package} {step} script exited non-zero: {}",
-                        String::from_utf8_lossy(&stderr)
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                    );
-                }
+                // ⛔ BEST-EFFORT, AND WHY THE GATE OWNS THE VERDICT: a vendor
+                // script can fail for reasons that do not matter to the
+                // binary — measured live, grok's postinstall requires
+                // `@iarna/toml`, a regular dependency the direct fetcher
+                // (main tarball only) does not install, and grok itself runs
+                // perfectly without it. Failing the install on every script
+                // error would have kept a working CLI out of the fleet. The
+                // publish gate (`staged_binary_runs`) is the contract: script
+                // succeeded + binary runs -> publish; script failed + binary
+                // still runs -> publish WITH the trace event below; binary
+                // does not run -> the install fails with the shim's own
+                // first error line.
                 append_trace_event(
                     &paths.home,
                     "managed_cli",
                     "install",
-                    "vendor_script_completed",
+                    if success {
+                        "vendor_script_completed"
+                    } else {
+                        "vendor_script_failed_nonfatal"
+                    },
                     serde_json::json!({
                         "package": package,
                         "script": step,
+                        "success": success,
+                        "first_error": String::from_utf8_lossy(&stderr)
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
                     }),
                 );
             }
             BoundedCommandOutput::TimedOut => {
-                anyhow::bail!("{package} {step} script timed out after 300s");
+                append_trace_event(
+                    &paths.home,
+                    "managed_cli",
+                    "install",
+                    "vendor_script_failed_nonfatal",
+                    serde_json::json!({
+                        "package": package,
+                        "script": step,
+                        "success": false,
+                        "first_error": "timed out after 300s",
+                    }),
+                );
             }
             BoundedCommandOutput::Failed => {
-                anyhow::bail!("{package} {step} script failed to start");
+                append_trace_event(
+                    &paths.home,
+                    "managed_cli",
+                    "install",
+                    "vendor_script_failed_nonfatal",
+                    serde_json::json!({
+                        "package": package,
+                        "script": step,
+                        "success": false,
+                        "first_error": "could not start",
+                    }),
+                );
             }
         }
     }
@@ -4938,6 +4973,24 @@ fn run_direct_install(
     // codex-litellm's scripts/install.js each put the native binary in place,
     // and a skipped script left all three as error-shim text on PATH.
     run_vendor_install_scripts(paths, &package_dir, package)?;
+    // ⛔ THE PUBLISH GATE, AT THE CHOKE POINT. Every bin the package declares
+    // must RUN (`--version` exits 0) before this install reports success —
+    // the caller's symlink publication hangs off it. The exists-only check
+    // this generalizes published claude, opencode and codex-litellm as
+    // vendor error shims: text on PATH, launch-parity-resolvable, dead on
+    // first use. A vendor script that fails (best-effort by design) or a
+    // package whose binary simply will not run fails HERE, loudly, with the
+    // binary's own first error line.
+    if let Ok(raw) = std::fs::read_to_string(package_dir.join("package.json"))
+        && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(bins) = manifest.get("bin").and_then(|value| value.as_object())
+    {
+        for name in bins.keys() {
+            if let Err(why) = staged_binary_runs(prefix, name) {
+                anyhow::bail!("{package} installed but {name} does not run ({why})");
+            }
+        }
+    }
     // Recreate npm env boilerplate marker so `process.env.npm_config_prefix` checks pass
     // (CLIs inspected to complain when binary is copied without npm env).
     // We already export npm_config_prefix etc. in shell_exports, but also ensure
