@@ -4886,6 +4886,37 @@ blame — the attribution fix holds — while the rate reads **8.2/min** (164 sp
 `app_control/request_begin` fires 214 times (~10.7/min). Nothing regressed; nothing new
 closed.
 
+### ⭐ THE INVISIBLE INSTANCE — A FAILED GUI RESTART LIVES ON AS A SECOND FULL GUI (2026-08-27)
+
+*Found by asking "why is the GUI host angry" with `ytop --probe` after the deploy night. Closed
+same night by hand; the mechanism is open.*
+
+**What was measured.** After the roll's convergence restart reported success
+(*"GUI restarted onto <build> — client and daemon now match"*), the owner saw **no window** and
+launched one by hand — leaving **two complete GUIs** running for 40+ minutes: the roll's
+instance (ppid 1, its binary since deleted under it) each with its own WebKit children, its own
+render loop, its own app-control polling. The second instance burned ~15% of a core through a
+163 MB webview and ~160 MB RSS + 159 MB swap doing it, **with no human able to see it**. The
+daemon answered `handled_by_pid` = the owner's instance; nothing anywhere said a second client
+existed at all.
+
+**And the daemon sat in a cgroup scope named for a pid that died hours earlier**
+(`yggterm-gui-<dead-pid>.scope`), so even the scope name pointed at a ghost.
+
+⇒ **Two defects in one shape:**
+1. **A restart is reported successful when only the PROCESS came up.** The window never
+   presented, the process survived, and every witness (the roll log, `server app state`, the
+   scope name) answered about processes and versions, never about whether a human can see
+   anything. Same class as the paint-ready DOM check: a presence proxy named for presentation.
+2. **Nothing reconciles two GUIs after a manual relaunch** — the second instance is invisible to
+   every verb the owner or an agent would consult.
+
+⇒ **Remedy shape (not built here):** a present-watchdog — a GUI that maps no window within N
+seconds of launch exits non-zero, so the roll's restart reports the failure it actually had; and
+the convergence path should refuse to leave an un-presented instance alive beside a presented
+one. **Falsifier:** repeat the deploy night — kill a window's presentation, let the roll
+"restart" it — then count GUI processes; two alive with one window is the defect.
+
 ### ⭐ THE DECLARE PROBE'S CADENCE IS NOW EXACT — a correct negative, re-asked every minute, per row
 
 The fix direction *"a cached negative for the declare probe"* recorded elsewhere in this file now
@@ -12053,6 +12084,16 @@ will not by itself bring the machine out of swap, and claiming otherwise would
 set up a measurement that is guaranteed to disappoint.
 
 *single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
+
+⭐ **AND STILL TRUE ON THE NEWEST BUILD, WITH THE POLICY APPLIED FROM BIRTH (2026-08-27,
+3.1.61):** the active session's Web View process — born 2026-08-27 *after* both
+memory-policy fixes, so it never ran unbounded — reached **727 MB RSS + 282 MB swapped
+(≈1.0 GB committed) in ~30 minutes**, and grew **660 → 727 MB across a ten-minute window in
+which nothing streamed into it at all** (idle growth). Its CPU calmed to ~2% of a core once the
+rendering finished; the memory did not come back. This is the settled RSS-metric blindness
+running exactly as written, on processes the jar-less fix covers — the bound cannot fire, and
+per-tab reclaim never engages, because the number WebKit reads is not the number that is
+growing. Nothing here contradicts the analysis; it is the analysis, live.
 
 `configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
 `YGGTERM_WEBKIT_CACHE_MODEL=web-browser` and a limit of
