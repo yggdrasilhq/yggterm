@@ -4851,6 +4851,34 @@ one campaign note still says — returns **zero** over a plane holding 235 of th
 also written twice, once as the LLM-facing complaint record and once as a bare duration record, so
 an unfiltered count doubles.
 
+### ⭐ STILL OPEN ON 3.1.60 — re-measured 2026-08-27 AFTER both GUI-host ytrace twin fixes had landed
+
+The foreign_batch misattribution fix (`53e35cab`) and the mount-MRU gate landed well before this
+build, so **these numbers are post-fix and the class is not closed by them**. One measurement,
+GUI host, `ytrace tail --category ui` (byte-budget ring: only ~72 min survived — ⚠ a short ring
+under high density is itself a sign to read rates, not totals):
+
+| reading | value |
+|---|---:|
+| block spans | 651 |
+| window | 72 min |
+| rate | **9.1/min** |
+| severe ≥1 s | 51 (8%), worst **3291 ms** |
+
+Severe-attribution top (witness before each gap): `dioxus_render/component_window` ×21 ·
+**`app_control/request_begin` ×8** · `terminal_mount/js_debug` ×5. ⛔ Same caveat as the lesson
+above holds in full: a constantly-running stamper tops any such table without being its cause —
+the renderer probes every frame; it does not follow that rendering stalls. What survives every
+correction is the RATE: on the newest build, with the twins fixed, blocking runs ~9× the
+≤1/min bar, and `app_control/request_begin` is again inside the severe set with a 3.3 s stall.
+
+⇒ The named open work higher up (`HostHealth`'s inline awaits, `read_poll_apply`'s recovery
+awaits, and app-control's synchronous snapshot/merge serving) remains the queue top. The
+two clean instances found since — `spawn_web_profile_switch`'s lock probe (already
+`spawn_blocking`) and the profile-write-lock acquire in the web-surface reconcile loop
+(already a background task) — were checked and are NOT on the UI thread, so they are
+attribution neighbours, not suspects.
+
 ### ⭐ THE DECLARE PROBE'S CADENCE IS NOW EXACT — a correct negative, re-asked every minute, per row
 
 The fix direction *"a cached negative for the declare probe"* recorded elsewhere in this file now
