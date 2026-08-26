@@ -4216,7 +4216,14 @@ fn app() -> Element {
                             on_api_key_change: move |value: String| state.with_mut_counted(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut_counted(|shell| shell.update_interface_llm_model(value)),
                             on_open_launch_flags: move |_| state.with_mut_counted(|shell| shell.set_launch_flags_open(true)),
-                            on_open_cli_install: move |_| state.with_mut_counted(|shell| shell.set_cli_install_open(true)),
+                            on_open_cli_install: move |_| {
+                                state.with_mut_counted(|shell| shell.set_cli_install_open(true));
+                                // Kick the launch-parity probe for the local
+                                // column as the modal opens, so the chips
+                                // converge on what a LAUNCH resolves rather
+                                // than what the GUI's own `PATH` carries.
+                                spawn_local_cli_presence_probe(state);
+                            },
                             on_focus_input: move |field_key: String| {
                                 focus_settings_field(state, &field_key);
                             },
@@ -4754,15 +4761,15 @@ fn app() -> Element {
                     CliInstallOverlay {
                         palette: snapshot.palette,
                         theme: snapshot.settings.theme,
-                        // THIS machine only. The remote hosts are listed with an
-                        // honest "not probed" rather than a guess: the GUI can
-                        // read its own PATH, and reaching over ssh for the others
-                        // is the provisioner's job, not the renderer's.
-                        machines: cli_install_machines(&snapshot),
+                        machines: cli_install_machines(
+                            snapshot.remote_machines.as_slice(),
+                            snapshot.local_cli_presence.as_deref(),
+                        ),
                         consent: yggterm_core::cli_install::InstallConsent::from_wire(
                             &snapshot.settings.agent_cli_install_consent,
                         ),
-                        pending: false,
+                        pending: snapshot.cli_install_pending,
+                        wanted: snapshot.settings.agent_cli_install_wanted.clone(),
                         on_grant: move |_| state.with_mut_counted(|shell| {
                             shell.set_agent_cli_install_consent(
                                 yggterm_core::cli_install::InstallConsent::Granted,
@@ -4773,8 +4780,12 @@ fn app() -> Element {
                                 yggterm_core::cli_install::InstallConsent::Declined,
                             )
                         }),
-                        on_install_all: move |_| state.with_mut_counted(|shell| {
-                            shell.request_recommended_cli_installs()
+                        on_toggle: move |slug: String| state.with_mut_counted(|shell| {
+                            shell.toggle_cli_install_wanted(slug)
+                        }),
+                        on_apply: move |_| spawn_cli_install_apply(state),
+                        on_reset_selection: move |_| state.with_mut_counted(|shell| {
+                            shell.reset_cli_install_selection()
                         }),
                         on_close: move |_| state.with_mut_counted(|shell| shell.set_cli_install_open(false)),
                     }

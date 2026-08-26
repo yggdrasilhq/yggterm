@@ -2047,35 +2047,48 @@ fn LaunchFlagsSettingsSection(
     }
 }
 
+/// The `machine_key` of THIS machine in the modal's list — the empty key, the
+/// same one `MachineCliStatus::build` has always given the local column.
+const LOCAL_CLI_MACHINE_KEY: &str = "";
+
 /// The machine list the CLI-installation modal draws, local first.
 ///
-/// The local machine is probed here, directly against this process's `PATH`.
-/// Every remote machine reports its own standing back over the existing ssh scan
+/// The local machine is answered from `local_presence` when the launch-parity
+/// probe has landed (shell start or the last apply) and falls back to this
+/// process's `PATH` only before the first probe returns. The remote machines
+/// report their own standing back over the existing ssh scan
 /// (`server remote cli-presence`), where the report is built against LAUNCH
 /// resolution — managed CLI bin dir plus the login-shell dirs a launch prepends.
 ///
-/// ⚠ **The two columns therefore answer slightly different questions, and the
-/// local one is the weaker.** This process's `PATH` is whatever the desktop
-/// session handed the GUI; it is neither deterministic nor what a launch will
-/// search. The remote side was moved to launch parity because it was wrong by a
-/// factor of ten; the local side is not moved WITH it here because the parity
-/// resolver consults the login shell, and this function runs on the render
-/// path, where a subprocess is the one cost this product cannot pay. Tracked as
-/// its own queue entry — the fix is for the daemon to report the local machine
-/// on the same wire the remotes already use, so nothing is probed during render.
+/// ⚠ **The fallback column is the weaker answer and says so by being
+/// temporary.** This process's `PATH` is whatever the desktop session handed
+/// the GUI; it is neither deterministic nor what a launch will search. That is
+/// exactly why the probe is spawned the moment the modal opens
+/// (`spawn_local_cli_presence_probe`) instead of during render: a subprocess
+/// per CLI is affordable on an explicit user action and nowhere else.
 ///
 /// ⛔ **A machine with an EMPTY report is `Unknown`, never `Absent`.** That is
 /// what an unreachable host, a host never yet refreshed, and a host whose
-/// yggterm predates the verb all produce. Rendering it as absence would make the
-/// primary button offer to install ten CLIs onto a machine nobody has contacted.
+/// yggterm predates the verb all produce. Rendering it as absence would make
+/// the apply button offer to install ten CLIs onto a machine nobody has
+/// contacted.
 fn cli_install_machines(
-    snapshot: &SharedSnapshot,
+    remote_machines: &[yggterm_server::RemoteMachineSnapshot],
+    local_presence: Option<&[yggterm_core::cli_install::CliPresenceReport]>,
 ) -> Vec<yggterm_core::cli_install::MachineCliStatus> {
     use yggterm_core::cli_install::{
         binary_on_process_path, machine_status_from_report, machine_status_with,
     };
-    let mut machines = vec![machine_status_with("This machine", binary_on_process_path)];
-    machines.extend(snapshot.remote_machines.iter().map(|machine| {
+    let mut machines = Vec::new();
+    match local_presence {
+        Some(report) if !report.is_empty() => machines.push(machine_status_from_report(
+            LOCAL_CLI_MACHINE_KEY,
+            "This machine",
+            report,
+        )),
+        _ => machines.push(machine_status_with("This machine", binary_on_process_path)),
+    }
+    machines.extend(remote_machines.iter().map(|machine| {
         machine_status_from_report(
             machine.machine_key.clone(),
             machine.label.clone(),
@@ -2101,12 +2114,17 @@ fn CliInstallOverlay(
     machines: Vec<yggterm_core::cli_install::MachineCliStatus>,
     consent: yggterm_core::cli_install::InstallConsent,
     pending: bool,
+    /// The user's per-CLI wanted overrides (slug → wanted). A slug absent
+    /// from the map means wanted — the recommend-every-CLI default.
+    wanted: std::collections::BTreeMap<String, bool>,
     on_grant: EventHandler<MouseEvent>,
     on_decline: EventHandler<MouseEvent>,
-    on_install_all: EventHandler<MouseEvent>,
+    on_toggle: EventHandler<String>,
+    on_apply: EventHandler<MouseEvent>,
+    on_reset_selection: EventHandler<MouseEvent>,
     on_close: EventHandler<MouseEvent>,
 ) -> Element {
-    use yggterm_core::cli_install::{plan_install_count, recommended_plans, ArrivalPlan, CliPresence};
+    use yggterm_core::cli_install::{ArrivalPlan, CliPresence};
 
     let overlay_wash = match theme {
         UiTheme::ZedLight => "rgba(228,237,245,0.03)",
@@ -2124,8 +2142,37 @@ fn CliInstallOverlay(
             "0 0 0 1px rgba(59,87,112,0.90), 0 0 0 10px rgba(124,200,255,0.16), 0 26px 60px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(68,84,99,0.94)"
         }
     };
-    let plans = recommended_plans(&machines, consent);
-    let pending_count = plan_install_count(&plans);
+    // The apply plan is computed from THIS machine only: installs and removals
+    // run through the local provisioner, and the button must never promise
+    // work on a machine this process cannot reach. The remote columns stay
+    // diagnostic until a per-machine apply path exists for them.
+    let wanted_for =
+        |slug: &str| wanted.get(slug).copied().unwrap_or(true);
+    let local = machines
+        .iter()
+        .find(|machine| machine.machine_key == LOCAL_CLI_MACHINE_KEY);
+    let (install_count, remove_count) = local
+        .map(|machine| {
+            (
+                machine
+                    .rows
+                    .iter()
+                    .filter(|row| row.presence == CliPresence::Absent && wanted_for(&row.slug))
+                    .count(),
+                machine
+                    .rows
+                    .iter()
+                    .filter(|row| row.presence.is_present() && !wanted_for(&row.slug))
+                    .count(),
+            )
+        })
+        .unwrap_or((0, 0));
+    let apply_count = install_count + remove_count;
+    let apply_summary = format!(
+        "{} to install · {} to remove on This machine.",
+        install_count,
+        remove_count
+    );
     // Counted independently of consent: the user must be able to SEE how much
     // work there is before deciding whether to authorise it. Gating this number
     // on consent would show "0 missing" to exactly the person being asked.
@@ -2133,6 +2180,80 @@ fn CliInstallOverlay(
         .iter()
         .map(|machine| machine.installable().count())
         .sum();
+
+    // Precomputed chip data — rsx bodies take nodes, not statements, so every
+    // per-row decision (interactive? wanted? what does apply do to it?) is
+    // settled here and the loop below only renders.
+    #[derive(Clone)]
+    struct CliChip {
+        slug: String,
+        display_name: String,
+        presence_word: &'static str,
+        version_word: String,
+        wanted: bool,
+        is_local: bool,
+        action_suffix: Option<&'static str>,
+    }
+    struct CliChipMachine {
+        key: String,
+        label: String,
+        summary: String,
+        rows: Vec<CliChip>,
+    }
+    let chip_machines: Vec<CliChipMachine> = machines
+        .iter()
+        .map(|machine| CliChipMachine {
+            key: machine.machine_key.clone(),
+            label: machine.display_label.clone(),
+            summary: machine.summary(),
+            rows: machine
+                .rows
+                .iter()
+                .map(|row| {
+                    // Only THIS machine's chips are controls: the apply path
+                    // runs the local provisioner, and a toggle that promises a
+                    // remote change the button cannot deliver is a lie in
+                    // the UI.
+                    let is_local = machine.machine_key == LOCAL_CLI_MACHINE_KEY;
+                    let row_wanted = wanted_for(&row.slug);
+                    let action_suffix = if !is_local {
+                        None
+                    } else if row.presence == CliPresence::Absent && row_wanted {
+                        Some("will install")
+                    } else if row.presence.is_present() && !row_wanted {
+                        Some("will remove")
+                    } else if row.presence == CliPresence::Absent && !row_wanted {
+                        Some("won't install")
+                    } else {
+                        None
+                    };
+                    CliChip {
+                        slug: row.slug.to_string(),
+                        display_name: row.display_name.to_string(),
+                        presence_word: match &row.presence {
+                            CliPresence::Present { .. } => "present",
+                            CliPresence::Absent => "absent",
+                            CliPresence::UnsupportedHere => "unsupported",
+                            CliPresence::Unknown => "unknown",
+                        },
+                        version_word: match &row.presence {
+                            CliPresence::Present { version: Some(v) } => v.clone(),
+                            CliPresence::Present { version: None } => "installed".to_string(),
+                            CliPresence::UnsupportedHere => "not on this platform".to_string(),
+                            CliPresence::Unknown => "not probed".to_string(),
+                            CliPresence::Absent if matches!(row.arrival, ArrivalPlan::Unattended) => {
+                                "missing".to_string()
+                            }
+                            CliPresence::Absent => "install by hand".to_string(),
+                        },
+                        wanted: row_wanted,
+                        is_local,
+                        action_suffix,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
 
     rsx! {
         div {
@@ -2238,10 +2359,10 @@ fn CliInstallOverlay(
                     }
                 }
 
-                for machine in machines.iter() {
+                for machine in chip_machines.iter() {
                     div {
-                        key: "{machine.machine_key}",
-                        "data-cli-install-machine": "{machine.machine_key}",
+                        key: "{machine.key}",
+                        "data-cli-install-machine": "{machine.key}",
                         style: format!(
                             "display:flex; flex-direction:column; gap:6px; padding:10px 12px; border-radius:14px; \
                              box-shadow: inset 0 0 0 1px {};",
@@ -2251,47 +2372,54 @@ fn CliInstallOverlay(
                             style: "display:flex; align-items:baseline; justify-content:space-between; gap:8px;",
                             div {
                                 style: format!("font-size:12px; font-weight:800; color:{};", palette.text),
-                                "{machine.display_label}"
+                                "{machine.label}"
                             }
                             div {
                                 style: format!("font-size:10px; font-weight:700; color:{};", palette.muted),
-                                "{machine.summary()}"
+                                "{machine.summary}"
                             }
                         }
                         div {
                             style: "display:flex; flex-wrap:wrap; gap:6px;",
-                            for row in machine.rows.iter() {
+                            for row in machine.rows.clone() {
                                 div {
                                     key: "{row.slug}",
                                     "data-cli-install-row": "{row.slug}",
-                                    "data-cli-install-presence": match &row.presence {
-                                        CliPresence::Present { .. } => "present",
-                                        CliPresence::Absent => "absent",
-                                        CliPresence::UnsupportedHere => "unsupported",
-                                        CliPresence::Unknown => "unknown",
-                                    },
+                                    "data-cli-install-presence": "{row.presence_word}",
                                     style: format!(
                                         "display:flex; align-items:center; gap:6px; padding:4px 9px; border-radius:9px; \
-                                         font-size:11px; font-weight:700; background:{}; color:{};",
-                                        if row.presence.is_present() {
+                                         font-size:11px; font-weight:700; background:{}; color:{}; \
+                                         cursor:{}; {}",
+                                        if !row.wanted {
+                                            if palette_is_dark(palette) { "rgba(38,30,20,0.62)" } else { "rgba(253,243,224,0.95)" }
+                                        } else if row.presence_word == "present" {
                                             if palette_is_dark(palette) { "rgba(16,72,52,0.55)" } else { "rgba(222,246,235,0.95)" }
-                                        } else if palette_is_dark(palette) {
-                                            "rgba(38,30,20,0.62)"
                                         } else {
-                                            "rgba(253,243,224,0.95)"
+                                            if palette_is_dark(palette) { "rgba(20,32,52,0.62)" } else { "rgba(228,238,250,0.95)" }
                                         },
-                                        palette.text
+                                        palette.text,
+                                        if row.is_local { "pointer" } else { "default" },
+                                        if row.is_local && row.wanted {
+                                            format!("box-shadow: inset 0 0 0 1px {};", palette.accent)
+                                        } else {
+                                            "box-shadow: none;".to_string()
+                                        }
                                     ),
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        if row.is_local {
+                                            on_toggle.call(row.slug.clone());
+                                        }
+                                    },
                                     span { "{row.display_name}" }
                                     span {
                                         style: format!("font-size:10px; font-weight:700; color:{};", palette.muted),
-                                        match (&row.presence, row.arrival) {
-                                            (CliPresence::Present { version: Some(v) }, _) => v.clone(),
-                                            (CliPresence::Present { version: None }, _) => "installed".to_string(),
-                                            (CliPresence::UnsupportedHere, _) => "not on this platform".to_string(),
-                                            (CliPresence::Unknown, _) => "not probed".to_string(),
-                                            (CliPresence::Absent, ArrivalPlan::Unattended) => "missing".to_string(),
-                                            (CliPresence::Absent, ArrivalPlan::NeedsHuman) => "install by hand".to_string(),
+                                        "{row.version_word}"
+                                    }
+                                    if let Some(suffix) = row.action_suffix {
+                                        span {
+                                            style: format!("font-size:9px; font-weight:800; letter-spacing:0.02em; color:{};", palette.accent),
+                                            "{suffix}"
                                         }
                                     }
                                 }
@@ -2306,27 +2434,50 @@ fn CliInstallOverlay(
                         style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
                         if actionable_total == 0 {
                             "Nothing to install on the machines yggterm has probed."
+                        } else if apply_count == 0 {
+                            "This machine already matches your selection."
                         } else {
-                            "Recommended: install every CLI on every machine, so a session opens wherever you click."
+                            "{apply_summary}"
                         }
                     }
-                    button {
-                        "data-cli-install-run": "1",
-                        disabled: pending || pending_count == 0,
-                        style: format!(
-                            "border:none; border-radius:10px; height:32px; padding:0 14px; font-size:12px; font-weight:800; \
-                             cursor:{}; background:{}; color:#fff; opacity:{};",
-                            if pending || pending_count == 0 { "default" } else { "pointer" },
-                            palette.accent,
-                            if pending || pending_count == 0 { "0.5" } else { "1" }
-                        ),
-                        onclick: move |evt| on_install_all.call(evt),
-                        if pending {
-                            "Installing…"
-                        } else if pending_count == 0 {
-                            "Install all recommended"
-                        } else {
-                            "Install all recommended ({pending_count})"
+                    div {
+                        style: "display:flex; gap:8px; align-items:center;",
+                        if !wanted.is_empty() {
+                            button {
+                                "data-cli-install-reset-selection": "1",
+                                disabled: pending,
+                                style: format!(
+                                    "border:none; background:transparent; color:{}; font-size:11px; font-weight:700; \
+                                     cursor:{}; text-decoration:underline;",
+                                    palette.muted,
+                                    if pending { "default" } else { "pointer" }
+                                ),
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    on_reset_selection.call(evt);
+                                },
+                                "Reset selection"
+                            }
+                        }
+                        button {
+                            "data-cli-install-run": "1",
+                            disabled: pending || apply_count == 0,
+                            style: format!(
+                                "border:none; border-radius:10px; height:32px; padding:0 14px; font-size:12px; font-weight:800; \
+                                 cursor:{}; background:{}; color:#fff; opacity:{};",
+                                if pending || apply_count == 0 { "default" } else { "pointer" },
+                                palette.accent,
+                                if pending || apply_count == 0 { "0.5" } else { "1" }
+                            ),
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_apply.call(evt);
+                            },
+                            if pending {
+                                "Applying…"
+                            } else {
+                                "Apply selection ({apply_count})"
+                            }
                         }
                     }
                 }

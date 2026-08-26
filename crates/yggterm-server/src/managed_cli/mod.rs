@@ -431,18 +431,59 @@ impl ManagedCliPaths {
     }
 
     /// Drop every generation of `slug` except the one just published, and any
-    /// partial tree an interrupted run abandoned.
+    /// partial tree an interrupted run abandoned — EXCEPT a generation a
+    /// running process is still executing from.
+    ///
+    /// ⛔ MEASURED BROKEN LIVE: a long-running CLI references files INSIDE its
+    /// generation tree long after its entry binary is loaded — the codex CLI
+    /// spawns `codex-code-mode-host` from
+    /// `lib/node_modules/<platform pkg>/vendor/.../bin/` on every shell
+    /// command it runs. Pruning that tree under a live session does not touch
+    /// the running process (its exe is already mapped), but every SUBSEQUENT
+    /// helper spawn dies with "No such file or directory", and the session
+    /// reads as "the CLI is broken" when the CLI is fine and the install
+    /// system deleted its working files. So before removing a generation, the
+    /// running processes' executables are sampled: any generation a live
+    /// process executes from is deferred to a later sweep, which will reap it
+    /// after the process is gone.
+    ///
+    /// ⚠ On hosts where liveness cannot be measured (no `/proc`), the
+    /// immediately-previous generation is retained unconditionally as a grace
+    /// generation — one update's worth of survival for a long-running session,
+    /// reaped by the refresh after next.
     fn prune_cli_generations(&self, slug: &str, keep: u64) {
         let keep_name = format!("{slug}.gen{keep}");
         let marker = format!("{slug}.gen");
         let Ok(entries) = fs::read_dir(self.cli_root()) else {
             return;
         };
+        let live_exes = running_process_executable_paths();
+        #[cfg(not(target_os = "linux"))]
+        let grace_name = format!("{slug}.gen{}", keep.saturating_sub(1));
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
             if name == keep_name || !name.starts_with(&marker) {
+                continue;
+            }
+            #[cfg(not(target_os = "linux"))]
+            if name == grace_name {
+                continue;
+            }
+            let path = entry.path();
+            if generation_is_executed_by_running_process(&path, &live_exes) {
+                append_trace_event(
+                    &self.home,
+                    "managed_cli",
+                    "install",
+                    "prune_deferred_running",
+                    serde_json::json!({
+                        "slug": slug,
+                        "generation": name,
+                        "reason": "a running process executes from this generation tree",
+                    }),
+                );
                 continue;
             }
             let _ = fs::remove_dir_all(entry.path());
@@ -1983,6 +2024,160 @@ mod tests {
         }
     }
 
+    /// Removal of an npm-managed CLI takes the WHOLE managed tree with it: the
+    /// published symlink AND every generation directory. The regression this
+    /// locks: a removal that only unlinked the symlink would leave the
+    /// multi-hundred-MB generation trees orphaned on disk forever while
+    /// reporting "removed".
+    #[test]
+    fn removing_an_npm_managed_cli_takes_the_generations_with_it() {
+        let paths = provision_test_paths("remove-npm");
+        let tool = ManagedCliTool::QwenCode;
+        let binary = tool.binary_name();
+        let generation_bin = paths
+            .cli_root()
+            .join(format!("{}.gen1", tool.descriptor().slug))
+            .join("bin");
+        std::fs::create_dir_all(&generation_bin).expect("create generation tree");
+        std::fs::write(generation_bin.join(binary), b"#!/bin/sh\nexit 0\n")
+            .expect("write fake binary");
+        let link = paths.bin_dir.join(binary);
+        std::os::unix::fs::symlink(generation_bin.join(binary), &link).expect("publish symlink");
+
+        let status = remove_local_managed_cli_with_paths(&paths, tool).expect("remove");
+        assert_eq!(status.action, "removed", "detail: {}", status.detail);
+        assert!(
+            paths.bin_dir.join(binary).symlink_metadata().is_err(),
+            "the published symlink must be gone"
+        );
+        assert!(
+            !paths
+                .cli_root()
+                .join(format!("{}.gen1", tool.descriptor().slug))
+                .exists(),
+            "the generation tree must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// ⛔ THE PRUNE MUST NOT DELETE A GENERATION A RUNNING PROCESS EXECUTES
+    /// FROM. Measured broken live: a long-running CLI spawns helper binaries
+    /// from inside its own generation tree, and a refresh that pruned the tree
+    /// under it broke every subsequent command the session tried to run. The
+    /// prune defers such a generation to a later sweep instead.
+    #[test]
+    fn a_running_process_defers_the_prune_of_its_generation() {
+        let paths = provision_test_paths("prune-live");
+        let slug = "prune-live-cli";
+        let live_gen = paths.cli_root().join(format!("{slug}.gen1"));
+        let dead_gen = paths.cli_root().join(format!("{slug}.gen2"));
+        for dir in [&live_gen, &dead_gen] {
+            std::fs::create_dir_all(dir).expect("create generation");
+        }
+        // A REAL executable copied into the generation tree: while it runs,
+        // /proc/<pid>/exe points inside the tree, exactly as a CLI's native
+        // helper does.
+        let executable = live_gen.join("sleeper");
+        std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeper");
+
+        paths.prune_cli_generations(slug, 3);
+        assert!(
+            live_gen.exists(),
+            "a generation a running process executes from must survive the prune"
+        );
+        assert!(
+            !dead_gen.exists(),
+            "a generation nothing is executing must still be pruned"
+        );
+
+        // Once the process is gone, the next sweep reaps the deferred tree.
+        let _ = child.kill();
+        let _ = child.wait();
+        let live_exes = running_process_executable_paths();
+        assert!(
+            !generation_is_executed_by_running_process(&live_gen, &live_exes),
+            "the killed process must no longer hold the generation"
+        );
+        paths.prune_cli_generations(slug, 3);
+        assert!(
+            !live_gen.exists(),
+            "the deferred generation must be reaped once its process is gone"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// Removing a CLI a process is currently executing from is REFUSED BY PATH:
+    /// the running exe would survive mapped, but every helper it spawns from
+    /// its generation tree afterwards would die with "No such file or
+    /// directory" — the exact live failure that motivated liveness-aware
+    /// pruning.
+    #[test]
+    fn removing_a_cli_a_process_is_running_from_is_refused() {
+        let paths = provision_test_paths("remove-running");
+        let tool = ManagedCliTool::QwenCode;
+        let tool_marker = format!("{}.gen", tool.descriptor().slug);
+        let tool_gen_bin = paths.cli_root().join(format!("{tool_marker}1")).join("bin");
+        std::fs::create_dir_all(&tool_gen_bin).expect("create tool generation");
+        let executable = tool_gen_bin.join(tool.binary_name());
+        std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
+        std::os::unix::fs::symlink(&executable, paths.bin_dir.join(tool.binary_name()))
+            .expect("publish symlink");
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .expect("spawn runner");
+
+        let error = remove_local_managed_cli_with_paths(&paths, tool)
+            .expect_err("removal must refuse while a process runs from the tree");
+        assert!(
+            error.to_string().contains("running"),
+            "the refusal must say the CLI is running: {error}"
+        );
+        assert!(
+            paths.cli_root().join(format!("{tool_marker}1")).exists(),
+            "the running generation must be untouched"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// A CLI that is not present reports "not installed" and removes nothing:
+    /// a removal click on a missing CLI must not be able to create or damage
+    /// a managed tree it did not find.
+    #[test]
+    fn removing_an_absent_cli_is_a_reported_no_op() {
+        let paths = provision_test_paths("remove-absent");
+        let tool = ManagedCliTool::QwenCode;
+        let status = remove_local_managed_cli_with_paths(&paths, tool).expect("remove");
+        assert_eq!(status.action, "not installed");
+        assert!(!paths.cli_root().exists(), "nothing may be created");
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// A vendor-installed CLI whose binary is a REAL file in the managed bin
+    /// dir is removed by deleting that file.
+    #[test]
+    fn removing_a_vendor_cli_deletes_its_user_local_binary() {
+        let paths = provision_test_paths("remove-vendor");
+        let tool = ManagedCliTool::Muse;
+        let binary = tool.binary_name();
+        std::fs::write(paths.bin_dir.join(binary), b"#!/bin/sh\nexit 0\n")
+            .expect("write fake vendor binary");
+
+        let status = remove_local_managed_cli_with_paths(&paths, tool).expect("remove");
+        assert_eq!(status.action, "removed", "detail: {}", status.detail);
+        assert!(
+            !paths.bin_dir.join(binary).exists(),
+            "the vendor binary must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
     /// ⛔ A PACKAGE'S INSTALLER MUST NOT STAGE ITS DOWNLOAD IN RAM.
     ///
     /// `os.tmpdir()` in a `preinstall` script resolves to `$TMPDIR`, and on the
@@ -2969,7 +3164,11 @@ fn probe_tool(paths: &ManagedCliPaths, tool: ManagedCliTool) -> ToolProbe {
     // the daemon `PATH` alone would report a CLI we JUST installed as still
     // absent, and `ensure_local_managed_cli` would bail with "did not become
     // available after the managed install finished" on a successful install.
-    if let Some(system_binary) = resolve_binary_for_launch_parity(tool.binary_name()) {
+    // The paths-aware resolver form keeps a test's temp bin dir authoritative
+    // for its own probe instead of leaking the real machine's installs in.
+    if let Some(system_binary) =
+        resolve_binary_for_launch_parity_with(Some(&paths.bin_dir), tool.binary_name())
+    {
         return ToolProbe {
             version: run_version_command(&system_binary),
             source: Some(ManagedCliBinarySource::System),
@@ -2981,6 +3180,48 @@ fn probe_tool(paths: &ManagedCliPaths, tool: ManagedCliTool) -> ToolProbe {
         source: None,
         available: false,
     }
+}
+
+/// Every file a running process is currently executing, best effort.
+///
+/// Linux reads `/proc/<pid>/exe` for each numeric pid. A deleted executable
+/// still reports through the link with a ` (deleted)` suffix, and the prefix
+/// match in [`generation_is_executed_by_running_process`] is on DIRECTORY
+/// components, so the suffix never blocks a match. Any read failure costs one
+/// pid's answer, never the sweep.
+#[cfg(target_os = "linux")]
+fn running_process_executable_paths() -> Vec<PathBuf> {
+    let mut executables = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return executables;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(target) = fs::read_link(format!("/proc/{name}/exe")) {
+            executables.push(target);
+        }
+    }
+    executables
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_process_executable_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Whether any running process executes from inside `generation_dir`.
+fn generation_is_executed_by_running_process(
+    generation_dir: &Path,
+    live_executables: &[PathBuf],
+) -> bool {
+    live_executables
+        .iter()
+        .any(|executable| executable.starts_with(generation_dir))
 }
 
 fn npm_binary() -> Option<PathBuf> {
@@ -4610,13 +4851,23 @@ fn login_shell_path_dirs() -> Vec<PathBuf> {
 /// required a `~/.local/bin/grok` symlink that then broke `grok update`'s
 /// `npm i -g` (EEXIST).
 pub(crate) fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
-    let managed_dir = ManagedCliPaths::resolve()
-        .ok()
-        .map(|paths| paths.bin_dir);
+    resolve_binary_for_launch_parity_with(
+        ManagedCliPaths::resolve().ok().map(|paths| paths.bin_dir).as_deref(),
+        binary_name,
+    )
+}
+
+/// The body of [`resolve_binary_for_launch_parity`], with the managed bin dir
+/// taken in so a caller holding explicit paths (and a test) answers for THAT
+/// configuration instead of whatever the real home resolves to.
+pub(crate) fn resolve_binary_for_launch_parity_with(
+    managed_bin_dir: Option<&Path>,
+    binary_name: &str,
+) -> Option<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(dir) = managed_dir {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
+    if let Some(dir) = managed_bin_dir {
+        if !dirs.contains(&dir.to_path_buf()) {
+            dirs.push(dir.to_path_buf());
         }
     }
     dirs.extend(launch_search_dirs());
@@ -4948,6 +5199,298 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
         }),
     );
     Ok(status)
+}
+
+/// The provisioning key serving a descriptor slug — the row key the
+/// CLI-installation modal carries — or `None` for a slug the registry does
+/// not know.
+pub fn managed_cli_tool_for_slug(slug: &str) -> Option<ManagedCliTool> {
+    managed_cli_tools_for_refresh()
+        .into_iter()
+        .find(|tool| tool.descriptor().slug == slug)
+}
+
+/// Remove a CLI THIS machine no longer wants, by provisioning key.
+///
+/// ⛔ **Only user-space installs are removable.** A binary resolving under a
+/// system prefix (`/usr/local`, `/usr`, `/opt`) is either root-owned or
+/// package-manager-owned, and deleting it is how a "remove Qwen" click becomes
+/// a broken machine for every other user of the host. The refusal is BY PATH,
+/// so the user can remove it by hand knowing exactly which file it is. This is
+/// the removal-side twin of the no-`sudo` rule in the auto-provisioning spec.
+///
+/// What IS removed, by install method:
+/// - npm-managed: the published symlink in the managed bin dir plus every
+///   `<slug>.gen*` generation under the managed CLI root — the whole tree
+///   `install_npm_isolated` created, nothing else.
+/// - uv: `uv tool uninstall <package>`, which removes the tool's bin shims and
+///   its tool directory together, so no dangling entry survives in
+///   `uv tool list`.
+/// - vendor-script / self-updating: the binary file itself, ONLY when it lives
+///   in a user-local bin dir (the managed bin dir or `~/.local/bin`).
+///
+/// The install lock is held for the whole body: removal mutates the same
+/// managed tree the install funnel writes, and the lock — not goodwill — is
+/// what keeps a concurrent refresh from re-installing the tool being removed
+/// ([[ManagedCliInstallLock]]).
+pub(crate) fn remove_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCliToolStatus> {
+    remove_local_managed_cli_with_paths(&ManagedCliPaths::resolve()?, tool)
+}
+
+/// The body of [`remove_local_managed_cli`], with the machine's paths taken in
+/// so a test can prove the removal semantics without touching the real home.
+pub(crate) fn remove_local_managed_cli_with_paths(
+    paths: &ManagedCliPaths,
+    tool: ManagedCliTool,
+) -> Result<ManagedCliToolStatus> {
+    let _install_guard = acquire_managed_cli_install_lock(&paths.home)?;
+    let before = probe_tool(paths, tool);
+    let binary = tool.binary_name();
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "remove_begin",
+        serde_json::json!({
+            "tool": binary,
+            "available": before.available,
+            "source": source_word(before.source),
+        }),
+    );
+
+    if !before.available {
+        let status = tool_status(
+            tool,
+            before.clone(),
+            before,
+            "not installed",
+            format!("{} is not installed on this machine.", tool.display_name()),
+        );
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "remove_end",
+            serde_json::json!({ "tool": binary, "action": "not installed" }),
+        );
+        return Ok(status);
+    }
+
+    // ⛔ THE GUARD, before any deletion. Where does the binary a launch would
+    // run actually live? Under a user-local bin dir the removal may proceed;
+    // anywhere else it is a system install yggterm did not put there, and the
+    // refusal names the path so a hand removal knows exactly which file.
+    let managed_hit = paths.bin_dir.join(binary);
+    let user_local_hit = user_local_bin_dir().map(|dir| dir.join(binary));
+    let resolved = resolve_binary_for_launch_parity_with(Some(&paths.bin_dir), binary);
+    let resolves_user_local = resolved.as_deref() == Some(managed_hit.as_path())
+        || user_local_hit
+            .as_deref()
+            .is_some_and(|candidate| resolved.as_deref() == Some(candidate));
+    if !resolves_user_local {
+        let refusal = format!(
+            "{} resolves to {} which is a system install — yggterm only removes binaries \
+             under its own managed dir or your user-local bin dir; remove it by hand if you \
+             want it gone",
+            tool.display_name(),
+            resolved
+                .as_deref()
+                .map(Path::display)
+                .map(|path| path.to_string())
+                .unwrap_or_else(|| "a system path".to_string())
+        );
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "remove_refused_system_path",
+            serde_json::json!({
+                "tool": binary,
+                "resolved": resolved.as_deref().map(Path::display).map(|path| path.to_string()),
+            }),
+        );
+        anyhow::bail!("{refusal}");
+    }
+
+    // ⛔ A CLI a process is RUNNING cannot be removed cleanly: the running exe
+    // survives (it is already mapped) but every helper it spawns from its
+    // generation tree dies with "No such file or directory" — the exact
+    // failure mode generation pruning learned to avoid. Refuse BY PATH so the
+    // user knows what to close first.
+    {
+        let live_executables = running_process_executable_paths();
+        let slug_marker = format!("{}.gen", tool.descriptor().slug);
+        let running_from: Option<PathBuf> = fs::read_dir(paths.cli_root())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&slug_marker))
+                    && generation_is_executed_by_running_process(&entry.path(), &live_executables)
+            })
+            .map(|entry| entry.path())
+            .or_else(|| {
+                live_executables
+                    .iter()
+                    .find(|exe| **exe == paths.bin_dir.join(binary))
+                    .cloned()
+            });
+        if let Some(tree) = running_from {
+            anyhow::bail!(
+                "{} is running from its managed install ({}) right now — close its sessions \
+                 first, then remove it",
+                tool.display_name(),
+                tree.display()
+            );
+        }
+    }
+
+    let detail = match tool.descriptor().install {
+        CliInstall::Npm(_) => remove_managed_npm_install(paths, tool)?,
+        CliInstall::Uv(package) => {
+            let uv = uv_binary()
+                .context("uv is required to remove this CLI and is not on the login PATH")?;
+            let mut command = Command::new(uv);
+            command.arg("tool").arg("uninstall").arg(&package);
+            apply_provision_env(&mut command, paths);
+            run_provision_command(command, &format!("uv tool uninstall {package}"))?;
+            format!("Uninstalled {package} with `uv tool uninstall`.")
+        }
+        CliInstall::VendorScript(_) | CliInstall::Manual => {
+            remove_user_local_binary(paths, tool)?
+        }
+    };
+
+    let mut after = probe_tool(paths, tool);
+    let mut detail = detail;
+    // A legacy npm install could leave a REAL file where the managed layout
+    // publishes a symlink (the shared-prefix era). The method-specific removal
+    // above does not cover it, so one user-local fallback runs before giving
+    // up — guarded by the same user-local boundary as everything else here.
+    if after.available {
+        if let Ok(extra) = remove_user_local_binary(paths, tool) {
+            detail = format!("{detail} {extra}");
+            after = probe_tool(paths, tool);
+        }
+    }
+    if after.available {
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "remove_still_present",
+            serde_json::json!({
+                "tool": binary,
+                "source": source_word(after.source),
+            }),
+        );
+        anyhow::bail!(
+            "{} still resolves after removal ({}); refusing to report it gone",
+            tool.display_name(),
+            after
+                .source
+                .map(|source| source_word(Some(source)))
+                .unwrap_or("unknown source")
+        );
+    }
+    let status = tool_status(tool, before, after, "removed", detail);
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "remove_end",
+        serde_json::json!({
+            "tool": binary,
+            "action": "removed",
+        }),
+    );
+    Ok(status)
+}
+
+/// Delete the npm-managed tree for `tool`: the published symlink in the
+/// managed bin dir plus every generation directory. Returns the detail line.
+fn remove_managed_npm_install(paths: &ManagedCliPaths, tool: ManagedCliTool) -> Result<String> {
+    let binary = tool.binary_name();
+    let link = paths.bin_dir.join(binary);
+    match fs::symlink_metadata(&link) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(&link)
+                    .with_context(|| format!("removing published link {}", link.display()))?;
+            } else {
+                anyhow::bail!(
+                    "{} is a directory where the managed install publishes a binary; refusing to delete it",
+                    link.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow!(error))
+                .with_context(|| format!("statting published link {}", link.display()));
+        }
+    }
+    let marker = format!("{}.gen", tool.descriptor().slug);
+    if let Ok(entries) = fs::read_dir(paths.cli_root()) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with(&marker) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    Ok(format!(
+        "Removed the Yggterm-managed {binary} install under {}.",
+        paths.cli_root().display()
+    ))
+}
+
+/// Delete a vendor- or self-installed binary, but ONLY out of a user-local bin
+/// dir. A hit anywhere else is a system install yggterm did not put there.
+fn remove_user_local_binary(paths: &ManagedCliPaths, tool: ManagedCliTool) -> Result<String> {
+    let binary = tool.binary_name();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(paths.bin_dir.join(binary));
+    if let Some(user_bin) = user_local_bin_dir() {
+        candidates.push(user_bin.join(binary));
+    }
+    for candidate in &candidates {
+        if let Ok(metadata) = fs::symlink_metadata(candidate) {
+            if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+                anyhow::bail!(
+                    "{} is a directory where a binary was expected; refusing to delete it",
+                    candidate.display()
+                );
+            }
+            fs::remove_file(candidate)
+                .with_context(|| format!("removing {}", candidate.display()))?;
+            return Ok(format!("Removed {}.", candidate.display()));
+        }
+    }
+    let resolved = resolve_binary_for_launch_parity_with(Some(&paths.bin_dir), binary);
+    anyhow::bail!(
+        "{} resolves to {} which is a system install — yggterm only removes binaries \
+         under its own managed dir or your user-local bin dir; remove it by hand if you want it gone",
+        tool.display_name(),
+        resolved
+            .as_deref()
+            .map(Path::display)
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| "a system path".to_string())
+    )
+}
+
+fn source_word(source: Option<ManagedCliBinarySource>) -> &'static str {
+    match source {
+        Some(ManagedCliBinarySource::Managed) => "managed",
+        Some(ManagedCliBinarySource::System) => "system",
+        None => "unavailable",
+    }
 }
 
 pub(crate) fn refresh_local_managed_cli(
