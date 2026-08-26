@@ -2008,6 +2008,309 @@ mod tests {
         assert_eq!(extract_semver_like_version("tool 1.2"), None);
     }
 
+    /// ⛔⛔ THE MOCK-REGISTRY HARNESS: every install shape the direct fetcher
+    /// must handle, proven against a local mock npm registry — install AND
+    /// update, and every way a vendor package says "my binary is not ready".
+    ///
+    /// This exists because the fleet ran the real registry's packages through
+    /// a fetcher that extracted tarballs and ran NOTHING, and three of ten
+    /// CLIs shipped as vendor error shims: present on PATH,
+    /// launch-parity-resolvable, and dead on first use ("native binary not
+    /// installed", "postinstall was not run", "compiled binary not found").
+    /// The shapes below are those vendors' shapes, minimized:
+    ///
+    /// - `mock-plain`: bin works as shipped (pi/qwen shape).
+    /// - `mock-finalize`: platform optional dependency carries the native
+    ///   binary; the vendor's postinstall copies it over the error shim
+    ///   (claude/opencode shape).
+    /// - `mock-preinstall`: the vendor's preinstall materializes the binary
+    ///   from an in-package payload (codex-litellm shape).
+    /// - `mock-broken`: the postinstall fails — the install must FAIL, never
+    ///   publish a shim.
+    /// - `mock-missing-dep`: the platform optional dependency 404s — fatal,
+    ///   because OUR platform's package is the one this machine needs.
+    ///
+    /// The update leg publishes a second version and proves the fetcher
+    /// resolves, installs and verifies it — the "update is flawless" half of
+    /// the owner's requirement.
+    struct MockRegistry {
+        child: std::process::Child,
+        base: String,
+        root: std::path::PathBuf,
+    }
+    impl MockRegistry {
+        fn spawn(root: &Path) -> MockRegistry {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            let port = listener.local_addr().expect("addr").port();
+            drop(listener);
+            let child = std::process::Command::new("python3")
+                .arg(env!("CARGO_MANIFEST_DIR").to_string() + "/../../scripts/mock-npm-registry/server.py")
+                .arg(root)
+                .arg(port.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .expect("spawn mock registry");
+            let base = format!("http://127.0.0.1:{port}");
+            // Wait for readiness.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    panic!("mock registry did not become ready on port {port}");
+                }
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            MockRegistry { child, base, root: root.to_path_buf() }
+        }
+
+        /// Lay down one version of one fixture package.
+        fn publish(&self, name: &str, version: &str, files: &[(&str, &[u8], u32)], manifest: serde_json::Value) {
+            let version_dir = self.root.join("packages").join(name).join(version);
+            std::fs::create_dir_all(version_dir.join("files")).expect("version dir");
+            for (rel, content, mode) in files {
+                let path = version_dir.join("files").join(rel);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("file dir");
+                }
+                std::fs::write(&path, content).expect("write file");
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).expect("stat").permissions();
+                permissions.set_mode(*mode);
+                std::fs::set_permissions(&path, permissions).expect("chmod");
+            }
+            std::fs::write(
+                version_dir.join("package.json"),
+                serde_json::to_vec(&manifest).expect("manifest"),
+            )
+            .expect("write manifest");
+            // The tarball must carry package.json TOO — it is the EXTRACTED
+            // copy the install reads for bin/scripts/optionalDependencies.
+            std::fs::write(
+                version_dir.join("files").join("package.json"),
+                serde_json::to_vec(&manifest).expect("manifest"),
+            )
+            .expect("write in-tar manifest");
+        }
+
+        fn url(&self) -> String {
+            self.base.clone()
+        }
+    }
+    impl Drop for MockRegistry {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn mock_manifest(bin: &str, bin_path: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut manifest = serde_json::json!({
+            "bin": { bin: bin_path },
+        });
+        if let (Some(obj), Some(extra)) = (manifest.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        manifest
+    }
+
+    const MOCK_SHIM: &[u8] = b"echo \"Error: mock vendor binary not installed.\" >&2\nexit 1\n";
+    // A REAL executable for fixture purposes: a shebang script answers
+    // --version with exit 0, which is all the publish gate requires.
+    const MOCK_NATIVE_1: &[u8] = b"#!/bin/sh\necho \"mock-native 1.0.0\"\n";
+    const MOCK_NATIVE_2: &[u8] = b"#!/bin/sh\necho \"mock-native 1.0.1\"\n";
+
+    #[test]
+    fn the_mock_registry_proves_install_and_update_for_every_shape() {
+        let root = std::env::temp_dir().join(format!(
+            "ygg-mock-registry-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture root");
+        let registry = MockRegistry::spawn(&root);
+
+        // mock-plain: the binary works as shipped.
+        registry.publish(
+            "mock-plain",
+            "3.1.0",
+            &[("bin/mock", b"#!/bin/sh\necho \"mock-plain 3.1.0\"\n", 0o755)],
+            mock_manifest("mock", "bin/mock", serde_json::json!({})),
+        );
+        // mock-finalize: shim + platform optional dep + postinstall copy.
+        registry.publish(
+            "mock-finalize",
+            "1.0.0",
+            &[
+                ("bin/mock", MOCK_SHIM, 0o755),
+                ("finalize.sh", b"#!/bin/sh\ncp -f ../mock-finalize-linux-x64/native bin/mock && chmod 755 bin/mock\n", 0o755),
+            ],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({
+                    "optionalDependencies": { "mock-finalize-linux-x64": "1.0.0" },
+                    "scripts": { "postinstall": "bash ./finalize.sh" },
+                }),
+            ),
+        );
+        registry.publish(
+            "mock-finalize-linux-x64",
+            "1.0.0",
+            &[("native", MOCK_NATIVE_1, 0o755)],
+            mock_manifest("mock-native", "native", serde_json::json!({})),
+        );
+        // mock-preinstall: preinstall materializes the binary from a payload.
+        registry.publish(
+            "mock-preinstall",
+            "2.0.0",
+            &[
+                ("payload/mock", b"#!/bin/sh\necho \"mock-pre 2.0.0\"\n", 0o755),
+                ("install.sh", b"#!/bin/sh\nmkdir -p bin && cp payload/mock bin/mock && chmod 755 bin/mock\n", 0o755),
+            ],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({ "scripts": { "preinstall": "bash ./install.sh" } }),
+            ),
+        );
+        // mock-broken: the postinstall fails and the shim stays a shim.
+        registry.publish(
+            "mock-broken",
+            "9.9.9",
+            &[
+                ("bin/mock", MOCK_SHIM, 0o755),
+                ("broken.sh", b"#!/bin/sh\nexit 3\n", 0o755),
+            ],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({ "scripts": { "postinstall": "bash ./broken.sh" } }),
+            ),
+        );
+        // mock-missing-dep: the platform dependency 404s.
+        registry.publish(
+            "mock-missing-dep",
+            "4.0.0",
+            &[("bin/mock", MOCK_SHIM, 0o755)],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({
+                    "optionalDependencies": { "mock-missing-dep-linux-x64": "1.0.0" },
+                }),
+            ),
+        );
+        let paths = provision_test_paths("mock-registry");
+        // The fetcher must talk to the MOCK, never the real registry.
+        // SAFETY: test process, single-threaded for this env key — the
+        // registry base is read only by this test's installs.
+        unsafe {
+            std::env::set_var("YGGTERM_NPM_REGISTRY_BASE", registry.url());
+        }
+
+        let install_and_version = |prefix: &Path, package: &str, tag: &str| -> String {
+            run_direct_install(&paths, prefix, package, tag).expect("install succeeds");
+            let bin = prefix.join("bin").join("mock");
+            let mut version_command = std::process::Command::new(&bin);
+            version_command.arg("--version");
+            match bounded_command_output(
+                &mut version_command,
+                MANAGED_CLI_VERSION_PROBE_TIMEOUT,
+            ) {
+                BoundedCommandOutput::Completed { stdout, success: true, .. } => {
+                    String::from_utf8_lossy(&stdout).trim().to_string()
+                }
+                other => panic!("installed {package} binary does not answer --version: {other:?}"),
+            }
+        };
+
+        // INSTALL, shape by shape.
+        let plain_prefix = paths.prefix.join("gen-plain");
+        assert_eq!(
+            install_and_version(&plain_prefix, "mock-plain", "latest"),
+            "mock-plain 3.1.0",
+            "plain shape: the shipped binary must be published as-is"
+        );
+        let finalize_prefix = paths.prefix.join("gen-finalize");
+        assert_eq!(
+            install_and_version(&finalize_prefix, "mock-finalize", "latest"),
+            "mock-native 1.0.0",
+            "finalize shape: postinstall must swap the shim for the platform native"
+        );
+        let pre_prefix = paths.prefix.join("gen-pre");
+        assert_eq!(
+            install_and_version(&pre_prefix, "mock-preinstall", "latest"),
+            "mock-pre 2.0.0",
+            "preinstall shape: the vendor script must materialize the binary"
+        );
+
+        // UPDATE: a second version is PUBLISHED (as a vendor release is), and
+        // the next install resolves, fetches, and verifies it.
+        registry.publish(
+            "mock-plain",
+            "3.2.0",
+            &[("bin/mock", b"#!/bin/sh\necho \"mock-plain 3.2.0\"\n", 0o755)],
+            mock_manifest("mock", "bin/mock", serde_json::json!({})),
+        );
+        let plain_update_prefix = paths.prefix.join("gen-plain-update");
+        assert_eq!(
+            install_and_version(&plain_update_prefix, "mock-plain", "latest"),
+            "mock-plain 3.2.0",
+            "update: the fetcher must resolve and install the newer version"
+        );
+
+        // FAILURE shapes never install.
+        let broken_prefix = paths.prefix.join("gen-broken");
+        let error = run_direct_install(&paths, &broken_prefix, "mock-broken", "latest")
+            .expect_err("a failing vendor script must fail the install");
+        assert!(
+            error.to_string().contains("postinstall"),
+            "the failure must name the script that failed: {error}"
+        );
+        let missing_prefix = paths.prefix.join("gen-missing");
+        let error = run_direct_install(&paths, &missing_prefix, "mock-missing-dep", "latest")
+            .expect_err("a missing platform dependency must fail the install");
+        assert!(
+            error.to_string().contains("mock-missing-dep-linux-x64"),
+            "the failure must name the dependency it could not fetch: {error}"
+        );
+
+        // THE PUBLISH GATE: a shim that exists but does not run is refused.
+        let shim_staged = paths.prefix.join("gen-gate");
+        std::fs::create_dir_all(shim_staged.join("bin")).expect("staged bin");
+        let gate_chmod = |content: &[u8]| {
+            let path = shim_staged.join("bin").join("mock");
+            std::fs::write(&path, content).expect("write gate fixture");
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).expect("stat").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod gate fixture");
+        };
+        gate_chmod(MOCK_SHIM);
+        assert!(
+            staged_binary_runs(&shim_staged, "mock").is_err(),
+            "an error shim must never pass the publish gate"
+        );
+        gate_chmod(MOCK_NATIVE_1);
+        assert!(
+            staged_binary_runs(&shim_staged, "mock").is_ok(),
+            "a binary that answers --version must pass the publish gate"
+        );
+
+        // SAFETY: see the set_var note above.
+        unsafe {
+            std::env::remove_var("YGGTERM_NPM_REGISTRY_BASE");
+        }
+        let _ = std::fs::remove_dir_all(&paths.home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The opencode shim health check: the vendor's error-shim text must NOT
     /// pass, and a real ELF binary must. Without this, the direct fetcher's
     /// fast path saw "bin exists, version matches" and kept a broken install
@@ -2041,25 +2344,6 @@ mod tests {
         // Other packages are never second-guessed.
         assert!(direct_install_shim_is_healthy(prefix, "@openai/codex"));
         let _ = std::fs::remove_dir_all(&paths.home);
-    }
-
-    /// The candidate list follows the vendor postinstall's preference order
-    /// for THIS platform, so a machine that cannot run the modern build gets
-    /// the baseline instead of a fatal install failure.
-    #[test]
-    fn opencode_native_candidates_prefer_glibc_then_baseline_then_musl() {
-        let candidates = opencode_native_package_candidates("1.18.23");
-        assert!(!candidates.is_empty(), "this test platform must have candidates");
-        assert_eq!(candidates[0].1, "1.18.23", "every candidate pins the CLI's version");
-        let names: Vec<&str> = candidates.iter().map(|(name, _)| name.as_str()).collect();
-        assert!(
-            names.iter().any(|name| name.contains("baseline")),
-            "the baseline fallback must be in the list: {names:?}"
-        );
-        assert!(
-            names.iter().all(|name| name.starts_with("opencode-")),
-            "candidates are the vendor's own platform packages: {names:?}"
-        );
     }
 
     fn provision_test_paths(tag: &str) -> ManagedCliPaths {
@@ -3080,7 +3364,15 @@ mod tests {
 
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedCommandOutput {
-    Completed { stdout: Vec<u8>, stderr: Vec<u8> },
+    Completed {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        /// The child's exit status. The version probe never cared (it reads
+        /// output); the publish gate DOES — a vendor error shim prints its
+        /// paragraph on stderr and exits non-zero, and "printed something"
+        /// must never read as "ran".
+        success: bool,
+    },
     TimedOut,
     Failed,
 }
@@ -3099,7 +3391,7 @@ fn bounded_command_output(command: &mut Command, timeout: Duration) -> BoundedCo
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
                 let mut stdout = Vec::new();
                 let mut stderr = Vec::new();
                 if child
@@ -3113,7 +3405,11 @@ fn bounded_command_output(command: &mut Command, timeout: Duration) -> BoundedCo
                 {
                     return BoundedCommandOutput::Failed;
                 }
-                return BoundedCommandOutput::Completed { stdout, stderr };
+                return BoundedCommandOutput::Completed {
+                    stdout,
+                    stderr,
+                    success: status.success(),
+                };
             }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
@@ -3139,7 +3435,7 @@ fn run_version_command(binary_path: &Path) -> Option<String> {
         MANAGED_CLI_VERSION_PROBE_TIMEOUT,
     );
     let (outcome_name, output) = match outcome {
-        BoundedCommandOutput::Completed { stdout, stderr } => {
+        BoundedCommandOutput::Completed { stdout, stderr, .. } => {
             let output = if stdout.is_empty() { stderr } else { stdout };
             ("completed", Some(output))
         }
@@ -4110,7 +4406,12 @@ fn install_one_npm_cli(
         //    network drop mid-download leaves far more than the 1 MB a registry
         //    resolution error does.
         let install_result = if managed_cli_fetcher_is_direct() {
-            run_direct_install(paths, &staged, package)
+            run_direct_install(
+                paths,
+                &staged,
+                package,
+                yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+            )
         } else {
             run_npm_install(paths, npm, &staged, package, background)
         };
@@ -4119,15 +4420,16 @@ fn install_one_npm_cli(
             return Err(error);
         }
 
-        // ⛔ VERIFY BEFORE PUBLISHING. npm exits 0 having installed a package
-        //    whose `bin` never materialised — a broken CLI that reports success
-        //    is worse than a failure, because nothing looks at it again until a
-        //    user tries to launch it.
-        let staged_binary = staged.join("bin").join(binary);
-        if !staged_binary.exists() {
+        // ⛔ VERIFY BEFORE PUBLISHING — the binary must RUN, not merely exist.
+        //    The exists-only check published claude, opencode and codex-litellm
+        //    as vendor error shims: a text file on PATH that exits non-zero
+        //    with an instruction paragraph on first use. A binary that cannot
+        //    answer `--version` never reaches the publish symlink, and the
+        //    install fails loudly with the vendor's own first error line.
+        if let Err(why) = staged_binary_runs(&staged, binary) {
             let _ = fs::remove_dir_all(&staged);
             anyhow::bail!(
-                "npm installed {package} but produced no {binary} in {}",
+                "npm installed {package} but {binary} does not run ({why}) in {}",
                 staged.display()
             );
         }
@@ -4153,7 +4455,12 @@ fn install_one_npm_cli(
     {
         let prefix = paths.prefix.clone();
         if managed_cli_fetcher_is_direct() {
-            run_direct_install(paths, &prefix, package)
+            run_direct_install(
+                paths,
+                &prefix,
+                package,
+                yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+            )
         } else {
             run_npm_install(paths, npm, &prefix, package, background)
         }
@@ -4202,60 +4509,234 @@ fn optional_native_package_for(package: &str) -> Option<String> {
     }
 }
 
-/// The platform packages `opencode-ai`'s own postinstall would pick from, in
-/// its preference order: glibc first, then the pre-AVX2 baseline build, then
-/// the musl builds (statically linked, they also run under glibc).
+/// The npm registry the direct fetcher talks to. Overridable ONLY for the
+/// mock-registry harness (`scripts/mock-npm-registry/`), which proves the
+/// install shapes against a local server; production always resolves to the
+/// real registry.
+fn npm_registry_base() -> String {
+    std::env::var("YGGTERM_NPM_REGISTRY_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://registry.npmjs.org".to_string())
+}
+
+/// Resolve an optionalDependency entry to the (package, exact version) to
+/// fetch. Vendors pin their platform packages to the main package's exact
+/// version (`"opencode-linux-x64": "1.18.23"`); npm alias ranges
+/// (`"npm:@scope/pkg@1.2.3"`) are unwrapped. Anything else (caret, tilde,
+/// `*`, workspace ranges) cannot be resolved from a registry URL and is
+/// SKIPPED rather than guessed at — a skipped optional dep is the
+/// pre-existing failure mode, never a wrong-binary install.
+fn exact_optional_dependency(name: &str, range: &str) -> Option<(String, String)> {
+    if let Some(rest) = range.trim().strip_prefix("npm:") {
+        let (package, version) = rest.rsplit_once('@')?;
+        return Some((package.to_string(), version.to_string()));
+    }
+    if range.is_empty() || range.contains(|ch: char| "~^><=*| ,".contains(ch)) {
+        return None;
+    }
+    let version = range.trim();
+    let first = version.chars().next()?;
+    if !(first.is_ascii_digit() || first == 'v') {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
+/// Fetch every PLATFORM optional dependency the freshly-extracted package
+/// declares, at its pinned version, into the same node_modules — what npm's
+/// optional-dependency resolution would have left on disk. This is the
+/// GENERAL form of what per-CLI special cases used to do: claude's native
+/// binary, opencode's platform binary and grok's all arrive as optional
+/// platform packages, and a main tarball without them is a CLI that prints
+/// "native binary not installed" the moment a session starts it.
 ///
-/// ⛔ WHY THIS EXISTS, MEASURED: the direct fetcher extracts tarballs and runs
-/// NO lifecycle scripts, and `opencode-ai`'s postinstall is not decoration —
-/// it copies the platform-native binary over the `bin/opencode.exe` JS shim,
-/// which otherwise stays a text file that prints "opencode-ai's postinstall
-/// script was not run" and exits. Every machine the direct fetcher provisioned
-/// had a present, published, launch-parity-resolvable opencode that died the
-/// moment a session started it. The npm path never saw this because npm runs
-/// the postinstall.
-fn opencode_native_package_candidates(version: &str) -> Vec<(String, String)> {
-    let platform = match std::env::consts::OS {
-        "linux" => "linux",
-        "macos" => "darwin",
-        "windows" => "windows",
-        _ => return Vec::new(),
+/// ⛔ A platform package that fails to fetch or extract is FATAL to the
+/// install: the vendor declared it optional only because OTHER platforms
+/// don't need it — OUR platform's package is exactly the one this machine
+/// does need, and a published CLI without it is the "reports success, dies
+/// on use" defect.
+fn fetch_platform_optional_dependencies(
+    curl: &Path,
+    staging: &Path,
+    prefix: &Path,
+    package: &str,
+    package_dir: &Path,
+    skip: &[&str],
+) -> Result<()> {
+    let manifest_path = package_dir.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return Ok(());
     };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        _ => return Vec::new(),
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
     };
-    let base = format!("opencode-{platform}-{arch}");
-    let version = version.to_string();
-    if platform == "linux" && arch == "x64" {
-        vec![
-            (base.clone(), version.clone()),
-            (format!("{base}-baseline"), version.clone()),
-            (format!("{base}-musl"), version.clone()),
-            (format!("{base}-baseline-musl"), version),
-        ]
-    } else if platform == "windows" && arch == "x64" {
-        vec![
-            (base.clone(), version.clone()),
-            (format!("{base}-baseline"), version),
-        ]
-    } else {
-        vec![(base, version)]
+    let Some(optional) = manifest
+        .get("optionalDependencies")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(());
+    };
+    let platform = direct_platform_suffix();
+    for (name, range) in optional {
+        let Some(range) = range.as_str() else { continue };
+        if name.contains(platform) && !skip.contains(&name.as_str()) {
+            let Some((dep_package, dep_version)) = exact_optional_dependency(name, range) else {
+                anyhow::bail!(
+                    "{package} declares platform dependency {name} at unresolvable range \
+                     {range:?} — cannot fetch the native binary this machine needs"
+                );
+            };
+            let dep_base = npm_registry_base();
+            let manifest_url = format!("{dep_base}/{dep_package}/{}", dep_version);
+            let meta_output = std::process::Command::new(curl)
+                .arg("-fsSL")
+                .arg(&manifest_url)
+                .output()
+                .with_context(|| format!("fetching manifest for {dep_package}"))?;
+            if !meta_output.status.success() {
+                anyhow::bail!(
+                    "platform dependency {dep_package}@{dep_version} fetch failed: {}",
+                    String::from_utf8_lossy(&meta_output.stderr)
+                );
+            }
+            let dep_meta: serde_json::Value = serde_json::from_slice(&meta_output.stdout)
+                .with_context(|| format!("parsing manifest for {dep_package}"))?;
+            let dep_tarball = dep_meta
+                .get("dist")
+                .and_then(|dist| dist.get("tarball"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("no dist.tarball for {dep_package}"))?
+                .to_string();
+            fetch_and_extract_package(
+                curl,
+                staging,
+                prefix,
+                &dep_package,
+                &dep_tarball,
+                &dep_version,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Run a package's OWN install scripts — preinstall, install, postinstall, in
+/// npm's order — from the package directory we just extracted and verified.
+///
+/// ⛔ THE DOCTRINE SHIFT, STATED: the direct fetcher was built to run no
+/// lifecycle scripts, and that posture is what left claude, opencode and
+/// codex-litellm shipping error-shim binaries fleet-wide — their native
+/// binary ARRIVES as data (an optional package we already fetch) but is put
+/// in PLACE by the vendor's script (`install.cjs`, `postinstall.mjs`,
+/// `scripts/install.js`). Running the vendor's own script from the verified
+/// tarball is the same trust decision npm makes and the provisioner already
+/// makes for Muse's installer; NOT running it is a decision that every
+/// script-finalized CLI is broken forever. The boundary that remains: the
+/// scripts run from the package we extracted (never re-fetched), HOME intact,
+/// stdin closed, TMPDIR on disk, bounded wall clock — and the publish gate
+/// below refuses a binary that does not RUN, so a failed or lying script can
+/// never land as a working-looking install.
+fn run_vendor_install_scripts(
+    paths: &ManagedCliPaths,
+    package_dir: &Path,
+    package: &str,
+) -> Result<()> {
+    const INSTALL_SCRIPT_ORDER: [&str; 3] = ["preinstall", "install", "postinstall"];
+    let manifest_path = package_dir.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return Ok(());
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+    let Some(scripts) = manifest
+        .get("scripts")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(());
+    };
+    for step in INSTALL_SCRIPT_ORDER {
+        let Some(script) = scripts.get(step).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if script.trim().is_empty() {
+            continue;
+        }
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(script);
+        command.current_dir(package_dir);
+        apply_provision_env(&mut command, paths);
+        match bounded_command_output(&mut command, Duration::from_secs(300)) {
+            BoundedCommandOutput::Completed { success, stderr, .. } => {
+                if !success {
+                    anyhow::bail!(
+                        "{package} {step} script exited non-zero: {}",
+                        String::from_utf8_lossy(&stderr)
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                    );
+                }
+                append_trace_event(
+                    &paths.home,
+                    "managed_cli",
+                    "install",
+                    "vendor_script_completed",
+                    serde_json::json!({
+                        "package": package,
+                        "script": step,
+                    }),
+                );
+            }
+            BoundedCommandOutput::TimedOut => {
+                anyhow::bail!("{package} {step} script timed out after 300s");
+            }
+            BoundedCommandOutput::Failed => {
+                anyhow::bail!("{package} {step} script failed to start");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The publish gate: the freshly installed entry binary must EXIST and must
+/// RUN (`--version` exits 0 within the probe budget). The exists-only check
+/// this replaces published claude, opencode and codex-litellm as text shims
+/// that print vendor error paragraphs and exit non-zero — present on PATH,
+/// launch-parity-resolvable, and dead on first use.
+fn staged_binary_runs(staged: &Path, binary: &str) -> std::result::Result<(), String> {
+    let bin = staged.join("bin").join(binary);
+    if !bin.is_file() {
+        return Err(format!("no bin/{binary} was produced"));
+    }
+    let mut command = Command::new(&bin);
+    command.arg("--version");
+    match bounded_command_output(&mut command, MANAGED_CLI_VERSION_PROBE_TIMEOUT) {
+        BoundedCommandOutput::Completed { stderr, success, .. } => {
+            if success {
+                Ok(())
+            } else {
+                let text = String::from_utf8_lossy(&stderr);
+                Err(format!(
+                    "--version exited non-zero: {}",
+                    text.lines().next().unwrap_or("").trim()
+                ))
+            }
+        }
+        BoundedCommandOutput::TimedOut => Err("--version timed out".to_string()),
+        BoundedCommandOutput::Failed => Err("--version could not be executed".to_string()),
     }
 }
 
-/// Fetch `opencode-ai`'s platform package and install its native binary over
-/// the JS error shim — exactly what the vendor postinstall does, minus npm.
-/// The first candidate whose binary answers `--version` wins; a candidate the
-/// registry does not publish (or whose binary will not run on this CPU) is
-/// skipped, never fatal.
 /// Whether the installed entry binary for `package` is a REAL executable
-/// rather than a vendor error shim. ⛔ The fast-path version check above reads
-/// only `package.json`, and opencode-ai's `bin/opencode.exe` EXISTS even when
-/// the install is broken — it is a text file that prints "postinstall script
-/// was not run" and exits. Without this health check, a broken opencode
-/// install would satisfy the fast path forever and never self-heal.
+/// rather than a vendor error shim. ⛔ The fast-path version check reads only
+/// `package.json`, and opencode-ai's `bin/opencode.exe` EXISTS even when the
+/// install is broken — it is a text file that prints "postinstall script was
+/// not run" and exits. Without this health check, a broken opencode install
+/// would satisfy the fast path forever and never self-heal.
 fn direct_install_shim_is_healthy(prefix: &Path, package: &str) -> bool {
     if package != "opencode-ai" {
         return true;
@@ -4270,88 +4751,6 @@ fn direct_install_shim_is_healthy(prefix: &Path, package: &str) -> bool {
         Ok(bytes) => bytes.starts_with(&[0x7f, b'E', b'L', b'F']),
         Err(_) => false,
     }
-}
-
-fn install_opencode_native_binary(
-    curl: &Path,
-    staging: &Path,
-    prefix: &Path,
-    version: &str,
-) -> Result<()> {
-    let shim = prefix
-        .join("lib")
-        .join("node_modules")
-        .join("opencode-ai")
-        .join("bin")
-        .join("opencode.exe");
-    let mut attempted: Vec<String> = Vec::new();
-    for (name, package_version) in opencode_native_package_candidates(version) {
-        attempted.push(name.clone());
-        let tarball_url = format!("https://registry.npmjs.org/{name}/-/{name}-{package_version}.tgz");
-        let tmp_tgz = staging.join(format!("{name}-{package_version}.tgz"));
-        let Ok(fetch) = std::process::Command::new(curl)
-            .arg("-fsSL")
-            .arg("-o")
-            .arg(&tmp_tgz)
-            .arg(&tarball_url)
-            .output()
-        else {
-            continue;
-        };
-        if !fetch.status.success() {
-            let _ = std::fs::remove_file(&tmp_tgz);
-            continue;
-        }
-        let extract_dir = staging.join(format!("extract-{name}-{package_version}"));
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        let Ok(extract) = std::process::Command::new("tar")
-            .arg("-xzf")
-            .arg(&tmp_tgz)
-            .arg("-C")
-            .arg(&extract_dir)
-            .output()
-        else {
-            let _ = std::fs::remove_file(&tmp_tgz);
-            continue;
-        };
-        let _ = std::fs::remove_file(&tmp_tgz);
-        if !extract.status.success() {
-            let _ = std::fs::remove_dir_all(&extract_dir);
-            continue;
-        }
-        let native = extract_dir
-            .join("package")
-            .join("bin")
-            .join("opencode");
-        if !native.is_file() {
-            let _ = std::fs::remove_dir_all(&extract_dir);
-            continue;
-        }
-        // COPY, never link: the extract dir is swept below, and a symlink into
-        // it would dangle on the next refresh — the dangling-symlink failure
-        // mode the generation layout exists to prevent.
-        std::fs::create_dir_all(shim.parent().unwrap())
-            .with_context(|| format!("creating {}", shim.parent().unwrap().display()))?;
-        let _ = std::fs::remove_file(&shim);
-        std::fs::copy(&native, &shim)
-            .with_context(|| format!("installing {name}'s native binary over {}", shim.display()))?;
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        let _ = std::process::Command::new("chmod").arg("755").arg(&shim).status();
-        let mut probe = std::process::Command::new(&shim);
-        probe.arg("--version");
-        if matches!(
-            bounded_command_output(&mut probe, MANAGED_CLI_VERSION_PROBE_TIMEOUT),
-            BoundedCommandOutput::Completed { .. }
-        ) {
-            return Ok(());
-        }
-    }
-    anyhow::bail!(
-        "opencode-ai's native binary could not be installed from any of its platform \
-         packages (tried: {}); the JS shim at {} would fail at launch",
-        attempted.join(", "),
-        shim.display()
-    )
 }
 
 fn native_tarball_url_for_codex(version: &str, platform: &str) -> String {
@@ -4439,6 +4838,7 @@ fn run_direct_install(
     paths: &ManagedCliPaths,
     prefix: &Path,
     package: &str,
+    dist_tag: &str,
 ) -> Result<()> {
     // Direct registry fetch — no npm, no cache, no tmpfs leak. Isolated from
     // system binaries: every CLI lands in its own generation under
@@ -4453,9 +4853,11 @@ fn run_direct_install(
     // `claude`/`grok` keeps its old inode through the swap; new launches see
     // the new symlink. No in-place overwrite of a live binary.
     let curl = curl_binary().context("curl is required for direct fetch")?;
+    let registry_base = npm_registry_base();
     let registry_url = format!(
-        "https://registry.npmjs.org/{}/latest",
-        package.replace('/', "%2F")
+        "{registry_base}/{}/{}",
+        package.replace('/', "%2F"),
+        dist_tag
     );
     let meta_output = std::process::Command::new(&curl)
         .arg("-fsSL")
@@ -4504,45 +4906,38 @@ fn run_direct_install(
     }
     let tmp_tgz = staging.join(format!("{}-{}.tgz", package.replace('/', "_"), version));
     fetch_and_extract_package(&curl, &staging, prefix, package, &tarball, &version)?;
-    // Also fetch platform-specific optional native package (e.g. codex-linux-x64)
-    // if this CLI distributes its binary that way. Missing it is the exact
-    // `native binary not installed` / `Missing optional dependency` error.
-    // codex uses version-suffixed tarball of the SAME package
-    // (@openai/codex@0.149.1-linux-x64), others use separate package
-    // (@anthropic-ai/claude-code-linux-x64).
-    if let Some(native_pkg) = optional_native_package_for(package) {
-        if package == "@openai/codex" {
-            // codex native: version-suffixed tarball of main package
-            let platform = direct_platform_suffix();
-            let native_tarball = native_tarball_url_for_codex(&version, platform);
-            let native_version = format!("{}-{}", version, platform);
-            // Try fetch; 404 gracefully skipped — not all versions publish every platform
-            let _ = fetch_and_extract_package(&curl, &staging, prefix, &native_pkg, &native_tarball, &native_version);
-        } else {
-            // claude/grok: separate native package at /latest
-            let native_url = format!("https://registry.npmjs.org/{}/latest", native_pkg.replace('/', "%2F"));
-            if let Ok(native_meta_out) = std::process::Command::new(&curl).arg("-fsSL").arg(&native_url).output() {
-                if native_meta_out.status.success() {
-                    if let Ok(native_meta) = serde_json::from_slice::<serde_json::Value>(&native_meta_out.stdout) {
-                        if let Some(native_tarball) = native_meta.get("dist").and_then(|d| d.get("tarball")).and_then(|v| v.as_str()) {
-                            let native_version = native_meta.get("version").and_then(|v| v.as_str()).unwrap_or(&version).to_string();
-                            let _ = fetch_and_extract_package(&curl, &staging, prefix, &native_pkg, native_tarball, &native_version);
-                        }
-                    }
-                }
-            }
-        }
+    let package_dir = prefix
+        .join("lib")
+        .join("node_modules")
+        .join(package);
+    // Fetch the platform optional dependencies the package declares (claude's
+    // native binary, opencode's platform binary, grok's) at their PINNED
+    // versions — the general form of what per-CLI special cases used to do.
+    // codex keeps its special case: its native is a version-SUFFIXED tarball
+    // of the main package itself, which the optional-dependency walk cannot
+    // express.
+    let codex_native: Option<String> = if package == "@openai/codex" {
+        optional_native_package_for(package).map(|value| value.to_string())
+    } else {
+        None
+    };
+    let skip: Vec<&str> = match codex_native.as_deref() {
+        Some(special) => vec![special],
+        None => Vec::new(),
+    };
+    if let Some(native_pkg) = codex_native.as_deref() {
+        let platform = direct_platform_suffix();
+        let native_tarball = native_tarball_url_for_codex(&version, platform);
+        let native_version = format!("{}-{}", version, platform);
+        // Try fetch; 404 gracefully skipped — not all versions publish every platform
+        let _ = fetch_and_extract_package(&curl, &staging, prefix, native_pkg, &native_tarball, &native_version);
     }
-    // opencode-ai ships its native binary via platform packages its OWN
-    // postinstall copies over the JS shim. The direct fetcher runs no scripts,
-    // so the shim would stay the "postinstall was not run" error text — do
-    // what the postinstall does, declaratively. Failure here must fail the
-    // install: a published shim that errors at launch is the exact
-    // "reports success, dies on use" defect the verify-before-publishing rule
-    // exists to keep off the wire.
-    if package == "opencode-ai" {
-        install_opencode_native_binary(&curl, &staging, prefix, &version)?;
-    }
+    fetch_platform_optional_dependencies(&curl, &staging, prefix, package, &package_dir, &skip)?;
+    // Run the vendor's own install scripts. Without them the finalize step
+    // never happens: claude's install.cjs, opencode's postinstall.mjs and
+    // codex-litellm's scripts/install.js each put the native binary in place,
+    // and a skipped script left all three as error-shim text on PATH.
+    run_vendor_install_scripts(paths, &package_dir, package)?;
     // Recreate npm env boilerplate marker so `process.env.npm_config_prefix` checks pass
     // (CLIs inspected to complain when binary is copied without npm env).
     // We already export npm_config_prefix etc. in shell_exports, but also ensure
