@@ -1586,10 +1586,12 @@ dependencies = [
 
 [[package]]
 name = "emd-renderer"
-version = "0.13.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.13.0#62aec277e71cfce161220250f409e42afae23a31"
+version = "0.14.1"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.1#db4471bccbfc5a3ad0d3167893bc6eacd55abcc3"
 dependencies = [
  "pulldown-cmark",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7316,8 +7318,8 @@ dependencies = [
 
 [[package]]
 name = "yggui"
-version = "0.13.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.13.0#62aec277e71cfce161220250f409e42afae23a31"
+version = "0.14.1"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.1#db4471bccbfc5a3ad0d3167893bc6eacd55abcc3"
 dependencies = [
  "anyhow",
  "dioxus",
@@ -7330,8 +7332,8 @@ dependencies = [
 
 [[package]]
 name = "yggui-contract"
-version = "0.13.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.13.0#62aec277e71cfce161220250f409e42afae23a31"
+version = "0.14.1"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.1#db4471bccbfc5a3ad0d3167893bc6eacd55abcc3"
 dependencies = [
  "serde",
 ]
