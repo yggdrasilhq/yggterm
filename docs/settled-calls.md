@@ -25,6 +25,16 @@ inference is dead — an uncorrelated thermal load still has a cause, and cappin
 hide it spends the user's responsiveness to buy our silence. **The heat is still open and still
 wants a real cause.**
 
+⭐ **RE-CONFIRMED AND ENFORCED 2026-08-27.** The owner restated it unprompted: *"when we are on
+AC power mode, we do not run balanced."* And the reason it needed restating is the durable
+lesson: the TLP config was already right (`PLATFORM_PROFILE_ON_AC=performance`) but TLP had not
+re-applied since the 19:54 pin, so the machine sat on `balanced` for days under a config that
+said otherwise. `sudo tlp start` restored `performance` immediately (AC online, live sysfs
+verified). **A config that is right while the machine runs another way is not the spec in force —
+the live sysfs value is, and the gap between them is silent.** Check the live
+`/sys/firmware/acpi/platform_profile` against `/etc/tlp.conf` before any heat investigation on
+this host.
+
 ⭐ The general form, worth carrying: **a remedy that degrades the thing being measured is not a
 result.** It will always look good on the metric it was chosen for.
 

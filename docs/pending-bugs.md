@@ -4879,6 +4879,13 @@ two clean instances found since — `spawn_web_profile_switch`'s lock probe (alr
 (already a background task) — were checked and are NOT on the UI thread, so they are
 attribution neighbours, not suspects.
 
+⭐ **First post-twin-fix build verifies the twins STAY fixed while the class stays open
+(2026-08-27, 3.1.61, first 20 min):** `foreign_batch` appears **0** times as a `ui/block`
+blame — the attribution fix holds — while the rate reads **8.2/min** (164 spans, 24 severe
+≥1 s, worst 3525 ms), mount churn shows 29 `bootstrap_reset` in the same window, and
+`app_control/request_begin` fires 214 times (~10.7/min). Nothing regressed; nothing new
+closed.
+
 ### ⭐ THE DECLARE PROBE'S CADENCE IS NOW EXACT — a correct negative, re-asked every minute, per row
 
 The fix direction *"a cached negative for the declare probe"* recorded elsewhere in this file now
@@ -11788,9 +11795,17 @@ transition rewrites it regardless of what any agent set**. Nothing was left
 applied by this campaign: the 19:06 write was a no-op because the machine had
 already switched itself to `balanced` on unplugging.
 
-⇒ **Owner gate**, in `owner-attention.md`: whether the *AC* profile should be
-`balanced` rather than `performance`. That is a persistent preference about his
-machine's power behaviour, not a defect fix.
+⇒ **Owner gate, ANSWERED since — see `docs/settled-calls.md` § *CAPPING POWER TO
+CUT HEAT IS A CHEAT FIX* (ruling 2026-08-14, re-confirmed 2026-08-27): the AC
+profile is `performance`, and `balanced` on AC is refused without re-opening the
+call. Battery keeps `balanced`.** ⭐ **And the mechanism that let the dead
+recommendation haunt the machine is measured:** the pin was withdrawn but TLP
+had already stopped re-applying its own config, so `/etc/tlp.conf` said
+`PLATFORM_PROFILE_ON_AC=performance` for days while the live sysfs read
+`balanced` — found 2026-08-27, restored with `sudo tlp start` in one step.
+**Before any heat investigation on this host, compare the LIVE
+`/sys/firmware/acpi/platform_profile` with the TLP config; a stale profile
+impersonates a heat regression.**
 
 ### The compaction waste is real, but it is a separate and much smaller item
 
