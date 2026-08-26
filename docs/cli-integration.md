@@ -699,6 +699,37 @@ title from startup instructions, replace an owner/store title, alter Claude
 Code authority, or hide a transcript that contains accepted user work merely
 because title generation is temporarily unavailable.
 
+### Issue Heading 25: Fleet CwdTree consumes the core durable projection over SSH
+
+**Measured failure (2026-08-26):** on the same current binary, `server titles
+ls` omitted startup-only Codex and Muse files while `server cwdtree ls` still
+returned them. The latter appended a daemon remote-machine snapshot populated
+by one hand-written Python scanner per CLI. Those transport scanners were a
+second implementation of store identity, title rejection, and conversation
+durability; Muse stopped at the wrong envelope, Pi emitted headers without
+dialogue, and Codex kept metadata-only rollouts. Restarting the GUI could not
+repair the disagreement because it faithfully reloaded the wrong remote
+projection.
+
+**Rule:** current peers call `server remote durable-sessions`, which serializes
+`scan_all_durable_sessions(agent_store_home(...))` rows without re-deriving
+their identity, cwd, title, kind, or durable verdict. The historical per-CLI
+SSH scripts remain only as a rolling-upgrade compatibility fallback when an
+older peer does not recognize the verb. Claude Code still keeps its native
+store-title authority; it merely crosses the same transport as every other
+core row.
+
+**Observability:** every applied remote refresh emits content-free
+`server/remote_machine/durable_projection_source` with `source: core_ssot` or
+`legacy_compat`, machine key, and row count. The remote producer emits
+`remote/durable_scan/complete` with aggregate counts by kind. No session id,
+cwd, path, title, or transcript text is recorded by either probe.
+
+**Not covered:** this does not remove rolling-upgrade compatibility, make an
+observer authoritative over a CLI store, change resume commands or PTY
+ownership, copy transcripts between machines, or allow an empty/partial parse
+to replace a previously healthy remote snapshot.
+
 **Checklist for any new CLI (add to `spec-adding-an-agent-cli.md` steps 1–9):** 1) `SessionKind` variant, 2) `AGENT_CLIS` descriptor (+ `TitleAuthority`, `store_globs`, `id_assigned_at_birth`, `resume_selector_token`, `re_roots_with_cwd`), 3) `SESSION_PATH_SCHEMES` (`remote-<slug>://` + `<slug>-runtime://`), 4) `cargo check` exhaustive matches, 5) catch-alls `rg SessionKind::(Codex|ClaudeCode)`, 6) `agent_arm_matrix` two arms (Local `local://` + Remote `remote-<slug>://`), 7) surfaces (icon/menu/KeyTips free), 8) provisioning `install`/`update`, 9) **title lifecycle** — the birth name is automatic (`New {machine} {display_name}`, from `new_session_birth_title`; nothing per-CLI to add), then either `heuristic`/`litellm` via `SessionTitleStore` for a `Generated` CLI + its fallback list, or `read_live_store_title` for a `Store` one — ⛔ a `Store` CLI without that hook can never be titled at all, 10) **resume id** (if `id_assigned_at_birth:false`, implement store→row mapping), 11) `spec-cli-integration-verification.md` oracles (`check-startpage.py`/`check-titles.py`/`check-cwdtree.py` must `0` on every fleet host + faithful 1920×1200 screenshot).
 
 ## 3. Inventory — which spec/doc now lives where
