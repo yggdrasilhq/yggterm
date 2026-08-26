@@ -118,8 +118,8 @@ if os.path.exists(db):
             t = (title or "").strip().lower()
             # Muse's index can remain at zero/New session after real turns.
             # The transcript is the evidence that decides whether this is
-            # noise; the DB counter is only a cheap candidate filter.
-            if (pc == 0 and t in ("", "new session", "new muse code session")
+            # noise; prompt_count is an observer and cannot veto the transcript.
+            if (t in ("", "new session", "new muse code session")
                     and not transcript_has_intent(sid)):
                 noise.append(sid)
     except Exception:
@@ -175,6 +175,76 @@ def muse_noise_ids(run_on_host, host):
     """
     ids = _run_python(run_on_host, host, _MUSE_NOISE_DUMP)
     return set(ids or [])
+
+
+_CODEX_NOISE_DUMP = r"""
+import json, os
+from pathlib import Path
+
+home = Path(os.path.expanduser("~"))
+noise = []
+
+def has_text(content):
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if isinstance(item, str) and item.strip():
+            return True
+        if isinstance(item, dict):
+            for key in ("text", "input_text", "output_text", "content", "value"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return True
+    return False
+
+def transcript_has_conversation(path):
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if record.get("type") == "response_item":
+                    payload = record.get("payload") or {}
+                    if (payload.get("type") == "message"
+                            and payload.get("role") in ("user", "assistant")
+                            and has_text(payload.get("content"))):
+                        return True
+                if record.get("type") == "compacted":
+                    payload = record.get("payload") or {}
+                    for message in payload.get("replacement_history") or []:
+                        if (isinstance(message, dict)
+                                and message.get("type") == "message"
+                                and message.get("role") in ("user", "assistant")
+                                and has_text(message.get("content"))):
+                            return True
+    except Exception:
+        return False
+    return False
+
+for root_name in (".codex", ".codex-litellm"):
+    root = home / root_name / "sessions"
+    if not root.exists():
+        continue
+    try:
+        for path in root.rglob("rollout-*.jsonl"):
+            if ".bak." in path.name:
+                continue
+            if not transcript_has_conversation(path):
+                noise.append(str(path))
+    except Exception:
+        pass
+print(json.dumps(noise))
+"""
+
+
+def codex_noise_paths(run_on_host, host):
+    """Codex-family rollout paths containing startup records but no dialogue."""
+    paths = _run_python(run_on_host, host, _CODEX_NOISE_DUMP)
+    return set(paths or [])
 
 
 _OPENCODE_DUMP = r"""

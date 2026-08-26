@@ -872,7 +872,9 @@ fn walk_and_collect(
                 let contextless_noise = row.effective_title.is_none()
                     && row.detail.is_none()
                     && match descriptor.kind {
-                        crate::SessionKind::Codex | crate::SessionKind::CodexLiteLlm => {
+                        crate::SessionKind::Codex
+                        | crate::SessionKind::CodexLiteLlm
+                        | crate::SessionKind::Pi => {
                             crate::titles::extract_tail_context(&path)
                                 .map(|context| context.trim().is_empty())
                                 .unwrap_or(false)
@@ -1180,6 +1182,34 @@ mod scan_truth_tests {
         assert!(
             rows.iter().all(|row| row.session_id != id),
             "startup metadata alone must not surface as an eight-character title"
+        );
+        assert!(transcript.exists(), "classification must never delete the source");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pi_startup_only_transcript_is_not_a_durable_row() {
+        let home = dirs::home_dir()
+            .unwrap()
+            .join(".yggterm/scratchpad")
+            .join(format!("pi-startup-noise-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let sessions = home.join(".pi/agent/sessions/--home-user-proj");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        let transcript = sessions.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/home/user/proj\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let rows = scan_all_durable_sessions(&home);
+        assert!(
+            rows.iter().all(|row| row.session_id != id),
+            "a Pi header without dialogue must not surface as an id-derived title"
         );
         assert!(transcript.exists(), "classification must never delete the source");
         let _ = std::fs::remove_dir_all(&home);
