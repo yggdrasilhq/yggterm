@@ -15273,6 +15273,19 @@ struct RemoteSummaryLine {
     live_runtime: bool,
 }
 
+/// One line on the current-peer durable-session wire path.
+///
+/// The row is serialized unchanged from yggterm-core, making the CLI store
+/// reader the authority on identity, cwd, title, and whether a transcript is a
+/// durable conversation. `live_runtime` remains transport metadata: it is not
+/// part of the durable scanner's answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteDurableSessionLine {
+    row: yggterm_core::startpage::StartpageDurableRow,
+    #[serde(default)]
+    live_runtime: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemotePreviewPayload {
     #[serde(default)]
@@ -19686,10 +19699,93 @@ fn scan_remote_cli_sessions(
     scanned
 }
 
+/// Ask a current peer for the exact durable projection produced by yggterm-core.
+///
+/// This is deliberately a separate wire verb from the historical Codex-only
+/// `server remote scan`: an older peer must reject it cleanly so the caller can
+/// retain compatibility without changing the meaning of an established verb.
+fn scan_remote_durable_sessions_ssot(
+    target: &SshConnectTarget,
+    machine_key: &str,
+) -> anyhow::Result<Vec<RemoteScannedSession>> {
+    let output = run_remote_yggterm_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        &["server", "remote", "durable-sessions"],
+        None,
+    )?;
+    let mut sessions = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let durable: RemoteDurableSessionLine = serde_json::from_str(line)
+            .context("invalid remote durable-session SSOT line")?;
+        sessions.push(remote_scanned_session_from_durable(
+            machine_key,
+            durable,
+        ));
+    }
+    Ok(sessions)
+}
+
+fn remote_scanned_session_from_durable(
+    machine_key: &str,
+    durable: RemoteDurableSessionLine,
+) -> RemoteScannedSession {
+    let row = durable.row;
+    let session_path =
+        yggterm_core::remote_agent_session_path(row.kind, machine_key, &row.session_id);
+    RemoteScannedSession {
+        session_path,
+        title_hint: row.effective_title.unwrap_or_default(),
+        session_id: row.session_id,
+        cwd: row.cwd,
+        started_at: String::new(),
+        modified_epoch: i64::try_from(row.modified_epoch_ms / 1_000).unwrap_or(i64::MAX),
+        event_count: usize::from(row.detail.is_some()),
+        user_message_count: 0,
+        assistant_message_count: 0,
+        recent_context: row.detail.unwrap_or_default(),
+        cached_precis: None,
+        cached_summary: None,
+        live_runtime: durable.live_runtime,
+        title_is_explicit: false,
+        storage_path: row.storage_path,
+    }
+}
+
+fn trace_remote_durable_projection_source(
+    machine_key: &str,
+    source: &str,
+    session_count: usize,
+) {
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "remote_machine",
+            "durable_projection_source",
+            serde_json::json!({
+                "machine_key": machine_key,
+                "source": source,
+                "session_count": session_count,
+            }),
+        );
+    }
+}
+
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
     let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+    // Current peers serialize the core scanner's rows directly. This is the
+    // authoritative path: startpage, cwdtree, titles and fleet refresh must not
+    // each decide independently what a CLI store contains. Keep the scripts
+    // below only for an older peer that cannot recognize the new wire verb.
+    if let Ok(sessions) = scan_remote_durable_sessions_ssot(target, &machine_key) {
+        let sessions = dedupe_remote_scanned_sessions(sessions);
+        trace_remote_durable_projection_source(&machine_key, "core_ssot", sessions.len());
+        return Ok(sessions);
+    }
+
     // The CLI home to scan, from the registry — not a literal repeated here and
     // in the scanner.
     let codex_home_arg = format!("~/{}", codex_home_dir_name());
@@ -19796,7 +19892,9 @@ fn scan_remote_machine_sessions(
         }
     }
 
-    Ok(dedupe_remote_scanned_sessions(sessions))
+    let sessions = dedupe_remote_scanned_sessions(sessions);
+    trace_remote_durable_projection_source(&machine_key, "legacy_compat", sessions.len());
+    Ok(sessions)
 }
 
 pub fn scan_remote_machine_sessions_for_target(
@@ -29273,6 +29371,49 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `server remote durable-sessions` — serialize the core durable-session SSOT.
+///
+/// The GUI host used to run one Python scanner per CLI over SSH. Those scripts
+/// disagreed with the local readers about title rejection and about whether a
+/// startup-only transcript was a conversation, so cwdtree could show rows that
+/// `titles ls` correctly omitted. Current peers use this verb; the caller keeps
+/// the scripts only as an older-version compatibility fallback.
+pub fn run_remote_durable_sessions() -> anyhow::Result<()> {
+    let yggterm_home = resolve_yggterm_home()?;
+    let agent_home = yggterm_core::startpage::agent_store_home(&yggterm_home);
+    let Some(_scan_lock) = try_acquire_remote_scan_lock(&yggterm_home, &agent_home)? else {
+        anyhow::bail!(
+            "remote durable-session scan already in progress for {}",
+            agent_home.display()
+        );
+    };
+    let live_runtime_ids = live_remote_runtime_codex_session_ids(&yggterm_home);
+    let rows = yggterm_core::startpage::scan_all_durable_sessions(&agent_home);
+    let mut kind_counts = std::collections::BTreeMap::<String, usize>::new();
+    for row in &rows {
+        *kind_counts.entry(format!("{:?}", row.kind)).or_default() += 1;
+    }
+    append_trace_event(
+        &yggterm_home,
+        "remote",
+        "durable_scan",
+        "complete",
+        serde_json::json!({
+            "source": "core_ssot",
+            "session_count": rows.len(),
+            "kind_counts": kind_counts,
+        }),
+    );
+    for row in rows {
+        let line = RemoteDurableSessionLine {
+            live_runtime: live_runtime_ids.contains(&row.session_id),
+            row,
+        };
+        write_stdout_line_strict(&serde_json::to_string(&line)?)?;
+    }
+    Ok(())
+}
+
 /// One running agent-CLI process discovered on THIS machine, identified by the
 /// real session id of its open transcript. Emitted as a JSON line by
 /// `run_remote_local_codex_identities`.
@@ -32616,6 +32757,38 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Fleet projection must preserve the core scanner's verdict rather than
+    /// re-derive a title or row scheme at the transport seam.
+    #[test]
+    fn remote_durable_wire_row_preserves_core_identity_title_and_kind() {
+        let durable = super::RemoteDurableSessionLine {
+            row: yggterm_core::startpage::StartpageDurableRow {
+                session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+                cwd: "/home/user/proj".to_string(),
+                title: Some("Repair Session Projection".to_string()),
+                generated_title: None,
+                effective_title: Some("Repair Session Projection".to_string()),
+                detail: Some("Check the fleet projection.".to_string()),
+                kind: yggterm_core::SessionKind::Muse,
+                modified_epoch_ms: 123_456_000,
+                storage_path: "/home/user/.local/share/muse/sessions/example/session.jsonl"
+                    .to_string(),
+                display_path: "muse://11111111-2222-4333-8444-555555555555".to_string(),
+            },
+            live_runtime: true,
+        };
+
+        let scanned = super::remote_scanned_session_from_durable("buildbox", durable);
+        assert_eq!(
+            scanned.session_path,
+            "remote-muse://buildbox/11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(scanned.title_hint, "Repair Session Projection");
+        assert_eq!(scanned.recent_context, "Check the fleet projection.");
+        assert_eq!(scanned.modified_epoch, 123_456);
+        assert!(scanned.live_runtime);
+    }
 
     /// ⛔ The REATTACH-before-CREATE ordering in
     /// [`ensure_daemon_shell_session_for_attach`], pinned at the source.
