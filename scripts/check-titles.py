@@ -100,7 +100,8 @@ CLI_STORES = [
 # stay per-script on purpose: the oracle must not import the Rust descriptors).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ygg_scan_truth import (  # noqa: E402
-    agy_durable_rows, opencode_durable_rows, kimi_durable_rows, muse_noise_ids, condense_store_title,
+    agy_durable_rows, opencode_durable_rows, kimi_durable_rows, muse_noise_ids,
+    codex_noise_paths, condense_store_title,
 )
 
 
@@ -193,6 +194,7 @@ def manual_walk_on_host(host):
         return sessions, f"cannot get HOME: {err}"
     home = home_out.strip() or os.path.expanduser("~")
     noise_ids = muse_noise_ids(run_on_host, host)
+    codex_noise = codex_noise_paths(run_on_host, host)
     for cli in CLI_STORES:
         for glob in cli["globs"]:
             # Expand glob to find command: use find for **, else ls
@@ -225,6 +227,8 @@ def manual_walk_on_host(host):
                 if any((ex in f) if "/" in ex else (ex in os.path.basename(f)) for ex in cli["exclude"]):
                     continue
                 if cli["slug"] == "muse" and os.path.basename(os.path.dirname(f)) in noise_ids:
+                    continue
+                if cli["slug"] in ("codex", "codex-litellm") and f in codex_noise:
                     continue
                 # Quick stat for mtime
                 stat_out, _ = run_on_host(host, f"stat -c %Y {shlex.quote(f)} 2>/dev/null || stat -f %m {shlex.quote(f)} 2>/dev/null")

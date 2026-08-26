@@ -6,7 +6,8 @@ use crate::{
     run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
     run_remote_resume_agent, run_remote_resume_cc, run_remote_resume_codex,
     run_remote_saved_agent_session_exists, run_remote_saved_codex_session_exists,
-    run_remote_scan, run_remote_stage_clipboard_png, run_remote_start_agent, run_remote_start_cc,
+    run_remote_durable_sessions, run_remote_scan, run_remote_stage_clipboard_png,
+    run_remote_start_agent, run_remote_start_cc,
     run_remote_start_codex,
     run_remote_agent_runtime_alive, run_remote_apps, run_remote_cli_presence,
     run_remote_terminate_agent,
@@ -53,6 +54,11 @@ pub enum RemoteServerCommand {
     Scan {
         codex_home: Option<String>,
     },
+    /// Emit the core durable-session projection for every registered CLI.
+    /// Current peers use this instead of re-encoding each store in an SSH-side
+    /// Python scanner; older peers simply do not recognize the verb and the
+    /// caller falls back to the legacy compatibility path.
+    DurableSessions,
     /// Emit THIS host's libyggterm app registry (`~/.yggterm/apps/*.json`), one
     /// manifest per line.
     ///
@@ -255,6 +261,7 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
         "scan" => RemoteServerCommand::Scan {
             codex_home: args.get(3).cloned(),
         },
+        "durable-sessions" if args.len() == 3 => RemoteServerCommand::DurableSessions,
         "apps" if args.len() == 3 => RemoteServerCommand::Apps,
         "cli-presence" if args.len() == 3 => RemoteServerCommand::CliPresence,
         "local-codex-identities" if args.len() == 3 => RemoteServerCommand::LocalCodexIdentities,
@@ -366,6 +373,7 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::RefreshManagedCli { mode } => run_remote_refresh_managed_cli(mode),
         RemoteServerCommand::EnsureManagedCli { tool } => run_remote_ensure_managed_cli(tool),
         RemoteServerCommand::Scan { codex_home } => run_remote_scan(codex_home.as_deref()),
+        RemoteServerCommand::DurableSessions => run_remote_durable_sessions(),
         RemoteServerCommand::Apps => run_remote_apps(),
         RemoteServerCommand::CliPresence => run_remote_cli_presence(),
         RemoteServerCommand::LocalCodexIdentities => run_remote_local_codex_identities(),
@@ -439,6 +447,19 @@ fn parse_managed_cli_tool(value: &str) -> Result<ManagedCliTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_durable_sessions_command() {
+        let args = vec![
+            "server".to_string(),
+            "remote".to_string(),
+            "durable-sessions".to_string(),
+        ];
+        assert_eq!(
+            parse_remote_server_command(&args).expect("parse command"),
+            Some(RemoteServerCommand::DurableSessions)
+        );
+    }
 
     #[test]
     fn parse_resume_cc_and_start_cc_mirror_codex() {

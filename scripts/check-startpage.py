@@ -93,7 +93,8 @@ CLI_STORES = [
 # stay per-script on purpose: the oracle must not import the Rust descriptors).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ygg_scan_truth import (  # noqa: E402
-    agy_durable_rows, opencode_durable_rows, kimi_durable_rows, muse_noise_ids, locally_backed_ids, condense_store_title,
+    agy_durable_rows, opencode_durable_rows, kimi_durable_rows, muse_noise_ids,
+    codex_noise_paths, locally_backed_ids, condense_store_title,
 )
 
 
@@ -277,6 +278,13 @@ def manual_walk_on_host(host):
             s for s in sessions
             if not (s.get("cli") == "muse"
                     and (s.get("parsed", {}) or {}).get("session_id") in noise)
+        ]
+    codex_noise = codex_noise_paths(run_on_host, host)
+    if codex_noise:
+        sessions = [
+            s for s in sessions
+            if not (s.get("cli") in ("codex", "codex-litellm")
+                    and s.get("path") in codex_noise)
         ]
 
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
