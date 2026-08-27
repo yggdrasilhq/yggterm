@@ -4088,6 +4088,130 @@ mod tests {
             .expect("the editor has a value epoch")
     }
 
+    // THE RENDER-DRUMBEAT GUARD (2026-08-27). Pane schema refetches — the
+    // common ping-tick case, the app re-declaring what it already declared —
+    // used to take a `with_mut_counted` regardless, dirtying the whole
+    // ShellState signal: ~1.7 root renders/s of the idle fan driver measured
+    // on the GUI host. The fetch sites now skip the write when a read-only
+    // mirror says the apply would rebuild exactly what is mounted. These tests
+    // hold the mirror to the apply's own semantics in BOTH directions: a
+    // no-change fetch MUST be judged a noop, and a genuine push MUST NOT be.
+    #[test]
+    fn an_identical_rail_schema_refetch_is_a_noop_but_a_real_push_is_not() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let schema = document_editor_schema("n1", "hello");
+
+        // Nothing mounted yet: the apply has real work (mount), not a noop.
+        let seq = shell.app_pane_next_request();
+        assert!(
+            !shell.app_pane_fetch_is_noop(seq, "pane", &schema),
+            "first mount is real work"
+        );
+        shell.app_pane_apply_schema(seq, "pane", schema.clone());
+
+        // Identical refetch while the field shows the declared value: noop.
+        let seq2 = shell.app_pane_next_request();
+        assert!(
+            shell.app_pane_fetch_is_noop(seq2, "pane", &schema),
+            "an identical re-declaration must skip the render"
+        );
+
+        // A stale seq would be declined by the apply — also no change.
+        assert!(shell.app_pane_fetch_is_noop(seq, "pane", &schema));
+
+        // A genuine push (the app changed the declared value) is NOT a noop.
+        let changed = document_editor_schema("n1", "goodbye");
+        assert!(
+            !shell.app_pane_fetch_is_noop(seq2, "pane", &changed),
+            "a new declared value must take the write"
+        );
+
+        // So must a changed buffer identity, even with identical text.
+        let rekeyed = document_editor_schema("n2", "hello");
+        assert!(
+            !shell.app_pane_fetch_is_noop(seq2, "pane", &rekeyed),
+            "buffer identity is not content equality"
+        );
+
+        // A recorded error means the apply clears it — real work.
+        let seq3 = shell.app_pane_next_request();
+        shell.app_pane_apply_error(seq3, "previous failure".into());
+        let seq4 = shell.app_pane_next_request();
+        assert!(
+            !shell.app_pane_fetch_is_noop(seq4, "pane", &schema),
+            "an error to clear is real work"
+        );
+    }
+
+    #[test]
+    fn an_identical_document_schema_refetch_is_a_noop_but_a_draft_change_is_not() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let schema = document_editor_schema("n1", "");
+
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", schema.clone());
+
+        // Identical refetch, nothing typed: noop.
+        let seq2 = shell.document_pane_next_request("local://a");
+        assert!(
+            shell.document_pane_fetch_is_noop(seq2, "local://a", "doc", &schema),
+            "an identical document re-declaration must skip the render"
+        );
+
+        // The user typed past the debounce: values differ from declared, and
+        // the app echoing the OLD text must still count as a noop (the draft
+        // is retained) — but a DIFFERENT declared value is real work.
+        shell.set_document_pane_value("local://a", "editor", "my draft".into());
+        assert!(
+            shell.document_pane_fetch_is_noop(seq2, "local://a", "doc", &schema),
+            "an echo of our own send must not re-render"
+        );
+        let switched = document_editor_schema("n2", "");
+        assert!(
+            !shell.document_pane_fetch_is_noop(seq2, "local://a", "doc", &switched),
+            "a buffer switch under a live draft is real work"
+        );
+    }
+
+    /// Both fetch-completion Ok arms must consult the noop mirror before
+    /// taking the write. A future editor who deletes the guard re-imports the
+    /// measured drumbeat silently — this fails on that edit instead.
+    #[test]
+    fn both_pane_schema_fetch_sites_skip_the_write_when_nothing_changed() {
+        let source = include_str!("state.rs");
+        for (name, anchor, mirror) in [
+            (
+                "rail",
+                "schema fetch panicked",
+                "app_pane_fetch_is_noop",
+            ),
+            (
+                "document",
+                "document schema fetch panicked",
+                "document_pane_fetch_is_noop",
+            ),
+        ] {
+            let site = source
+                .find(anchor)
+                .unwrap_or_else(|| panic!("the {name} fetch site exists"));
+            let body = &source[site..];
+            let after_apply = body
+                .find("apply_schema")
+                .unwrap_or_else(|| panic!("the {name} apply call exists"));
+            let window = &body[..after_apply];
+            assert!(
+                window.contains(mirror),
+                "the {name} fetch completion must consult {mirror} before writing"
+            );
+            assert!(
+                window.contains("if !noop"),
+                "the {name} guard must actually skip the write, not only compute it"
+            );
+        }
+    }
+
     // THE new-file collision (YS-1). Two brand-new notes are both EMPTY, so
     // content equality said "undisturbed" and the uncontrolled textarea was
     // never remounted between them — one buffer serving two files. Buffer
