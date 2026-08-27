@@ -19225,8 +19225,19 @@ console.log('ok');
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(
-            script.contains("const terminalScrollbarGutterPx = () => Math.max("),
+            script.contains("const terminalScrollbarGutterPx = () => {"),
             "the right gutter needs exactly one owner in the mount script"
+        );
+        // XTERM-BUG: gutter-steals-tui-width — on the ALTERNATE screen the
+        // gutter must be ZERO (a full-screen TUI repaints its own right edge;
+        // scrollback does not exist), and the D-pad must stand down with it.
+        assert!(
+            script.contains("active.type === 'alternate'") && script.contains("'alternate_screen'"),
+            "the alternate screen must release the gutter and hide the scroll D-pad"
+        );
+        assert!(
+            script.contains("var(--yggterm-scrollbar-gutter, 8px)"),
+            "the paint box must read the gutter through the runtime variable so an alternate-screen transition retracts it live"
         );
         assert!(
             script.contains("Number(content.width || 0) - rightGutterPx"),
@@ -19237,8 +19248,8 @@ console.log('ok');
             "the grid proposal must read the gutter from its owner, not a second literal"
         );
         assert!(
-            script.contains("width: calc(100% - ${terminalScrollbarGutterPx()}px) !important;"),
-            "the .xterm-screen paint box must read the gutter from the same owner as the grid"
+            script.contains("width: calc(100% - var(--yggterm-scrollbar-gutter, 8px)) !important;"),
+            "the .xterm-screen paint box must read the gutter through the runtime variable — the same number the grid owner computes"
         );
         assert!(
             script.contains("screen.style.width = `calc(100% - ${terminalScrollbarGutterPx()}px)`;"),
