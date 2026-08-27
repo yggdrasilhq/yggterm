@@ -25096,6 +25096,48 @@ impl ShellState {
             value_epochs,
         });
     }
+    /// Whether applying this fetched rail schema would change no reactive state.
+    ///
+    /// Mirrors [`Self::app_pane_apply_schema`] read-only so the fetch-completion
+    /// site can SKIP the `with_mut_counted` — which dirties the whole
+    /// `ShellState` signal and re-renders the root — when the pane would be
+    /// rebuilt into exactly what it already is. Measured on the GUI host
+    /// 2026-08-27 (see pending-bugs § the minute-aligned render wave): pane
+    /// schema refetches were ~100 of ~200 sampled render-cause writes in ten
+    /// minutes, the largest share of a sustained ~1.7 root renders/s that
+    /// keeps the desktop's fan spinning with nothing streaming. Deliberately
+    /// STRICT: anything not provably identical takes the write, because a
+    /// swallowed genuine app push is a worse bug than the render it saves.
+    fn app_pane_fetch_is_noop(&self, seq: u64, pane_id: &str, schema: &AppPaneSchema) -> bool {
+        if seq != self.app_pane_request_seq {
+            // The apply declines a stale seq — declining is also "no change".
+            return true;
+        }
+        let Some(mounted) = self.app_pane_schema.as_ref() else {
+            return false;
+        };
+        if mounted.pane_id != pane_id || mounted.schema != *schema || self.app_pane_error.is_some()
+        {
+            return false;
+        }
+        // The apply rebuilds the values map from exactly the declared,
+        // non-display-only widgets, and bumps an epoch only when the field is
+        // not already showing the declared value.
+        let mut declared_now: HashMap<String, String> = HashMap::new();
+        for widget in &schema.widgets {
+            if let Some((id, declared)) = widget.declared_value()
+                && !widget.value_is_display_only()
+            {
+                declared_now.insert(id, declared);
+            }
+        }
+        if self.app_pane_values.len() != declared_now.len() {
+            return false;
+        }
+        declared_now.iter().all(|(id, declared)| {
+            self.app_pane_values.get(id).map(String::as_str) == Some(declared.as_str())
+        })
+    }
     /// The heading a pane's toast carries. The app named the pane; yggterm must
     /// not have an opinion about what it is called.
     fn app_pane_toast_title(&self, pane_id: &str) -> String {
@@ -25897,6 +25939,65 @@ impl ShellState {
             contribution.document_loaded = true;
             contribution.document_attempts = 0;
         }
+    }
+    /// Whether applying this fetched document schema would change no reactive
+    /// state — the [`Self::document_pane_apply_schema`] mirror of
+    /// [`Self::app_pane_fetch_is_noop`], with the document channel's two extra
+    /// rebuilds accounted: `last_sent` is replaced wholesale by the declared
+    /// map, and the contribution's `document_loaded`/`document_attempts` are
+    /// re-stamped. Strict for the same reason: anything not provably identical
+    /// takes the write.
+    fn document_pane_fetch_is_noop(
+        &self,
+        seq: u64,
+        session_path: &str,
+        pane_id: &str,
+        schema: &AppPaneSchema,
+    ) -> bool {
+        // Replies never CREATE a channel: a missing channel is the apply
+        // declining — also "no change".
+        let Some(channel) = self
+            .document_panes
+            .get(&Self::document_pane_key(session_path))
+        else {
+            return true;
+        };
+        if seq != channel.request_seq {
+            return true;
+        }
+        let Some(mounted) = channel.schema.as_ref() else {
+            return false;
+        };
+        if mounted.pane_id != pane_id || mounted.schema != *schema || channel.error.is_some() {
+            return false;
+        }
+        if let Some(contribution) = self.sidebar_contributions.get(session_path) {
+            if !contribution.document_loaded || contribution.document_attempts != 0 {
+                return false;
+            }
+        }
+        // `last_sent` is rebuilt from scratch: it must already be exactly the
+        // declared map.
+        let mut declared_now: HashMap<String, String> = HashMap::new();
+        for widget in &schema.widgets {
+            if let Some((id, declared)) = widget.declared_value()
+                && !widget.value_is_display_only()
+            {
+                declared_now.insert(id, declared);
+            }
+        }
+        if channel.last_sent.len() != declared_now.len() {
+            return false;
+        }
+        if channel.values.len() != declared_now.len() {
+            return false;
+        }
+        declared_now.iter().all(|(id, _declared)| {
+            // The whole-map `last_sent` check above proved every declared value
+            // is an echo of what we sent, so the apply retains whatever each
+            // field shows; the only possible change is a missing/extra key.
+            channel.values.contains_key(id)
+        })
     }
     fn document_pane_apply_error(&mut self, seq: u64, session_path: &str, error: String) {
         let Some(channel) = self
@@ -68238,7 +68339,18 @@ async fn app_pane_fetch_schema(
         serde_json::from_value::<AppPaneSchema>(value)
             .map_err(|error| format!("pane schema is malformed: {error}"))
     }) {
-        Ok(schema) => state.with_mut_counted(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema)),
+        Ok(schema) => {
+            // ⛔ THE RENDER-DRUMBEAT GUARD. A pane the app re-declares
+            // identically (the common ping-tick case) used to take a
+            // `with_mut_counted` anyway — dirtying the whole `ShellState`
+            // signal for a rebuild into exactly what was mounted, ~1.7 root
+            // renders/s of the fan driver measured 2026-08-27. Skip the write
+            // when the mirror says nothing would change.
+            let noop = state.with(|shell| shell.app_pane_fetch_is_noop(seq, &pane_id, &schema));
+            if !noop {
+                state.with_mut_counted(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema));
+            }
+        }
         Err(error) => state.with_mut_counted(|shell| shell.app_pane_apply_error(seq, error)),
     }
 }
@@ -68271,9 +68383,19 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
         serde_json::from_value::<AppPaneSchema>(value)
             .map_err(|error| format!("document schema is malformed: {error}"))
     }) {
-        Ok(schema) => state.with_mut_counted(|shell| {
-            shell.document_pane_apply_schema(seq, &session_path, &pane_id, schema)
-        }),
+        Ok(schema) => {
+            // Same render-drumbeat guard as the rail channel above: an
+            // identical document re-declaration must not dirty the signal.
+            let noop = state.with(|shell| {
+                shell
+                    .document_pane_fetch_is_noop(seq, &session_path, &pane_id, &schema)
+            });
+            if !noop {
+                state.with_mut_counted(|shell| {
+                    shell.document_pane_apply_schema(seq, &session_path, &pane_id, schema)
+                });
+            }
+        }
         Err(error) => {
             state.with_mut_counted(|shell| shell.document_pane_apply_error(seq, &session_path, error))
         }
