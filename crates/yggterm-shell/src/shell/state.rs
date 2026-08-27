@@ -17220,6 +17220,17 @@ struct ShellState {
     managed_cli_refresh_requests: HashSet<String>,
     managed_cli_refresh_completed: HashMap<String, u64>,
     managed_cli_refresh_retry_after_ms: HashMap<String, u64>,
+    /// The CLI-installation modal's apply job is running (install/remove of
+    /// selected agent CLIs on THIS machine). Drives the modal's pending state;
+    /// a second apply must not start while one is in flight.
+    cli_install_pending: bool,
+    /// THIS machine's agent-CLI presence, resolved the way a LAUNCH resolves
+    /// (`local_cli_presence_now`). Cached here so the modal's local column
+    /// answers the same question a launch does and flips its chips after an
+    /// apply — the render-path `PATH` probe it replaces cannot see the managed
+    /// bin dir at all. `None` until the first probe; the modal then falls back
+    /// to the process-`PATH` answer rather than blocking render.
+    local_cli_presence: Option<Vec<yggterm_core::cli_install::CliPresenceReport>>,
     live_session_snapshot_refresh_in_flight: bool,
     live_session_snapshot_nudge_in_flight: bool,
     next_live_session_snapshot_after_ms: u64,
@@ -18109,6 +18120,8 @@ struct RenderSnapshot {
     theme_editor_drag_stop: Option<usize>,
     launch_flags_open: bool,
     cli_install_open: bool,
+    cli_install_pending: bool,
+    local_cli_presence: Option<Vec<yggterm_core::cli_install::CliPresenceReport>>,
     theme_accent: String,
     shell_tint: String,
     chrome_material_tint: String,
@@ -19602,6 +19615,8 @@ impl ShellState {
             managed_cli_refresh_requests: HashSet::new(),
             managed_cli_refresh_completed: HashMap::new(),
             managed_cli_refresh_retry_after_ms: HashMap::new(),
+            cli_install_pending: false,
+            local_cli_presence: None,
             live_session_snapshot_refresh_in_flight: false,
             live_session_snapshot_nudge_in_flight: false,
             next_live_session_snapshot_after_ms: 0,
@@ -20912,6 +20927,8 @@ impl ShellState {
             theme_editor_drag_stop: self.theme_editor_drag_stop,
             launch_flags_open: self.launch_flags_open,
             cli_install_open: self.cli_install_open,
+            cli_install_pending: self.cli_install_pending,
+            local_cli_presence: self.local_cli_presence.clone(),
             theme_accent: dominant_accent(&active_theme_spec, palette.accent),
             shell_tint: shell_tint(self.settings.theme, &active_theme_spec),
             chrome_material_tint: chrome_material_tint(self.settings.theme, &active_theme_spec),
@@ -31982,6 +31999,15 @@ impl ShellState {
         self.cli_install_open = open;
     }
 
+    /// Whether the local column still needs its launch-parity presence probe.
+    fn local_cli_presence_needs_probe(&self) -> bool {
+        self.local_cli_presence.is_none()
+    }
+
+    fn adopt_local_cli_presence(&mut self, presence: Vec<yggterm_core::cli_install::CliPresenceReport>) {
+        self.local_cli_presence = Some(presence);
+    }
+
     /// Record the licence acknowledgement behind the CLI-installation modal.
     ///
     /// ⛔ Stored as the wire word, never as a bool — `Declined` and `Undecided`
@@ -32007,20 +32033,90 @@ impl ShellState {
     /// cannot report progress for would promise the user work they could not
     /// watch. `Foreground` is the right mode: a human asked, by name, and is
     /// waiting.
-    fn request_recommended_cli_installs(&mut self) {
+    /// Whether the user wants `slug` installed on THIS machine. Absent from
+    /// the override map means wanted — the recommend-every-CLI default — so
+    /// the map only ever carries explicit departures.
+    fn cli_install_wanted(&self, slug: &str) -> bool {
+        *self.settings.agent_cli_install_wanted.get(slug).unwrap_or(&true)
+    }
+
+    /// Flip one slug's wanted state and persist it. The toggle IS the record:
+    /// there is no separate "apply" of the selection itself, only of the
+    /// installs and removals it implies.
+    fn toggle_cli_install_wanted(&mut self, slug: String) {
+        let next = !self.cli_install_wanted(&slug);
+        self.settings.agent_cli_install_wanted.insert(slug, next);
+        self.persist_settings();
+    }
+
+    /// Forget every override, returning the selection to recommend-every-CLI.
+    fn reset_cli_install_selection(&mut self) {
+        self.settings.agent_cli_install_wanted.clear();
+        self.persist_settings();
+    }
+
+    /// Apply the modal's selection on THIS machine.
+    ///
+    /// ⛔ **Refuses unless consent has been granted**, and re-reads it here
+    /// rather than trusting the caller: this is the last point before a fetch
+    /// or a deletion, and a button that can be reached by any other path must
+    /// not be the only thing standing between a user and someone else's
+    /// install script — or the removal of a binary they still wanted.
+    ///
+    /// Returns the decision snapshot (slug → wanted) for the background job,
+    /// or `None` when the apply must not start (already running, or the
+    /// consent gate refused — in which case the user has been told why).
+    fn begin_cli_install_apply(&mut self) -> Option<Vec<(String, bool)>> {
+        if self.cli_install_pending {
+            return None;
+        }
         let consent = yggterm_core::cli_install::InstallConsent::from_wire(
             &self.settings.agent_cli_install_consent,
         );
         if !consent.may_fetch() {
-            return;
+            self.push_notification(
+                NotificationTone::Warning,
+                "Install consent needed",
+                "Agree to the third-party licence banner in the Agent CLI installation modal first — nothing is fetched or removed without it.".to_string(),
+            );
+            return None;
         }
-        std::thread::spawn(|| {
-            if let Err(error) = yggterm_server::refresh_local_managed_cli_now(
-                yggterm_server::ManagedCliRefreshMode::Foreground,
-            ) {
-                tracing::warn!(?error, "cli-install: local managed-CLI refresh failed");
-            }
-        });
+        let decision: Vec<(String, bool)> = yggterm_core::agent_cli::AGENT_CLIS
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor.slug.to_string(),
+                    self.cli_install_wanted(&descriptor.slug),
+                )
+            })
+            .collect();
+        self.cli_install_pending = true;
+        self.last_action = "applying agent CLI selection".to_string();
+        Some(decision)
+    }
+
+    /// Land the apply job's outcome: clear the pending flag, adopt the fresh
+    /// launch-parity presence so the chips show what is now TRUE on disk, and
+    /// tell the user what happened per CLI.
+    fn finish_cli_install_apply(&mut self, outcome: CliInstallApplyOutcome) {
+        self.cli_install_pending = false;
+        if let Some(presence) = outcome.presence {
+            self.local_cli_presence = Some(presence);
+        }
+        self.last_action = outcome.summary.clone();
+        self.push_notification(
+            if outcome.ok {
+                NotificationTone::Success
+            } else {
+                NotificationTone::Warning
+            },
+            if outcome.ok {
+                "Agent CLI selection applied"
+            } else {
+                "Agent CLI apply finished with failures"
+            },
+            outcome.summary,
+        );
     }
 
     /// Store one CLI's launch flags, keyed by its descriptor slug.
@@ -41232,6 +41328,104 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
             }
         });
         maybe_spawn_missing_managed_cli_refreshes(state);
+    });
+}
+/// What one apply of the CLI-installation modal's selection produced.
+struct CliInstallApplyOutcome {
+    ok: bool,
+    summary: String,
+    /// Fresh launch-parity presence for THIS machine after the job. `None`
+    /// when the job died before it could probe (the modal keeps its cache).
+    presence: Option<Vec<yggterm_core::cli_install::CliPresenceReport>>,
+}
+/// The apply job: install what the selection wants that is missing, remove
+/// what it does not want that is present — one CLI at a time, every outcome
+/// reported BY NAME, on the calling thread's blocking pool. Presence is
+/// re-probed through the launch-parity resolver at both ends so the decision
+/// and the confirmation both answer what a LAUNCH would see.
+fn run_cli_install_apply_job(decision: Vec<(String, bool)>) -> CliInstallApplyOutcome {
+    let presence_before = yggterm_server::local_cli_presence_now();
+    let present =
+        |slug: &str| presence_before.iter().any(|row| row.slug == slug && row.present);
+    let mut lines: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (slug, wanted) in decision {
+        if wanted && !present(&slug) {
+            match yggterm_server::install_managed_cli_tool_by_slug(&slug) {
+                Ok(message) => lines.push(format!("{slug}: {message}")),
+                Err(error) => failures.push(format!("{slug}: {error}")),
+            }
+        } else if !wanted && present(&slug) {
+            match yggterm_server::remove_managed_cli_tool_by_slug(&slug) {
+                Ok(message) => lines.push(format!("{slug}: {message}")),
+                Err(error) => failures.push(format!("{slug}: {error}")),
+            }
+        }
+    }
+    let presence = yggterm_server::local_cli_presence_now();
+    let ok = failures.is_empty();
+    let summary = if lines.is_empty() && failures.is_empty() {
+        "Nothing to do — every wanted CLI is installed and nothing unwanted is present."
+            .to_string()
+    } else if failures.is_empty() {
+        lines.join(" · ")
+    } else {
+        let done = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}; ", lines.join(" · "))
+        };
+        format!("{done}failures: {}", failures.join("; "))
+    };
+    CliInstallApplyOutcome {
+        ok,
+        summary,
+        presence: Some(presence),
+    }
+}
+/// The async wrapper the modal's Apply button calls: snapshot the decision
+/// under the state lock, run npm/uv/removal OFF it, land the outcome back.
+fn spawn_cli_install_apply(state: Signal<ShellState>) {
+    let decision = safe_shell_mut(state, "cli_install_apply_begin", |shell| {
+        shell.begin_cli_install_apply()
+    })
+    .ok()
+    .flatten();
+    let Some(decision) = decision else {
+        return;
+    };
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || run_cli_install_apply_job(decision))
+            .await
+            .unwrap_or_else(|error| CliInstallApplyOutcome {
+                ok: false,
+                summary: format!("apply job failed to run: {error}"),
+                presence: None,
+            });
+        let _ = safe_shell_mut(state, "cli_install_apply_complete", |shell| {
+            shell.finish_cli_install_apply(outcome)
+        });
+    });
+}
+/// One launch-parity presence probe for the modal's local column, run OFF the
+/// render path the first time the modal opens (and re-run by every apply).
+/// A login-shell resolution per CLI is a subprocess per CLI — affordable on an
+/// explicit user action, never on render.
+fn spawn_local_cli_presence_probe(state: Signal<ShellState>) {
+    let needs_probe = safe_shell_read(state, "cli_presence_probe_gate", |shell| {
+        shell.local_cli_presence_needs_probe()
+    })
+    .unwrap_or(false);
+    if !needs_probe {
+        return;
+    }
+    spawn(async move {
+        let presence = task::spawn_blocking(yggterm_server::local_cli_presence_now).await;
+        if let Ok(presence) = presence {
+            let _ = safe_shell_mut(state, "cli_presence_probe_complete", |shell| {
+                shell.adopt_local_cli_presence(presence)
+            });
+        }
     });
 }
 fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_key: String) {

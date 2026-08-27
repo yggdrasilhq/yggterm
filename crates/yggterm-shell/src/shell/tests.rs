@@ -10597,6 +10597,54 @@ console.log('ok');
         );
     }
 
+    /// The local column answers the LAUNCH-parity probe when it has landed,
+    /// and only falls back to the process-`PATH` walk before the first probe
+    /// returns. The regression this locks: the modal once reported CLIs as
+    /// missing that the machine had installed and was RUNNING, because the
+    /// managed bin dir a launch prepends is not in the GUI's desktop `PATH` —
+    /// and a freshly installed CLI could never flip its chip.
+    #[test]
+    fn the_local_cli_column_prefers_the_launch_parity_probe_over_the_process_path() {
+        // The launch-parity report says codex is present. The process-`PATH`
+        // fallback (binary_on_process_path) may say anything at all — the
+        // report wins either way.
+        let report = vec![yggterm_core::cli_install::CliPresenceReport {
+            slug: "codex".to_string(),
+            present: true,
+            version: Some("9.9.9".to_string()),
+        }];
+        let machines = cli_install_machines(&[], Some(&report));
+        let local = machines
+            .iter()
+            .find(|machine| machine.machine_key == LOCAL_CLI_MACHINE_KEY)
+            .expect("the local machine is always listed first");
+        let codex = local
+            .rows
+            .iter()
+            .find(|row| row.slug == "codex")
+            .expect("codex is a registered CLI");
+        assert!(
+            codex.presence.is_present(),
+            "the probe report must drive the local column"
+        );
+        // A slug absent from the report is Unknown, never Absent — an
+        // incomplete probe must not read as "install it".
+        let missing = local
+            .rows
+            .iter()
+            .find(|row| row.slug != "codex")
+            .expect("the registry has more than one CLI");
+        assert!(
+            !missing.presence.is_present() && !matches!(missing.presence, yggterm_core::cli_install::CliPresence::Absent),
+            "a slug the report does not mention must stay Unknown, got {:?}",
+            missing.presence
+        );
+
+        // Before the first probe lands, the fallback column still renders.
+        let fallback = cli_install_machines(&[], None);
+        assert_eq!(fallback.len(), 1);
+    }
+
     // ONE precedence list decides both "is a modal up" and "who gets the Enter".
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
@@ -43545,6 +43593,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -44708,6 +44758,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -44915,6 +44967,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -45122,6 +45176,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -45332,6 +45388,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -45546,6 +45604,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -45752,6 +45812,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -45958,6 +46020,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -46205,6 +46269,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -46414,6 +46480,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -46662,6 +46730,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
@@ -47187,6 +47257,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             theme_editor_open: false,
             launch_flags_open: false,
             cli_install_open: false,
+            cli_install_pending: false,
+            local_cli_presence: None,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,

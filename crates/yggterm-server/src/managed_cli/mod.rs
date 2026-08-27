@@ -431,18 +431,59 @@ impl ManagedCliPaths {
     }
 
     /// Drop every generation of `slug` except the one just published, and any
-    /// partial tree an interrupted run abandoned.
+    /// partial tree an interrupted run abandoned — EXCEPT a generation a
+    /// running process is still executing from.
+    ///
+    /// ⛔ MEASURED BROKEN LIVE: a long-running CLI references files INSIDE its
+    /// generation tree long after its entry binary is loaded — the codex CLI
+    /// spawns `codex-code-mode-host` from
+    /// `lib/node_modules/<platform pkg>/vendor/.../bin/` on every shell
+    /// command it runs. Pruning that tree under a live session does not touch
+    /// the running process (its exe is already mapped), but every SUBSEQUENT
+    /// helper spawn dies with "No such file or directory", and the session
+    /// reads as "the CLI is broken" when the CLI is fine and the install
+    /// system deleted its working files. So before removing a generation, the
+    /// running processes' executables are sampled: any generation a live
+    /// process executes from is deferred to a later sweep, which will reap it
+    /// after the process is gone.
+    ///
+    /// ⚠ On hosts where liveness cannot be measured (no `/proc`), the
+    /// immediately-previous generation is retained unconditionally as a grace
+    /// generation — one update's worth of survival for a long-running session,
+    /// reaped by the refresh after next.
     fn prune_cli_generations(&self, slug: &str, keep: u64) {
         let keep_name = format!("{slug}.gen{keep}");
         let marker = format!("{slug}.gen");
         let Ok(entries) = fs::read_dir(self.cli_root()) else {
             return;
         };
+        let live_exes = running_process_executable_paths();
+        #[cfg(not(target_os = "linux"))]
+        let grace_name = format!("{slug}.gen{}", keep.saturating_sub(1));
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
             if name == keep_name || !name.starts_with(&marker) {
+                continue;
+            }
+            #[cfg(not(target_os = "linux"))]
+            if name == grace_name {
+                continue;
+            }
+            let path = entry.path();
+            if generation_is_executed_by_running_process(&path, &live_exes) {
+                append_trace_event(
+                    &self.home,
+                    "managed_cli",
+                    "install",
+                    "prune_deferred_running",
+                    serde_json::json!({
+                        "slug": slug,
+                        "generation": name,
+                        "reason": "a running process executes from this generation tree",
+                    }),
+                );
                 continue;
             }
             let _ = fs::remove_dir_all(entry.path());
@@ -1967,6 +2008,344 @@ mod tests {
         assert_eq!(extract_semver_like_version("tool 1.2"), None);
     }
 
+    /// ⛔⛔ THE MOCK-REGISTRY HARNESS: every install shape the direct fetcher
+    /// must handle, proven against a local mock npm registry — install AND
+    /// update, and every way a vendor package says "my binary is not ready".
+    ///
+    /// This exists because the fleet ran the real registry's packages through
+    /// a fetcher that extracted tarballs and ran NOTHING, and three of ten
+    /// CLIs shipped as vendor error shims: present on PATH,
+    /// launch-parity-resolvable, and dead on first use ("native binary not
+    /// installed", "postinstall was not run", "compiled binary not found").
+    /// The shapes below are those vendors' shapes, minimized:
+    ///
+    /// - `mock-plain`: bin works as shipped (pi/qwen shape).
+    /// - `mock-finalize`: platform optional dependency carries the native
+    ///   binary; the vendor's postinstall copies it over the error shim
+    ///   (claude/opencode shape).
+    /// - `mock-preinstall`: the vendor's preinstall materializes the binary
+    ///   from an in-package payload (codex-litellm shape).
+    /// - `mock-broken`: the postinstall fails — the install must FAIL, never
+    ///   publish a shim.
+    /// - `mock-missing-dep`: the platform optional dependency 404s — fatal,
+    ///   because OUR platform's package is the one this machine needs.
+    ///
+    /// The update leg publishes a second version and proves the fetcher
+    /// resolves, installs and verifies it — the "update is flawless" half of
+    /// the owner's requirement.
+    struct MockRegistry {
+        child: std::process::Child,
+        base: String,
+        root: std::path::PathBuf,
+    }
+    impl MockRegistry {
+        fn spawn(root: &Path) -> MockRegistry {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            let port = listener.local_addr().expect("addr").port();
+            drop(listener);
+            let child = std::process::Command::new("python3")
+                .arg(env!("CARGO_MANIFEST_DIR").to_string() + "/../../scripts/mock-npm-registry/server.py")
+                .arg(root)
+                .arg(port.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .expect("spawn mock registry");
+            let base = format!("http://127.0.0.1:{port}");
+            // Wait for readiness.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    panic!("mock registry did not become ready on port {port}");
+                }
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            MockRegistry { child, base, root: root.to_path_buf() }
+        }
+
+        /// Lay down one version of one fixture package.
+        fn publish(&self, name: &str, version: &str, files: &[(&str, &[u8], u32)], manifest: serde_json::Value) {
+            let version_dir = self.root.join("packages").join(name).join(version);
+            std::fs::create_dir_all(version_dir.join("files")).expect("version dir");
+            for (rel, content, mode) in files {
+                let path = version_dir.join("files").join(rel);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("file dir");
+                }
+                std::fs::write(&path, content).expect("write file");
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).expect("stat").permissions();
+                permissions.set_mode(*mode);
+                std::fs::set_permissions(&path, permissions).expect("chmod");
+            }
+            std::fs::write(
+                version_dir.join("package.json"),
+                serde_json::to_vec(&manifest).expect("manifest"),
+            )
+            .expect("write manifest");
+            // The tarball must carry package.json TOO — it is the EXTRACTED
+            // copy the install reads for bin/scripts/optionalDependencies.
+            std::fs::write(
+                version_dir.join("files").join("package.json"),
+                serde_json::to_vec(&manifest).expect("manifest"),
+            )
+            .expect("write in-tar manifest");
+        }
+
+        fn url(&self) -> String {
+            self.base.clone()
+        }
+    }
+    impl Drop for MockRegistry {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn mock_manifest(bin: &str, bin_path: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut manifest = serde_json::json!({
+            "bin": { bin: bin_path },
+        });
+        if let (Some(obj), Some(extra)) = (manifest.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        manifest
+    }
+
+    const MOCK_SHIM: &[u8] = b"echo \"Error: mock vendor binary not installed.\" >&2\nexit 1\n";
+    // A REAL executable for fixture purposes: a shebang script answers
+    // --version with exit 0, which is all the publish gate requires.
+    const MOCK_NATIVE_1: &[u8] = b"#!/bin/sh\necho \"mock-native 1.0.0\"\n";
+    const MOCK_NATIVE_2: &[u8] = b"#!/bin/sh\necho \"mock-native 1.0.1\"\n";
+
+    #[test]
+    fn the_mock_registry_proves_install_and_update_for_every_shape() {
+        let root = std::env::temp_dir().join(format!(
+            "ygg-mock-registry-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture root");
+        let registry = MockRegistry::spawn(&root);
+
+        // mock-plain: the binary works as shipped.
+        registry.publish(
+            "mock-plain",
+            "3.1.0",
+            &[("bin/mock", b"#!/bin/sh\necho \"mock-plain 3.1.0\"\n", 0o755)],
+            mock_manifest("mock", "bin/mock", serde_json::json!({})),
+        );
+        // mock-finalize: shim + platform optional dep + postinstall copy.
+        registry.publish(
+            "mock-finalize",
+            "1.0.0",
+            &[
+                ("bin/mock", MOCK_SHIM, 0o755),
+                ("finalize.sh", b"#!/bin/sh\ncp -f ../mock-finalize-linux-x64/native bin/mock && chmod 755 bin/mock\n", 0o755),
+            ],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({
+                    "optionalDependencies": { "mock-finalize-linux-x64": "1.0.0" },
+                    "scripts": { "postinstall": "bash ./finalize.sh" },
+                }),
+            ),
+        );
+        registry.publish(
+            "mock-finalize-linux-x64",
+            "1.0.0",
+            &[("native", MOCK_NATIVE_1, 0o755)],
+            mock_manifest("mock-native", "native", serde_json::json!({})),
+        );
+        // mock-preinstall: preinstall materializes the binary from a payload.
+        registry.publish(
+            "mock-preinstall",
+            "2.0.0",
+            &[
+                ("payload/mock", b"#!/bin/sh\necho \"mock-pre 2.0.0\"\n", 0o755),
+                ("install.sh", b"#!/bin/sh\nmkdir -p bin && cp payload/mock bin/mock && chmod 755 bin/mock\n", 0o755),
+            ],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({ "scripts": { "preinstall": "bash ./install.sh" } }),
+            ),
+        );
+        // mock-broken: the postinstall fails and the shim stays a shim.
+        registry.publish(
+            "mock-broken",
+            "9.9.9",
+            &[
+                ("bin/mock", MOCK_SHIM, 0o755),
+                ("broken.sh", b"#!/bin/sh\nexit 3\n", 0o755),
+            ],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({ "scripts": { "postinstall": "bash ./broken.sh" } }),
+            ),
+        );
+        // mock-missing-dep: the platform dependency 404s.
+        registry.publish(
+            "mock-missing-dep",
+            "4.0.0",
+            &[("bin/mock", MOCK_SHIM, 0o755)],
+            mock_manifest(
+                "mock",
+                "bin/mock",
+                serde_json::json!({
+                    "optionalDependencies": { "mock-missing-dep-linux-x64": "1.0.0" },
+                }),
+            ),
+        );
+        let paths = provision_test_paths("mock-registry");
+        // The fetcher must talk to the MOCK, never the real registry.
+        // SAFETY: test process, single-threaded for this env key — the
+        // registry base is read only by this test's installs.
+        unsafe {
+            std::env::set_var("YGGTERM_NPM_REGISTRY_BASE", registry.url());
+        }
+
+        let install_and_version = |prefix: &Path, package: &str, tag: &str| -> String {
+            run_direct_install(&paths, prefix, package, tag).expect("install succeeds");
+            let bin = prefix.join("bin").join("mock");
+            let mut version_command = std::process::Command::new(&bin);
+            version_command.arg("--version");
+            match bounded_command_output(
+                &mut version_command,
+                MANAGED_CLI_VERSION_PROBE_TIMEOUT,
+            ) {
+                BoundedCommandOutput::Completed { stdout, success: true, .. } => {
+                    String::from_utf8_lossy(&stdout).trim().to_string()
+                }
+                other => panic!("installed {package} binary does not answer --version: {other:?}"),
+            }
+        };
+
+        // INSTALL, shape by shape.
+        let plain_prefix = paths.prefix.join("gen-plain");
+        assert_eq!(
+            install_and_version(&plain_prefix, "mock-plain", "latest"),
+            "mock-plain 3.1.0",
+            "plain shape: the shipped binary must be published as-is"
+        );
+        let finalize_prefix = paths.prefix.join("gen-finalize");
+        assert_eq!(
+            install_and_version(&finalize_prefix, "mock-finalize", "latest"),
+            "mock-native 1.0.0",
+            "finalize shape: postinstall must swap the shim for the platform native"
+        );
+        let pre_prefix = paths.prefix.join("gen-pre");
+        assert_eq!(
+            install_and_version(&pre_prefix, "mock-preinstall", "latest"),
+            "mock-pre 2.0.0",
+            "preinstall shape: the vendor script must materialize the binary"
+        );
+
+        // UPDATE: a second version is PUBLISHED (as a vendor release is), and
+        // the next install resolves, fetches, and verifies it.
+        registry.publish(
+            "mock-plain",
+            "3.2.0",
+            &[("bin/mock", b"#!/bin/sh\necho \"mock-plain 3.2.0\"\n", 0o755)],
+            mock_manifest("mock", "bin/mock", serde_json::json!({})),
+        );
+        let plain_update_prefix = paths.prefix.join("gen-plain-update");
+        assert_eq!(
+            install_and_version(&plain_update_prefix, "mock-plain", "latest"),
+            "mock-plain 3.2.0",
+            "update: the fetcher must resolve and install the newer version"
+        );
+
+        // FAILURE shapes never install.
+        let broken_prefix = paths.prefix.join("gen-broken");
+        let error = run_direct_install(&paths, &broken_prefix, "mock-broken", "latest")
+            .expect_err("a vendor script that leaves a dead binary must fail the install");
+        assert!(
+            error.to_string().contains("does not run"),
+            "the failure must come from the publish gate, naming the dead binary: {error}"
+        );
+        let missing_prefix = paths.prefix.join("gen-missing");
+        let error = run_direct_install(&paths, &missing_prefix, "mock-missing-dep", "latest")
+            .expect_err("a missing platform dependency must fail the install");
+        assert!(
+            error.to_string().contains("mock-missing-dep-linux-x64"),
+            "the failure must name the dependency it could not fetch: {error}"
+        );
+
+        // THE PUBLISH GATE: a shim that exists but does not run is refused.
+        let shim_staged = paths.prefix.join("gen-gate");
+        std::fs::create_dir_all(shim_staged.join("bin")).expect("staged bin");
+        let gate_chmod = |content: &[u8]| {
+            let path = shim_staged.join("bin").join("mock");
+            std::fs::write(&path, content).expect("write gate fixture");
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).expect("stat").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod gate fixture");
+        };
+        gate_chmod(MOCK_SHIM);
+        assert!(
+            staged_binary_runs(&shim_staged, "mock").is_err(),
+            "an error shim must never pass the publish gate"
+        );
+        gate_chmod(MOCK_NATIVE_1);
+        assert!(
+            staged_binary_runs(&shim_staged, "mock").is_ok(),
+            "a binary that answers --version must pass the publish gate"
+        );
+
+        // SAFETY: see the set_var note above.
+        unsafe {
+            std::env::remove_var("YGGTERM_NPM_REGISTRY_BASE");
+        }
+        let _ = std::fs::remove_dir_all(&paths.home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The opencode shim health check: the vendor's error-shim text must NOT
+    /// pass, and a real ELF binary must. Without this, the direct fetcher's
+    /// fast path saw "bin exists, version matches" and kept a broken install
+    /// forever.
+    #[test]
+    fn the_opencode_error_shim_is_not_a_healthy_binary() {
+        let paths = provision_test_paths("opencode-shim");
+        let prefix = &paths.prefix;
+        let shim_dir = prefix
+            .join("lib")
+            .join("node_modules")
+            .join("opencode-ai")
+            .join("bin");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        let shim = shim_dir.join("opencode.exe");
+
+        // The broken state: a text file, exactly what the vendor ships as the
+        // placeholder shim.
+        std::fs::write(&shim, "echo \"Error: opencode-ai's postinstall script was not run.\"\n")
+            .expect("write shim");
+        assert!(
+            !direct_install_shim_is_healthy(prefix, "opencode-ai"),
+            "the error shim must not satisfy the fast path"
+        );
+        // A real ELF (any ELF header will do for the check).
+        std::fs::write(&shim, b"\x7fELF\x02\x01\x01\x00rest-of-binary").expect("write elf");
+        assert!(
+            direct_install_shim_is_healthy(prefix, "opencode-ai"),
+            "a real binary must satisfy the fast path"
+        );
+        // Other packages are never second-guessed.
+        assert!(direct_install_shim_is_healthy(prefix, "@openai/codex"));
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
     fn provision_test_paths(tag: &str) -> ManagedCliPaths {
         let tmp = std::env::temp_dir().join(format!(
             "ygg-provision-{tag}-{}-{}",
@@ -1981,6 +2360,160 @@ mod tests {
             bin_dir,
             cache_dir: tmp.join("cache"),
         }
+    }
+
+    /// Removal of an npm-managed CLI takes the WHOLE managed tree with it: the
+    /// published symlink AND every generation directory. The regression this
+    /// locks: a removal that only unlinked the symlink would leave the
+    /// multi-hundred-MB generation trees orphaned on disk forever while
+    /// reporting "removed".
+    #[test]
+    fn removing_an_npm_managed_cli_takes_the_generations_with_it() {
+        let paths = provision_test_paths("remove-npm");
+        let tool = ManagedCliTool::QwenCode;
+        let binary = tool.binary_name();
+        let generation_bin = paths
+            .cli_root()
+            .join(format!("{}.gen1", tool.descriptor().slug))
+            .join("bin");
+        std::fs::create_dir_all(&generation_bin).expect("create generation tree");
+        std::fs::write(generation_bin.join(binary), b"#!/bin/sh\nexit 0\n")
+            .expect("write fake binary");
+        let link = paths.bin_dir.join(binary);
+        std::os::unix::fs::symlink(generation_bin.join(binary), &link).expect("publish symlink");
+
+        let status = remove_local_managed_cli_with_paths(&paths, tool).expect("remove");
+        assert_eq!(status.action, "removed", "detail: {}", status.detail);
+        assert!(
+            paths.bin_dir.join(binary).symlink_metadata().is_err(),
+            "the published symlink must be gone"
+        );
+        assert!(
+            !paths
+                .cli_root()
+                .join(format!("{}.gen1", tool.descriptor().slug))
+                .exists(),
+            "the generation tree must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// ⛔ THE PRUNE MUST NOT DELETE A GENERATION A RUNNING PROCESS EXECUTES
+    /// FROM. Measured broken live: a long-running CLI spawns helper binaries
+    /// from inside its own generation tree, and a refresh that pruned the tree
+    /// under it broke every subsequent command the session tried to run. The
+    /// prune defers such a generation to a later sweep instead.
+    #[test]
+    fn a_running_process_defers_the_prune_of_its_generation() {
+        let paths = provision_test_paths("prune-live");
+        let slug = "prune-live-cli";
+        let live_gen = paths.cli_root().join(format!("{slug}.gen1"));
+        let dead_gen = paths.cli_root().join(format!("{slug}.gen2"));
+        for dir in [&live_gen, &dead_gen] {
+            std::fs::create_dir_all(dir).expect("create generation");
+        }
+        // A REAL executable copied into the generation tree: while it runs,
+        // /proc/<pid>/exe points inside the tree, exactly as a CLI's native
+        // helper does.
+        let executable = live_gen.join("sleeper");
+        std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeper");
+
+        paths.prune_cli_generations(slug, 3);
+        assert!(
+            live_gen.exists(),
+            "a generation a running process executes from must survive the prune"
+        );
+        assert!(
+            !dead_gen.exists(),
+            "a generation nothing is executing must still be pruned"
+        );
+
+        // Once the process is gone, the next sweep reaps the deferred tree.
+        let _ = child.kill();
+        let _ = child.wait();
+        let live_exes = running_process_executable_paths();
+        assert!(
+            !generation_is_executed_by_running_process(&live_gen, &live_exes),
+            "the killed process must no longer hold the generation"
+        );
+        paths.prune_cli_generations(slug, 3);
+        assert!(
+            !live_gen.exists(),
+            "the deferred generation must be reaped once its process is gone"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// Removing a CLI a process is currently executing from is REFUSED BY PATH:
+    /// the running exe would survive mapped, but every helper it spawns from
+    /// its generation tree afterwards would die with "No such file or
+    /// directory" — the exact live failure that motivated liveness-aware
+    /// pruning.
+    #[test]
+    fn removing_a_cli_a_process_is_running_from_is_refused() {
+        let paths = provision_test_paths("remove-running");
+        let tool = ManagedCliTool::QwenCode;
+        let tool_marker = format!("{}.gen", tool.descriptor().slug);
+        let tool_gen_bin = paths.cli_root().join(format!("{tool_marker}1")).join("bin");
+        std::fs::create_dir_all(&tool_gen_bin).expect("create tool generation");
+        let executable = tool_gen_bin.join(tool.binary_name());
+        std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
+        std::os::unix::fs::symlink(&executable, paths.bin_dir.join(tool.binary_name()))
+            .expect("publish symlink");
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .expect("spawn runner");
+
+        let error = remove_local_managed_cli_with_paths(&paths, tool)
+            .expect_err("removal must refuse while a process runs from the tree");
+        assert!(
+            error.to_string().contains("running"),
+            "the refusal must say the CLI is running: {error}"
+        );
+        assert!(
+            paths.cli_root().join(format!("{tool_marker}1")).exists(),
+            "the running generation must be untouched"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// A CLI that is not present reports "not installed" and removes nothing:
+    /// a removal click on a missing CLI must not be able to create or damage
+    /// a managed tree it did not find.
+    #[test]
+    fn removing_an_absent_cli_is_a_reported_no_op() {
+        let paths = provision_test_paths("remove-absent");
+        let tool = ManagedCliTool::QwenCode;
+        let status = remove_local_managed_cli_with_paths(&paths, tool).expect("remove");
+        assert_eq!(status.action, "not installed");
+        assert!(!paths.cli_root().exists(), "nothing may be created");
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// A vendor-installed CLI whose binary is a REAL file in the managed bin
+    /// dir is removed by deleting that file.
+    #[test]
+    fn removing_a_vendor_cli_deletes_its_user_local_binary() {
+        let paths = provision_test_paths("remove-vendor");
+        let tool = ManagedCliTool::Muse;
+        let binary = tool.binary_name();
+        std::fs::write(paths.bin_dir.join(binary), b"#!/bin/sh\nexit 0\n")
+            .expect("write fake vendor binary");
+
+        let status = remove_local_managed_cli_with_paths(&paths, tool).expect("remove");
+        assert_eq!(status.action, "removed", "detail: {}", status.detail);
+        assert!(
+            !paths.bin_dir.join(binary).exists(),
+            "the vendor binary must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
     }
 
     /// ⛔ A PACKAGE'S INSTALLER MUST NOT STAGE ITS DOWNLOAD IN RAM.
@@ -2831,7 +3364,15 @@ mod tests {
 
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedCommandOutput {
-    Completed { stdout: Vec<u8>, stderr: Vec<u8> },
+    Completed {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        /// The child's exit status. The version probe never cared (it reads
+        /// output); the publish gate DOES — a vendor error shim prints its
+        /// paragraph on stderr and exits non-zero, and "printed something"
+        /// must never read as "ran".
+        success: bool,
+    },
     TimedOut,
     Failed,
 }
@@ -2850,7 +3391,7 @@ fn bounded_command_output(command: &mut Command, timeout: Duration) -> BoundedCo
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
                 let mut stdout = Vec::new();
                 let mut stderr = Vec::new();
                 if child
@@ -2864,7 +3405,11 @@ fn bounded_command_output(command: &mut Command, timeout: Duration) -> BoundedCo
                 {
                     return BoundedCommandOutput::Failed;
                 }
-                return BoundedCommandOutput::Completed { stdout, stderr };
+                return BoundedCommandOutput::Completed {
+                    stdout,
+                    stderr,
+                    success: status.success(),
+                };
             }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
@@ -2890,7 +3435,7 @@ fn run_version_command(binary_path: &Path) -> Option<String> {
         MANAGED_CLI_VERSION_PROBE_TIMEOUT,
     );
     let (outcome_name, output) = match outcome {
-        BoundedCommandOutput::Completed { stdout, stderr } => {
+        BoundedCommandOutput::Completed { stdout, stderr, .. } => {
             let output = if stdout.is_empty() { stderr } else { stdout };
             ("completed", Some(output))
         }
@@ -2969,7 +3514,11 @@ fn probe_tool(paths: &ManagedCliPaths, tool: ManagedCliTool) -> ToolProbe {
     // the daemon `PATH` alone would report a CLI we JUST installed as still
     // absent, and `ensure_local_managed_cli` would bail with "did not become
     // available after the managed install finished" on a successful install.
-    if let Some(system_binary) = resolve_binary_for_launch_parity(tool.binary_name()) {
+    // The paths-aware resolver form keeps a test's temp bin dir authoritative
+    // for its own probe instead of leaking the real machine's installs in.
+    if let Some(system_binary) =
+        resolve_binary_for_launch_parity_with(Some(&paths.bin_dir), tool.binary_name())
+    {
         return ToolProbe {
             version: run_version_command(&system_binary),
             source: Some(ManagedCliBinarySource::System),
@@ -2981,6 +3530,48 @@ fn probe_tool(paths: &ManagedCliPaths, tool: ManagedCliTool) -> ToolProbe {
         source: None,
         available: false,
     }
+}
+
+/// Every file a running process is currently executing, best effort.
+///
+/// Linux reads `/proc/<pid>/exe` for each numeric pid. A deleted executable
+/// still reports through the link with a ` (deleted)` suffix, and the prefix
+/// match in [`generation_is_executed_by_running_process`] is on DIRECTORY
+/// components, so the suffix never blocks a match. Any read failure costs one
+/// pid's answer, never the sweep.
+#[cfg(target_os = "linux")]
+fn running_process_executable_paths() -> Vec<PathBuf> {
+    let mut executables = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return executables;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(target) = fs::read_link(format!("/proc/{name}/exe")) {
+            executables.push(target);
+        }
+    }
+    executables
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_process_executable_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Whether any running process executes from inside `generation_dir`.
+fn generation_is_executed_by_running_process(
+    generation_dir: &Path,
+    live_executables: &[PathBuf],
+) -> bool {
+    live_executables
+        .iter()
+        .any(|executable| executable.starts_with(generation_dir))
 }
 
 fn npm_binary() -> Option<PathBuf> {
@@ -3815,7 +4406,12 @@ fn install_one_npm_cli(
         //    network drop mid-download leaves far more than the 1 MB a registry
         //    resolution error does.
         let install_result = if managed_cli_fetcher_is_direct() {
-            run_direct_install(paths, &staged, package)
+            run_direct_install(
+                paths,
+                &staged,
+                package,
+                yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+            )
         } else {
             run_npm_install(paths, npm, &staged, package, background)
         };
@@ -3824,15 +4420,16 @@ fn install_one_npm_cli(
             return Err(error);
         }
 
-        // ⛔ VERIFY BEFORE PUBLISHING. npm exits 0 having installed a package
-        //    whose `bin` never materialised — a broken CLI that reports success
-        //    is worse than a failure, because nothing looks at it again until a
-        //    user tries to launch it.
-        let staged_binary = staged.join("bin").join(binary);
-        if !staged_binary.exists() {
+        // ⛔ VERIFY BEFORE PUBLISHING — the binary must RUN, not merely exist.
+        //    The exists-only check published claude, opencode and codex-litellm
+        //    as vendor error shims: a text file on PATH that exits non-zero
+        //    with an instruction paragraph on first use. A binary that cannot
+        //    answer `--version` never reaches the publish symlink, and the
+        //    install fails loudly with the vendor's own first error line.
+        if let Err(why) = staged_binary_runs(&staged, binary) {
             let _ = fs::remove_dir_all(&staged);
             anyhow::bail!(
-                "npm installed {package} but produced no {binary} in {}",
+                "npm installed {package} but {binary} does not run ({why}) in {}",
                 staged.display()
             );
         }
@@ -3858,7 +4455,12 @@ fn install_one_npm_cli(
     {
         let prefix = paths.prefix.clone();
         if managed_cli_fetcher_is_direct() {
-            run_direct_install(paths, &prefix, package)
+            run_direct_install(
+                paths,
+                &prefix,
+                package,
+                yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+            )
         } else {
             run_npm_install(paths, npm, &prefix, package, background)
         }
@@ -3904,6 +4506,285 @@ fn optional_native_package_for(package: &str) -> Option<String> {
         "@anthropic-ai/claude-code" => Some(format!("@anthropic-ai/claude-code-{platform}")),
         "@xai-official/grok" => Some(format!("@xai-official/grok-{platform}")),
         _ => None,
+    }
+}
+
+/// The npm registry the direct fetcher talks to. Overridable ONLY for the
+/// mock-registry harness (`scripts/mock-npm-registry/`), which proves the
+/// install shapes against a local server; production always resolves to the
+/// real registry.
+fn npm_registry_base() -> String {
+    std::env::var("YGGTERM_NPM_REGISTRY_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://registry.npmjs.org".to_string())
+}
+
+/// Resolve an optionalDependency entry to the (package, exact version) to
+/// fetch. Vendors pin their platform packages to the main package's exact
+/// version (`"opencode-linux-x64": "1.18.23"`); npm alias ranges
+/// (`"npm:@scope/pkg@1.2.3"`) are unwrapped. Anything else (caret, tilde,
+/// `*`, workspace ranges) cannot be resolved from a registry URL and is
+/// SKIPPED rather than guessed at — a skipped optional dep is the
+/// pre-existing failure mode, never a wrong-binary install.
+fn exact_optional_dependency(name: &str, range: &str) -> Option<(String, String)> {
+    if let Some(rest) = range.trim().strip_prefix("npm:") {
+        let (package, version) = rest.rsplit_once('@')?;
+        return Some((package.to_string(), version.to_string()));
+    }
+    if range.is_empty() || range.contains(|ch: char| "~^><=*| ,".contains(ch)) {
+        return None;
+    }
+    let version = range.trim();
+    let first = version.chars().next()?;
+    if !(first.is_ascii_digit() || first == 'v') {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
+/// Fetch every PLATFORM optional dependency the freshly-extracted package
+/// declares, at its pinned version, into the same node_modules — what npm's
+/// optional-dependency resolution would have left on disk. This is the
+/// GENERAL form of what per-CLI special cases used to do: claude's native
+/// binary, opencode's platform binary and grok's all arrive as optional
+/// platform packages, and a main tarball without them is a CLI that prints
+/// "native binary not installed" the moment a session starts it.
+///
+/// ⛔ A platform package that fails to fetch or extract is FATAL to the
+/// install: the vendor declared it optional only because OTHER platforms
+/// don't need it — OUR platform's package is exactly the one this machine
+/// does need, and a published CLI without it is the "reports success, dies
+/// on use" defect.
+fn fetch_platform_optional_dependencies(
+    curl: &Path,
+    staging: &Path,
+    prefix: &Path,
+    package: &str,
+    package_dir: &Path,
+    skip: &[&str],
+) -> Result<()> {
+    let manifest_path = package_dir.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return Ok(());
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+    let Some(optional) = manifest
+        .get("optionalDependencies")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(());
+    };
+    let platform = direct_platform_suffix();
+    for (name, range) in optional {
+        let Some(range) = range.as_str() else { continue };
+        if name.contains(platform) && !skip.contains(&name.as_str()) {
+            let Some((dep_package, dep_version)) = exact_optional_dependency(name, range) else {
+                anyhow::bail!(
+                    "{package} declares platform dependency {name} at unresolvable range \
+                     {range:?} — cannot fetch the native binary this machine needs"
+                );
+            };
+            let dep_base = npm_registry_base();
+            let manifest_url = format!("{dep_base}/{dep_package}/{}", dep_version);
+            let meta_output = std::process::Command::new(curl)
+                .arg("-fsSL")
+                .arg(&manifest_url)
+                .output()
+                .with_context(|| format!("fetching manifest for {dep_package}"))?;
+            if !meta_output.status.success() {
+                anyhow::bail!(
+                    "platform dependency {dep_package}@{dep_version} fetch failed: {}",
+                    String::from_utf8_lossy(&meta_output.stderr)
+                );
+            }
+            let dep_meta: serde_json::Value = serde_json::from_slice(&meta_output.stdout)
+                .with_context(|| format!("parsing manifest for {dep_package}"))?;
+            let dep_tarball = dep_meta
+                .get("dist")
+                .and_then(|dist| dist.get("tarball"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("no dist.tarball for {dep_package}"))?
+                .to_string();
+            fetch_and_extract_package(
+                curl,
+                staging,
+                prefix,
+                &dep_package,
+                &dep_tarball,
+                &dep_version,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Run a package's OWN install scripts — preinstall, install, postinstall, in
+/// npm's order — from the package directory we just extracted and verified.
+///
+/// ⛔ THE DOCTRINE SHIFT, STATED: the direct fetcher was built to run no
+/// lifecycle scripts, and that posture is what left claude, opencode and
+/// codex-litellm shipping error-shim binaries fleet-wide — their native
+/// binary ARRIVES as data (an optional package we already fetch) but is put
+/// in PLACE by the vendor's script (`install.cjs`, `postinstall.mjs`,
+/// `scripts/install.js`). Running the vendor's own script from the verified
+/// tarball is the same trust decision npm makes and the provisioner already
+/// makes for Muse's installer; NOT running it is a decision that every
+/// script-finalized CLI is broken forever. The boundary that remains: the
+/// scripts run from the package we extracted (never re-fetched), HOME intact,
+/// stdin closed, TMPDIR on disk, bounded wall clock. Scripts are BEST-EFFORT
+/// — the publish gate, not the script's exit code, decides whether an
+/// install lands (see the gate and the measured grok case below).
+fn run_vendor_install_scripts(
+    paths: &ManagedCliPaths,
+    package_dir: &Path,
+    package: &str,
+) -> Result<()> {
+    const INSTALL_SCRIPT_ORDER: [&str; 3] = ["preinstall", "install", "postinstall"];
+    let manifest_path = package_dir.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return Ok(());
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+    let Some(scripts) = manifest
+        .get("scripts")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(());
+    };
+    for step in INSTALL_SCRIPT_ORDER {
+        let Some(script) = scripts.get(step).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if script.trim().is_empty() {
+            continue;
+        }
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(script);
+        command.current_dir(package_dir);
+        apply_provision_env(&mut command, paths);
+        match bounded_command_output(&mut command, Duration::from_secs(300)) {
+            BoundedCommandOutput::Completed { success, stderr, .. } => {
+                // ⛔ BEST-EFFORT, AND WHY THE GATE OWNS THE VERDICT: a vendor
+                // script can fail for reasons that do not matter to the
+                // binary — measured live, grok's postinstall requires
+                // `@iarna/toml`, a regular dependency the direct fetcher
+                // (main tarball only) does not install, and grok itself runs
+                // perfectly without it. Failing the install on every script
+                // error would have kept a working CLI out of the fleet. The
+                // publish gate (`staged_binary_runs`) is the contract: script
+                // succeeded + binary runs -> publish; script failed + binary
+                // still runs -> publish WITH the trace event below; binary
+                // does not run -> the install fails with the shim's own
+                // first error line.
+                append_trace_event(
+                    &paths.home,
+                    "managed_cli",
+                    "install",
+                    if success {
+                        "vendor_script_completed"
+                    } else {
+                        "vendor_script_failed_nonfatal"
+                    },
+                    serde_json::json!({
+                        "package": package,
+                        "script": step,
+                        "success": success,
+                        "first_error": String::from_utf8_lossy(&stderr)
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    }),
+                );
+            }
+            BoundedCommandOutput::TimedOut => {
+                append_trace_event(
+                    &paths.home,
+                    "managed_cli",
+                    "install",
+                    "vendor_script_failed_nonfatal",
+                    serde_json::json!({
+                        "package": package,
+                        "script": step,
+                        "success": false,
+                        "first_error": "timed out after 300s",
+                    }),
+                );
+            }
+            BoundedCommandOutput::Failed => {
+                append_trace_event(
+                    &paths.home,
+                    "managed_cli",
+                    "install",
+                    "vendor_script_failed_nonfatal",
+                    serde_json::json!({
+                        "package": package,
+                        "script": step,
+                        "success": false,
+                        "first_error": "could not start",
+                    }),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The publish gate: the freshly installed entry binary must EXIST and must
+/// RUN (`--version` exits 0 within the probe budget). The exists-only check
+/// this replaces published claude, opencode and codex-litellm as text shims
+/// that print vendor error paragraphs and exit non-zero — present on PATH,
+/// launch-parity-resolvable, and dead on first use.
+fn staged_binary_runs(staged: &Path, binary: &str) -> std::result::Result<(), String> {
+    let bin = staged.join("bin").join(binary);
+    if !bin.is_file() {
+        return Err(format!("no bin/{binary} was produced"));
+    }
+    let mut command = Command::new(&bin);
+    command.arg("--version");
+    match bounded_command_output(&mut command, MANAGED_CLI_VERSION_PROBE_TIMEOUT) {
+        BoundedCommandOutput::Completed { stderr, success, .. } => {
+            if success {
+                Ok(())
+            } else {
+                let text = String::from_utf8_lossy(&stderr);
+                Err(format!(
+                    "--version exited non-zero: {}",
+                    text.lines().next().unwrap_or("").trim()
+                ))
+            }
+        }
+        BoundedCommandOutput::TimedOut => Err("--version timed out".to_string()),
+        BoundedCommandOutput::Failed => Err("--version could not be executed".to_string()),
+    }
+}
+
+/// Whether the installed entry binary for `package` is a REAL executable
+/// rather than a vendor error shim. ⛔ The fast-path version check reads only
+/// `package.json`, and opencode-ai's `bin/opencode.exe` EXISTS even when the
+/// install is broken — it is a text file that prints "postinstall script was
+/// not run" and exits. Without this health check, a broken opencode install
+/// would satisfy the fast path forever and never self-heal.
+fn direct_install_shim_is_healthy(prefix: &Path, package: &str) -> bool {
+    if package != "opencode-ai" {
+        return true;
+    }
+    let shim = prefix
+        .join("lib")
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    match fs::read(&shim) {
+        Ok(bytes) => bytes.starts_with(&[0x7f, b'E', b'L', b'F']),
+        Err(_) => false,
     }
 }
 
@@ -3992,6 +4873,7 @@ fn run_direct_install(
     paths: &ManagedCliPaths,
     prefix: &Path,
     package: &str,
+    dist_tag: &str,
 ) -> Result<()> {
     // Direct registry fetch — no npm, no cache, no tmpfs leak. Isolated from
     // system binaries: every CLI lands in its own generation under
@@ -4006,9 +4888,11 @@ fn run_direct_install(
     // `claude`/`grok` keeps its old inode through the swap; new launches see
     // the new symlink. No in-place overwrite of a live binary.
     let curl = curl_binary().context("curl is required for direct fetch")?;
+    let registry_base = npm_registry_base();
     let registry_url = format!(
-        "https://registry.npmjs.org/{}/latest",
-        package.replace('/', "%2F")
+        "{registry_base}/{}/{}",
+        package.replace('/', "%2F"),
+        dist_tag
     );
     let meta_output = std::process::Command::new(&curl)
         .arg("-fsSL")
@@ -4049,7 +4933,7 @@ fn run_direct_install(
                     } else { vec![] };
                     bins.iter().all(|name| prefix.join("bin").join(name).exists())
                 }).unwrap_or(true);
-                if bin_ok {
+                if bin_ok && direct_install_shim_is_healthy(prefix, package) {
                     return Ok(());
                 }
             }
@@ -4057,32 +4941,53 @@ fn run_direct_install(
     }
     let tmp_tgz = staging.join(format!("{}-{}.tgz", package.replace('/', "_"), version));
     fetch_and_extract_package(&curl, &staging, prefix, package, &tarball, &version)?;
-    // Also fetch platform-specific optional native package (e.g. codex-linux-x64)
-    // if this CLI distributes its binary that way. Missing it is the exact
-    // `native binary not installed` / `Missing optional dependency` error.
-    // codex uses version-suffixed tarball of the SAME package
-    // (@openai/codex@0.149.1-linux-x64), others use separate package
-    // (@anthropic-ai/claude-code-linux-x64).
-    if let Some(native_pkg) = optional_native_package_for(package) {
-        if package == "@openai/codex" {
-            // codex native: version-suffixed tarball of main package
-            let platform = direct_platform_suffix();
-            let native_tarball = native_tarball_url_for_codex(&version, platform);
-            let native_version = format!("{}-{}", version, platform);
-            // Try fetch; 404 gracefully skipped — not all versions publish every platform
-            let _ = fetch_and_extract_package(&curl, &staging, prefix, &native_pkg, &native_tarball, &native_version);
-        } else {
-            // claude/grok: separate native package at /latest
-            let native_url = format!("https://registry.npmjs.org/{}/latest", native_pkg.replace('/', "%2F"));
-            if let Ok(native_meta_out) = std::process::Command::new(&curl).arg("-fsSL").arg(&native_url).output() {
-                if native_meta_out.status.success() {
-                    if let Ok(native_meta) = serde_json::from_slice::<serde_json::Value>(&native_meta_out.stdout) {
-                        if let Some(native_tarball) = native_meta.get("dist").and_then(|d| d.get("tarball")).and_then(|v| v.as_str()) {
-                            let native_version = native_meta.get("version").and_then(|v| v.as_str()).unwrap_or(&version).to_string();
-                            let _ = fetch_and_extract_package(&curl, &staging, prefix, &native_pkg, native_tarball, &native_version);
-                        }
-                    }
-                }
+    let package_dir = prefix
+        .join("lib")
+        .join("node_modules")
+        .join(package);
+    // Fetch the platform optional dependencies the package declares (claude's
+    // native binary, opencode's platform binary, grok's) at their PINNED
+    // versions — the general form of what per-CLI special cases used to do.
+    // codex keeps its special case: its native is a version-SUFFIXED tarball
+    // of the main package itself, which the optional-dependency walk cannot
+    // express.
+    let codex_native: Option<String> = if package == "@openai/codex" {
+        optional_native_package_for(package).map(|value| value.to_string())
+    } else {
+        None
+    };
+    let skip: Vec<&str> = match codex_native.as_deref() {
+        Some(special) => vec![special],
+        None => Vec::new(),
+    };
+    if let Some(native_pkg) = codex_native.as_deref() {
+        let platform = direct_platform_suffix();
+        let native_tarball = native_tarball_url_for_codex(&version, platform);
+        let native_version = format!("{}-{}", version, platform);
+        // Try fetch; 404 gracefully skipped — not all versions publish every platform
+        let _ = fetch_and_extract_package(&curl, &staging, prefix, native_pkg, &native_tarball, &native_version);
+    }
+    fetch_platform_optional_dependencies(&curl, &staging, prefix, package, &package_dir, &skip)?;
+    // Run the vendor's own install scripts. Without them the finalize step
+    // never happens: claude's install.cjs, opencode's postinstall.mjs and
+    // codex-litellm's scripts/install.js each put the native binary in place,
+    // and a skipped script left all three as error-shim text on PATH.
+    run_vendor_install_scripts(paths, &package_dir, package)?;
+    // ⛔ THE PUBLISH GATE, AT THE CHOKE POINT. Every bin the package declares
+    // must RUN (`--version` exits 0) before this install reports success —
+    // the caller's symlink publication hangs off it. The exists-only check
+    // this generalizes published claude, opencode and codex-litellm as
+    // vendor error shims: text on PATH, launch-parity-resolvable, dead on
+    // first use. A vendor script that fails (best-effort by design) or a
+    // package whose binary simply will not run fails HERE, loudly, with the
+    // binary's own first error line.
+    if let Ok(raw) = std::fs::read_to_string(package_dir.join("package.json"))
+        && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(bins) = manifest.get("bin").and_then(|value| value.as_object())
+    {
+        for name in bins.keys() {
+            if let Err(why) = staged_binary_runs(prefix, name) {
+                anyhow::bail!("{package} installed but {name} does not run ({why})");
             }
         }
     }
@@ -4610,13 +5515,23 @@ fn login_shell_path_dirs() -> Vec<PathBuf> {
 /// required a `~/.local/bin/grok` symlink that then broke `grok update`'s
 /// `npm i -g` (EEXIST).
 pub(crate) fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
-    let managed_dir = ManagedCliPaths::resolve()
-        .ok()
-        .map(|paths| paths.bin_dir);
+    resolve_binary_for_launch_parity_with(
+        ManagedCliPaths::resolve().ok().map(|paths| paths.bin_dir).as_deref(),
+        binary_name,
+    )
+}
+
+/// The body of [`resolve_binary_for_launch_parity`], with the managed bin dir
+/// taken in so a caller holding explicit paths (and a test) answers for THAT
+/// configuration instead of whatever the real home resolves to.
+pub(crate) fn resolve_binary_for_launch_parity_with(
+    managed_bin_dir: Option<&Path>,
+    binary_name: &str,
+) -> Option<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(dir) = managed_dir {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
+    if let Some(dir) = managed_bin_dir {
+        if !dirs.contains(&dir.to_path_buf()) {
+            dirs.push(dir.to_path_buf());
         }
     }
     dirs.extend(launch_search_dirs());
@@ -4948,6 +5863,298 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
         }),
     );
     Ok(status)
+}
+
+/// The provisioning key serving a descriptor slug — the row key the
+/// CLI-installation modal carries — or `None` for a slug the registry does
+/// not know.
+pub fn managed_cli_tool_for_slug(slug: &str) -> Option<ManagedCliTool> {
+    managed_cli_tools_for_refresh()
+        .into_iter()
+        .find(|tool| tool.descriptor().slug == slug)
+}
+
+/// Remove a CLI THIS machine no longer wants, by provisioning key.
+///
+/// ⛔ **Only user-space installs are removable.** A binary resolving under a
+/// system prefix (`/usr/local`, `/usr`, `/opt`) is either root-owned or
+/// package-manager-owned, and deleting it is how a "remove Qwen" click becomes
+/// a broken machine for every other user of the host. The refusal is BY PATH,
+/// so the user can remove it by hand knowing exactly which file it is. This is
+/// the removal-side twin of the no-`sudo` rule in the auto-provisioning spec.
+///
+/// What IS removed, by install method:
+/// - npm-managed: the published symlink in the managed bin dir plus every
+///   `<slug>.gen*` generation under the managed CLI root — the whole tree
+///   `install_npm_isolated` created, nothing else.
+/// - uv: `uv tool uninstall <package>`, which removes the tool's bin shims and
+///   its tool directory together, so no dangling entry survives in
+///   `uv tool list`.
+/// - vendor-script / self-updating: the binary file itself, ONLY when it lives
+///   in a user-local bin dir (the managed bin dir or `~/.local/bin`).
+///
+/// The install lock is held for the whole body: removal mutates the same
+/// managed tree the install funnel writes, and the lock — not goodwill — is
+/// what keeps a concurrent refresh from re-installing the tool being removed
+/// ([[ManagedCliInstallLock]]).
+pub(crate) fn remove_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCliToolStatus> {
+    remove_local_managed_cli_with_paths(&ManagedCliPaths::resolve()?, tool)
+}
+
+/// The body of [`remove_local_managed_cli`], with the machine's paths taken in
+/// so a test can prove the removal semantics without touching the real home.
+pub(crate) fn remove_local_managed_cli_with_paths(
+    paths: &ManagedCliPaths,
+    tool: ManagedCliTool,
+) -> Result<ManagedCliToolStatus> {
+    let _install_guard = acquire_managed_cli_install_lock(&paths.home)?;
+    let before = probe_tool(paths, tool);
+    let binary = tool.binary_name();
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "remove_begin",
+        serde_json::json!({
+            "tool": binary,
+            "available": before.available,
+            "source": source_word(before.source),
+        }),
+    );
+
+    if !before.available {
+        let status = tool_status(
+            tool,
+            before.clone(),
+            before,
+            "not installed",
+            format!("{} is not installed on this machine.", tool.display_name()),
+        );
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "remove_end",
+            serde_json::json!({ "tool": binary, "action": "not installed" }),
+        );
+        return Ok(status);
+    }
+
+    // ⛔ THE GUARD, before any deletion. Where does the binary a launch would
+    // run actually live? Under a user-local bin dir the removal may proceed;
+    // anywhere else it is a system install yggterm did not put there, and the
+    // refusal names the path so a hand removal knows exactly which file.
+    let managed_hit = paths.bin_dir.join(binary);
+    let user_local_hit = user_local_bin_dir().map(|dir| dir.join(binary));
+    let resolved = resolve_binary_for_launch_parity_with(Some(&paths.bin_dir), binary);
+    let resolves_user_local = resolved.as_deref() == Some(managed_hit.as_path())
+        || user_local_hit
+            .as_deref()
+            .is_some_and(|candidate| resolved.as_deref() == Some(candidate));
+    if !resolves_user_local {
+        let refusal = format!(
+            "{} resolves to {} which is a system install — yggterm only removes binaries \
+             under its own managed dir or your user-local bin dir; remove it by hand if you \
+             want it gone",
+            tool.display_name(),
+            resolved
+                .as_deref()
+                .map(Path::display)
+                .map(|path| path.to_string())
+                .unwrap_or_else(|| "a system path".to_string())
+        );
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "remove_refused_system_path",
+            serde_json::json!({
+                "tool": binary,
+                "resolved": resolved.as_deref().map(Path::display).map(|path| path.to_string()),
+            }),
+        );
+        anyhow::bail!("{refusal}");
+    }
+
+    // ⛔ A CLI a process is RUNNING cannot be removed cleanly: the running exe
+    // survives (it is already mapped) but every helper it spawns from its
+    // generation tree dies with "No such file or directory" — the exact
+    // failure mode generation pruning learned to avoid. Refuse BY PATH so the
+    // user knows what to close first.
+    {
+        let live_executables = running_process_executable_paths();
+        let slug_marker = format!("{}.gen", tool.descriptor().slug);
+        let running_from: Option<PathBuf> = fs::read_dir(paths.cli_root())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&slug_marker))
+                    && generation_is_executed_by_running_process(&entry.path(), &live_executables)
+            })
+            .map(|entry| entry.path())
+            .or_else(|| {
+                live_executables
+                    .iter()
+                    .find(|exe| **exe == paths.bin_dir.join(binary))
+                    .cloned()
+            });
+        if let Some(tree) = running_from {
+            anyhow::bail!(
+                "{} is running from its managed install ({}) right now — close its sessions \
+                 first, then remove it",
+                tool.display_name(),
+                tree.display()
+            );
+        }
+    }
+
+    let detail = match tool.descriptor().install {
+        CliInstall::Npm(_) => remove_managed_npm_install(paths, tool)?,
+        CliInstall::Uv(package) => {
+            let uv = uv_binary()
+                .context("uv is required to remove this CLI and is not on the login PATH")?;
+            let mut command = Command::new(uv);
+            command.arg("tool").arg("uninstall").arg(&package);
+            apply_provision_env(&mut command, paths);
+            run_provision_command(command, &format!("uv tool uninstall {package}"))?;
+            format!("Uninstalled {package} with `uv tool uninstall`.")
+        }
+        CliInstall::VendorScript(_) | CliInstall::Manual => {
+            remove_user_local_binary(paths, tool)?
+        }
+    };
+
+    let mut after = probe_tool(paths, tool);
+    let mut detail = detail;
+    // A legacy npm install could leave a REAL file where the managed layout
+    // publishes a symlink (the shared-prefix era). The method-specific removal
+    // above does not cover it, so one user-local fallback runs before giving
+    // up — guarded by the same user-local boundary as everything else here.
+    if after.available {
+        if let Ok(extra) = remove_user_local_binary(paths, tool) {
+            detail = format!("{detail} {extra}");
+            after = probe_tool(paths, tool);
+        }
+    }
+    if after.available {
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "remove_still_present",
+            serde_json::json!({
+                "tool": binary,
+                "source": source_word(after.source),
+            }),
+        );
+        anyhow::bail!(
+            "{} still resolves after removal ({}); refusing to report it gone",
+            tool.display_name(),
+            after
+                .source
+                .map(|source| source_word(Some(source)))
+                .unwrap_or("unknown source")
+        );
+    }
+    let status = tool_status(tool, before, after, "removed", detail);
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "remove_end",
+        serde_json::json!({
+            "tool": binary,
+            "action": "removed",
+        }),
+    );
+    Ok(status)
+}
+
+/// Delete the npm-managed tree for `tool`: the published symlink in the
+/// managed bin dir plus every generation directory. Returns the detail line.
+fn remove_managed_npm_install(paths: &ManagedCliPaths, tool: ManagedCliTool) -> Result<String> {
+    let binary = tool.binary_name();
+    let link = paths.bin_dir.join(binary);
+    match fs::symlink_metadata(&link) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(&link)
+                    .with_context(|| format!("removing published link {}", link.display()))?;
+            } else {
+                anyhow::bail!(
+                    "{} is a directory where the managed install publishes a binary; refusing to delete it",
+                    link.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow!(error))
+                .with_context(|| format!("statting published link {}", link.display()));
+        }
+    }
+    let marker = format!("{}.gen", tool.descriptor().slug);
+    if let Ok(entries) = fs::read_dir(paths.cli_root()) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with(&marker) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    Ok(format!(
+        "Removed the Yggterm-managed {binary} install under {}.",
+        paths.cli_root().display()
+    ))
+}
+
+/// Delete a vendor- or self-installed binary, but ONLY out of a user-local bin
+/// dir. A hit anywhere else is a system install yggterm did not put there.
+fn remove_user_local_binary(paths: &ManagedCliPaths, tool: ManagedCliTool) -> Result<String> {
+    let binary = tool.binary_name();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(paths.bin_dir.join(binary));
+    if let Some(user_bin) = user_local_bin_dir() {
+        candidates.push(user_bin.join(binary));
+    }
+    for candidate in &candidates {
+        if let Ok(metadata) = fs::symlink_metadata(candidate) {
+            if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+                anyhow::bail!(
+                    "{} is a directory where a binary was expected; refusing to delete it",
+                    candidate.display()
+                );
+            }
+            fs::remove_file(candidate)
+                .with_context(|| format!("removing {}", candidate.display()))?;
+            return Ok(format!("Removed {}.", candidate.display()));
+        }
+    }
+    let resolved = resolve_binary_for_launch_parity_with(Some(&paths.bin_dir), binary);
+    anyhow::bail!(
+        "{} resolves to {} which is a system install — yggterm only removes binaries \
+         under its own managed dir or your user-local bin dir; remove it by hand if you want it gone",
+        tool.display_name(),
+        resolved
+            .as_deref()
+            .map(Path::display)
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| "a system path".to_string())
+    )
+}
+
+fn source_word(source: Option<ManagedCliBinarySource>) -> &'static str {
+    match source {
+        Some(ManagedCliBinarySource::Managed) => "managed",
+        Some(ManagedCliBinarySource::System) => "system",
+        None => "unavailable",
+    }
 }
 
 pub(crate) fn refresh_local_managed_cli(

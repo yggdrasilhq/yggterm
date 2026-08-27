@@ -4851,6 +4851,152 @@ one campaign note still says — returns **zero** over a plane holding 235 of th
 also written twice, once as the LLM-facing complaint record and once as a bare duration record, so
 an unfiltered count doubles.
 
+### ⭐ STILL OPEN ON 3.1.60 — re-measured 2026-08-27 AFTER both GUI-host ytrace twin fixes had landed
+
+The foreign_batch misattribution fix (`53e35cab`) and the mount-MRU gate landed well before this
+build, so **these numbers are post-fix and the class is not closed by them**. One measurement,
+GUI host, `ytrace tail --category ui` (byte-budget ring: only ~72 min survived — ⚠ a short ring
+under high density is itself a sign to read rates, not totals):
+
+| reading | value |
+|---|---:|
+| block spans | 651 |
+| window | 72 min |
+| rate | **9.1/min** |
+| severe ≥1 s | 51 (8%), worst **3291 ms** |
+
+Severe-attribution top (witness before each gap): `dioxus_render/component_window` ×21 ·
+**`app_control/request_begin` ×8** · `terminal_mount/js_debug` ×5. ⛔ Same caveat as the lesson
+above holds in full: a constantly-running stamper tops any such table without being its cause —
+the renderer probes every frame; it does not follow that rendering stalls. What survives every
+correction is the RATE: on the newest build, with the twins fixed, blocking runs ~9× the
+≤1/min bar, and `app_control/request_begin` is again inside the severe set with a 3.3 s stall.
+
+⇒ The named open work higher up (`HostHealth`'s inline awaits, `read_poll_apply`'s recovery
+awaits, and app-control's synchronous snapshot/merge serving) remains the queue top. The
+two clean instances found since — `spawn_web_profile_switch`'s lock probe (already
+`spawn_blocking`) and the profile-write-lock acquire in the web-surface reconcile loop
+(already a background task) — were checked and are NOT on the UI thread, so they are
+attribution neighbours, not suspects.
+
+⭐ **First post-twin-fix build verifies the twins STAY fixed while the class stays open
+(2026-08-27, 3.1.61, first 20 min):** `foreign_batch` appears **0** times as a `ui/block`
+blame — the attribution fix holds — while the rate reads **8.2/min** (164 spans, 24 severe
+≥1 s, worst 3525 ms), mount churn shows 29 `bootstrap_reset` in the same window, and
+`app_control/request_begin` fires 214 times (~10.7/min). Nothing regressed; nothing new
+closed.
+
+### ⛔ [11.0] THE 5-MINUTE NO-OP RESTART LOOP — THE GUI ASKS, THE DAEMON REFUSES, FOREVER, AND THE ASK ITSELF DEAFENED THE DAEMON
+
+**Status:** HALF FIXED (the deafness — `PEER_TRIAGE_PROBE_BUDGET_MS`); the loop remains OPEN
+with its owner being whoever next touches the bidirectional-convergence half.
+
+**Measured 2026-08-27, three days of GUI-host trace (`daemon_request/hot_restart`):** 392 spans,
+**387 of them in the 9-11 s bucket** (p50 10,233 ms), **~12 every hour around the clock** —
+gaps of 5 min 10 s, i.e. a 5-minute tick plus the call's own cost. One daemon pid answered 125
+of them across ~10 hours and was never replaced.
+
+**The correlation window names both halves.** Inside one span:
+`hot_update_install_state_promoted` → `spawned_hot_restart_daemon_child` →
+`hot_update_handoff_prepared` → **`hot_restart_swap_queue_skipped {"reason": "the replacement
+binary is not ahead of this daemon, so no swap can be owed"}`** →
+`spawned_daemon_exit {code: 0}` **0.7 s later** — the spawned successor bound for a socket the
+CALLER itself holds, so single-instance correctness killed it instantly — while
+`lock_holder {"held_ms": 10336, "request": "hot_restart"}` and
+`lock_wait_slow {"request": "status", "waited_us": 10261252}` show what the ask cost everyone
+else: **the daemon deaf for ten seconds, five minutes at a time, all day.**
+
+**Fixed half:** the under-lock duplicate-owner probe and live-successor lookup now carry a
+750 ms per-peer triage budget (`PEER_TRIAGE_PROBE_BUDGET_MS`), locked by a silent-peer test and
+a source contract. The snapshot fan-out got this same medicine earlier; hot-restart was the
+caller that never got it.
+
+**Open half (the loop):** `hot_restart_pending` stays true for a same-version newer-build-on-disk,
+the GUI's convergence fires every 5 min, the daemon answers "handoff started" while internally
+recording that **no swap can be owed**, a doomed child is spawned and instantly reaped — and
+nothing ever converges or backs off. Each round now costs ~1 s instead of ~10, but the honest
+fix is semantic: either the daemon's "no swap can be owed" verdict must reach the requester as
+*do not retry until the build changes*, or the same-version pending flag must clear when the
+daemon has answered the question once. **Falsifier:** with a newer build on disk at the same
+version, `daemon_request/hot_restart` must not recur more than once per build change.
+
+### ⭐ THE MINUTE-ALIGNED RENDER WAVE — THE FAN DRIVER, MEASURED (2026-08-27, post-reboot, 3.1.62)
+
+*Owner: "fan spinning rapidly — what resource, and is yggterm to blame?" Asked after rebooting
+away the swap disease. Everything thermal reads COOL — Tctl 50°C, GPU 46°C @ 9-11 W, NVMe 53°C,
+Wi-Fi 54°C — so the fan is not answering temperature; it is answering POWER, and the power
+picture has a yggterm signature on an otherwise idle machine.*
+
+**The steady state (40 s window, per-process deltas):** the machine's top FOUR CPU consumers are
+all yggterm family — WebKitWebProcess (the transcript Web View) 18.1% of a core, the daemon
+13.0%, the GUI shell 11.4%, ychrome 10.2% — **~0.5 core continuous** against a 96%-idle
+16-core box. By itself not a fan driver. The waves are:
+
+| reading | value |
+|---|---|
+| wave cadence | **exactly every 60 s** (:38:28, :39:28, :40:28) |
+| `render/web_content` per wave | **8.7-10.0 s CPU**, `core_fraction` 0.146-0.166 |
+| `render/gui` per wave | 4.4-7.0 s CPU, core_fraction 0.073-0.117 |
+| span payload | **`force_foreground: true`, `app_control_backgrounded: false`** |
+| coincidence | `terminal_app_declares` minute polls; on one wave, a `hot_warm_ensure_ok` on `remote-session://dev/8a5749e0…` that **held the daemon lock 615 ms**, forwarded a remote PTY resize, and replayed **25-29 K chars** of backlog into xterm |
+
+⇒ **A minute-aligned chore is force-rendering the entire GUI + webview every minute, whether or
+not anything changed.** Two of the three waves had no ensure behind them at all — the wave is
+not caused by terminal activity; terminal activity sometimes rides along. This is the
+blink-storm family (`[11.8]`'s "background chores each writing once per render it precedes")
+with a 60 s driver instead of a 2.5 s tick, and it hands the EC **60 power bursts an hour**,
+which in `performance` profile (the owner's own settled ruling — see `docs/settled-calls.md` §
+*CAPPING POWER TO CUT HEAT IS A CHEAT FIX*) fans the machine up on every burst even at cool
+temps.
+
+**What is fixed and verifiable on this same build (3.1.62):** the hot-restart deafness is GONE —
+`ytrace query daemon_request/hot_restart` over 45 minutes returns EMPTY, against 387 spans at
+10.2 s across the previous three days. `ui/block` reads **1.24/min** (56 in 45 min, worst
+3156 ms) against 8.2-9.1/min pre-fix — near the ≤1/min bar but not under it, and the max is
+still a visible freeze. The reboot cleared the swap disease completely: swap free 15.5 of
+16 GB, memory PSI 0.
+
+**Open and re-proven on the fresh boot:** the transcript Web View process — born AFTER the
+memory policy — reached **1.16 GB resident within ~2 h** and holds 18% of a core (the 6.7
+RSS-blindness bug, running as written).
+
+⇒ **The render-wave fix belongs to the render/blink lane**: whatever the 60 s chore is, a
+nothing-changed render must not force a foreground full paint of the transcript webview.
+**Falsifier:** quiet the GUI for five minutes with no typing and no session output; the
+`render/web_content` spans ≥5 s must not recur at 60 s cadence. The felt test: the fan settles
+on an idle desktop.
+
+### ⭐ THE INVISIBLE INSTANCE — A FAILED GUI RESTART LIVES ON AS A SECOND FULL GUI (2026-08-27)
+
+*Found by asking "why is the GUI host angry" with `ytop --probe` after the deploy night. Closed
+same night by hand; the mechanism is open.*
+
+**What was measured.** After the roll's convergence restart reported success
+(*"GUI restarted onto <build> — client and daemon now match"*), the owner saw **no window** and
+launched one by hand — leaving **two complete GUIs** running for 40+ minutes: the roll's
+instance (ppid 1, its binary since deleted under it) each with its own WebKit children, its own
+render loop, its own app-control polling. The second instance burned ~15% of a core through a
+163 MB webview and ~160 MB RSS + 159 MB swap doing it, **with no human able to see it**. The
+daemon answered `handled_by_pid` = the owner's instance; nothing anywhere said a second client
+existed at all.
+
+**And the daemon sat in a cgroup scope named for a pid that died hours earlier**
+(`yggterm-gui-<dead-pid>.scope`), so even the scope name pointed at a ghost.
+
+⇒ **Two defects in one shape:**
+1. **A restart is reported successful when only the PROCESS came up.** The window never
+   presented, the process survived, and every witness (the roll log, `server app state`, the
+   scope name) answered about processes and versions, never about whether a human can see
+   anything. Same class as the paint-ready DOM check: a presence proxy named for presentation.
+2. **Nothing reconciles two GUIs after a manual relaunch** — the second instance is invisible to
+   every verb the owner or an agent would consult.
+
+⇒ **Remedy shape (not built here):** a present-watchdog — a GUI that maps no window within N
+seconds of launch exits non-zero, so the roll's restart reports the failure it actually had; and
+the convergence path should refuse to leave an un-presented instance alive beside a presented
+one. **Falsifier:** repeat the deploy night — kill a window's presentation, let the roll
+"restart" it — then count GUI processes; two alive with one window is the defect.
+
 ### ⭐ THE DECLARE PROBE'S CADENCE IS NOW EXACT — a correct negative, re-asked every minute, per row
 
 The fix direction *"a cached negative for the declare probe"* recorded elsewhere in this file now
@@ -11760,9 +11906,17 @@ transition rewrites it regardless of what any agent set**. Nothing was left
 applied by this campaign: the 19:06 write was a no-op because the machine had
 already switched itself to `balanced` on unplugging.
 
-⇒ **Owner gate**, in `owner-attention.md`: whether the *AC* profile should be
-`balanced` rather than `performance`. That is a persistent preference about his
-machine's power behaviour, not a defect fix.
+⇒ **Owner gate, ANSWERED since — see `docs/settled-calls.md` § *CAPPING POWER TO
+CUT HEAT IS A CHEAT FIX* (ruling 2026-08-14, re-confirmed 2026-08-27): the AC
+profile is `performance`, and `balanced` on AC is refused without re-opening the
+call. Battery keeps `balanced`.** ⭐ **And the mechanism that let the dead
+recommendation haunt the machine is measured:** the pin was withdrawn but TLP
+had already stopped re-applying its own config, so `/etc/tlp.conf` said
+`PLATFORM_PROFILE_ON_AC=performance` for days while the live sysfs read
+`balanced` — found 2026-08-27, restored with `sudo tlp start` in one step.
+**Before any heat investigation on this host, compare the LIVE
+`/sys/firmware/acpi/platform_profile` with the TLP config; a stale profile
+impersonates a heat regression.**
 
 ### The compaction waste is real, but it is a separate and much smaller item
 
@@ -12010,6 +12164,16 @@ will not by itself bring the machine out of swap, and claiming otherwise would
 set up a measurement that is guaranteed to disappoint.
 
 *single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
+
+⭐ **AND STILL TRUE ON THE NEWEST BUILD, WITH THE POLICY APPLIED FROM BIRTH (2026-08-27,
+3.1.61):** the active session's Web View process — born 2026-08-27 *after* both
+memory-policy fixes, so it never ran unbounded — reached **727 MB RSS + 282 MB swapped
+(≈1.0 GB committed) in ~30 minutes**, and grew **660 → 727 MB across a ten-minute window in
+which nothing streamed into it at all** (idle growth). Its CPU calmed to ~2% of a core once the
+rendering finished; the memory did not come back. This is the settled RSS-metric blindness
+running exactly as written, on processes the jar-less fix covers — the bound cannot fire, and
+per-tab reclaim never engages, because the number WebKit reads is not the number that is
+growing. Nothing here contradicts the analysis; it is the analysis, live.
 
 `configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
 `YGGTERM_WEBKIT_CACHE_MODEL=web-browser` and a limit of
