@@ -30789,6 +30789,47 @@ console.log('ok');
             WorkspaceViewMode::Terminal
         );
     }
+
+    /// App-control used to bypass the row capability guard: forcing `preview`
+    /// on a ychrome shell hid its native page and exposed the dead terminal-
+    /// transcript placeholder. A browser webview is an overlay on the terminal
+    /// plane, not a rendered transcript owned by the shell row.
+    #[test]
+    fn app_control_preview_request_for_web_surface_shell_stays_terminal() {
+        let session_path = "local://browser-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        seed_web_surface(&mut shell, session_path);
+        let row = test_sidebar_row(session_path);
+
+        let (effective, adjustment) = app_control_open_mode_for_row(
+            &shell,
+            &row,
+            WorkspaceViewMode::Rendered,
+        );
+
+        assert_eq!(effective, WorkspaceViewMode::Terminal);
+        assert_eq!(
+            adjustment,
+            Some("requested preview is unavailable for this row")
+        );
+    }
+
+    #[test]
+    fn app_control_preview_request_for_agent_transcript_remains_rendered() {
+        let session_path = "codex://agent-preview";
+        let shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut row = test_sidebar_row(session_path);
+        row.session_kind = Some(SessionKind::Codex);
+
+        let (effective, adjustment) = app_control_open_mode_for_row(
+            &shell,
+            &row,
+            WorkspaceViewMode::Rendered,
+        );
+
+        assert_eq!(effective, WorkspaceViewMode::Rendered);
+        assert_eq!(adjustment, None);
+    }
     #[test]
     fn delete_shortcut_does_not_target_tree_while_terminal_is_active() {
         let session_path = "local://delete-key";

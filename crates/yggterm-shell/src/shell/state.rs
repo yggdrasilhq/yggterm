@@ -42388,6 +42388,31 @@ fn preferred_open_mode_for_row(shell: &ShellState, row: &BrowserRow) -> Workspac
     }
 }
 
+/// Resolve an app-control view request against the surface the row actually
+/// owns.
+///
+/// `preview` means the shell's rendered transcript/document plane. A native
+/// libyggterm web surface is not that plane: it is an app-owned child surface
+/// composited over its live shell row while the workspace stays in `Terminal`.
+/// Blindly honouring `--view preview` on a ychrome row therefore hid the page
+/// and exposed the shell's unreachable transcript placeholder. The ordinary
+/// row-open path already refuses that state through
+/// [`preferred_open_mode_for_row`]; app-control must use the same capability
+/// rule instead of bypassing it.
+fn app_control_open_mode_for_row(
+    shell: &ShellState,
+    row: &BrowserRow,
+    requested: WorkspaceViewMode,
+) -> (WorkspaceViewMode, Option<&'static str>) {
+    if requested == WorkspaceViewMode::Rendered && !row_offers_rendered_view(shell, row) {
+        return (
+            preferred_open_mode_for_row(shell, row),
+            Some("requested preview is unavailable for this row"),
+        );
+    }
+    (requested, None)
+}
+
 /// Whether `row`'s session has a non-terminal surface to show.
 ///
 /// Kind answers for agent CLIs and documents; for a shell it depends on whether
@@ -42418,8 +42443,9 @@ fn session_path_offers_rendered_view(
     if kind.is_some_and(SessionKind::offers_rendered_view) {
         return true;
     }
-    // The shell-hosts-an-app case: the app owns the surface, so its declaration
-    // is the authority, not the session's kind.
+    // A declared DOCUMENT pane belongs to the rendered plane. A native browser
+    // page does not: it is composited over the app's terminal row and therefore
+    // deliberately does not make the transcript-preview toggle reachable.
     shell.viewport_pane_for_session(session_path).is_some()
 }
 
@@ -85127,7 +85153,16 @@ async fn process_pending_app_control_requests(
                 }
                 Some(row) => {
                     let mut terminal_open_attempt = None::<Value>;
-                    if let Some(mode) = resolved_view_mode {
+                    let requested_view_mode =
+                        resolved_view_mode.map(|mode| format!("{mode:?}"));
+                    let mut effective_view_mode = None::<String>;
+                    let mut view_mode_adjustment = None::<&'static str>;
+                    if let Some(requested_mode) = resolved_view_mode {
+                        let (mode, adjustment) = state.with(|shell| {
+                            app_control_open_mode_for_row(shell, &row, requested_mode)
+                        });
+                        effective_view_mode = Some(format!("{mode:?}"));
+                        view_mode_adjustment = adjustment;
                         state.with_mut_counted(|shell| {
                             shell.prepare_app_control_foreground_open();
                             shell.server.set_view_mode(mode);
@@ -85164,7 +85199,9 @@ async fn process_pending_app_control_requests(
                         data: Some(json!({
                             "queued": true,
                             "session_path": session_path,
-                            "view_mode": resolved_view_mode.map(|mode| format!("{mode:?}")),
+                            "requested_view_mode": requested_view_mode,
+                            "view_mode": effective_view_mode,
+                            "view_mode_adjustment": view_mode_adjustment,
                             "terminal_open_attempt": terminal_open_attempt,
                         })),
                         error: None,

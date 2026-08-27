@@ -26178,8 +26178,19 @@ pub fn run_app_control_open_path(
         },
         timeout_ms,
     )?;
-    let settled_state =
-        wait_for_app_control_open_path_ready(&home, session_path, view_mode, timeout_ms)?;
+    // The GUI is the capability owner. It may safely adjust an impossible
+    // request (for example `preview` on a shell-hosted native web surface) and
+    // reports the effective mode in the first response. Wait for that mode,
+    // not the request that was refused, or the CLI times out after the GUI has
+    // already done the right thing.
+    let settled_view_mode = app_control_effective_open_view_mode(response.data.as_ref())
+        .or_else(|| view_mode.clone());
+    let settled_state = wait_for_app_control_open_path_ready(
+        &home,
+        session_path,
+        settled_view_mode,
+        timeout_ms,
+    )?;
     let mut data = response.data.take().unwrap_or_else(|| json!({}));
     if let Some(map) = data.as_object_mut() {
         map.insert("activated".to_string(), Value::Bool(true));
@@ -26188,6 +26199,14 @@ pub fn run_app_control_open_path(
     response.data = Some(data);
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
+}
+
+fn app_control_effective_open_view_mode(data: Option<&Value>) -> Option<AppControlViewMode> {
+    match data?.get("view_mode")?.as_str()? {
+        "Terminal" | "terminal" => Some(AppControlViewMode::Terminal),
+        "Rendered" | "Preview" | "rendered" | "preview" => Some(AppControlViewMode::Preview),
+        _ => None,
+    }
 }
 
 fn app_control_open_path_ready(
@@ -37615,6 +37634,28 @@ mod tests {
             "remote-session://guihost/test",
             Some(&super::AppControlViewMode::Preview),
         ));
+    }
+
+    #[test]
+    fn app_control_open_wait_uses_gui_adjusted_effective_mode() {
+        assert_eq!(
+            super::app_control_effective_open_view_mode(Some(&json!({
+                "requested_view_mode": "Rendered",
+                "view_mode": "Terminal",
+                "view_mode_adjustment": "requested preview is unavailable for this row",
+            }))),
+            Some(super::AppControlViewMode::Terminal)
+        );
+    }
+
+    #[test]
+    fn app_control_open_wait_keeps_supported_preview_mode() {
+        assert_eq!(
+            super::app_control_effective_open_view_mode(Some(&json!({
+                "view_mode": "Rendered",
+            }))),
+            Some(super::AppControlViewMode::Preview)
+        );
     }
 
     #[test]
