@@ -24738,3 +24738,47 @@ already installed.
 the launch path uses, so one `PATH` answers both questions. **Falsified by:** probing a
 machine whose CLIs sit on a login-only `PATH` entry and seeing the matrix disagree with
 that machine's own local self-report.
+
+## ynpm/browser retro (2026-08-27): ten filed frictions from docs/agent-browser-workflow-retrospective-2026-08-27.md
+
+A live authenticated data-polishing workflow filed ten items. The doc is the
+SSOT for the full narrative; the queue keeps the list + one-line contracts so
+nothing evaporates:
+
+1. **Viewport-mutating verbs vs multiple clients** — should an untargeted
+   `app open --view …` refuse whenever >1 live client exists? Runtime guard
+   shipped (`1474e1d7`); the blanket refusal is the open question.
+2. **Browser-profile ownership capability matrix** — attended Ychrome owns the
+   profile; shadow owns shell geometry/mode; `ychrome ctl` owns authenticated
+   page QA. Must be explicit in help output, not re-derived from lock warnings.
+3. **`web ensure` cold-surface recovery contract** — `accepted:true` +
+   `about:blank` must never read as recovery: either restore the declared URL
+   (new generation reported) or refuse naming why. Same family as
+   agent-passkey-gap-2026-07-28; recurred live after a GUI update.
+4. **Update-proof staleness** — update/restart must expose the successor client
+   identity + carry active row/view across; an attended-client alias instead of
+   PID rediscovery; proof helpers stamp build/row before/after.
+5. **One app-control response envelope** — `.data` vs `.data.state` split made
+   a plausible jq query return null. Want settled-state consistency or a
+   `--field` projection that exits non-zero on absence.
+6. **`ychrome ctl eval --stdin` / `js_file=PATH`** — long programs must stop
+   surviving three shell layers; per-eval isolation from prior globals.
+   Validated again by this workflow; the pending-bugs entry predates it.
+7. **Capture must name the scroll owner** — `region=full` is ROOT-scroll
+   capture; inner-container SPAs get cropped. Report candidate scrollports;
+   `region=scrollport selector=…` / `region=auto-full` stitching later.
+8. **Anonymous interactive controls flagged in snapshots** — a pagination
+   control showing only `✓` forced ordinal addressing. Snapshots should flag
+   repeated unnamed controls and recommend accessible names.
+9. **One non-interactive tools PATH + a `browser-engine` forwarding verb** —
+   `ychrome` was absent from PATH over plain ssh; agents must not rediscover
+   the sibling binary's location per host.
+10. **Stable ctl error codes + retryability** — a transient 400 open-failure
+    was indistinguishable from an invalid request. Machine-readable codes,
+    request ids, retry flags; a proof primitive owns bounded retries.
+
+Related landed tonight: the passkey half of the same family — engine pages
+carry the scoped shim + the engine registers the `yggterm-appctl://` scheme
+(ychrome `467a1fc`), and `ctl fido2 list|grant|deny|shim` answers ceremonies
+agentically (`aabd89d`+`955107a`). The desired end state (one proof command →
+one manifest) builds on items 4, 5, 7, 10.
