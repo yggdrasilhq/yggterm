@@ -14,6 +14,8 @@ This skill is the agent's hands and eyes on the live yggterm desktop. Use it to:
 5. **Verify before claiming shipped**: per CLAUDE.md, "compiled binary on disk + passing unit tests" is not proof. Exercise the affordance live via this skill and quote the evidence (screenshot path, state field value, telemetry event) in the user-facing report.
 
 This was the explicit design intent: yggterm is agent-first controllable for everything from a remote console.
+The authenticated browser-polishing friction and desired platform primitive are
+recorded in `docs/agent-browser-workflow-retrospective-2026-08-27.md`.
 
 ## ⛔ FIRST DECISION: read a background row without moving the user's viewport
 
@@ -41,6 +43,35 @@ Canonical quiet Ychrome read:
 yggterm server app web read --as readable --session <ychrome-row>
 yggterm server app web screenshot <scratch.png> --session <ychrome-row>
 ```
+
+For repeatable authenticated browser QA—or when the prepared native surface is
+`no_webview`, reclaimed, or cold—use Ychrome's agent engine instead of
+foregrounding the row:
+
+```bash
+~/.local/bin/ychrome ctl open url=https://example.test profile=<prepared-profile>
+~/.local/bin/ychrome ctl wait page_id=<id> 'until={"idle_ms":800}'
+~/.local/bin/ychrome ctl eval page_id=<id> js='document.body.innerText'
+~/.local/bin/ychrome ctl shot page_id=<id> --out <scratch.png>
+~/.local/bin/ychrome ctl close page_id=<id>
+```
+
+The ctl page is **not the user's literal visible tab**. It is an offscreen peer
+that reuses the same named profile, cookie jar, egress, blockers, and identity;
+that is what makes it suitable for release proof without changing the user's
+selected row or tab. Close the temporary page. On non-login SSH shells,
+`ychrome` may not be on `PATH`; use the installed absolute path rather than
+concluding the command is absent.
+
+⛔ Do not blindly treat `web ensure` as a recovery primitive for a prepared
+authenticated page. A cold post-restart surface can report `no_webview`, queue
+a rebuild, and answer from `about:blank`. If preserving the exact visible tab
+matters, stop and report that fact; if the task is browser QA, use the ctl
+engine with the prepared profile.
+
+⚠ `ychrome ctl shot region=full` captures the root document's scroll extent.
+Apps with an inner scrollport can still return one viewport. Scroll the changed
+heading into view (or target its element) before taking the proof screenshot.
 
 ## ⛔ BEFORE YOU RESTART THE GUI: the presentation policy binds you
 
