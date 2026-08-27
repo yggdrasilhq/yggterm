@@ -9718,7 +9718,7 @@ console.log('ok');
     fn pinned_grid_script_prepends_only_for_a_read_only_viewer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let unpinned =
-            terminal_eval_script_with_pinned_grid("yggterm-terminal-test", &theme, true, None);
+            terminal_eval_script_with_pinned_grid("yggterm-terminal-test", &theme, true, None, None);
         assert!(
             !unpinned.contains("__yggtermShadowPinnedGrid ="),
             "the user's own GUI owns the PTY and must keep fitting to its window"
@@ -9733,11 +9733,80 @@ console.log('ok');
             &theme,
             true,
             Some((168, 63)),
+            None,
         );
         assert!(pinned.contains("window.__yggtermShadowPinnedGrid = { cols: 168, rows: 63 };"));
         assert!(
             pinned.ends_with(&terminal_eval_script("yggterm-terminal-test", &theme, true)),
             "the pin must be a prefix so the mount script itself is unchanged"
+        );
+    }
+
+    /// THE SQUISHED-VIEWPORT BIRTH FIX (2026-08-27). xterm's own default is
+    /// 80×24; a surface born there while its PTY lives at 169×65 squishes the
+    /// TUI into the stale canvas with a dead strip beside it — the outer
+    /// viewport never repaints because nothing tells it to. The mount now seeds
+    /// the constructor with the session's known PTY geometry for EVERY client,
+    /// and the constructor consumes it.
+    #[test]
+    fn the_mount_seeds_the_birth_grid_into_the_constructor() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let seeded = terminal_eval_script_with_pinned_grid(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            None,
+            Some((169, 65)),
+        );
+        assert!(
+            seeded.contains("window.__yggtermInitialGrid = { cols: 169, rows: 65 };"),
+            "the birth grid must be assigned before the mount script"
+        );
+        // The CONSTRUCTOR consumes it — not just an assignment nobody reads.
+        let constructor = seeded
+            .find("const term = new window.Terminal({")
+            .map(|at| &seeded[at..at + 900])
+            .expect("the Terminal constructor exists");
+        assert!(
+            constructor.contains("__yggtermInitialGrid"),
+            "the Terminal constructor must read the birth grid"
+        );
+        assert!(
+            constructor.contains("cols >= 20 && rows >= 4"),
+            "the seed is guarded against degenerate grids at birth"
+        );
+
+        // Without an initial grid nothing is ASSIGNED — the constructor's read
+        // is unconditional by design (it spreads an empty object when the
+        // global is absent), so the pre-existing default path is unchanged.
+        let plain = terminal_eval_script_with_pinned_grid(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            None,
+            None,
+        );
+        assert!(
+            !plain.contains("window.__yggtermInitialGrid ="),
+            "no birth grid, no assignment — the pre-existing default path is unchanged"
+        );
+        assert_eq!(plain, terminal_eval_script("yggterm-terminal-test", &theme, true));
+
+        // And the provider itself must NOT gate on the shadow role: the whole
+        // point is that the ACTIVE client's canvas is born at the real grid.
+        let source = include_str!("terminal_scripts.rs");
+        let at = source
+            .find("fn initial_terminal_grid_for_mount")
+            .expect("the birth-grid provider exists");
+        let body = &source[at..at + 700];
+        assert!(
+            body.contains("parse_pty_size_cells"),
+            "the birth grid comes from the session's PTY size metadata"
+        );
+        assert!(
+            !body.contains("client_is_shadow_viewer"),
+            "the birth grid applies to EVERY client — the Active client's \
+             canvas is the one that was squishing"
         );
     }
     #[test]

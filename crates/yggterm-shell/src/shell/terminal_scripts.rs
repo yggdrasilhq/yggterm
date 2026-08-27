@@ -49,17 +49,37 @@ fn terminal_eval_script(
 ///
 /// `pinned_grid` is `None` for the user's own GUI (which owns the PTY and sizes
 /// it by fitting, as before), so this prepends nothing on that path.
+///
+/// `initial_grid` is the BIRTH value for every client: xterm's own default is
+/// 80×24, and a surface born at the default while its PTY already lives at
+/// another grid is the squished-viewport class — measured live 2026-08-27 on
+/// the GUI host: `xterm_paint/mount_open {cols: 80, rows: 24}` beside a
+/// 169×65 PTY, the sync resize answered `resize_noop` because the PTY was
+/// already right, and nothing ever told the CANVAS. Seeding the constructor
+/// removes the 80×24 phase entirely; the fit only fine-tunes afterward.
 fn terminal_eval_script_with_pinned_grid(
     host_id: &str,
     theme: &TerminalTheme,
     initial_input_enabled: bool,
     pinned_grid: Option<(u64, u64)>,
+    initial_grid: Option<(u64, u64)>,
 ) -> String {
     let script = terminal_eval_script(host_id, theme, initial_input_enabled);
-    let Some((cols, rows)) = pinned_grid else {
+    let mut prefix = String::new();
+    if let Some((cols, rows)) = initial_grid {
+        prefix.push_str(&format!(
+            "window.__yggtermInitialGrid = {{ cols: {cols}, rows: {rows} }};\n"
+        ));
+    }
+    if let Some((cols, rows)) = pinned_grid {
+        prefix.push_str(&format!(
+            "window.__yggtermShadowPinnedGrid = {{ cols: {cols}, rows: {rows} }};\n"
+        ));
+    }
+    if prefix.is_empty() {
         return script;
-    };
-    format!("window.__yggtermShadowPinnedGrid = {{ cols: {cols}, rows: {rows} }};\n{script}")
+    }
+    format!("{prefix}{script}")
 }
 
 /// The grid a read-only viewer should pin its xterm to for `session_path`:
@@ -71,6 +91,22 @@ fn shadow_pinned_terminal_grid(shell: &ShellState, session_path: &str) -> Option
     if !client_is_shadow_viewer() {
         return None;
     }
+    let session = shell.server.session_for_path(session_path)?;
+    let (cols, rows) = parse_pty_size_cells(&metadata_value(session, "PTY size"))?;
+    terminal_grid_is_usable_cells(cols, rows).then_some((cols, rows))
+}
+
+/// The grid EVERY client's xterm should be BORN with for `session_path`: the
+/// session's current PTY geometry from the same "PTY size" metadata the session
+/// panel displays. Unlike the shadow pin this is a birth value only — the
+/// Active client still owns fitting to its window afterward — but xterm's own
+/// default is 80×24, and a surface born at the default while its PTY already
+/// lives at another grid is the squished-viewport class (live 2026-08-27:
+/// `xterm_paint/mount_open {cols: 80, rows: 24}` beside a 169×65 PTY, the sync
+/// resize answered `resize_noop` because the PTY was already right, and nothing
+/// ever told the canvas — the outer viewport never repainted and the TUI
+/// rendered squished into the stale canvas with a dead strip beside it).
+fn initial_terminal_grid_for_mount(shell: &ShellState, session_path: &str) -> Option<(u64, u64)> {
     let session = shell.server.session_for_path(session_path)?;
     let (cols, rows) = parse_pty_size_cells(&metadata_value(session, "PTY size"))?;
     terminal_grid_is_usable_cells(cols, rows).then_some((cols, rows))
@@ -1395,6 +1431,19 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
         }}
         const term = new window.Terminal({{
+            // BIRTH GRID: Rust seeds the session's current PTY geometry
+            // (`__yggtermInitialGrid`, from the same "PTY size" the session
+            // panel shows) so the surface is never born at xterm's 80×24
+            // default while the PTY lives elsewhere — the squished-viewport
+            // class. Absent → the object spreads nothing and xterm defaults
+            // apply as before. The fit still fine-tunes afterward; this only
+            // removes the wrong birth geometry and the letterbox phase.
+            ...(() => {{
+                const g = window.__yggtermInitialGrid;
+                const cols = Number((g && g.cols) || 0);
+                const rows = Number((g && g.rows) || 0);
+                return (cols >= 20 && rows >= 4) ? {{ cols, rows }} : {{}};
+            }})(),
             allowProposedApi: true,
             // User bug 6 (multiline URLs): xterm's DEFAULT OSC-8 link handler
             // shows a confirm() dialog and then calls window.open(), which is
