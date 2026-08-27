@@ -15,6 +15,33 @@ This skill is the agent's hands and eyes on the live yggterm desktop. Use it to:
 
 This was the explicit design intent: yggterm is agent-first controllable for everything from a remote console.
 
+## ⛔ FIRST DECISION: read a background row without moving the user's viewport
+
+Before the first `app open`, decide whose viewport the command targets.
+
+- **Content-only inspection:** prefer session-addressed verbs; they do not
+  select the row: `server app web read|eval|screenshot --session <path>` and
+  `server app terminal read-buffer <path>`.
+- **A viewport is genuinely required:** start a named shadow first, then pass
+  `--client <shadow>` to every `open`, view switch, state probe, screenshot,
+  search, or pointer action. The complete recipe and teardown duty are in
+  "THE SHADOW-PROBE LAW" below.
+- **Never run an untargeted `app open` as an inspection step.** It routes to the
+  active client and visibly changes the user's selected row. This remains true
+  when the target is an existing Ychrome row.
+- **`--view preview` is the agent-transcript/document plane, not a Ychrome
+  page.** A native libyggterm browser surface is composited over its shell row
+  while that row remains in `Terminal`. Current builds safely adjust an
+  impossible preview request back to `Terminal`; older builds expose a dead
+  terminal-transcript placeholder, so omit `--view` when opening an app row.
+
+Canonical quiet Ychrome read:
+
+```bash
+yggterm server app web read --as readable --session <ychrome-row>
+yggterm server app web screenshot <scratch.png> --session <ychrome-row>
+```
+
 ## ⛔ BEFORE YOU RESTART THE GUI: the presentation policy binds you
 
 This skill hands you `app launch` and the kill-and-relaunch loop. That power is
