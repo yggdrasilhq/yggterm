@@ -1070,10 +1070,40 @@ fn terminal_eval_script_with_canvas_renderer(
         // is to compute the grid against the box that actually paints it. Every
         // consumer of that 8px reads it from here, so the paint box and the grid
         // can never drift apart again.
-        const terminalScrollbarGutterPx = () => Math.max(
-            0,
-            Number(window.__yggtermXtermScrollbarGutterPx || 8)
-        );
+        let lastAppliedScrollbarGutterPx = null;
+        const syncScrollbarGutterVar = () => {{
+            try {{
+                const gutterPx = terminalScrollbarGutterPx();
+                if (lastAppliedScrollbarGutterPx === gutterPx) {{
+                    return;
+                }}
+                lastAppliedScrollbarGutterPx = gutterPx;
+                if (host && host.style) {{
+                    host.style.setProperty('--yggterm-scrollbar-gutter', gutterPx + 'px');
+                }}
+                // The grid proposal subtracts the SAME number — a transition
+                // between screens must re-fit or the columns lie.
+                fitTerminalToHost('scrollbar_gutter_changed');
+            }} catch (_error) {{}}
+        }};
+        const terminalScrollbarGutterPx = () => {{
+            // XTERM-BUG: gutter-steals-tui-width — on the ALTERNATE screen a
+            // full-screen TUI (opencode, grok, claude, any editor) repaints
+            // its own right edge every frame; scrollback does not exist, so
+            // the scrollbar reservation is pure theft: the TUI's last column
+            // lands under the clip or a dead 8px strip rides its right
+            // flank. Alternate screen → no gutter, full width, no D-pad.
+            try {{
+                const active = term && term.buffer ? term.buffer.active : null;
+                if (active && active.type === 'alternate') {{
+                    return 0;
+                }}
+            }} catch (_error) {{}}
+            return Math.max(
+                0,
+                Number(window.__yggtermXtermScrollbarGutterPx || 8)
+            );
+        }};
         const hostMetrics = () => {{
             const rect = host.getBoundingClientRect();
             const computed = window.getComputedStyle(host);
@@ -3360,7 +3390,7 @@ fn terminal_eval_script_with_canvas_renderer(
                        the ::-webkit-scrollbar width rule below, and the
                        SAME number the grid proposal subtracts — see
                        XTERM-BUG: right-edge-glyph-clipped. */
-                    width: calc(100% - ${{terminalScrollbarGutterPx()}}px) !important;
+                    width: calc(100% - var(--yggterm-scrollbar-gutter, 8px)) !important;
                 }}
                 /* XTERM-BUG: scrollable-element-zero-height (xterm.js 6)
                    xterm.js 6 moved .xterm-screen INSIDE a new VS Code-derived
@@ -6278,6 +6308,22 @@ fn terminal_eval_script_with_canvas_renderer(
                 const baseY = Math.max(0, Number(active.baseY || 0));
                 const rows = Math.max(1, Number(term.rows || 0));
                 const distanceRows = Math.max(0, baseY - viewportY);
+                // Alternate screen: no scrollback exists to scroll, the D-pad
+                // would only overlay the TUI's own chrome, and the gutter it
+                // implies must be released (and the grid re-fit at full
+                // width) the moment the TUI takes the screen.
+                if (active.type === 'alternate') {{
+                    controller.style.opacity = '0';
+                    controller.style.pointerEvents = 'none';
+                    controller.setAttribute('data-yggterm-scroll-controller-visible', 'false');
+                    if (entry) {{
+                        entry.scrollControllerVisible = false;
+                        entry.scrollControllerReason = 'alternate_screen';
+                    }}
+                    syncScrollbarGutterVar();
+                    return;
+                }}
+                syncScrollbarGutterVar();
                 const visible = distanceRows >= Math.max(3, Math.ceil(rows / 2))
                     || scrollbackIntent === 'UserScrollback';
                 controller.style.opacity = visible ? '1' : '0';
