@@ -11,6 +11,20 @@
 #
 #   scripts/deploy-fleet.sh [--from <dir>] [--hosts "dev guihost oc"] [--dry-run]
 #                           [--allow-behind] [--preflight] [--no-pin]
+#                           [--allow-downgrade]
+#
+# ⛔⛔ A DEPLOY MAY NEVER TAKE A HOST BACKWARDS — 2026-08-27, MEASURED TWICE IN
+# ONE HOUR. The hourly roll put 3.1.61 fleet-wide and restarted the GUI host;
+# minutes later a lane deploying from a STALE checkout wrote 3.1.60 back over
+# all four flat paths (mtimes 01:47:59 and 02:01:40), clobbered the fresh GUI's
+# binary under three running windows, and left every host one version behind —
+# silently, with four green ✅ rows, because nothing in this script asked
+# "older than what is already there?". The roll's own commit compare then saw
+# the live daemon still current and skipped, so the regression persisted.
+# ⇒ Per host, before any write: read the version the host already carries and
+#   refuse a strictly-older incoming build. Same version and newer proceed;
+#   a fresh host has nothing to compare and proceeds. `--allow-downgrade`
+#   exists for the deliberate rollback and says so in the log.
 #
 # ⭐ `--preflight` runs ONLY the ancestry check and exits, without needing build
 # products. Run it BEFORE the release build. The ancestry gate is correct and is
@@ -40,13 +54,15 @@ FROM="target/release"
 # ⇒ `scripts/ygg-live-host.sh` is the repo's single owner of "where is the live
 #   GUI". Ask it. If it cannot answer, say so loudly rather than deploying to a
 #   short list that looks complete.
-HOSTS="dev $("$(dirname "$0")/ygg-live-host.sh" 2>/dev/null || true) oc"
+LIVE_HOST="$("$(dirname "$0")/ygg-live-host.sh" 2>/dev/null || true)"
+HOSTS="dev $LIVE_HOST oc"
 HOSTS="$(printf '%s\n' $HOSTS | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
 DRY=0
 ALLOW_BEHIND=0
 PREFLIGHT=0
 HOSTS_EXPLICIT=0
 NO_PIN=0
+ALLOW_DOWNGRADE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
@@ -55,6 +71,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift;;
     --allow-behind) ALLOW_BEHIND=1; shift;;
     --preflight) PREFLIGHT=1; shift;;
+    --allow-downgrade) ALLOW_DOWNGRADE=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -67,10 +84,12 @@ done
 # ⇒ Measured cost: `deploy_fleet_guard`'s two ancestry tests passed `--hosts local`,
 # were refused before it was parsed, and sat RED long enough to be filed as a
 # known-failing pair — a real gate whose tests nobody could read.
-# ⚠ The refusal itself is CORRECT and stays: resolving to fewer than three hosts
-# silently skips the only host a UI change can be proven on. It simply must not
-# fire when the caller has already answered the question.
-if [ "$HOSTS_EXPLICIT" = 0 ] && [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
+# ⚠ The refusal itself is CORRECT and stays: failing to resolve the live host
+# silently skips the only host a UI change can be proven on. Count is not the
+# invariant: the live host may legitimately be one of the fixed fleet hosts
+# (for example `dev`), leaving two unique names after deduplication. Preserve the
+# resolver's answer and prove that exact answer remains in the deployment set.
+if [ "$HOSTS_EXPLICIT" = 0 ] && { [ -z "$LIVE_HOST" ] || ! printf '%s\n' $HOSTS | grep -Fxq "$LIVE_HOST"; }; then
   echo "deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing." >&2
   echo "  Deploying to '$HOSTS' would SKIP the only host a UI change can be proven on." >&2
   echo "  Pass --hosts explicitly if that is really what you want." >&2
@@ -276,14 +295,29 @@ echo "deploy-fleet: $VERSION ($BUILD_COMMIT) from $FROM → $HOSTS"
 GUI_SUM=$(md5sum "$GUI" | awk '{print $1}')
 HL_SUM=$(md5sum "$HL" | awk '{print $1}')
 
-# The four copies, and which build product belongs in each. `~/.local/bin` is the
+# The six copies, and which build product belongs in each. `~/.local/bin` is the
 # GUI's home; `~/.yggterm/bin` is the install root the daemon actually runs from
 # AND the path remote sessions invoke. All four are real, so all four are written.
+#
+# ⛔⛔ AND THE MANAGED-VERSIONS PAIR IS NOT OPTIONAL — ITS ABSENCE DEADLOCKED THE
+# GUI UPDATE RESTART. The GUI's convergence finder (`installed_gui_executable_for_version`)
+# and `install_path_declared_version` trust exactly one layout statement:
+# `~/.yggterm/versions/<VERSION>/<binary>`. This script wrote the flat four and
+# walked past that directory, whose newest entry was 3.1.59 while the fleet ran
+# 3.1.60+ — so the finder answered "no matching GUI binary on disk" for a binary
+# THIS DEPLOY HAD JUST WRITTEN, convergence returned None, and a GUI that was
+# closed (by a deploy, a crash, or the draft-hold retry) had nothing to relaunch
+# onto: measured on the GUI host 2026-08-27 as the live "Version Skew — Binary
+# Missing" notification and a dead window the owner relaunched by hand. The
+# version directory IS the declaration — nothing can bump it without a move —
+# so writing it is what makes convergence true on every host.
 declare -A COPY=(
   ["\$HOME/.local/bin/yggterm"]="GUI"
   ["\$HOME/.local/bin/yggterm-headless"]="HL"
   ["\$HOME/.yggterm/bin/yggterm"]="GUI"
   ["\$HOME/.yggterm/bin/yggterm-headless"]="HL"
+  ["\$HOME/.yggterm/versions/$VERSION/yggterm"]="GUI"
+  ["\$HOME/.yggterm/versions/$VERSION/yggterm-headless"]="HL"
 )
 
 # ⛔ NEVER `rm -f *.old.*`. A past deploy renamed a live binary while a daemon
@@ -415,7 +449,7 @@ for host in $HOSTS; do classify_host "$host"; done
 # as a partial deploy; one named refusal reads as what it is.
 for host in $HOSTS; do
   [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] || continue
-  echo "  ⛔ $host: cannot be reached over ssh, so its four copies are SKIPPED, not failed." >&2
+  echo "  ⛔ $host: cannot be reached over ssh, so its six copies are SKIPPED, not failed." >&2
   echo "     If this is the machine you are standing on, its fleet alias and its" >&2
   echo "     kernel hostname ($(hostname -s)) differ and nothing local can bridge them." >&2
   echo "     Fix it for good with:  export YGG_FLEET_SELF=$host" >&2
@@ -441,6 +475,33 @@ fi
 for host in $HOSTS; do
   [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] && continue
 
+  # ⛔ THE DOWNGRADE GUARD. Ask the host what it already carries — both flat
+  # roots, since a split past deploy can leave them disagreeing — and refuse a
+  # strictly-older incoming build for that host. Refusal is PER HOST: the rest
+  # of the fleet still receives the release, and the refusal names both
+  # versions so the operator knows exactly which checkout is stale.
+  if [ "$ALLOW_DOWNGRADE" = 0 ]; then
+    host_versions=$(run_on "$host" '"$HOME/.local/bin/yggterm" --version 2>/dev/null; "$HOME/.yggterm/bin/yggterm-headless" --version 2>/dev/null' 2>/dev/null)
+    stale_ref=""
+    while read -r hv; do
+      [ -n "$hv" ] || continue
+      oldest=$(printf '%s\n%s\n' "$VERSION" "$hv" | sort -V | head -1)
+      if [ "$oldest" = "$VERSION" ] && [ "$VERSION" != "$hv" ]; then
+        stale_ref="$hv"
+        break
+      fi
+    done <<EOF
+$host_versions
+EOF
+    if [ -n "$stale_ref" ]; then
+      echo "  ⛔ $host: REFUSING DOWNGRADE — host already runs $stale_ref, this build is $VERSION." >&2
+      echo "     A checkout older than the fleet is trying to deploy. Rebase it, or pass" >&2
+      echo "     --allow-downgrade if taking this host backwards is deliberate." >&2
+      FAILED=1
+      continue
+    fi
+  fi
+
   # The canonical four are written whether or not they exist yet; anything else
   # this host already carries is written because it exists. Union, deduped by
   # the resolved path so a symlinked root is not written twice.
@@ -463,6 +524,29 @@ for host in $HOSTS; do
     fi
     push_one "$host" "$src" "$dest" "$want" || FAILED=1
   done
+
+  # ⛔ PRUNE ONLY WHAT NO LIVE PROCESS STILL EXECUTES. The versions/ layout now
+  # grows one pair per release (~86 MB); left alone it accrues forever. But a
+  # version directory is also where a RUNNING daemon binary may live (the
+  # managed-versions install model), and deleting a live binary's path makes its
+  # /proc/<pid>/exe read "(deleted)" — the exact cold-kill class the .old.*
+  # warning above exists for. So: semver-older than THIS deploy only, never the
+  # running version, and never a path any /proc/*/exe still points into.
+  run_on "$host" 'cd "$HOME/.yggterm/versions" 2>/dev/null || exit 0
+    open_exe_paths=$(for f in /proc/[0-9]*/exe; do readlink "$f" 2>/dev/null; done)
+    for d in [0-9]*; do
+      case "$d" in
+        '"$VERSION"') continue ;;
+        *[!0-9.]*) continue ;;
+      esac
+      newer=$(printf "%s\n%s\n" "$d" "'$VERSION'" | sort -V | tail -1)
+      [ "$newer" = "'$VERSION'" ] || continue
+      case "
+$open_exe_paths
+" in *"$HOME/.yggterm/versions/$d/"*) continue ;; esac
+      rm -rf "$HOME/.yggterm/versions/$d" && echo "  · pruned versions/$d (older, not executed)"
+    done' 2>/dev/null | sed 's/^/  /'
+
   unset DEST_KIND
 done
 

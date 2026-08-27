@@ -149,26 +149,33 @@ copies.
   *Meanwhile:* the relay is fixing the half that is ours — the ~481,000 clock
   syscalls per second — which is the real defect either way.
 
-- **Should the desktop host's *AC* power profile be `balanced` instead of
-  `performance`? It is pinned to `balanced` right now and that needs his ruling.**
+- **~~Should the desktop host's *AC* power profile be `balanced`?~~ DECIDED — `performance`, owner ruling 2026-08-14, re-confirmed 2026-08-27.**
   Owner-reported the machine "very hot" while charging; an interleaved A/B
   (arms alternating every 5 min, mains throughout, both arms sharing the same
-  charge drift) settles it:
+  charge drift) measured the trade:
 
   | arm | n | mean | peak | **>85°C** |
   |---|---|---|---|---|
   | `performance` | 90 | 71.9°C | 92°C | **10.0%** |
   | `balanced` | 71 | 65.2°C | 83°C | **0.0%** |
 
-  **`balanced` eliminates the >85°C band entirely (0/71 vs 9/90, Fisher exact
-  p≈0.004)**, cuts >80°C from 27.8% to 2.8%, and drops the peak 9°C. Thermals
-  there are uncorrelated with our CPU (r=0.071, n=1,170), so **no code change can
-  substitute for this.** **Recommendation: keep `balanced` on AC.** ⚠ It is his
-  call because it caps sustained power and he may want the headroom.
-  ⛔ **What is in force now:** `balanced`, set at 19:54 after he reported the
-  heat. It is a runtime setting — **any power-source transition rewrites it**, and
-  `echo performance | sudo tee /sys/firmware/acpi/platform_profile` restores it.
-  Nothing persists across a reboot. → `docs/pending-bugs.md` § *THE HOST RUNS AT
+  **The owner rejected the trade** (`docs/settled-calls.md` § *CAPPING POWER TO
+  CUT HEAT IS A CHEAT FIX*): balanced buys the temperature by making the whole
+  UI ~20% more sluggish. ⛔ **The machine runs `performance` on AC. Do not
+  propose, pin, or re-measure `balanced` on AC — the ruling refuses re-opening
+  by argument, and the owner re-confirmed it 2026-08-27 ("when we are on AC we
+  do not run balanced").** Battery keeps `balanced` (TLP
+  `PLATFORM_PROFILE_ON_BAT`); only AC is ruled.
+
+  ⛔ **The enforcement half is TLP, and it can drift silently.** The config was
+  already right (`/etc/tlp.conf`: `PLATFORM_PROFILE_ON_AC=performance`) yet the
+  machine ran `balanced` for days — TLP had not re-applied since an older
+  pin, and nothing watches the gap between config and live value. Found and
+  fixed 2026-08-27 with `sudo tlp start` (profile read `performance`
+  immediately). **The check, when heat is investigated: read the LIVE
+  `/sys/firmware/acpi/platform_profile` and compare it with the TLP config
+  before blaming any workload — a stale profile impersonates a heat regression.**
+  → `docs/settled-calls.md`, `docs/pending-bugs.md` § *THE HOST RUNS AT
   90+°C WITH 14 OF ITS 16 CORES IDLE*.
   *Meanwhile:* the relay is on the half that is ours — the web process growing
   ~366 MB/h whose bound cannot fire, and a daemon leaking a thread per dead PTY.

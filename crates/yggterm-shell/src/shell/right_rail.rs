@@ -955,12 +955,8 @@ fn WebFindBar(
     // edge it is supposed to be anchored to. The narrowing is the helper's
     // `flex` parameter, not an appended property, so the style attribute never
     // carries `flex` twice.
-    let input_style = web_chrome_input_style(
-        &foreground,
-        false,
-        border,
-        WEB_CHROME_INPUT_FLEX_FIND,
-    );
+    let input_style =
+        web_chrome_input_style(&foreground, false, border, WEB_CHROME_INPUT_FLEX_FIND);
     let step_style = web_chrome_icon_button_style(&foreground, has_matches);
     let close_style = web_chrome_icon_button_style(&foreground, true);
     let label_style = format!(
@@ -1240,8 +1236,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             let tab = tabs.get(&tab_id).cloned();
             let heads_group = row.heads_group;
             let group_size = tab.as_ref().map(|tab| tab.group_size).unwrap_or(0);
-            let expanded =
-                heads_group.then(|| tab.as_ref().is_none_or(|tab| !tab.group_collapsed));
+            let expanded = heads_group.then(|| tab.as_ref().is_none_or(|tab| !tab.group_collapsed));
             let loading = tab.as_ref().is_some_and(|tab| tab.loading);
             // BACKGROUND-only, and the view already resolved that — see
             // `WebSurfaceOverlayTabView::media_playing`. The rail asks
@@ -1254,7 +1249,10 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             // when closable it despawns like any tab (user request: first
             // tab must despawn, not navigate home to Brave).
             let app_tab_can_go_home = tab.as_ref().is_some_and(|tab| tab.holds_saved_page);
-            let label = tab.as_ref().map(|tab| tab.label.clone()).unwrap_or_default();
+            let label = tab
+                .as_ref()
+                .map(|tab| tab.label.clone())
+                .unwrap_or_default();
             let selected = tab.as_ref().is_some_and(|tab| tab.active);
             // How many rows this one heads — the folder header's count, on the
             // row that replaced it. `None` on a row that heads nothing, so an
@@ -1300,66 +1298,68 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             // still reserves the box plus its gap on every row in the rail
             // (DESIGN.md, 2026-07-31).
             let shows_close = !is_app_tab || app_tab_can_go_home;
-            let actions = (heads_group || shows_close).then(|| rsx! {
-                // The head row's "+", which is what replaced the folder
-                // header's: it fills the GROUP, not the window, and it is
-                // typing-ready like every other "+".
-                if heads_group {
-                    button {
-                        "data-web-tab-group-add": "{tab_id}",
-                        style: session_row_action_button_style(palette.text),
-                        title: "New tab in this group",
-                        onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                        onclick: move |evt: MouseEvent| {
-                            evt.stop_propagation();
-                            let path = add_path.clone();
-                            open_web_surface_tab(
-                                state,
-                                &path,
-                                WebTabOpenRequest::blank_in_group(tab_id),
-                            );
-                        },
-                        "+"
+            let actions = (heads_group || shows_close).then(|| {
+                rsx! {
+                    // The head row's "+", which is what replaced the folder
+                    // header's: it fills the GROUP, not the window, and it is
+                    // typing-ready like every other "+".
+                    if heads_group {
+                        button {
+                            "data-web-tab-group-add": "{tab_id}",
+                            style: session_row_action_button_style(palette.text),
+                            title: "New tab in this group",
+                            onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                let path = add_path.clone();
+                                open_web_surface_tab(
+                                    state,
+                                    &path,
+                                    WebTabOpenRequest::blank_in_group(tab_id),
+                                );
+                            },
+                            "+"
+                        }
                     }
-                }
-                // The app tab's ✕ once QUIT ychrome (a Ctrl+C to the
-                // app) while this same row's menu refused to close it
-                // and said why — two affordances on one row
-                // disagreeing. So it lost the ✕ entirely, and the user
-                // then had a first tab with no close button at all
-                // (report + screenshot, 2026-08-01).
-                //
-                // Both are avoidable, because the app tab has TWO
-                // states and only one of them is "the app". While it
-                // shows a real page it is a real tab — it gets a ✕ that
-                // despawns the row (user request: first tab must close
-                // and despawn, not just navigate home to Brave). The
-                // surface keeps its home via the next heartbeat if
-                // needed; the closed entry goes to the undo stack.
-                // Quitting the app still lives where quitting an app
-                // lives.
-                if shows_close {
-                    button {
-                        "data-web-tab-close": "{tab_id}",
-                        style: session_row_action_button_style(palette.text),
-                        // ⛔ Says what it does NOT do. Closing a head must
-                        // never read as closing the group: its members move up
-                        // one level, exactly as Ungroup would leave them.
-                        title: if heads_group {
-                            "Close tab (its group's tabs move up one level)"
-                        } else {
-                            "Close tab"
-                        },
-                        onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                        onclick: move |evt: MouseEvent| {
-                            evt.stop_propagation();
-                            let close_path = close_path.clone();
-                            state.with_mut_counted(|shell| {
-                                shell.web_surface_close_tab(&close_path, tab_id);
-                                shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
-                            });
-                        },
-                        "✕"
+                    // The app tab's ✕ once QUIT ychrome (a Ctrl+C to the
+                    // app) while this same row's menu refused to close it
+                    // and said why — two affordances on one row
+                    // disagreeing. So it lost the ✕ entirely, and the user
+                    // then had a first tab with no close button at all
+                    // (report + screenshot, 2026-08-01).
+                    //
+                    // Both are avoidable, because the app tab has TWO
+                    // states and only one of them is "the app". While it
+                    // shows a real page it is a real tab — it gets a ✕ that
+                    // despawns the row (user request: first tab must close
+                    // and despawn, not just navigate home to Brave). The
+                    // surface keeps its home via the next heartbeat if
+                    // needed; the closed entry goes to the undo stack.
+                    // Quitting the app still lives where quitting an app
+                    // lives.
+                    if shows_close {
+                        button {
+                            "data-web-tab-close": "{tab_id}",
+                            style: session_row_action_button_style(palette.text),
+                            // ⛔ Says what it does NOT do. Closing a head must
+                            // never read as closing the group: its members move up
+                            // one level, exactly as Ungroup would leave them.
+                            title: if heads_group {
+                                "Close tab (its group's tabs move up one level)"
+                            } else {
+                                "Close tab"
+                            },
+                            onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                let close_path = close_path.clone();
+                                state.with_mut_counted(|shell| {
+                                    shell.web_surface_close_tab(&close_path, tab_id);
+                                    shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
+                                });
+                            },
+                            "✕"
+                        }
                     }
                 }
             });
@@ -1369,12 +1369,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                 if state.with_mut_counted(|shell| shell.consume_suppressed_row_click()) {
                     return;
                 }
-                select_web_surface_tab(
-                    state,
-                    select_path.clone(),
-                    tab_id,
-                    WebTabSelect::User,
-                );
+                select_web_surface_tab(state, select_path.clone(), tab_id, WebTabSelect::User);
             });
 
             let menu_path = session_path.clone();
@@ -1645,6 +1640,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
         }
     }
 }
+use emd_renderer::components::{
+    AgentFindingSpec, DataGridSpec, EmdComponent, EvidenceSpec, EvidenceState, MetricSpec,
+    MetricTone, PanelSpec, PlotMark, PlotSpec, QuerySpec, SparklineSpec, build_plot_scene,
+    sparkline_paths,
+};
 /// Renders a schema an APP declared, with generic widgets. yggterm knows nothing
 /// about what any of it means: a click just POSTs the widget's action id back to
 /// the app's control endpoint, and whatever schema comes back is drawn next.
@@ -1658,8 +1658,8 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
 // Raw HTML blocks/spans in the source are dropped by construction; images
 // render as their alt text + a link (asset transport is a follow-up; the GUI
 // cannot assume a note's relative path is fetchable from its own host).
-
 use emd_renderer::{MdBlock, MdInline, parse_markdown_blocks, top_level_block_ranges};
+use yggui::prose::AnalyticalTextRole;
 
 // The typed markdown model + parser live in `emd-renderer`, which is no longer
 // in this tree: it moved to libyggterm (MPL-2.0) on 2026-08-02, because the
@@ -1835,6 +1835,479 @@ fn md_text_with_inline_images(text: &str, prose: &ProseTokens, ink: &ProseInk) -
         }
     }
 }
+
+fn evidence_state_label(state: EvidenceState) -> &'static str {
+    match state {
+        EvidenceState::Observed => "observed",
+        EvidenceState::Collecting => "collecting",
+        EvidenceState::Silent => "silent",
+        EvidenceState::Unavailable => "unavailable",
+        EvidenceState::Stale => "stale",
+        EvidenceState::Uninstrumented => "uninstrumented",
+    }
+}
+
+fn evidence_badge_style(state: EvidenceState, prose: &ProseTokens, ink: &ProseInk) -> String {
+    let color = match state {
+        EvidenceState::Observed => "#009E73",
+        EvidenceState::Collecting => ink.accent.as_str(),
+        EvidenceState::Silent | EvidenceState::Stale => "#E69F00",
+        EvidenceState::Unavailable => "#D55E00",
+        EvidenceState::Uninstrumented => ink.muted.as_str(),
+    };
+    format!(
+        "display:inline-flex; align-items:center; border:1px solid {color}; border-radius:999px; \
+         padding:2px 7px; color:{color}; text-transform:uppercase; {}",
+        prose.analytical_text_style(AnalyticalTextRole::Badge),
+    )
+}
+
+fn evidence_footer(evidence: &EvidenceSpec, prose: &ProseTokens, ink: &ProseInk) -> Element {
+    let badge_style = evidence_badge_style(evidence.state, prose, ink);
+    let label = evidence_state_label(evidence.state);
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; flex-wrap:wrap; align-items:center; gap:5px 10px; \
+                 border-top:1px solid {}; margin-top:12px; padding-top:9px; \
+                 color:{}; {}",
+                ink.hairline,
+                ink.muted,
+                prose.analytical_text_style(AnalyticalTextRole::Evidence),
+            ),
+            span { style: "{badge_style}", "{label}" }
+            span { title: "Question", "{evidence.question}" }
+            span { title: "Window", "{evidence.window}" }
+            span { title: "Freshness", "↻ {evidence.freshness}" }
+            span { title: "Units", "{evidence.units}" }
+            span { title: "Source", "source: {evidence.source}" }
+            span { title: "Reproduce", "reproduce: {evidence.reproduction}" }
+        }
+    }
+}
+
+fn emd_plot_node(spec: &PlotSpec, prose: &ProseTokens, ink: &ProseInk, index: usize) -> Element {
+    let scene = build_plot_scene(spec);
+    let plot_style = format!(
+        "border:1px solid {}; border-radius:12px; padding:14px 15px 11px; \
+         margin:14px 0; background:color-mix(in srgb, {} 3%, transparent); \
+         min-width:0; overflow:hidden;",
+        ink.hairline, ink.ink,
+    );
+    let title_style = format!(
+        "color:{}; {}",
+        ink.ink,
+        prose.analytical_text_style(AnalyticalTextRole::Title),
+    );
+    let subtitle_style = format!(
+        "color:{}; margin-top:2px; {}",
+        ink.muted,
+        prose.analytical_text_style(AnalyticalTextRole::Subtitle),
+    );
+    let axis_text = format!(
+        "{} fill:{};",
+        prose.analytical_text_style(AnalyticalTextRole::Axis),
+        ink.muted,
+    );
+    match scene {
+        Err(message) => rsx! {
+            div {
+                key: "plot-error{index}",
+                style: "{plot_style}",
+                div { style: "{title_style}", "{spec.title}" }
+                div {
+                    style: "{subtitle_style}",
+                    if spec.evidence.state == EvidenceState::Collecting {
+                        "Collecting observations…"
+                    } else {
+                        "{message}"
+                    }
+                }
+                {evidence_footer(&spec.evidence, prose, ink)}
+            }
+        },
+        Ok(scene) => {
+            let view_box = format!("0 0 {} {}", scene.width, scene.height);
+            let grid_stroke = ink.hairline.clone();
+            let legend_style = format!(
+                "display:flex; flex-wrap:wrap; gap:6px 14px; margin:5px 0 1px; \
+                 color:{}; {}",
+                ink.muted,
+                prose.analytical_text_style(AnalyticalTextRole::Legend),
+            );
+            rsx! {
+                div {
+                    key: "plot{index}",
+                    style: "{plot_style}",
+                    div {
+                        style: "display:flex; justify-content:space-between; align-items:flex-start; gap:12px;",
+                        div {
+                            div { style: "{title_style}", "{spec.title}" }
+                            if let Some(subtitle) = &spec.subtitle {
+                                div { style: "{subtitle_style}", "{subtitle}" }
+                            }
+                        }
+                        span {
+                            style: evidence_badge_style(spec.evidence.state, prose, ink),
+                            "{evidence_state_label(spec.evidence.state)}"
+                        }
+                    }
+                    if spec.legend && scene.series.len() > 1 {
+                        div {
+                            style: "{legend_style}",
+                            for series in &scene.series {
+                                span {
+                                    style: "display:inline-flex; align-items:center; gap:5px;",
+                                    span {
+                                        style: format!(
+                                            "display:inline-block; width:9px; height:9px; border-radius:50%; background:{};",
+                                            series.color,
+                                        ),
+                                    }
+                                    "{series.name}"
+                                }
+                            }
+                        }
+                    }
+                    svg {
+                        view_box: "{view_box}",
+                        preserve_aspect_ratio: "xMidYMid meet",
+                        role: "img",
+                        style: "display:block; width:100%; height:auto; overflow:visible; margin-top:5px;",
+                        title { "{spec.title}: {spec.evidence.question}" }
+                        for tick in &scene.y_ticks {
+                            line {
+                                x1: "{scene.left}", y1: "{tick.position}",
+                                x2: "{scene.right}", y2: "{tick.position}",
+                                stroke: "{grid_stroke}", stroke_width: "1",
+                            }
+                            text {
+                                x: "{scene.left - 10.0}", y: "{tick.position + 4.0}",
+                                text_anchor: "end", style: "{axis_text}", "{tick.label}"
+                            }
+                        }
+                        for tick in &scene.x_ticks {
+                            text {
+                                x: "{tick.position}", y: "{scene.bottom + 24.0}",
+                                text_anchor: "middle", style: "{axis_text}", "{tick.label}"
+                            }
+                        }
+                        line {
+                            x1: "{scene.left}", y1: "{scene.bottom}",
+                            x2: "{scene.right}", y2: "{scene.bottom}",
+                            stroke: "{ink.muted}", stroke_width: "1",
+                        }
+                        for series in &scene.series {
+                            for path_data in &series.area_paths {
+                                path {
+                                    d: "{path_data}", fill: "{series.color}", fill_opacity: "0.14",
+                                    stroke: "none",
+                                }
+                            }
+                            if spec.mark != PlotMark::Bar && spec.mark != PlotMark::Point {
+                                for path_data in &series.line_paths {
+                                    path {
+                                        d: "{path_data}", fill: "none", stroke: "{series.color}",
+                                        stroke_width: "2.4", stroke_linecap: "round", stroke_linejoin: "round",
+                                        vector_effect: "non-scaling-stroke",
+                                    }
+                                }
+                            }
+                            for bar in &series.bars {
+                                rect {
+                                    x: "{bar.x}", y: "{bar.y}", width: "{bar.width}", height: "{bar.height}",
+                                    rx: "2", fill: "{series.color}", fill_opacity: "0.86",
+                                    title { "{bar.tooltip}" }
+                                }
+                            }
+                            for point in &series.points {
+                                circle {
+                                    cx: "{point.x}", cy: "{point.y}", r: "3.6",
+                                    fill: "{series.color}", stroke: "{ink.code_surface}", stroke_width: "1.4",
+                                    style: "transition:r 100ms ease; cursor:crosshair;",
+                                    title { "{point.tooltip}" }
+                                }
+                            }
+                        }
+                    }
+                    {evidence_footer(&spec.evidence, prose, ink)}
+                }
+            }
+        }
+    }
+}
+
+fn emd_sparkline_node(
+    spec: &SparklineSpec,
+    prose: &ProseTokens,
+    ink: &ProseInk,
+    index: usize,
+) -> Element {
+    let paths = sparkline_paths(&spec.values, 220.0, 42.0);
+    let color = spec.color.as_deref().unwrap_or("#0072B2");
+    rsx! {
+        div {
+            key: "spark{index}",
+            style: format!(
+                "display:grid; grid-template-columns:minmax(90px,auto) minmax(120px,1fr) auto; \
+                 align-items:center; gap:12px; border-top:1px solid {}; padding:9px 0; min-width:0;",
+                ink.hairline,
+            ),
+            div {
+                div { style: format!("color:{}; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::Label)), "{spec.label}" }
+                if let Some(delta) = &spec.delta {
+                    div { style: format!("color:{}; {}", ink.muted, prose.analytical_text_style(AnalyticalTextRole::Caption)), "{delta}" }
+                }
+            }
+            svg {
+                view_box: "0 0 220 42", preserve_aspect_ratio: "none",
+                style: "display:block; width:100%; height:42px; overflow:visible;",
+                title { "{spec.evidence.question}" }
+                for path_data in paths {
+                    path {
+                        d: "{path_data}", fill: "none", stroke: "{color}", stroke_width: "2.2",
+                        stroke_linecap: "round", stroke_linejoin: "round", vector_effect: "non-scaling-stroke",
+                    }
+                }
+            }
+            div {
+                style: format!("color:{}; text-align:right; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::ExactValue)),
+                "{spec.value.as_deref().unwrap_or(evidence_state_label(spec.evidence.state))}"
+            }
+        }
+    }
+}
+
+fn emd_metric_node(
+    spec: &MetricSpec,
+    prose: &ProseTokens,
+    ink: &ProseInk,
+    index: usize,
+) -> Element {
+    let tone = match spec.tone {
+        MetricTone::Neutral => ink.accent.as_str(),
+        MetricTone::Good => "#009E73",
+        MetricTone::Warning => "#E69F00",
+        MetricTone::Critical => "#D55E00",
+    };
+    rsx! {
+        div {
+            key: "metric{index}",
+            style: format!(
+                "border:1px solid {}; border-top:2px solid {}; border-radius:10px; padding:12px 13px; min-width:0;",
+                ink.hairline, tone,
+            ),
+            div { style: format!("color:{}; {}", ink.muted, prose.analytical_text_style(AnalyticalTextRole::Evidence)), "{spec.label}" }
+            div { style: format!("color:{}; margin-top:4px; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::MetricValue)), "{spec.value}" }
+            if let Some(delta) = &spec.delta {
+                div { style: format!("color:{tone}; margin-top:3px; {}", prose.analytical_text_style(AnalyticalTextRole::Evidence)), "{delta}" }
+            }
+            if let Some(detail) = &spec.detail {
+                div { style: format!("color:{}; margin-top:6px; {}", ink.muted, prose.analytical_text_style(AnalyticalTextRole::Caption)), "{detail}" }
+            }
+        }
+    }
+}
+
+fn emd_query_node(spec: &QuerySpec, prose: &ProseTokens, ink: &ProseInk, index: usize) -> Element {
+    rsx! {
+        div {
+            key: "query{index}",
+            style: format!("border:1px solid {}; border-radius:10px; overflow:hidden; min-width:0;", ink.hairline),
+            div {
+                style: format!(
+                    "display:flex; justify-content:space-between; align-items:center; gap:10px; \
+                     border-bottom:1px solid {}; padding:8px 10px; color:{}; {}",
+                    ink.hairline,
+                    ink.ink,
+                    prose.analytical_text_style(AnalyticalTextRole::QueryHeader),
+                ),
+                span { "{spec.title}" }
+                span { style: format!("color:{}; {}", ink.muted, prose.analytical_text_style(AnalyticalTextRole::MonoLabel)), "{spec.language}" }
+            }
+            pre {
+                style: format!(
+                    "margin:0; padding:12px; overflow:auto; background:{}; color:{}; \
+                     min-height:72px; {}",
+                    ink.code_surface,
+                    ink.ink,
+                    prose.analytical_text_style(AnalyticalTextRole::MonoBody),
+                ),
+                "{spec.source}"
+            }
+            if let Some(status) = &spec.status {
+                div { style: format!("border-top:1px solid {}; padding:6px 10px; color:{}; {}", ink.hairline, ink.muted, prose.analytical_text_style(AnalyticalTextRole::Caption)), "{status}" }
+            }
+        }
+    }
+}
+
+fn emd_data_grid_node(
+    spec: &DataGridSpec,
+    prose: &ProseTokens,
+    ink: &ProseInk,
+    index: usize,
+) -> Element {
+    let pad = if spec.compact { "6px 9px" } else { "9px 11px" };
+    rsx! {
+        div {
+            key: "data{index}",
+            style: "overflow:auto; min-width:0;",
+            div { style: format!("color:{}; margin-bottom:7px; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::Label)), "{spec.title}" }
+            table {
+                style: format!("width:100%; border-collapse:collapse; {}", prose.analytical_text_style(AnalyticalTextRole::DataTable)),
+                thead {
+                    tr {
+                        for (column_index, column) in spec.columns.iter().enumerate() {
+                            th {
+                                key: "dc{column_index}",
+                                style: format!(
+                                    "padding:{pad}; border-bottom:2px solid {}; color:{}; text-align:left; \
+                                     white-space:nowrap; {}",
+                                    ink.hairline,
+                                    ink.ink,
+                                    prose.analytical_text_style(AnalyticalTextRole::DataHeader),
+                                ),
+                                "{column}"
+                            }
+                        }
+                    }
+                }
+                tbody {
+                    for (row_index, row) in spec.rows.iter().enumerate() {
+                        tr {
+                            key: "dr{row_index}",
+                            for (cell_index, cell) in row.iter().enumerate() {
+                                td {
+                                    key: "dd{cell_index}",
+                                    style: format!(
+                                        "padding:{pad}; border-bottom:1px solid {}; color:{}; \
+                                         white-space:nowrap; {}",
+                                        ink.hairline,
+                                        ink.ink,
+                                        prose.analytical_text_style(AnalyticalTextRole::MonoBody),
+                                    ),
+                                    "{cell}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            {evidence_footer(&spec.evidence, prose, ink)}
+        }
+    }
+}
+
+fn emd_agent_finding_node(
+    spec: &AgentFindingSpec,
+    prose: &ProseTokens,
+    ink: &ProseInk,
+    index: usize,
+) -> Element {
+    rsx! {
+        div {
+            key: "agent{index}",
+            style: format!(
+                "border:1px solid {}; border-radius:11px; padding:13px 14px; \
+                 background:color-mix(in srgb, {} 5%, transparent); min-width:0;",
+                ink.hairline, ink.accent,
+            ),
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                span { style: format!("color:{}; text-transform:uppercase; {}", ink.accent, prose.analytical_text_style(AnalyticalTextRole::Eyebrow)), "Agent analysis" }
+                if let Some(status) = &spec.status {
+                    span { style: evidence_badge_style(spec.evidence.state, prose, ink), "{status}" }
+                }
+            }
+            div { style: format!("color:{}; margin-top:5px; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::CardTitle)), "{spec.title}" }
+            div { style: format!("color:{}; margin-top:7px; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::Body)), "{spec.summary}" }
+            if !spec.findings.is_empty() {
+                ul { style: format!("color:{}; margin:9px 0 0; padding-left:19px; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::CompactBody)),
+                    for finding in &spec.findings { li { style: "margin:4px 0;", "{finding}" } }
+                }
+            }
+            if let Some(question) = &spec.next_question {
+                div { style: format!("border-left:1px solid {}; margin-top:10px; padding-left:9px; color:{}; {}", ink.ink, ink.muted, prose.analytical_text_style(AnalyticalTextRole::CompactBody)), em { "{question}" } }
+            }
+            {evidence_footer(&spec.evidence, prose, ink)}
+        }
+    }
+}
+
+fn emd_panel_node(spec: &PanelSpec, prose: &ProseTokens, ink: &ProseInk, index: usize) -> Element {
+    rsx! {
+        section {
+            key: "panel{index}",
+            style: format!("border:1px solid {}; border-radius:12px; padding:13px 14px; min-width:0;", ink.hairline),
+            div {
+                style: "display:flex; justify-content:space-between; align-items:flex-start; gap:10px; margin-bottom:10px;",
+                div {
+                    div { style: format!("color:{}; {}", ink.ink, prose.analytical_text_style(AnalyticalTextRole::PanelTitle)), "{spec.title}" }
+                    if let Some(subtitle) = &spec.subtitle {
+                        div { style: format!("color:{}; margin-top:2px; {}", ink.muted, prose.analytical_text_style(AnalyticalTextRole::Caption)), "{subtitle}" }
+                    }
+                }
+                if !spec.controls.is_empty() {
+                    div { style: "display:flex; flex-wrap:wrap; gap:5px; justify-content:flex-end;",
+                        for control in &spec.controls {
+                            button {
+                                disabled: true,
+                                title: "Declarative EMD action; this document surface has no action route",
+                                "data-emd-action": control.action.as_deref().unwrap_or(""),
+                                style: format!(
+                                    "border:1px solid {}; border-radius:7px; padding:4px 8px; \
+                                     background:{}; color:{}; opacity:0.86; {}",
+                                    if control.primary { ink.accent.as_str() } else { ink.hairline.as_str() },
+                                    if control.primary { ink.accent.as_str() } else { "transparent" },
+                                    if control.primary { "#ffffff" } else { ink.ink.as_str() },
+                                    prose.analytical_text_style(AnalyticalTextRole::Control),
+                                ),
+                                "{control.label}"
+                            }
+                        }
+                    }
+                }
+            }
+            div { style: "display:flex; flex-direction:column; gap:10px; min-width:0;",
+                for (child_index, child) in spec.children.iter().enumerate() {
+                    {emd_component_node(child, prose, ink, child_index)}
+                }
+            }
+        }
+    }
+}
+
+fn emd_component_node(
+    component: &EmdComponent,
+    prose: &ProseTokens,
+    ink: &ProseInk,
+    index: usize,
+) -> Element {
+    match component {
+        EmdComponent::Grid(spec) => rsx! {
+            div {
+                key: "grid{index}",
+                style: format!(
+                    "display:grid; grid-template-columns:repeat({}, minmax(0, 1fr)); gap:{}px; \
+                     margin:14px 0; align-items:start; min-width:0;",
+                    spec.columns, spec.gap_px,
+                ),
+                for (child_index, child) in spec.children.iter().enumerate() {
+                    {emd_component_node(child, prose, ink, child_index)}
+                }
+            }
+        },
+        EmdComponent::Panel(spec) => emd_panel_node(spec, prose, ink, index),
+        EmdComponent::Plot(spec) => emd_plot_node(spec, prose, ink, index),
+        EmdComponent::Sparkline(spec) => emd_sparkline_node(spec, prose, ink, index),
+        EmdComponent::Metric(spec) => emd_metric_node(spec, prose, ink, index),
+        EmdComponent::Query(spec) => emd_query_node(spec, prose, ink, index),
+        EmdComponent::DataGrid(spec) => emd_data_grid_node(spec, prose, ink, index),
+        EmdComponent::AgentFinding(spec) => emd_agent_finding_node(spec, prose, ink, index),
+    }
+}
+
 fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: usize) -> Element {
     match block {
         MdBlock::Heading { level, children } => {
@@ -1853,6 +2326,21 @@ fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: us
                 key: "pre{index}",
                 style: prose.code_block_style(ink),
                 "{code}"
+            }
+        },
+        MdBlock::Component(document) => emd_component_node(&document.component, prose, ink, index),
+        MdBlock::ComponentError { message, source } => rsx! {
+            div {
+                key: "emd-error{index}",
+                role: "alert",
+                style: format!(
+                    "border:1px solid #D55E00; border-left:3px solid #D55E00; border-radius:8px; \
+                     padding:10px 12px; margin:{}px 0; color:{}; background:{};",
+                    prose.block_gap_px, ink.ink, ink.code_surface,
+                ),
+                div { style: format!("color:#D55E00; {}", prose.analytical_text_style(AnalyticalTextRole::ErrorTitle)), "Extended component could not render" }
+                div { style: format!("margin-top:4px; {}", prose.analytical_text_style(AnalyticalTextRole::Subtitle)), "{message}" }
+                pre { style: format!("overflow:auto; margin:8px 0 0; {}", prose.analytical_text_style(AnalyticalTextRole::MonoBody)), "{source}" }
             }
         },
         MdBlock::BlockQuote(body) => rsx! {
@@ -2242,7 +2730,10 @@ fn DocumentSurfaceBody(
                 !matches!(
                     widget,
                     AppPaneWidget::Markdown { .. }
-                        | AppPaneWidget::TextInput { multiline: true, .. }
+                        | AppPaneWidget::TextInput {
+                            multiline: true,
+                            ..
+                        }
                         | AppPaneWidget::ListRow { .. }
                 )
             })
@@ -2251,12 +2742,17 @@ fn DocumentSurfaceBody(
     let has_bar = !bar_widgets.is_empty();
     // Editor + markdown together = the SPLIT VIEW (markdown-mode editing):
     // editor left, live preview right, each scrolling independently.
-    let split_view = body_widgets
+    let split_view = body_widgets.iter().any(|w| {
+        matches!(
+            w,
+            AppPaneWidget::TextInput {
+                multiline: true,
+                ..
+            }
+        )
+    }) && body_widgets
         .iter()
-        .any(|w| matches!(w, AppPaneWidget::TextInput { multiline: true, .. }))
-        && body_widgets
-            .iter()
-            .any(|w| matches!(w, AppPaneWidget::Markdown { .. }));
+        .any(|w| matches!(w, AppPaneWidget::Markdown { .. }));
     // Where the gutter sits. The app may declare it; absent means centred.
     // Clamped through the contract so host and app cannot disagree about the
     // limit — a disagreement shows up as a gutter that snaps back mid-drag.
@@ -4034,8 +4530,10 @@ fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 fn daemon_version_rank(daemon_version: &str, client_version: &str) -> DaemonVersionRank {
-    let (Some(daemon), Some(client)) = (version_triple(daemon_version), version_triple(client_version))
-    else {
+    let (Some(daemon), Some(client)) = (
+        version_triple(daemon_version),
+        version_triple(client_version),
+    ) else {
         return DaemonVersionRank::Unknown;
     };
     match daemon.cmp(&client) {
@@ -4319,7 +4817,10 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
     };
     let mut runtime = vec![SessionMetadataEntry {
         label: "Status",
-        value: format!("{} · {working}", friendly_launch_phase(session.launch_phase)),
+        value: format!(
+            "{} · {working}",
+            friendly_launch_phase(session.launch_phase)
+        ),
     }];
     // PTY grid is surfaced by `managed_session_from_snapshot` as a "PTY size"
     // metadata entry (the daemon owns the live grid; the GUI session model does
@@ -5097,7 +5598,9 @@ impl ShellIcon {
             ShellIcon::Copy => &["M5.4 5.4h5.2v5.2H5.4z", "M3.4 8.6V3.4h5.2"],
             ShellIcon::Duplicate => &["M3.2 3.2h5v5h-5z", "M5.8 10.8h5v-5"],
             ShellIcon::Split => &["M2.6 3.4h8.8v7.2H2.6z", "M7 3.4v7.2"],
-            ShellIcon::Folder => &["M2.4 4.3a1 1 0 0 1 1-1h2l1.2 1.4h4.1a1 1 0 0 1 1 1v4.1a1 1 0 0 1-1 1H3.4a1 1 0 0 1-1-1V4.3Z"],
+            ShellIcon::Folder => &[
+                "M2.4 4.3a1 1 0 0 1 1-1h2l1.2 1.4h4.1a1 1 0 0 1 1 1v4.1a1 1 0 0 1-1 1H3.4a1 1 0 0 1-1-1V4.3Z",
+            ],
             ShellIcon::Rename => &["M3 11l1.4-.35 6-6-1.05-1.05-6 6L3 11z"],
             ShellIcon::Collapse => &["M3.8 5.4L7 8.6l3.2-3.2"],
             ShellIcon::Expand => &["M5.4 3.8L8.6 7l-3.2 3.2"],
@@ -5117,7 +5620,10 @@ impl ShellIcon {
                 "M11.5 8.7c.6-.7.9-1.7.9-1.7S10.3 3.6 7 3.6c-.5 0-1 .1-1.4.2",
                 "M2.6 2.6l8.8 8.8",
             ],
-            ShellIcon::Clock => &["M7 2.6a4.4 4.4 0 1 0 0 8.8 4.4 4.4 0 0 0 0-8.8Z", "M7 4.6V7l1.7 1"],
+            ShellIcon::Clock => &[
+                "M7 2.6a4.4 4.4 0 1 0 0 8.8 4.4 4.4 0 0 0 0-8.8Z",
+                "M7 4.6V7l1.7 1",
+            ],
             // An arrow travelling INTO a box: "put this value in the page".
             ShellIcon::Fill => &[
                 "M11.4 4.2V2.9H2.6v8.2h8.8V9.8",
@@ -5135,7 +5641,11 @@ impl ShellIcon {
                 "M2.9 5.3v5.6h8.2V5.3",
                 "M5.6 7.5h2.8",
             ],
-            ShellIcon::External => &["M7.6 2.9h3.5v3.5", "M11.1 2.9 6.4 7.6", "M9.6 8.4v2.7H2.9V4.4h2.7"],
+            ShellIcon::External => &[
+                "M7.6 2.9h3.5v3.5",
+                "M11.1 2.9 6.4 7.6",
+                "M9.6 8.4v2.7H2.9V4.4h2.7",
+            ],
             ShellIcon::Globe => &[
                 "M7 2.1a4.9 4.9 0 1 0 0 9.8 4.9 4.9 0 0 0 0-9.8Z",
                 "M2.1 7h9.8",
@@ -5575,9 +6085,7 @@ fn web_tab_menu_items(
                 return web_tab_move_page_items(tab, tabs);
             }
             // ---- create -----------------------------------------------------
-            items.push(
-                RowMenuItem::new("webtab-new", "New tab", 't').icon(ShellIcon::Plus),
-            );
+            items.push(RowMenuItem::new("webtab-new", "New tab", 't').icon(ShellIcon::Plus));
             // The head row's "+", which is what replaced the folder header's:
             // "+" fills the group, not the window.
             if tab.group_size > 0 {
@@ -5595,7 +6103,10 @@ fn web_tab_menu_items(
             );
             let reopen = RowMenuItem::new(
                 "webtab-reopen",
-                format!("Reopen {}", web_tab_count_phrase(reopen_count.max(1), "closed tab")),
+                format!(
+                    "Reopen {}",
+                    web_tab_count_phrase(reopen_count.max(1), "closed tab")
+                ),
                 'e',
             )
             .icon(ShellIcon::Reopen);
@@ -5655,15 +6166,15 @@ fn web_tab_menu_items(
             // rows have had exactly this verb all along, and a tab row that
             // could only be renamed by a gesture nobody announces is a
             // half-shipped affordance.
-            let rename = RowMenuItem::new("webtab-rename", "Rename tab", 'n')
-                .icon(ShellIcon::Rename);
+            let rename =
+                RowMenuItem::new("webtab-rename", "Rename tab", 'n').icon(ShellIcon::Rename);
             items.push(if tab.is_app_tab {
                 rename.disabled("the app's tab is named by the app")
             } else {
                 rename
             });
-            let move_to = RowMenuItem::new("webtab-move", "Move to group ▸", 'm')
-                .icon(ShellIcon::Folder);
+            let move_to =
+                RowMenuItem::new("webtab-move", "Move to group ▸", 'm').icon(ShellIcon::Folder);
             items.push(if tab.is_app_tab {
                 move_to.disabled("the app's tab belongs to the app, not to the tree")
             } else {
@@ -5675,7 +6186,11 @@ fn web_tab_menu_items(
                 items.push(
                     RowMenuItem::new(
                         "webgroup-toggle",
-                        if tab.group_collapsed { "Expand group" } else { "Collapse group" },
+                        if tab.group_collapsed {
+                            "Expand group"
+                        } else {
+                            "Collapse group"
+                        },
                         'e',
                     )
                     .icon(if tab.group_collapsed {
@@ -5795,7 +6310,10 @@ fn web_tab_move_page_items(
             match candidate {
                 Some(id) if id == tab.id => return true,
                 Some(id) => {
-                    candidate = tabs.iter().find(|row| row.id == id).and_then(|row| row.group_head)
+                    candidate = tabs
+                        .iter()
+                        .find(|row| row.id == id)
+                        .and_then(|row| row.group_head)
                 }
                 None => return false,
             }
@@ -5803,10 +6321,7 @@ fn web_tab_move_page_items(
         false
     };
     for head in tabs.iter().filter(|row| {
-        row.group_size > 0
-            && row.id != tab.id
-            && !row.is_app_tab
-            && !descends(Some(row.id))
+        row.group_size > 0 && row.id != tab.id && !row.is_app_tab && !descends(Some(row.id))
     }) {
         let item = RowMenuItem::hinted(
             format!("webtab-move:{}", head.id),
@@ -6270,7 +6785,11 @@ fn document_surface_edit_script(action: &str) -> String {
           }} catch (_e) {{ return "error"; }}
         }})();
         "#,
-        select_all = if command == "selectAll" { "true" } else { "false" },
+        select_all = if command == "selectAll" {
+            "true"
+        } else {
+            "false"
+        },
         command = command,
     )
 }
@@ -6442,18 +6961,10 @@ fn row_menu_items(
     // ever offered on a given row.
     match row_set_role {
         RowSetMenuRole::Head => {
-            items.push(RowMenuItem::new(
-                "ungroup-row-set",
-                "Ungroup",
-                'u',
-            ));
+            items.push(RowMenuItem::new("ungroup-row-set", "Ungroup", 'u'));
         }
         RowSetMenuRole::Member => {
-            items.push(RowMenuItem::new(
-                "leave-row-set",
-                "Remove from group",
-                'u',
-            ));
+            items.push(RowMenuItem::new("leave-row-set", "Remove from group", 'u'));
         }
         RowSetMenuRole::None => {}
     }
@@ -6599,9 +7110,8 @@ fn row_menu_items(
             'g',
         ));
         items.push(RowMenuItem::new("regenerate-title", "Regenerate Titles", 'i').emphasized());
-        items.push(
-            RowMenuItem::new("regenerate-summary", "Regenerate Summaries", 'z').emphasized(),
-        );
+        items
+            .push(RowMenuItem::new("regenerate-summary", "Regenerate Summaries", 'z').emphasized());
     }
     if is_workspace_row(row) {
         items.push(RowMenuItem::divider());
@@ -6624,10 +7134,7 @@ fn split_group_member_labels(
     let Some(group_id) = row.session_id.as_deref() else {
         return Vec::new();
     };
-    let Some(group) = split_groups
-        .iter()
-        .find(|group| group.group_id == group_id)
-    else {
+    let Some(group) = split_groups.iter().find(|group| group.group_id == group_id) else {
         return Vec::new();
     };
     group
@@ -6861,7 +7368,11 @@ fn open_web_profile_switcher_from_event(
 /// [`ShellState::apply_web_tab_menu_action`], where a headless test can compare
 /// what a label counted against what actually closed; the one thing that cannot
 /// live there is the split, which needs this `Signal` to open a pane.
-fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabContextMenu, id: String) {
+fn dispatch_web_tab_menu_action(
+    mut state: Signal<ShellState>,
+    menu: WebTabContextMenu,
+    id: String,
+) {
     // PAGE TURNS FIRST, and they are the only ids that leave the menu standing.
     // "Move to folder ▸" is a submenu: the overlay stays where it is and shows
     // the other list. Resolved through the pure owner
@@ -6891,7 +7402,11 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
             return;
         }
         WebTabMenuAction::NewTabAbove(tab_id) => {
-            open_web_surface_tab(state, &session_path, WebTabOpenRequest::blank_above(*tab_id));
+            open_web_surface_tab(
+                state,
+                &session_path,
+                WebTabOpenRequest::blank_above(*tab_id),
+            );
             return;
         }
         WebTabMenuAction::ReopenClosedTabs => {
@@ -6902,12 +7417,7 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
             // resolves that tab's egress (the same reason the duplicate
             // selects). `Opened`, because the user picked a verb, not a row.
             if let Some(first) = reopened.first() {
-                select_web_surface_tab(
-                    state,
-                    session_path.clone(),
-                    *first,
-                    WebTabSelect::Opened,
-                );
+                select_web_surface_tab(state, session_path.clone(), *first, WebTabSelect::Opened);
             }
             return;
         }
@@ -6923,11 +7433,9 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
                 &YgguiClipboardContents::Text { text: url.clone() },
             );
             state.with_mut_counted(|shell| match copied {
-                Ok(_) => shell.push_notification(
-                    NotificationTone::Success,
-                    "URL Copied",
-                    url.clone(),
-                ),
+                Ok(_) => {
+                    shell.push_notification(NotificationTone::Success, "URL Copied", url.clone())
+                }
                 // Named, not swallowed: a copy that silently did nothing is
                 // discovered at the paste, somewhere else entirely.
                 Err(error) => shell.push_notification(
@@ -6983,12 +7491,9 @@ fn spawn_web_profile_switch(mut state: Signal<ShellState>, session_path: String,
                     return WebProfileSwitchGate::Allowed;
                 }
                 match yggterm_server::profile_write_lock_report(&endpoint) {
-                    Ok(report) => web_profile_switch_gate(
-                        &target,
-                        &report.locks,
-                        &self_client_id,
-                        self_pid,
-                    ),
+                    Ok(report) => {
+                        web_profile_switch_gate(&target, &report.locks, &self_client_id, self_pid)
+                    }
                     // Cannot ask who holds it ⇒ cannot promise we are alone on
                     // the jar. The reconciler's own acquire will fall back by
                     // role, so a switch here would hand the user an outcome
@@ -7010,11 +7515,7 @@ fn spawn_web_profile_switch(mut state: Signal<ShellState>, session_path: String,
                 // Nothing to apply, by construction: the refusal carries a
                 // sentence, never a profile. The surface stays exactly as it was.
                 state.with_mut_counted(|shell| {
-                    shell.push_notification(
-                        NotificationTone::Error,
-                        "Profile In Use",
-                        message,
-                    );
+                    shell.push_notification(NotificationTone::Error, "Profile In Use", message);
                 });
             }
             WebProfileSwitchPlan::Switch(profile) => {
@@ -7105,7 +7606,9 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             // Codex means "whatever the user set as their default agent" — the
             // `AgentSessionProfile` setting picks the fork, exactly as the old
             // `new-session` arm did.
-            Some(SessionKind::Codex) => spawn_start_group_session(state, anchor, preferred_agent_kind),
+            Some(SessionKind::Codex) => {
+                spawn_start_group_session(state, anchor, preferred_agent_kind)
+            }
             Some(kind) => spawn_start_group_session(state, anchor, kind),
             // An id naming a CLI that is not registered cannot have been drawn
             // by this menu; closing is the honest response to a verb that does
@@ -7180,7 +7683,11 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             let candidates = state.with_mut_counted(|shell| {
                 let candidates = split_candidate_paths_for(
                     &row,
-                    &shell.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+                    &shell
+                        .selected_tree_paths
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
                     &shell.split_groups,
                 );
                 shell.close_context_menu();
@@ -7207,9 +7714,11 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
                 .map(ToOwned::to_owned)
             {
                 let label = row.label.clone();
-                spawn_server_snapshot_action(state, format!("refreshing {label}"), move |endpoint| {
-                    refresh_remote_machine(&endpoint, &machine_key)
-                });
+                spawn_server_snapshot_action(
+                    state,
+                    format!("refreshing {label}"),
+                    move |endpoint| refresh_remote_machine(&endpoint, &machine_key),
+                );
             }
         }
         // One id, two rows: on a saved SSH machine row "Delete…" forgets the

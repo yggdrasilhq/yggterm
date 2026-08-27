@@ -139,8 +139,28 @@ tick() {
   #   deny-by-default: anything not recognised as inert counts as build-affecting,
   #   so a new directory errs toward rolling rather than toward silently skipping.
   local churn
-  churn="$(ssh -n "$build_host" "cd $DEPLOY_TREE && git diff --name-only $running origin/main 2>/dev/null \
-             | grep -vE '^(docs/|CHANGELOG\.md|README\.md|[^/]*\.md$|\.agents/|scripts/)' | head -5" 2>/dev/null)"
+  case "$running" in
+    *[!0-9a-f]*|'')
+      # A daemon-supplied build id is data, never shell source. More
+      # importantly, an identity we cannot compare is UNKNOWN, not docs-only.
+      churn="__unresolved_running_build__"
+      ;;
+    *)
+      # A public-history rewrite can legitimately leave the live daemon's
+      # build commit absent from today's clone. `git diff` then exits non-zero
+      # and prints nothing; suppressing stderr used to collapse that failure
+      # into an empty path set and permanently classify every later build as
+      # inert. Preserve the deny-by-default promise: an absent commit or any
+      # failed diff is itself a build-affecting marker and therefore rolls.
+      churn="$(ssh -n "$build_host" "cd $DEPLOY_TREE && {
+          if git cat-file -e $running^{commit} 2>/dev/null; then
+            git diff --name-only $running origin/main || printf '%s\\n' __running_build_diff_failed__
+          else
+            printf '%s\\n' __running_build_not_in_origin_history__
+          fi
+        } | grep -vE '^(docs/|CHANGELOG\.md|README\.md|[^/]*\.md$|\.agents/|scripts/)' | head -5" 2>/dev/null)"
+      ;;
+  esac
   if [ -z "$churn" ]; then
     say "main is $main_sha but nothing since $running touches the build — not rolling, not restarting anything"
     reconcile_client "$live_host" "" "current build"
