@@ -3396,6 +3396,10 @@ pub enum ServerRequest {
         machine_key: Option<String>,
         background: bool,
     },
+    RemoveManagedCli {
+        machine_key: String,
+        slug: String,
+    },
     RefreshPreview {
         path: String,
         #[serde(default)]
@@ -4149,6 +4153,7 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::OpenRemoteSession { .. }
         | ServerRequest::RefreshRemoteMachine { .. }
         | ServerRequest::RefreshManagedCli { .. }
+        | ServerRequest::RemoveManagedCli { .. }
         | ServerRequest::UpdateSessionCopy { .. }
         // A shared-view mutation: it moves a row in the order every client
         // renders, so a shadow may not do it.
@@ -10376,6 +10381,13 @@ impl DaemonRuntime {
                     message: Some(message),
                 }
             }
+            ServerRequest::RemoveManagedCli { machine_key, slug } => {
+                let message = self.server.remove_managed_cli_on_machine(&machine_key, &slug)?;
+                self.persist()?;
+                ServerResponse::Ack {
+                    message: Some(message),
+                }
+            }
             ServerRequest::RefreshPreview {
                 path,
                 full_remote_payload,
@@ -14518,6 +14530,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::OpenRemoteSession { .. } => "open_remote_session",
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
+        ServerRequest::RemoveManagedCli { .. } => "remove_managed_cli",
         ServerRequest::RefreshPreview { .. } => "refresh_preview",
         ServerRequest::UpdateSessionCopy { .. } => "update_session_copy",
         ServerRequest::SetSessionOutlinePrefix { .. } => "set_session_outline_prefix",
@@ -17468,6 +17481,21 @@ pub fn refresh_managed_cli(
         &ServerRequest::RefreshManagedCli {
             machine_key: machine_key.map(ToOwned::to_owned),
             background,
+        },
+    )?)
+}
+
+/// Remove ONE agent CLI on ONE machine, through the daemon.
+pub fn remove_managed_cli(
+    endpoint: &ServerEndpoint,
+    machine_key: &str,
+    slug: &str,
+) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::RemoveManagedCli {
+            machine_key: machine_key.to_string(),
+            slug: slug.to_string(),
         },
     )?)
 }

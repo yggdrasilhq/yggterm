@@ -216,7 +216,8 @@ use yggterm_server::{
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_local_managed_cli_now, refresh_managed_cli,
-    refresh_preview_with_history, refresh_remote_machine, remove_session, remove_ssh_target,
+    refresh_preview_with_history, refresh_remote_machine, remove_managed_cli, remove_session,
+    remove_ssh_target,
     request_terminal_launch, request_terminal_launch_for_path,
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
@@ -32040,6 +32041,17 @@ impl ShellState {
         *self.settings.agent_cli_install_wanted.get(slug).unwrap_or(&true)
     }
 
+    /// Whether the user wants `slug` installed on `machine_key`. Same default
+    /// rule per machine: absent = wanted.
+    fn cli_install_wanted_on(&self, machine_key: &str, slug: &str) -> bool {
+        self.settings
+            .agent_cli_install_wanted_remote
+            .get(machine_key)
+            .and_then(|map| map.get(slug))
+            .copied()
+            .unwrap_or_else(|| self.cli_install_wanted(slug))
+    }
+
     /// Flip one slug's wanted state and persist it. The toggle IS the record:
     /// there is no separate "apply" of the selection itself, only of the
     /// installs and removals it implies.
@@ -32049,9 +32061,27 @@ impl ShellState {
         self.persist_settings();
     }
 
-    /// Forget every override, returning the selection to recommend-every-CLI.
+    /// Flip one slug's wanted state on ONE machine. A local-machine key
+    /// routes to the local map; everything else gets a per-machine entry.
+    fn toggle_cli_install_wanted_on(&mut self, machine_key: String, slug: String) {
+        if machine_key.is_empty() {
+            self.toggle_cli_install_wanted(slug);
+            return;
+        }
+        let next = !self.cli_install_wanted_on(&machine_key, &slug);
+        self.settings
+            .agent_cli_install_wanted_remote
+            .entry(machine_key)
+            .or_default()
+            .insert(slug, next);
+        self.persist_settings();
+    }
+
+    /// Forget every override — local and remote — returning the selection to
+    /// recommend-every-CLI everywhere.
     fn reset_cli_install_selection(&mut self) {
         self.settings.agent_cli_install_wanted.clear();
+        self.settings.agent_cli_install_wanted_remote.clear();
         self.persist_settings();
     }
 
@@ -32066,7 +32096,10 @@ impl ShellState {
     /// Returns the decision snapshot (slug → wanted) for the background job,
     /// or `None` when the apply must not start (already running, or the
     /// consent gate refused — in which case the user has been told why).
-    fn begin_cli_install_apply(&mut self) -> Option<Vec<(String, bool)>> {
+    fn begin_cli_install_apply(
+        &mut self,
+        remote_presence: &[(String, Vec<yggterm_core::cli_install::CliPresenceReport>)],
+    ) -> Option<CliInstallApplyDecision> {
         if self.cli_install_pending {
             return None;
         }
@@ -32081,7 +32114,7 @@ impl ShellState {
             );
             return None;
         }
-        let decision: Vec<(String, bool)> = yggterm_core::agent_cli::AGENT_CLIS
+        let local: Vec<(String, bool)> = yggterm_core::agent_cli::AGENT_CLIS
             .iter()
             .map(|descriptor| {
                 (
@@ -32090,15 +32123,44 @@ impl ShellState {
                 )
             })
             .collect();
+        // Per-machine decisions, snapshotted WITH the presence the modal
+        // rendered from — the blocking job must not need state to know what
+        // "missing" and "present" mean on a machine it cannot probe.
+        let remote: Vec<CliInstallMachineDecision> = self
+            .settings
+            .agent_cli_install_wanted_remote
+            .keys()
+            .map(|machine_key| {
+                let presence = remote_presence
+                    .iter()
+                    .find(|(key, _)| key == machine_key)
+                    .map(|(_, report)| report.clone())
+                    .unwrap_or_default();
+                let wanted: Vec<(String, bool)> = yggterm_core::agent_cli::AGENT_CLIS
+                    .iter()
+                    .map(|descriptor| {
+                        (
+                            descriptor.slug.to_string(),
+                            self.cli_install_wanted_on(machine_key, &descriptor.slug),
+                        )
+                    })
+                    .collect();
+                CliInstallMachineDecision {
+                    machine_key: machine_key.clone(),
+                    wanted,
+                    presence,
+                }
+            })
+            .collect();
         self.cli_install_pending = true;
         self.last_action = "applying agent CLI selection".to_string();
-        Some(decision)
+        Some(CliInstallApplyDecision { local, remote })
     }
 
     /// Land the apply job's outcome: clear the pending flag, adopt the fresh
     /// launch-parity presence so the chips show what is now TRUE on disk, and
     /// tell the user what happened per CLI.
-    fn finish_cli_install_apply(&mut self, outcome: CliInstallApplyOutcome) {
+    fn finish_cli_install_apply(&mut self, outcome: CliInstallApplyOutcome) -> Vec<String> {
         self.cli_install_pending = false;
         if let Some(presence) = outcome.presence {
             self.local_cli_presence = Some(presence);
@@ -32117,6 +32179,7 @@ impl ShellState {
             },
             outcome.summary,
         );
+        outcome.machines_needing_install_refresh
     }
 
     /// Store one CLI's launch flags, keyed by its descriptor slug.
@@ -41337,19 +41400,39 @@ struct CliInstallApplyOutcome {
     /// Fresh launch-parity presence for THIS machine after the job. `None`
     /// when the job died before it could probe (the modal keeps its cache).
     presence: Option<Vec<yggterm_core::cli_install::CliPresenceReport>>,
+    /// Remote machines whose selection implies INSTALLS. They ride the
+    /// proven per-machine background refresh (its own notifications, its own
+    /// presence update), queued by the wrapper once the state lock is free.
+    machines_needing_install_refresh: Vec<String>,
 }
-/// The apply job: install what the selection wants that is missing, remove
-/// what it does not want that is present — one CLI at a time, every outcome
-/// reported BY NAME, on the calling thread's blocking pool. Presence is
-/// re-probed through the launch-parity resolver at both ends so the decision
-/// and the confirmation both answer what a LAUNCH would see.
-fn run_cli_install_apply_job(decision: Vec<(String, bool)>) -> CliInstallApplyOutcome {
+/// One machine's selection, snapshotted at apply time — wanted flags AND the
+/// presence the modal rendered from, so the blocking job never needs state
+/// to know what "missing" and "present" mean on a machine it cannot probe.
+struct CliInstallMachineDecision {
+    machine_key: String,
+    wanted: Vec<(String, bool)>,
+    presence: Vec<yggterm_core::cli_install::CliPresenceReport>,
+}
+struct CliInstallApplyDecision {
+    local: Vec<(String, bool)>,
+    remote: Vec<CliInstallMachineDecision>,
+}
+/// The apply job: local install/remove first (direct provisioner), then
+/// remote removals through the daemon's remove verb (user-local-only on the
+/// remote too). Remote INSTALLS are deferred: the job returns the machines,
+/// and the wrapper queues their background refresh — the sweep path with its
+/// own progress notifications and presence flip. Presence for THIS machine
+/// is re-probed through the launch-parity resolver at both ends.
+fn run_cli_install_apply_job(
+    endpoint: yggterm_server::ServerEndpoint,
+    decision: CliInstallApplyDecision,
+) -> CliInstallApplyOutcome {
     let presence_before = yggterm_server::local_cli_presence_now();
     let present =
         |slug: &str| presence_before.iter().any(|row| row.slug == slug && row.present);
     let mut lines: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    for (slug, wanted) in decision {
+    for (slug, wanted) in decision.local {
         if wanted && !present(&slug) {
             match yggterm_server::install_managed_cli_tool_by_slug(&slug) {
                 Ok(message) => lines.push(format!("{slug}: {message}")),
@@ -41362,11 +41445,58 @@ fn run_cli_install_apply_job(decision: Vec<(String, bool)>) -> CliInstallApplyOu
             }
         }
     }
+    let mut machines_needing_install_refresh: Vec<String> = Vec::new();
+    for machine in decision.remote {
+        let mut touched = false;
+        let present_on =
+            |slug: &str| machine.presence.iter().any(|row| row.slug == slug && row.present);
+        for (slug, wanted) in machine.wanted {
+            if wanted && !present_on(&slug) {
+                // Installs on a machine ride that machine's refresh sweep —
+                // one ssh round trip covers every missing CLI, and the
+                // sweep's own report updates the chips.
+                touched = true;
+                break;
+            }
+            if !wanted && present_on(&slug) {
+                match yggterm_server::remove_managed_cli(
+                    &endpoint,
+                    &machine.machine_key,
+                    &slug,
+                ) {
+                    Ok(message) => {
+                        lines.push(format!(
+                            "{slug} on {}: {message}",
+                            machine.machine_key,
+                            message = message.unwrap_or_else(|| "removed".to_string())
+                        ));
+                        touched = true;
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "{slug} on {}: {error}",
+                            machine.machine_key
+                        ))
+                    }
+                }
+            }
+        }
+        if touched && !machines_needing_install_refresh.contains(&machine.machine_key) {
+            machines_needing_install_refresh.push(machine.machine_key);
+        }
+    }
     let presence = yggterm_server::local_cli_presence_now();
     let ok = failures.is_empty();
     let summary = if lines.is_empty() && failures.is_empty() {
-        "Nothing to do — every wanted CLI is installed and nothing unwanted is present."
-            .to_string()
+        if machines_needing_install_refresh.is_empty() {
+            "Nothing to do — every wanted CLI is installed and nothing unwanted is present."
+                .to_string()
+        } else {
+            format!(
+                "Queued installs on {}",
+                machines_needing_install_refresh.join(", ")
+            )
+        }
     } else if failures.is_empty() {
         lines.join(" · ")
     } else {
@@ -41375,36 +41505,61 @@ fn run_cli_install_apply_job(decision: Vec<(String, bool)>) -> CliInstallApplyOu
         } else {
             format!("{}; ", lines.join(" · "))
         };
-        format!("{done}failures: {}", failures.join("; "))
+        format!("{done}failures: {}", failures.join(" · "))
     };
     CliInstallApplyOutcome {
         ok,
         summary,
         presence: Some(presence),
+        machines_needing_install_refresh,
     }
 }
 /// The async wrapper the modal's Apply button calls: snapshot the decision
-/// under the state lock, run npm/uv/removal OFF it, land the outcome back.
+/// under the state lock, run npm/uv/removal OFF it, land the outcome back,
+/// then queue per-machine install refreshes through the proven sweep path.
 fn spawn_cli_install_apply(state: Signal<ShellState>) {
-    let decision = safe_shell_mut(state, "cli_install_apply_begin", |shell| {
-        shell.begin_cli_install_apply()
+    let Some((decision, endpoint)) = safe_shell_mut(state, "cli_install_apply_begin", |shell| {
+        let endpoint = shell.bootstrap.server_endpoint.clone();
+        // Remote presence as the modal rendered it — the decision snapshot.
+        let remote_presence: Vec<(String, Vec<yggterm_core::cli_install::CliPresenceReport>)> =
+            shell
+                .server
+                .remote_machines()
+                .iter()
+                .map(|machine| {
+                    (
+                        machine.machine_key.clone(),
+                        machine.cli_presence.clone(),
+                    )
+                })
+                .collect();
+        (
+            shell.begin_cli_install_apply(&remote_presence),
+            endpoint,
+        )
     })
     .ok()
-    .flatten();
-    let Some(decision) = decision else {
+    .and_then(|(decision, endpoint)| decision.map(|decision| (decision, endpoint)))
+    else {
         return;
     };
     spawn(async move {
-        let outcome = task::spawn_blocking(move || run_cli_install_apply_job(decision))
+        let outcome = task::spawn_blocking(move || run_cli_install_apply_job(endpoint, decision))
             .await
             .unwrap_or_else(|error| CliInstallApplyOutcome {
                 ok: false,
                 summary: format!("apply job failed to run: {error}"),
                 presence: None,
+                machines_needing_install_refresh: Vec::new(),
             });
-        let _ = safe_shell_mut(state, "cli_install_apply_complete", |shell| {
+        let machines = safe_shell_mut(state, "cli_install_apply_complete", |shell| {
             shell.finish_cli_install_apply(outcome)
-        });
+        })
+        .ok()
+        .unwrap_or_default();
+        for machine_key in machines {
+            spawn_background_managed_cli_refresh(state, machine_key);
+        }
     });
 }
 /// One launch-parity presence probe for the modal's local column, run OFF the

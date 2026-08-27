@@ -4770,6 +4770,10 @@ fn app() -> Element {
                         ),
                         pending: snapshot.cli_install_pending,
                         wanted: snapshot.settings.agent_cli_install_wanted.clone(),
+                        wanted_remote: snapshot
+                            .settings
+                            .agent_cli_install_wanted_remote
+                            .clone(),
                         on_grant: move |_| state.with_mut_counted(|shell| {
                             shell.set_agent_cli_install_consent(
                                 yggterm_core::cli_install::InstallConsent::Granted,
@@ -4780,9 +4784,11 @@ fn app() -> Element {
                                 yggterm_core::cli_install::InstallConsent::Declined,
                             )
                         }),
-                        on_toggle: move |slug: String| state.with_mut_counted(|shell| {
-                            shell.toggle_cli_install_wanted(slug)
-                        }),
+                        on_toggle: move |(machine_key, slug): (String, String)| {
+                            state.with_mut_counted(|shell| {
+                                shell.toggle_cli_install_wanted_on(machine_key, slug)
+                            })
+                        },
                         on_apply: move |_| spawn_cli_install_apply(state),
                         on_reset_selection: move |_| state.with_mut_counted(|shell| {
                             shell.reset_cli_install_selection()

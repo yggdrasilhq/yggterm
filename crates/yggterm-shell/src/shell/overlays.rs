@@ -2114,12 +2114,16 @@ fn CliInstallOverlay(
     machines: Vec<yggterm_core::cli_install::MachineCliStatus>,
     consent: yggterm_core::cli_install::InstallConsent,
     pending: bool,
-    /// The user's per-CLI wanted overrides (slug → wanted). A slug absent
-    /// from the map means wanted — the recommend-every-CLI default.
+    /// The user's per-CLI wanted overrides for THIS machine (slug → wanted).
+    /// A slug absent from the map means wanted — the recommend-every-CLI
+    /// default.
     wanted: std::collections::BTreeMap<String, bool>,
+    /// Per-CLI wanted overrides for REMOTE machines (machine_key → slug →
+    /// wanted), same default rule.
+    wanted_remote: std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
     on_grant: EventHandler<MouseEvent>,
     on_decline: EventHandler<MouseEvent>,
-    on_toggle: EventHandler<String>,
+    on_toggle: EventHandler<(String, String)>,
     on_apply: EventHandler<MouseEvent>,
     on_reset_selection: EventHandler<MouseEvent>,
     on_close: EventHandler<MouseEvent>,
@@ -2142,37 +2146,49 @@ fn CliInstallOverlay(
             "0 0 0 1px rgba(59,87,112,0.90), 0 0 0 10px rgba(124,200,255,0.16), 0 26px 60px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(68,84,99,0.94)"
         }
     };
-    // The apply plan is computed from THIS machine only: installs and removals
-    // run through the local provisioner, and the button must never promise
-    // work on a machine this process cannot reach. The remote columns stay
-    // diagnostic until a per-machine apply path exists for them.
-    let wanted_for =
-        |slug: &str| wanted.get(slug).copied().unwrap_or(true);
-    let local = machines
-        .iter()
-        .find(|machine| machine.machine_key == LOCAL_CLI_MACHINE_KEY);
-    let (install_count, remove_count) = local
-        .map(|machine| {
-            (
-                machine
-                    .rows
-                    .iter()
-                    .filter(|row| row.presence == CliPresence::Absent && wanted_for(&row.slug))
-                    .count(),
-                machine
-                    .rows
-                    .iter()
-                    .filter(|row| row.presence.is_present() && !wanted_for(&row.slug))
-                    .count(),
-            )
-        })
-        .unwrap_or((0, 0));
+    // The apply plan spans EVERY machine the modal lists: this machine's
+    // work runs the local provisioner; a remote machine's installs ride its
+    // background refresh sweep and its removals run the daemon's remove verb
+    // over ssh. Unknown presence ("not probed") never counts as work — a
+    // machine nobody has contacted must not look like ten installs waiting.
+    let wanted_for = |machine_key: &str, slug: &str| {
+        if machine_key == LOCAL_CLI_MACHINE_KEY {
+            wanted.get(slug).copied().unwrap_or(true)
+        } else {
+            wanted_remote
+                .get(machine_key)
+                .and_then(|map| map.get(slug))
+                .copied()
+                .unwrap_or_else(|| wanted.get(slug).copied().unwrap_or(true))
+        }
+    };
+    let mut install_count = 0usize;
+    let mut remove_count = 0usize;
+    for machine in machines.iter() {
+        for row in machine.rows.iter() {
+            if row.presence == CliPresence::Unknown
+                || row.presence == CliPresence::UnsupportedHere
+            {
+                continue;
+            }
+            let row_wanted = wanted_for(&machine.machine_key, &row.slug);
+            if row.presence == CliPresence::Absent && row_wanted {
+                install_count += 1;
+            } else if row.presence.is_present() && !row_wanted {
+                remove_count += 1;
+            }
+        }
+    }
     let apply_count = install_count + remove_count;
-    let apply_summary = format!(
-        "{} to install · {} to remove on This machine.",
-        install_count,
-        remove_count
-    );
+    let apply_summary = if install_count + remove_count == 0 {
+        "This fleet already matches your selection.".to_string()
+    } else {
+        format!(
+            "{} to install · {} to remove across the fleet.",
+            install_count,
+            remove_count
+        )
+    };
     // Counted independently of consent: the user must be able to SEE how much
     // work there is before deciding whether to authorise it. Gating this number
     // on consent would show "0 missing" to exactly the person being asked.
@@ -2186,6 +2202,7 @@ fn CliInstallOverlay(
     // settled here and the loop below only renders.
     #[derive(Clone)]
     struct CliChip {
+        machine_key: String,
         slug: String,
         display_name: String,
         presence_word: &'static str,
@@ -2210,15 +2227,9 @@ fn CliInstallOverlay(
                 .rows
                 .iter()
                 .map(|row| {
-                    // Only THIS machine's chips are controls: the apply path
-                    // runs the local provisioner, and a toggle that promises a
-                    // remote change the button cannot deliver is a lie in
-                    // the UI.
                     let is_local = machine.machine_key == LOCAL_CLI_MACHINE_KEY;
-                    let row_wanted = wanted_for(&row.slug);
-                    let action_suffix = if !is_local {
-                        None
-                    } else if row.presence == CliPresence::Absent && row_wanted {
+                    let row_wanted = wanted_for(&machine.machine_key, &row.slug);
+                    let action_suffix = if row.presence == CliPresence::Absent && row_wanted {
                         Some("will install")
                     } else if row.presence.is_present() && !row_wanted {
                         Some("will remove")
@@ -2228,6 +2239,7 @@ fn CliInstallOverlay(
                         None
                     };
                     CliChip {
+                        machine_key: machine.machine_key.clone(),
                         slug: row.slug.to_string(),
                         display_name: row.display_name.to_string(),
                         presence_word: match &row.presence {
@@ -2398,8 +2410,8 @@ fn CliInstallOverlay(
                                             if palette_is_dark(palette) { "rgba(20,32,52,0.62)" } else { "rgba(228,238,250,0.95)" }
                                         },
                                         palette.text,
-                                        if row.is_local { "pointer" } else { "default" },
-                                        if row.is_local && row.wanted {
+                                        "pointer",
+                                        if row.wanted {
                                             format!("box-shadow: inset 0 0 0 1px {};", palette.accent)
                                         } else {
                                             "box-shadow: none;".to_string()
@@ -2407,9 +2419,8 @@ fn CliInstallOverlay(
                                     ),
                                     onclick: move |evt| {
                                         evt.stop_propagation();
-                                        if row.is_local {
-                                            on_toggle.call(row.slug.clone());
-                                        }
+                                        on_toggle
+                                            .call((row.machine_key.clone(), row.slug.clone()));
                                     },
                                     span { "{row.display_name}" }
                                     span {
