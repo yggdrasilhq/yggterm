@@ -132,6 +132,19 @@ const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const DAEMON_REQUEST_IO_TIMEOUT_MS: u64 = 10_000;
 const DAEMON_LONG_REQUEST_IO_TIMEOUT_MS: u64 = 60_000;
+/// Per-peer budget for a triage probe made WHILE HOLDING the daemon runtime
+/// lock (the hot-restart duplicate-owner check and live-successor lookup).
+///
+/// Measured 2026-08-27 on the GUI host: the hot-restart handler dialed every
+/// versioned peer at the full 10 s `Status` timeout under the lock, and with
+/// one live-but-slow peer the span read `lock_holder {held_ms: 10336}` —
+/// the whole daemon deaf for ten seconds, every five minutes, all day
+/// (387 of 392 `daemon_request/hot_restart` spans in the 9-11 s bucket).
+/// A local unix-socket `Status` answers in single-digit ms when the peer is
+/// healthy (median 9 ms in the same trace), so 750 ms is ~75x a healthy
+/// answer and still bounds the handler's worst case well under a second per
+/// stalled peer. `None`/not-found is the safe fallback for both callers.
+const PEER_TRIAGE_PROBE_BUDGET_MS: u64 = 750;
 const DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS: u64 = 2_000;
 
 /// Deduplicate uglass isolated HOME npm prefixes onto the host shared prefix.
@@ -9894,9 +9907,14 @@ impl DaemonRuntime {
                     // doomed spawn.
                     let live_successor_version = expected_version.as_deref().and_then(|target| {
                         let want = parse_daemon_version_triple(target)?;
-                        reachable_versioned_daemon_statuses_excluding_endpoint(
+                        // ⛔ Budgeted triage probe — same lock, same measured
+                        // 10 s deafness as the duplicate-owner check above.
+                        reachable_versioned_daemon_statuses_filtered(
                             self.store.home_dir(),
-                            &owner_endpoint,
+                            Some(&owner_endpoint),
+                            Some(std::time::Duration::from_millis(
+                                PEER_TRIAGE_PROBE_BUDGET_MS,
+                            )),
                         )
                         .into_iter()
                         .find_map(|(_peer_endpoint, status)| {
@@ -14869,6 +14887,25 @@ pub fn status(endpoint: &ServerEndpoint) -> Result<ServerRuntimeStatus> {
     }
 }
 
+/// A status round trip with an EXPLICIT per-peer budget, for triage probes.
+///
+/// See [`reachable_versioned_daemon_statuses_filtered`] for the measured reason
+/// this exists: the request-derived default for `Status` is the full
+/// [`DAEMON_REQUEST_IO_TIMEOUT_MS`], which is the right ceiling for a client
+/// that genuinely needs the roster and exactly wrong for a caller holding the
+/// daemon runtime lock while it asks a peer a yes/no question.
+pub fn status_with_io_timeout(
+    endpoint: &ServerEndpoint,
+    io_timeout: std::time::Duration,
+) -> Result<ServerRuntimeStatus> {
+    let identity = current_client_identity();
+    match send_request_as_with_io_timeout(endpoint, &ServerRequest::Status, &identity, io_timeout)? {
+        ServerResponse::Status(status) => Ok(status),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected status response: {:?}", other),
+    }
+}
+
 pub fn working_flags(endpoint: &ServerEndpoint) -> Result<Vec<(String, bool)>> {
     match send_request(endpoint, &ServerRequest::WorkingFlags)? {
         ServerResponse::WorkingFlags { flags } => Ok(flags),
@@ -16933,20 +16970,7 @@ fn format_daemon_name_verdicts(row: &StrandedDaemonRow) -> Vec<String> {
 pub fn reachable_versioned_daemon_statuses(
     home_dir: &Path,
 ) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
-    let paths = versioned_server_status_probe_paths(home_dir);
-    let mut seen_pids = HashSet::<u32>::new();
-
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let endpoint = ServerEndpoint::UnixSocket(path);
-            let runtime = status(&endpoint).ok()?;
-            if !seen_pids.insert(runtime.server_pid) {
-                return None;
-            }
-            Some((endpoint, runtime))
-        })
-        .collect()
+    reachable_versioned_daemon_statuses_filtered(home_dir, None, None)
 }
 
 #[cfg(unix)]
@@ -16954,12 +16978,47 @@ fn reachable_versioned_daemon_statuses_excluding_endpoint(
     home_dir: &Path,
     excluded_endpoint: &ServerEndpoint,
 ) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+    reachable_versioned_daemon_statuses_filtered(home_dir, Some(excluded_endpoint), None)
+}
+
+/// The one enumeration behind every peer-status sweep, parameterized on the
+/// per-peer probe budget.
+///
+/// `None` budget keeps the historical full `DAEMON_REQUEST_IO_TIMEOUT_MS` per
+/// peer. ⛔ **A CALLER UNDER THE DAEMON RUNTIME LOCK MAY NOT USE THAT DEFAULT.**
+/// Measured on the GUI host 2026-08-27: the hot-restart handler dialed every
+/// versioned peer through this enumeration while holding the runtime lock, one
+/// live-but-slow peer cost the full 10 s budget, and the request span read
+/// `lock_holder {held_ms: 10336, request: "hot_restart"}` with a `status`
+/// request waiting `waited_us: 10261252` behind it — **the whole daemon deaf
+/// for ten seconds, every five minutes, all day** (387 of 392 spans in the
+/// 9-11 s bucket over three days of trace). The duplicate-owner check and the
+/// live-successor lookup are TRIAGE questions — "is a duplicate alive?", "is a
+/// successor already up?" — and a peer that cannot answer a triage question
+/// within [`PEER_TRIAGE_PROBE_BUDGET_MS`] is not about to own anything; `None`
+/// (not found) is their safe answer. A dead peer's socket file still fails
+/// connect() instantly, so the budget only bites a peer that is genuinely
+/// accepting-but-stalled, which is precisely the peer to give up on.
+#[cfg(unix)]
+fn reachable_versioned_daemon_statuses_filtered(
+    home_dir: &Path,
+    excluded_endpoint: Option<&ServerEndpoint>,
+    probe_budget: Option<std::time::Duration>,
+) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+    let paths = match excluded_endpoint {
+        Some(excluded) => versioned_server_status_probe_paths_excluding_endpoint(home_dir, excluded),
+        None => versioned_server_status_probe_paths(home_dir),
+    };
     let mut seen_pids = HashSet::<u32>::new();
-    versioned_server_status_probe_paths_excluding_endpoint(home_dir, excluded_endpoint)
+
+    paths
         .into_iter()
         .filter_map(|path| {
             let endpoint = ServerEndpoint::UnixSocket(path);
-            let runtime = status(&endpoint).ok()?;
+            let runtime = match probe_budget {
+                Some(budget) => status_with_io_timeout(&endpoint, budget).ok()?,
+                None => status(&endpoint).ok()?,
+            };
             if !seen_pids.insert(runtime.server_pid) {
                 return None;
             }
@@ -23762,9 +23821,18 @@ fn hot_restart_duplicate_runtime_owner_status(
         expected_version,
         owned_terminal_session_keys,
         current_pid,
-        reachable_versioned_daemon_statuses(home)
-            .into_iter()
-            .map(|(_, status)| status),
+        // ⛔ BUDGETED, AND THIS IS THE WHOLE FIX: this runs under the daemon
+        // runtime lock, and the request-derived `Status` timeout is 10 s per
+        // peer. See `PEER_TRIAGE_PROBE_BUDGET_MS` for the measured 10.3 s
+        // lock hold this replaces. Not finding a duplicate here is the safe
+        // answer — the caller proceeds to the defer/force logic.
+        reachable_versioned_daemon_statuses_filtered(
+            home,
+            None,
+            Some(std::time::Duration::from_millis(PEER_TRIAGE_PROBE_BUDGET_MS)),
+        )
+        .into_iter()
+        .map(|(_, status)| status),
     )
 }
 
@@ -24124,15 +24192,32 @@ fn send_request_as(
     request: &ServerRequest,
     identity: &ClientIdentity,
 ) -> Result<ServerResponse> {
+    send_request_as_with_io_timeout(
+        endpoint,
+        request,
+        identity,
+        std::time::Duration::from_millis(daemon_request_io_timeout_ms(request)),
+    )
+}
+
+/// The one wire client, parameterized on the IO timeout so a triage caller can
+/// bring its own (shorter) budget. `send_request_as` derives the timeout from
+/// the request kind; this form is for probes whose caller is holding a lock.
+fn send_request_as_with_io_timeout(
+    endpoint: &ServerEndpoint,
+    request: &ServerRequest,
+    identity: &ClientIdentity,
+    io_timeout: std::time::Duration,
+) -> Result<ServerResponse> {
     let envelope = ClientRequestEnvelope::new(request.clone(), identity);
     let mut request_bytes =
         serde_json::to_vec(&envelope).context("serializing daemon request payload")?;
     request_bytes.push(b'\n');
-    let io_timeout = Some(std::time::Duration::from_millis(
-        daemon_request_io_timeout_ms(request),
-    ));
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(daemon_request_total_deadline_ms(request));
+    let io_timeout = Some(io_timeout);
+    // The total deadline mirrors the request-derived ratio (3x the per-syscall
+    // budget) but is computed from the EFFECTIVE timeout, so a triage probe's
+    // whole round trip is bounded by its own budget, not by Status's default.
+    let deadline = std::time::Instant::now() + io_timeout.unwrap_or_default().saturating_mul(3);
     match endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => {
@@ -24300,6 +24385,7 @@ mod tests {
         hot_restart_block_reason_summary, hot_restart_blocker_is_deadline_exempt,
         ServerRequest, ShadowAccess, gate_screen_tail, hot_restart_blockers_actionable_first,
         hot_restart_deadline_verdict, hot_update_handoff_would_refuse_binary, role_gate,
+        DAEMON_REQUEST_IO_TIMEOUT_MS, PEER_TRIAGE_PROBE_BUDGET_MS,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
     #[cfg(unix)]
@@ -25395,6 +25481,105 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// A peer that ACCEPTS the connection and never answers — the exact shape
+    /// the 2026-08-27 GUI-host measurement caught holding the hot-restart
+    /// handler for its full 10 s default while the daemon runtime lock was
+    /// held (`lock_holder {held_ms: 10336, request: "hot_restart"}`).
+    #[cfg(unix)]
+    fn fake_daemon_accepts_then_goes_silent(socket: &Path) -> std::thread::JoinHandle<()> {
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket).expect("bind silent fake daemon socket");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _addr)) = listener.accept() {
+                // Swallow the request bytes so the client's write succeeds,
+                // then never answer — the stalled-peer shape.
+                let mut sink = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut sink);
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        })
+    }
+
+    /// THE DEFECT CLASS, LOCKED: a triage probe with an explicit budget must
+    /// fail fast against a silent peer, and must NOT pay the request-derived
+    /// 10 s default. This is the client half of the 10.3 s runtime-lock hold
+    /// measured on the GUI host; the daemon-side half is that the hot-restart
+    /// duplicate-owner check and live-successor lookup pass
+    /// `PEER_TRIAGE_PROBE_BUDGET_MS`, not the default.
+    #[cfg(unix)]
+    #[test]
+    fn a_triage_status_probe_fails_fast_when_a_peer_accepts_and_never_answers() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-triage-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let socket = dir.join("server-9-9-9.sock");
+        let _silent = fake_daemon_accepts_then_goes_silent(&socket);
+        let endpoint = ServerEndpoint::UnixSocket(socket.clone());
+
+        let started = std::time::Instant::now();
+        let result = super::status_with_io_timeout(
+            &endpoint,
+            std::time::Duration::from_millis(PEER_TRIAGE_PROBE_BUDGET_MS),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a peer that never answers must error, not hang: {result:?}"
+        );
+        // The budget, plus slack for scheduling; the old default was 10,000 ms.
+        assert!(
+            elapsed < std::time::Duration::from_millis(PEER_TRIAGE_PROBE_BUDGET_MS + 1500),
+            "the probe must cost its budget, not the 10 s default — took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the budget itself is a TRIAGE number: if someone raises it to or
+    /// past the request-derived default, this stops being a triage probe and
+    /// the 10.3 s lock hold comes back with it.
+    #[test]
+    fn the_peer_triage_budget_stays_well_under_the_full_request_timeout() {
+        assert!(
+            PEER_TRIAGE_PROBE_BUDGET_MS < DAEMON_REQUEST_IO_TIMEOUT_MS / 4,
+            "PEER_TRIAGE_PROBE_BUDGET_MS={} must stay well under DAEMON_REQUEST_IO_TIMEOUT_MS={}",
+            PEER_TRIAGE_PROBE_BUDGET_MS,
+            DAEMON_REQUEST_IO_TIMEOUT_MS
+        );
+    }
+
+    /// Both hot-restart call sites that run UNDER the daemon runtime lock must
+    /// use the budgeted enumeration. A future editor who swaps one back to the
+    /// unbounded `reachable_versioned_daemon_statuses*` re-imports the measured
+    /// 10.3 s deafness; this fails on that edit, not on the next incident.
+    #[test]
+    fn the_under_lock_hot_restart_probes_use_the_triage_budget() {
+        let source = include_str!("daemon.rs");
+        let duplicate = source
+            .find("fn hot_restart_duplicate_runtime_owner_status(")
+            .expect("the duplicate-owner check exists");
+        let successor = source
+            .find("let live_successor_version = expected_version.as_deref()")
+            .expect("the live-successor lookup exists");
+        for (name, site) in [("duplicate-owner", duplicate), ("live-successor", successor)] {
+            let body = &source[site..site + 2600];
+            assert!(
+                body.contains("reachable_versioned_daemon_statuses_filtered"),
+                "{name} must call the budgeted enumeration"
+            );
+            assert!(
+                body.contains("PEER_TRIAGE_PROBE_BUDGET_MS"),
+                "{name} must pass the triage budget, not the request-derived default"
+            );
+        }
     }
 
     #[cfg(unix)]

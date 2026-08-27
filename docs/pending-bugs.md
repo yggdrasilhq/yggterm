@@ -4886,6 +4886,40 @@ blame — the attribution fix holds — while the rate reads **8.2/min** (164 sp
 `app_control/request_begin` fires 214 times (~10.7/min). Nothing regressed; nothing new
 closed.
 
+### ⛔ [11.0] THE 5-MINUTE NO-OP RESTART LOOP — THE GUI ASKS, THE DAEMON REFUSES, FOREVER, AND THE ASK ITSELF DEAFENED THE DAEMON
+
+**Status:** HALF FIXED (the deafness — `PEER_TRIAGE_PROBE_BUDGET_MS`); the loop remains OPEN
+with its owner being whoever next touches the bidirectional-convergence half.
+
+**Measured 2026-08-27, three days of GUI-host trace (`daemon_request/hot_restart`):** 392 spans,
+**387 of them in the 9-11 s bucket** (p50 10,233 ms), **~12 every hour around the clock** —
+gaps of 5 min 10 s, i.e. a 5-minute tick plus the call's own cost. One daemon pid answered 125
+of them across ~10 hours and was never replaced.
+
+**The correlation window names both halves.** Inside one span:
+`hot_update_install_state_promoted` → `spawned_hot_restart_daemon_child` →
+`hot_update_handoff_prepared` → **`hot_restart_swap_queue_skipped {"reason": "the replacement
+binary is not ahead of this daemon, so no swap can be owed"}`** →
+`spawned_daemon_exit {code: 0}` **0.7 s later** — the spawned successor bound for a socket the
+CALLER itself holds, so single-instance correctness killed it instantly — while
+`lock_holder {"held_ms": 10336, "request": "hot_restart"}` and
+`lock_wait_slow {"request": "status", "waited_us": 10261252}` show what the ask cost everyone
+else: **the daemon deaf for ten seconds, five minutes at a time, all day.**
+
+**Fixed half:** the under-lock duplicate-owner probe and live-successor lookup now carry a
+750 ms per-peer triage budget (`PEER_TRIAGE_PROBE_BUDGET_MS`), locked by a silent-peer test and
+a source contract. The snapshot fan-out got this same medicine earlier; hot-restart was the
+caller that never got it.
+
+**Open half (the loop):** `hot_restart_pending` stays true for a same-version newer-build-on-disk,
+the GUI's convergence fires every 5 min, the daemon answers "handoff started" while internally
+recording that **no swap can be owed**, a doomed child is spawned and instantly reaped — and
+nothing ever converges or backs off. Each round now costs ~1 s instead of ~10, but the honest
+fix is semantic: either the daemon's "no swap can be owed" verdict must reach the requester as
+*do not retry until the build changes*, or the same-version pending flag must clear when the
+daemon has answered the question once. **Falsifier:** with a newer build on disk at the same
+version, `daemon_request/hot_restart` must not recur more than once per build change.
+
 ### ⭐ THE INVISIBLE INSTANCE — A FAILED GUI RESTART LIVES ON AS A SECOND FULL GUI (2026-08-27)
 
 *Found by asking "why is the GUI host angry" with `ytop --probe` after the deploy night. Closed
