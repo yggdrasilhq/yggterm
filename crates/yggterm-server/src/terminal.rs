@@ -23,6 +23,11 @@ use yggterm_core::{append_bounded_jsonl_record, append_trace_event, resolve_yggt
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
+/// Env keys a PTY child must NEVER inherit: a stale COLUMNS/LINES from the
+/// daemon's own launch shell overrides the tty winsize in env-preferring
+/// TUIs and pins them at a grid the PTY does not have. The ioctl is the only
+/// truth; see the measured root cause at the shell_command removal site.
+const STALE_TERMINAL_SIZE_ENV_REMOVALS: [&str; 2] = ["COLUMNS", "LINES"];
 const MAX_CHUNKS: usize = 512;
 // Per [[spec-tmux-parity-and-beyond]]: raw-byte retention is the
 // substrate for GUI-restart history replay. Was 2 MB pre-2026-05-26;
@@ -4417,6 +4422,10 @@ fn shell_command(
         for key in terminal_identity_env_removals() {
             command.env_remove(key);
         }
+        for key in STALE_TERMINAL_SIZE_ENV_REMOVALS {
+            // The winsize ioctl is the ONLY grid a PTY child may trust.
+            command.env_remove(key);
+        }
         for (key, value) in terminal_identity_env_pairs() {
             command.env(key, value);
         }
@@ -4437,6 +4446,18 @@ fn shell_command(
     };
     command.arg(wrapped_launch_command);
     for key in terminal_identity_env_removals() {
+        command.env_remove(key);
+    }
+    for key in STALE_TERMINAL_SIZE_ENV_REMOVALS {
+        // ⛔ THE WINSIZE IOCTL IS THE ONLY GRID A PTY CHILD MAY TRUST.
+        // MEASURED ROOT CAUSE (qwen renders a ~100-col box inside a 169-col
+        // PTY): the DAEMON inherited COLUMNS=120 from the shell that launched
+        // it, every PTY child inherited it from the daemon, and qwen — an
+        // Ink-style TUI — prefers process.env.COLUMNS over the tty winsize
+        // and never re-reads it. SIGWINCH does nothing for it; the "fixed
+        // small box" survived nudges, re-fits and restarts for exactly as
+        // long as the daemon's env carried the variable. tmux and ssh strip
+        // these for the same reason.
         command.env_remove(key);
     }
     for (key, value) in terminal_identity_env_pairs() {
@@ -5076,6 +5097,49 @@ mod screen_width_tests {
     /// The grid WIDE_SCREEN was formatted against. Wide enough that nothing in
     /// it wraps, so these cases test the measurement and not the wrap.
     const GRID: u16 = 80;
+
+    /// ⛔ THE WINSIZE IOCTL IS THE ONLY GRID A PTY CHILD MAY TRUST. A daemon
+    /// launched from a COLUMNS-exporting shell used to hand every PTY child
+    /// that stale env var, and env-preferring TUIs (qwen/Ink) then rendered a
+    /// ~120-col box inside a 169-col PTY forever — deaf to SIGWINCH, nudge,
+    /// re-fit and restart. The spawn env must strip the stale pair even when
+    /// the daemon's own environment carries it.
+    #[test]
+    fn the_pty_child_env_never_carries_a_stale_terminal_size() {
+        let key = format!("test-pty-env-{}", std::process::id());
+        // SAFETY: single-threaded test mutation of the process env for these
+        // two keys; restored before returning.
+        let saved_columns = std::env::var("COLUMNS").ok();
+        let saved_lines = std::env::var("LINES").ok();
+        unsafe {
+            std::env::set_var("COLUMNS", "120");
+            std::env::set_var("LINES", "36");
+        }
+        let mut command = crate::terminal::shell_command("true", None, Some(&key));
+        let carries = |command: &portable_pty::CommandBuilder, name: &str| {
+            command
+                .iter_full_env_as_str()
+                .any(|(env_name, _): (_, &str)| env_name.eq_ignore_ascii_case(name))
+        };
+        let columns_carried = carries(&command, "COLUMNS");
+        let lines_carried = carries(&command, "LINES");
+        unsafe {
+            if let Some(value) = saved_columns {
+                std::env::set_var("COLUMNS", value);
+            } else {
+                std::env::remove_var("COLUMNS");
+            }
+            if let Some(value) = saved_lines {
+                std::env::set_var("LINES", value);
+            } else {
+                std::env::remove_var("LINES");
+            }
+        }
+        assert!(
+            !columns_carried && !lines_carried,
+            "a PTY child inherited a stale terminal size from the daemon's env"
+        );
+    }
 
     #[test]
     fn max_column_counts_blank_runs_not_bytes() {
