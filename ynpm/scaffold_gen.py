@@ -139,7 +139,16 @@ jobs:
           NODE_AUTH_TOKEN: ${{{{ secrets.NPM_TOKEN }}}}
         run: |
           cd "pack/@ygghq/{name}-${{{{ matrix.target }}}}"
-          npm publish --access public --provenance || echo "version already published"
+          # IDEMPOTENCE WITHOUT LYING: only the genuine already-published
+          # conflict is a skip; every other publish error fails the step with
+          # its real output (a broken package.json must not report as a clean
+          # skip — that exact mask shipped once and went green publishing
+          # nothing).
+          if ! npm publish --access public --provenance 2>pub_err.txt; then
+            grep -qE "EPUBLISHCONFLICT|previously published|cannot publish over" pub_err.txt || {{ cat pub_err.txt >&2; exit 1; }}
+            echo "version already published — skipping (genuine conflict)"
+          fi
+          rm -f pub_err.txt
 
   publish-main:
     needs: build
