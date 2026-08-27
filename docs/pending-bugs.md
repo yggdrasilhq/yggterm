@@ -4920,6 +4920,52 @@ fix is semantic: either the daemon's "no swap can be owed" verdict must reach th
 daemon has answered the question once. **Falsifier:** with a newer build on disk at the same
 version, `daemon_request/hot_restart` must not recur more than once per build change.
 
+### ⭐ THE MINUTE-ALIGNED RENDER WAVE — THE FAN DRIVER, MEASURED (2026-08-27, post-reboot, 3.1.62)
+
+*Owner: "fan spinning rapidly — what resource, and is yggterm to blame?" Asked after rebooting
+away the swap disease. Everything thermal reads COOL — Tctl 50°C, GPU 46°C @ 9-11 W, NVMe 53°C,
+Wi-Fi 54°C — so the fan is not answering temperature; it is answering POWER, and the power
+picture has a yggterm signature on an otherwise idle machine.*
+
+**The steady state (40 s window, per-process deltas):** the machine's top FOUR CPU consumers are
+all yggterm family — WebKitWebProcess (the transcript Web View) 18.1% of a core, the daemon
+13.0%, the GUI shell 11.4%, ychrome 10.2% — **~0.5 core continuous** against a 96%-idle
+16-core box. By itself not a fan driver. The waves are:
+
+| reading | value |
+|---|---|
+| wave cadence | **exactly every 60 s** (:38:28, :39:28, :40:28) |
+| `render/web_content` per wave | **8.7-10.0 s CPU**, `core_fraction` 0.146-0.166 |
+| `render/gui` per wave | 4.4-7.0 s CPU, core_fraction 0.073-0.117 |
+| span payload | **`force_foreground: true`, `app_control_backgrounded: false`** |
+| coincidence | `terminal_app_declares` minute polls; on one wave, a `hot_warm_ensure_ok` on `remote-session://dev/8a5749e0…` that **held the daemon lock 615 ms**, forwarded a remote PTY resize, and replayed **25-29 K chars** of backlog into xterm |
+
+⇒ **A minute-aligned chore is force-rendering the entire GUI + webview every minute, whether or
+not anything changed.** Two of the three waves had no ensure behind them at all — the wave is
+not caused by terminal activity; terminal activity sometimes rides along. This is the
+blink-storm family (`[11.8]`'s "background chores each writing once per render it precedes")
+with a 60 s driver instead of a 2.5 s tick, and it hands the EC **60 power bursts an hour**,
+which in `performance` profile (the owner's own settled ruling — see `docs/settled-calls.md` §
+*CAPPING POWER TO CUT HEAT IS A CHEAT FIX*) fans the machine up on every burst even at cool
+temps.
+
+**What is fixed and verifiable on this same build (3.1.62):** the hot-restart deafness is GONE —
+`ytrace query daemon_request/hot_restart` over 45 minutes returns EMPTY, against 387 spans at
+10.2 s across the previous three days. `ui/block` reads **1.24/min** (56 in 45 min, worst
+3156 ms) against 8.2-9.1/min pre-fix — near the ≤1/min bar but not under it, and the max is
+still a visible freeze. The reboot cleared the swap disease completely: swap free 15.5 of
+16 GB, memory PSI 0.
+
+**Open and re-proven on the fresh boot:** the transcript Web View process — born AFTER the
+memory policy — reached **1.16 GB resident within ~2 h** and holds 18% of a core (the 6.7
+RSS-blindness bug, running as written).
+
+⇒ **The render-wave fix belongs to the render/blink lane**: whatever the 60 s chore is, a
+nothing-changed render must not force a foreground full paint of the transcript webview.
+**Falsifier:** quiet the GUI for five minutes with no typing and no session output; the
+`render/web_content` spans ≥5 s must not recur at 60 s cadence. The felt test: the fan settles
+on an idle desktop.
+
 ### ⭐ THE INVISIBLE INSTANCE — A FAILED GUI RESTART LIVES ON AS A SECOND FULL GUI (2026-08-27)
 
 *Found by asking "why is the GUI host angry" with `ytop --probe` after the deploy night. Closed
