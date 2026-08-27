@@ -12166,7 +12166,7 @@ set up a measurement that is guaranteed to disappoint.
 *single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
 
 ⭐ **AND STILL TRUE ON THE NEWEST BUILD, WITH THE POLICY APPLIED FROM BIRTH (2026-08-27,
-3.1.61):** the active session's Web View process — born 2026-08-27 *after* both
+3.1.64):** the active session's Web View process — born 2026-08-27 *after* both
 memory-policy fixes, so it never ran unbounded — reached **727 MB RSS + 282 MB swapped
 (≈1.0 GB committed) in ~30 minutes**, and grew **660 → 727 MB across a ten-minute window in
 which nothing streamed into it at all** (idle growth). Its CPU calmed to ~2% of a core once the
@@ -12174,6 +12174,31 @@ rendering finished; the memory did not come back. This is the settled RSS-metric
 running exactly as written, on processes the jar-less fix covers — the bound cannot fire, and
 per-tab reclaim never engages, because the number WebKit reads is not the number that is
 growing. Nothing here contradicts the analysis; it is the analysis, live.
+
+### ⭐ RE-MEASURED ON 3.1.67, AFTER THE RENDER-DRUMBEAT FIX — THE GROWTH REVERSED IN A QUIET WINDOW
+
+The schema-refetch noop fix (same day, commit `6aab27da`) removed the largest measured render
+cause (~100 of ~200 sampled writes in ten minutes, ~1.7 root renders/s sustained). The first
+growth measurement on the fixed build, same host, same measurement method (per-region
+`Anonymous:` deltas over 7 minutes, 10 WebKit processes on the box):
+
+| reading | 3.1.64 GUI (drumbeat live) | 3.1.67 (drumbeat fixed) |
+|---|---|---|
+| window | 10 min "idle", nothing streaming | 7 min mixed |
+| anon direction | **660 → 727 MB, monotonic** | **669 → 504 MB (−23.6 MB/min)** |
+| top deltas | n/a (never region-attributed) | JIT/rwx pools + allocator arenas oscillating |
+
+⇒ **The monotonic growth and the render drumbeat were contemporaneous, and on the fixed build
+the direction reversed in the same window shape.** That is evidence, not exoneration: the
+morning reading was one process under one activity mix, and a GC sawtooth can fake either
+direction across a 7-minute window. **What remains owed before this entry's leak classification
+changes: (1) a sustained-streaming window** (fleet agents writing at 100K+ chars/min — the
+condition under which core_fraction climbed to 0.26) **re-measured the same way; (2) the
+committed (RSS+swap) horizon**, since the settled mechanism — swap evicting RSS under the
+RSS-valued bound — predicts growth resuming exactly when the machine starts swapping again
+(it had crept to 2–4 GB by evening). The structural half is unchanged: the cgroup
+`memory.high` + swap-denial scope remains the only fix that makes the existing threshold mean
+what it says, and it still needs its falsifier first.
 
 `configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
 `YGGTERM_WEBKIT_CACHE_MODEL=web-browser` and a limit of

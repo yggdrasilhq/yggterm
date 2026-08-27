@@ -229,6 +229,11 @@ pub struct ProcMemory {
     /// Anonymous (non-file-backed) memory, or 0 on the `status` fallback. This is the
     /// number the allocator-trim chore moves.
     pub anonymous_kb: u64,
+    /// Swapped-out pages, or 0 when the reading came from a source that cannot see
+    /// them. THE 6.7 number: a WebKit process whose anon keeps climbing while RSS
+    /// stays flat is leaking INTO SWAP, and a probe that cannot see swap reads that
+    /// leak as "memory went down".
+    pub swap_kb: u64,
     pub source: ProcMemorySource,
 }
 
@@ -246,6 +251,17 @@ impl ProcMemory {
         }
     }
 
+    /// RSS (or PSS) plus swap: the footprint the machine is actually carrying.
+    ///
+    /// The committed number the 6.7 webview-growth entry is about. The in-process
+    /// WebKit bound cannot see swap (it reads `statm`/`VmRSS` only), which is why
+    /// a process can hold 1.5 GB committed while its internal threshold — reading
+    /// a kernel-evicted RSS — never fires. This is the parent-side reading of the
+    /// same process, where both halves are visible.
+    pub fn committed_kb(&self) -> u64 {
+        self.preferred_kb().saturating_add(self.swap_kb)
+    }
+
     /// The fields of this reading that are safe to put on the wire, and the source
     /// that produced them. THE one owner of "how a memory reading is published".
     ///
@@ -258,6 +274,8 @@ impl ProcMemory {
     pub fn perf_fields(&self) -> Value {
         let mut payload = json!({
             "rss_kb": self.rss_kb,
+            "swap_kb": self.swap_kb,
+            "committed_kb": self.committed_kb(),
             "memory_source": self.source.as_str(),
         });
         if self.source.knows_pss_and_anonymous() {
@@ -278,6 +296,7 @@ pub fn parse_smaps_rollup(text: &str) -> Option<ProcMemory> {
         rss_kb: 0,
         pss_kb: 0,
         anonymous_kb: 0,
+        swap_kb: 0,
         source: ProcMemorySource::SmapsRollup,
     };
     for line in text.lines() {
@@ -293,6 +312,7 @@ pub fn parse_smaps_rollup(text: &str) -> Option<ProcMemory> {
             "Rss:" => memory.rss_kb = value,
             "Pss:" => memory.pss_kb = value,
             "Anonymous:" => memory.anonymous_kb = value,
+            "Swap:" => memory.swap_kb = value,
             _ => {}
         }
     }
@@ -326,15 +346,33 @@ pub fn read_process_memory(pid: i32) -> Option<ProcMemory> {
     {
         return Some(memory);
     }
-    let rss_kb = fs::read_to_string(format!("/proc/{pid}/status"))
-        .ok()
-        .and_then(|text| parse_status_rss_kb(&text))?;
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let rss_kb = parse_status_rss_kb(&status)?;
+    // The fallback CAN see swap (`VmSwap:`) even though it cannot see PSS — and
+    // leaving it out here would make the fallback path report a committed
+    // footprint that ignores exactly the pages the 6.7 entry is about.
+    let swap_kb = parse_status_swap_kb(&status).unwrap_or(0);
     Some(ProcMemory {
         rss_kb,
         pss_kb: 0,
         anonymous_kb: 0,
+        swap_kb,
         source: ProcMemorySource::StatusVmRss,
     })
+}
+
+/// Parse `VmSwap:` (KiB) out of `/proc/<pid>/status` — 0 when absent. The
+/// `status` fallback's swap half: paired with [`parse_status_rss_kb`] so the
+/// committed footprint never silently loses its swapped pages.
+fn parse_status_swap_kb(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("VmSwap:") else {
+            continue;
+        };
+        let value = rest.split_whitespace().next()?;
+        return value.parse().ok();
+    }
+    None
 }
 
 /// Sum every `drm-engine-*` counter (nanoseconds of GPU engine time) in one
@@ -755,6 +793,11 @@ pub struct RenderRoleRollup {
     pub cpu_ms: f64,
     /// PSS where available, else RSS, summed across the role's processes.
     pub mem_kb: u64,
+    /// `mem_kb` PLUS every role process's swapped-out pages: the footprint the
+    /// machine is actually carrying. THE 6.7 number — a role whose `mem_kb` is
+    /// flat while `committed_kb` climbs is leaking into swap, which an
+    /// RSS-valued bound and an RSS-only rollup both read as "stable".
+    pub committed_kb: u64,
     /// GPU engine nanoseconds summed across the role's processes, or `None` when NO
     /// process in the role had a readable counter. The distinction survives the rollup
     /// on purpose: "this role did no GPU work" and "we could not see the GPU" are
@@ -790,6 +833,7 @@ pub fn roll_up_roles(samples: &[RenderProcSample]) -> Vec<RenderRoleRollup> {
                 role: sample.role,
                 cpu_ms: 0.0,
                 mem_kb: 0,
+                committed_kb: 0,
                 gpu_ns: None,
                 procs: 0,
                 interval_ms: sample.interval_ms,
@@ -800,6 +844,10 @@ pub fn roll_up_roles(samples: &[RenderProcSample]) -> Vec<RenderRoleRollup> {
         entry.mem_kb += sample
             .memory
             .map(|memory| memory.preferred_kb())
+            .unwrap_or(0);
+        entry.committed_kb += sample
+            .memory
+            .map(|memory| memory.committed_kb())
             .unwrap_or(0);
         if let Some(gpu_ns) = sample.gpu_ns {
             entry.gpu_ns = Some(entry.gpu_ns.unwrap_or(0).saturating_add(gpu_ns));
@@ -838,6 +886,7 @@ pub fn emit_render_role_events(home: &Path, rollups: &[RenderRoleRollup], contex
             "role": rollup.role.as_str(),
             "procs": rollup.procs,
             "mem_kb": rollup.mem_kb,
+            "committed_kb": rollup.committed_kb,
             "hot_pid": rollup.hot_pid,
             "hot_cpu_ms": rollup.hot_cpu_ms.max(0.0),
         });
@@ -1091,6 +1140,7 @@ mod tests {
                 rss_kb: mem_kb,
                 pss_kb: 0,
                 anonymous_kb: 0,
+                swap_kb: 0,
                 source: ProcMemorySource::StatusVmRss,
             }),
             gpu_ns: None,
@@ -1228,6 +1278,36 @@ mod tests {
         assert_eq!(stat.cpu_ticks(), 1800);
     }
 
+    /// THE 6.7 INSTRUMENT: the rollup parser must carry `Swap:` and the
+    /// committed footprint must include it. Before this, a web process leaking
+    /// into swap read as "RSS flat — stable" on exactly the plane built to
+    /// catch the growth.
+    #[test]
+    fn smaps_rollup_swap_travels_into_committed() {
+        let text = "Rss:                123456 kB\nPss:                 98765 kB\n\
+                    Anonymous:           54321 kB\nSwap:                45678 kB\n";
+        let memory = parse_smaps_rollup(text).expect("a rollup with Rss parses");
+        assert_eq!(memory.swap_kb, 45_678);
+        assert_eq!(
+            memory.committed_kb(),
+            memory.preferred_kb() + memory.swap_kb,
+            "committed = preferred + swap"
+        );
+        assert_eq!(memory.committed_kb(), 98_765 + 45_678);
+    }
+
+    /// And the status fallback — the reading taken when smaps_rollup is
+    /// unreadable — must not silently drop the swapped pages either.
+    #[test]
+    fn status_fallback_carries_vmswap_into_committed() {
+        let text = "Name:  WebKitWebProces\nVmRSS:  123456 kB\nVmSwap:  45678 kB\n";
+        assert_eq!(parse_status_rss_kb(&text), Some(123_456));
+        assert_eq!(parse_status_swap_kb(&text), Some(45_678));
+        // A status file without swap (an old kernel, a kernel thread) reads None
+        // — "could not look" stays distinct from "zero".
+        assert_eq!(parse_status_swap_kb("Name:  x\nVmRSS:  1 kB\n"), None);
+    }
+
     /// The parser bug this guards against: a comm containing spaces AND parentheses
     /// derails positional `split_whitespace`, silently yielding another field's value
     /// as CPU time.
@@ -1294,6 +1374,7 @@ mod tests {
             rss_kb: 543_284,
             pss_kb: 0,
             anonymous_kb: 0,
+            swap_kb: 0,
             source: ProcMemorySource::StatusVmRss,
         };
         assert_eq!(fallback.preferred_kb(), 543_284);
@@ -1314,6 +1395,7 @@ mod tests {
             rss_kb: 543_284,
             pss_kb: 0,
             anonymous_kb: 0,
+            swap_kb: 0,
             source: ProcMemorySource::StatusVmRss,
         };
         let fields = fallback.perf_fields();
@@ -1331,11 +1413,14 @@ mod tests {
             rss_kb: 123_456,
             pss_kb: 98_765,
             anonymous_kb: 54_321,
+            swap_kb: 45_678,
             source: ProcMemorySource::SmapsRollup,
         };
         let fields = rollup.perf_fields();
         assert_eq!(fields.get("pss_kb"), Some(&json!(98_765)));
         assert_eq!(fields.get("anonymous_kb"), Some(&json!(54_321)));
+        assert_eq!(fields.get("swap_kb"), Some(&json!(45_678)));
+        assert_eq!(fields.get("committed_kb"), Some(&json!(98_765 + 45_678)));
         assert_eq!(fields.get("memory_source"), Some(&json!("smaps_rollup")));
     }
 
@@ -1409,6 +1494,7 @@ mod tests {
                 pss_kb: 600,
                 anonymous_kb: 400,
                 source: ProcMemorySource::SmapsRollup,
+                swap_kb: 0,
             }),
             gpu_ns: None,
         }
@@ -1744,6 +1830,7 @@ drm-engine-compute:\t3434919 ns\n";
             role: RenderRole::WebGpu,
             cpu_ms: 0.0,
             mem_kb: 0,
+            committed_kb: 0,
             gpu_ns: None,
             procs: 1,
             interval_ms: 60_000.0,
@@ -1754,6 +1841,7 @@ drm-engine-compute:\t3434919 ns\n";
             role: RenderRole::WebContent,
             cpu_ms: 250.0,
             mem_kb: 4096,
+            committed_kb: 4096,
             gpu_ns: Some(7_000_000),
             procs: 3,
             interval_ms: 60_000.0,
@@ -1828,6 +1916,7 @@ drm-engine-compute:\t3434919 ns\n";
                 pss_kb: 0,
                 anonymous_kb: 0,
                 source: ProcMemorySource::StatusVmRss,
+                swap_kb: 0,
             }),
             ..observation(pid, "WebKitWebProces", 1, ticks)
         };
