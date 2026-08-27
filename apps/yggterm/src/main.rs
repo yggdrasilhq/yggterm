@@ -972,6 +972,13 @@ fn main() -> Result<()> {
     // a thread exists, so "first statement in main()" is the whole guarantee.
     // Nothing here needs the identity declared first.
     yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
+    // And the identity ENV, for the same reason and the same single-threaded
+    // moment: a relaunched GUI inherits the launcher's `TERM_PROGRAM_VERSION`,
+    // and every version census that reads `/proc/<pid>/environ` then reports
+    // the grandparent's version as this process's (measured three versions
+    // stale, live, 2026-08-27). See
+    // `yggterm_server::build_identity::stamp_terminal_identity_env`.
+    yggterm_server::build_identity::stamp_terminal_identity_env();
 
     let entry_args = std::env::args().skip(1).collect::<Vec<_>>();
     // FIRST, ahead of even the supervisor: this process may have been re-exec'd for
