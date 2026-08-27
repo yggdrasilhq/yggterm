@@ -88,6 +88,29 @@ Per [[spec-cwd-tree-agent-cli-unified]] and `docs/cli-integration.md`:
 
 ---
 
+## Git Topology Habit — pristine main, worktree lanes (code-heavy repos)
+
+For repos whose content is CODE (yggterm, ychrome, ytop, yedit, kasten, yRDP,
+libyggterm, …). Pure-information repos that merely use git for versioning are
+exempt. The standing topology, per repo:
+
+1. **The main checkout stays PRISTINE and synced with upstream**: `git pull`
+   (fetch + fast-forward) at session start; no feature work, no dirty tree.
+   Other agents on other hosts build from it — a dirty or divergent main
+   poisons every build that cites it.
+2. **Feature work happens in a WORKTREE on a lane branch**
+   (`git worktree add ../<repo>--<lane> -b lane/<team>/<topic>`), rebasing onto
+   main as main advances — never committing feature work in the main checkout.
+3. **CRITICAL PATCHES go upstream IMMEDIATELY** — the moment a change fixes
+   something other running builds need (a fleet regression, an installer fix,
+   a crash), commit and push it from the lane so every other agent's next
+   build carries it. A fix that exists only in a local lane is a fix other
+   agents' deploys actively regress (measured 2026-08-27: an unpushed
+   generation-prune fix let 3.1.65's deploy re-break running qwen sessions on
+   dev within the hour). Do not batch critical fixes with feature work.
+4. **At completion**: merge the lane into main, push, and DELETE the branch
+   and the worktree — a landed lane that lingers is a second main that drifts.
+
 ## Operating Directives & Engineering Contracts
 
 - **Docs SSOT Audit:** `docs/architecture-audit-2026-05-16.md` is required reading before terminal, session, hot-update, theme, telemetry, app-control, or release-gate changes.
