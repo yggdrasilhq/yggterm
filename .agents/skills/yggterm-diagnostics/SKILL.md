@@ -185,6 +185,15 @@ are profiling).
   on its birth id without another state change. `projection` carries no title
   text, only title quality and kind/icon agreement; the sweep names every
   registered CLI even when its row count is zero.
+- Fleet durable-projection drift has its own content-free pair of probes:
+  `server/remote_machine/durable_projection_source` says whether each applied
+  machine refresh came from `core_ssot` or the rolling-upgrade
+  `legacy_compat` scanners, and `remote/durable_scan/complete` reports the
+  current peer's aggregate row counts by CLI kind. Neither event contains a
+  session id, cwd, storage path, title, or transcript text. For a current fleet,
+  any fresh `legacy_compat` answer is a version/capability incident; compare it
+  with `server titles ls`, `server cwdtree ls`, and `server app rows` before
+  reasoning from a stale screenshot.
 - `server app session <remove|delete> <path>` — delete a session (e.g. a phantom).
 - `server app screenshot [out.png]` — app capture. **Since v2.8.46, when the active view
   is a terminal and the canvas renderer is on, this composites the xterm canvas layers
