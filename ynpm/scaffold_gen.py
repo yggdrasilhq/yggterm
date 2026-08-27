@@ -133,7 +133,7 @@ jobs:
           EXE="{bin_}"; case "$TARGET" in win32-*) EXE="{bin_}.exe";; esac
           mkdir -p "pack/@ygghq/{name}-$TARGET/bin"
           cp "$BUILT/$EXE" "pack/@ygghq/{name}-$TARGET/bin/{bin_}"
-          printf '{{"name":"@ygghq/{name}-%s","version":"{version}","bin":{{"{bin_}":"bin/{bin_}"}},"os":[],"cpu":[],"license":"GPL-3.0-or-later"}}\\n' "$TARGET" > "pack/@ygghq/{name}-$TARGET/package.json"
+          printf '{"name":"@ygghq/{name}-%s","version":"{version}","bin":{"{bin_}":"bin/{bin_}"},"os":[],"cpu":[],"license":"GPL-3.0-or-later"}\\n' "$TARGET" > "pack/@ygghq/{name}-$TARGET/package.json"
       - name: Publish platform package
         env:
           NODE_AUTH_TOKEN: ${{{{ secrets.NPM_TOKEN }}}}
