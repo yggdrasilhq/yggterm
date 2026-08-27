@@ -176,7 +176,7 @@ pub use daemon::{
     prepare_client_close, prepare_update_restart, raise_external_window,
     PeerDaemonSummary, stale_daemon_answer_warning,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
-    refresh_preview_with_history,
+    refresh_preview_with_history, remove_managed_cli,
     refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
     reorder_live_sessions_scoped, row_order_ledger_report,
     request_terminal_launch, request_terminal_launch_for_path, retire_daemon,
@@ -9301,6 +9301,37 @@ impl YggtermServer {
             }
         };
         Ok(summarize_managed_cli_report(&label, &report))
+    }
+
+    /// Remove ONE agent CLI on ONE machine. Local resolves to the local
+    /// provisioner's removal; a named machine runs the remote removal verb
+    /// over ssh; the fleet scope is refused — removal is an explicit,
+    /// per-machine decision, never a broadcast.
+    pub fn remove_managed_cli_on_machine(
+        &self,
+        machine_key: &str,
+        slug: &str,
+    ) -> anyhow::Result<String> {
+        let tool = managed_cli::managed_cli_tool_for_slug(slug)
+            .ok_or_else(|| anyhow::anyhow!("no registered agent CLI has slug {slug}"))?;
+        match ManagedCliRefreshScope::parse(Some(machine_key)) {
+            ManagedCliRefreshScope::Local => {
+                let status = remove_local_managed_cli(tool)?;
+                Ok(format!("{}: {}", status.action, status.detail))
+            }
+            ManagedCliRefreshScope::Machine(machine_key) => {
+                let target = self.remote_target_for_machine_key(&machine_key)?;
+                let status = remove_remote_managed_cli(
+                    &target.ssh_target,
+                    target.prefix.as_deref(),
+                    tool,
+                )?;
+                Ok(format!("{} on {machine_key}: {}", status.action, status.detail))
+            }
+            ManagedCliRefreshScope::Fleet => anyhow::bail!(
+                "removal is a per-machine decision — name the machine (or 'local'), never the fleet"
+            ),
+        }
     }
 
     pub fn queue_background_managed_cli_refresh(
@@ -22794,6 +22825,30 @@ fn ensure_remote_managed_cli(
         .with_context(|| format!("parsing remote managed cli ensure status for {ssh_target}"))
 }
 
+/// Remove ONE managed CLI on ONE remote machine, by invoking the verb the
+/// remote binary routes (`remote_cli.rs` → `run_remote_remove_managed_cli` →
+/// `remove_local_managed_cli`). Removal is user-local-only on the remote too:
+/// a system-path binary there is refused by the same guard, by path. A remote
+/// binary too old to route the verb answers an unknown-command error, which
+/// propagates to the user as "this machine needs a yggterm update" — honest,
+/// never a silent no-op.
+fn remove_remote_managed_cli(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    tool: ManagedCliTool,
+) -> anyhow::Result<ManagedCliToolStatus> {
+    // Removal does not install; a fraction of the refresh budget is generous.
+    let output = run_remote_yggterm_command_with_timeout(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "remove-managed-cli", tool.binary_name()],
+        None,
+        REMOTE_MANAGED_CLI_COMMAND_TIMEOUT_MS,
+    )?;
+    serde_json::from_str(output.trim())
+        .with_context(|| format!("parsing remote managed cli remove status for {ssh_target}"))
+}
+
 /// How long a CONFIRMED-present remote CLI stays cached before the launch path
 /// asks that machine again. Long on purpose: a CLI that is installed does not
 /// disappear, and every miss here costs an SSH ROUND TRIP.
@@ -29186,6 +29241,12 @@ pub fn run_remote_refresh_managed_cli(mode: ManagedCliRefreshMode) -> anyhow::Re
 
 pub fn run_remote_ensure_managed_cli(tool: ManagedCliTool) -> anyhow::Result<()> {
     let status = ensure_local_managed_cli(tool)?;
+    write_stdout_payload(&serde_json::to_string(&status)?)?;
+    Ok(())
+}
+
+pub fn run_remote_remove_managed_cli(tool: ManagedCliTool) -> anyhow::Result<()> {
+    let status = remove_local_managed_cli(tool)?;
     write_stdout_payload(&serde_json::to_string(&status)?)?;
     Ok(())
 }

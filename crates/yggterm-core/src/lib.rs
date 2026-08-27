@@ -547,6 +547,13 @@ pub struct AppSettings {
     /// so the map only ever carries EXPLICIT departures from that default.
     #[serde(default)]
     pub agent_cli_install_wanted: BTreeMap<String, bool>,
+    /// Per-CLI desired state for REMOTE machines, keyed machine_key → slug →
+    /// wanted. The same semantics as [`Self::agent_cli_install_wanted`] (an
+    /// absent slug means wanted; the map carries only explicit departures),
+    /// one map per machine because "what do I want where" is the modal's
+    /// whole point.
+    #[serde(default)]
+    pub agent_cli_install_wanted_remote: BTreeMap<String, BTreeMap<String, bool>>,
     pub default_agent_profile: AgentSessionProfile,
     pub in_app_notifications: bool,
     pub system_notifications: bool,
@@ -619,6 +626,7 @@ impl Default for AppSettings {
             agent_cli_extra_args: default_agent_cli_extra_args(),
             agent_cli_install_consent: String::new(),
             agent_cli_install_wanted: BTreeMap::new(),
+            agent_cli_install_wanted_remote: BTreeMap::new(),
             default_agent_profile: AgentSessionProfile::Codex,
             in_app_notifications: true,
             system_notifications: false,
@@ -1252,6 +1260,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.agent_cli_install_wanted = serde_json::from_value(value.clone())
             .context("failed to parse agent_cli_install_wanted")?;
     }
+    if let Some(value) = object.get("agent_cli_install_wanted_remote") {
+        settings.agent_cli_install_wanted_remote = serde_json::from_value(value.clone())
+            .context("failed to parse agent_cli_install_wanted_remote")?;
+    }
     if let Some(value) = object.get("litellm_endpoint") {
         settings.litellm_endpoint =
             serde_json::from_value(value.clone()).context("failed to parse litellm_endpoint")?;
@@ -1430,6 +1442,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "prefer_ghostty_backend": settings.prefer_ghostty_backend,
         "agent_cli_install_consent": settings.agent_cli_install_consent,
         "agent_cli_install_wanted": settings.agent_cli_install_wanted,
+        "agent_cli_install_wanted_remote": settings.agent_cli_install_wanted_remote,
         "litellm_endpoint": settings.litellm_endpoint,
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,
@@ -4325,6 +4338,36 @@ mod tests {
         // map — every slug defaults to wanted.
         let legacy = parse_settings_value(&serde_json::json!({})).expect("parse legacy");
         assert!(legacy.agent_cli_install_wanted.is_empty());
+    }
+
+    /// The per-machine wanted map survives a round trip: the modal's remote
+    /// selections (install Kimi THERE, remove Qwen ELSEWHERE) are decisions
+    /// that must outlive a restart exactly like the local ones.
+    #[test]
+    fn settings_round_trip_the_cli_install_wanted_remote_map() {
+        let mut original = AppSettings::default();
+        original
+            .agent_cli_install_wanted_remote
+            .entry("machine-a".to_string())
+            .or_default()
+            .insert("kimi".to_string(), true);
+        original
+            .agent_cli_install_wanted_remote
+            .entry("machine-b".to_string())
+            .or_default()
+            .insert("qwen-code".to_string(), false);
+
+        let json = serialize_settings_value(&original);
+        assert!(json.get("agent_cli_install_wanted_remote").is_some());
+        let round_tripped = parse_settings_value(&json).expect("parse settings");
+        assert_eq!(round_tripped, original);
+        assert_eq!(
+            round_tripped
+                .agent_cli_install_wanted_remote
+                .get("machine-b")
+                .and_then(|map| map.get("qwen-code")),
+            Some(&false)
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::{
     ManagedCliRefreshMode, ManagedCliTool, run_remote_ensure_managed_cli,
+    run_remote_remove_managed_cli,
     run_remote_generation_context,
     run_remote_antigravity_rename, run_remote_cc_rename, run_remote_local_codex_identities, run_remote_preview,
     run_remote_preview_head,
@@ -49,6 +50,9 @@ pub enum RemoteServerCommand {
         mode: ManagedCliRefreshMode,
     },
     EnsureManagedCli {
+        tool: ManagedCliTool,
+    },
+    RemoveManagedCli {
         tool: ManagedCliTool,
     },
     Scan {
@@ -258,6 +262,9 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
         "ensure-managed-cli" if args.len() >= 4 => RemoteServerCommand::EnsureManagedCli {
             tool: parse_managed_cli_tool(&args[3])?,
         },
+        "remove-managed-cli" if args.len() >= 4 => RemoteServerCommand::RemoveManagedCli {
+            tool: parse_managed_cli_tool(&args[3])?,
+        },
         "scan" => RemoteServerCommand::Scan {
             codex_home: args.get(3).cloned(),
         },
@@ -372,6 +379,7 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         }
         RemoteServerCommand::RefreshManagedCli { mode } => run_remote_refresh_managed_cli(mode),
         RemoteServerCommand::EnsureManagedCli { tool } => run_remote_ensure_managed_cli(tool),
+        RemoteServerCommand::RemoveManagedCli { tool } => run_remote_remove_managed_cli(tool),
         RemoteServerCommand::Scan { codex_home } => run_remote_scan(codex_home.as_deref()),
         RemoteServerCommand::DurableSessions => run_remote_durable_sessions(),
         RemoteServerCommand::Apps => run_remote_apps(),
