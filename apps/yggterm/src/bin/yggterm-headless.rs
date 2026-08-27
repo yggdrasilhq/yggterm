@@ -1142,6 +1142,10 @@ fn main() -> Result<()> {
     // "first statement in main()" is the whole guarantee the lock enforces, and
     // nothing here needs the identity declared first.
     yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
+    // The daemon's own environ gets inherited by every row it spawns and by the
+    // relaunch path, so a stale `TERM_PROGRAM_VERSION` here would re-seed the
+    // lie into children indefinitely. Same single-threaded moment as above.
+    yggterm_server::build_identity::stamp_terminal_identity_env();
 
     tracing_subscriber::fmt()
         .with_env_filter("info")

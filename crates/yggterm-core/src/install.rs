@@ -233,8 +233,72 @@ pub fn handoff_target_is_usable(
 
 #[cfg(test)]
 mod handoff_target_tests {
-    use super::{handoff_target_is_usable, install_path_declared_version};
+    use super::{find_direct_install_state_scoped, handoff_target_is_usable, install_path_declared_version, write_direct_install_state};
     use std::path::Path;
+
+    /// THE FLEET SHAPE, LOCKED: the state file lives in the yggterm HOME while
+    /// the binary runs from an unrelated root (`~/.local/bin`), and the finder
+    /// must still find it. The hot-restart promote reads through this; its
+    /// measured failure mode was `managed_direct_install: false` every five
+    /// minutes with `active_version` three versions stale.
+    #[test]
+    fn the_finder_falls_back_to_the_yggterm_home_when_no_ancestor_carries_state() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-install-finder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let exe_root = home.join("elsewhere").join("bin");
+        std::fs::create_dir_all(&exe_root).expect("exe root");
+        let yggterm_home = home.join("yggterm-home");
+        write_direct_install_state(
+            &yggterm_home,
+            "yggdrasilhq/yggterm",
+            "linux-x86_64",
+            "3.1.64",
+            &exe_root.join("yggterm"),
+        )
+        .expect("write state");
+
+        // No ancestor carries a state file: the ancestor-only walk finds none,
+        // the explicit yggterm-home fallback does.
+        let exe = exe_root.join("yggterm");
+        let via_ancestors_only =
+            find_direct_install_state_scoped(&exe, None).expect("probe without fallback");
+        assert!(
+            via_ancestors_only.is_none(),
+            "control: no ancestor of {exe:?} may carry install-state"
+        );
+        let found =
+            find_direct_install_state_scoped(&exe, Some(&yggterm_home)).expect("probe with fallback");
+        let Some((root, state)) = found else {
+            panic!("the finder must fall back to the yggterm home");
+        };
+        assert_eq!(root, yggterm_home);
+        assert_eq!(state.active_version, "3.1.64");
+
+        // And when the binary DOES sit under the managed root, the walk finds
+        // that root first and the fallback never fires (root wins by proximity).
+        write_direct_install_state(
+            &exe_root,
+            "yggdrasilhq/yggterm",
+            "linux-x86_64",
+            "3.1.63",
+            &exe,
+        )
+        .expect("write nested state");
+        let found =
+            find_direct_install_state_scoped(&exe, Some(&yggterm_home)).expect("probe scoped");
+        assert_eq!(
+            found.expect("nested state").0,
+            exe_root,
+            "the nearest root must win over the home fallback"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn a_managed_path_declares_its_own_version() {
@@ -490,9 +554,35 @@ fn direct_install_state_for_executable(
 fn find_direct_install_state(
     executable_path: &Path,
 ) -> Result<Option<(PathBuf, DirectInstallState)>> {
+    let home_fallback = crate::resolve_yggterm_home().ok();
+    find_direct_install_state_scoped(
+        executable_path,
+        home_fallback.as_deref(),
+    )
+}
+
+/// The finder proper, with the yggterm-home fallback passed explicitly so
+/// tests can exercise it without touching process-global env.
+fn find_direct_install_state_scoped(
+    executable_path: &Path,
+    home_fallback: Option<&Path>,
+) -> Result<Option<(PathBuf, DirectInstallState)>> {
     for ancestor in executable_path.ancestors() {
         if let Some(state) = load_direct_install_state(ancestor)? {
             return Ok(Some((ancestor.to_path_buf(), state)));
+        }
+    }
+    // ⛔ THE STATE FILE'S CANONICAL HOME IS NOT ALWAYS AN ANCESTOR OF THE
+    // BINARY. On a fleet install the daemon can run from `~/.local/bin` while
+    // the state lives in `~/.yggterm/install-state.json` — never an ancestor of
+    // the executable's path. Measured live 2026-08-27: the hot-restart promote
+    // answered `managed_direct_install: false` every five minutes, on every
+    // attempt, against a state file that was sitting right there — so
+    // `active_version` stayed three versions stale (3.1.61 while the fleet ran
+    // 3.1.64) and any consumer of the record read a lie.
+    if let Some(root) = home_fallback {
+        if let Some(state) = load_direct_install_state(root)? {
+            return Ok(Some((root.to_path_buf(), state)));
         }
     }
     Ok(None)

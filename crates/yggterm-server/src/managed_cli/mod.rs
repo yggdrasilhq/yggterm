@@ -34,8 +34,8 @@ use yggui_contract::UiTheme;
 
 const MANAGED_NPM_DIRNAME: &str = "npm";
 const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";
-const EXPORTED_TERM_PROGRAM: &str = "vscode";
-const YGGTERM_TERM_PROGRAM: &str = "yggterm";
+pub(crate) const EXPORTED_TERM_PROGRAM: &str = "vscode";
+pub(crate) const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENV_YGGTERM_TERMINAL_APPEARANCE: &str = "YGGTERM_TERMINAL_APPEARANCE";
 pub(crate) const ENV_YGGTERM_CC_EXTRA_ARGS: &str = "YGGTERM_CC_EXTRA_ARGS";
