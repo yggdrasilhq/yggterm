@@ -193,7 +193,18 @@ mod tests {
     /// Sites in this crate still allowed to spell a store path by hand. The
     /// list should only ever shrink — each entry is a place a fourth agent CLI
     /// would have to be remembered.
-    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[];
+    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[
+        yggterm_core::RecordedStoreLiteral {
+            owner: "installed_gui_executable_for_version",
+            recorded: "join(\".local\")",
+            // Not an agent-CLI store at all: this is the version-convergence
+            // finder's LAST-resort candidate — a raw copy of the yggterm GUI in
+            // `~/.local/bin`, the path deploy-fleet writes. It reads a filesystem
+            // location of yggterm's own install, and the registry is about agent
+            // CLIs' transcript stores; there is nothing to ask there.
+            reason: "install-root probe for the GUI binary, not a store layout",
+        },
+    ];
 
     #[test]
     fn no_store_path_literal_outside_the_agent_cli_registry() {
@@ -55236,7 +55247,7 @@ mod webtabs_menu_switcher_locks {
         // slot must be ABSENT — `.then(…)` yielding None — not an empty element,
         // which would still reserve its gap on every row.
         assert!(
-            rail.contains("let actions = (heads_group || shows_close).then(|| rsx! {"),
+            rail.contains("let actions = (heads_group || shows_close).then(|| {"),
             "the row's conditional verbs must be an absent slot when absent, \
              never an empty one:\n{rail}"
         );
