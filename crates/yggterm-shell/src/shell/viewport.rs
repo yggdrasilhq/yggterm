@@ -5978,6 +5978,8 @@ fn TerminalCanvas(
             );
             let pinned_grid =
                 state.with(|shell| shadow_pinned_terminal_grid(shell, &session_path));
+            let initial_grid =
+                state.with(|shell| initial_terminal_grid_for_mount(shell, &session_path));
             let mut eval = terminal_document.eval(terminal_eval_script_with_pinned_grid(
                 &host_id,
                 &theme,
@@ -5998,6 +6000,7 @@ fn TerminalCanvas(
                     snapshot.web_find_bar_focused,
                 ),
                 pinned_grid,
+                initial_grid,
             ));
             append_trace_event(
                 &trace_home,
