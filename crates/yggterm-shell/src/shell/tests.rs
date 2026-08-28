@@ -3421,6 +3421,226 @@ mod tests {
         }
     }
 
+    /// A native FULL_DOCUMENT snapshot can only paint what the page has made
+    /// part of its document. Lazy content needs event-loop turns near the
+    /// viewport, and app-like pages often put their real height in a nested
+    /// scrollport while the document itself stays one viewport tall.
+    #[test]
+    fn full_page_screenshots_prepare_the_real_scroll_extent_and_restore_it() {
+        let source = SHELL_SOURCE;
+        let capture = source
+            .split("async fn capture_web_page(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// One eval round trip").next())
+            .expect("shell.rs must define the human page capture path");
+        assert!(
+            capture.contains("web_shot_prepare_full_page")
+                && capture.contains("web_shot_restore_full_page"),
+            "the human full-page path must hydrate lazy content, materialize a dominant inner \
+             scrollport, and restore the page after the native snapshot:\n{capture}"
+        );
+
+        let agent_capture = source
+            .split("async fn web_surface_screenshot_for(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// The engine verb for a find step").next())
+            .expect("shell.rs must define the app-control page capture path");
+        assert!(
+            agent_capture.contains("web_shot_prepare_full_page")
+                && agent_capture.contains("web_shot_restore_full_page"),
+            "human and app-control full-page screenshots must prepare and restore the same \
+             page geometry:\n{agent_capture}"
+        );
+
+        for required in [
+            "WEB_SHOT_PRESCROLL_CAP",
+            "WEB_SHOT_PRESCROLL_SETTLE",
+            "scrollHeight",
+            "clientHeight",
+            "overflowY",
+            "original_style",
+            "delete window.__yggtermFullShot",
+        ] {
+            assert!(
+                source.contains(required),
+                "the intelligent full-page preparation lost {required:?}"
+            );
+        }
+    }
+
+    /// Execute the shipped page-side transaction, not a Rust reimplementation,
+    /// against the page shape that made FULL_DOCUMENT look like a viewport:
+    /// the root is 600 px tall and a dominant inner scrollport owns 2400 px.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_page_transaction_materializes_a_dominant_inner_scrollport_without_page_drift() {
+        use javascriptcore::{Context, ContextExt, ExceptionExt, ValueExt};
+
+        let harness = r#"
+globalThis.window = globalThis;
+globalThis.innerWidth = 1000;
+globalThis.innerHeight = 600;
+globalThis.scrollX = 9;
+globalThis.scrollY = 17;
+
+function styleBag() {
+  return { cssText: '', setProperty: function (key, value, priority) {
+    this[key] = value + (priority ? ' !' + priority : '');
+  }};
+}
+function element(tag, config) {
+  var el = {
+    tagName: tag,
+    parentElement: null,
+    scrollHeight: config.scrollHeight,
+    clientHeight: config.clientHeight,
+    scrollLeft: config.scrollLeft || 0,
+    scrollTop: config.scrollTop || 0,
+    overflowY: config.overflowY || 'visible',
+    position: config.position || 'static',
+    attr: config.attr === undefined ? null : config.attr,
+    style: styleBag(),
+    isConnected: true,
+    getBoundingClientRect: function () { return config.rect; },
+    getAttribute: function (name) { return name === 'style' ? this.attr : null; },
+    setAttribute: function (name, value) { if (name === 'style') this.attr = value; },
+    removeAttribute: function (name) { if (name === 'style') this.attr = null; },
+    scrollTo: function (x, y) { this.scrollLeft = x; this.scrollTop = y; },
+    remove: function () { this.isConnected = false; }
+  };
+  return el;
+}
+var html = element('HTML', {scrollHeight:600, clientHeight:600, rect:{left:0,top:0,right:1000,bottom:600,width:1000,height:600}});
+var body = element('BODY', {scrollHeight:600, clientHeight:600, rect:{left:0,top:0,right:1000,bottom:600,width:1000,height:600}});
+var inner = element('DIV', {scrollHeight:2400, clientHeight:500, scrollTop:125, overflowY:'auto', attr:'color:red', rect:{left:20,top:50,right:980,bottom:550,width:960,height:500}});
+inner.parentElement = body;
+body.parentElement = html;
+body.appendChild = function (el) { el.parentElement = body; };
+globalThis.getComputedStyle = function (el) { return {overflowY:el.overflowY, position:el.position}; };
+globalThis.document = {
+  scrollingElement: html,
+  documentElement: html,
+  body: body,
+  querySelectorAll: function () { return [inner, body, html]; },
+  createElement: function (tag) { return element(tag.toUpperCase(), {scrollHeight:0,clientHeight:0,rect:{left:0,top:0,right:0,bottom:0,width:0,height:0}}); }
+};
+globalThis.scrollTo = function (x, y) { scrollX = x; scrollY = y; html.scrollLeft = x; html.scrollTop = y; };
+"#;
+        let program = format!(
+            r#"{harness}
+const begin = JSON.parse({begin});
+inner.attr = 'color:green';
+inner.scrollTop = 999;
+scrollY = 888;
+const materialized = JSON.parse({materialize});
+const innerAtSnapshot = inner.scrollTop;
+const rootAtSnapshot = scrollY;
+inner.scrollTop = 999;
+scrollY = 888;
+const restored = JSON.parse({restore});
+JSON.stringify({{
+  target_kind: begin.target_kind,
+  materialized_kind: materialized.target_kind,
+  restored: restored.restored,
+  inline_style: inner.attr,
+  inner_at_snapshot: innerAtSnapshot,
+  root_at_snapshot: rootAtSnapshot,
+  inner_scroll_top: inner.scrollTop,
+  root_scroll_y: scrollY,
+  transaction_gone: typeof window.__yggtermFullShot === 'undefined'
+}});
+"#,
+            begin = WEB_SHOT_FULL_BEGIN_JS,
+            materialize = WEB_SHOT_FULL_MATERIALIZE_JS,
+            restore = WEB_SHOT_FULL_RESTORE_JS,
+        );
+        let context = Context::new();
+        let value = context
+            .evaluate(&program)
+            .expect("the full-page scripts must evaluate");
+        if let Some(exception) = context.exception() {
+            panic!(
+                "full-page transaction threw: {} (line {})",
+                exception.message().unwrap_or_default(),
+                exception.line_number()
+            );
+        }
+        let answer: Value = serde_json::from_str(&value.to_str()).expect("transaction answers JSON");
+        assert_eq!(answer["target_kind"], "inner");
+        assert_eq!(answer["materialized_kind"], "inner");
+        assert_eq!(answer["restored"], true);
+        assert_eq!(
+            answer["inline_style"], "color:green",
+            "restoration must preserve a lazy loader's inline-style change"
+        );
+        assert_eq!(
+            answer["inner_at_snapshot"], 125,
+            "the native snapshot must see the inner scrollport at the user's position"
+        );
+        assert_eq!(
+            answer["root_at_snapshot"], 17,
+            "fixed content must be painted at the user's root scroll position"
+        );
+        assert_eq!(answer["inner_scroll_top"], 125);
+        assert_eq!(answer["root_scroll_y"], 17);
+        assert_eq!(answer["transaction_gone"], true);
+    }
+
+    /// Saving the PNG and publishing it to the system clipboard are separate
+    /// effects. A successful file write must never produce a lying "copied"
+    /// toast when the native clipboard owner failed.
+    #[test]
+    fn page_screenshot_save_and_clipboard_copy_are_independently_accounted() {
+        let source = SHELL_SOURCE;
+        let capture = source
+            .split("async fn capture_web_page(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// One eval round trip").next())
+            .expect("shell.rs must define the human page capture path");
+        assert!(
+            capture.contains("YgguiClipboardContents::PngBase64")
+                && capture.contains("set_native_clipboard_contents"),
+            "the one human capture path must publish the exact saved PNG through the native \
+             clipboard owner:\n{capture}"
+        );
+        assert!(
+            source.contains("Screenshot Saved and Copied")
+                && source.contains("Screenshot Saved; Copy Failed"),
+            "the toast must distinguish total success from save-only partial success"
+        );
+
+        let outcome = |clipboard_error: Option<&str>, restore_error: Option<&str>| {
+            WebShotCaptureOutcome {
+                path: "/home/user/.yggterm/screenshots/page-full-1.png".to_string(),
+                width: 1000,
+                height: 2400,
+                clipboard_error: clipboard_error.map(str::to_string),
+                restore_error: restore_error.map(str::to_string),
+            }
+        };
+        let (tone, title, _) = web_shot_notification(&outcome(None, None));
+        assert!(matches!(tone, NotificationTone::Success));
+        assert_eq!(title, "Screenshot Saved and Copied");
+
+        let (tone, title, message) =
+            web_shot_notification(&outcome(Some("clipboard unavailable"), None));
+        assert!(matches!(tone, NotificationTone::Warning));
+        assert_eq!(title, "Screenshot Saved; Copy Failed");
+        assert!(message.contains("clipboard unavailable"));
+
+        let (_, title, message) =
+            web_shot_notification(&outcome(None, Some("surface navigated")));
+        assert_eq!(title, "Screenshot Saved and Copied; Page Restore Failed");
+        assert!(message.contains("surface navigated"));
+
+        let (_, title, message) = web_shot_notification(&outcome(
+            Some("clipboard unavailable"),
+            Some("surface navigated"),
+        ));
+        assert_eq!(title, "Screenshot Saved; Copy and Page Restore Failed");
+        assert!(message.contains("clipboard unavailable") && message.contains("surface navigated"));
+    }
+
     /// The terminus SERVES every id the table claims.
     ///
     /// A chord in the table with no arm at the terminus is a key that consumes

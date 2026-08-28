@@ -19441,6 +19441,324 @@ const WEB_SHOT_DOC_WIDTH_JS: &str = r#"(() => {
   return String(max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0, window.innerWidth || 0));
 })()"#;
 
+/// Begin one intelligent full-page capture transaction.
+///
+/// `FULL_DOCUMENT` is authoritative for document pixels, but two common page
+/// shapes can still make that document incomplete: lazy content that has never
+/// approached the viewport, and a dominant `overflow-y` scrollport inside a
+/// one-viewport document. This probe chooses ONE scroll owner. It prefers the
+/// document unless a large inner scrollport has substantially more hidden
+/// extent, so a long sidebar cannot steal a normal article's screenshot.
+///
+/// The original scroll positions and inline styles live in the page only for
+/// the transaction. Rust yields between scroll steps; the page-side state lets
+/// the final restore run even when the native snapshot fails.
+const WEB_SHOT_FULL_BEGIN_JS: &str = r#"(() => {
+  if (window.__yggtermFullShot && window.__yggtermFullShot.active) {
+    return JSON.stringify({ ok: false, error: 'full-page capture already active' });
+  }
+  const root = document.scrollingElement || document.documentElement;
+  if (!root) {
+    return JSON.stringify({ ok: false, error: 'page has no scrolling element' });
+  }
+  const viewW = Math.max(1, window.innerWidth || root.clientWidth || 1);
+  const viewH = Math.max(1, window.innerHeight || root.clientHeight || 1);
+  const viewArea = viewW * viewH;
+  const blockedTags = new Set(['TEXTAREA', 'SELECT']);
+  let best = null;
+  for (const el of document.querySelectorAll('*')) {
+    if (el === root || el === document.body || el === document.documentElement || blockedTags.has(el.tagName)) continue;
+    const style = getComputedStyle(el);
+    const overflowY = style.overflowY;
+    if (overflowY !== 'auto' && overflowY !== 'scroll' && overflowY !== 'overlay') continue;
+    const hidden = (el.scrollHeight || 0) - (el.clientHeight || 0);
+    if (hidden <= 2 || el.clientHeight <= 0) continue;
+    const rect = el.getBoundingClientRect();
+    const visibleW = Math.max(0, Math.min(rect.right, viewW) - Math.max(rect.left, 0));
+    const visibleH = Math.max(0, Math.min(rect.bottom, viewH) - Math.max(rect.top, 0));
+    const visibleArea = visibleW * visibleH;
+    if (visibleArea < viewArea * 0.25 || rect.width < viewW * 0.45 || rect.height < viewH * 0.35) continue;
+    const score = hidden * visibleArea;
+    if (!best || score > best.score) best = { el, hidden, score };
+  }
+  const rootHidden = Math.max(0, (root.scrollHeight || 0) - (root.clientHeight || viewH));
+  const useInner = !!best && best.hidden > Math.max(32, rootHidden * 1.5);
+  const target = useInner ? best.el : root;
+  const originals = [];
+  if (useInner) {
+    let el = target;
+    while (el) {
+      // `original_style` is filled immediately before materialization. Lazy
+      // loaders may legitimately change inline style while the pre-scroll is
+      // yielding; recording it here would restore over those page changes.
+      originals.push({ el, original_style: null });
+      if (el === document.documentElement) break;
+      el = el.parentElement;
+    }
+  }
+  window.__yggtermFullShot = {
+    active: true,
+    root,
+    target,
+    target_kind: useInner ? 'inner' : 'document',
+    root_x: window.scrollX || 0,
+    root_y: window.scrollY || 0,
+    target_x: useInner ? (target.scrollLeft || 0) : (window.scrollX || 0),
+    target_y: useInner ? (target.scrollTop || 0) : (window.scrollY || 0),
+    originals,
+    spacer: null
+  };
+  return JSON.stringify({
+    ok: true,
+    target_kind: window.__yggtermFullShot.target_kind,
+    scroll_h: target.scrollHeight || 0,
+    client_h: useInner ? (target.clientHeight || viewH) : viewH,
+    scroll_top: useInner ? (target.scrollTop || 0) : (window.scrollY || 0)
+  });
+})()"#;
+
+/// Re-read the chosen scroll owner. Re-measure every step because an infinite
+/// or lazy feed can grow while the walk is in progress.
+const WEB_SHOT_FULL_METRICS_JS: &str = r#"(() => {
+  const shot = window.__yggtermFullShot;
+  if (!shot || !shot.active || !shot.target) return JSON.stringify({ ok: false, error: 'no full-page capture' });
+  const inner = shot.target_kind === 'inner';
+  return JSON.stringify({
+    ok: true,
+    target_kind: shot.target_kind,
+    scroll_h: shot.target.scrollHeight || 0,
+    client_h: inner ? (shot.target.clientHeight || window.innerHeight || 600) : (window.innerHeight || shot.root.clientHeight || 600),
+    scroll_top: inner ? (shot.target.scrollTop || 0) : (window.scrollY || 0)
+  });
+})()"#;
+
+fn web_shot_full_scroll_js(y: f64) -> String {
+    format!(
+        r#"(() => {{
+  const shot = window.__yggtermFullShot;
+  if (!shot || !shot.active || !shot.target) return JSON.stringify({{ ok: false, error: 'no full-page capture' }});
+  if (shot.target_kind === 'inner') shot.target.scrollTo(shot.target_x, {y});
+  else window.scrollTo(shot.root_x, {y});
+  return JSON.stringify({{ ok: true }});
+}})()"#
+    )
+}
+
+/// Expand the chosen inner scrollport into ordinary document flow for ONE
+/// native snapshot. Its ancestors are unclipped only for the transaction, and
+/// a spacer covers layouts whose fixed/absolute ancestry still refuses to
+/// contribute the full height to the document.
+const WEB_SHOT_FULL_MATERIALIZE_JS: &str = r#"(() => {
+  const shot = window.__yggtermFullShot;
+  if (!shot || !shot.active || !shot.target) return JSON.stringify({ ok: false, error: 'no full-page capture' });
+  // Lazy pixels stay loaded after the walk. Put the viewport back BEFORE the
+  // snapshot so fixed/sticky content is painted at the position the user left
+  // it, not at the bottom reached by hydration.
+  if (shot.target_kind === 'inner') shot.target.scrollTo(shot.target_x, shot.target_y);
+  window.scrollTo(shot.root_x, shot.root_y);
+  if (shot.target_kind !== 'inner') {
+    return JSON.stringify({ ok: true, target_kind: 'document', document_h: shot.root.scrollHeight || 0 });
+  }
+  const targetHeight = Math.max(shot.target.scrollHeight || 0, shot.target.clientHeight || 0);
+  shot.originals.forEach((record, index) => {
+    const el = record.el;
+    record.original_style = el.getAttribute('style');
+    el.style.setProperty('max-height', 'none', 'important');
+    el.style.setProperty('overflow-y', 'visible', 'important');
+    el.style.setProperty('contain', 'none', 'important');
+    if (index === 0) {
+      el.style.setProperty('height', targetHeight + 'px', 'important');
+      const position = getComputedStyle(el).position;
+      if (position === 'fixed' || position === 'absolute' || position === 'sticky') {
+        el.style.setProperty('position', 'relative', 'important');
+        el.style.setProperty('inset', 'auto', 'important');
+      }
+    } else {
+      el.style.setProperty('height', 'auto', 'important');
+    }
+  });
+  let documentHeight = Math.max(shot.root.scrollHeight || 0, document.body ? document.body.scrollHeight || 0 : 0);
+  if (documentHeight + 2 < targetHeight && document.body) {
+    const spacer = document.createElement('div');
+    spacer.setAttribute('aria-hidden', 'true');
+    spacer.style.cssText = 'display:block;width:1px;height:' + Math.ceil(targetHeight - documentHeight) + 'px;pointer-events:none;';
+    document.body.appendChild(spacer);
+    shot.spacer = spacer;
+    documentHeight = Math.max(shot.root.scrollHeight || 0, document.body.scrollHeight || 0);
+  }
+  void shot.root.offsetHeight;
+  return JSON.stringify({ ok: true, target_kind: 'inner', target_h: targetHeight, document_h: documentHeight });
+})()"#;
+
+/// Restore every page property the full-page transaction borrowed.
+const WEB_SHOT_FULL_RESTORE_JS: &str = r#"(() => {
+  const shot = window.__yggtermFullShot;
+  if (!shot || !shot.active) return JSON.stringify({ ok: true, restored: false });
+  if (shot.spacer && shot.spacer.isConnected) shot.spacer.remove();
+  for (let i = shot.originals.length - 1; i >= 0; i -= 1) {
+    const record = shot.originals[i];
+    if (record.original_style === null) record.el.removeAttribute('style');
+    else record.el.setAttribute('style', record.original_style);
+  }
+  if (shot.target_kind === 'inner' && shot.target) shot.target.scrollTo(shot.target_x, shot.target_y);
+  window.scrollTo(shot.root_x, shot.root_y);
+  const restored = { ok: true, restored: true, target_kind: shot.target_kind, scroll_y: shot.root_y };
+  delete window.__yggtermFullShot;
+  return JSON.stringify(restored);
+})()"#;
+
+const WEB_SHOT_PRESCROLL_SETTLE: Duration = Duration::from_millis(120);
+const WEB_SHOT_PRESCROLL_CAP: usize = 60;
+
+#[derive(Debug)]
+struct WebShotFullPagePreparation {
+    active: bool,
+    report: Value,
+}
+
+fn web_shot_eval_value(raw: String) -> Result<Value, String> {
+    let inner: String = serde_json::from_str(&raw).unwrap_or(raw);
+    serde_json::from_str(&inner)
+        .map_err(|error| format!("the page's screenshot probe was not JSON: {error}"))
+}
+
+/// Hydrate the authoritative scroll owner, then materialize an inner owner so
+/// WebKit's one native FULL_DOCUMENT snapshot contains its full pixel extent.
+async fn web_shot_prepare_full_page(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+) -> WebShotFullPagePreparation {
+    let begin = match web_surface_eval_json(desktop, native_id, WEB_SHOT_FULL_BEGIN_JS)
+        .await
+        .and_then(web_shot_eval_value)
+    {
+        Ok(value) if value["ok"].as_bool() == Some(true) => value,
+        Ok(value) => {
+            return WebShotFullPagePreparation {
+                active: false,
+                report: value,
+            };
+        }
+        Err(error) => {
+            return WebShotFullPagePreparation {
+                active: false,
+                report: json!({ "ok": false, "error": error }),
+            };
+        }
+    };
+
+    let mut steps = 0usize;
+    let mut y = 0.0f64;
+    let mut final_height = begin["scroll_h"].as_f64().unwrap_or(0.0);
+    let mut capped = false;
+    let mut walk_error = None;
+    loop {
+        let metrics = match web_surface_eval_json(desktop, native_id, WEB_SHOT_FULL_METRICS_JS)
+            .await
+            .and_then(web_shot_eval_value)
+        {
+            Ok(value) if value["ok"].as_bool() == Some(true) => value,
+            Ok(value) => {
+                walk_error = value["error"].as_str().map(str::to_string);
+                break;
+            }
+            Err(error) => {
+                walk_error = Some(error);
+                break;
+            }
+        };
+        final_height = metrics["scroll_h"].as_f64().unwrap_or(final_height);
+        let viewport = metrics["client_h"].as_f64().unwrap_or(600.0);
+        if y >= final_height {
+            break;
+        }
+        if steps >= WEB_SHOT_PRESCROLL_CAP {
+            capped = true;
+            break;
+        }
+        if let Err(error) = web_surface_eval_json(desktop, native_id, &web_shot_full_scroll_js(y))
+            .await
+        {
+            walk_error = Some(error);
+            break;
+        }
+        tokio::time::sleep(WEB_SHOT_PRESCROLL_SETTLE).await;
+        steps += 1;
+        y += (viewport * 0.9).max(200.0);
+    }
+
+    let materialized = web_surface_eval_json(desktop, native_id, WEB_SHOT_FULL_MATERIALIZE_JS)
+        .await
+        .and_then(web_shot_eval_value);
+    // The style read above forces layout; this settle gives paint and any last
+    // IntersectionObserver work a turn before the native snapshot is queued.
+    tokio::time::sleep(WEB_SHOT_PRESCROLL_SETTLE).await;
+    WebShotFullPagePreparation {
+        active: true,
+        report: json!({
+            "ok": materialized.as_ref().is_ok_and(|value| value["ok"].as_bool() == Some(true)),
+            "target_kind": begin["target_kind"],
+            "steps": steps,
+            "settle_ms": WEB_SHOT_PRESCROLL_SETTLE.as_millis(),
+            "final_height": final_height,
+            "capped": capped,
+            "walk_error": walk_error,
+            "materialized": materialized.unwrap_or_else(|error| json!({ "ok": false, "error": error })),
+        }),
+    }
+}
+
+async fn web_shot_restore_full_page(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+) -> Result<Value, String> {
+    web_surface_eval_json(desktop, native_id, WEB_SHOT_FULL_RESTORE_JS)
+        .await
+        .and_then(web_shot_eval_value)
+}
+
+#[derive(Debug)]
+struct WebShotCaptureOutcome {
+    path: String,
+    width: i32,
+    height: i32,
+    clipboard_error: Option<String>,
+    restore_error: Option<String>,
+}
+
+fn web_shot_notification(
+    outcome: &WebShotCaptureOutcome,
+) -> (NotificationTone, &'static str, String) {
+    let dimensions_and_path = format!(
+        "{}x{} · {}",
+        outcome.width, outcome.height, outcome.path
+    );
+    match (&outcome.clipboard_error, &outcome.restore_error) {
+        (None, None) => (
+            NotificationTone::Success,
+            "Screenshot Saved and Copied",
+            dimensions_and_path,
+        ),
+        (Some(copy_error), None) => (
+            NotificationTone::Warning,
+            "Screenshot Saved; Copy Failed",
+            format!("{dimensions_and_path} · {copy_error}"),
+        ),
+        (None, Some(restore_error)) => (
+            NotificationTone::Warning,
+            "Screenshot Saved and Copied; Page Restore Failed",
+            format!("{dimensions_and_path} · {restore_error}"),
+        ),
+        (Some(copy_error), Some(restore_error)) => (
+            NotificationTone::Warning,
+            "Screenshot Saved; Copy and Page Restore Failed",
+            format!(
+                "{dimensions_and_path} · copy: {copy_error} · restore: {restore_error}"
+            ),
+        ),
+    }
+}
+
 /// Where a screenshot the USER asked for lands.
 ///
 /// The same directory the agent control plane writes captures to, because they
@@ -19526,11 +19844,10 @@ fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
         };
         let mut state = state;
         state.with_mut_counted(|shell| match outcome {
-            Ok((path, w, h)) => shell.push_notification(
-                NotificationTone::Success,
-                "Screenshot Saved",
-                format!("{w}x{h} · {path}"),
-            ),
+            Ok(outcome) => {
+                let (tone, title, message) = web_shot_notification(&outcome);
+                shell.push_notification(tone, title, message);
+            }
             // Named, never swallowed: a capture that silently did nothing is
             // discovered later, in a directory that does not have the file.
             Err(reason) => {
@@ -19542,28 +19859,101 @@ fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
 
 /// THE capture path. One region, one optional crop, one PNG, one report.
 async fn capture_web_page(
-    _state: Signal<ShellState>,
+    state: Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
     kind: &str,
     region: dioxus::desktop::PageSnapshotRegion,
     crop: Option<dioxus::desktop::PageCrop>,
-) -> Result<(String, i32, i32), String> {
+) -> Result<WebShotCaptureOutcome, String> {
     // The SAME `~/.yggterm` the agent control plane writes captures to, from
     // its one resolver — a screenshot a human takes and one an agent takes are
     // the same artifact and belong in one place.
     let home = resolve_yggterm_home().map_err(|error| error.to_string())?;
     let path = web_shot_output_path(&home, kind);
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(i32, i32), String>>();
-    desktop.snapshot_web_surface_region(native_id, region, crop, path.clone(), move |outcome| {
-        let _ = tx.send(outcome);
-    })?;
-    match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(Ok((w, h)))) => Ok((path.display().to_string(), w, h)),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(_)) => Err("the surface went away mid-capture".to_string()),
-        Err(_) => Err("the capture timed out (30s)".to_string()),
+    let full_page = kind == "full";
+    let preparation = if full_page {
+        Some(web_shot_prepare_full_page(desktop, native_id).await)
+    } else {
+        None
+    };
+    if let Some(preparation) = preparation.as_ref()
+        && preparation.report["ok"].as_bool() != Some(true)
+    {
+        let restore_error = if preparation.active {
+            web_shot_restore_full_page(desktop, native_id)
+                .await
+                .err()
+        } else {
+            None
+        };
+        let reason = preparation.report["error"]
+            .as_str()
+            .or_else(|| preparation.report["materialized"]["error"].as_str())
+            .unwrap_or("the page could not expose its full scroll extent");
+        if let Some(restore_error) = restore_error {
+            return Err(format!(
+                "full-page preparation failed: {reason}; page restore also failed: {restore_error}"
+            ));
+        }
+        return Err(format!("full-page preparation failed: {reason}"));
     }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(i32, i32), String>>();
+    let start = desktop.snapshot_web_surface_region(native_id, region, crop, path.clone(), move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    let capture = match start {
+        Ok(()) => match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(dimensions))) => Ok(dimensions),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(_)) => Err("the surface went away mid-capture".to_string()),
+            Err(_) => Err("the capture timed out (30s)".to_string()),
+        },
+        Err(error) => Err(error),
+    };
+    let restore_error = if preparation.as_ref().is_some_and(|value| value.active) {
+        web_shot_restore_full_page(desktop, native_id)
+            .await
+            .err()
+    } else {
+        None
+    };
+    let (width, height) = match capture {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            return Err(match restore_error {
+                Some(restore_error) => {
+                    format!("{error}; page restore also failed: {restore_error}")
+                }
+                None => error,
+            });
+        }
+    };
+
+    // The file is the pixel authority. Seed the native clipboard from THOSE
+    // exact bytes after the write completes, rather than encoding a second
+    // image or assuming that a successful file write implies a successful
+    // clipboard publication.
+    let clipboard_error = std::fs::read(&path)
+        .map_err(|error| format!("read saved PNG for clipboard: {error}"))
+        .and_then(|png| {
+            set_native_clipboard_contents(
+                state,
+                &YgguiClipboardContents::PngBase64 {
+                    png_base64: BASE64_STANDARD.encode(png),
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        })
+        .err();
+    Ok(WebShotCaptureOutcome {
+        path: path.display().to_string(),
+        width,
+        height,
+        clipboard_error,
+        restore_error,
+    })
 }
 
 /// One eval round trip against a page, awaited.
