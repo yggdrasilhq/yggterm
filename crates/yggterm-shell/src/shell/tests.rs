@@ -94,6 +94,7 @@ mod tests {
             rss_kb: over_threshold,
             pss_kb: 1,
             anonymous_kb: 1,
+            swap_kb: 0,
             source: ProcMemorySource::SmapsRollup,
         };
         assert!(
