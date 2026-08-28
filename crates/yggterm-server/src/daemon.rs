@@ -36160,8 +36160,8 @@ mod tests {
         // not theirs. The obligation to re-cut belongs to the commit that
         // changes the shape; when it is missed, the cost is paid by whoever
         // runs the suite next, which is everyone.
-        const STAMPED_AT_VERSION: &str = "3.1.27";
-        const STAMPED_SHAPE_HASH: u64 = 0xb0be92515d8e30a0;
+        const STAMPED_AT_VERSION: &str = "3.2.0";
+        const STAMPED_SHAPE_HASH: u64 = 0xa134672e9c226177;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
