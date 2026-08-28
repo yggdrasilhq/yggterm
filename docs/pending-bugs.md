@@ -58,10 +58,15 @@ must vanish for these argv shapes.
 
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
-**Status:** OPEN
-**ROOT CAUSE FOUND (owner-caught live 2026-08-28); fix on
-`lane/dev/pass0-identity` (`3c50684e`), unmerged. The display-plane hardening
-(kind on the wire, Unknown-never-Codex, persistence refusal) is on the same lane.**
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+(merged to main in `6245b1b1`, ships in 3.1.71). **ROOT CAUSE FOUND
+(owner-caught live 2026-08-28).** The observation
+that proves or falsifies the fix: an ssh-shell row survives a GUI restart with
+its kind AND title intact, and a restart that flips a row to codex must show a
+`cli/identity_*` trace event — a flip with no event means a path reader is
+still minting somewhere. The display-plane hardening (kind on the wire,
+Unknown-never-Codex, persistence refusal, the skill vocabulary) is in the same
+merge.
 
 **The owner's report (2026-08-28, verbatim intent):** plain SHELL sessions transform
 one by one into EMPTY CODEX sessions after launch; some stay shells while most
