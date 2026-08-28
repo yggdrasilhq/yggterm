@@ -12410,6 +12410,36 @@ visible-blink cost and still must exempt the active surface and any held draft. 
 instrument note stands: the probe's `committed_kb` per role made this a standing query — the
 reading above is reproducible from `ytrace tail --category render` alone.
 
+### ⭐ FALSIFIER MEASURED (2026-08-28 evening, the GUI host, 3.1.72) — THE STRUCTURAL BOUND IS BUILDABLE
+
+The precondition this entry deferred to is now measured, live, and REVERSED. The GUI session
+scope (`user.slice/user-1000.slice/session-57062.scope`) holds **exactly the six yggterm-family
+processes** — the GUI, two WebKit processes, two bwrap helpers, glycin-svg — and nothing else;
+the daemon runs in its own session scope. `cgroup.controllers` lists `cpu memory pids` with
+`subtree_control` EMPTY.
+
+Measured both ways, privileged, on live processes:
+
+| step | result |
+|---|---|
+| enable `+memory` with the six processes inside the scope | **EBUSY** — the internal-process constraint is real: the scope must be emptied into children first |
+| create child + migrate the live GUI pid mid-session | clean, atomic, zero disruption |
+| migrate the remaining five (WebKit ×2, bwrap ×2, glycin) | clean |
+| enable `+memory` after emptying | **succeeds**; `memory.current` live-accounted in both children |
+| full rollback (return pids, `-memory`, rmdir children) | original state, zero residue, GUI intact |
+
+⇒ **The build order is decided by the measurement**: at GUI startup the app (or its systemd
+unit) creates child cgroups — `gui`, `web`, `helpers` — moves the family in, enables `+memory`
+on the scope, and sets `memory.high` (+ the swap policy) on the `web` child so WebKit's own
+threshold finally reads a number that includes what it swapped out. The daemon's separate
+session scope takes the same shape independently. No new kernel privilege beyond what the
+deploy path already carries, and the migration is safe on a live session — measured, not
+assumed. The 16:31 incident (95% RAM, 7.8 GiB swap, edit-plane stalls) is the business case;
+this measurement retires the last precondition. **The next unit is the build** (start-up child
+cgroup shape + the `web` child's `memory.high` value, chosen from the family-committed series),
+after which the 6.7 leak classification gets its sustained-streaming committed curve re-read
+under a real bound.
+
 `configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
 `YGGTERM_WEBKIT_CACHE_MODEL=web-browser` and a limit of
 `(MemTotal_MB / 8).clamp(768, 3072)` — **1,888 MB** on this 15 GB host — with
