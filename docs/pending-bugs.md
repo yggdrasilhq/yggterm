@@ -12456,9 +12456,9 @@ visible-blink cost and still must exempt the active surface and any held draft. 
 instrument note stands: the probe's `committed_kb` per role made this a standing query — the
 reading above is reproducible from `ytrace tail --category render` alone.
 
-## ⛔⛔ THE FLOOD REGIME — AN AGENT SESSION WATCHED ACROSS SSH AT 22K CHARS/S MISSES HALF ITS FRAME BUDGET, WEBKIT BURNS ~50% OF A CORE, AND THE OWNER'S TYPING HITS 2.8 S (2026-08-28 20:07–20:23, the GUI host, 3.1.72)
+## ⛔⛔ THE FLOOD REGIME — AN AGENT SESSION WATCHED ACROSS SSH AT 22K CHARS/S MISSED HALF ITS FRAME BUDGET, WEBKIT BURNED ~50% OF A CORE, AND THE OWNER'S TYPING HIT 2.8 S (2026-08-28 20:07–20:23, the GUI host, 3.1.72)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *Owner: "yggterm just hit a render storm or something. Laptop became hot." — said on the GUI host. Measured
 within minutes; the storm was still raging at filing.*
@@ -12492,8 +12492,17 @@ holds effective_frame_ms p95 ≤ 20 ms, WebKit process CPU ≤ 20% of a core, an
 ≤ 50 ms on the keystroke leg; with the flood off, cadence and frame cost return to today's
 quiet-floor numbers.
 
-**Immediate mitigations while it is open:** scroll away from or park the flooding row (paint
+**Immediate mitigations while it was open:** scroll away from or park the flooding row (paint
 follows the active surface); or let the agent finish — the regime ends with the flood.
+
+**Fixed by:** a flood-adaptive write cadence in the xterm bridge script. Each surface tracks
+an EMA of written chars per flush interval (coalescing makes written/elapsed the true inflow);
+crossing 10K chars/s flips that surface into flood cadence — a 66 ms write budget (~15 fps)
+with largest-payload batching — and falling under 3K releases it. Typing keeps its realtime
+budget unconditionally (the input-hot branch precedes the flood branch in the resolver). The
+transition is edge-triggered and emits one `flood_mode` record per direction, and every
+`xterm_write_flush` payload now carries `flood_mode`, so a storm is one query. Locked by a
+source-contract test (thresholds, typing precedence, one-emit-per-direction, payload field).
 
 ### ⭐ FALSIFIER MEASURED (2026-08-28 evening, the GUI host, 3.1.72) — THE STRUCTURAL BOUND IS BUILDABLE
 

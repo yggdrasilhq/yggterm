@@ -836,6 +836,16 @@ fn terminal_eval_script_with_canvas_renderer(
             terminalInlineStatusAnimationSustainedAfterMs,
             Number({terminal_inline_status_animation_long_after_ms} || 0)
         );
+        // ⛔ THE FLOOD REGIME (pending-bugs: an agent session watched across SSH at 22K
+        // chars/s missed half its frame budget while WebKit burned ~50% of a core). When ONE
+        // visible surface's write throughput crosses the enter threshold, that surface's
+        // write cadence drops to the flood budget (largest-payload batching at ~15 fps — a
+        // scrolling log is unreadable above that anyway), and typing keeps its realtime
+        // budget via the input-hot branch below. Edge-triggered: the transition emits ONCE
+        // per direction, never per frame (design law 11).
+        const YGG_FLOOD_ENTER_CHARS_PER_S = 10000;
+        const YGG_FLOOD_EXIT_CHARS_PER_S = 3000;
+        const YGG_FLOOD_WRITE_FRAME_MS = 66;
         let host = document.getElementById(hostId);
         sendTerminalEvent({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
         if (!host) {{
@@ -10435,6 +10445,14 @@ fn terminal_eval_script_with_canvas_renderer(
             if (terminalInputHot()) {{
                 return terminalActiveWriteFrameMs;
             }}
+            // THE FLOOD BUDGET. Checked after input-hot so typing keeps its realtime
+            // echo even mid-flood; while the owner is only WATCHING the flood, the
+            // surface paints at the flood cadence and the largest pending payload per
+            // frame (see the EMA update in flushPendingWrite).
+            const floodHostEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+            if (floodHostEntry && floodHostEntry.floodActive) {{
+                return Math.max(terminalActiveWriteFrameMs, YGG_FLOOD_WRITE_FRAME_MS);
+            }}
             if (!recentInlineStatusAnimationHot()) {{
                 return terminalActiveWriteFrameMs;
             }}
@@ -10795,6 +10813,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     elapsed_ms: flushElapsedMs,
                     effective_frame_ms: currentEntry ? Number(currentEntry.effectiveTerminalWriteFrameMs || 0) : effectiveTerminalWriteFrameMs(),
                     active_frame_budget: currentEntry ? Boolean(currentEntry.activeWriteFrameBudget) : activeWriteFrameBudgetApplies(),
+                    flood_mode: currentEntry ? Boolean(currentEntry.floodActive) : false,
                     pending_chars: currentEntry ? String(currentEntry.writeBridgePendingData || '').length : 0,
                     last_raw_payload_length: currentEntry ? Number(currentEntry.lastRawPayloadLength || 0) : 0,
                     last_raw_payload_line_count: currentEntry ? Number(currentEntry.lastRawPayloadLineCount || 0) : 0,
@@ -10844,6 +10863,34 @@ fn terminal_eval_script_with_canvas_renderer(
                 payload = `\x1bc\x1b[2J\x1b[3J\x1b[H${{payload}}`;
             }}
             const rawPayloadLength = payload.length;
+            // THE FLOOD EMA. Measured on WRITTEN chars per flush interval: coalescing
+            // merges every enqueue since the last flush, so written/elapsed IS the
+            // surface's inflow rate. Hysteresis via the EMA plus separate enter/exit
+            // thresholds (enter 10K chars/s, exit 3K) so a bursty stream cannot flap
+            // the cadence per frame. The transition emits ONCE per direction (law 11).
+            const floodNowMs = Date.now();
+            const floodPrevMs = Number(entry.floodLastFlushAtMs || 0);
+            const floodElapsedMs = floodPrevMs > 0 ? Math.max(1, floodNowMs - floodPrevMs) : 1000;
+            const floodInstCharsPerS = (rawPayloadLength * 1000) / floodElapsedMs;
+            const floodEmaPrev = Number(entry.floodEmaCharsPerS || 0);
+            const floodEma = floodEmaPrev
+                + (floodInstCharsPerS - floodEmaPrev) * Math.min(1, floodElapsedMs / 2000);
+            const floodWasActive = Boolean(entry.floodActive);
+            if (!floodWasActive && floodEma >= YGG_FLOOD_ENTER_CHARS_PER_S) {{
+                entry.floodActive = true;
+            }} else if (floodWasActive && floodEma < YGG_FLOOD_EXIT_CHARS_PER_S) {{
+                entry.floodActive = false;
+            }}
+            entry.floodEmaCharsPerS = floodEma;
+            entry.floodLastFlushAtMs = floodNowMs;
+            if (Boolean(entry.floodActive) !== floodWasActive) {{
+                try {{
+                    sendTerminalEvent({{
+                        kind: "debug",
+                        message: `flood_mode host=${{hostId}} active=${{entry.floodActive ? 1 : 0}} ema_chars_per_s=${{Math.round(floodEma)}} frame_ms=${{YGG_FLOOD_WRITE_FRAME_MS}}`
+                    }});
+                }} catch (_floodTraceError) {{}}
+            }}
             const rawFrameLike = terminalPayloadLooksHighVolumeFrame(payload);
             const rawPayloadLineCount = (payload.match(/\n/g) || []).length;
             const writeFrameMs = effectiveTerminalWriteFrameMs();
@@ -14673,4 +14720,91 @@ fn terminal_scroll_control_script(session_path: &str, action: &'static str) -> S
         }})();
         "#
     )
+}
+
+#[cfg(test)]
+mod flood_adaptive_paint_tests {
+    use super::*;
+
+    /// ⛔ THE FLOOD REGIME CONTRACT (pending-bugs: an agent session watched across SSH
+    /// at 22K chars/s missed half its frame budget while WebKit burned ~50% of a core
+    /// and the owner typed through 2.8 s blocks). The write cadence must adapt to
+    /// measured throughput with hysteresis, yield to typing, emit the transition ONCE
+    /// per direction, and publish the state on every flush record.
+    #[test]
+    fn the_flood_cadence_is_hysteretic_yields_to_typing_and_emits_once_per_direction() {
+        let source = SHELL_SOURCE;
+        let product = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The thresholds exist as named constants, and enter sits strictly above
+        // exit — hysteresis is the anti-flap half of the contract.
+        assert!(
+            product.contains(concat!("YGG_FLOOD_ENTER", "_CHARS_PER_S = 10000;")),
+            "the flood enter threshold must be a named constant at 10000 chars/s"
+        );
+        assert!(
+            product.contains(concat!("YGG_FLOOD_EXIT", "_CHARS_PER_S = 3000;")),
+            "the flood exit threshold must be a named constant at 3000 chars/s"
+        );
+        assert!(
+            product.contains(concat!("YGG_FLOOD_", "WRITE_FRAME_MS = 66;")),
+            "the flood write budget must be a named constant at 66 ms (~15 fps)"
+        );
+
+        // The cadence branch yields to typing: the input-hot early return must
+        // appear BEFORE the flood budget read in the resolver.
+        let resolver = product
+            .find("const effectiveTerminalWriteFrameMs = ()")
+            .expect("the frame-budget resolver must exist");
+        let input_hot = product[resolver..]
+            .find("if (terminalInputHot())")
+            .expect("the input-hot branch must exist in the resolver");
+        let flood_branch = product[resolver..]
+            .find("floodHostEntry.floodActive")
+            .expect("the flood budget branch must exist in the resolver");
+        assert!(
+            resolver + input_hot < resolver + flood_branch,
+            "typing must keep its realtime budget before the flood cadence is consulted"
+        );
+
+        // The transition is EDGE-TRIGGERED: the emit lives inside the
+        // active-changed conditional, and the EMA update site is the only writer.
+        let ema_site = product
+            .find("floodEmaCharsPerS = floodEma;")
+            .expect("the EMA write-back must exist");
+        let transition = product
+            .find(concat!("flood_mode host=",))
+            .expect("the transition trace must exist");
+        assert!(
+            transition > ema_site,
+            "the flood transition trace must live at the EMA update site (one emit per direction)"
+        );
+        for side in ["active=${{entry.floodActive ? 1 : 0}}", "ema_chars_per_s="] {
+            assert!(product.contains(side), "the transition must record {side}");
+        }
+
+        // Every flush record publishes the regime, so a storm is visible in one query.
+        assert!(
+            product.contains("flood_mode: currentEntry ? Boolean(currentEntry.floodActive) : false"),
+            "the flush payload must carry flood_mode"
+        );
+
+        // Hysteresis arithmetic: enter strictly above exit.
+        let parse = |name: &str| -> u32 {
+            let needle = format!("{name} = ");
+            let line = product
+                .lines()
+                .find(|l| l.contains(&needle))
+                .expect("threshold line");
+            line.split('=').last().unwrap().trim().trim_end_matches(';').parse().unwrap()
+        };
+        assert!(
+            parse(concat!("YGG_FLOOD_ENTER", "_CHARS_PER_S")) > parse(concat!("YGG_FLOOD_EXIT", "_CHARS_PER_S")),
+            "enter threshold must exceed exit threshold — equal values flap the cadence"
+        );
+    }
 }
