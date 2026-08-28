@@ -372,64 +372,89 @@ pub fn family_armed() -> bool {
     FAMILY_ARMED.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// One process the sweep moved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FamilyMigration {
-    pub pid: i32,
-    pub comm: String,
-    /// Where the process was, when it could be read — `None` means it exited
-    /// between the walk and the move, which is the common race and not an
-    /// error.
-    pub from: Option<String>,
-    pub to: &'static str,
+/// The sweep tick. Ten seconds: a WebKit child is born on a surface mount and
+/// the lag between its birth and its bound is what the scope-level ceiling
+/// covers anyway, so faster buys nothing and slower loiters in an unbounded
+/// child during exactly the traffic that grows it.
+const FAMILY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawn the family sweep as a plain thread of the arming process.
+///
+/// ⛔ **WHY NOT THE RENDER PROBE'S LOOP — it was tried, and it was measured
+/// dead on the first live arm (3.2.8):** the probe's whole body sits behind
+/// the profiling toggle, and the memory bound is not a profiling feature.
+/// Moving the walk before the gate would have coupled the bound to the
+/// probe's lifecycle, its sampling, and a toggle nobody thinks about when
+/// asking "why is my web plane unbounded". The sweep gets its own thread: it
+/// outlives nothing, it reads nothing but `/proc` and cgroupfs, and it dies
+/// with the process.
+///
+/// `home` is the perf home the `family_migration` events land in.
+pub fn spawn_family_sweep(home: std::path::PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("cgroup-family-sweep".to_string())
+        .spawn(move || {
+            let self_pid = std::process::id() as i32;
+            loop {
+                std::thread::sleep(FAMILY_SWEEP_INTERVAL);
+                // The stats-only walk: pid + ppid + comm per family member —
+                // the ONE owner of the tree walk (`render_probe`) is reused,
+                // not grown a second copy.
+                for (pid, comm) in crate::render_probe::observe_process_tree_stats(self_pid)
+                    .into_iter()
+                    .map(|stat| (stat.pid, stat.comm))
+                {
+                    let Some(child) = family_child_for_comm(&comm) else {
+                        continue;
+                    };
+                    if current_child_basename(pid).as_deref() == Some(child) {
+                        continue;
+                    }
+                    if migrate_misplaced_one(pid, &comm) {
+                        let _ = crate::trace::append_trace_event(
+                            &home,
+                            "gui",
+                            "memory",
+                            "family_migration",
+                            serde_json::json!({
+                                "pid": pid,
+                                "comm": comm,
+                                "to": child,
+                            }),
+                        );
+                    }
+                }
+            }
+        });
 }
 
-/// Migrate family members sitting in the wrong child — the WebKit children
-/// are born into `gui` (they inherit the GUI's child) and belong in `web`.
-///
-/// Runs every probe tick over the freshly walked tree. Cheap by construction:
-/// a process already in its right child costs one `/proc/<pid>/cgroup` read,
-/// and only a NEW or misplaced member costs a write. Self-healing across pid
-/// recycle for the same reason — nothing is remembered, everything is read.
-pub fn migrate_misplaced<'a, I>(members: I) -> Vec<FamilyMigration>
-where
-    I: IntoIterator<Item = (i32, &'a str)>,
-{
+/// Migrate ONE misplaced member into the child its comm names. The threaded
+/// sweep's per-member body: silent on a member that exited mid-sweep (the
+/// common race, not an error).
+fn migrate_misplaced_one(pid: i32, comm: &str) -> bool {
     if !family_armed() {
-        return Vec::new();
+        return false;
+    }
+    let Some(child) = family_child_for_comm(comm) else {
+        return false;
+    };
+    if current_child_basename(pid).as_deref() == Some(child) {
+        return false;
     }
     // The children are SIBLINGS of this process's own child: after the arm
     // the GUI sits in `<scope>/gui`, so the scope root is one level up. A
-    // process that is not in `gui` is not running an armed family (stale flag
-    // across an exec boundary) and must not write into a guessed path.
+    // process that is not in `gui` is not running an armed family (a stale
+    // flag across an exec boundary) and must not write into a guessed path.
     let Some(own) = own_cgroup_path(std::process::id() as i32) else {
-        return Vec::new();
+        return false;
     };
     let Some((scope_root, base)) = own.rsplit_once('/') else {
-        return Vec::new();
+        return false;
     };
     if base != "gui" {
-        return Vec::new();
+        return false;
     }
-    let mut moved = Vec::new();
-    for (pid, comm) in members {
-        let Some(child) = family_child_for_comm(comm) else {
-            continue;
-        };
-        let from = current_child_basename(pid);
-        if from.as_deref() == Some(child) {
-            continue;
-        }
-        if migrate_pid(format!("{scope_root}/{child}"), pid).is_ok() {
-            moved.push(FamilyMigration {
-                pid,
-                comm: comm.to_string(),
-                from,
-                to: child,
-            });
-        }
-    }
-    moved
+    migrate_pid(format!("{scope_root}/{child}"), pid).is_ok()
 }
 
 #[cfg(test)]
@@ -653,13 +678,13 @@ mod tests {
         // CI runs unscoped: the flag is off, so the sweep must touch nothing —
         // not read /proc for its own cgroup, not write a single cgroup file.
         set_family_armed(false);
-        let moved = migrate_misplaced([(std::process::id() as i32, "WebKitWebProcess")]);
-        assert!(
-            moved.is_empty(),
-            "an unarmed sweep must move nothing: {moved:?}"
-        );
-        // And the flag round-trips, because the GUI arm and the probe loop are
-        // two call sites that must never disagree about which state they are in.
+        assert!(!super::migrate_misplaced_one(
+            std::process::id() as i32,
+            "WebKitWebProcess"
+        ));
+        // And the flag round-trips, because the GUI arm and the sweep thread
+        // are two call sites that must never disagree about which state they
+        // are in.
         set_family_armed(true);
         assert!(family_armed());
         set_family_armed(false);

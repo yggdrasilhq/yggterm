@@ -615,9 +615,10 @@ rescued from: `re-arm after inheriting unbounded <unit>: …`), and — since th
 family shape — `family`: `{armed, children, web_high_bytes, web_swap_max_bytes,
 error}` for the GUI's own launch, **null on everything else** (one-shots, an
 opted-out or unbounded GUI). Null means not attempted, which is a different
-finding from `armed: false`. The runtime sweep emits `gui/memory/family_migration`
-per move (`pid`, `comm`, `from`, `to`) — rare, discrete, and the standing proof
-that the WebKit children really sit in the `web` child.
+finding from `armed: false`. The runtime sweep (its own thread, spawned at arm
+time — not the profiling-gated probe) emits `gui/memory/family_migration` per
+move (`pid`, `comm`, `to`) — rare, discrete, and the standing proof that the
+WebKit children really sit in the `web` child.
 
 ⇒ **`tail | grep <name> | tail -1` therefore answers about a random CLI process,
 not about the app.** Read after relaunching a GUI, it says the GUI came up blind.
