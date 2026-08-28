@@ -21,14 +21,21 @@ Closed narratives from before 2026-08-02 are in
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
-(merged to main in `6245b1b1`, ships in 3.1.71). **ROOT CAUSE FOUND
-(owner-caught live 2026-08-28).** The observation
-that proves or falsifies the fix: an ssh-shell row survives a GUI restart with
-its kind AND title intact, and a restart that flips a row to codex must show a
-`cli/identity_*` trace event — a flip with no event means a path reader is
-still minting somewhere. The display-plane hardening (kind on the wire,
-Unknown-never-Codex, persistence refusal, the skill vocabulary) is in the same
-merge.
+(merged to main in `6245b1b1`, shipped in the owner's 3.2.x wave — both live
+binaries carry the identity markers, verified on `/proc/<pid>/exe` 2026-08-28).
+**ROOT CAUSE FOUND (owner-caught live 2026-08-28).**
+
+**Live proof, HALF LANDED (2026-08-28, the 3.2.2 adoption restarts):** every
+`local://` shell row rode the adoption restarts with kind AND title intact —
+Yedit, both Ychromes, and the opencode row — and the persisted state after
+adoption carries all of them as `kind: shell`. The transform did not fire.
+**The remaining observation completes on the `live::` family:** a fresh ssh
+shell (`live::29fabb5b…`, "Yggterm SSH Terminal") was born after adoption; it
+must survive the next GUI restart as `ssh_shell` with its title. A restart that
+flips ANY row to codex must show a `cli/identity_*` trace event — a flip with no
+event means a path reader is still minting somewhere. The display-plane
+hardening (kind on the wire, Unknown-never-Codex, persistence refusal, the skill
+vocabulary) is in the same merge.
 
 **The owner's report (2026-08-28, verbatim intent):** plain SHELL sessions transform
 one by one into EMPTY CODEX sessions after launch; some stay shells while most
