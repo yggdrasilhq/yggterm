@@ -372,7 +372,10 @@ fn build_remote_durable_rows_for_cwdtree(snapshot_json: &Option<serde_json::Valu
             let title = if yggterm_core::looks_like_generated_fallback_title(&title_hint) || yggterm_core::looks_like_low_signal_generated_copy(&title_hint) {
                 None
             } else if title_hint.trim().is_empty() { None } else { Some(title_hint.clone()) };
-            let kind = yggterm_core::agent_scheme::session_kind_for_path(&session_path).unwrap_or(yggterm_core::SessionKind::Codex);
+            let kind_on_wire = sess
+                .get("kind")
+                .and_then(|value| serde_json::from_value::<yggterm_core::SessionKind>(value.clone()).ok());
+            let kind = yggterm_core::agent_scheme::session_kind_for_scanned_row(&session_path, kind_on_wire);
             let display_path = if session_path.is_empty() { format!("remote-session://{}", session_id) } else { session_path.clone() };
             rows.push(yggterm_core::startpage::StartpageDurableRow {
                 session_id: session_id.clone(),

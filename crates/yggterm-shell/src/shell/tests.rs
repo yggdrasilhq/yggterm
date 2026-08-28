@@ -24484,6 +24484,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://pi-raspberry/019caa6f".to_string(),
                     session_id: "019caa6f".to_string(),
                     cwd: "/srv/app".to_string(),
@@ -24538,6 +24539,7 @@ console.log('ok');
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/a".to_string(),
                         session_id: "019d0a2e-bd7b-7260-925e-1f0ed8d3189b".to_string(),
                         cwd: "/home/user".to_string(),
@@ -24555,6 +24557,7 @@ console.log('ok');
                         storage_path: "/home/user/.codex/sessions/a.jsonl".to_string(),
                     },
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/b".to_string(),
                         session_id: "019d0fff-bd7b-7260-925e-1f0ed8d3189b".to_string(),
                         cwd: "/home/user".to_string(),
@@ -24606,6 +24609,7 @@ console.log('ok');
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/older".to_string(),
                         session_id: "older".to_string(),
                         cwd: "/home/user".to_string(),
@@ -24623,6 +24627,7 @@ console.log('ok');
                         storage_path: "older".to_string(),
                     },
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/newer".to_string(),
                         session_id: "newer".to_string(),
                         cwd: "/home/user".to_string(),
@@ -24668,6 +24673,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://pi-raspberry/019caa6f".to_string(),
                     session_id: "019caa6f".to_string(),
                     cwd: "/srv/app".to_string(),
@@ -25030,6 +25036,7 @@ console.log('ok');
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/1".to_string(),
                         session_id: "1".to_string(),
                         cwd: "/home/user".to_string(),
@@ -25047,6 +25054,7 @@ console.log('ok');
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/2".to_string(),
                         session_id: "2".to_string(),
                         cwd: "/home/user".to_string(),
@@ -25094,6 +25102,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://guihost/1".to_string(),
                     session_id: "1".to_string(),
                     cwd: "/mnt/net/data/netshare/notes/obsidian/codex".to_string(),
@@ -25671,6 +25680,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: remote_path.clone(),
                     session_id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
                     cwd: "/home/user".to_string(),
@@ -26079,6 +26089,7 @@ console.log('ok');
     fn merged_sidebar_rows_reject_stale_remote_metadata_live_candidates() {
         let remote_sessions = (0..5)
             .map(|ix| RemoteScannedSession {
+                kind: None,
                 session_path: format!("remote-session://oc/runtime-{ix}"),
                 session_id: format!("runtime-{ix}"),
                 cwd: "/home/user".to_string(),
@@ -26162,6 +26173,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d"
                         .to_string(),
                     session_id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
@@ -26282,6 +26294,7 @@ console.log('ok');
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: "remote-session://dev/019caa6f-b32c-7a73-b4d3-db83225663dc"
                     .to_string(),
                 session_id: "019caa6f-b32c-7a73-b4d3-db83225663dc".to_string(),
@@ -26349,6 +26362,7 @@ console.log('ok');
     }
     fn copy_scan_test_machine() -> RemoteMachineSnapshot {
         let session = |id: &str, cached_summary: Option<&str>, context: &str| RemoteScannedSession {
+            kind: None,
             session_path: format!("remote-session://guihost/{id}"),
             session_id: id.to_string(),
             cwd: format!("/home/user/{id}"),
@@ -27446,6 +27460,7 @@ console.log('ok');
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: path.to_string(),
                 session_id: "019dfc16-7e12-73d0-b8dd-aa9e9c887f9a".to_string(),
                 cwd: "/home/user/gh/yggterm".to_string(),
@@ -27480,6 +27495,7 @@ console.log('ok');
     #[test]
     fn remote_scanned_session_label_uses_cached_copy_before_generic_codex_label() {
         let mut session = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://dev/019dfc16-7e12-73d0-b8dd-aa9e9c887f9a".to_string(),
             session_id: "019dfc16-7e12-73d0-b8dd-aa9e9c887f9a".to_string(),
             cwd: "/home/user/gh/yggterm".to_string(),
@@ -27547,6 +27563,7 @@ console.log('ok');
     #[test]
     fn a_saved_title_is_honoured_but_is_an_argument_not_a_live_store_read() {
         let session = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://devhost/00000000-0000-4000-8000-0000000000d2"
                 .to_string(),
             session_id: "00000000-0000-4000-8000-0000000000d2".to_string(),
@@ -27600,6 +27617,7 @@ console.log('ok');
     #[test]
     fn a_scanned_row_with_no_turns_shows_its_cli_placeholder_not_a_short_hash() {
         let mut session = RemoteScannedSession {
+            kind: None,
             session_path: "remote-muse://devhost/00000000-0000-4000-8000-0000000000e1".to_string(),
             session_id: "00000000-0000-4000-8000-0000000000e1".to_string(),
             cwd: "/home/user".to_string(),
@@ -27638,6 +27656,7 @@ console.log('ok');
     #[test]
     fn remote_scanned_session_label_falls_back_to_short_id_not_generic_codex_session() {
         let session = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://devhost/00000000-0000-4000-8000-0000000000d1"
                 .to_string(),
             session_id: "00000000-0000-4000-8000-0000000000d1".to_string(),
@@ -28188,6 +28207,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Planned,
                 health: RemoteMachineHealth::Cached,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://guihost/abc".to_string(),
                     session_id: "abc".to_string(),
                     cwd: "/home/user".to_string(),
@@ -28347,6 +28367,7 @@ console.log('ok');
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/1".to_string(),
                         session_id: "1".to_string(),
                         cwd: "/home/user".to_string(),
@@ -28364,6 +28385,7 @@ console.log('ok');
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/2".to_string(),
                         session_id: "2".to_string(),
                         cwd: "/home/user/data/netshare".to_string(),
@@ -28412,6 +28434,7 @@ console.log('ok');
             needs_resort: false,
             workspace_folders: Vec::new(),
             scanned_sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: "remote-session://guihost/1".to_string(),
                 session_id: "1".to_string(),
                 cwd: "/mnt/net/data/netshare/notes/obsidian/codex".to_string(),
@@ -28472,6 +28495,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://practice/1".to_string(),
                     session_id: "1".to_string(),
                     cwd: "/home/user".to_string(),
@@ -28576,6 +28600,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://practice/1".to_string(),
                     session_id: "1".to_string(),
                     cwd: "/home/user".to_string(),
@@ -28716,6 +28741,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Cached,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://guihost/1".to_string(),
                     session_id: "1".to_string(),
                     cwd: "/home/user".to_string(),
@@ -29707,6 +29733,7 @@ console.log('ok');
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: "remote-session://dev/version-proof".to_string(),
                     session_id: "version-proof".to_string(),
                     cwd: "/home/user/gh/yggterm".to_string(),
@@ -29806,6 +29833,7 @@ console.log('ok');
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: "remote-session://oc/1".to_string(),
                 session_id: "1".to_string(),
                 cwd: "/home/user/gh/excel-inspired".to_string(),
@@ -31247,6 +31275,7 @@ console.log('ok');
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Cached,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: "remote-session://dev/123".to_string(),
                 session_id: "123".to_string(),
                 cwd: "/srv/app".to_string(),
@@ -42547,6 +42576,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/a".to_string(),
                         session_id: "a".to_string(),
                         cwd: "/home/user/one".to_string(),
@@ -42564,6 +42594,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         storage_path: "/home/user/.codex/sessions/a.jsonl".to_string(),
                     },
                     RemoteScannedSession {
+                        kind: None,
                         session_path: "remote-session://guihost/b".to_string(),
                         session_id: "b".to_string(),
                         cwd: "/home/user/two".to_string(),
@@ -47638,6 +47669,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let newer_path = format!("remote-cc://dev/{newer_id}");
 
         let scanned = |id: &str, path: &str, modified_epoch: i64| RemoteScannedSession {
+            kind: None,
             session_path: path.to_string(),
             session_id: id.to_string(),
             cwd: "/home/user/gh/widgets".to_string(),
@@ -47808,6 +47840,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let remote_session =
             |name: &str, modified_epoch: i64, started_at: &str| RemoteScannedSession {
+                kind: None,
                 session_path: format!("remote-session://dev/{name}"),
                 session_id: name.to_string(),
                 cwd: "/home/user/gh/yggterm".to_string(),
@@ -47887,6 +47920,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let remote_session =
             |machine: &str, name: &str, cwd: &str, modified_epoch: i64| RemoteScannedSession {
+                kind: None,
                 session_path: format!("remote-session://{machine}/{name}"),
                 session_id: name.to_string(),
                 cwd: cwd.to_string(),
@@ -48008,6 +48042,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let remote_session =
             |machine: &str, name: &str, cwd: &str, modified_epoch: i64| RemoteScannedSession {
+                kind: None,
                 session_path: format!("remote-session://{machine}/{name}"),
                 session_id: name.to_string(),
                 cwd: cwd.to_string(),
@@ -48471,6 +48506,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             value: "/home/user/gh/yggterm".to_string(),
         }];
         let remote_session = |name: &str, cwd: &str, modified_epoch: i64| RemoteScannedSession {
+            kind: None,
             session_path: format!("remote-session://dev/{name}"),
             session_id: name.to_string(),
             cwd: cwd.to_string(),
@@ -49981,6 +50017,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     #[test]
     fn remote_scanned_session_label_uses_cwd_instead_of_short_uuid() {
         let session = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://dev/6d8cdd5".to_string(),
             session_id: "6d8cdd5".to_string(),
             cwd: "/home/user/git/samplenotes".to_string(),

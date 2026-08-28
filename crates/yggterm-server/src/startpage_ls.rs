@@ -742,8 +742,10 @@ fn build_remote_durable_rows(
             } else {
                 Some(title_hint.clone())
             };
-            let kind = yggterm_core::agent_scheme::session_kind_for_path(&session_path)
-                .unwrap_or(yggterm_core::SessionKind::Codex);
+            let kind_on_wire = sess
+                .get("kind")
+                .and_then(|value| serde_json::from_value::<yggterm_core::SessionKind>(value.clone()).ok());
+            let kind = yggterm_core::agent_scheme::session_kind_for_scanned_row(&session_path, kind_on_wire);
             let display_path = if session_path.is_empty() {
                 format!("remote-session://{}", session_id)
             } else {
