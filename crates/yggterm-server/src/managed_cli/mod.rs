@@ -2346,6 +2346,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.home);
     }
 
+    /// The v2 preview package (`@opencode-ai/cli`) carries the same
+    /// entry-bin trap under a scoped path and a new bin name — the health
+    /// check must follow the package the descriptor names, or a broken 2.0
+    /// install satisfies the fast path forever.
+    #[test]
+    fn the_opencode2_preview_shim_is_checked_under_its_scoped_path() {
+        let paths = provision_test_paths("opencode2-shim");
+        let prefix = &paths.prefix;
+        let shim_dir = prefix
+            .join("lib")
+            .join("node_modules")
+            .join("@opencode-ai")
+            .join("cli")
+            .join("bin");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        let shim = shim_dir.join("opencode2.exe");
+
+        std::fs::write(&shim, "echo \"Error: postinstall script was not run.\"\n")
+            .expect("write shim");
+        assert!(
+            !direct_install_shim_is_healthy(prefix, "@opencode-ai/cli"),
+            "the scoped package's error shim must not satisfy the fast path"
+        );
+        std::fs::write(&shim, b"\x7fELF\x02\x01\x01\x00rest-of-binary").expect("write elf");
+        assert!(
+            direct_install_shim_is_healthy(prefix, "@opencode-ai/cli"),
+            "a real binary must satisfy the fast path"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
     fn provision_test_paths(tag: &str) -> ManagedCliPaths {
         let tmp = std::env::temp_dir().join(format!(
             "ygg-provision-{tag}-{}-{}",
@@ -4768,20 +4799,25 @@ fn staged_binary_runs(staged: &Path, binary: &str) -> std::result::Result<(), St
 
 /// Whether the installed entry binary for `package` is a REAL executable
 /// rather than a vendor error shim. ⛔ The fast-path version check reads only
-/// `package.json`, and opencode-ai's `bin/opencode.exe` EXISTS even when the
-/// install is broken — it is a text file that prints "postinstall script was
-/// not run" and exits. Without this health check, a broken opencode install
-/// would satisfy the fast path forever and never self-heal.
+/// `package.json`, and opencode's entry bins EXIST even when the install is
+/// broken — a text file that prints "postinstall script was not run" and
+/// exits. Without this health check, a broken opencode install would satisfy
+/// the fast path forever and never self-heal. Both generations share the trap:
+/// the abandoned v1 line (`opencode-ai`, bin `opencode.exe`) and the v2
+/// preview (`@opencode-ai/cli`, bin `opencode2.exe`) — kept separate so a
+/// host still carrying v1 keeps healing too.
 fn direct_install_shim_is_healthy(prefix: &Path, package: &str) -> bool {
-    if package != "opencode-ai" {
-        return true;
-    }
+    let entry_bin = match package {
+        "opencode-ai" => ("opencode-ai", "opencode.exe"),
+        "@opencode-ai/cli" => ("@opencode-ai/cli", "opencode2.exe"),
+        _ => return true,
+    };
     let shim = prefix
         .join("lib")
         .join("node_modules")
-        .join("opencode-ai")
+        .join(entry_bin.0)
         .join("bin")
-        .join("opencode.exe");
+        .join(entry_bin.1);
     match fs::read(&shim) {
         Ok(bytes) => bytes.starts_with(&[0x7f, b'E', b'L', b'F']),
         Err(_) => false,
