@@ -388,6 +388,71 @@ const SCROLL_NAV_SHIM_JS: &str = r#"(function(){
 ///
 /// Reports the value VERBATIM as CSS text. Parsing is the shell's job — the
 /// engine layer must not learn what the shell's seam palette looks like.
+/// ⛔⛔ WEBKITGTK HAS NO `is-playing-video`, AND THAT IS THE WHOLE BUG.
+///
+/// The background-tab activity dot was written from
+/// `webkit_web_view_is_playing_audio`, which is WebKit's own media session and
+/// is the honest answer to *"is this tab making a sound"*. It is not the answer
+/// to *"is this tab playing"*: **a muted video plays no audio**, and background
+/// video autoplays muted on essentially every site — so the one case the
+/// indicator exists for is the one case its trigger cannot see.
+///
+/// There is no property to swap it for. The PAGE has to answer, so this shim
+/// watches the media elements and reports the edges over the surface message
+/// channel the theme-colour shim already uses.
+///
+/// Three things about it are load-bearing:
+///
+/// * **It reports `false` at document-start.** The host keeps a latch per
+///   SURFACE, and a surface outlives its documents — without this, navigating
+///   away from a playing video would leave the dot lit on a page that is not
+///   playing anything.
+/// * **It re-asserts while playing.** A dropped message would otherwise leave
+///   the latch stuck false for as long as the video runs, and the failure would
+///   be silent in the reassuring direction.
+/// * ⛔ **It reads `paused`/`ended`/`readyState`, never `muted`.** Muted is
+///   exactly the state this exists to catch, and a shim that filtered on it
+///   would reimplement the bug one layer down.
+const MEDIA_ACTIVITY_SHIM_JS: &str = r#"(function(){
+  if (window.__yggtermMediaShim) { return; }
+  window.__yggtermMediaShim = true;
+  var last = null;
+  var lastAt = 0;
+  var HEARTBEAT_MS = 2000;
+  var playing = function () {
+    var nodes = document.querySelectorAll('video, audio');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      // ⛔ `muted` is deliberately NOT consulted. See the doc comment.
+      if (!el.paused && !el.ended && el.readyState > 2) { return true; }
+    }
+    return false;
+  };
+  var report = function (force) {
+    var now = Date.now();
+    var value = playing();
+    if (!force && value === last && !(value && now - lastAt >= HEARTBEAT_MS)) { return; }
+    last = value;
+    lastAt = now;
+    try {
+      window.webkit.messageHandlers.yggtermSurface.postMessage(
+        JSON.stringify({ type: 'media', playing: value })
+      );
+    } catch (e) {}
+  };
+  // The reset. A surface outlives its documents and the host's latch is keyed
+  // by surface, so a new document must say what it is before anything believes
+  // the last one.
+  report(true);
+  for (var ev of ['play', 'playing', 'pause', 'ended', 'emptied', 'loadeddata', 'waiting', 'stalled']) {
+    document.addEventListener(ev, function () { report(false); }, true);
+  }
+  // The net for everything the events miss: a <video> added by a script and
+  // started before a listener could see it, and the heartbeat that keeps a long
+  // playback asserted.
+  setInterval(function () { report(false); }, 1000);
+})();"#;
+
 const THEME_COLOR_SHIM_JS: &str = r#"(function(){
   if (window.__yggtermThemeColorShim) { return; }
   window.__yggtermThemeColorShim = true;
@@ -599,6 +664,7 @@ fn attach_surface_message_channel(
     surface_id: u64,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
     theme_colors: &Rc<RefCell<HashMap<u64, String>>>,
+    media_activity: &Rc<RefCell<HashMap<u64, bool>>>,
     capture_asks: &Rc<RefCell<Vec<PendingCaptureAsk>>>,
     fresh_capture_asks: &Rc<RefCell<Vec<SurfaceCaptureAsk>>>,
     engine_capture_asks: &Rc<RefCell<HashMap<u64, u64>>>,
@@ -615,6 +681,7 @@ fn attach_surface_message_channel(
     // wry's ipc channel uses. Registering first can drop the first message.
     let close_requests = close_requests.clone();
     let theme_colors = theme_colors.clone();
+    let media_activity = media_activity.clone();
     let capture_asks = capture_asks.clone();
     let fresh_capture_asks = fresh_capture_asks.clone();
     let engine_capture_asks = engine_capture_asks.clone();
@@ -708,6 +775,16 @@ fn attach_surface_message_channel(
                     .borrow_mut()
                     .insert(surface_id, color.to_string());
             }
+            return;
+        }
+        // The page's own answer to "am I playing" (see `MEDIA_ACTIVITY_SHIM_JS`).
+        // Recorded, never interpreted: the shell owns what a dot means.
+        if message.get("type").and_then(|kind| kind.as_str()) == Some("media") {
+            let playing = message
+                .get("playing")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            media_activity.borrow_mut().insert(surface_id, playing);
             return;
         }
         if message.get("type").and_then(|kind| kind.as_str()) != Some("close") {
@@ -1996,6 +2073,10 @@ pub struct WebSurfaceHost {
     /// i.e. it would shed evidence at the one hop that has no back-pressure to
     /// report it with.
     trace_batches: Rc<RefCell<Vec<SurfaceTraceBatch>>>,
+    /// Per SURFACE, the page's own last word on whether it is playing anything
+    /// (see [`MEDIA_ACTIVITY_SHIM_JS`]). ⛔ A LATCH, not a freshness window —
+    /// the SHELL owns staleness, exactly as it does for the audio flag.
+    media_activity: Rc<RefCell<HashMap<u64, bool>>>,
     /// Capture asks the shell has not been told about yet, drained each
     /// reconcile tick. See the HARDWARE CAPTURE section.
     media_permission_requests: Rc<RefCell<Vec<SurfaceMediaPermissionRequest>>>,
@@ -3878,6 +3959,10 @@ struct SurfaceWindowPlumbing {
     backdrop_rgb: Rc<Cell<Option<(u8, u8, u8)>>>,
     fullscreen: Rc<Cell<Option<u64>>>,
     theme_colors: Rc<RefCell<HashMap<u64, String>>>,
+    /// Per SURFACE, the page's own last word on whether it is playing anything
+    /// (see [`MEDIA_ACTIVITY_SHIM_JS`]). ⛔ A LATCH, not a freshness window —
+    /// the SHELL owns staleness, exactly as it does for the audio flag.
+    media_activity: Rc<RefCell<HashMap<u64, bool>>>,
     popups: Rc<RefCell<Vec<SurfacePopup>>>,
     link_opens: Rc<RefCell<Vec<SurfaceLinkOpen>>>,
     next_id: Rc<Cell<u64>>,
@@ -4048,6 +4133,7 @@ fn build_popup_webview(
         backdrop_rgb,
         fullscreen,
         theme_colors,
+        media_activity,
         link_opens,
         media_permission_requests,
         parked_media_permissions,
@@ -4102,6 +4188,7 @@ fn build_popup_webview(
         .with_initialization_script_for_main_only(SCROLL_NAV_SHIM_JS, true)
         // A popup paints its page's own colour behind it like any surface.
         .with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true)
+        .with_initialization_script_for_main_only(MEDIA_ACTIVITY_SHIM_JS, true)
         // ...and a popup's `getUserMedia()` can hang exactly as a tab's can —
         // the "verify with your camera" window IS a popup. See
         // §THE ASK THE ENGINE NEVER RAISES.
@@ -4154,6 +4241,7 @@ fn build_popup_webview(
         popup_id,
         close_requests,
         theme_colors,
+        media_activity,
         capture_asks,
         fresh_capture_asks,
         engine_capture_asks,
@@ -4402,6 +4490,7 @@ impl WebSurfaceHost {
             page_menu: Rc::new(RefCell::new(None)),
             fullscreen: Rc::new(Cell::new(None)),
             theme_colors: Rc::new(RefCell::new(HashMap::new())),
+            media_activity: Rc::new(RefCell::new(HashMap::new())),
             media_permission_requests: Rc::new(RefCell::new(Vec::new())),
             parked_media_permissions: Rc::new(RefCell::new(HashMap::new())),
             retired_media_permissions: Rc::new(RefCell::new(Vec::new())),
@@ -4603,6 +4692,7 @@ impl WebSurfaceHost {
             backdrop_rgb: self.backdrop_rgb.clone(),
             fullscreen: self.fullscreen.clone(),
             theme_colors: self.theme_colors.clone(),
+            media_activity: self.media_activity.clone(),
             popups: self.popups.clone(),
             link_opens: self.link_opens.clone(),
             next_id: self.next_id.clone(),
@@ -5001,6 +5091,7 @@ impl WebSurfaceHost {
             // ...and every surface reports its THEME COLOR, so no shell pixel
             // beside the page is ever a color the page did not choose.
             .with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true)
+            .with_initialization_script_for_main_only(MEDIA_ACTIVITY_SHIM_JS, true)
             // ...and every surface reports a `getUserMedia()` it is WAITING on,
             // because the engine reports nothing at all for a page it has not
             // presented. See §THE ASK THE ENGINE NEVER RAISES.
@@ -5258,6 +5349,7 @@ impl WebSurfaceHost {
             id,
             &self.close_requests,
             &self.theme_colors,
+            &self.media_activity,
             &self.capture_asks,
             &self.fresh_capture_asks,
             &self.engine_capture_asks,
@@ -5565,6 +5657,28 @@ impl WebSurfaceHost {
             .is_some_and(|s| s.webview.webview().is_playing_audio())
     }
 
+    /// Is surface `id` playing ANY media — sound or picture?
+    ///
+    /// ⛔⛔ This is the predicate every caller wants, and `is_playing_audio`
+    /// only looked like it. WebKitGTK exposes no `is-playing-video`, so a MUTED
+    /// video is invisible to the engine's own answer — and background video
+    /// autoplays muted almost everywhere, which made the one case the activity
+    /// dot exists for the one case it could not see. The page reports the
+    /// picture half itself (see [`MEDIA_ACTIVITY_SHIM_JS`]).
+    ///
+    /// ⚠ The two halves are ORed, never swapped. The engine's answer covers
+    /// WebAudio and any element the shim's document could not reach; the shim
+    /// covers muted playback. Dropping either loses a real case.
+    pub fn is_playing_media(&self, id: u64) -> bool {
+        self.is_playing_audio(id)
+            || self
+                .media_activity
+                .borrow()
+                .get(&id)
+                .copied()
+                .unwrap_or(false)
+    }
+
     /// Mute or unmute surface `id`.
     ///
     /// # WHO OWNS THE SPEAKERS — not "may an unseen page make noise"
@@ -5644,6 +5758,9 @@ impl WebSurfaceHost {
         self.fullscreen
             .set(fullscreen_owner_after(self.fullscreen.get(), id, false));
         self.theme_colors.borrow_mut().remove(&id);
+        // …and the media latch with it, or the next surface to take this id
+        // inherits a dead page's claim to be playing.
+        self.media_activity.borrow_mut().remove(&id);
         // And the questions this surface had outstanding. A destroyed webview
         // will never be answered, and an unanswered ask is a held engine object
         // plus a dialog on screen for a page that is gone. Deny, and tell the
@@ -9741,6 +9858,61 @@ mod fullscreen_and_theme_locks {
                 .count(),
             2,
             "every view that can show a page must report its theme colour"
+        );
+    }
+
+    /// ⛔⛔ THE BUG THIS SHIM EXISTS FOR, GUARDED AT ITS OWN SOURCE.
+    ///
+    /// The background-activity dot keyed on `webkit_web_view_is_playing_audio`.
+    /// A MUTED video plays no audio, background video autoplays muted almost
+    /// everywhere, and so the indicator was blind to precisely the case it was
+    /// asked for. The one way to reintroduce that is for this shim to start
+    /// consulting `muted` — which reads like a sensible filter and is the bug
+    /// one layer down.
+    #[test]
+    fn the_media_shim_never_filters_on_muted_and_rides_every_view() {
+        assert!(
+            !MEDIA_ACTIVITY_SHIM_JS.contains(".muted"),
+            "the media shim consults `muted` — that is the original defect, moved"
+        );
+        assert!(
+            MEDIA_ACTIVITY_SHIM_JS.contains("!el.paused && !el.ended && el.readyState > 2"),
+            "the media shim's playing test changed shape"
+        );
+        // A surface outlives its documents and the host keeps a per-surface
+        // latch, so a new document MUST state its own case or navigating away
+        // from a video leaves the dot lit on a page playing nothing.
+        assert!(
+            MEDIA_ACTIVITY_SHIM_JS.contains("report(true);"),
+            "the shim no longer resets the host's latch at document-start"
+        );
+
+        let product = product();
+        for needle in [
+            // Recorded, never interpreted — the shell owns what a dot means.
+            "if message.get(\"type\").and_then(|kind| kind.as_str()) == Some(\"media\") {",
+            "media_activity.borrow_mut().insert(surface_id, playing);",
+            // ⛔ ORed with the engine's own answer, never swapped for it: the
+            // engine still covers WebAudio and anything the shim cannot reach.
+            "pub fn is_playing_media(&self, id: u64) -> bool {",
+            "self.is_playing_audio(id)",
+            // A closed surface must not leave its claim behind for the next
+            // surface to take that id.
+            "self.media_activity.borrow_mut().remove(&id);",
+        ] {
+            assert!(
+                product.contains(needle),
+                "the media-activity wiring lost a call site: {needle}"
+            );
+        }
+        // Both builders, exactly like the theme shim: a view with no shim is a
+        // view whose muted playback is invisible again.
+        assert_eq!(
+            product
+                .matches(".with_initialization_script_for_main_only(MEDIA_ACTIVITY_SHIM_JS, true)")
+                .count(),
+            2,
+            "every view that can show a page must report whether it is playing"
         );
     }
 
