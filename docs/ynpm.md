@@ -200,6 +200,10 @@ deploys. That is the ad-hoc chore ynpm retires:
 - Windows CI matrix: packaging supports win32 targets from day one; the
   build runners for them are added per repo as each tool's Windows port
   reaches parity.
+- Dev mode and alternative sources are channel features, not trust
+  boundaries: a dev binary is built from a checkout the builder already
+  trusts, and forgejo/github fetches verify against the release checksums
+  exactly as npm fetches verify against the registry integrity hash.
 
 ## 10. First milestone
 
@@ -210,3 +214,147 @@ deploys. That is the ad-hoc chore ynpm retires:
 3. ytop first (smallest surface), end to end: tag → workflow → registry →
    `ynpm install` on three hosts → the sweep keeps it current.
 4. Then ychrome, ychrome-vault, yedit, kasten; yRDP as a `git` package.
+
+---
+
+## 11. Dev mode: `ynpm dev`, and the drift law
+
+Releasing through GitHub Actions → npm → `ynpm sync-fleet` is the production
+channel: slow by design (CI matrix, review, tag). Development cannot wait on
+it, and hand-scp'ing dev binaries is exactly the chore ynpm retired. So dev
+is a first-class channel:
+
+```
+ynpm dev <repo-checkout>          build release locally → install as a DEV
+                                  generation on THIS host (registry untouched)
+ynpm dev --fleet <repo-checkout>  build once here, push the built generation
+                                  to every connected machine's dev slot (the
+                                  same transport yggterm's fleet already has)
+ynpm prod <name>                  back to the registry channel (latest prod)
+ynpm status                       per package: channel, dev age, prod drift
+```
+
+- **Channels are per package, not per host.** A package in dev mode carries a
+  `dev` marker generation with: build commit, built-at time, builder host, and
+  the prod version it supersedes. `~/.local/bin/<name>` points at whichever
+  channel is live; switching is the same atomic symlink rename as any
+  generation publish.
+- **The drift law (6 hours).** The TTL sweep reads the dev markers. A package
+  whose live channel is `dev` for more than 6 hours past its last prod
+  publish raises a yggterm notification: *"<name> has been dev for 7h —
+  publish it (`ynpm publish`) or pin it (`ynpm dev --pin`)"*. The reminder
+  is the law; dev must not silently become the fleet's production.
+- **The auto-switch back is conditional, and only forward:** when the drift
+  reminder has fired and a prod version ≥ the dev build lands on the
+  registry (CI published it), the sweep auto-switches that package to prod
+  and drops the dev generation. Dev never auto-publishes — publishing is a
+  human/CI decision; switching back is bookkeeping.
+- **Fleet drift is symmetric:** a machine on prod while the dev host has
+  moved on is normal during development; `ynpm dev --fleet` re-converges
+  them. `ynpm status --fleet` shows the per-machine channel map.
+
+## 12. Sources: npm is the default, not the gate
+
+The registry channel needs no auth to install (public packages), but it is
+not the only door. Each package resolves through a **source chain** — config
+declares the order, per package or globally:
+
+| source | tarballs from | auth | used when |
+|---|---|---|---|
+| `npm` (default) | registry.npmjs.org | none to install | everything public |
+| `forgejo` | the self-hosted Forgejo release assets | forgejo token (vault) | private/pre-release builds, and hosts that must not touch npmjs |
+| `github` | GitHub release assets | optional (public repos need none) | consumers who avoid the npm registry |
+
+- **The asset contract is the same shape as the npm platform package** (a
+  tarball with `bin/`, `package.json`, `finalize.mjs`), attached to a release
+  tagged `v<version>`, named `@ygghq/<name>-<platform>.tgz`. One artifact
+  shape, three doors.
+- `ynpm install @ygghq/kasten --from forgejo`, or config:
+  `{ "kasten": { "sources": ["forgejo", "npm"] } }`. The chain is
+  fall-through in order; a source that cannot serve the version is skipped
+  and named in the output.
+- Checksums: a `SHA256SUMS` asset on the release verifies forgejo/github
+  fetches (npm tarballs carry the registry's integrity hash already).
+- `ynpm publish --release forgejo` drives the same build matrix locally and
+  uploads release assets — the private-channel counterpart of the CI
+  publish.
+
+## 13. The registries: one config family, user files last
+
+Two registries answer "what can be installed/launched", and both are
+**config files, not code** — a user teaches ynpm and yggterm about new
+software by dropping a file, Debian-style:
+
+```
+/etc-analogue (shipped, updated by releases):
+  ~/.yggterm/ynpm/clis.d/00-base.json        the CLI registry — every agent
+                                             CLI ynpm knows (codex, claude,
+                                             qwen, kimi, grok, opencode, pi,
+                                             muse, antigravity, …)
+  ~/.yggterm/ynpm/apps.d/00-base.json        the surfaces registry — every
+                                             launchable app surface (the
+                                             libyggterm apps + peers)
+
+/user-analogue (owned by the user, never written by ynpm or yggterm):
+  ~/.yggterm/ynpm/clis.d/*.json              drop-ins; lexicographic; last wins
+  ~/.yggterm/ynpm/apps.d/*.json
+```
+
+- **CLI registry entry** (what ynpm needs to install and yggterm needs to
+  launch): name, npm package (or source chain), install shape
+  (`native`/`script`/`git`), launch command, and — explicitly — an
+  `integration` field: `none` for "installable + launchable as a plain
+  binary", or the name of a compiled integration (transcript parsing,
+  SessionKind, resume) that ships in yggterm itself. **A registry entry can
+  make a brand-new CLI installable today; the integration nuances
+  (transcript JSONL, resume flags, picker phrases) remain code-side work.**
+  The shipped `00-base.json` is generated FROM the compiled `AGENT_CLIS`
+  descriptors at yggterm build time — one SSOT, two consumers.
+- **Surfaces registry entry** (what yggterm's right-click / startpage needs
+  to launch a program): command (PATH-resolved), args, title, icon, and the
+  surface it takes over. **Not exclusive to libyggterm apps**: `emacs -nx`,
+  `tmux new`, anything on PATH is a legitimate entry. The libyggterm apps
+  are entries whose command happens to speak the surface protocol.
+- **Conflict rule:** ynpm and yggterm write ONLY the `00-base` files; user
+  files are read-merged over them and never touched by tooling. `ynpm
+  doctor` reports merge conflicts (same name in two files) and names the
+  winning file.
+- Documented as a yggui skill (`.agents/skills/`) so any user or agent can
+  add an entry: the schema, an example, and the merge rules.
+
+## 14. Bookkeeping: small by policy
+
+npm's bloat is a policy failure, not a law. ynpm inherits the provisioner's
+hygiene and adds the ynpm-specific sweep arms:
+
+- generations: liveness-aware prune (a running binary's generation is
+  deferred, never deleted underneath a session), N-keep by default;
+- dev generations: shorter TTL (dev churn is the highest-volume churn);
+- the npm cache: shared, GC'd (`npm cache verify` on the sweep cadence —
+  measured 1.65 GB reclaimed);
+- `ynpm gc`: the manual arm — prunes generations, GCs the cache, removes
+  orphaned shims (a `~/.local/bin` entry whose generation is gone), prints
+  the before/after totals per package;
+- every prune is a ytrace event (§15) with the reason, so "where did my disk
+  go" is answerable.
+
+## 15. ytrace probe points
+
+ynpm is observable like everything else in the fleet — every verb emits
+ytrace events (category `ynpm`) at the decision points where bugs live:
+
+| probe | at | carries |
+|---|---|---|
+| `ynpm/resolve` | version/source chosen | package, source chain order, the source that won, why |
+| `ynpm/fetch` | tarball/asset fetched | url, bytes, integrity result, cache hit |
+| `ynpm/finalize` | postinstall ran | exit, fast-copy or fallback path |
+| `ynpm/gate` | runs-before-publish gate | binary, --version exit, elapsed |
+| `ynpm/install` | generation published | package, version, channel, generation id |
+| `ynpm/dev_install` | dev generation | commit, built-at, host, fleet targets |
+| `ynpm/drift` | the 6h law fires | package, dev age, last prod |
+| `ynpm/prune` | anything deleted | what, why, bytes reclaimed |
+| `ynpm/publish` | registry/release upload | package, version, source, duration |
+
+The events are the debugging surface: an install that "hangs" is a missing
+`ynpm/gate`, a flaky update is a `ynpm/resolve` source-chain surprise, and
+the drift law's firings are queryable history.
