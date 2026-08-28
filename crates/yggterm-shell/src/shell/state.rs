@@ -37458,12 +37458,14 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             // gets built by accident.
             let surfaces = published_web_surface_counts();
             let runtime = published_web_surface_runtime_counts();
-            // The walk runs on EVERY tick whether or not profiling is on: the
-            // family sweep rides it, and the memory bound is not a profiling
-            // feature — gating the walk behind the toggle left the WebKit
-            // children in `gui` on the first live arm (3.2.8) with the
-            // `web` child bounded and empty. One /proc stat per process per
-            // tick, off the UI thread, is the whole cost.
+            // Cheap atomic; the profiling toggle can flip at runtime and an off
+            // profiler should cost nothing at all. (The family sweep does NOT
+            // ride this loop — it has its own thread, spawned at arm time: the
+            // memory bound is not a profiling feature, and gating it here left
+            // the WebKit children unmoved on the first armed boot.)
+            if !yggterm_core::perf_profiling_enabled() {
+                continue;
+            }
             let Ok(observations) = task::spawn_blocking(move || {
                 yggterm_core::render_probe::observe_process_tree(root_pid)
             })
@@ -37471,45 +37473,6 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             else {
                 continue;
             };
-            // The family sweep rides the same walk: the WebKit children are born
-            // into `gui` (they inherit the GUI's child) and belong in `web`. Same
-            // two laws as the probe above — no signal write, /proc and cgroupfs
-            // off the UI thread — and by construction it is cheap: a member in
-            // its right child costs one cgroup read per tick, and only a NEW or
-            // misplaced member costs a write.
-            if yggterm_core::cgroup_family::family_armed() {
-                let members: Vec<(i32, String)> = observations
-                    .iter()
-                    .map(|observation| (observation.stat.pid, observation.stat.comm.clone()))
-                    .collect();
-                let migrations = task::spawn_blocking(move || {
-                    yggterm_core::cgroup_family::migrate_misplaced(
-                        members.iter().map(|(pid, comm)| (*pid, comm.as_str())),
-                    )
-                })
-                .await
-                .unwrap_or_default();
-                for migration in &migrations {
-                    append_trace_event(
-                        &perf_home,
-                        "gui",
-                        "memory",
-                        "family_migration",
-                        serde_json::json!({
-                            "pid": migration.pid,
-                            "comm": migration.comm,
-                            "from": migration.from,
-                            "to": migration.to,
-                        }),
-                    );
-                }
-            }
-            // Cheap atomic; the profiling toggle can flip at runtime and an off
-            // profiler should cost nothing at all. Gated AFTER the walk: the
-            // sweep above is not optional.
-            if !yggterm_core::perf_profiling_enabled() {
-                continue;
-            }
             // NOT current_millis(): that is a SystemTime wall clock, and feeding it
             // here inflated interval_ms across a suspend/resume while the CPU tick
             // counters stood still — under-reporting core_fraction on exactly the

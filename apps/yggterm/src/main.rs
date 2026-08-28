@@ -1249,6 +1249,15 @@ fn main() -> Result<()> {
             scope_fs_root.map(|root| yggterm_core::cgroup_family::arm_family(root, self_pid));
         if let Some(armed) = report.as_ref().map(|r| r.armed) {
             yggterm_core::cgroup_family::set_family_armed(armed);
+            // The sweep thread exists only for an armed family: WebKit
+            // children are born into `gui` and belong in `web` within one
+            // tick of their birth. It is deliberately NOT the render probe's
+            // loop — that one sits behind the profiling toggle, and the first
+            // live arm measured the WebKit children still in `gui` beside a
+            // bounded, empty `web` child because of exactly that gate.
+            if armed {
+                yggterm_core::cgroup_family::spawn_family_sweep(startup_home.clone());
+            }
         }
         report
     } else {
