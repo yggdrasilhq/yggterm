@@ -1699,11 +1699,14 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
 /// impossible by construction: [`SessionKind::is_agent`] is derived from this
 /// table (see `session_kind.rs`).
 /// The npm dist-tag a CLI installs from, when the vendor's `latest` is not
-/// the line the owner chose. OpenCode's v2 binary ships on the `beta` tag
-/// while `latest` stays on the 1.x line (owner directive 2026-08-26), so the
-/// provisioner must resolve the tag, not assume the word "latest". A fn over
-/// [`SessionKind`] rather than a descriptor field: it is provisioning policy
-/// (revisable in one place) and adding a descriptor field would ripple
+/// the line the owner chose. OpenCode's v2 binary ships as `@opencode-ai/cli`
+/// on the `beta` tag (build-numbered versions) while `latest` there stays one
+/// step behind and the UNSCOPED `opencode-ai@beta` is the abandoned v1 line
+/// (owner directive 2026-08-26; wrong-package pin fixed 2026-08-28), so the
+/// provisioner must resolve the tag against THIS package, not assume the word
+/// "latest" nor that the tag exists on every package that ever carried it. A
+/// fn over [`SessionKind`] rather than a descriptor field: it is provisioning
+/// policy (revisable in one place) and adding a descriptor field would ripple
 /// through every registry literal.
 pub fn npm_dist_tag(kind: SessionKind) -> Option<&'static str> {
     match kind {
@@ -2373,11 +2376,16 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         display_name: "OpenCode",
         session_metadata_label: "OpenCode Session",
         slug: "opencode",
-        binary_name: "opencode",
-        // The npm package is `opencode-ai`; the binary it installs is
-        // `opencode`. Naming the wrong one is how provisioning silently
+        binary_name: "opencode2",
+        // ⛔ TWO packages, ONE tag name: `opencode-ai@beta` is the ABANDONED
+        // v1-line beta (date-stamped versions, frozen upstream); the v2 line
+        // the owner directed (2026-08-26) ships as `@opencode-ai/cli@beta`
+        // (build-numbered versions) and installs the binary `opencode2`.
+        // Pinning the right tag on the wrong package is how the managed
+        // install served a frozen August beta while every terminal ran the
+        // 2.0 preview. Naming the wrong one is how provisioning silently
         // installs nothing.
-        install: CliInstall::Npm("opencode-ai"),
+        install: CliInstall::Npm("@opencode-ai/cli"),
         update: CliUpdate::Reinstall,
         icon_glyph: "OC_",
         // Nearest available (7.90:1).
@@ -7705,5 +7713,23 @@ mod tests {
         assert!(!chosen.to_ascii_lowercase().starts_with("please "));
         assert!(!crate::looks_like_generated_fallback_title(&chosen));
         assert!(!crate::looks_like_low_signal_generated_copy(&chosen));
+    }
+
+    /// Regression lock for the 2026-08-28 wrong-package fix: OpenCode's v2
+    /// line ships as `@opencode-ai/cli` under the `beta` tag and installs the
+    /// binary `opencode2`. The tag NAME alone is not the decision — the same
+    /// word exists on the abandoned unscoped v1 package — so both halves of
+    /// the pin are asserted here, and a future edit that restores either half
+    /// of the frozen-August drift fails this instead of every opencode row.
+    #[test]
+    fn opencode_installs_the_v2_preview_package_not_the_abandoned_v1_beta() {
+        let descriptor = agent_cli_descriptor(SessionKind::OpenCode)
+            .expect("OpenCode is a registered agent CLI");
+        assert_eq!(descriptor.binary_name, "opencode2");
+        match descriptor.install {
+            CliInstall::Npm(package) => assert_eq!(package, "@opencode-ai/cli"),
+            other => panic!("OpenCode must install from npm, got {other:?}"),
+        }
+        assert_eq!(npm_dist_tag(SessionKind::OpenCode), Some("beta"));
     }
 }
