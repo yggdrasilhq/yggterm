@@ -18,9 +18,27 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [6.7] EVERY `server remote` / `server terminal` ONE-SHOT — INCLUDING THE AGENT RESUME HANDOFF — PAYS THE DESKTOP PREAMBLE THE `server app` FAMILY JUST STOPPED PAYING
+## ⛔ [6.7] EVERY `server remote` / `server terminal` ONE-SHOT — INCLUDING THE AGENT RESUME HANDOFF — PAID THE DESKTOP PREAMBLE THE `server app` FAMILY STOPPED PAYING
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Falsifying observation:** after the roll ships this, on a GUI host running the new
+build: a `server remote protocol-version` (or `resume-codex --require-existing`)
+one-shot emits NO `startup/linux_desktop_backend_policy` event and no
+`--internal-gl-probe` child (the old build emitted the full three-event startup
+triple per spawn and re-exec'd twice); `server remote resume-codex` wall cost over
+ssh drops by the preamble plus probe (~300+ ms → tens of ms); and a GUI launch on
+the same build still records its full `linux_desktop_backend_policy` story (the
+block moved to the GUI fallthrough, not deleted) with the same fields as before.
+
+**Fixed by:** the whole desktop/GL preamble moved from the top of `main()` to the
+GUI fallthrough — every verb dispatch (remote, terminal, sessions, everything that
+returns before the shell) now runs without it, and the GUI configures immediately
+before it presents. The allocator's arena re-exec gained the same shape of gate:
+full re-exec only for long-lived invocations (a shell run, or the exact
+`server daemon`/`daemon-bridge` argv); one-shot verbs keep their single boot with a
+best-effort `mallopt`. Locked by the verb-dispatch source-order test and the
+allocator-gate predicate test.
 
 **Measured (dev's own event trace, 2026-08-28 16:5x, build 3.1.69):** the trace records
 `startup/main_enter` + `startup/linux_memory_scope` +

@@ -377,21 +377,74 @@ fn maybe_wait_for_update_relaunch_parent_exit() {
     }
 }
 
-fn configure_linux_allocator_limits() -> Result<()> {
+/// Will THIS invocation run the GUI shell (or the daemon) — the long-lived
+/// processes the allocator re-exec exists for? The GUI shell is the dispatch
+/// fallthrough: every one-shot CLI verb names itself as the first token
+/// (`server`, `automation`, `collection`, `snapshot`, `web-import`, `install`,
+/// `doc`, the help/version tokens), and everything else falls through to the
+/// shell. Pure so the gate is testable without exec-ing anything.
+fn invocation_runs_a_shell(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        None => true, // no args: the GUI launch
+        Some(first) => !matches!(
+            first,
+            "server"
+                | "automation"
+                | "collection"
+                | "snapshot"
+                | "web-import"
+                | "install"
+                | "doc"
+                | "--version"
+                | "-V"
+                | "version"
+                | "--build-commit"
+                | "build-commit"
+                | "--help"
+                | "-h"
+                | "help"
+        ),
+    }
+}
+
+/// The allocator re-exec is a FULL PROCESS BOOT paid by every invocation that
+/// arrives without `MALLOC_ARENA_MAX` in its environment — measured 2026-08-28
+/// as one of the three boots behind every `server app clients` census (re-exec
+/// + GL-probe child + the parent). Arena count only matters for a process that
+/// lives long enough to fragment, so the re-exec is for the shell and the
+/// daemon; a one-shot verb gets the best-effort `mallopt` and keeps its single
+/// boot.
+fn allocator_reexec_required(args: &[String]) -> bool {
+    // The daemon is long-lived without running a shell — exact argv, because
+    // `server` as a first token is otherwise the one-shot family.
+    if args.len() == 2
+        && args[0] == "server"
+        && (args[1] == "daemon" || args[1] == "daemon-bridge")
+    {
+        return true;
+    }
+    invocation_runs_a_shell(args)
+}
+
+fn configure_linux_allocator_limits(args: &[String]) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         const ARENA_MAX: libc::c_int = 2;
         if std::env::var_os(ENV_MALLOC_ARENA_MAX).is_none() {
-            let exe =
-                std::env::current_exe().context("locating yggterm binary for allocator re-exec")?;
-            let mut command = Command::new(exe);
-            command
-                .args(std::env::args_os().skip(1))
-                .env(ENV_MALLOC_ARENA_MAX, ARENA_MAX.to_string());
-            let error = command.exec();
-            return Err(anyhow::anyhow!(
-                "re-execing yggterm with allocator limits failed: {error}"
-            ));
+            if allocator_reexec_required(args) {
+                let exe = std::env::current_exe()
+                    .context("locating yggterm binary for allocator re-exec")?;
+                let mut command = Command::new(exe);
+                command
+                    .args(std::env::args_os().skip(1))
+                    .env(ENV_MALLOC_ARENA_MAX, ARENA_MAX.to_string());
+                let error = command.exec();
+                return Err(anyhow::anyhow!(
+                    "re-execing yggterm with allocator limits failed: {error}"
+                ));
+            }
+            // A one-shot keeps one boot and takes the best-effort raise; a
+            // short-lived client cannot fragment arenas it never fills.
         }
         let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, ARENA_MAX) };
     }
@@ -1124,15 +1177,10 @@ fn main() -> Result<()> {
     } else {
         MemoryScopeOutcome::NotAttempted
     };
-    configure_linux_allocator_limits()?;
+    configure_linux_allocator_limits(&args)?;
     // After the allocator re-exec above (which returns early), so the raise
     // lands on the process that actually runs the GUI.
     configure_file_descriptor_limit();
-    configure_linux_desktop_backend();
-    configure_linux_terminal_renderer_policy();
-    configure_linux_accessibility_bridge();
-    configure_linux_webkit_compositing();
-    configure_linux_webkit_memory_policy();
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -1188,43 +1236,6 @@ fn main() -> Result<()> {
             "bounded": memory_scope.bounded(),
             "inherited_unit": memory_scope.inherited_unit(),
             "fallback_reason": memory_scope.fallback_reason(),
-        }),
-    );
-    #[cfg(target_os = "linux")]
-    append_trace_event(
-        &startup_home,
-        "gui",
-        "startup",
-        "linux_desktop_backend_policy",
-        serde_json::json!({
-            "gdk_backend": std::env::var("GDK_BACKEND").ok(),
-            "winit_unix_backend": std::env::var("WINIT_UNIX_BACKEND").ok(),
-            "policy": std::env::var("YGGTERM_LINUX_BACKEND_POLICY").ok(),
-            "xterm_canvas_renderer": std::env::var(ENV_YGGTERM_ENABLE_XTERM_CANVAS).ok(),
-            "xterm_canvas_policy": std::env::var("YGGTERM_XTERM_CANVAS_POLICY").ok(),
-            "wayland_display_present": std::env::var_os("WAYLAND_DISPLAY").is_some(),
-            "display_present": std::env::var_os("DISPLAY").is_some(),
-            // The GL decision and the three settings it owns. `configure_linux_webkit_compositing`
-            // runs long before this trace exists, so it exports its reason and we read
-            // it back — and the probe's own report is read from its OnceLock rather
-            // than re-probed, so there is exactly one probe per process.
-            "webkit_gl_policy": std::env::var(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY).ok(),
-            "libgl_always_software": std::env::var("LIBGL_ALWAYS_SOFTWARE").ok(),
-            "gallium_driver": std::env::var("GALLIUM_DRIVER").ok(),
-            "webkit_disable_dmabuf_renderer": std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").ok(),
-            "web_surface_under_glass": std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS").ok(),
-            "gl_probe_class": yggterm_core::gl_probe::gl_probe_report()
-                .map(|report| report.class.as_str()),
-            "gl_probe_driver": yggterm_core::gl_probe::gl_probe_report()
-                .and_then(|report| report.driver.clone()),
-            "gl_probe_renderer": yggterm_core::gl_probe::gl_probe_report()
-                .and_then(|report| report.renderer.clone()),
-            "gl_probe_reason": yggterm_core::gl_probe::gl_probe_report()
-                .map(|report| report.reason.clone()),
-            // What the probe COST, so a timeout budget that starts drifting is visible
-            // rather than inferred.
-            "gl_probe_elapsed_ms": yggterm_core::gl_probe::gl_probe_report()
-                .map(|report| report.elapsed_ms),
         }),
     );
     let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
@@ -1725,6 +1736,66 @@ fn main() -> Result<()> {
         && command == "doc"
     {
         return run_document_cli(&store, &args[1..]);
+    }
+
+    // ⛔ THE DESKTOP/GL PREAMBLE RUNS HERE, NOT AT THE TOP OF MAIN — everything
+    // above this line that matched an arm has already returned. Measured
+    // 2026-08-28 on a GUI host: every one-shot verb boot (`server remote
+    // resume-codex` — the agent-resume handoff, the product's felt click — and
+    // `server terminal resize` among them) walked this block first and
+    // re-exec'd the binary as the `--internal-gl-probe` child (158 ms of EGL
+    // init) for settings nothing but a PRESENTING process ever reads. Only a
+    // process that reached this point is about to open a window, so only it
+    // pays for the desktop backend, the terminal renderer policy, the
+    // accessibility bridge, the WebKit compositing decision, and the WebKit
+    // memory policy. The trace record of that decision moves with the block,
+    // so a GUI launch still reports its full GL story and a one-shot reports
+    // nothing — because it did none of it. No thread exists before this point
+    // on the fallthrough path (the dispatch above returns before the shell
+    // spawns anything), which keeps the `set_var` calls inside sound.
+    #[cfg(target_os = "linux")]
+    {
+        configure_linux_desktop_backend();
+        configure_linux_terminal_renderer_policy();
+        configure_linux_accessibility_bridge();
+        configure_linux_webkit_compositing();
+        configure_linux_webkit_memory_policy();
+        append_trace_event(
+            &startup_home,
+            "gui",
+            "startup",
+            "linux_desktop_backend_policy",
+            serde_json::json!({
+                "gdk_backend": std::env::var("GDK_BACKEND").ok(),
+                "winit_unix_backend": std::env::var("WINIT_UNIX_BACKEND").ok(),
+                "policy": std::env::var("YGGTERM_LINUX_BACKEND_POLICY").ok(),
+                "xterm_canvas_renderer": std::env::var(ENV_YGGTERM_ENABLE_XTERM_CANVAS).ok(),
+                "xterm_canvas_policy": std::env::var("YGGTERM_XTERM_CANVAS_POLICY").ok(),
+                "wayland_display_present": std::env::var_os("WAYLAND_DISPLAY").is_some(),
+                "display_present": std::env::var_os("DISPLAY").is_some(),
+                // The GL decision and the three settings it owns. The configure
+                // call above exports its reason and we read it back — and the
+                // probe's own report is read from its OnceLock rather than
+                // re-probed, so there is exactly one probe per process.
+                "webkit_gl_policy": std::env::var(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY).ok(),
+                "libgl_always_software": std::env::var("LIBGL_ALWAYS_SOFTWARE").ok(),
+                "gallium_driver": std::env::var("GALLIUM_DRIVER").ok(),
+                "webkit_disable_dmabuf_renderer": std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").ok(),
+                "web_surface_under_glass": std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS").ok(),
+                "gl_probe_class": yggterm_core::gl_probe::gl_probe_report()
+                    .map(|report| report.class.as_str()),
+                "gl_probe_driver": yggterm_core::gl_probe::gl_probe_report()
+                    .and_then(|report| report.driver.clone()),
+                "gl_probe_renderer": yggterm_core::gl_probe::gl_probe_report()
+                    .and_then(|report| report.renderer.clone()),
+                "gl_probe_reason": yggterm_core::gl_probe::gl_probe_report()
+                    .map(|report| report.reason.clone()),
+                // What the probe COST, so a timeout budget that starts drifting
+                // is visible rather than inferred.
+                "gl_probe_elapsed_ms": yggterm_core::gl_probe::gl_probe_report()
+                    .map(|report| report.elapsed_ms),
+            }),
+        );
     }
 
     let settings_span = PerfSpan::start(&startup_home, "startup", "load_settings");
@@ -4914,7 +4985,7 @@ mod tests {
         client_process_runs_a_deleted_binary, compatible_signal_client_count,
         linux_window_profile_from_input,
         main_should_retire_superseded_clients_before_shell, raised_file_descriptor_soft_limit,
-        record_matches_executable, server_app_subcommand_owns_its_help,
+        allocator_reexec_required, invocation_runs_a_shell, record_matches_executable, server_app_subcommand_owns_its_help,
         server_app_wants_generic_help, should_handoff_to_preferred_executable,
         should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
@@ -5805,6 +5876,98 @@ mod tests {
             1,
             "exactly one `server app` dispatch site — a second copy is the drift \
              the ONE-owner rule exists to prevent"
+        );
+    }
+
+    /// ⛔ THE SAME LOCK FOR THE WHOLE REMAINING VERB SURFACE. The desktop/GL
+    /// preamble now lives at the GUI fallthrough, so EVERY dispatch arm —
+    /// `server remote` (the agent-resume handoff: resume-codex/resume-cc), the
+    /// `server terminal` family, sessions, snapshots — must appear textually
+    /// before it. The remote dispatcher and the terminal arms are the measured
+    /// specimens (each paid the preamble plus a 158 ms probe child per spawn
+    /// before the move). If a dispatch lands below the preamble call again,
+    /// every handoff click pays for a WebKit configuration it never reads.
+    #[test]
+    fn the_verb_dispatch_precedes_the_desktop_preamble() {
+        let source = include_str!("main.rs");
+        let preamble_call = source
+            .find("configure_linux_webkit_compositing();")
+            .expect("the preamble call must exist");
+        for (label, needle) in [
+            (
+                "the remote verb dispatcher (server remote resume-codex & family)",
+                "try_run_remote_server_command(&args)",
+            ),
+            (
+                "the terminal-resize dispatch arm",
+                "args[2] == \"resize\"",
+            ),
+            (
+                "the terminal-write dispatch arm",
+                "args[2] == \"write\"",
+            ),
+        ] {
+            let site = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{label} must exist in main.rs — the needle drifted"));
+            assert!(
+                site < preamble_call,
+                "{label} must dispatch BEFORE the desktop/GL preamble — a one-shot \
+                 has no WebKit to configure"
+            );
+        }
+        // And the preamble must still sit above the GUI's own startup (the
+        // settings load is the first GUI-only step), or a GUI launch would
+        // present before its GL path is decided. The needle is the perf-span
+        // label — `store.load_settings()` also appears in a pre-main helper.
+        let gui_startup = source
+            .find("\"load_settings\")")
+            .expect("the GUI settings-load perf span must exist");
+        assert!(
+            preamble_call < gui_startup,
+            "the desktop/GL preamble must run before the GUI's own startup — the \
+             presenting process configures before it presents"
+        );
+    }
+
+    /// The allocator re-exec is a process boot; it belongs to the long-lived
+    /// invocations only. The daemon is long-lived without running a shell, so
+    /// the exact-argv arms matter as much as the fallthrough.
+    #[test]
+    fn the_allocator_reexec_targets_long_lived_invocations() {
+        assert!(invocation_runs_a_shell(&[]), "bare argv is the GUI launch");
+        assert!(invocation_runs_a_shell(&["--agent".to_string(), "row".to_string()]));
+        assert!(!invocation_runs_a_shell(&[
+            "server".to_string(),
+            "app".to_string(),
+            "clients".to_string()
+        ]));
+        assert!(!invocation_runs_a_shell(&[
+            "server".to_string(),
+            "remote".to_string(),
+            "resume-codex".to_string(),
+            "id".to_string()
+        ]));
+        assert!(!invocation_runs_a_shell(&["automation".to_string(), "list".to_string()]));
+        assert!(
+            allocator_reexec_required(&[]),
+            "the GUI keeps the arena cap from birth"
+        );
+        assert!(
+            allocator_reexec_required(&["server".to_string(), "daemon".to_string()]),
+            "the daemon is long-lived and keeps the arena cap from birth"
+        );
+        assert!(
+            allocator_reexec_required(&["server".to_string(), "daemon-bridge".to_string()]),
+            "the bridge is long-lived too"
+        );
+        assert!(
+            !allocator_reexec_required(&[
+                "server".to_string(),
+                "app".to_string(),
+                "clients".to_string()
+            ]),
+            "a census one-shot must not pay a process boot for arena tuning"
         );
     }
 
