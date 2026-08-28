@@ -38,34 +38,6 @@ the product's core click — and the fix is the same one-move pattern with the s
 one-owner rule. Verify after fixing with the same instrument: the three-event triple
 must vanish for these argv shapes.
 
-## ⛔ [6.7] THE FLEET MONITOR'S CLIENT CENSUS BOOTED THE FULL DESKTOP — AND A GL PROBE CHILD — ~8.5×/MIN PER GUI HOST
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-**Falsifying observation:** after the roll
-reaches a GUI host, `ytrace tail` must show NO
-`startup/linux_desktop_backend_policy` events for argv `["server","app","clients"]`
-spawns (the old three-event signature per spawn disappears), and `time yggterm server
-app clients` over ssh drops by the probe's cost (~150–200 ms → tens of ms).
-
-**Measured (the GUI host, 2026-08-28, 3.1.69):** two windows 5.5 h apart (10:41–11:19,
-16:01–16:47), identical rate: **~250–390 one-shot `yggterm server app clients`
-processes per 45 min — 8.5/min sustained all day** — each caught live with env
-`SSH_CONNECTION` naming the build host (dev): the fleet monitor (a `ytop` debug build running
-under an interactive shell) polls the client census over ssh at its top-app tick, and
-the same poller hits dev's own daemon locally. Each spawn walked the desktop preamble
-and re-exec'd as `--internal-gl-probe` (158 ms, `gl_probe_reason: egl_driver_name`) —
-a process boot that exists only to ask the daemon for state the daemon serves over its
-socket. **Fixed in the same commit as this entry**: the whole `server app` family
-routes before the desktop preamble (automation/collection/web-import precedent), help
-routing moved with it unchanged, one source-order lock test. **Two residuals, both
-real and NOT yggterm's to fix here:** (1) the poller's cadence — a client census does
-not change every tick and belongs behind a cache in ytop's own repo, at ~8.5/min ×
-~16 h/day this is ~8,000 process boots/day the monitor author never intended; (2)
-a `ygg-booter.py watch --interval 300` loop pinned to the GUI host has been running for 6+ days from an
-old deploy checkout — same class, lower rate, worth a look in the fleet lane.
-
-
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
 **Status:** OPEN
