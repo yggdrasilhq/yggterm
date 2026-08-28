@@ -2833,7 +2833,8 @@ fn ChromeBehaviorSettingsSection(
                 InlineSettingsToggleRow {
                     field_key: SETTINGS_FIRST_FIELD_KEY.to_string(),
                     label: "Auto-hide Titlebar".to_string(),
-                    description: "Collapse the chrome to a top-edge hover strip and pin it while search or titlebar menus are active.".to_string(),
+                    description: "Collapse to a hover strip at the top edge.".to_string(),
+                    tooltip: "Collapses the chrome to a top-edge hover strip; pinned while search or titlebar menus are active.".to_string(),
                     enabled: auto_hide_titlebar,
                     palette,
                     on_change,
@@ -2841,7 +2842,8 @@ fn ChromeBehaviorSettingsSection(
                 InlineSettingsToggleRow {
                     field_key: SETTINGS_MIRROR_CHROME_FIELD_KEY.to_string(),
                     label: "Mirror Chrome".to_string(),
-                    description: "Reflect the window about its centre: the session tree, its ☰ toggle, the view toggle and + move right; the rail and its buttons move left. The search box stays put.".to_string(),
+                    description: "Swap the tree and rail to opposite edges.".to_string(),
+                    tooltip: "Reflects the window about its centre: the session tree, its ☰ toggle, the view toggle and + move right; the rail and its buttons move left. The search box stays put.".to_string(),
                     enabled: chrome_mirrored,
                     palette,
                     on_change: on_change_mirror,
@@ -2855,6 +2857,7 @@ fn InlineSettingsToggleRow(
     field_key: String,
     label: String,
     description: String,
+    #[props(default)] tooltip: String,
     enabled: bool,
     palette: Palette,
     on_change: EventHandler<bool>,
@@ -2862,6 +2865,7 @@ fn InlineSettingsToggleRow(
     rsx! {
         button {
             r#type: "button",
+            title: "{tooltip}",
             "data-settings-field-key": "{field_key}",
             "data-settings-toggle-key": "{field_key}",
             "data-settings-toggle-enabled": if enabled { "true" } else { "false" },
@@ -2944,7 +2948,8 @@ fn NotificationSettingsSection(
                 InlineSettingsToggleRow {
                     field_key: "notification-sound".to_string(),
                     label: "Sound".to_string(),
-                    description: "Play a local notification sound when the shell surfaces in-app delivery.".to_string(),
+                    description: "Chime for in-app notifications.".to_string(),
+                    tooltip: "Play a local notification sound when the shell surfaces in-app delivery.".to_string(),
                     enabled: sound_enabled,
                     palette,
                     on_change,
@@ -2979,7 +2984,8 @@ fn TelemetrySettingsSection(
                 InlineSettingsToggleRow {
                     field_key: "terminal-telemetry".to_string(),
                     label: "Diagnostics".to_string(),
-                    description: "Record terminal readiness, reconnect, input, and render fault events to local SQLite.".to_string(),
+                    description: "Record fault events to local SQLite.".to_string(),
+                    tooltip: "Record terminal readiness, reconnect, input, and render fault events to local SQLite.".to_string(),
                     enabled,
                     palette,
                     on_change,
@@ -3021,7 +3027,8 @@ fn PerfProfilingSettingsSection(
                 InlineSettingsToggleRow {
                     field_key: "perf-profiling".to_string(),
                     label: "Profiling".to_string(),
-                    description: "Time hot paths (terminal attach, persist, snapshot, requests) to perf-telemetry.jsonl. Inspect with `yggterm-headless server perf-summary`.".to_string(),
+                    description: "Time hot paths to perf-telemetry.jsonl.".to_string(),
+                    tooltip: "Time hot paths (terminal attach, persist, snapshot, requests) to perf-telemetry.jsonl. Inspect with `yggterm-headless server perf-summary`.".to_string(),
                     enabled,
                     palette,
                     on_change,
