@@ -18,44 +18,6 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [6.7] EVERY `server remote` / `server terminal` ONE-SHOT — INCLUDING THE AGENT RESUME HANDOFF — PAID THE DESKTOP PREAMBLE THE `server app` FAMILY STOPPED PAYING
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-**Falsifying observation:** after the roll ships this, on a GUI host running the new
-build: a `server remote protocol-version` (or `resume-codex --require-existing`)
-one-shot emits NO `startup/linux_desktop_backend_policy` event and no
-`--internal-gl-probe` child (the old build emitted the full three-event startup
-triple per spawn and re-exec'd twice); `server remote resume-codex` wall cost over
-ssh drops by the preamble plus probe (~300+ ms → tens of ms); and a GUI launch on
-the same build still records its full `linux_desktop_backend_policy` story (the
-block moved to the GUI fallthrough, not deleted) with the same fields as before.
-
-**Fixed by:** the whole desktop/GL preamble moved from the top of `main()` to the
-GUI fallthrough — every verb dispatch (remote, terminal, sessions, everything that
-returns before the shell) now runs without it, and the GUI configures immediately
-before it presents. The allocator's arena re-exec gained the same shape of gate:
-full re-exec only for long-lived invocations (a shell run, or the exact
-`server daemon`/`daemon-bridge` argv); one-shot verbs keep their single boot with a
-best-effort `mallopt`. Locked by the verb-dispatch source-order test and the
-allocator-gate predicate test.
-
-**Measured (dev's own event trace, 2026-08-28 16:5x, build 3.1.69):** the trace records
-`startup/main_enter` + `startup/linux_memory_scope` +
-`startup/linux_desktop_backend_policy` — the full desktop/GL preamble signature — for
-`server remote codex-session-exists`, **`server remote resume-codex`**, and
-`server terminal resize` spawns, one trace triple per invocation. These are the AGENT
-HANDOFF verbs: every `codex resume` this product performs routes through a spawn that
-re-exec'd the binary once more as the `--internal-gl-probe` child (158 ms EGL init,
-measured) for an answer a PTY handshake never reads. The `server app` family was hoisted
-before the preamble for exactly this shape (same day — see the CHANGELOG and the
-source-order lock); these verbs were left behind because they genuinely read the store,
-so the hoist needs the store-open ordered before the preamble block or a store-free
-dispatch worked out per verb. **The felt cost is owner-perceived handoff latency** —
-the product's core click — and the fix is the same one-move pattern with the same
-one-owner rule. Verify after fixing with the same instrument: the three-event triple
-must vanish for these argv shapes.
-
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
