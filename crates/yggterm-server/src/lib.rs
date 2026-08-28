@@ -10939,11 +10939,23 @@ impl YggtermServer {
             *agent_kind
         } else if let Some(storage_path) = storage_path.as_deref()
             && let Some(correct_kind) = yggterm_core::agent_scheme::session_kind_for_row(storage_path, "")
+            && !matches!(kind, SessionKind::Shell | SessionKind::SshShell)
         {
+            // ⛔ A SHELL ROW'S KIND IS NOT UP FOR RE-DERIVATION — not here
+            // either. The Storage stamp on a shell row is a wiring fault
+            // (pending-bugs, Pass 0), and reading it as the row's kind is one
+            // half of how plain ssh-shell rows came back from a GUI restart as
+            // CODEX rows, retitled to the codex birth name, with their human
+            // titles gone (owner-caught live 2026-08-28: both `live::` rows).
             correct_kind
-        } else if kind == SessionKind::SshShell {
-            SessionKind::Codex
         } else {
+            // ⛔ AND NEVER the old `SshShell => Codex` arm that stood here: it
+            // dates from when `live::` keys were codex runtime keys, but the
+            // persist side has written SshShell for plain ssh terminals since
+            // the remote plain-shell scan — and 36dbc458 moved this block
+            // ABOVE the rekey decision, so the rewrite didn't just relabel the
+            // row, it RE-KEYED it onto the codex runtime lane. The persisted
+            // kind is the newest truth about the row; restore keeps it.
             kind
         };
         let restored_local_id =
@@ -46006,6 +46018,53 @@ terminal_window_id: None,
                 server.sessions.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// ⛔ THE OWNER-CAUGHT TRANSFORM (2026-08-28): both `live::` ssh-shell rows
+    /// came back from a GUI restart as CODEX rows, retitled to the codex birth
+    /// name, human titles gone. The restore path's old `SshShell => Codex` arm
+    /// — a relic of the era when `live::` keys were codex runtime keys — not
+    /// only relabelled the row, it sat ABOVE the rekey decision, so the row
+    /// re-keyed onto the codex runtime lane. The persisted kind is the newest
+    /// truth; restore keeps it.
+    #[test]
+    fn an_ssh_shell_row_restores_an_ssh_shell_and_never_rekeys_onto_codex() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let key = "live::0197c95a-0000-7000-8000-0000000000a5";
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: key.to_string(),
+            id: "0197c95a-0000-7000-8000-0000000000a5".to_string(),
+            title: "Jyas SSH Terminal".to_string(),
+            kind: SessionKind::SshShell,
+            keep_alive: true,
+            ssh_target: "jyas".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/proj".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        let session = server
+            .sessions
+            .get(key)
+            .expect("the ssh shell row must restore under its own key");
+        assert_eq!(
+            session.kind,
+            SessionKind::SshShell,
+            "a persisted ssh shell came back as {:?} — the codex transform",
+            session.kind
+        );
+        assert_eq!(session.title, "Jyas SSH Terminal", "the title was rewritten");
     }
 
     #[test]
