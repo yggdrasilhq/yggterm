@@ -174,6 +174,45 @@ today it mints an empty conversation silently; the fix refuses with the store ma
 named. And the Pass 0 field test: click the row, check the store — a NEW empty
 conversation appearing there is the fault firing.
 
+## ⛔ [11.0] THE SHADOW'S SURFACE DOES NOT FOLLOW `open --view preview`, AND THE RENDERED PREVIEW STAYS EMPTY FOR DURABLE REMOTE ROWS (PASS 0 ITEM 5)
+
+**Status:** OPEN
+
+**Repro (2026-08-28, 3.2.2, shadow client `pass0-agent` on the GUI host):**
+`server app open <row> --view preview --client pass0-agent` against a durable
+remote row answers with the row ACTIVE in state (`active_view_mode: "Rendered"`)
+but the render never happens, and the open itself answers
+`timed out waiting for app open to settle … "ready":false,
+"reason":"preview readiness unmeasured"` after 750 ms. Two distinct faults:
+
+1. **F1 — surface stickiness in the shadow:** with a libyggterm APP surface
+   (ychrome) last mounted, the state's `active_session_path` + view mode switch
+   to the target row, but the shadow's main surface keeps showing the app page —
+   captured visually (`shadow-client.sh capture`): sidebar renders the live rail
+   fine, main surface still the browser. The row switch never mounted the new
+   surface. (The state says one thing; the pixels say another — the
+   instrument-vs-pixel law, in the shadow.)
+2. **F2 — empty rendered preview for durable remote rows:** for durable remote
+   rows (claude `remote-cc://…`, codex `remote-session://…`) the preview payload
+   stays **0 blocks / 0 summary** across repeated `refresh_preview` (~520 ms
+   each, trace) plus `remote_preview_sync` begin/end pairs and
+   `daemon_declare_absent` for the row. The sync "completes" and delivers
+   nothing. Control: the owner's GUI renders a 264k-token transcript for the
+   running opencode row — the rendered plane works there; the shadow + durable
+   combination does not.
+
+**Matrix measured:** opencode running row — `open --view preview` does not
+switch the view at all (stays Terminal) · codex remote row — Rendered, 0 blocks ·
+claude durable row — Rendered, 0 blocks, readiness unmeasured · local shell —
+Terminal, 0 blocks (CORRECT: shells have no transcript).
+
+**Fix direction:** (a) the shadow's `open` must run the same surface-mount path
+as a click (or the surface mount must be keyed per client, not per daemon-active
+session); (b) `preview readiness unmeasured` must become a measured state — the
+readiness wait dropping the distinction is the same class the flush-gate fix
+named (`webview_edit_acks_late` discriminator); (c) the remote preview sync must
+carry its refusal (why 0 blocks) on the wire instead of completing silently.
+
 ## ⛔ [99.1] A ROW MID-RELAUNCH REPORTS `idle`, WHICH IS THE GREEN LIGHT FOR A SUBMIT
 
 **Status:** OPEN
