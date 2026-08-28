@@ -2,6 +2,7 @@
 # ynpm scaffold generator — scaffold.sh sets NAME/VERSION/BIN/REPO_ROOT.
 # Writes: package.json (@ygghq main package), finalize.mjs (postinstall),
 # .github/workflows/ynpm-publish.yml (tag-triggered build + publish matrix).
+import pathlib
 import json
 import os
 
@@ -33,55 +34,9 @@ package = {
 with open(os.path.join(repo_root, "package.json"), "w") as f:
     f.write(json.dumps(package, indent=2) + "\n")
 
-finalize = """#!/usr/bin/env node
-/**
- * ynpm finalize - the yggdrasilhq-package postinstall.
- *
- * Copies this package's platform binary over the entry shim, marks it
- * executable, and verifies it RUNS (--version). Exits non-zero otherwise:
- * the ynpm install gate refuses a package whose binary cannot run, exactly
- * like the managed-CLI provisioner's publish gate.
- *
- * First-party script: ships in yggdrasilhq's own package, from the same repo
- * as the binary. The boundary is the vendor-script boundary: HOME intact, no
- * privilege escalation, stdin closed by the installer.
- */
-const fs = require("fs");
-const path = require("path");
-const { execFileSync } = require("child_process");
-
-const NAME = process.env.YNPM_BIN_NAME;
-const PACKAGE = process.env.YNPM_PACKAGE_NAME;
-const PLATFORM = process.env.YNPM_PLATFORM;
-
-function fail(message) {
-  console.error(`ynpm finalize: ${message}`);
-  process.exit(1);
-}
-
-if (!NAME || !PACKAGE || !PLATFORM) {
-  fail("YNPM_BIN_NAME / YNPM_PACKAGE_NAME / YNPM_PLATFORM must be set by the installer");
-}
-
-const shimPath = path.join(__dirname, "bin", NAME);
-const platformBinary = path.join(
-  __dirname, "..", "..", "..", `${PACKAGE}-${PLATFORM}`, "bin", NAME
-);
-
-if (!fs.existsSync(platformBinary)) {
-  fail(`${PACKAGE}-${PLATFORM} is not installed beside this package - the platform binary is required on this machine`);
-}
-
-fs.mkdirSync(path.dirname(shimPath), { recursive: true });
-fs.copyFileSync(platformBinary, shimPath);
-fs.chmodSync(shimPath, 0o755);
-
-try {
-  execFileSync(shimPath, ["--version"], { stdio: "ignore", timeout: 30000 });
-} catch (error) {
-  fail(`${NAME} does not run after finalize (${error.status ?? error.message})`);
-}
-"""
+# The finalize is the CANONICAL template (ESM, self-deriving) — the same
+# file scaffold.sh copies, so the two generators cannot drift again.
+finalize = (pathlib.Path(__file__).parent / "templates" / "finalize.mjs").read_text()
 with open(os.path.join(repo_root, "finalize.mjs"), "w") as f:
     f.write(finalize)
 
@@ -131,13 +86,23 @@ jobs:
           set -e
           BUILT="target/release"; [ -n "$TRIPLE" ] && BUILT="target/$TRIPLE/release"
           EXE="{bin_}"; case "$TARGET" in win32-*) EXE="{bin_}.exe";; esac
+          case "$TARGET" in
+            linux-x64) PKG_OS=linux; PKG_CPU=x64 ;;
+            linux-arm64) PKG_OS=linux; PKG_CPU=arm64 ;;
+            darwin-x64) PKG_OS=darwin; PKG_CPU=x64 ;;
+            darwin-arm64) PKG_OS=darwin; PKG_CPU=arm64 ;;
+            win32-x64) PKG_OS=win32; PKG_CPU=x64 ;;
+            win32-arm64) PKG_OS=win32; PKG_CPU=arm64 ;;
+          esac
           mkdir -p "pack/@ygghq/{name}-$TARGET/bin"
           cp "$BUILT/$EXE" "pack/@ygghq/{name}-$TARGET/bin/{bin_}"
-          printf '{"name":"@ygghq/{name}-%s","version":"{version}","bin":{"{bin_}":"bin/{bin_}"},"os":[],"cpu":[],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/{name}.git"}}\\n' "$TARGET" > "pack/@ygghq/{name}-$TARGET/package.json"
+          printf '{"name":"@ygghq/{name}-%s","version":"{version}","bin":{"{bin_}":"bin/{bin_}"},"os":["$PKG_OS"],"cpu":["$PKG_CPU"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/{name}.git"}}\\n' "$TARGET" > "pack/@ygghq/{name}-$TARGET/package.json"
       - name: Publish platform package
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{{{ secrets.NPM_TOKEN }}}}
         run: |
+          echo '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > ~/.npmrc
           cd "pack/@ygghq/{name}-${{{{ matrix.target }}}}"
           # IDEMPOTENCE WITHOUT LYING: only the genuine already-published
           # conflict is a skip; every other publish error fails the step with
