@@ -37458,11 +37458,12 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             // gets built by accident.
             let surfaces = published_web_surface_counts();
             let runtime = published_web_surface_runtime_counts();
-            // Cheap atomic; the profiling toggle can flip at runtime and an off
-            // profiler should cost nothing at all.
-            if !yggterm_core::perf_profiling_enabled() {
-                continue;
-            }
+            // The walk runs on EVERY tick whether or not profiling is on: the
+            // family sweep rides it, and the memory bound is not a profiling
+            // feature — gating the walk behind the toggle left the WebKit
+            // children in `gui` on the first live arm (3.2.8) with the
+            // `web` child bounded and empty. One /proc stat per process per
+            // tick, off the UI thread, is the whole cost.
             let Ok(observations) = task::spawn_blocking(move || {
                 yggterm_core::render_probe::observe_process_tree(root_pid)
             })
@@ -37470,12 +37471,6 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             else {
                 continue;
             };
-            // NOT current_millis(): that is a SystemTime wall clock, and feeding it
-            // here inflated interval_ms across a suspend/resume while the CPU tick
-            // counters stood still — under-reporting core_fraction on exactly the
-            // laptop whose fan is the complaint. The probe owns its own monotonic
-            // clock now, and no longer accepts one.
-            let samples = probe.observe(&observations);
             // The family sweep rides the same walk: the WebKit children are born
             // into `gui` (they inherit the GUI's child) and belong in `web`. Same
             // two laws as the probe above — no signal write, /proc and cgroupfs
@@ -37509,6 +37504,18 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
                     );
                 }
             }
+            // Cheap atomic; the profiling toggle can flip at runtime and an off
+            // profiler should cost nothing at all. Gated AFTER the walk: the
+            // sweep above is not optional.
+            if !yggterm_core::perf_profiling_enabled() {
+                continue;
+            }
+            // NOT current_millis(): that is a SystemTime wall clock, and feeding it
+            // here inflated interval_ms across a suspend/resume while the CPU tick
+            // counters stood still — under-reporting core_fraction on exactly the
+            // laptop whose fan is the complaint. The probe owns its own monotonic
+            // clock now, and no longer accepts one.
+            let samples = probe.observe(&observations);
             if samples.is_empty() {
                 // First tick after startup: there is no previous observation, so the
                 // only available number would be a lifetime average. Skip it.
