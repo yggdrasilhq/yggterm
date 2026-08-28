@@ -77113,14 +77113,41 @@ async fn web_surface_screenshot_for(
             "reason": format!("create {}: {error}", parent.display()),
         });
     }
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-    if let Err(reason) = desktop.snapshot_web_surface_full_page(native_id, path.clone(), move |outcome| {
-        let _ = tx.send(outcome);
-    }) {
-        return json!({ "accepted": false, "session_path": session, "reason": reason });
+    let preparation = web_shot_prepare_full_page(desktop, native_id).await;
+    let preparation_report = preparation.report.clone();
+    if preparation_report["ok"].as_bool() != Some(true) {
+        let restore = if preparation.active {
+            web_shot_restore_full_page(desktop, native_id).await
+        } else {
+            Ok(json!({ "ok": true, "restored": false }))
+        };
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "full-page preparation failed",
+            "full_page_preparation": preparation_report,
+            "page_restore": restore.unwrap_or_else(|error| json!({ "ok": false, "error": error })),
+        });
     }
-    match tokio::time::timeout(Duration::from_secs(20), rx).await {
-        Ok(Ok(Ok(()))) => json!({
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let start = desktop.snapshot_web_surface_full_page(native_id, path.clone(), move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    let capture = match start {
+        Ok(()) => match tokio::time::timeout(Duration::from_secs(20), rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err("snapshot callback dropped (surface destroyed mid-capture?)".to_string()),
+            Err(_) => Err("snapshot timed out (20s)".to_string()),
+        },
+        Err(reason) => Err(reason),
+    };
+    let restore = if preparation.active {
+        web_shot_restore_full_page(desktop, native_id).await
+    } else {
+        Ok(json!({ "ok": true, "restored": false }))
+    };
+    let mut response = match capture {
+        Ok(()) => json!({
             "accepted": true,
             "session_path": session,
             "native_id": native_id,
@@ -77128,22 +77155,20 @@ async fn web_surface_screenshot_for(
             "capture_backend": "webkit_full_document_snapshot",
             "capture_faithful": true,
         }),
-        Ok(Ok(Err(error))) => json!({
+        Err(error) => json!({
             "accepted": false,
             "session_path": session,
             "reason": error,
         }),
-        Ok(Err(_)) => json!({
-            "accepted": false,
-            "session_path": session,
-            "reason": "snapshot callback dropped (surface destroyed mid-capture?)",
-        }),
-        Err(_) => json!({
-            "accepted": false,
-            "session_path": session,
-            "reason": "snapshot timed out (20s)",
-        }),
+    };
+    if let Some(object) = response.as_object_mut() {
+        object.insert("full_page_preparation".to_string(), preparation_report);
+        object.insert(
+            "page_restore".to_string(),
+            restore.unwrap_or_else(|error| json!({ "ok": false, "error": error })),
+        );
     }
+    response
 }
 
 /// The engine verb for a find step. The one place the shell's `FindStep` and

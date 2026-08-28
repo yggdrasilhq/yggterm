@@ -162,6 +162,20 @@ mechanism behind `server app web eval` / `app web fill`). The app computes the
 value; the GUI injects it. This is how a host-resident credential reaches a
 client-rendered page without the secret living in yggterm.
 
+**Screenshot ownership:** the GUI host owns the page context-menu captures;
+the embedded app binary does not. "Screenshot full page" first walks the
+authoritative scroll owner with 120 ms event-loop settles for lazy content. If
+the root document is viewport-sized and a large inner `overflow-y` scrollport
+holds the real extent, the host temporarily expands that dominant scrollport,
+takes one native `FULL_DOCUMENT` snapshot, and restores its inline styles and
+root/inner scroll positions. The walk is capped at 60 steps. It does not merge
+multiple independent scrollports or reach into a cross-origin iframe's private
+document. Human-menu captures then publish the exact saved PNG to the retained
+native system-clipboard owner; save and copy outcomes are reported separately.
+`server app web screenshot` uses the same full-page preparation but deliberately
+does not clobber the human's clipboard. When changing any of this, update
+`docs/web-surfaces.md` and keep all screenshot regression locks green.
+
 ## Building a libyggterm app — quick-and-dirty to heavyweight
 
 Minimum viable app (what ychrome does):
