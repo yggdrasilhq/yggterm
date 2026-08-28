@@ -77,6 +77,53 @@ falsifier** for whichever mechanism is real: reproduce the owner's recipe — th
 report's "one by one" says a sequential chore, so watch a fresh shell across a
 mount and across a GUI restart before believing any static reading.
 
+## ⛔ [11.0] A LIVE AGENT ROW CAN ADDRESS ITS CLI BY A UUID THE CLI NEVER MINTED — EVERY RESUME MINTS AN EMPTY CONVERSATION (PASS 0 ITEM 2)
+
+**Status:** OPEN
+
+**Live-proven on the GUI host (2026-08-28, build 3.1.69), kind antigravity:** the row
+`agy-runtime://f3abb609-c5d7-48b4-9764-3992cb850143` ("Use the data-fabric skill")
+carries `id = f3abb609…` — the yggterm BIRTH id — and its resume command is
+`agy --dangerously-skip-permissions --conversation 'f3abb609-…'`. The antigravity
+store holds NO conversation with that id (its conversations are `8d72e580`,
+`dc5cb10b`, `e1383038`, `b4a08f97`, `e886d7e2`, `132a9f95`; a metadata-only
+`f895c224` row with step_count 0 and a zero epoch shows the minted-empty shape is
+real). The row's title names content ("data-fabric") that lives in two OTHER
+conversations. **Clicking this row mints a fresh empty conversation, every time** —
+the owner's "EMPTY <CLI> session" mechanism, caught on a second CLI.
+
+**The design says the rewiring should happen and doesn't.** `agent_runtime_alias_candidates`
+(daemon.rs ~1627) documents the law: *self-minting CLIs keep the yggterm birth id in
+their row key and the real CLI id in `session.id`*. The identity-overlay family
+(`CodexRuntimeProcessIdentity`, `ClaudeCodeRuntimeProcessIdentity` →
+`overlay_*_runtime_managed_identity`, which sets `session.id = identity.session_id`)
+exists for exactly two CLIs. **The other seven registered self-minting CLIs
+(antigravity, muse, pi, qwen, grok, kimi, opencode) have no runtime→store-id probe**,
+so their `session.id` stays the birth id forever, and every OUTBOUND address rides it:
+the resume command, the titles-store lookup (this row has no entry there either), the
+webview transcript binding (Pass 0 item 5), and the Pass 2 booter/monitor registration.
+
+**Two instrument lies on the same row, free of charge:** `source: LiveLocal` with
+`launch_phase: RemoteBootstrap` — a LOCAL row reporting a remote bootstrap phase,
+the stuck-phase signature `runtime_key_for_path_against_keys` already documented
+(a runtime the manager cannot find gets stamped RemoteBootstrap; the runtime here
+is dead — the attachment sweep's `missing_runtime:1` for this kind).
+
+**Fix direction:** (a) a store-side identity match for every self-minting CLI — the
+daemon already holds each CLI's store; match the row to its real conversation id by
+cwd + title + recency while the runtime is alive (the CLI's own identity output when
+it is not), and write it into `session.id` through the SAME overlay contract codex
+uses; (b) until a row's id binds, **resume must refuse to mint** — offer the store
+match by cwd+title (the provenance the row already shows) instead of firing
+`--conversation <birth-id>`; (c) regression lock: a self-minting CLI row whose id is
+not in its CLI's store must never produce a resume command carrying that id; (d) fix
+the LiveLocal+RemoteBootstrap phase lie with the same lock.
+
+**Falsifier:** resume a titled self-minting row whose id is absent from its store —
+today it mints an empty conversation silently; the fix refuses with the store match
+named. And the Pass 0 field test: click the row, check the store — a NEW empty
+conversation appearing there is the fault firing.
+
 ## ⛔ [99.1] A ROW MID-RELAUNCH REPORTS `idle`, WHICH IS THE GREEN LIGHT FOR A SUBMIT
 
 **Status:** OPEN
