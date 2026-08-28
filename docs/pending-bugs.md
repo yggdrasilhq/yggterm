@@ -6506,7 +6506,12 @@ the `systemd-run --user --scope` unit the GUI already arms.
 `apps/yggterm/src/main.rs`):**
 
 1. create `gui` / `web` / `helpers` under the private scope;
-2. the GUI migrates ITSELF into `gui` — which is what makes the next step legal;
+2. DRAIN the scope root into `gui` — every member, not only the arming process. The
+   first live arm (3.2.7, 00:45) caught the self-only form failing: the launch chain's
+   own waiter (`~/.local/bin/yggterm`, `ppid=1`, alive for the scope's whole life) sat
+   at the scope root beside the arming process, `+memory` answered EBUSY, and the
+   family armed with children but NO bound. The constraint is "no internal
+   processes", so the arm empties the root completely;
 3. `+memory` on the scope's `subtree_control`;
 4. the `web` child gets `memory.high` = the engine's own sanctioned single-process
    share (`MemTotal/8`) and `memory.swap.max` = half of it — derived from the limit

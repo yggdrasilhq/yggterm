@@ -141,9 +141,16 @@ pub fn create_children<P: AsRef<Path>>(scope_root: P) -> io::Result<Vec<String>>
 
 /// Migrate `pid` into `child` (a filesystem path): write the pid to
 /// `cgroup.procs`. The write is the whole migration — measured clean and
-/// atomic on live processes, including mid-session.
+/// atomic on live processes, including mid-session. Appended, not truncated:
+/// the kernel treats the file as a command port (position and truncation are
+/// meaningless to it), and append keeps a synthetic tree honest as a log of
+/// the commands issued.
 pub fn migrate_pid<P: AsRef<Path>>(child: P, pid: i32) -> io::Result<()> {
-    std::fs::write(child.as_ref().join("cgroup.procs"), format!("{pid}\n"))
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(child.as_ref().join("cgroup.procs"))?;
+    io::Write::write_all(&mut file, format!("{pid}\n").as_bytes())
 }
 
 /// Enable the `memory` controller on `scope_root`'s subtree.
@@ -254,10 +261,35 @@ pub enum CgroupFamilyError {
     Io(#[from] io::Error),
 }
 
-/// Arm the whole shape in the measured order, from `scope_root`, migrating
-/// `self_pid` into `gui`. Idempotent: an already-armed family re-arms cleanly
+/// Every pid currently a member of `scope_root`, from its `cgroup.procs`.
+/// An absent file means no members — a real cgroup always carries the file,
+/// and a synthetic tree (the tests') may not.
+pub fn scope_root_pids<P: AsRef<Path>>(scope_root: P) -> io::Result<Vec<i32>> {
+    let text = match std::fs::read_to_string(scope_root.as_ref().join("cgroup.procs")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .collect())
+}
+
+/// Arm the whole shape in the measured order, from `scope_root`, draining the
+/// scope root into `gui`. Idempotent: an already-armed family re-arms cleanly
 /// (existing children tolerated, the enable is a no-op write, bounds are
 /// rewritten).
+///
+/// ⛔ **THE ROOT IS DRAINED, NOT MERELY SELF-MIGRATED** — and that is not a
+/// style choice, it is the measured failure: on the GUI host (3.2.7, first
+/// live arm) the launch chain's own waiter (`~/.local/bin/yggterm`, `ppid=1`,
+/// alive for the scope's whole life) sat at the scope root beside the arming
+/// process, and the self-only migration left it there — `+memory` answered
+/// EBUSY and the family armed with NO bound on the web child. The constraint
+/// is "the scope holds no internal processes", so the arm empties the root
+/// completely: every member moves into `gui` (the arming process among them),
+/// and only then can the controller come on.
 ///
 /// Every failure leaves the family as it was and reports why — an unbounded
 /// GUI that says so is the same contract the scope arm ships.
@@ -275,7 +307,22 @@ pub fn arm_family<P: AsRef<Path>>(scope_root: P, self_pid: i32) -> FamilyArmRepo
         Err(error) => return fail(report, format!("children could not be created ({error})")),
     };
 
-    if let Err(error) = migrate_pid(scope_root.join("gui"), self_pid) {
+    // Drain the scope root into `gui` — every member, the arming process
+    // included (its own move is the same write; into the same child, it is a
+    // no-op if already there). A member that exits mid-drain is gone, not an
+    // error; a pid that cannot be read back simply does not move.
+    let gui_child = scope_root.join("gui");
+    match scope_root_pids(scope_root) {
+        Ok(pids) => {
+            for pid in pids {
+                let _ = migrate_pid(&gui_child, pid);
+            }
+        }
+        Err(error) => {
+            return fail(report, format!("the scope root could not be read ({error})"))
+        }
+    }
+    if let Err(error) = migrate_pid(&gui_child, self_pid) {
         return fail(report, format!("the GUI could not enter the gui child ({error})"));
     }
     if let Err(error) = enable_memory_controller(scope_root) {
@@ -471,6 +518,31 @@ mod tests {
             "the GUI entered the gui child before the enable, which is what makes \
              the enable legal"
         );
+    }
+
+    #[test]
+    fn the_scope_root_is_drained_not_merely_self_migrated() {
+        // THE 3.2.7 FIRST-LIVE-ARM DEFECT: the launch chain's waiter sat at
+        // the scope root beside the arming process; a self-only migration
+        // left it there and `+memory` answered EBUSY — the family armed with
+        // no bound at all. The arm empties the ROOT: every member moves into
+        // `gui` before the enable, whatever it is and however it got there.
+        let (_dir, root) = synthetic_scope();
+        std::fs::write(root.join("cgroup.procs"), "111\n4242\n999\n").expect("root members");
+        let report = arm_family(&root, 4242);
+        assert!(report.armed, "the drain makes the enable legal: {report:?}");
+        // The kernel empties the root as the SIDE EFFECT of the migrations;
+        // the file-level contract here is that a migration command was issued
+        // for EVERY root member before the enable.
+        let gui_members =
+            std::fs::read_to_string(root.join("gui/cgroup.procs")).expect("gui procs");
+        for pid in ["111", "4242", "999"] {
+            assert!(
+                gui_members.split_whitespace().any(|m| m == pid),
+                "scope-root member {pid} must have a migration command issued \
+                 into gui before the enable; gui held: {gui_members:?}"
+            );
+        }
     }
 
     #[test]
