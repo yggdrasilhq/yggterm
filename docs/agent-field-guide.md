@@ -2793,3 +2793,39 @@ arithmetic is how a session produced three wrong readings in one afternoon.
 in one session, one of them on the person who had just written the warning. They are
 not facts to remember, they are STEPS to run — which is the argument for calling the
 helper rather than reproducing its logic at a shell prompt.
+
+## Prove an alarm STOPPED by pinning it to the handover, with the trigger still armed (2026-08-21)
+
+An alarm going quiet proves nothing on its own — the condition may simply have
+passed. Two checks turn silence into evidence, and both are cheap.
+
+**1. Pin the silence to the build boundary, by emitter version.** Incidents carry
+`app_version`, and a fleet mid-roll has several versions emitting at once. Count by
+version, not by wall clock:
+
+```sh
+ytrace incidents --since 1h --json | python3 -c '...group by app_version...'
+```
+
+⚠ A record timestamped AFTER the new daemon bound may still come from the OLD one —
+daemons coexist by design during a handover, and the retiring process keeps emitting
+for seconds. Read the record's own `app_version` before calling it a regression. A
+count that stopped at the handover, with zero from the new version, is the shape you
+want; "one incident after the start timestamp" was the old daemon's last word.
+
+**2. Prove the TRIGGER IS STILL ARMED.** This is the half that gets skipped, and
+without it the whole reading is worthless:
+
+```sh
+# the alarm's own predicate, evaluated against the live machine
+mem_used_fraction = (MemTotal - MemAvailable) / MemTotal   # vs the panic threshold
+swap_used_gib     = SwapTotal - SwapFree                   # vs the OLD trigger
+```
+
+If the old predicate would fire RIGHT NOW and the fixed build is silent, the silence
+is the fix. If the condition has lapsed, you have measured the weather.
+
+⇒ Applied to the swap-residency alarm: swap 7.15 GiB against a 4.0 GiB old trigger —
+armed — with zero incidents from the fixed version across ten minutes, against a prior
+0.82/min. That is a falsifier answered; "no incidents lately" would not have been.
+
