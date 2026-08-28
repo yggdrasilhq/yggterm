@@ -25237,6 +25237,7 @@ impl ShellState {
         declared_now.iter().all(|(id, declared)| {
             self.app_pane_values.get(id).map(String::as_str) == Some(declared.as_str())
         })
+    }
     /// Raise (or refresh) the app-raised modal. The pane id is the pane whose
     /// action asked for it, so every click inside POSTs under that pane.
     ///
