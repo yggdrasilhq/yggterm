@@ -25246,3 +25246,156 @@ the subject's own lifecycle record over any external liveness probe.**
 
 
 
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+*Both mechanisms are fixed, falsified RED-before/GREEN-after, and proved on two real daemons of
+different builds in a sandbox `YGGTERM_HOME`. What is owed is the entry's own falsifier on the
+desktop host: restart the daemon under a live agent row, attach to that row from a fresh client,
+and see the scrollback come back with the CLI's pid unchanged. That needs the fix deployed there.*
+
+*Mechanism (a) fixed 2026-08-22. Mechanism (b) — the half the user actually saw — fixed
+2026-08-22 in the same pair of changes as the seat-policy half it needs to work.*
+⇒ **That is the deadlock, and (a) is what supplies it with victims.** ✅ **FIXED 2026-08-22.**
+
+`probe_socket_occupancy` guarded the branch that unlinks a REAL socket file and only that one —
+`refresh_legacy_server_socket_aliases` re-pointed a candidate that was ALREADY a symlink with no
+occupancy question asked at all. So a name only had to be taken once and every later daemon
+perpetuated the loss for free.
+
+⚠⚠ **AND THE PROBE COULD NOT HAVE ANSWERED IT EVEN IF IT HAD BEEN CALLED THERE**, which is
+the part that makes this its own defect rather than a missing call. A probe follows the path, and
+a diverted path leads to the daemon that TOOK the name — which always answers. ⇒ The question
+*"whose address is this name"* has exactly one instrument: the kernel's bind table, which goes on
+reporting the original path long after that path stopped leading there. `socket_sweep`'s census
+already reads it; the alias refresh now asks it, on BOTH branches, once per refresh, and keeps
+the name whenever the census cannot be read.
+
+⭐⭐ **AND PREVENTION RESCUES NOBODY, SO THE DAEMON TAKES ITS NAME BACK.** An unlinked socket
+inode cannot be re-linked to a path by anything, so every daemon already stranded stays stranded
+under prevention alone. A live daemon re-binds its own versioned name instead.
+
+⚠⚠ **AND THE LIMIT ON THAT, STATED BEFORE IT IS BELIEVED.** The reclaim runs INSIDE the daemon
+whose name was taken, so it rescues a daemon that is itself running this build and nobody else.
+The memory finding says stranded daemons *"cannot be rescued by anything"* — that becomes false
+for daemons carrying the fix and stays TRUE for the ones already stranded today, which are running
+older binaries with no reclaim thread in them. ⇒ **The daemon measured on the build host at 29 h
+and 80 pty masters is not saved by this.** Its rows have to be moved or they die with it. What the
+fix guarantees is that the next generation of daemons cannot be put in that position, by either
+half: prevention stops a fixed daemon taking anyone's name, and the reclaim gets a fixed daemon's
+name back if an older one takes it. Reclaiming it is
+a complete cure because everything that looks for a daemon looks by name —
+`reachable_versioned_daemon_statuses` dials the versioned paths, the bridge resolver asks those
+daemons which one owns a runtime key, and the cross-daemon reconcile addresses siblings the same
+way.
+
+⛔ **Two guards, and a wrong `true` in either is this same defect aimed at a different victim.**
+A DIFFERENT real socket file at the name belongs to whoever bound it and is left alone. And a
+RETIRING daemon never re-binds: it unlinked that path itself, for a successor that has not bound
+yet, so taking it back would fail that successor's bind on an address already in use — from the
+process handing over to it.
+
+⚠ **A THIRD PATH EMPTIES THE NAME, and it looks like the innocent case.** A re-pointed alias whose
+target daemon later dies becomes a DANGLING symlink, and the next client to dial it unlinks it
+(`clear_local_daemon_socket_link_escaping_home` — correct behaviour over garbage). The name is then
+ABSENT while its owner is still bound to it: the same stranding with the evidence removed. An
+absent name is also the shape of somebody else's bind window, so it comes back only while the
+KERNEL still names this daemon as bound to it — a daemon that has not bound yet appears nowhere in
+that table at all.
+
+### ⚠⚠ A THIRD INSTRUMENT LYING, AND IT IS THE ENUMERATION VERB ITSELF
+
+`server daemons` — the census written precisely because `server status` answers for one daemon
+and *"the whole daemon-lifecycle problem is about the others"* — **did not list the stranded
+daemon.** Measured on the build host 2026-08-22: the census printed two rows while a third daemon
+was alive with 83 pty masters. It cannot see it, and for the same reason nothing else can: it
+probes the versioned socket PATHS, and every one of them had been re-pointed to the newest
+daemon. ⇒ A daemon that has lost its name is absent from the one instrument whose job is to find
+daemons, so the population looks smaller and healthier than it is. The `/proc/net/unix` bind-name
+read is the cross-check; `ls -la $YGGTERM_HOME/server-*.sock` showing symlinks is the fast tell.
+
+### ⚠ AND THE CONTESTED KEY WAS NOT WHAT IT WAS SAID TO BE
+
+The report reaching this lane said the successor's runtime under the contested key was *"a WRAPPER
+STILL WAITING TO ATTACH"*. Checked against the trace instead of repeated: on the build host the
+key that re-failed every 60 s for 28 hours was a **plain shell** (`exec '/bin/bash' -i`), and no
+attach wrapper is involved in one at any point. The substance survives — the tenant was a
+stand-in, not work — but a fix built on the stated specifics would have keyed on a wrapper that
+is not there. ⇒ **What the tenant IS, and what the fix keys on:** a child this daemon spawned for
+itself, that nobody has ever typed into. Adopted children are the session's own travelling pty and
+are never displaced; a child somebody has typed into is never displaced. The two arms of
+`a_stand_in_yields_the_key_to_the_sessions_own_pty` and
+`a_child_somebody_has_typed_into_is_still_a_conflict` differ by exactly one byte of client input.
+## ⛔⛔⛔ [11.28] A ROW RESUMES INTO A BLANK SESSION AND KEEPS ITS OLD TITLE — 91% OF ONE CLI'S ROWS
+
+**Status:** OPEN
+
+*Filed 2026-08-22 from a screenshot, then measured. Not the socket-alias lane's work; it is a
+different defect that produces a very similar-looking symptom, which is exactly why it wants its
+own entry.*
+
+**What it looks like.** Click a row that has been idle a few days. The viewport prints
+
+```
+warning: conversation "<id>" not found
+```
+
+then the CLI's fresh-start banner, and a bare prompt. The Session Metadata panel still shows the
+old title, the old session id, `Persistence: keep-alive`, `Status: running`, and a `Connect`
+line offering `resume-<cli> <id> --require-existing`. **History: 0 user · 0 assistant.** Nothing
+errored. The row simply became a new, empty session wearing the old one's name.
+
+### ⛔ TWO STORES, AND THE ROW IS LISTED FROM THE WRONG ONE
+
+This CLI keeps a session's **transcript** and its **resumable conversation** in different places,
+with different lifetimes:
+
+| artefact | lifetime, measured on one host |
+|---|---|
+| `…/brain/<id>/.system_generated/logs/transcript_full.jsonl` | oldest **28.7 days** — 543 of them |
+| `…/conversation_summaries.db` (title, preview, step count) | 999 rows |
+| `…/conversations/<id>.db` — **what the CLI resumes from** | oldest **1.6 days** — 46 of them |
+
+Every transcript touched in the last three days has a conversation db; **every conversation db is
+under two days old.** So the CLI keeps what it can re-open for about two days and what it can
+show for a month, and the scan globs list rows from the month-long artefact.
+
+⇒ **497 of 543 rows — 91% — are listed, titled, and offer a Connect line, and cannot be
+resumed.**
+
+### ⛔⛔ AND `--require-existing` CANNOT REFUSE THEM, BY CONSTRUCTION
+
+`remote_saved_agent_session_exists` returns `Ok(true)` unconditionally for this CLI when the
+local index misses. That is a deliberate, documented choice — a remote id names a session on
+another host, so a local miss is not proof of absence, and the comment says a bad id will *"fail
+loudly at `<cli> --conversation` time"*.
+
+**It does not fail loudly.** It prints one `warning:` line above a fresh prompt and starts a new
+conversation. The refusal path (`remote_resume_missing_saved_session_error`) is therefore
+unreachable for this CLI, and the guard that exists to stop a resume landing on a session that
+is not there never fires. ⇒ The blanket `true` was right about the remote case and wrong about
+the local one, and nothing separates them.
+
+### ⚠ WHAT WAS AND WAS NOT MEASURED
+
+- ✅ The transcript on disk was **not** appended to by the blank session (mtime unchanged six
+  days later), so no transcript was corrupted in the observed case.
+- ⛔ **NOT established:** what happens if a person now types into that blank row, which shares
+  the old id and therefore the old brain directory. That is the exact hazard the second-resume
+  guard exists to prevent, reached through a door the guard does not cover.
+- ⛔ **NOT established:** whether the CLI prunes conversation dbs on a timer or on a count. The
+  two-day figure is one host's population, not a documented policy.
+
+### WHAT IT WANTS
+
+1. ⭐ **The existence check must ask the store the CLI actually resumes from**, per CLI, and a
+   LOCAL id must be answerable locally — the blanket `true` may keep protecting remote ids only.
+2. **A row that cannot be resumed must not offer a Connect line that silently starts a new
+   session.** Either the row says so before it is opened, or the resume refuses.
+3. ⚠ **A CLI's own warning is not an error, and must not be treated as one.** The comment relied
+   on a loud failure that the CLI never had; the only thing that can be trusted here is
+   yggterm's own read of the store.
+
+**Falsifier:** open a row whose CLI-resumable artefact is absent and see either a refusal or a
+row that never offered the resume — and, on a row that IS resumable, a normal attach with its
+history intact.
+
+
