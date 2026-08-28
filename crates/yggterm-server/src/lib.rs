@@ -10429,10 +10429,27 @@ impl YggtermServer {
         configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         let display = remote_runtime_agent_display(kind);
-        let saved_session_exists = remote_saved_agent_session_exists(kind, session_id)?;
-        if remote_resume_requires_missing_saved_session_failure(
-            require_existing,
+        // Computed before the saved-session gate: whether THIS daemon still
+        // holds a runtime row for the key is the live half of the gate below.
+        let key = remote_runtime_agent_session_key(kind, session_id)
+            .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
+        // ⛔ LIVE RUNTIME WINS OVER THE TRANSCRIPT GATE — the same rule the
+        // `resume-<slug>` wrappers enforce before their own store probe (see
+        // `run_remote_resume_agent`). Measured 2026-08-28: opencode2's v2
+        // preview mints its own `ses_…` session ids and never stores yggterm's
+        // row uuid, so the probe answered "absent" for a row whose PTY this
+        // daemon still held; the row was marked `Saved Session: missing`, and
+        // every later restore refused without ever attempting the resume —
+        // which, had it run, would have taken the live-runtime bridge arm and
+        // succeeded. The store is now consulted only to choose
+        // resume-vs-picker for a row nothing holds.
+        let live_runtime_held = self.sessions.contains_key(&key);
+        let saved_session_exists = live_runtime_held
+            || remote_saved_agent_session_exists(kind, session_id)?;
+        if remote_require_existing_refusal_allowed(
+            live_runtime_held,
             saved_session_exists,
+            require_existing,
         ) {
             anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
         }
@@ -10468,8 +10485,6 @@ impl YggtermServer {
                 ));
             }
         }
-        let key = remote_runtime_agent_session_key(kind, session_id)
-            .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
         let target = local_session_target(kind, cwd);
         let fallback_title = format!(
             "Remote {display} {}",
@@ -10492,7 +10507,12 @@ impl YggtermServer {
                 false,
             );
         }
-        let launch_command = if saved_session_exists {
+        // A held live row must re-attach through the RESUME command — its
+        // wrapper's live-runtime arm bridges the existing PTY. The picker arm
+        // is only for a cold row nothing holds and no transcript names; typing
+        // it into a running TUI's PTY would drive that TUI's own UI.
+        let resumable = saved_session_exists || live_runtime_held;
+        let launch_command = if resumable {
             remote_persistent_resume_shell_command_with_terminal_appearance(
                 kind,
                 session_id,
@@ -10517,7 +10537,7 @@ impl YggtermServer {
             runtime_kind: remote_runtime_agent_registry_kind(kind),
             title: title.clone(),
             cwd: target.cwd.clone(),
-            summary: Some(if saved_session_exists {
+            summary: Some(if resumable {
                 format!("Daemon-owned remote {display} session")
             } else {
                 "Daemon-owned remote resume picker".to_string()
@@ -10530,6 +10550,7 @@ impl YggtermServer {
             Some("ensuring daemon-owned agent runtime"),
             &json!({
                 "saved_session_exists": saved_session_exists,
+                "live_runtime_held": live_runtime_held,
                 "cwd": target.cwd,
                 "kind": format!("{kind:?}"),
             }),
@@ -11737,6 +11758,24 @@ impl YggtermServer {
             let ssh_target = session.ssh_target.clone()?;
             let ssh_prefix = session.ssh_prefix.clone();
             let session_id = session.id.clone();
+            // ⛔ A LIVE runtime row outranks this probe — the same rule as
+            // `remote_require_existing_refusal_allowed`. The probe answers
+            // about the CLI's transcript store; a row whose PTY this daemon
+            // still holds must never be marked missing because the store
+            // cannot see the id (measured 2026-08-28: opencode2's v2 preview
+            // mints its own `ses_…` ids, so for rows yggterm launched the
+            // probe could only ever answer "absent"). Retract an earlier mark
+            // too — the `Ok(true)` recovery arm below can never fire under
+            // that id scheme.
+            if remote_runtime_agent_session_key(session.kind, &session_id)
+                .map(|runtime_key| self.sessions.contains_key(&runtime_key))
+                .unwrap_or(false)
+            {
+                if session_metadata_value(session, "Saved Session").as_deref() == Some("missing") {
+                    recovered_remote_live_session = Some(session.session_path.clone());
+                }
+                return None;
+            }
             match fetch_remote_saved_agent_session_exists(
                 session.kind,
                 &ssh_target,
@@ -13752,6 +13791,26 @@ fn remote_resume_requires_missing_saved_session_failure(
     saved_session_exists: bool,
 ) -> bool {
     require_existing && !saved_session_exists
+}
+
+/// Whether a store-absent answer may refuse a `--require-existing` resume.
+///
+/// ⛔ A daemon-held LIVE runtime row outranks the store probe: the resume
+/// wrapper's own live-runtime bridge arm would attach to the running PTY and
+/// never need the transcript, so refusing first turns a working session into
+/// an unopenable row. Measured 2026-08-28 (opencode2 v2 self-minting ids): the
+/// ensure path refused on the probe, the resume never ran, and the row was
+/// unusable until the daemon state was cleared — while the session itself kept
+/// running the whole time. Callers that have ALREADY taken the live arm before
+/// probing (the `resume-<slug>` wrappers) keep
+/// [`remote_resume_requires_missing_saved_session_failure`]; this adds the
+/// live half for callers that probe first.
+fn remote_require_existing_refusal_allowed(
+    live_runtime_held: bool,
+    saved_session_exists: bool,
+    require_existing: bool,
+) -> bool {
+    require_existing && !saved_session_exists && !live_runtime_held
 }
 
 fn remote_resume_seed_fallback_text(session: &ManagedSessionView) -> Option<String> {
@@ -34052,6 +34111,7 @@ mod tests {
         parse_recent_context_sections, parse_stored_transcript,
         push_preview_block, remote_bootstrap_install_command, remote_cache_key,
         remote_command_cache, remote_direct_attach_launch_command,
+        remote_require_existing_refusal_allowed,
         remote_resume_requires_missing_saved_session_failure,
         remote_resume_runtime_output_mismatches_managed_session,
         remote_resume_runtime_output_requires_restart, remote_resume_shell_command,
@@ -39612,6 +39672,25 @@ mod tests {
         assert!(!remote_resume_requires_missing_saved_session_failure(
             true, true
         ));
+    }
+
+    #[test]
+    fn a_live_runtime_row_cannot_be_refused_on_a_store_absence() {
+        // Regression lock, 2026-08-28: opencode2's v2 preview mints its own
+        // `ses_…` ids and never stores yggterm's row uuid, so the store probe
+        // answered "absent" for a row whose PTY the daemon still held — and
+        // the ensure path refused the restore before the resume, whose own
+        // live-runtime arm would have attached. A held runtime row must
+        // outrank the probe in every combination.
+        assert!(!remote_require_existing_refusal_allowed(true, false, true));
+        // Cold row (nothing held): the probe still governs.
+        assert!(remote_require_existing_refusal_allowed(false, false, true));
+        // Without --require-existing the answer never refuses.
+        assert!(!remote_require_existing_refusal_allowed(true, false, false));
+        assert!(!remote_require_existing_refusal_allowed(false, false, false));
+        // A present transcript never refuses, held or not.
+        assert!(!remote_require_existing_refusal_allowed(true, true, true));
+        assert!(!remote_require_existing_refusal_allowed(false, true, true));
     }
 
     #[test]
