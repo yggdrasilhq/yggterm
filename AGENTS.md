@@ -134,6 +134,7 @@ exempt. The standing topology, per repo:
 ## Platform, Skills & Licensing
 
 - **libyggterm Surface Ownership:** yggterm provides the surface interface; embedded libyggterm apps (ychrome, ytop, Paper) own their content. Zero app-specific chrome belongs in `yggterm-shell`. Consult `.agents/skills/libyggterm-surfaces/SKILL.md`.
+- **⛔ THE YGG GAUGE LIVES IN THE SKILLS — never re-derive it, never guess your own context.** The context-gauge tooling (the hook, the window table, THE CONTEXT RITUAL) is documented in `.agents/skills/yggterm-agent-fleet/SKILL.md` § *the context ritual* + *the automatic path* (`~/.claude/hooks/context-relay-gauge.py`, thresholds 55/70/85). Before citing any context percentage — yours or another row's — read that section and verify against the CLI's own instrument (`/context` for Claude; the PTY frame for everything else). A gauge that disagrees with the instrument is WRONG and gets fixed same-session (stale-doc law).
 - **Synchronize Skills:** When changing surface mechanisms, telemetry, or diagnostics, update the matching `.agents/skills/` file in the same commit.
 - **Licensing:** Code is licensed under `GPL-3.0-or-later` (see `LICENSE`); markdown docs under `CC BY-SA 4.0`. Copyright owner: Avikalpa Kundu.
 
