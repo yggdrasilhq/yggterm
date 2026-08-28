@@ -85,6 +85,7 @@ Per [[spec-cwd-tree-agent-cli-unified]] and `docs/cli-integration.md`:
    - *Muse:* Authoritative title extraction from `session-index.db`; scrollback offset preservation during re-attach.
    - *Antigravity:* Row bounds clamping on interactive footer shortcuts (`esc/ctrl/enter/tab`) to prevent top prompt clipping; batched streaming token renders.
    - *Pi / Qwen / Grok / OpenCode / Kimi:* Synchronized PTY resize propagation to prevent line-wrap distortions.
+8. **OpenCode2 Own-Row Integration (tab bar):** opencode2 (v2 preview, `@opencode-ai/cli`) is the only registered CLI with a row system of its own — its TUI hosts N session tabs inside one PTY. Contract ([[spec-cli-integration]] Issue 26): every open tab mirrors to a yggterm Live Sessions row; a tab spawn seats its row **immediately below the TUI's last tab row**; tab switch ⇄ active-row switch, both directions; tab close ⇄ row despawn (hide, never a durable tombstone — the TUI can reopen tabs). ⛔ **Until the mirror ships, opencode rows are excluded from fleet orchestration:** an opencode session works like a normal session — no relay, no booter claim, no monitor subscription — and no verb may assume a PTY write reaches a specific opencode session (it lands in whatever tab is focused). Per-session addressing goes through the opencode service API (`opencode2 api`) or does not happen.
 
 ---
 

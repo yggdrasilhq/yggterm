@@ -3923,6 +3923,49 @@ has a second face on PATH: a user's `~/.opencode/bin` carries BOTH `opencode`
 (v1 stable) and `opencode2` (preview) — typing `opencode` gets v1, so address
 the CLI the descriptor declares, not the one the banner reminds you of.
 
+### ⛔⛔ OPENCODE2: the TUI hosts N sessions in ONE PTY — the row is not the session (tab bar)
+
+**Owner-directed 2026-08-28; this is the one registered CLI that breaks the
+fleet's one-session-one-row law.** OpenCode2's TUI has a **tab bar**: N open
+session tabs on the current cwd, spawned from `+ New session`, closed with ×,
+switched with `session.tab.*` keybinds. A shared background **service** owns the
+sessions; the row's PTY hosts only the TUI client. **One yggterm row is 1 : N
+opencode sessions.**
+
+**The tell:** a row whose screen carries a tab bar at the top. Everything you
+read off that PTY — footer, composer, context % — describes **the focused tab**,
+never "the session".
+
+⇒ **What this does to every fleet primitive, until yggterm mirrors tabs to rows
+([[spec-cli-integration]] Issue 26):**
+
+- **A PTY write lands in the FOCUSED tab, whoever that is.** `submit`, `send`, a
+  boot, a nudge — addressed to the row, delivered to whichever session the human
+  last focused. This is the wrong-row wake hazard with no wrong row to blame.
+  ⛔ **Per-session addressing goes through the service API or does not happen:**
+  `opencode2 api post /api/session/<id>/prompt` (steer/queue inbox semantics —
+  the same contract as §4), `…/rename`, `GET /api/session/<id>/context`,
+  `GET /api/session/active` for the tab list, `GET /api/event` for lifecycle.
+- **Monitor, booter, notify and the context gauge are per-ROW.** They see one
+  stream and one footer for N sessions; a classification, a boot decision or a
+  gauge reading taken off an opencode row is a reading about ONE tab of N,
+  presented as if about the row.
+- ⛔ **NO fleet orchestration on opencode rows.** Owner rule, same day: an
+  opencode session works **like a normal session** — no relay, no booter
+  subscribe, no monitor, no delegate spawns *from* fleet tooling against its
+  rows — because the row primitive those tools address does not exist
+  per-session yet. This is the first CLI a campaign must route AROUND.
+- **Claim discipline:** the row belongs to the TUI. An opencode session that
+  wants to name itself renames its SESSION (`POST …/rename` or `ctrl+r` in the
+  TUI) and must **not** fight the other tabs over the one row title. Only the
+  anchor row carries a seat; sessions under it wait for the tab→row mirror to
+  get their own.
+
+**When the tab→row mirror ships, update this entry in the same commit** — the
+contract (spawn seats below the TUI's last tab; switch follows both ways; close
+hides, never tombstones, because `session.tab.reopen` exists) will live in
+yggterm, and the "route around" rule above dies with it.
+
 ---
 
 ## 11.9 ⭐ REHEARSE A VERB BEFORE IT DECIDES SOMETHING — aim it at a sandbox

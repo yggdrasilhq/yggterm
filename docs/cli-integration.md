@@ -732,6 +732,82 @@ to replace a previously healthy remote snapshot.
 
 **Checklist for any new CLI (add to `spec-adding-an-agent-cli.md` steps 1–9):** 1) `SessionKind` variant, 2) `AGENT_CLIS` descriptor (+ `TitleAuthority`, `store_globs`, `id_assigned_at_birth`, `resume_selector_token`, `re_roots_with_cwd`), 3) `SESSION_PATH_SCHEMES` (`remote-<slug>://` + `<slug>-runtime://`), 4) `cargo check` exhaustive matches, 5) catch-alls `rg SessionKind::(Codex|ClaudeCode)`, 6) `agent_arm_matrix` two arms (Local `local://` + Remote `remote-<slug>://`), 7) surfaces (icon/menu/KeyTips free), 8) provisioning `install`/`update`, 9) **title lifecycle** — the birth name is automatic (`New {machine} {display_name}`, from `new_session_birth_title`; nothing per-CLI to add), then either `heuristic`/`litellm` via `SessionTitleStore` for a `Generated` CLI + its fallback list, or `read_live_store_title` for a `Store` one — ⛔ a `Store` CLI without that hook can never be titled at all, 10) **resume id** (if `id_assigned_at_birth:false`, implement store→row mapping), 11) `spec-cli-integration-verification.md` oracles (`check-startpage.py`/`check-titles.py`/`check-cwdtree.py` must `0` on every fleet host + faithful 1920×1200 screenshot).
 
+### Issue Heading 26: OpenCode2 owns a row system of its own — the tab bar must mirror into ours
+
+**Owner directive 2026-08-28.** Every other registered CLI satisfies one law this
+file has been built on since Issue 3: **one PTY = one process = one session = one
+row.** OpenCode2 (the v2 preview, `@opencode-ai/cli`, bin `opencode2` — §11
+register) breaks it, and it is the only CLI that does:
+
+* the row's PTY hosts the TUI **client**; a shared background **service** owns
+  the sessions;
+* the TUI renders **N open session tabs** on the current cwd — a tab bar with
+  `+ New session`, per-tab close (×), and `session.tab.next/previous/close/
+  reopen/select.N` keybinds;
+* so one yggterm row is **1 : N** opencode sessions. OpenCode has its own row
+  system, and ours has never heard of it.
+
+**Why this must integrate, and why it blocks the fleet.** The yggterm row is the
+addressing primitive for everything the fleet does — booter, monitor, notify
+cards, `terminal submit`, cross-row messaging, the context gauge, and the
+orchestrator/relay/sub-session workflows. With N sessions hidden behind one row:
+
+* a PTY write (submit, send, a boot, a nudge) lands in **whichever tab the human
+  has focused** — a message addressed to one session can enter a stranger's
+  composer, which is the wrong-row wake hazard without even needing a wrong row;
+* per-session liveness, context budget and title are invisible; the footer read
+  answers for the focused tab only;
+* a tab spawned from `+ New session` appears nowhere in Live Sessions; a tab
+  closed with × leaves its row untouched.
+
+**The contract (owner-specified, verbatim intent):**
+
+1. **Every open opencode2 tab ↔ one yggterm Live Sessions row.** Each session
+   becomes addressable, ownable and claimable like any agent row.
+2. **Tab spawn → row spawn immediately below the TUI's last tab row.** A new
+   session seats itself as a contiguous block directly under its opencode
+   anchor, in tab order — exactly where the human sees it appear in the tab bar.
+3. **Tab switch → row switch.** Moving between tabs moves yggterm's active row
+   with it, both directions: focusing a row in yggterm focuses that tab in the
+   TUI.
+4. **Tab close → row despawn.** ⚠ The TUI has `session.tab.reopen` — a closed
+   tab is recoverable upstream, so the row removal is a hide/retire, **never** a
+   durable tombstone of the session.
+5. **TUI row close** takes the anchor and its tab rows with it.
+
+**Mechanism sketch — the v2 service API already exposes every primitive:**
+`GET /api/session/active` (the open tabs), `GET /api/event` (SSE lifecycle
+stream: spawn/close/focus), `POST /api/session/{id}/prompt` (per-session
+delivery with steer/queue inbox semantics — the same contract as §4's "a busy
+row queues your message"), `POST /api/session/{id}/rename` (title sync),
+`DELETE /api/session/{id}` (explicit delete only), `GET /api/session/{id}/context`
+(per-session context gauge feed). Drive it through `opencode2 api` — the same
+discovery and auth flow the TUI uses — rather than hand-rolled socket discovery.
+Seat tab rows as sub-seats under the anchor row (`N.x.y`), per the standing
+row-hygiene scheme.
+
+**Two identity notes.** (a) The tab rows are a **projection** of the opencode
+service's session list, marked as such — the same relationship a durable scan
+row has to its store. The service is authoritative for its sessions; yggterm
+rows stay yggterm's truth for presence; the mirror must not become a second
+row source of truth. (b) opencode2 also has **child sessions** (`session.child.*`
+/ `session.parent`, and fork) — a sub-agent primitive, not a tab. Tabs are peer
+sessions on one cwd; children are nested work. The row mirror is for tabs; child
+sessions are the natural hook for the later sub-session orchestrator workflows
+and must not be conflated with them.
+
+**Until this ships (standing rule):** opencode2 rows are **excluded from fleet
+orchestration** — an opencode session works like a normal session (no relay,
+no booter claim, no monitor subscription), because the primitive those tools
+address does not exist per-session yet. No verb may assume a PTY write reaches
+a specific opencode session; per-session addressing goes through the service
+API or does not happen.
+
+**Not covered:** this does not change resume selectors or JSONL delegation, does
+not parse opencode transcripts into the viewport, does not promote the opencode
+service to an observer of yggterm row state, and does not ask yggterm to render
+the tab bar itself — the TUI keeps its chrome; we mirror presence, not pixels.
+
 ## 3. Inventory — which spec/doc now lives where
 
 * `spec-cli-integration-verification.md` — the **harness** (verb + oracle pattern, `AGENT_CLIS` SSOT, adding a CLI is one descriptor).
