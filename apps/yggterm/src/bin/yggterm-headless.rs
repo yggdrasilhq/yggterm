@@ -2413,6 +2413,10 @@ mod tests {
             assistant_message_count: 0,
             title_hint: "019dfc5a".to_string(),
             recent_context: String::new(),
+            // A scanned row whose title the CLI never wrote: this fixture is
+            // testing the title fallback, so the kind stays unresolved — the
+            // scheme helper owns that answer, not this test.
+            kind: None,
             cached_precis: None,
             cached_summary: None,
             live_runtime: false,
