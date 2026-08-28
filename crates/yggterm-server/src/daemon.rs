@@ -702,11 +702,39 @@ fn probe_socket_occupancy(candidate: &Path) -> SocketOccupancy {
     }
 }
 
+/// Back-alias every older versioned socket name onto this daemon, so a client
+/// built against an older version still finds a daemon at the name it knows.
+///
+/// ⛔⛔ **A NAME A LIVE DAEMON IS BOUND TO IS THAT DAEMON'S ADDRESS, AND
+/// NOTHING HERE MAY TAKE IT.** Re-pointing such a name does not merely change a
+/// convenience alias: the daemon behind it stays bound to an inode that no path
+/// reaches, so it, and every session it owns, becomes undialable for the rest of
+/// its life. That is not a degraded alias; it is the constitution's
+/// *"a session owned by an OLDER daemon is still a first-class row"* breaking in
+/// the most expensive direction, with everything healthy and nothing reachable.
+///
+/// ⛔ **AND THE SYMLINK BRANCH WAS THE HOLE.** `probe_socket_occupancy` guarded
+/// the branch that unlinks a real socket file, and only that one — a candidate
+/// that was ALREADY a symlink was re-pointed with no occupancy question asked at
+/// all. So a name only had to be taken once; every later daemon then perpetuated
+/// the loss for free, and the daemon behind it could never get it back. Worse,
+/// the probe cannot answer for that branch even if it were called there: it
+/// follows the symlink and asks the daemon that took the name, which always says
+/// yes. The question needs the kernel's bind table, which still reports the
+/// original name long after the path stopped leading to it — see
+/// [`crate::socket_sweep::socket_name_is_a_live_daemons_address`].
 #[cfg(unix)]
 fn refresh_legacy_server_socket_aliases(current: &Path) {
     let Some(current_version) = parse_versioned_server_socket_name(current) else {
         return;
     };
+    let Some(home_dir) = current.parent() else {
+        return;
+    };
+    // ONE kernel read for every candidate. A `status` probe per socket is the
+    // gate measured to hang 16 live daemons at once; this issues no requests.
+    let census = crate::socket_sweep::LiveDaemonCensus::gather(home_dir);
+    let mut declined = Vec::new();
     for candidate in versioned_server_socket_alias_candidates(current) {
         let Some(candidate_version) = parse_versioned_server_socket_name(&candidate) else {
             continue;
@@ -715,6 +743,13 @@ fn refresh_legacy_server_socket_aliases(current: &Path) {
             continue;
         }
         if versioned_socket_alias_points_to_current(&candidate, current) {
+            continue;
+        }
+        // ⛔ BEFORE EITHER BRANCH, AND WITHOUT FOLLOWING THE PATH. This is the
+        //    only check that still works once the name has been diverted, and
+        //    it is fail-safe on an unreadable census.
+        if crate::socket_sweep::socket_name_is_a_live_daemons_address(&census, &candidate) {
+            declined.push(candidate.display().to_string());
             continue;
         }
         if versioned_socket_candidate_is_symlink(&candidate) {
@@ -732,6 +767,299 @@ fn refresh_legacy_server_socket_aliases(current: &Path) {
         }
         let _ = fs::remove_file(&candidate);
         let _ = std::os::unix::fs::symlink(current, &candidate);
+    }
+    if !declined.is_empty() {
+        // ⭐ The theft used to be SILENT, which is why it survived so long: the
+        //    only trace of it was a session nobody could reach, hours later.
+        declined.sort();
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "versioned_socket_alias_declined",
+            serde_json::json!({
+                "current": current.display().to_string(),
+                "names_still_owned_by_a_live_daemon": declined,
+                "census_complete": census.is_complete(),
+                "reason": "a name a live daemon is bound to is that daemon's address",
+            }),
+        );
+    }
+}
+
+/// How often a daemon re-checks that its own name still leads to it.
+///
+/// A name is taken at another daemon's BIND, which is a rare event, so this is
+/// paced for cheapness rather than latency: one `lstat` per interval.
+#[cfg(unix)]
+const SOCKET_NAME_RECLAIM_CHECK_MS: u64 = 15_000;
+
+/// What actually sits at a socket path right now.
+///
+/// ⚠ `Missing` and `Symlink` are kept apart on purpose, and collapsing them is a
+/// bug with teeth — see [`classify_own_socket_name`].
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketNameEntry {
+    Missing,
+    Symlink,
+    RealFile((u64, u64)),
+}
+
+/// What has become of the name this daemon bound.
+///
+/// ⛔ Four answers, and two of them exist to keep the cure from becoming the
+/// disease: taking a name back from a daemon that genuinely bound it is exactly
+/// the theft this lane exists to stop, and so is taking one from a daemon that
+/// is halfway through binding it.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnSocketName {
+    /// The name still leads to the socket file this daemon bound.
+    StillOurs,
+    /// A symlink stands where our socket was. That is what a re-point leaves,
+    /// and whatever made it kept a name of its own, so taking this one back
+    /// costs nobody anything.
+    Taken,
+    /// A DIFFERENT real socket file stands at our name. Somebody is bound to it
+    /// for real; removing it would strand THEM.
+    HeldByAnother,
+    /// Nothing is there at all.
+    ///
+    /// ⚠⚠ **RECLAIMABLE, BUT ONLY UNDER TWO GUARDS, AND BOTH ARE LOAD-BEARING.**
+    /// This is a real end-state of the same disease: a name is re-pointed at a
+    /// newer daemon, that daemon dies, its socket file is swept, the alias is
+    /// now dangling, and the next client to dial it unlinks the dangling link
+    /// (`clear_local_daemon_socket_link_escaping_home` — correct behaviour over
+    /// garbage). The name is then absent while its owner is still bound to it,
+    /// which is the stranding again with the evidence removed.
+    ///
+    /// ⛔ It is ALSO the shape of a bind window that belongs to somebody else:
+    /// our own retirement unlinks this path so a successor can bind it, and a
+    /// successor's bind is `remove` then `bind` with a gap between. Reclaiming
+    /// in either window takes the name from the very process meant to have it
+    /// next. ⇒ Only a daemon that is NOT retiring, and that the kernel still
+    /// names as bound to this path, may take an absent name back.
+    Absent,
+}
+
+/// What stands at `path`, without following it.
+///
+/// ⚠ `symlink_metadata`, never `metadata`: a name that has become a symlink is
+/// already not ours, and following it would compare this daemon against the one
+/// that took it.
+#[cfg(unix)]
+fn socket_name_entry(path: &Path) -> SocketNameEntry {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return SocketNameEntry::Missing;
+    };
+    if metadata.file_type().is_symlink() {
+        return SocketNameEntry::Symlink;
+    }
+    SocketNameEntry::RealFile((metadata.dev(), metadata.ino()))
+}
+
+/// `(device, inode)` of the socket FILE at `path` — the identity of a NAME, as
+/// distinct from the identity of the socket behind it.
+#[cfg(unix)]
+fn socket_file_identity(path: &Path) -> Option<(u64, u64)> {
+    match socket_name_entry(path) {
+        SocketNameEntry::RealFile(identity) => Some(identity),
+        _ => None,
+    }
+}
+
+/// The whole verdict, pure, so it can be tested without a daemon.
+#[cfg(unix)]
+fn classify_own_socket_name(current: SocketNameEntry, bound: (u64, u64)) -> OwnSocketName {
+    match current {
+        SocketNameEntry::Missing => OwnSocketName::Absent,
+        SocketNameEntry::Symlink => OwnSocketName::Taken,
+        SocketNameEntry::RealFile(identity) if identity == bound => OwnSocketName::StillOurs,
+        SocketNameEntry::RealFile(_) => OwnSocketName::HeldByAnother,
+    }
+}
+
+/// May this daemon bind its own name again?
+///
+/// ⛔⛔ **THE TWO GUARDS ARE THE WHOLE SAFETY OF THE RECLAIM, so they are one
+/// pure function and not three conditions scattered through a loop.** A wrong
+/// `true` here is the defect this lane exists to remove, aimed at a different
+/// victim: the daemon that is supposed to have the name next.
+///
+/// * `retiring` — we broke out of the accept loop and are unlinking this path
+///   FOR a successor. Taking it back makes that successor's bind fail on an
+///   address already in use, from the process handing over to it.
+/// * `kernel_still_names_us` — for an ABSENT name only. It separates "our name,
+///   emptied out from under us" from "somebody else's bind window": the kernel
+///   goes on reporting the path we bound, and a daemon that has not bound yet
+///   appears nowhere at all.
+#[cfg(unix)]
+fn may_reclaim_own_socket_name(
+    verdict: OwnSocketName,
+    retiring: bool,
+    kernel_still_names_us: bool,
+) -> bool {
+    if retiring {
+        return false;
+    }
+    match verdict {
+        OwnSocketName::Taken => true,
+        OwnSocketName::Absent => kernel_still_names_us,
+        OwnSocketName::StillOurs | OwnSocketName::HeldByAnother => false,
+    }
+}
+
+/// Bind a fresh listener at a name that was taken, and hand it back.
+#[cfg(unix)]
+fn rebind_taken_socket_name(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    // ⛔ A SYMLINK IS REMOVED; A REAL SOCKET FILE NEVER IS. The check is
+    // repeated here rather than trusted from the caller, because what would be
+    // removed is somebody's address if it is anything other than a symlink or
+    // nothing.
+    match socket_name_entry(path) {
+        SocketNameEntry::Symlink => fs::remove_file(path)?,
+        SocketNameEntry::Missing => {}
+        SocketNameEntry::RealFile(_) => {
+            return Err(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "a real socket file stands at this name; it belongs to whatever bound it",
+            ));
+        }
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// ⭐⭐ **A DAEMON WHOSE NAME WAS TAKEN TAKES IT BACK.**
+///
+/// The prevention above stops new victims; it cannot rescue the ones already
+/// made, and there is no way to re-link an unlinked socket inode to a path. The
+/// daemon can, however, bind a SECOND listener at its own name — and that is a
+/// complete cure, because everything that looks for a daemon looks by name:
+/// `reachable_versioned_daemon_statuses` dials the versioned paths, the bridge
+/// resolver asks those daemons which of them owns a runtime key, and the
+/// cross-daemon reconcile addresses siblings the same way. A daemon nobody can
+/// dial is a daemon that owns rows nobody can open, which is the whole
+/// user-visible defect.
+///
+/// ⛔ **It never takes a name away from anybody.** A real socket file standing
+/// at our name means somebody bound it for real, and that is left alone — the
+/// only names reclaimed are the ones that are a symlink or absent, where the
+/// process that took ours kept a name of its own.
+///
+/// ⚠ The reclaimed listener is served by this thread rather than the main accept
+/// loop, so the loop keeps ONE listener and one poll. Connections land in the
+/// same handler with the same outcome channel, so a shutdown or hot-restart RPC
+/// arriving here drives the daemon exactly as one arriving on the original.
+#[cfg(unix)]
+fn spawn_versioned_socket_name_reclaim(
+    path: PathBuf,
+    home_dir: PathBuf,
+    runtime: Arc<Mutex<DaemonRuntime>>,
+    last_activity_ms: Arc<AtomicU64>,
+    outcomes: std::sync::mpsc::Sender<Result<DaemonRequestOutcome>>,
+    retiring: Arc<AtomicBool>,
+) {
+    let Some(mut bound) = socket_file_identity(&path) else {
+        // We just bound it; if it is not a real file of ours already, something
+        // is racing us and this thread has no safe move to make.
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("yggterm-socket-reclaim".to_string())
+        .spawn(move || {
+            let mut reclaimed: Option<std::os::unix::net::UnixListener> = None;
+            let mut last_check_ms = 0_u64;
+            loop {
+                let now_ms = current_millis() as u64;
+                if now_ms.saturating_sub(last_check_ms) >= SOCKET_NAME_RECLAIM_CHECK_MS {
+                    last_check_ms = now_ms;
+                    let verdict = classify_own_socket_name(socket_name_entry(&path), bound);
+                    // ⛔ A RETIRING DAEMON NEVER TAKES A NAME BACK. It unlinked
+                    //    that path itself, for a successor that has not bound
+                    //    yet — re-binding there would make the handover fail on
+                    //    an address already in use, from the process handing
+                    //    over.
+                    // The census read is deferred behind the cheap answers: it
+                    // is only ever needed for an ABSENT name.
+                    let kernel_still_names_us = verdict == OwnSocketName::Absent
+                        && crate::socket_sweep::socket_name_is_a_live_daemons_address(
+                            &crate::socket_sweep::LiveDaemonCensus::gather(&home_dir),
+                            &path,
+                        );
+                    if may_reclaim_own_socket_name(
+                        verdict,
+                        retiring.load(Ordering::SeqCst),
+                        kernel_still_names_us,
+                    ) {
+                        match rebind_taken_socket_name(&path) {
+                            Ok(listener) => {
+                                if let Some(identity) = socket_file_identity(&path) {
+                                    bound = identity;
+                                }
+                                append_trace_event(
+                                    &home_dir,
+                                    "daemon",
+                                    "lifecycle",
+                                    "versioned_socket_name_reclaimed",
+                                    serde_json::json!({
+                                        "path": path.display().to_string(),
+                                        "pid": std::process::id(),
+                                        "server_version": SERVER_PROTOCOL_VERSION,
+                                        "reason": "this name had been re-pointed away from a \
+                                                   daemon that is still bound and still serving",
+                                    }),
+                                );
+                                reclaimed = Some(listener);
+                            }
+                            Err(error) => {
+                                append_trace_event(
+                                    &home_dir,
+                                    "daemon",
+                                    "lifecycle",
+                                    "versioned_socket_name_reclaim_failed",
+                                    serde_json::json!({
+                                        "path": path.display().to_string(),
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                let Some(listener) = reclaimed.as_ref() else {
+                    // Nothing to serve yet: sleep until the next check is due
+                    // rather than ticking, so an idle daemon pays one wake per
+                    // interval instead of one per second forever.
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        SOCKET_NAME_RECLAIM_CHECK_MS,
+                    ));
+                    continue;
+                };
+                match listener.accept() {
+                    Ok((stream, _)) => spawn_unix_client_handler(
+                        stream,
+                        runtime.clone(),
+                        last_activity_ms.clone(),
+                        outcomes.clone(),
+                    ),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        let _ =
+                            wait_for_listener_ready(listener.as_raw_fd(), DAEMON_ACCEPT_POLL_MS);
+                    }
+                    Err(_) => {
+                        // A listener that will not accept is worse than none:
+                        // drop it and let the next check re-bind.
+                        reclaimed = None;
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(error=%error, "failed to spawn yggterm socket-name reclaim thread");
     }
 }
 
@@ -16078,16 +16406,42 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                 let served = crate::pty_handoff::serve_handoff(
                     &stream,
                     &mut |metadata| {
-                        let rt = lock_daemon_runtime(&runtime, "pty_handoff_seat_verdict");
-                        matches!(
+                        let verdict = {
+                            let rt = lock_daemon_runtime(&runtime, "pty_handoff_seat_verdict");
                             rt.terminals.seat_verdict(
                                 &metadata.runtime_key,
                                 metadata.shell_pid,
                                 metadata.shell_start_time,
-                            ),
-                            crate::terminal::SeatVerdict::Conflict
-                        )
-                        .then(|| crate::terminal::seat_conflict_reason(&metadata.runtime_key))
+                            )
+                        };
+                        // ⛔ EXHAUSTIVE, NOT `matches!(.., Conflict)`. A fourth
+                        // answer added later would silently join the "proceed"
+                        // side of a boolean test, and the whole reason this
+                        // enum has more than two variants is that collapsing
+                        // any two of them has already cost a daemon its life.
+                        match verdict {
+                            crate::terminal::SeatVerdict::Conflict => {
+                                Some(crate::terminal::seat_conflict_reason(&metadata.runtime_key))
+                            }
+                            crate::terminal::SeatVerdict::PlaceholderYields => {
+                                append_trace_event(
+                                    &home_dir,
+                                    "daemon",
+                                    "lifecycle",
+                                    "pty_handoff_placeholder_yielded",
+                                    serde_json::json!({
+                                        "runtime_key": metadata.runtime_key,
+                                        "shell_pid": metadata.shell_pid,
+                                        "reason": "this daemon held a stand-in for the key — \
+                                                   spawned here, never typed into — and the \
+                                                   session's own pty is the one arriving",
+                                    }),
+                                );
+                                None
+                            }
+                            crate::terminal::SeatVerdict::Vacant
+                            | crate::terminal::SeatVerdict::AlreadySeated => None,
+                        }
                     },
                     &mut |metadata, fd| {
                         let mut rt = lock_daemon_runtime(&runtime, "pty_handoff_adopt");
@@ -21555,6 +21909,21 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         spawn_superseded_daemon_takeover(runtime.clone());
         let (client_outcome_tx, client_outcome_rx) =
             std::sync::mpsc::channel::<Result<DaemonRequestOutcome>>();
+        // ⭐ The other half of [[finding-a-roll-takes-a-live-daemons-socket-name]]:
+        // prevention stops new victims, and this is what rescues the ones a
+        // pre-fix daemon already made — including one measured alive 28 h with
+        // 83 pty masters and no path leading to it.
+        // Set the moment the accept loop breaks, BEFORE this daemon unlinks its
+        // own path for a successor. See `spawn_versioned_socket_name_reclaim`.
+        let retiring = Arc::new(AtomicBool::new(false));
+        spawn_versioned_socket_name_reclaim(
+            path.clone(),
+            home_dir.clone(),
+            runtime.clone(),
+            last_activity_ms.clone(),
+            client_outcome_tx.clone(),
+            Arc::clone(&retiring),
+        );
         let mut restart_after_exit = None::<PathBuf>;
         // Started at most once: the drain thread polls until our hands are empty
         // and retires us itself, so a second handoff RPC must not stack another.
@@ -21626,6 +21995,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 Err(error) => return Err(error).context("accepting daemon client"),
             }
         }
+        // ⛔ BEFORE `drop(listener)` and before the unlink below: from here on
+        // this daemon's own name belongs to whoever binds it next, and the
+        // reclaim thread must stop competing for it.
+        retiring.store(true, Ordering::SeqCst);
         let restart_executable = restart_after_exit.take();
         append_trace_event(
             &home_dir,
@@ -29369,6 +29742,203 @@ mod tests {
             fs::read_link(&stale_alias).expect("stale alias should be retargeted"),
             current
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// ⛔⛔⛔ THE HALF THE OWNER SAW: A NAME, ONCE TAKEN, WAS RE-POINTED FOR EVER.
+    ///
+    /// `probe_socket_occupancy` guarded the branch that unlinks a REAL socket
+    /// file and only that one. A candidate that was already a symlink was
+    /// re-pointed with no occupancy question asked — so a name only had to be
+    /// taken once and every later daemon perpetuated the loss for free.
+    ///
+    /// ⚠ **And the probe could not have answered it anyway**, which is the part
+    /// that makes this its own test rather than a second call to an existing
+    /// guard: a probe through a diverted name reaches whatever the name points
+    /// at now, and that is precisely the daemon that took it. Only the kernel's
+    /// bind table still remembers whose name it was.
+    ///
+    /// The state below is the measured live one, reproduced exactly: a listener
+    /// alive and bound, its name unlinked out from under it and replaced by a
+    /// symlink to somebody else.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_a_live_daemon_is_still_bound_to_is_never_re_pointed() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-name-theft-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create temp socket dir");
+        let current = root.join("server-4-2-9.sock");
+        let stranded_name = root.join("server-4-2-7.sock");
+        let decoy = root.join("someone-elses.sock");
+
+        // A live daemon, bound to its own versioned name.
+        let stranded = std::os::unix::net::UnixListener::bind(&stranded_name)
+            .expect("bind the older daemon's socket");
+        // Its name is taken: unlinked, and a symlink to another socket put in
+        // its place. The listener is untouched and still accepting — the kernel
+        // still reports it as bound to `stranded_name`.
+        let _decoy = std::os::unix::net::UnixListener::bind(&decoy).expect("bind the decoy");
+        fs::remove_file(&stranded_name).expect("unlink the older name");
+        std::os::unix::fs::symlink(&decoy, &stranded_name).expect("re-point the older name");
+
+        // A dangling alias for a version nobody ever bound — the POSITIVE
+        // control, so this test cannot pass by refusing to touch any symlink.
+        let dangling = root.join("server-4-2-8.sock");
+        std::os::unix::fs::symlink(root.join("never-bound.sock"), &dangling)
+            .expect("create a dangling alias");
+
+        let _current_listener =
+            std::os::unix::net::UnixListener::bind(&current).expect("bind current socket");
+        super::refresh_legacy_server_socket_aliases(&current);
+
+        assert_eq!(
+            fs::read_link(&stranded_name).expect("the stranded name should still be a symlink"),
+            decoy,
+            "a name a LIVE daemon is still bound to must never be re-pointed — doing it \
+             leaves that daemon accepting on an inode no path reaches, with every session \
+             it owns unreachable from every client on the host"
+        );
+        assert_eq!(
+            fs::read_link(&dangling).expect("the dangling alias should be retargeted"),
+            current,
+            "an alias no live daemon answers to is still back-aliased; the guard must be \
+             about occupancy, not about symlinks"
+        );
+
+        drop(stranded);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The verdict table for a daemon's own name, without a daemon.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_taken_name_may_be_bound_again() {
+        assert_eq!(
+            super::classify_own_socket_name(super::SocketNameEntry::RealFile((7, 11)), (7, 11)),
+            super::OwnSocketName::StillOurs
+        );
+        assert_eq!(
+            super::classify_own_socket_name(super::SocketNameEntry::Symlink, (7, 11)),
+            super::OwnSocketName::Taken,
+            "a symlink is what a re-point leaves behind, and whatever made it kept a name \
+             of its own — so putting our listener back strands nobody"
+        );
+        assert_eq!(
+            super::classify_own_socket_name(super::SocketNameEntry::RealFile((7, 12)), (7, 11)),
+            super::OwnSocketName::HeldByAnother,
+            "⛔ a DIFFERENT real socket file at our name belongs to whoever bound it — \
+             taking it back would be the very theft this lane exists to stop"
+        );
+        assert_eq!(
+            super::classify_own_socket_name(super::SocketNameEntry::Missing, (7, 11)),
+            super::OwnSocketName::Absent,
+            "⛔⛔ AND AN ABSENT NAME IS NOT A TAKEN ONE — the two need different guards"
+        );
+    }
+
+    /// ⛔⛔ THE GUARDS ON THE RECLAIM, WHICH ARE WHAT KEEP THE CURE FROM BECOMING
+    /// A SECOND VERSION OF THE DISEASE.
+    ///
+    /// A wrong `true` here takes a name from the process that is supposed to
+    /// have it next — a successor mid-bind, or the successor this very daemon is
+    /// retiring in favour of.
+    #[cfg(unix)]
+    #[test]
+    fn a_retiring_daemon_never_takes_its_name_back() {
+        use super::OwnSocketName::*;
+        use super::may_reclaim_own_socket_name as may;
+
+        // Retiring: no verdict licenses anything. This daemon unlinked the path
+        // ITSELF, for a successor that has not bound yet.
+        for verdict in [Taken, Absent, StillOurs, HeldByAnother] {
+            assert!(
+                !may(verdict, true, true),
+                "a retiring daemon must never re-bind its own name ({verdict:?})"
+            );
+        }
+        // Serving: a re-pointed name comes back, and a real socket file never
+        // does.
+        assert!(may(Taken, false, false), "a symlink is a re-point, and it comes back");
+        assert!(!may(StillOurs, false, true));
+        assert!(
+            !may(HeldByAnother, false, true),
+            "⛔ a real socket file at our name belongs to whoever bound it"
+        );
+        // An emptied name comes back only when the kernel still says the path is
+        // ours; otherwise it is somebody's bind window and must be left alone.
+        assert!(may(Absent, false, true));
+        assert!(
+            !may(Absent, false, false),
+            "⛔ an absent name nobody is bound to is a BIND WINDOW — a successor that has \
+             not bound yet appears nowhere in the kernel table, and taking the name there \
+             makes its bind fail on an address already in use"
+        );
+    }
+
+    /// ⭐⭐ AND THE CURE FOR THE DAEMONS ALREADY STRANDED: IT TAKES ITS NAME BACK.
+    ///
+    /// Prevention makes no new victims and rescues none of the existing ones —
+    /// an unlinked socket inode cannot be re-linked to a path by anything. What
+    /// a live daemon CAN do is bind its own name again, and that is a complete
+    /// cure, because everything that looks for a daemon looks by name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_whose_name_was_taken_binds_it_again() {
+        use std::io::{Read, Write};
+
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-name-reclaim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create temp socket dir");
+        let name = root.join("server-4-3-1.sock");
+        let decoy = root.join("the-daemon-that-took-it.sock");
+
+        let stranded = std::os::unix::net::UnixListener::bind(&name).expect("bind our own name");
+        let bound = super::socket_file_identity(&name).expect("our socket file identity");
+        let _decoy = std::os::unix::net::UnixListener::bind(&decoy).expect("bind the decoy");
+        fs::remove_file(&name).expect("unlink our name");
+        std::os::unix::fs::symlink(&decoy, &name).expect("re-point our name");
+
+        assert_eq!(
+            super::classify_own_socket_name(super::socket_name_entry(&name), bound),
+            super::OwnSocketName::Taken,
+            "the name no longer leads to the socket this daemon bound"
+        );
+
+        let reclaimed = super::rebind_taken_socket_name(&name).expect("bind the name again");
+        reclaimed
+            .set_nonblocking(false)
+            .expect("serve the reclaimed listener blocking, for the test");
+
+        // ⭐ THE ASSERTION THAT CANNOT BE FAKED BY A LINK TARGET: a client that
+        // dials the NAME reaches THIS process again.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = reclaimed.accept().expect("accept on the reclaimed name");
+            stream.write_all(b"reclaimed\n").expect("answer the client");
+        });
+        let mut client =
+            std::os::unix::net::UnixStream::connect(&name).expect("dial the reclaimed name");
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).expect("read the answer");
+        server.join().expect("server thread");
+        assert_eq!(
+            answer, "reclaimed\n",
+            "after the reclaim the name must reach the daemon whose name it is, not the \
+             daemon that took it"
+        );
+
+        drop(stranded);
         fs::remove_dir_all(root).ok();
     }
 
