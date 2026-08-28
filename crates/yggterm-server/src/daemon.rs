@@ -30952,6 +30952,7 @@ mod tests {
                 health: RemoteMachineHealth::Healthy,
                 sessions: (0..5)
                     .map(|ix| RemoteScannedSession {
+                        kind: None,
                         session_path: remote_scanned_session_path("dev", &format!("runtime-{ix}")),
                         session_id: format!("runtime-{ix}"),
                         cwd: "/home/user".to_string(),
@@ -31366,6 +31367,7 @@ mod tests {
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: active_path.clone(),
                 session_id: "missing-runtime".to_string(),
                 cwd: "/home/user".to_string(),
@@ -35335,6 +35337,7 @@ mod tests {
             health: RemoteMachineHealth::Healthy,
             sessions: vec![
                 RemoteScannedSession {
+                    kind: None,
                     session_path: remote_scanned_session_path("guihost", "one"),
                     session_id: "one".to_string(),
                     cwd: "/home/user".to_string(),
@@ -35352,6 +35355,7 @@ mod tests {
                     storage_path: "/home/user/.codex/sessions/one.jsonl".to_string(),
                 },
                 RemoteScannedSession {
+                    kind: None,
                     session_path: remote_scanned_session_path("guihost", "two"),
                     session_id: "two".to_string(),
                     cwd: "/srv/app".to_string(),
@@ -35421,6 +35425,7 @@ mod tests {
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path:
                     "remote-muse://example-host/8d3ff8e8-3a22-420d-a5d5-738790ee5701"
                         .to_string(),
@@ -35466,6 +35471,7 @@ mod tests {
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![
                     RemoteScannedSession {
+                        kind: None,
                         session_path: remote_scanned_session_path("guihost", "one"),
                         session_id: "one".to_string(),
                         cwd: "/home/user".to_string(),
@@ -35483,6 +35489,7 @@ mod tests {
                         storage_path: "/home/user/.codex/sessions/one.jsonl".to_string(),
                     },
                     RemoteScannedSession {
+                        kind: None,
                         session_path: remote_scanned_session_path("guihost", "two"),
                         session_id: "two".to_string(),
                         cwd: "/home/user".to_string(),
@@ -35512,6 +35519,7 @@ mod tests {
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: remote_scanned_session_path("oc", "three"),
                     session_id: "three".to_string(),
                     cwd: "/root".to_string(),
