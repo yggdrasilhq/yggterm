@@ -18,6 +18,65 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
+
+**Status:** OPEN
+
+**The owner's report (2026-08-28, verbatim intent):** plain SHELL sessions transform
+one by one into EMPTY CODEX sessions after launch; some stay shells while most
+convert. It is Pass 0's known fault class, and the pass's own rule applies: every
+fault must appear as a `cli/[fault]` ytrace event BEFORE its fix.
+
+**Measured on the GUI host (2026-08-28, build 3.1.69):**
+
+- **An idle unmounted shell does NOT convert.** A probe born
+  `server app terminal new --kind shell --no-activate` stayed `terminal` /
+  "probe: pass0 shell identity" / `local://8043bc7d…` across 64 s of sampling, and
+  its persisted entry stayed `kind: shell` with NO storage. The transform needs
+  something the idle probe does not get: a mount, a GUI birth path, a restart, or
+  the owner's exact recipe (not yet named).
+- **The persisted state on this host is coherent right now** — every shell row
+  persists `kind: shell`, empty storage; every codex row carries a codex storage.
+  Whatever converted, it is not sitting in `server-state.json` today.
+- **There are NO empty codex rollouts to blame:** 625 files under `~/.codex/sessions`,
+  zero with no message records (a metadata-only rollout counts as empty; none exist).
+  An "empty codex session" here is a row wearing a codex identity WITHOUT a
+  transcript — wiring, not data.
+- **The `cli` ytrace category has no identity-provenance events.** Ten hours of
+  trace holds only `attachment_sweep` / `title_sweep` / version+refresh probes. A
+  kind flip can happen with no witness — which is why the fault reached the owner
+  unexplained.
+
+**The suspects, ranked (all display/wiring plane, none yet proven):**
+
+1. **Six display-plane fallbacks answer `SessionKind::Codex` for anything they
+   cannot parse** — `unwrap_or(SessionKind::Codex)` at
+   `yggterm-shell/src/shell/state.rs:44909` (sidebar `session_kind_for_row`),
+   `state.rs:55360`, `yggterm-server/src/lib.rs:31355` and `:31410`
+   (`synthesize_remote_scanned_*_session_view`),
+   `startpage_ls.rs:746`, `cwdtree_ls.rs:375`. `local://` deliberately carries NO
+   kind in the scheme registry, so every one of these sites is one refactor away
+   from painting a shell codex. **An unknown is Unknown, never Codex** — the
+   fallback manufactures other-CLI identity out of ignorance.
+2. **The persistence path re-derives kind from the `Storage` metadata**
+   (`persisted_live_session_from_managed`, `lib.rs:1461` → `resolved_kind =
+   session_kind_for_row(storage_path)`). A shell row that ever acquires a Storage
+   stamp pointing at a codex layout would silently come back from a restart AS
+   CODEX, resuming nothing — the empty-codex shape. The entry must refuse to
+   re-derive over a plain shell instead of propagating the stamp quietly.
+3. **The attachment sweep is read-only** (counts only) — exonerated as the
+   converter; still the right place for the `cli/identity_flip` event once the
+   grammar exists.
+
+**Fix direction:** (a) wire the identity-provenance trace grammar FIRST — one event
+per kind read/write per row (`who set it, when, from what input`), so the flip
+names itself; (b) replace every `unwrap_or(SessionKind::Codex)` with an explicit
+Unknown/Shell resolution and a regression lock per site; (c) make the persistence
+re-derivation refuse (loudly) when it would change a shell's kind. **The
+falsifier** for whichever mechanism is real: reproduce the owner's recipe — the
+report's "one by one" says a sequential chore, so watch a fresh shell across a
+mount and across a GUI restart before believing any static reading.
+
 ## ⛔ [99.1] A ROW MID-RELAUNCH REPORTS `idle`, WHICH IS THE GREEN LIGHT FOR A SUBMIT
 
 **Status:** OPEN
@@ -4888,8 +4947,11 @@ closed.
 
 ### ⛔ [11.0] THE 5-MINUTE NO-OP RESTART LOOP — THE GUI ASKS, THE DAEMON REFUSES, FOREVER, AND THE ASK ITSELF DEAFENED THE DAEMON
 
-**Status:** HALF FIXED (the deafness — `PEER_TRIAGE_PROBE_BUDGET_MS`); the loop remains OPEN
-with its owner being whoever next touches the bidirectional-convergence half.
+**Status:** OPEN
+
+(The deafness half — `PEER_TRIAGE_PROBE_BUDGET_MS` — is fixed in code; the loop
+itself remains open, its owner being whoever next touches the
+bidirectional-convergence half.)
 
 **Measured 2026-08-27, three days of GUI-host trace (`daemon_request/hot_restart`):** 392 spans,
 **387 of them in the 9-11 s bucket** (p50 10,233 ms), **~12 every hour around the clock** —
