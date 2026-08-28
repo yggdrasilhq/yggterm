@@ -12456,6 +12456,45 @@ visible-blink cost and still must exempt the active surface and any held draft. 
 instrument note stands: the probe's `committed_kb` per role made this a standing query — the
 reading above is reproducible from `ytrace tail --category render` alone.
 
+## ⛔⛔ THE FLOOD REGIME — AN AGENT SESSION WATCHED ACROSS SSH AT 22K CHARS/S MISSES HALF ITS FRAME BUDGET, WEBKIT BURNS ~50% OF A CORE, AND THE OWNER'S TYPING HITS 2.8 S (2026-08-28 20:07–20:23, the GUI host, 3.1.72)
+
+**Status:** OPEN
+
+*Owner: "yggterm just hit a render storm or something. Laptop became hot." — said on the GUI host. Measured
+within minutes; the storm was still raging at filing.*
+
+**The anatomy, all measured in one 16-min tail (20:07–20:23):**
+
+- ONE session — identified after the fact by the owner's own screenshot: **the campaign's own
+  SSH Shell** (a `dev` remote agent session watched live on the GUI host; `active_session_path`
+  in app state matches) — streamed **21.2M visible chars in 16 min (~22K chars/s)**, with
+  backlog 100K–1.9M chars/min and reveal drains to 1.87 MB/min. The flood source was the
+  agent's own diagnostic traffic: a 13.5 MB trace tail pulled for analysis prints megabytes
+  through the same PTY the owner is watching. **This is the product's core scenario — a remote
+  agent session observed across SSH — not a curiosity.**
+- The paint path is the DESIGNED fast path, verified live: `renderer_decision … requested=1
+  addon_available=1 webgl_loaded=1 actual=gpu_canvas` (WebGL canvas active; no software pins in
+  the WebKit env), and the write path coalesces correctly (`pending_chars: 0` at flush).
+- **Yet 372 of 787 flush frames exceeded the 16 ms budget (max 500 ms)**, WebKitWebProcess
+  burned 44–53% of a core sustained (the same process carrying the 2.0 GiB committed from
+  §6.7), the GUI 39%, and the hottest thermal zone read **75 °C** with ui/block at **101
+  incidents (18 severe ≥1 s, p95 2.8 s)** across 2 h while the owner typed 1,512 keystrokes.
+
+⇒ **The flood regime is unhandled.** Scrolling a 169×65 grid at vsync under 22K chars/s costs
+~0.5 core in the render process even on the GPU path — the per-frame cost is the surrounding
+compositing and JS, not the raster. A human cannot read a log above ~15 fps of scroll, so the
+correct behaviour under flood is a **flood-adaptive paint cadence**: when one visible surface's
+enqueue throughput crosses ~10K chars/s, cap that surface at ~15 fps and batch to the largest
+pending payload, restoring full cadence when throughput falls. Trace the regime
+(`flood_mode: true` on the render samples) so the next storm is visible in one query.
+**Falsifier:** with the adaptive cadence live, a 20K chars/s flood into the active surface
+holds effective_frame_ms p95 ≤ 20 ms, WebKit process CPU ≤ 20% of a core, and ui/block p95
+≤ 50 ms on the keystroke leg; with the flood off, cadence and frame cost return to today's
+quiet-floor numbers.
+
+**Immediate mitigations while it is open:** scroll away from or park the flooding row (paint
+follows the active surface); or let the agent finish — the regime ends with the flood.
+
 ### ⭐ FALSIFIER MEASURED (2026-08-28 evening, the GUI host, 3.1.72) — THE STRUCTURAL BOUND IS BUILDABLE
 
 The precondition this entry deferred to is now measured, live, and REVERSED. The GUI session
