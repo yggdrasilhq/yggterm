@@ -24,12 +24,48 @@ if [ -n "$closed" ]; then
 fi
 
 # 2. Every entry declares exactly one status from the vocabulary.
+#
+# ⛔⛔ PAIRED PER ENTRY, NEVER BY TOTAL — AND THE TOTAL VERSION WAS GREEN OVER TWO
+# DEFECTS AT ONCE. This compared `grep -c '^## '` against `grep -c '^\*\*Status'`
+# and required the two numbers to match. Measured 2026-08-22: 351 against 351,
+# passing, while ONE entry was a bare heading with no body and no status (a fixed
+# item's headstone, left behind when its body was deleted) and ANOTHER carried
+# TWO status lines (a merge that kept both halves of one topic). Each defect
+# moved a total by one, in opposite directions, so they cancelled.
+#
+# ⇒ **A total cannot fail on an absence when a surplus elsewhere pays for it.**
+#   The check has to ask the question once per entry, which is the level the rule
+#   is actually written at. Same shape as every other counting instrument this
+#   project has had to repair: the aggregate answers a different question than
+#   the one its name suggests.
+# ⚠ Kept for the summary line at the end: a COUNT is a fine thing to report and a
+#    poor thing to check with, which is the whole point of the pairing above.
 entries=$(grep -cE '^## ' "$QUEUE")
-statuses=$(grep -cE '^\*\*Status:\*\* (OPEN|FIXED IN CODE — LIVE PROOF OWED|AWAITING A DECISION)$' "$QUEUE")
-if [ "$entries" -ne "$statuses" ]; then
-  note "$entries entries but $statuses valid status lines — every entry needs exactly one"
-  grep -nE '^\*\*Status:\*\*' "$QUEUE" | grep -vE '\*\*Status:\*\* (OPEN|FIXED IN CODE — LIVE PROOF OWED|AWAITING A DECISION)$' | head -10 >&2
+bad_entries=$(awk '
+  /^## / {
+    if (seen) report(head_line, head_text, n)
+    seen = 1; n = 0; head_line = NR; head_text = $0; next
+  }
+  /^\*\*Status:\*\* (OPEN|FIXED IN CODE — LIVE PROOF OWED|AWAITING A DECISION)$/ { if (seen) n++ ; next }
+  END { if (seen) report(head_line, head_text, n) }
+  function report(ln, text, count) {
+    if (count != 1) printf "%d: %d status line(s) — %.90s\n", ln, count, text
+  }
+' "$QUEUE")
+if [ -n "$bad_entries" ]; then
+  note "every entry needs exactly one status line from the vocabulary:"
+  echo "$bad_entries" | head -10 >&2
 fi
+# A malformed status line is its own message: the loop above only counts VALID
+# ones, so a typo shows up as "0 status line(s)" without saying what was typed.
+grep -nE '^\*\*Status:\*\*' "$QUEUE" \
+  | grep -vE '\*\*Status:\*\* (OPEN|FIXED IN CODE — LIVE PROOF OWED|AWAITING A DECISION)$' \
+  | head -10 > /tmp/ygg-docs-ssot-badstatus.$$ || true
+if [ -s /tmp/ygg-docs-ssot-badstatus.$$ ]; then
+  note "status lines outside the vocabulary:"
+  cat /tmp/ygg-docs-ssot-badstatus.$$ >&2
+fi
+rm -f /tmp/ygg-docs-ssot-badstatus.$$
 
 # 2b. No paragraph appears twice.
 #

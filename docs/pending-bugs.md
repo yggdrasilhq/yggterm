@@ -458,7 +458,136 @@ Owner: whoever next touches the web verb surface. The record side of this is
 already solved — media probe records carry a host-stamped `(row, tab)` — so this
 is specifically about the imperative verbs.
 
-## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
+## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
+
+**Status:** OPEN
+
+Two agent rows lost their process during a cross-CLI greeting run. Neither death was
+recorded anywhere, and every instrument that a fleet verb consults kept describing them
+as healthy:
+
+    owned_terminal_session_count      4      ← the daemon knows
+    live_terminal_sessions          5 entries ← the list does not
+    server rows departed              0      ← the ONE owner of "where did it go and why"
+    server app rows                 live_member:true, presence:live_rail,
+                                    wedge_suspected:false, busy_reason:"idle"
+    server screen                   "no session here matches …"
+
+⛔ **`busy_reason:"idle"` is the specific danger.** Idle is the green light every
+delivery verb waits for, so a brief aimed at a dead row passes the readiness gate,
+writes into nothing, and the row then has no transcript — which routes it straight to
+the reap. `ygg-fold` decides DEAD by *"uuid not in live"*, and the uuid IS in live, so
+the seat is never reclaimed either: it is held forever by a process that does not exist.
+
+⚖ **The count is its own witness**, and that is what makes this cheap to detect: owned
+and live disagreed by exactly the number of dead rows, both times. Whatever removes a
+PTY from the owned set already knows; nothing tells the live list or the ledger.
+
+⇒ Recommended: make the departure ledger the single place a row's disappearance is
+recorded, and derive `live_member` from PTY ownership rather than from a list that is
+only ever appended to. Until then a sweep cannot distinguish a working lane from a
+corpse, which is the assumption every watchdog in the fleet is built on.
+
+⚠ Observed in a headless sandbox (`YGGTERM_HOME` + Xvfb, recipe in the field guide).
+The rendering half of that environment does not travel to a desktop; the daemon half is
+the same binary the fleet runs everywhere, and the ledger and the owned/live split are
+both daemon-side. **Reproduce on a desktop before assuming the scope is wider than the
+evidence.**
+
+## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
+
+**Status:** OPEN
+
+`ygg-deliver`'s reap destroys a row whose transcript is ABSENT, on the stated premise
+that such a row *"has never written a word, so it was never briefed and cannot become
+anything"*. Measured during the greeting run: a codex row that had been briefed, had
+run a shell command, and had reported its result **had written no transcript at all**
+— no store file existed for it twenty minutes after birth.
+
+⚖ The premise is calibrated on one CLI. `ygg-spawn` allows 90 s of transcript lag from
+a measurement taken on a CLI that accepts a caller-supplied session id, so its row id
+IS its transcript id from the first byte. Four registered CLIs declare
+`id_assigned_at_birth: false`; they mint their own id and write on their own schedule,
+and until then the row's id addresses nothing. ABSENT is literally true for them and
+the inference drawn from it is false.
+
+⛔ **Not fixed by the FOUND/ABSENT/UNMEASURABLE split**, deliberately — that separated
+"we did not look" from "we looked", and this is a case where we looked in the right
+place and the answer is still not evidence.
+
+⇒ Recommended, and NOT taken here because it needs a measurement this lane does not
+have: find out how long after birth each `id_assigned_at_birth:false` CLI first writes
+a store file, and treat ABSENT inside that window as UNMEASURABLE. **Do not guess the
+threshold** — too short destroys working lanes, too long lets briefless debris hold
+seats, and both failures are silent. A cheaper interim that needs no timing at all:
+ask whether the row has a live agent PROCESS before destroying it, since a row with one
+has manifestly not failed to be born.
+
+## ⛔ [99.1·99.2] A COMPOSER'S PLACEHOLDER HINT IS COUNTED AS AN UNSENT DRAFT
+
+**Status:** OPEN
+
+*Root-caused 2026-08-22 and deliberately not fixed here: the repair is in the daemon's
+composer reader, and this lane's scope was the fleet verbs. The root cause is below,
+which is the expensive half.*
+
+Rows are reported as holding a composer draft on planes where nothing has ever been
+typed into them. `terminal submit` therefore refuses the FIRST message a row is ever
+sent — its brief — with `submitted:false` and *"the composer holds an unsent draft —
+refusing to probe, because the probe types a marker and clears the line with Ctrl+U
+and would destroy it"*, and `input-check` answers `consuming_input:false` for the same
+reason.
+
+⛔ **The refusal is correct behaviour on a wrong reading, which is why it is dangerous.**
+The law forbids retrying `submitted:false`, so a spawner that hits this has no way to
+brief the row it just created, and the row then routes to the reap as never-briefed.
+`send` plus a lone carriage return delivers past it, but that path has no draft guard at
+all — it is the workaround, not the fix.
+
+### The root cause, measured in a sandbox on 2026-08-22
+
+`session_composer_holds_draft` is the UNION of two arms — a keystroke counter and the
+rendered grid — and either saying "there is text there" is enough to refuse. The grid
+arm is `yggterm_core::composer_row_holds_text`, which finds the composer marker on the
+composer row and returns true when **anything at all** follows it:
+
+    let head = text[marker.len_utf8()..].trim();
+    return Some(!head.is_empty() || !content.trim().is_empty());
+
+⇒ **A CLI that draws a placeholder hint on its composer row when the composer is empty
+is indistinguishable, at that line, from a person mid-sentence.** Replayed over the
+rendered rows of an idle agent row that had just COMPLETED a turn, the marker's `head`
+was that CLI's suggestion text, so the arm returns true — and keeps returning it, for
+as long as the hint is drawn.
+
+**The other arm is excluded, and this is what makes it a root cause rather than a
+suspicion:** a second row of a different CLI reported `composer_held_draft:true` when
+not one byte had ever been written to it by anything — no send, no submit, no probe —
+so the keystroke counter cannot be what produced it.
+
+⚖ **The entry this replaces called the trigger "something about a NEW row". It is not.**
+It is what the CLI paints on that line, so it lasts exactly as long as the hint does:
+transient for a CLI that clears it after boot, and observed persisting through a
+completed turn for one that does not. **The earlier live census — 4 drafts across 36
+owned sessions — was not re-measured here**, so how much of the fleet this reaches is
+still open; the per-CLI shape of the hint decides it, not the age of the row.
+
+⇒ Recommended: the grid arm must distinguish CHROME on the composer row from CONTENT.
+The same file already has `composer_row_is_chrome` for rows BELOW the composer and a
+per-CLI `composer_footer_hints` list feeding it; a per-CLI `composer_placeholder_hints`
+is the shape that already exists here. ⛔ **Do not fix it by dropping the grid arm** —
+it is there because the keystroke counter is zeroed by a daemon handover, and the two
+cover each other. ⛔ And do not widen it to "ignore any short line": a person's
+half-typed sentence starts short.
+
+**What would falsify it being fixed:** an idle agent row of a CLI that draws a
+placeholder, on a plane where nothing has been typed, answering `composer_held_draft:
+false` — while a row with one real character typed into it still answers `true`.
+
+⭐ **It is now rehearsable without a desktop.** A sandbox `YGGTERM_HOME` + GUI reproduces
+it in about four minutes (recipe: field guide; aiming the verbs: fleet skill §11.9),
+which is how it was root-caused.
+
 ## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
 
 **Status:** OPEN
@@ -21007,7 +21136,7 @@ renders at NORMAL intensity (`❯\u{a0}THIS_IS_AN_UNSENT_DRAFT`, no `ESC[2m`), s
 faint really is chrome and the guard is correct.
 
 
-**Status:** OPEN
+**A second report of the same question, from a different seat.**
 
 Orchestrator, 2026-08-06, after telling the owner that delegates were working
 when **3 of ~33 processes** were actually mid-turn, and being corrected by him.
@@ -25398,4 +25527,135 @@ the local one, and nothing separates them.
 row that never offered the resume — and, on a row that IS resumable, a normal attach with its
 history intact.
 
+
+## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
+
+**Status:** OPEN
+
+Two agent rows lost their process during a cross-CLI greeting run. Neither death was
+recorded anywhere, and every instrument that a fleet verb consults kept describing them
+as healthy:
+
+    owned_terminal_session_count      4      ← the daemon knows
+    live_terminal_sessions          5 entries ← the list does not
+    server rows departed              0      ← the ONE owner of "where did it go and why"
+    server app rows                 live_member:true, presence:live_rail,
+                                    wedge_suspected:false, busy_reason:"idle"
+    server screen                   "no session here matches …"
+
+⛔ **`busy_reason:"idle"` is the specific danger.** Idle is the green light every
+delivery verb waits for, so a brief aimed at a dead row passes the readiness gate,
+writes into nothing, and the row then has no transcript — which routes it straight to
+the reap. `ygg-fold` decides DEAD by *"uuid not in live"*, and the uuid IS in live, so
+the seat is never reclaimed either: it is held forever by a process that does not exist.
+
+⚖ **The count is its own witness**, and that is what makes this cheap to detect: owned
+and live disagreed by exactly the number of dead rows, both times. Whatever removes a
+PTY from the owned set already knows; nothing tells the live list or the ledger.
+
+⇒ Recommended: make the departure ledger the single place a row's disappearance is
+recorded, and derive `live_member` from PTY ownership rather than from a list that is
+only ever appended to. Until then a sweep cannot distinguish a working lane from a
+corpse, which is the assumption every watchdog in the fleet is built on.
+
+⚠ Observed in a headless sandbox (`YGGTERM_HOME` + Xvfb, recipe in the field guide).
+The rendering half of that environment does not travel to a desktop; the daemon half is
+the same binary the fleet runs everywhere, and the ledger and the owned/live split are
+both daemon-side. **Reproduce on a desktop before assuming the scope is wider than the
+evidence.**
+
+
+**Status:** OPEN
+
+`ygg-deliver`'s reap destroys a row whose transcript is ABSENT, on the stated premise
+that such a row *"has never written a word, so it was never briefed and cannot become
+anything"*. Measured during the greeting run: a codex row that had been briefed, had
+run a shell command, and had reported its result **had written no transcript at all**
+— no store file existed for it twenty minutes after birth.
+
+⚖ The premise is calibrated on one CLI. `ygg-spawn` allows 90 s of transcript lag from
+a measurement taken on a CLI that accepts a caller-supplied session id, so its row id
+IS its transcript id from the first byte. Four registered CLIs declare
+`id_assigned_at_birth: false`; they mint their own id and write on their own schedule,
+and until then the row's id addresses nothing. ABSENT is literally true for them and
+the inference drawn from it is false.
+
+⛔ **Not fixed by the FOUND/ABSENT/UNMEASURABLE split**, deliberately — that separated
+"we did not look" from "we looked", and this is a case where we looked in the right
+place and the answer is still not evidence.
+
+⇒ Recommended, and NOT taken here because it needs a measurement this lane does not
+have: find out how long after birth each `id_assigned_at_birth:false` CLI first writes
+a store file, and treat ABSENT inside that window as UNMEASURABLE. **Do not guess the
+threshold** — too short destroys working lanes, too long lets briefless debris hold
+seats, and both failures are silent. A cheaper interim that needs no timing at all:
+ask whether the row has a live agent PROCESS before destroying it, since a row with one
+has manifestly not failed to be born.
+
+## ⛔ [99.1·99.2] A COMPOSER'S PLACEHOLDER HINT IS COUNTED AS AN UNSENT DRAFT
+
+**Status:** OPEN
+
+*Root-caused 2026-08-22 and deliberately not fixed here: the repair is in the daemon's
+composer reader, and this lane's scope was the fleet verbs. The root cause is below,
+which is the expensive half.*
+
+Rows are reported as holding a composer draft on planes where nothing has ever been
+typed into them. `terminal submit` therefore refuses the FIRST message a row is ever
+sent — its brief — with `submitted:false` and *"the composer holds an unsent draft —
+refusing to probe, because the probe types a marker and clears the line with Ctrl+U
+and would destroy it"*, and `input-check` answers `consuming_input:false` for the same
+reason.
+
+⛔ **The refusal is correct behaviour on a wrong reading, which is why it is dangerous.**
+The law forbids retrying `submitted:false`, so a spawner that hits this has no way to
+brief the row it just created, and the row then routes to the reap as never-briefed.
+`send` plus a lone carriage return delivers past it, but that path has no draft guard at
+all — it is the workaround, not the fix.
+
+### The root cause, measured in a sandbox on 2026-08-22
+
+`session_composer_holds_draft` is the UNION of two arms — a keystroke counter and the
+rendered grid — and either saying "there is text there" is enough to refuse. The grid
+arm is `yggterm_core::composer_row_holds_text`, which finds the composer marker on the
+composer row and returns true when **anything at all** follows it:
+
+    let head = text[marker.len_utf8()..].trim();
+    return Some(!head.is_empty() || !content.trim().is_empty());
+
+⇒ **A CLI that draws a placeholder hint on its composer row when the composer is empty
+is indistinguishable, at that line, from a person mid-sentence.** Replayed over the
+rendered rows of an idle agent row that had just COMPLETED a turn, the marker's `head`
+was that CLI's suggestion text, so the arm returns true — and keeps returning it, for
+as long as the hint is drawn.
+
+**The other arm is excluded, and this is what makes it a root cause rather than a
+suspicion:** a second row of a different CLI reported `composer_held_draft:true` when
+not one byte had ever been written to it by anything — no send, no submit, no probe —
+so the keystroke counter cannot be what produced it.
+
+⚖ **The entry this replaces called the trigger "something about a NEW row". It is not.**
+It is what the CLI paints on that line, so it lasts exactly as long as the hint does:
+transient for a CLI that clears it after boot, and observed persisting through a
+completed turn for one that does not. **The earlier live census — 4 drafts across 36
+owned sessions — was not re-measured here**, so how much of the fleet this reaches is
+still open; the per-CLI shape of the hint decides it, not the age of the row.
+
+⇒ Recommended: the grid arm must distinguish CHROME on the composer row from CONTENT.
+The same file already has `composer_row_is_chrome` for rows BELOW the composer and a
+per-CLI `composer_footer_hints` list feeding it; a per-CLI `composer_placeholder_hints`
+is the shape that already exists here. ⛔ **Do not fix it by dropping the grid arm** —
+it is there because the keystroke counter is zeroed by a daemon handover, and the two
+cover each other. ⛔ And do not widen it to "ignore any short line": a person's
+half-typed sentence starts short.
+
+**What would falsify it being fixed:** an idle agent row of a CLI that draws a
+placeholder, on a plane where nothing has been typed, answering `composer_held_draft:
+false` — while a row with one real character typed into it still answers `true`.
+
+⭐ **It is now rehearsable without a desktop.** A sandbox `YGGTERM_HOME` + GUI reproduces
+it in about four minutes (recipe: field guide; aiming the verbs: fleet skill §11.9),
+which is how it was root-caused.
+
+**A second report of the same question, from a different seat.**
 
