@@ -3906,6 +3906,23 @@ route facts, a clean `session_end`). Skipping them from a session list is right;
 reading the index row as "this file is empty" is not, and **it must never drive
 a delete.**
 
+### ⛔ OPENCODE: TWO packages share one tag name — the row you drive is `opencode2` (fixed 2026-08-28)
+
+OpenCode's v2 preview ships as the npm package **`@opencode-ai/cli`** (bin
+`opencode2`, build-numbered versions `0.0.0-beta-<n>`, beta tag moves); the
+UNSCOPED `opencode-ai@beta` is the abandoned v1 line (date-stamped
+`0.0.0-beta-<date>`, frozen upstream). The managed install pinned the right
+TAG on the WRONG package for days and every integrated row served a stale
+build while terminals ran the fresh one — symptom: `opencode --version` in a
+row disagrees with `opencode2 --version` in a shell. Fixed in
+`agent_cli.rs` (descriptor: binary_name `opencode2`, package `@opencode-ai/cli`,
+tag `beta`) with a regression lock; `npm_dist_tag` is policy, the PACKAGE is
+the pin. Verify your row's lineage from the binary, never the name:
+`readlink /proc/<pid>/exe` must name `@opencode-ai/cli`. The same-name trap
+has a second face on PATH: a user's `~/.opencode/bin` carries BOTH `opencode`
+(v1 stable) and `opencode2` (preview) — typing `opencode` gets v1, so address
+the CLI the descriptor declares, not the one the banner reminds you of.
+
 ---
 
 ## 11.9 ⭐ REHEARSE A VERB BEFORE IT DECIDES SOMETHING — aim it at a sandbox
