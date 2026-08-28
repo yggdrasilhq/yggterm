@@ -68,7 +68,9 @@ old deploy checkout — same class, lower rate, worth a look in the fleet lane.
 
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
-**Status:** OPEN
+**Status:** OPEN — **ROOT CAUSE FOUND (owner-caught live 2026-08-28); fix on
+`lane/dev/pass0-identity` (`3c50684e`), unmerged. The display-plane hardening
+(kind on the wire, Unknown-never-Codex, persistence refusal) is on the same lane.**
 
 **The owner's report (2026-08-28, verbatim intent):** plain SHELL sessions transform
 one by one into EMPTY CODEX sessions after launch; some stay shells while most
@@ -121,9 +123,44 @@ per kind read/write per row (`who set it, when, from what input`), so the flip
 names itself; (b) replace every `unwrap_or(SessionKind::Codex)` with an explicit
 Unknown/Shell resolution and a regression lock per site; (c) make the persistence
 re-derivation refuse (loudly) when it would change a shell's kind. **The
-falsifier** for whichever mechanism is real: reproduce the owner's recipe — the
-report's "one by one" says a sequential chore, so watch a fresh shell across a
-mount and across a GUI restart before believing any static reading.
+falsifier** for whichever mechanism is real: ~~reproduce the owner's recipe~~ —
+**DONE, he caught it live**: a GUI restart flipped both `live::` ssh-shell rows
+to codex. **ROOT CAUSE FOUND** — see the Status block at the top; the "one by
+one" reading was wrong — it was one restart, every SshShell row at once.
+
+## THE MECHANISM, live-caught 2026-08-28 (owner watching the restart)
+
+yggterm restarted on the GUI host and BOTH `live::` plain ssh-shell rows came
+back as CODEX rows, retitled to the codex birth name ("New dev Terminal"),
+their human titles gone. Persisted state captured mid-fault: `kind: codex`,
+EMPTY storage, `live::` keys.
+
+Two halves, both in `restore_live_session`:
+
+1. **An explicit `SshShell => Codex` arm** in the kind normalization — a relic
+   of the era when `live::` keys were codex runtime keys, written long before
+   the remote plain-shell scan made SshShell a persisted kind. **`36dbc458`
+   (Aug 24, the managed-CLI fetcher work) moved the normalization block ABOVE
+   the rekey decision**, so the arm stopped merely relabelling the row and
+   RE-KEYED it onto the codex runtime lane (`restored_local_runtime_id` +
+   `live_row_rekeys_onto_local_runtime` consume the normalized kind). That is
+   the transform: not a display accident — a re-key.
+2. **The persist side then wrote `kind: codex` into the record**, so the poison
+   rode every later restart. The stored file — not just the running process —
+   was carrying the wrong identity.
+
+The fix (lane `3c50684e`): the arm is gone — the persisted kind is the newest
+truth about a row; the Storage re-derivation also refuses over Shell/SshShell
+(a Storage stamp on a shell is itself a wiring fault); locked by
+`an_ssh_shell_row_restores_an_ssh_shell_and_never_rekeys_onto_codex`.
+
+**Remedy for the poisoned records:** the persisted records now say codex, so the
+fix alone will not heal them — a restart with the fix restores what is
+persisted (codex). The two rows are plain ssh shells (no agent content); once
+the fix merges, remove the two husks and open fresh ssh terminals, or repair
+the records in `server-state.json` in a daemon-down window.
+
+The display-plane suspects below remain hardening, not the root cause:
 
 ## ⛔ [11.0] A LIVE AGENT ROW CAN ADDRESS ITS CLI BY A UUID THE CLI NEVER MINTED — EVERY RESUME MINTS AN EMPTY CONVERSATION (PASS 0 ITEM 2)
 
