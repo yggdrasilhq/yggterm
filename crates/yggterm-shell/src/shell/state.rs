@@ -44906,10 +44906,14 @@ fn merge_hot_sidebar_sessions(
 
 fn session_kind_for_row(row: &BrowserRow) -> SessionKind {
     match row.kind {
-        BrowserRowKind::Session => row_session_kind(row).unwrap_or(SessionKind::Codex),
+        // ⛔ Shell, never Codex, when nothing names the CLI — see
+        // `session_kind_for_scanned_row`. This kind drives the OPEN path
+        // (`open_stored_session`), so the old `unwrap_or(SessionKind::Codex)`
+        // sent every unattributable row's click down the CODEX resume path.
+        BrowserRowKind::Session => row_session_kind(row).unwrap_or(SessionKind::Shell),
         BrowserRowKind::Document => SessionKind::Document,
-        BrowserRowKind::Group => SessionKind::Codex,
-        BrowserRowKind::Separator => SessionKind::Codex,
+        // A group or a separator is not a session and must never open one.
+        BrowserRowKind::Group | BrowserRowKind::Separator => SessionKind::Shell,
     }
 }
 fn session_kind_action_label(kind: SessionKind) -> &'static str {
@@ -55077,6 +55081,7 @@ fn remote_scanned_session_from_live(
     let user_message_count = counted.map(|c| c.user).unwrap_or(preview_user);
     let assistant_message_count = counted.map(|c| c.assistant).unwrap_or(preview_assistant);
     RemoteScannedSession {
+        kind: None,
         session_path: session.session_path.clone(),
         session_id: session_id.to_string(),
         cwd,
@@ -55355,9 +55360,18 @@ fn remote_scanned_session_label_with_saved_title(
     }
     // The kind comes from the row's own scheme. It used to be hardcoded to
     // Codex, so a muse or agy row that reached this line was humanized as a
-    // Codex session — a second CLI's name on a first CLI's row.
+    // Codex session — a second CLI's name on a first CLI's row. An
+    // unattributable path (a plain `local://` shell row) humanizes as a SHELL
+    // for the same reason: never name a row after a CLI it did not name.
     let kind = yggterm_core::agent_scheme::session_kind_for_path(&session.session_path)
-        .unwrap_or(SessionKind::Codex);
+        .or_else(|| {
+            let trimmed = session.session_path.trim_start();
+            (trimmed.starts_with("local://")
+                || trimmed.starts_with("live::")
+                || trimmed.starts_with("ssh://"))
+            .then_some(SessionKind::Shell)
+        })
+        .unwrap_or(SessionKind::Shell);
     humanized_terminal_title(kind, &session.cwd, None)
         .filter(|title| !memoized_generated_fallback_title(title))
         // ⛔ A ROW WITH NO TURNS YET IS NOT UNTITLED — IT IS NEW, and the CLI's

@@ -1473,13 +1473,38 @@ fn persisted_live_session_from_managed(
             && local_live_session_kind_is_recoverable(session.kind))
         .then(|| "localhost".to_string())
     });
-    let resolved_kind = if let Some(storage_path) = storage_path.as_deref()
-        && let Some(correct_kind) = yggterm_core::agent_scheme::session_kind_for_row(storage_path, "")
-    {
-        correct_kind
+    // ⛔ A PLAIN SHELL ROW'S KIND IS NOT UP FOR RE-DERIVATION. Shells keep no
+    // transcript, so a `Storage` stamp on a shell row is itself a wiring fault
+    // (Pass 0, pending-bugs "A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX
+    // SESSION") — and reading it as the row's kind is how a stamped shell came
+    // back from a restart as an agent row of the stamp's CLI, resuming a
+    // session that does not exist. Shell kinds survive persistence untouched;
+    // the stamped ones say so on the identity trace instead of propagating.
+    let shell_kind_cannot_be_rederived =
+        matches!(session.kind, SessionKind::Shell | SessionKind::SshShell);
+    let rederived_kind = if shell_kind_cannot_be_rederived {
+        None
+    } else if let Some(storage_path) = storage_path.as_deref() {
+        yggterm_core::agent_scheme::session_kind_for_row(storage_path, "")
     } else {
-        session.kind
+        None
     };
+    if shell_kind_cannot_be_rederived && storage_path.is_some() {
+        if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "cli",
+                "identity_persistence_refused_rederive",
+                serde_json::json!({
+                    "session_path": session.session_path,
+                    "kept_kind": session.kind,
+                    "storage_path": storage_path,
+                }),
+            );
+        }
+    }
+    let resolved_kind = rederived_kind.unwrap_or(session.kind);
     ssh_target.map(|ssh_target| PersistedLiveSession {
         key: key.to_string(),
         id: session.id.clone(),
@@ -2783,12 +2808,51 @@ pub(crate) fn overlay_codex_runtime_snapshot_identity(
     }
 }
 
+/// ONE door for the Pass 0 identity-provenance trace (`cli/identity_*`).
+///
+/// Every fault in the identity family — rows addressed by ids their CLI never
+/// minted, rows wearing another CLI's kind — hid inside a write nobody
+/// witnessed. This event is the witness: it fires whenever a row's identity is
+/// REWRITTEN (birth id → CLI id) or a rewrite is REFUSED (a persistence stamp
+/// that would change a shell's kind), with both spellings so the diff is
+/// readable straight off the trace.
+pub(crate) fn emit_identity_trace(
+    event: &str,
+    session_path: &str,
+    from_id: Option<&str>,
+    to_id: &str,
+) {
+    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "cli",
+            event,
+            serde_json::json!({
+                "session_path": session_path,
+                "from_id": from_id,
+                "to_id": to_id,
+            }),
+        );
+    }
+}
+
 pub(crate) fn overlay_claude_code_runtime_managed_identity(
     session: &mut ManagedSessionView,
     identity: &ClaudeCodeRuntimeProcessIdentity,
 ) {
     if session.kind != SessionKind::ClaudeCode {
         return;
+    }
+    // IDENTITY PROVENANCE (Pass 0): the birth id → CLI id rewire is exactly
+    // the write every identity fault hides inside, so it names itself here.
+    if session.id != identity.session_id {
+        emit_identity_trace(
+            "identity_runtime_overlay",
+            &session.session_path,
+            Some(&session.id),
+            &identity.session_id,
+        );
     }
     let runtime_key = session.session_path.clone();
     let title_was_generated = session.title.trim().is_empty()
@@ -2830,6 +2894,15 @@ pub(crate) fn overlay_codex_runtime_managed_identity(
 ) {
     if session.kind != SessionKind::Codex {
         return;
+    }
+    // IDENTITY PROVENANCE (Pass 0) — see the Claude Code twin above.
+    if session.id != identity.session_id {
+        emit_identity_trace(
+            "identity_runtime_overlay",
+            &session.session_path,
+            Some(&session.id),
+            &identity.session_id,
+        );
     }
     let runtime_key = session.session_path.clone();
     let title_was_generated = session.title.trim().is_empty()
@@ -2998,6 +3071,8 @@ fn remote_scanned_session_from_live_codex(
     let scheme_path = yggterm_core::agent_scheme::remote_agent_session_path(session.kind, machine_key, &session_id);
     Some(RemoteScannedSession {
         session_path: scheme_path,
+        // The live row's kind is the fact this mirror exists to carry.
+        kind: Some(session.kind),
         session_id,
         cwd,
         started_at: metadata_value(session, "Started"),
@@ -3366,6 +3441,19 @@ pub struct RemoteScannedSession {
     pub cached_summary: Option<String>,
     #[serde(default)]
     pub live_runtime: bool,
+    /// The kind the SCANNING daemon knew this session to be, or `None` when the
+    /// peer spoke a payload older than the field.
+    ///
+    /// ⛔ **`None` means UNKNOWN, never Codex.** The consumers of this struct
+    /// used to derive kind from `session_path` alone and mint `SessionKind::Codex`
+    /// for anything the scheme registry could not name — which labelled the
+    /// remote machines' plain shell rows (no scheme kind, no transcript) as
+    /// empty Codex sessions in every tree and start page the GUI host renders.
+    /// Resolve `None` through
+    /// [`yggterm_core::agent_scheme::session_kind_for_scanned_row`], never with
+    /// a bare `unwrap_or`.
+    #[serde(default)]
+    pub kind: Option<crate::SessionKind>,
     /// Whether `title_hint` is a name a HUMAN chose.
     ///
     /// ⛔ The mirror needs its own provenance because it OUTLIVES the live row.
@@ -17211,6 +17299,9 @@ fn load_remote_machine_sessions_from_mirror(
         };
         Ok(RemoteScannedSession {
             session_path,
+            // The metadata mirror predates per-row kind; `None` is honest and
+            // the consumers fall back to the path resolver.
+            kind: None,
             session_id,
             cwd: row.get(1)?,
             started_at: row.get(2)?,
@@ -19723,6 +19814,9 @@ fn scan_remote_cli_sessions(
                 };
                 scanned.push(RemoteScannedSession {
                     session_path,
+                    // This loop scans ONE CLI's store (the `kind` in the path
+                    // above) — the kind is known and said so.
+                    kind: Some(kind),
                     title_hint,
                     session_id: summary.session_id,
                     cwd: summary.cwd,
@@ -19799,6 +19893,9 @@ fn remote_scanned_session_from_durable(
         yggterm_core::remote_agent_session_path(row.kind, machine_key, &row.session_id);
     RemoteScannedSession {
         session_path,
+        // The durable projection is where the kind is KNOWN — carry it rather
+        // than making every consumer re-derive it from the path spelling.
+        kind: Some(row.kind),
         title_hint: row.effective_title.unwrap_or_default(),
         session_id: row.session_id,
         cwd: row.cwd,
@@ -19889,6 +19986,9 @@ fn scan_remote_machine_sessions(
         let sanitized_recent_context = sanitize_recent_context_payload(&summary.recent_context);
         sessions.push(RemoteScannedSession {
             session_path: remote_scanned_session_path(&machine_key, &summary.id),
+            // The historical `server remote scan` reads the codex rollout
+            // store only — every line here IS codex; say so on the wire.
+            kind: Some(crate::SessionKind::Codex),
             session_id: summary.id.clone(),
             cwd: summary.cwd,
             started_at: summary.started_at,
@@ -31350,9 +31450,10 @@ fn synthesize_remote_scanned_session_view(
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
-    let derived_kind = parse_remote_agent_session_path_with_kind(&scanned.session_path)
-        .map(|(_, _, kind)| kind)
-        .unwrap_or(SessionKind::Codex);
+    let derived_kind = yggterm_core::agent_scheme::session_kind_for_scanned_row(
+        &scanned.session_path,
+        scanned.kind,
+    );
     let target = SshConnectTarget {
         label: machine.label.clone(),
         kind: derived_kind,
@@ -31405,9 +31506,10 @@ fn synthesize_remote_scanned_preview_session_view(
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
-    let derived_kind = parse_remote_agent_session_path_with_kind(&scanned.session_path)
-        .map(|(_, _, kind)| kind)
-        .unwrap_or(SessionKind::Codex);
+    let derived_kind = yggterm_core::agent_scheme::session_kind_for_scanned_row(
+        &scanned.session_path,
+        scanned.kind,
+    );
     let resolved_title = if scanned.title_hint.trim().is_empty() || looks_like_generated_fallback_title(&scanned.title_hint) {
         String::new()
     } else {
@@ -33105,6 +33207,7 @@ mod tests {
 
     fn scanned_row(session_path: &str, session_id: &str) -> super::RemoteScannedSession {
         super::RemoteScannedSession {
+            kind: None,
             session_path: session_path.to_string(),
             session_id: session_id.to_string(),
             cwd: "/home/user".to_string(),
@@ -35472,6 +35575,7 @@ mod tests {
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path,
                 session_id: session_id.to_string(),
                 cwd: "/home/user/gh/yggterm".to_string(),
@@ -36164,6 +36268,7 @@ mod tests {
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: session_path.to_string(),
                 session_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
                 cwd: "/home/operator/workspace".to_string(),
@@ -36909,6 +37014,35 @@ mod tests {
             identity_restamp < re_derivation,
             "the command re-derivation must sit with the identity re-stamp, not \
              back inside the transcript branch where no app row ever reaches it"
+        );
+    }
+
+    /// ⛔ THE PASS 0 LOCK (pending-bugs "A PLAIN SHELL ROW CAN SURFACE AS AN
+    /// EMPTY CODEX SESSION"). The persistence path re-derives kind from the
+    /// `Storage` metadata. A shell keeps no transcript, so a Storage stamp on a
+    /// shell row is a wiring fault — and re-deriving from it restored the shell
+    /// AS the stamp's CLI, resuming a session that does not exist. The kind of
+    /// a shell row must survive persistence untouched.
+    #[test]
+    fn a_shell_row_is_never_rederived_into_an_agent_by_its_storage_stamp() {
+        let mut server = test_server();
+        let key = server.start_local_session(SessionKind::Shell, Some("/home/user"), None);
+        if let Some(session) = server.sessions.get_mut(&key) {
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Storage",
+                "/home/user/.codex/sessions/rollout-0197c95a-0000-7000-8000-00000000000f.jsonl"
+                    .to_string(),
+            );
+        }
+        let session = server.sessions.get(&key).expect("the shell row");
+        let record = persisted_live_session_from_managed(&key, session, true, None, false)
+            .expect("a local shell row must persist");
+        assert_eq!(
+            record.kind,
+            SessionKind::Shell,
+            "a stamped shell was persisted as the stamp's CLI — the empty-codex \
+             transform, riding persistence"
         );
     }
 
@@ -40170,6 +40304,7 @@ terminal_window_id: None,
             // session, so it says so, and the launch-refresh assertions below
             // now rest on a stated fact instead of on the fallback.
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: remote_scanned_session_path(
                     "guihost",
                     "019d09a4-c69e-7071-bd9a-8834060029a9",
@@ -40410,6 +40545,7 @@ terminal_window_id: None,
         }
 
         let sessions = vec![RemoteScannedSession {
+            kind: None,
             session_path: remote_scanned_session_path("guihost", "abc123"),
             session_id: "abc123".to_string(),
             cwd: "/srv/app".to_string(),
@@ -40882,6 +41018,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: remote_scanned_session_path(
                     "guihost",
                     "019cf00a-57bd-7480-a642-495ac1389b8e",
@@ -41086,6 +41223,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: remote_scanned_session_path("dev", session_id),
                 session_id: session_id.to_string(),
                 cwd: "/home/user/gh/yggterm".to_string(),
@@ -41485,6 +41623,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_id: "019cf00a-57bd-7480-a642-495ac1389b8e".to_string(),
                 session_path: "remote-session://guihost/019cf00a-57bd-7480-a642-495ac1389b8e"
                     .to_string(),
@@ -42291,6 +42430,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: path.clone(),
                 session_id: "abc".to_string(),
                 cwd: "/home/user/gh/yggterm".to_string(),
@@ -42819,6 +42959,7 @@ terminal_window_id: None,
             "head".to_string(),
         );
         let scanned = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://guihost/abc123".to_string(),
             session_id: "abc123".to_string(),
             cwd: "/home/user".to_string(),
@@ -42874,6 +43015,7 @@ terminal_window_id: None,
             "tail".to_string(),
         );
         let scanned = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://guihost/tail123".to_string(),
             session_id: "tail123".to_string(),
             cwd: "/home/user".to_string(),
@@ -42919,6 +43061,7 @@ terminal_window_id: None,
             StoredPreviewHydrationMode::Deferred,
         );
         let scanned = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://guihost/abc123".to_string(),
             session_id: "abc123".to_string(),
             cwd: "/home/user".to_string(),
@@ -42968,6 +43111,7 @@ terminal_window_id: None,
             StoredPreviewHydrationMode::Deferred,
         );
         let scanned = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://dev/019d0000-0000-7000-8000-000000000001".to_string(),
             session_id: "019d0000-0000-7000-8000-000000000001".to_string(),
             cwd: "/home/user/git/samplenotes".to_string(),
@@ -43005,6 +43149,7 @@ terminal_window_id: None,
             StoredPreviewHydrationMode::Deferred,
         );
         let scanned = RemoteScannedSession {
+            kind: None,
             session_path: "remote-session://dev/019d0000-0000-7000-8000-000000000001".to_string(),
             session_id: "019d0000-0000-7000-8000-000000000001".to_string(),
             cwd: "/home/user/git/samplenotes".to_string(),
@@ -43205,6 +43350,7 @@ terminal_window_id: None,
     fn dedupe_remote_scanned_sessions_prefers_richer_newer_entry() {
         let sessions = vec![
             RemoteScannedSession {
+                kind: None,
                 session_path: remote_scanned_session_path("oc", "abc123"),
                 session_id: "abc123".to_string(),
                 cwd: "/home/user".to_string(),
@@ -43222,6 +43368,7 @@ terminal_window_id: None,
                 storage_path: "/one.jsonl".to_string(),
             },
             RemoteScannedSession {
+                kind: None,
                 session_path: remote_scanned_session_path("oc", "abc123"),
                 session_id: "abc123".to_string(),
                 cwd: "/home/user".to_string(),
@@ -43319,6 +43466,7 @@ terminal_window_id: None,
                     remote_deploy_state: RemoteDeployState::Ready,
                     health: RemoteMachineHealth::Healthy,
                     sessions: vec![RemoteScannedSession {
+                        kind: None,
                         session_path: active_path.clone(),
                         session_id: "abc123".to_string(),
                         cwd: "/home/user/gh/yggterm".to_string(),
@@ -43384,6 +43532,7 @@ terminal_window_id: None,
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
                 sessions: vec![RemoteScannedSession {
+                    kind: None,
                     session_path: active_path.clone(),
                     session_id: "abc123".to_string(),
                     cwd: "/home/user/gh/yggterm".to_string(),
@@ -43643,6 +43792,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: remote_path.clone(),
                 session_id: "abc123".to_string(),
                 cwd: "/home/user/gh/yggterm".to_string(),
@@ -45450,6 +45600,7 @@ terminal_window_id: None,
                     health: RemoteMachineHealth::Healthy,
                     sessions: vec![
                         RemoteScannedSession {
+                            kind: None,
                             session_path: first_path.clone(),
                             session_id: "abc123".to_string(),
                             cwd: "/srv/dev/one".to_string(),
@@ -45467,6 +45618,7 @@ terminal_window_id: None,
                             storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
                         },
                         RemoteScannedSession {
+                            kind: None,
                             session_path: second_path.clone(),
                             session_id: "def456".to_string(),
                             cwd: "/srv/dev/two".to_string(),
@@ -47227,6 +47379,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Planned,
             health: RemoteMachineHealth::Cached,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: "remote-session://dev/abc123".to_string(),
                 session_id: "abc123".to_string(),
                 cwd: "/srv/app".to_string(),
@@ -47953,6 +48106,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: "remote-session://dev/fresh-codex".to_string(),
                 session_id: "fresh-codex".to_string(),
                 cwd: "/home/user/gh/yggterm".to_string(),
@@ -48153,6 +48307,7 @@ terminal_window_id: None,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![
                 RemoteScannedSession {
+                    kind: None,
                     session_path: remote_scanned_session_path("guihost", "live-1"),
                     session_id: "live-1".to_string(),
                     cwd: "/home/user".to_string(),
@@ -48170,6 +48325,7 @@ terminal_window_id: None,
                     storage_path: "/home/user/.codex/sessions/live-1.jsonl".to_string(),
                 },
                 RemoteScannedSession {
+                    kind: None,
                     session_path: remote_scanned_session_path("guihost", "live-2"),
                     session_id: "live-2".to_string(),
                     cwd: "/srv/app".to_string(),
@@ -48258,6 +48414,7 @@ terminal_window_id: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: vec![RemoteScannedSession {
+                kind: None,
                 session_path: remote_scanned_session_path("guihost", "cached-1"),
                 session_id: "cached-1".to_string(),
                 cwd: "/home/user".to_string(),
@@ -49227,6 +49384,7 @@ terminal_window_id: None,
             sessions: Vec::new(),
         };
         let scanned = RemoteScannedSession {
+            kind: None,
             session_path: remote_scanned_session_path("oc", "abc123"),
             session_id: "abc123".to_string(),
             cwd: "/srv/app".to_string(),
