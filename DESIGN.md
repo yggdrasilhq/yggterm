@@ -16,6 +16,28 @@ When this file is copied into another repo, the default move is:
 
 Do not bury project-only nouns in the reusable sections.
 
+## The design system, exhibited (ydesign)
+
+This file is the prose constitution. Its **exhibition** — the components and
+canonical patterns rendered live, as screenshot-able notebooks — is the
+libyggterm app `ydesign` (`yggdrasilhq/ydesign`, run `ydesign` inside
+yggterm). Any design work in this repo or any libyggterm app consults it:
+
+- **Start here** — the layer ladder (Dioxus → yggui → app → project
+  overlay), the consultation ladder (fall through a layer; grow the lower
+  layer when a component is missing; never a second encoding), and the
+  pixel-proof habit.
+- **Component gallery / Sidebars / Forms & settings / Motion & feedback /
+  emd & notebooks** — the base language, one concern per notebook, with live
+  specimens appended to the pages that exhibit controls.
+- **Worked examples** — canonical surfaces (the Live Sessions anatomy,
+  the partitioned sidebar) rebuilt as real schemas to compare against.
+- **Roadmap** — the ledger of demanded components and filed visual defects;
+  file a divergence there before fixing it app-side.
+
+Where this file and a ydesign notebook disagree, fix the drifted layer and
+record the correction in both.
+
 ## Core System
 
 ### Brand intent
