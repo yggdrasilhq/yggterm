@@ -18,6 +18,42 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [CLI] OPENCODE2 SELF-MINTS `ses_…` IDS — THE STORE PROBE CANNOT SEE YGGTERM ROWS (identity rebind owed)
+
+**Status:** OPEN
+
+**Root cause, measured 2026-08-28 (owner-caught live: "the CLI integrated row is
+unusable").** opencode2 (the v2 preview, `@opencode-ai/cli`) ignores yggterm's
+`--session <row-uuid>` and mints its own ids (`ses_…`) in
+`~/.local/share/opencode/opencode.db` — a fresh check of the store found zero
+rows matching a live row's uuid and three `ses_…` rows. Every store-keyed
+half therefore answers about the wrong id: `<slug>-session-exists` for a live
+row returned **absent**, the focus sweep marked it `Saved Session: missing`,
+and `remote_saved_session_launch_blocked_reason` refused every later launch —
+a daemon hot-restart bricked the row while its PTY stayed alive and the agent
+inside kept working. The owner had to spawn a plain shell row to keep working.
+
+**Landed same day (`19b53996`):** a held live runtime now outranks the store
+probe — `remote_require_existing_refusal_allowed` in `ensure_remote_runtime_
+agent_session` (no refusal, resume command never the picker) and the focus
+sweep skips/retracts the missing-mark for live rows, with the regression lock
+`a_live_runtime_row_cannot_be_refused_on_a_store_absence`. The wrappers
+(`resume-<slug>`) already had the live-first arm; only the probe-first callers
+were broken.
+
+**What remains open (this entry):** the identity rebind. opencode2 must be
+declared self-minting (`id_assigned_at_birth: false`) and the runtime-identity
+rebind (the Issue 16 machinery, fleet-wide since the muse/antigravity fixes)
+must discover the row's real `ses_…` id from the v2 store — via the opencode
+service API (`GET /api/session` / `/api/session/active`), not the DB schema,
+which is private. Until then a COLD resume of a v2 session (PTY gone, GUI
+gone) can never work: `--session <row-uuid>` names an id the store never held.
+This rebind is also the prerequisite for the Issue 26 tab→row mirror, whose
+per-tab rows need exactly these `ses_…` ids as their CLI-side handle.
+
+**Not covered:** v1-line opencode (`opencode-ai`, abandoned) kept the old
+behavior; no store schema is parsed or written; no transcript is copied.
+
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

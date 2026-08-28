@@ -808,6 +808,43 @@ not parse opencode transcripts into the viewport, does not promote the opencode
 service to an observer of yggterm row state, and does not ask yggterm to render
 the tab bar itself — the TUI keeps its chrome; we mirror presence, not pixels.
 
+### Issue Heading 27: opencode2 self-mints `ses_…` ids — a store probe false-deathed a live row (gate fixed; rebind owed)
+
+**Owner-caught live 2026-08-28**, minutes after Issue 26 was written. After a
+routine daemon hot-restart, switching to a live remote opencode2 row never
+restored it: the viewport kept stale pixels, the "Resuming Remote Terminal"
+toast never cleared, and three switch attempts changed nothing. The agent
+inside the row kept working the whole time — the owner routed around his own
+row through a plain shell row.
+
+**Root cause (two halves).** (1) *Identity:* the v2 preview ignores yggterm's
+`--session <row-uuid>` and mints its own `ses_…` ids in its SQLite store — the
+row uuid is never stored, so every store-keyed half answers about a phantom.
+(2) *Gate order:* the restore path probed the store BEFORE attempting the
+resume; the probe answered "absent", the row was marked
+`Saved Session: missing`, and a sticky mark refused every later launch. The
+resume wrapper's own live-runtime arm — which bridges the held PTY and never
+needs the transcript — would have succeeded; it was never allowed to run. The
+sweep's own trace field said `live_runtime_truth_beats_transcript_metadata`
+while the code let transcript truth kill the live row: the policy and the
+branch disagreed, and the trace was the only honest one.
+
+**Landed (`19b53996`):** a daemon-held live runtime row now outranks the store
+probe wherever `--require-existing` is enforced probe-first
+(`remote_require_existing_refusal_allowed` + the sweep skip/retract), and a
+held row re-attaches through the resume command — never the resume picker,
+whose keystrokes would drive a running TUI. Regression lock:
+`a_live_runtime_row_cannot_be_refused_on_a_store_absence`.
+
+**Still open:** the identity rebind (see `pending-bugs.md` [CLI] entry) —
+`id_assigned_at_birth: false` for opencode2 plus store→row mapping through the
+opencode service API. Cold resume of a v2 session cannot work until then, and
+the Issue 26 tab mirror needs the same `ses_…` ids as its CLI-side handle.
+
+**Not covered:** does not change the wrapper verbs' contract (they already
+took the live arm first), does not parse or write the v2 store schema, does
+not alter v1-line opencode.
+
 ## 3. Inventory — which spec/doc now lives where
 
 * `spec-cli-integration-verification.md` — the **harness** (verb + oracle pattern, `AGENT_CLIS` SSOT, adding a CLI is one descriptor).
