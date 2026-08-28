@@ -185,6 +185,15 @@ are profiling).
   on its birth id without another state change. `projection` carries no title
   text, only title quality and kind/icon agreement; the sweep names every
   registered CLI even when its row count is zero.
+- **`identity_*` events are the identity-provenance witnesses** (Pass 0):
+  `identity_runtime_overlay` fires whenever a row's birth id is REWRITTEN to the
+  real CLI id (codex/claude overlays) — `from_id`/`to_id` both named, so a row
+  still answering on its birth id is visible by ABSENCE; and
+  `identity_persistence_refused_rederive` fires when persistence declines to
+  re-derive a shell row's kind from a Storage stamp (a stamp on a shell is
+  itself a wiring fault — read it, don't propagate it). A kind flip with NEITHER
+  event in the trace did not happen through a witnessed write — suspect a path
+  reader, not the daemon.
 - Fleet durable-projection drift has its own content-free pair of probes:
   `server/remote_machine/durable_projection_source` says whether each applied
   machine refresh came from `core_ssot` or the rolling-upgrade
