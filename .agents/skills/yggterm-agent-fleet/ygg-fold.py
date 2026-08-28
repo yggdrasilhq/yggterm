@@ -41,11 +41,20 @@ import time
 
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ygg_appctl  # noqa: E402
 import ygg_transcript  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RELAY = os.path.expanduser("~/.yggterm/relay")
-YGG = os.path.expanduser("~/.local/bin/yggterm-headless")
+
+#: ⛔ THE PLANE EVERY APP-CONTROL CALL HERE IS AIMED AT — machine, YGGTERM_HOME
+#: and binary. `main()` replaces it with the resolved one; the import-time value
+#: exists so a function can be imported and read without a resolution running.
+#: ⚖ It is a module global rather than a seventh parameter because a row's OWN
+#: host is already a parameter on half these functions, and the two are different
+#: questions — the aim stays constant across a sweep, the row's host does not.
+PLANE = ygg_appctl.Plane(None, os.environ.get(ygg_appctl.ENV_BIN) or ygg_appctl.DEFAULT_BIN,
+                         os.environ.get(ygg_appctl.ENV_HOME) or None)
+RELAY = PLANE.relay_dir()
 
 #: A row idle for less than this is never called finished, whatever it said. A
 #: lane often prints its closing summary and then keeps working for a minute.
@@ -111,7 +120,7 @@ def wakeable(transcript_bytes, idle_min):
     strength of the weaker test, which is how a 5 MB row gets prompted.
     """
     return transcript_bytes <= WAKEABLE_MAX_TRANSCRIPT_BYTES and idle_min <= WAKEABLE_MAX_IDLE_MIN
-WAKE_LEDGER = os.path.join(os.path.expanduser("~/.yggterm/relay"), "fold-wakes.json")
+WAKE_LEDGER = os.path.join(RELAY, "fold-wakes.json")
 
 #: ⚠ A PHRASE LIST IS A GUESS LIST, so it is deliberately NOT the whole test.
 #: It promotes an already-idle row to FINISHED; it can never fold a busy one on
@@ -152,23 +161,16 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=120, **kw)
 
 
-def gui_host():
-    r = run([os.path.join(HERE, "..", "..", "..", "scripts", "ygg-live-host.sh"), "--quiet"])
-    host = (r.stdout or "").strip()
-    return host or os.environ.get("YGG_GUI_HOST", "")
-
-
-def rows_census(host):
+def rows_census(plane):
     """ONE app-control call, and everything else is read off this machine.
 
     ⛔ Every probe against the GUI costs the person using it typing latency —
     measured at 24% of their UI-thread blocks. A sweep that asked the GUI about
     each row in turn would be the worst available shape.
     """
-    r = run(["ssh", "-n", host, f"{YGG} server app rows --json"])
-    try:
-        rows = (json.loads(r.stdout).get("data") or {}).get("rows") or []
-    except Exception:
+    reply = plane.app_json("rows --json", timeout=120)
+    rows = (reply.get("data") or {}).get("rows") or []
+    if reply.get("error"):
         log("⛔ could not read the row list — refusing to guess")
         return []
     seen, out = set(), []
@@ -187,14 +189,10 @@ def rows_census(host):
     return out
 
 
-def rows_all(host):
+def rows_all(plane):
     """Every session row, seated or not. `rows_census` keeps only seated ones
     because a SWEEP is seat-scoped by design; a single-row call is not."""
-    r = run(["ssh", "-n", host, f"{YGG} server app rows --json"])
-    try:
-        rows = (json.loads(r.stdout).get("data") or {}).get("rows") or []
-    except Exception:
-        return []
+    rows = (plane.app_json("rows --json", timeout=120).get("data") or {}).get("rows") or []
     seen, out = set(), []
     for row in rows:
         path = row.get("full_path") or ""
@@ -279,9 +277,15 @@ def screen_state(uuid, host):
     #
     # `terminal read-buffer` resolves the same rows and answers in full. It is
     # the instrument; this is now a thin classifier over it.
-    cmd = (f"{YGG} server app terminal read-buffer 'remote-cc://{host or 'dev'}/{uuid}' "
-           f"--mode screen")
-    r = run(["ssh", "-n", host, cmd]) if host else run(["bash", "-c", cmd])
+    # ⚠ The machine in the address is UNCHANGED from before this call was aimed:
+    #    a row with no host in its own uri falls back to a hardcoded machine key.
+    #    That fallback is wrong on any other fleet and is filed as its own item;
+    #    it is left exactly as it was here, because moving the aim and moving the
+    #    addressing in one change makes neither of them reviewable.
+    cmd = PLANE.at(host).shell(
+        f"server app terminal read-buffer 'remote-cc://{host or 'dev'}/{uuid}' "
+        f"--mode screen")
+    r = PLANE.at(host).run_shell(cmd, timeout=120)
     text = ""
     try:
         text = ((json.loads(r.stdout or "{}").get("data") or {}).get("text") or "")
@@ -311,8 +315,7 @@ def composer_is_empty(uuid, host):
     contain the words on it, and a line-shaped rule over the stream is what made
     `composer_held_draft` unreliable in the first place.
     """
-    cmd = f"{YGG} server screen 'cc-runtime://{uuid}'"
-    r = run(["ssh", "-n", host, cmd]) if host else run(["bash", "-c", cmd])
+    r = PLANE.at(host).run_shell(PLANE.shell(f"server screen 'cc-runtime://{uuid}'"), timeout=120)
     marker_lines = [ln for ln in (r.stdout or "").splitlines() if ln.lstrip().startswith(("❯", ">", "│ >"))]
     if not marker_lines:
         return False, "no composer line found on the rendered screen"
@@ -363,7 +366,7 @@ def last_assistant_text(path):
 _MANUAL_TITLES = None
 
 
-def manually_titled_uuids(host):
+def manually_titled_uuids(plane):
     """⛔⛔ A ROW A PERSON NAMED BY HAND IS A ROW A PERSON IS KEEPING.
 
     Measured 2026-08-21, by destroying one. The owner kept a row group of sessions
@@ -387,11 +390,13 @@ def manually_titled_uuids(host):
     # ⛔ The store is resolved from the REMOTE's own home, never written out here:
     # a literal home path is both wrong on any other account and a private-data
     # leak into a public repo. The pre-push guard caught exactly that.
+    # ⛔ The store is resolved from the AIMED home, so a sandbox run reads the
+    #    sandbox's keepsake list and not the live plane's.
     q = ("import sqlite3,json,os;"
-         "c=sqlite3.connect(os.path.expanduser('~/.yggterm/session-titles.db'));"
+         f"c=sqlite3.connect(os.path.expanduser({json.dumps(plane.home_path('session-titles.db'))}));"
          "print(json.dumps([r[0] for r in c.execute("
          "\"select session_id from session_titles where source='manual'\")]))")
-    r = run(["ssh", "-n", host, f"python3 -c {json.dumps(q)}"])
+    r = plane.run_shell(f"python3 -c {json.dumps(q)}", timeout=120)
     try:
         _MANUAL_TITLES = set(json.loads(r.stdout.strip()))
     except Exception:
@@ -409,9 +414,17 @@ def protected_uuids():
 
     ⛔ `never-arm.tsv` is PER HOST and its meaning is stronger than "do not wake":
     it marks a row a person is using. Folding one is worse than typing into it.
+
+    ⛔⛔ BOTH LISTS, THE LIVE PLANE'S AND THE AIMED ONE'S. The file lives in the
+    yggterm home, so aiming this verb at a sandbox aims its protection with it —
+    and a fresh sandbox home has no list at all, i.e. NOTHING is protected. That
+    is correct for sandbox rows and catastrophic if the aim is ever wrong, so the
+    two are UNIONED. Protecting a row that did not need it costs a rerun;
+    protecting one row too few destroys somebody's working lane.
     """
     out = set()
-    for path in (os.path.join(RELAY, "never-arm.tsv"),):
+    for path in {os.path.join(RELAY, "never-arm.tsv"),
+                 os.path.join(ygg_appctl.default_home(), "relay", "never-arm.tsv")}:
         try:
             for line in open(path):
                 for tok in re.findall(r"[0-9a-f]{8}-[0-9a-f-]{27}", line):
@@ -614,7 +627,7 @@ def harvest(row, verdict, why):
     return path
 
 
-def wake(row, host, apply_it):
+def wake(row, plane, apply_it):
     """One `continue`, and only into a row that is genuinely at rest.
 
     ⛔ `submitted: false` means the row was mid-output, NOT unreachable. It is
@@ -631,7 +644,8 @@ def wake(row, host, apply_it):
     if not apply_it:
         log("  (dry run: would send one `continue`)")
         return True
-    out = run(["ssh", "-n", host, f"printf 'continue' | {YGG} server app terminal submit '{uri}' --stdin"])
+    out = plane.run_shell(
+        "printf 'continue' | " + plane.shell(f"server app terminal submit '{uri}' --stdin"))
     try:
         data = json.loads(out.stdout).get("data") or {}
     except Exception:
@@ -686,7 +700,7 @@ def successor_brief(row, why):
     return path
 
 
-def respawn(row, why, host, apply_it):
+def respawn(row, why, plane, apply_it):
     """Replace a cold lane: spawn its successor FIRST, then fold the predecessor.
 
     ⛔⛔ THE ORDER IS THE WHOLE DESIGN. Folding first empties the seat, and a seat
@@ -721,7 +735,7 @@ def respawn(row, why, host, apply_it):
             log(f"     {line}")
         return False
     log(f"  successor is up: {new_row}")
-    return fold(row, "COLD", why, host, True)
+    return fold(row, "COLD", why, plane, True)
 
 
 def agent_pids(uuid):
@@ -763,7 +777,7 @@ def work_state(row):
     return br, unlanded, dirty, cwd
 
 
-def fold(row, verdict, why, host, apply_it, force=False):
+def fold(row, verdict, why, plane, apply_it, force=False):
     uuid, uri = row["uuid"], row["uri"]
 
     # ⛔⛔ TAKE THE WORK BEFORE TAKING THE ROW.
@@ -841,11 +855,7 @@ def fold(row, verdict, why, host, apply_it, force=False):
         return True
 
     # 1. the ROW
-    out = run(["ssh", "-n", host, f"{YGG} server app session remove '{uri}'"])
-    try:
-        data = json.loads(out.stdout).get("data") or {}
-    except Exception:
-        data = {}
+    data = plane.app_json(f"session remove '{uri}'", timeout=120).get("data") or {}
     log(f"  remove: row_still_listed={data.get('row_still_listed')} verified={data.get('verified')}")
 
     # 2. the MONITOR — orphaned subscribers escalate into a corpse otherwise, and
@@ -979,7 +989,7 @@ def sweep_worktrees(repo, apply_it):
     return 0
 
 
-def cmd_orphans(a, host, live):
+def cmd_orphans(a, plane, live):
     """⛔⛔ REMOVING A WORKTREE DOES NOT REMOVE ITS ROWS, AND NOTHING SAID SO.
 
     A lane's session is rooted in the lane's worktree, so the cwd tree draws a
@@ -995,16 +1005,15 @@ def cmd_orphans(a, host, live):
     verb this tool does not have, so it is named and left alone rather than killed
     for the crime of being untidy.
     """
-    rows = rows_census(host)
+    rows = rows_census(plane)
     # rows_census keeps only SEATED rows; an orphan usually has no seat left.
-    r = run(["ssh", "-n", host, f"{YGG} server app rows --json"])
-    try:
-        allrows = (json.loads(r.stdout).get("data") or {}).get("rows") or []
-    except Exception:
+    reply = plane.app_json("rows --json", timeout=120)
+    allrows = (reply.get("data") or {}).get("rows") or []
+    if reply.get("error"):
         log("⛔ could not read the row list")
         return 2
     seen, dead, alive, keepsakes = set(), [], [], []
-    kept = manually_titled_uuids(host)
+    kept = manually_titled_uuids(plane)
     for row in allrows:
         path = row.get("full_path") or ""
         cwd = (row.get("session_cwd") or "").strip()
@@ -1029,7 +1038,7 @@ def cmd_orphans(a, host, live):
         if a.apply:
             row = {"uri": path, "uuid": uuid, "seat": str(seat or "-"),
                    "label": row_label(allrows, path), "session_cwd": cwd}
-            fold(row, "DEAD", "cwd tree no longer exists", host, True)
+            fold(row, "DEAD", "cwd tree no longer exists", plane, True)
     log(f"— orphaned rows: {len(dead)} dead, {len(alive)} alive, {len(keepsakes)} kept"
         + ("" if a.apply else " · nothing was changed. Re-run with --apply."))
     return 0
@@ -1103,12 +1112,16 @@ def main():
     if a.cmd == "worktrees":
         return sweep_worktrees(a.repo, a.apply)
 
-    host = a.host or gui_host()
-    if not host:
-        log("⛔ no GUI host — blind is not clear")
+    global PLANE, RELAY, WAKE_LEDGER
+    plane = ygg_appctl.resolve(a.host)
+    if plane is None:
+        log("⛔ no row plane — blind is not clear")
         return 2
+    PLANE = plane
+    RELAY = plane.relay_dir()
+    WAKE_LEDGER = os.path.join(RELAY, "fold-wakes.json")
 
-    rows = rows_census(host)
+    rows = rows_census(plane)
     protected = protected_uuids()
     live_by_host, live = {}, set()
     try:
@@ -1125,7 +1138,7 @@ def main():
         return 2
 
     if a.cmd == "orphans":
-        return cmd_orphans(a, host, live)
+        return cmd_orphans(a, plane, live)
 
     if a.cmd == "row":
         rows = [r for r in rows if a.target in r["uri"]]
@@ -1136,7 +1149,7 @@ def main():
             # exists to clear was precisely the debris it refused to look at, with
             # "no seated row matches" reading as "no such row". Measured
             # 2026-08-21 on a dead lane whose seat had gone with its twin.
-            rows = [r for r in rows_all(host) if a.target in r["uri"]]
+            rows = [r for r in rows_all(plane) if a.target in r["uri"]]
             if not rows:
                 log(f"⛔ no row matches {a.target}")
                 return 2
@@ -1167,10 +1180,10 @@ def main():
         if verdict in ("DEAD", "FINISHED") or forced:
             if forced and verdict not in ("DEAD", "FINISHED"):
                 log(f"  --force: folding a {verdict} row on an operator's say-so")
-            if fold(row, verdict, why, host, a.apply, force=forced):
+            if fold(row, verdict, why, plane, a.apply, force=forced):
                 folded += 1
         elif verdict == "STALLED" and getattr(a, "wake", False):
-            wake(row, host, a.apply)
+            wake(row, plane, a.apply)
         elif verdict == "COLD":
             cap = getattr(a, "max_respawns", 0) or 0
             if getattr(a, "respawn", False) and cap and respawned >= cap:
@@ -1178,7 +1191,7 @@ def main():
                     f"its successor brief is written and the next sweep will take it")
             elif getattr(a, "respawn", False):
                 respawned += 1
-                if respawn(row, why, host, a.apply):
+                if respawn(row, why, plane, a.apply):
                     folded += 1
             else:
                 path = successor_brief(row, why)

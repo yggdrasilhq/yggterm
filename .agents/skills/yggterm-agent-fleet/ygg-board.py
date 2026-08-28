@@ -49,9 +49,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import ygg_appctl  # noqa: E402
 from ygg_host import resolve_gui_host  # noqa: E402
 
-STATE = Path.home() / ".yggterm" / "relay"
+#: ⛔ The fleet's own store lives IN the yggterm home; `~/.yggterm/relay` is
+#: this expression with the home left at its default. See ygg_appctl.
+STATE = Path(ygg_appctl.relay_dir())
 INTENT = STATE / "board-intent"
 
 # A transcript silent longer than this is COLD: a wake re-reads it all before it
