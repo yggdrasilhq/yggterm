@@ -18,6 +18,54 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [6.7] EVERY `server remote` / `server terminal` ONE-SHOT — INCLUDING THE AGENT RESUME HANDOFF — PAYS THE DESKTOP PREAMBLE THE `server app` FAMILY JUST STOPPED PAYING
+
+**Status:** OPEN
+
+**Measured (dev's own event trace, 2026-08-28 16:5x, build 3.1.69):** the trace records
+`startup/main_enter` + `startup/linux_memory_scope` +
+`startup/linux_desktop_backend_policy` — the full desktop/GL preamble signature — for
+`server remote codex-session-exists`, **`server remote resume-codex`**, and
+`server terminal resize` spawns, one trace triple per invocation. These are the AGENT
+HANDOFF verbs: every `codex resume` this product performs routes through a spawn that
+re-exec'd the binary once more as the `--internal-gl-probe` child (158 ms EGL init,
+measured) for an answer a PTY handshake never reads. The `server app` family was hoisted
+before the preamble for exactly this shape (same day — see the CHANGELOG and the
+source-order lock); these verbs were left behind because they genuinely read the store,
+so the hoist needs the store-open ordered before the preamble block or a store-free
+dispatch worked out per verb. **The felt cost is owner-perceived handoff latency** —
+the product's core click — and the fix is the same one-move pattern with the same
+one-owner rule. Verify after fixing with the same instrument: the three-event triple
+must vanish for these argv shapes.
+
+## ⛔ [6.7] THE FLEET MONITOR'S CLIENT CENSUS BOOTED THE FULL DESKTOP — AND A GL PROBE CHILD — ~8.5×/MIN PER GUI HOST
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Falsifying observation:** after the roll
+reaches a GUI host, `ytrace tail` must show NO
+`startup/linux_desktop_backend_policy` events for argv `["server","app","clients"]`
+spawns (the old three-event signature per spawn disappears), and `time yggterm server
+app clients` over ssh drops by the probe's cost (~150–200 ms → tens of ms).
+
+**Measured (the GUI host, 2026-08-28, 3.1.69):** two windows 5.5 h apart (10:41–11:19,
+16:01–16:47), identical rate: **~250–390 one-shot `yggterm server app clients`
+processes per 45 min — 8.5/min sustained all day** — each caught live with env
+`SSH_CONNECTION` naming the build host (dev): the fleet monitor (a `ytop` debug build running
+under an interactive shell) polls the client census over ssh at its top-app tick, and
+the same poller hits dev's own daemon locally. Each spawn walked the desktop preamble
+and re-exec'd as `--internal-gl-probe` (158 ms, `gl_probe_reason: egl_driver_name`) —
+a process boot that exists only to ask the daemon for state the daemon serves over its
+socket. **Fixed in the same commit as this entry**: the whole `server app` family
+routes before the desktop preamble (automation/collection/web-import precedent), help
+routing moved with it unchanged, one source-order lock test. **Two residuals, both
+real and NOT yggterm's to fix here:** (1) the poller's cadence — a client census does
+not change every tick and belongs behind a cache in ytop's own repo, at ~8.5/min ×
+~16 h/day this is ~8,000 process boots/day the monitor author never intended; (2)
+a `ygg-booter.py watch --interval 300` loop pinned to the GUI host has been running for 6+ days from an
+old deploy checkout — same class, lower rate, worth a look in the fleet lane.
+
+
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
 **Status:** OPEN
@@ -5074,6 +5122,38 @@ nothing-changed render must not force a foreground full paint of the transcript 
 **Falsifier:** quiet the GUI for five minutes with no typing and no session output; the
 `render/web_content` spans ≥5 s must not recur at 60 s cadence. The felt test: the fan settles
 on an idle desktop.
+
+### ⭐ RE-MEASURED ON 3.1.69 (2026-08-28) — THE WAVE'S TWO SIGNATURES DIED, THE QUIET-MINUTE BURN DID NOT
+
+The schema-noop fix (`6aab27da`) was owed this measurement on ≥3.1.68. Two 38–45 min windows,
+same GUI host, same method — per-minute `core_fraction` from the 60 s render probes plus the
+component_window cause attribution (38 min morning 10:41–11:19, 45 min afternoon 16:01–16:47,
+all on 3.1.69):
+
+| reading | 3.1.62 wave (idle machine) | 3.1.69 morning | 3.1.69 afternoon |
+|---|---|---|---|
+| `render/web_content+gui` per minute | **0.22–0.28 core** | mean 0.384, median 0.388, max 1.053, quiet floor 0.125–0.21 | mean 0.275, median 0.209, max 0.963 |
+| `force_foreground: true` on samples | **every wave** | **ZERO occurrences in 38 min** | zero |
+| render-cause write sites | pane-schema refetches ~200 writes/10 min | **gone from the cause table** (noop holds) | gone (top site: `working_flags_apply` 204→204) |
+| wave trigger | 60 s chore, "not caused by terminal activity" | peaks ride REAL backlog drains (11:07: 505k visible chars + 325 KB reveal replay → we:0.84) | peaks ride `background_live_session_snapshot` (173 begin+complete) and `remote_machine_refresh` (~3/min) |
+
+⇒ **Both headline signatures the wave was caught by are dead** — nothing-changed renders no
+longer run `force_foreground`, and the render-cause write drumbeat is gone. **But the
+falsifier still fails on its own bar**: in the twelve consecutive zero-output minutes
+(10:42–10:53 — no stream chars, no reveals, no flushes, 1 input event total), web_content alone
+still burned **0.11–0.25 core = 6.6–15 s CPU per minute**, above the entry's ≥5 s line. One
+concrete driver was caught red-handed in the morning window and is CONDITIONAL:
+**`right_rail.rs:3189` — the document-pane textarea `oninput` → `set_document_pane_value` —
+wrote 1,836 times causing 1,821 root renders in 38 min (~48/min, every ~1.25 s) during minutes
+with ONE real input event** — a synthetic input echo, self-sustaining while a document pane is
+mounted (with ~2.1 s component-window cadence, the blink-storm tick). The afternoon window has
+NO trace of it — the pane had been closed — which is why it is conditional, not gone. It needs
+the deterministic harness (mock document pane, count `input` events with zero typing) and then
+belongs to the render/blink lane's fix, not a symptom patch.
+
+**Also measured in the same windows (render-attributed, open):** `working_flags_apply` 204
+writes→204 renders/45 min; `state.rs:37707` 174→174; `background_live_session_snapshot`
+begin+complete 147 each/38 min — the chore this campaign's queue suspected, still rendering.
 
 ### ⭐ THE INVISIBLE INSTANCE — A FAILED GUI RESTART LIVES ON AS A SECOND FULL GUI (2026-08-27)
 
@@ -12308,6 +12388,31 @@ RSS-valued bound — predicts growth resuming exactly when the machine starts sw
 (it had crept to 2–4 GB by evening). The structural half is unchanged: the cgroup
 `memory.high` + swap-denial scope remains the only fix that makes the existing threshold mean
 what it says, and it still needs its falsifier first.
+
+### ⭐ THE PREDICTED HORIZON ARRIVED (2026-08-28, the GUI host, 3.1.69) — 7.8 GiB SWAPPED, WEBVIEW AT 2.0 GiB COMMITTED, AND THE EDIT PLANE STALLED
+
+The 3.1.67 subsection's item (2) — "growth resumes exactly when the machine starts swapping
+again" — is no longer a prediction. Same day, 16:31: the daemon's own health plane fired
+**`host_panic_memory`** (severity error, sustained 69 s): **95.1% RAM in use, 7.8 GiB
+swapped**, 64.6°C package — and 23 seconds later the GUI logged the first of **29
+`webview/edit_stall` incidents**: flush-gate timeouts (VirtualDom frozen ~2 s each,
+15 total by then) and late acks (the webview answered after the gate gave up). Cause and
+effect inside one minute: memory pressure → reclaim → the edit plane stalls → **the owner's
+typing latency**, which is the felt symptom this whole campaign tracks.
+
+**Per-process swap attribution (top of `/proc/*/status VmSwap`, 16:47):** one
+`WebKitWebProcess` held **1,119,908 KB swapped + 975,884 KB RSS ≈ 2.0 GiB committed** — the
+single largest swapped process on the box, a quarter of all swap — while running exactly the
+memory policy every build now applies from birth. opencode2 held ~0.8 GiB across two
+processes, the owner's browser ~1.5 GiB across nine. MemAvailable had recovered to 5.9 GB by
+the time of the reading; the swap stayed out.
+
+⇒ **The structural bound is no longer deferrable on "measure first": the falsifier's own
+precondition (the GUI host's cgroup scope has no controllers enabled) is now the next measurement
+this campaign owes.** Option 2 (parent-side committed-cap recycle) still carries the
+visible-blink cost and still must exempt the active surface and any held draft. And the
+instrument note stands: the probe's `committed_kb` per role made this a standing query — the
+reading above is reproducible from `ytrace tail --category render` alone.
 
 `configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
 `YGGTERM_WEBKIT_CACHE_MODEL=web-browser` and a limit of

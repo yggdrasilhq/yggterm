@@ -753,19 +753,39 @@ fn launch_app_background(
 enum BuiltinCliCommand {
     MainHelp,
     ServerHelp,
-    ServerAppHelp,
     ServerSessionsHelp,
     ServerSnapshot,
 }
 
 /// `server app` subcommands that print their OWN help.
 ///
-/// The generic `server app … --help` interception below runs BEFORE the app
-/// dispatcher, so without this exception it swallows the deeper help and the
-/// subcommand's help printer becomes dead code the user can never reach —
-/// which is exactly what happened to `server app audio --help`.
+/// The generic `server app … --help` interception (the hoisted router in
+/// `main()`) asks this before dispatching, so without this exception it would
+/// swallow the deeper help and the subcommand's help printer becomes dead code
+/// the user can never reach — which is exactly what happened to
+/// `server app audio --help`.
 fn server_app_subcommand_owns_its_help(subcommand: &str) -> bool {
     matches!(subcommand, "audio")
+}
+
+/// Does this `server app …` invocation want the APP-LEVEL help rather than a
+/// verb dispatch? Pure half of the hoisted `server app` router, so the shapes
+/// the old classify interception owned stay locked without booting anything:
+/// bare `server app`, a help token IN the subcommand position, and a help
+/// token anywhere behind a subcommand that does not own its own deeper help.
+fn server_app_wants_generic_help(args: &[String]) -> bool {
+    let Some(subcommand) = args.get(2) else {
+        return true; // bare `server app`
+    };
+    if matches!(subcommand.as_str(), "--help" | "-h" | "help") {
+        return true;
+    }
+    if server_app_subcommand_owns_its_help(subcommand) {
+        return false; // the subcommand's own dispatcher owns its help
+    }
+    args.iter()
+        .skip(3)
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
 }
 
 fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
@@ -779,21 +799,10 @@ fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
         {
             Some(BuiltinCliCommand::ServerHelp)
         }
-        [server, app] if server == "server" && app == "app" => {
-            Some(BuiltinCliCommand::ServerAppHelp)
-        }
-        [server, app, rest @ ..]
-            if server == "server"
-                && app == "app"
-                && !rest
-                    .first()
-                    .is_some_and(|sub| server_app_subcommand_owns_its_help(sub))
-                && rest
-                    .iter()
-                    .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help")) =>
-        {
-            Some(BuiltinCliCommand::ServerAppHelp)
-        }
+        // `server app*` does NOT flow through classify any more: the whole
+        // family — bare, help, and dispatch — routes in the hoisted router
+        // before the desktop preamble (the one-shot cost lock). An arm here
+        // would be a second copy waiting to drift.
         [server, sessions]
             if server == "server" && matches!(sessions.as_str(), "sessions" | "session-copy") =>
         {
@@ -1041,6 +1050,69 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "web-import" {
         return yggterm_server::run_browser_import_cli(&args[1..]);
     }
+    // ⛔ `server app …` dispatches BEFORE the desktop/GL preamble — MEASURED
+    // 2026-08-28 on a GUI host: the fleet monitor's client census (a bare
+    // `server app clients` one-shot over ssh, ~8.5/min sustained, 322 spawns in
+    // 45 minutes) booted the full desktop preamble per call, and
+    // `configure_linux_webkit_compositing` re-exec'd this binary as its
+    // `--internal-gl-probe` child — 158 ms of EGL init (`gl_probe_reason:
+    // egl_driver_name` in the `linux_desktop_backend_policy` trace) for an
+    // answer no presenting surface of a census ever reads. The trace shows the
+    // shape directly: `startup/main_enter` with
+    // args=["server","app","clients"] followed by `startup/linux_memory_scope`
+    // and `startup/linux_desktop_backend_policy`, three events × hundreds of
+    // ephemeral pids per hour, per GUI host. A verb that only talks to the
+    // daemon's socket (or walks local /proc) has no WebKit to configure, so it
+    // gets the same early dispatch the automation/collection/web-import arms
+    // above already own. ONE owner: this router and
+    // `yggterm_server::app_control_cli` — do not inline a verb here, and do
+    // not grow a second `server app` arm back below the preamble.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "app" {
+        if server_app_wants_generic_help(&args) {
+            yggterm_server::app_control_cli::print_server_app_help("yggterm");
+            return Ok(());
+        }
+        struct GuiHost;
+        impl yggterm_server::app_control_cli::AppControlHost for GuiHost {
+            fn binary_name(&self) -> &'static str {
+                "yggterm"
+            }
+            // The one genuine fork: this binary IS the app, so it spawns the
+            // window itself instead of asking a companion.
+            fn launch_app(
+                &self,
+                args: &[String],
+                home_dir: &std::path::Path,
+                timeout_ms: u64,
+            ) -> anyhow::Result<()> {
+                let log_path = args.windows(2).find_map(|window| {
+                    if window[0] == "--log" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                launch_app_background(
+                    home_dir,
+                    timeout_ms,
+                    args.iter().any(|arg| arg == "--wait-visible"),
+                    args.iter().any(|arg| arg == "--wait-settled"),
+                    args.iter().any(|arg| arg == "--allow-multi-window"),
+                    args.iter().any(|arg| arg == "--skip-active-exec-handoff"),
+                    log_path,
+                )
+            }
+        }
+        // The store opens later, after the preamble; this verb family only
+        // needs the same home the store would resolve — one resolution, and no
+        // sessions-dir creation a read-only census should not pay.
+        let app_control_home = yggterm_core::resolve_yggterm_home()?;
+        return yggterm_server::app_control_cli::run_app_control_cli(
+            &args,
+            &app_control_home,
+            &GuiHost,
+        );
+    }
     #[cfg(target_os = "linux")]
     let memory_scope = if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();
@@ -1166,10 +1238,6 @@ fn main() -> Result<()> {
             }
             BuiltinCliCommand::ServerHelp => {
                 print_server_help();
-                return Ok(());
-            }
-            BuiltinCliCommand::ServerAppHelp => {
-                yggterm_server::app_control_cli::print_server_app_help("yggterm");
                 return Ok(());
             }
             BuiltinCliCommand::ServerSessionsHelp => {
@@ -1588,48 +1656,11 @@ fn main() -> Result<()> {
             .map(String::as_str);
         return run_screenrecord_capture(&args[2], output_path, timeout_ms, duration_secs);
     }
-    if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
-        // ONE OWNER for the whole `server app` surface — see
-        // `yggterm_server::app_control_cli`. The 1,308-line `match` that stood
-        // here was a second copy of the headless binary's, and the pair had
-        // drifted by six verbs. Do not inline a verb here.
-        struct GuiHost;
-        impl yggterm_server::app_control_cli::AppControlHost for GuiHost {
-            fn binary_name(&self) -> &'static str {
-                "yggterm"
-            }
-            // The one genuine fork: this binary IS the app, so it spawns the
-            // window itself instead of asking a companion.
-            fn launch_app(
-                &self,
-                args: &[String],
-                home_dir: &std::path::Path,
-                timeout_ms: u64,
-            ) -> anyhow::Result<()> {
-                let log_path = args.windows(2).find_map(|window| {
-                    if window[0] == "--log" {
-                        Some(window[1].as_str())
-                    } else {
-                        None
-                    }
-                });
-                launch_app_background(
-                    home_dir,
-                    timeout_ms,
-                    args.iter().any(|arg| arg == "--wait-visible"),
-                    args.iter().any(|arg| arg == "--wait-settled"),
-                    args.iter().any(|arg| arg == "--allow-multi-window"),
-                    args.iter().any(|arg| arg == "--skip-active-exec-handoff"),
-                    log_path,
-                )
-            }
-        }
-        return yggterm_server::app_control_cli::run_app_control_cli(
-            &args,
-            store.home_dir(),
-            &GuiHost,
-        );
-    }
+    // `server app …` does NOT dispatch here any more: the whole family routes
+    // in the hoisted router before the desktop preamble (the one-shot cost
+    // lock, measured on the fleet monitor's census). Do not re-plant an arm
+    // here — a verb below the preamble makes every one-shot pay for WebKit
+    // configuration it never reads.
     if args.as_slice() == ["server", "shutdown"] {
         let endpoint = cli_server_endpoint(store.home_dir());
         if let Some(message) = shutdown(&endpoint)? {
@@ -4884,8 +4915,8 @@ mod tests {
         linux_window_profile_from_input,
         main_should_retire_superseded_clients_before_shell, raised_file_descriptor_soft_limit,
         record_matches_executable, server_app_subcommand_owns_its_help,
-        should_handoff_to_preferred_executable, should_retire_superseded_client,
-        signal_client_instances_dir, signal_client_scope_matches,
+        server_app_wants_generic_help, should_handoff_to_preferred_executable,
+        should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
         signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
         superseded_client_retirement_strategy_label, under_glass_default_armed,
@@ -5640,19 +5671,6 @@ mod tests {
             Some(BuiltinCliCommand::ServerHelp)
         );
         assert_eq!(
-            classify_builtin_cli_command(&["server".to_string(), "app".to_string()]),
-            Some(BuiltinCliCommand::ServerAppHelp)
-        );
-        assert_eq!(
-            classify_builtin_cli_command(&[
-                "server".to_string(),
-                "app".to_string(),
-                "launch".to_string(),
-                "--help".to_string()
-            ]),
-            Some(BuiltinCliCommand::ServerAppHelp)
-        );
-        assert_eq!(
             classify_builtin_cli_command(&["server".to_string(), "sessions".to_string()]),
             Some(BuiltinCliCommand::ServerSessionsHelp)
         );
@@ -5665,54 +5683,134 @@ mod tests {
             ]),
             Some(BuiltinCliCommand::ServerSessionsHelp)
         );
+        // Every `server app*` shape returns None from classify: the whole
+        // family routes in the hoisted pre-preamble router, and a second
+        // opinion here would be a copy waiting to drift.
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "app".to_string()]),
+            None,
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "app".to_string(),
+                "clients".to_string(),
+            ]),
+            None,
+        );
     }
 
-    /// A `server app` subcommand that prints its OWN help must not have that
-    /// help swallowed by the generic interception, or its help printer is code
-    /// the user can never reach. `audio` is the case that found this.
+    /// The hoisted `server app` router must serve the app-level help in EXACTLY
+    /// the shapes the old classify interception owned, and dispatch everything
+    /// else — the help printers a user can never reach are dead code.
     #[test]
-    fn a_server_app_subcommand_that_owns_its_help_is_not_intercepted() {
+    fn the_server_app_router_serves_generic_help_exactly_where_classify_used_to() {
+        // Bare `server app` is still the app-level help.
+        assert!(server_app_wants_generic_help(&[
+            "server".to_string(),
+            "app".to_string()
+        ]));
+        // A help token in the subcommand position.
         for spelling in ["--help", "-h", "help"] {
-            assert_eq!(
-                classify_builtin_cli_command(&[
+            assert!(
+                server_app_wants_generic_help(&[
+                    "server".to_string(),
+                    "app".to_string(),
+                    spelling.to_string(),
+                ]),
+                "`server app {spelling}` is the app-level help"
+            );
+        }
+        // Help behind a verb that does not own deeper help: intercepted.
+        assert!(server_app_wants_generic_help(&[
+            "server".to_string(),
+            "app".to_string(),
+            "launch".to_string(),
+            "--help".to_string()
+        ]));
+        assert!(server_app_wants_generic_help(&[
+            "server".to_string(),
+            "app".to_string(),
+            "screenshot".to_string(),
+            "--help".to_string(),
+        ]));
+        // The audio family owns its own help — dispatch, never intercept.
+        for spelling in ["--help", "-h", "help"] {
+            assert!(
+                !server_app_wants_generic_help(&[
                     "server".to_string(),
                     "app".to_string(),
                     "audio".to_string(),
                     spelling.to_string(),
                 ]),
-                None,
                 "`server app audio {spelling}` must fall through to the audio \
-                 dispatcher, which owns the audio help",
+                 dispatcher, which owns the audio help"
             );
         }
-        // Only the subcommands that actually have their own help are exempt —
-        // everything else still gets the app-level help, as before.
+        // And the shape the fleet monitor actually runs, thousands of times a
+        // day: a real verb with no help token anywhere — straight to dispatch.
+        assert!(!server_app_wants_generic_help(&[
+            "server".to_string(),
+            "app".to_string(),
+            "clients".to_string(),
+        ]));
+        assert!(!server_app_wants_generic_help(&[
+            "server".to_string(),
+            "app".to_string(),
+            "screenshot".to_string(),
+            "--target".to_string(),
+            "x".to_string(),
+        ]));
+        // `server app audio` with no subcommand still falls through to the
+        // audio help.
+        assert!(!server_app_wants_generic_help(&[
+            "server".to_string(),
+            "app".to_string(),
+            "audio".to_string(),
+        ]));
         assert!(server_app_subcommand_owns_its_help("audio"));
         assert!(!server_app_subcommand_owns_its_help("screenshot"));
-        assert_eq!(
-            classify_builtin_cli_command(&[
-                "server".to_string(),
-                "app".to_string(),
-                "screenshot".to_string(),
-                "--help".to_string(),
-            ]),
-            Some(BuiltinCliCommand::ServerAppHelp),
+    }
+
+    /// ⛔ THE ONE-SHOT COST LOCK. The `server app` dispatch must be textually
+    /// BEFORE the desktop/GL preamble call in `main()`. Measured 2026-08-28 on
+    /// a GUI host: the fleet monitor's `server app clients` census ran ~8.5/min all
+    /// day (322 spawns in 45 minutes), and a dispatch below the preamble makes
+    /// every census boot the desktop block AND re-exec the binary as the
+    /// `--internal-gl-probe` child (158 ms of EGL init per spawn) for an answer
+    /// a census never reads. This fails the moment a `server app` arm is
+    /// re-planted below `configure_linux_webkit_compositing()`.
+    #[test]
+    fn server_app_dispatch_precedes_the_desktop_preamble() {
+        let source = include_str!("main.rs");
+        let dispatch = source
+            .find("run_app_control_cli(")
+            .expect("the app-control dispatch call must exist");
+        let preamble_call = source
+            .find("configure_linux_webkit_compositing();")
+            .expect("the preamble call must exist");
+        assert!(
+            dispatch < preamble_call,
+            "`server app` must dispatch BEFORE the desktop/GL preamble — a census \
+             one-shot has no WebKit to configure, and below the preamble it pays \
+             for the probe child on every call"
         );
-        // Bare `server app` is still the app-level help, and `server app audio`
-        // with no subcommand still falls through to the audio help.
+        // The stale arm's tombstone must still steer: exactly one host impl —
+        // every dispatch site needs one, so a re-planted arm shows up here.
+        // The needle is assembled from halves so this assertion cannot match
+        // its own source text.
+        let host_needle = concat!("struct Gui", "Host");
         assert_eq!(
-            classify_builtin_cli_command(&["server".to_string(), "app".to_string()]),
-            Some(BuiltinCliCommand::ServerAppHelp),
-        );
-        assert_eq!(
-            classify_builtin_cli_command(&[
-                "server".to_string(),
-                "app".to_string(),
-                "audio".to_string(),
-            ]),
-            None,
+            source.matches(host_needle).count(),
+            1,
+            "exactly one `server app` dispatch site — a second copy is the drift \
+             the ONE-owner rule exists to prevent"
         );
     }
+
+    // The audio-family interception contract moved with the router: see
+    // `the_server_app_router_serves_generic_help_exactly_where_classify_used_to`,
+    // which now owns these shapes against `server_app_wants_generic_help`.
 
     #[test]
     fn app_launch_wait_uses_dom_snapshot_sized_state_budget() {
