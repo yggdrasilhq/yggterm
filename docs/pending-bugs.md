@@ -68,7 +68,8 @@ old deploy checkout — same class, lower rate, worth a look in the fleet lane.
 
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
-**Status:** OPEN — **ROOT CAUSE FOUND (owner-caught live 2026-08-28); fix on
+**Status:** OPEN
+**ROOT CAUSE FOUND (owner-caught live 2026-08-28); fix on
 `lane/dev/pass0-identity` (`3c50684e`), unmerged. The display-plane hardening
 (kind on the wire, Unknown-never-Codex, persistence refusal) is on the same lane.**
 
@@ -128,7 +129,7 @@ falsifier** for whichever mechanism is real: ~~reproduce the owner's recipe~~ �
 to codex. **ROOT CAUSE FOUND** — see the Status block at the top; the "one by
 one" reading was wrong — it was one restart, every SshShell row at once.
 
-## THE MECHANISM, live-caught 2026-08-28 (owner watching the restart)
+### THE MECHANISM, live-caught 2026-08-28 (owner watching the restart)
 
 yggterm restarted on the GUI host and BOTH `live::` plain ssh-shell rows came
 back as CODEX rows, retitled to the codex birth name ("New dev Terminal"),
