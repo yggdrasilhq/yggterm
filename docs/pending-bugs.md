@@ -58,10 +58,15 @@ must vanish for these argv shapes.
 
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
-**Status:** OPEN
-**ROOT CAUSE FOUND (owner-caught live 2026-08-28); fix on
-`lane/dev/pass0-identity` (`3c50684e`), unmerged. The display-plane hardening
-(kind on the wire, Unknown-never-Codex, persistence refusal) is on the same lane.**
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+(merged to main in `6245b1b1`, ships in 3.1.71). **ROOT CAUSE FOUND
+(owner-caught live 2026-08-28).** The observation
+that proves or falsifies the fix: an ssh-shell row survives a GUI restart with
+its kind AND title intact, and a restart that flips a row to codex must show a
+`cli/identity_*` trace event — a flip with no event means a path reader is
+still minting somewhere. The display-plane hardening (kind on the wire,
+Unknown-never-Codex, persistence refusal, the skill vocabulary) is in the same
+merge.
 
 **The owner's report (2026-08-28, verbatim intent):** plain SHELL sessions transform
 one by one into EMPTY CODEX sessions after launch; some stay shells while most
@@ -458,136 +463,9 @@ Owner: whoever next touches the web verb surface. The record side of this is
 already solved — media probe records carry a host-stamped `(row, tab)` — so this
 is specifically about the imperative verbs.
 
-## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
+## ⛔⛔ [99.0] EVERY FLEET VERB LOOKS FOR A ROW'S WORK IN ONE CLI'S STORE, AND THE OTHER NINE READ EMPTY
 
 **Status:** OPEN
-
-Two agent rows lost their process during a cross-CLI greeting run. Neither death was
-recorded anywhere, and every instrument that a fleet verb consults kept describing them
-as healthy:
-
-    owned_terminal_session_count      4      ← the daemon knows
-    live_terminal_sessions          5 entries ← the list does not
-    server rows departed              0      ← the ONE owner of "where did it go and why"
-    server app rows                 live_member:true, presence:live_rail,
-                                    wedge_suspected:false, busy_reason:"idle"
-    server screen                   "no session here matches …"
-
-⛔ **`busy_reason:"idle"` is the specific danger.** Idle is the green light every
-delivery verb waits for, so a brief aimed at a dead row passes the readiness gate,
-writes into nothing, and the row then has no transcript — which routes it straight to
-the reap. `ygg-fold` decides DEAD by *"uuid not in live"*, and the uuid IS in live, so
-the seat is never reclaimed either: it is held forever by a process that does not exist.
-
-⚖ **The count is its own witness**, and that is what makes this cheap to detect: owned
-and live disagreed by exactly the number of dead rows, both times. Whatever removes a
-PTY from the owned set already knows; nothing tells the live list or the ledger.
-
-⇒ Recommended: make the departure ledger the single place a row's disappearance is
-recorded, and derive `live_member` from PTY ownership rather than from a list that is
-only ever appended to. Until then a sweep cannot distinguish a working lane from a
-corpse, which is the assumption every watchdog in the fleet is built on.
-
-⚠ Observed in a headless sandbox (`YGGTERM_HOME` + Xvfb, recipe in the field guide).
-The rendering half of that environment does not travel to a desktop; the daemon half is
-the same binary the fleet runs everywhere, and the ledger and the owned/live split are
-both daemon-side. **Reproduce on a desktop before assuming the scope is wider than the
-evidence.**
-
-## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
-
-**Status:** OPEN
-
-`ygg-deliver`'s reap destroys a row whose transcript is ABSENT, on the stated premise
-that such a row *"has never written a word, so it was never briefed and cannot become
-anything"*. Measured during the greeting run: a codex row that had been briefed, had
-run a shell command, and had reported its result **had written no transcript at all**
-— no store file existed for it twenty minutes after birth.
-
-⚖ The premise is calibrated on one CLI. `ygg-spawn` allows 90 s of transcript lag from
-a measurement taken on a CLI that accepts a caller-supplied session id, so its row id
-IS its transcript id from the first byte. Four registered CLIs declare
-`id_assigned_at_birth: false`; they mint their own id and write on their own schedule,
-and until then the row's id addresses nothing. ABSENT is literally true for them and
-the inference drawn from it is false.
-
-⛔ **Not fixed by the FOUND/ABSENT/UNMEASURABLE split**, deliberately — that separated
-"we did not look" from "we looked", and this is a case where we looked in the right
-place and the answer is still not evidence.
-
-⇒ Recommended, and NOT taken here because it needs a measurement this lane does not
-have: find out how long after birth each `id_assigned_at_birth:false` CLI first writes
-a store file, and treat ABSENT inside that window as UNMEASURABLE. **Do not guess the
-threshold** — too short destroys working lanes, too long lets briefless debris hold
-seats, and both failures are silent. A cheaper interim that needs no timing at all:
-ask whether the row has a live agent PROCESS before destroying it, since a row with one
-has manifestly not failed to be born.
-
-## ⛔ [99.1·99.2] A COMPOSER'S PLACEHOLDER HINT IS COUNTED AS AN UNSENT DRAFT
-
-**Status:** OPEN
-
-*Root-caused 2026-08-22 and deliberately not fixed here: the repair is in the daemon's
-composer reader, and this lane's scope was the fleet verbs. The root cause is below,
-which is the expensive half.*
-
-Rows are reported as holding a composer draft on planes where nothing has ever been
-typed into them. `terminal submit` therefore refuses the FIRST message a row is ever
-sent — its brief — with `submitted:false` and *"the composer holds an unsent draft —
-refusing to probe, because the probe types a marker and clears the line with Ctrl+U
-and would destroy it"*, and `input-check` answers `consuming_input:false` for the same
-reason.
-
-⛔ **The refusal is correct behaviour on a wrong reading, which is why it is dangerous.**
-The law forbids retrying `submitted:false`, so a spawner that hits this has no way to
-brief the row it just created, and the row then routes to the reap as never-briefed.
-`send` plus a lone carriage return delivers past it, but that path has no draft guard at
-all — it is the workaround, not the fix.
-
-### The root cause, measured in a sandbox on 2026-08-22
-
-`session_composer_holds_draft` is the UNION of two arms — a keystroke counter and the
-rendered grid — and either saying "there is text there" is enough to refuse. The grid
-arm is `yggterm_core::composer_row_holds_text`, which finds the composer marker on the
-composer row and returns true when **anything at all** follows it:
-
-    let head = text[marker.len_utf8()..].trim();
-    return Some(!head.is_empty() || !content.trim().is_empty());
-
-⇒ **A CLI that draws a placeholder hint on its composer row when the composer is empty
-is indistinguishable, at that line, from a person mid-sentence.** Replayed over the
-rendered rows of an idle agent row that had just COMPLETED a turn, the marker's `head`
-was that CLI's suggestion text, so the arm returns true — and keeps returning it, for
-as long as the hint is drawn.
-
-**The other arm is excluded, and this is what makes it a root cause rather than a
-suspicion:** a second row of a different CLI reported `composer_held_draft:true` when
-not one byte had ever been written to it by anything — no send, no submit, no probe —
-so the keystroke counter cannot be what produced it.
-
-⚖ **The entry this replaces called the trigger "something about a NEW row". It is not.**
-It is what the CLI paints on that line, so it lasts exactly as long as the hint does:
-transient for a CLI that clears it after boot, and observed persisting through a
-completed turn for one that does not. **The earlier live census — 4 drafts across 36
-owned sessions — was not re-measured here**, so how much of the fleet this reaches is
-still open; the per-CLI shape of the hint decides it, not the age of the row.
-
-⇒ Recommended: the grid arm must distinguish CHROME on the composer row from CONTENT.
-The same file already has `composer_row_is_chrome` for rows BELOW the composer and a
-per-CLI `composer_footer_hints` list feeding it; a per-CLI `composer_placeholder_hints`
-is the shape that already exists here. ⛔ **Do not fix it by dropping the grid arm** —
-it is there because the keystroke counter is zeroed by a daemon handover, and the two
-cover each other. ⛔ And do not widen it to "ignore any short line": a person's
-half-typed sentence starts short.
-
-**What would falsify it being fixed:** an idle agent row of a CLI that draws a
-placeholder, on a plane where nothing has been typed, answering `composer_held_draft:
-false` — while a row with one real character typed into it still answers `true`.
-
-⭐ **It is now rehearsable without a desktop.** A sandbox `YGGTERM_HOME` + GUI reproduces
-it in about four minutes (recipe: field guide; aiming the verbs: fleet skill §11.9),
-which is how it was root-caused.
-
 ## ⛔ [99.0] THREE CLIs ARE READ AND CLASSIFIED; THE OTHER SEVEN NEED A REAL SESSION ON DISK FIRST
 
 **Status:** OPEN
@@ -5199,7 +5077,6 @@ closed.
 
 ### ⛔ [11.0] THE 5-MINUTE NO-OP RESTART LOOP — THE GUI ASKS, THE DAEMON REFUSES, FOREVER, AND THE ASK ITSELF DEAFENED THE DAEMON
 
-**Status:** OPEN
 
 (The deafness half — `PEER_TRIAGE_PROBE_BUDGET_MS` — is fixed in code; the loop
 itself remains open, its owner being whoever next touches the
@@ -21136,7 +21013,6 @@ renders at NORMAL intensity (`❯\u{a0}THIS_IS_AN_UNSENT_DRAFT`, no `ESC[2m`), s
 faint really is chrome and the guard is correct.
 
 
-**A second report of the same question, from a different seat.**
 
 Orchestrator, 2026-08-06, after telling the owner that delegates were working
 when **3 of ~33 processes** were actually mid-turn, and being corrected by him.
@@ -25135,324 +25011,6 @@ the launch path uses, so one `PATH` answers both questions. **Falsified by:** pr
 machine whose CLIs sit on a login-only `PATH` entry and seeing the matrix disagree with
 that machine's own local self-report.
 
-## ynpm/browser retro (2026-08-27): ten filed frictions from docs/agent-browser-workflow-retrospective-2026-08-27.md
-
-A live authenticated data-polishing workflow filed ten items. The doc is the
-SSOT for the full narrative; the queue keeps the list + one-line contracts so
-nothing evaporates:
-
-1. **Viewport-mutating verbs vs multiple clients** — should an untargeted
-   `app open --view …` refuse whenever >1 live client exists? Runtime guard
-   shipped (`1474e1d7`); the blanket refusal is the open question.
-2. **Browser-profile ownership capability matrix** — attended Ychrome owns the
-   profile; shadow owns shell geometry/mode; `ychrome ctl` owns authenticated
-   page QA. Must be explicit in help output, not re-derived from lock warnings.
-3. **`web ensure` cold-surface recovery contract** — `accepted:true` +
-   `about:blank` must never read as recovery: either restore the declared URL
-   (new generation reported) or refuse naming why. Same family as
-   agent-passkey-gap-2026-07-28; recurred live after a GUI update.
-4. **Update-proof staleness** — update/restart must expose the successor client
-   identity + carry active row/view across; an attended-client alias instead of
-   PID rediscovery; proof helpers stamp build/row before/after.
-5. **One app-control response envelope** — `.data` vs `.data.state` split made
-   a plausible jq query return null. Want settled-state consistency or a
-   `--field` projection that exits non-zero on absence.
-6. **`ychrome ctl eval --stdin` / `js_file=PATH`** — long programs must stop
-   surviving three shell layers; per-eval isolation from prior globals.
-   Validated again by this workflow; the pending-bugs entry predates it.
-7. **Capture must name the scroll owner** — `region=full` is ROOT-scroll
-   capture; inner-container SPAs get cropped. Report candidate scrollports;
-   `region=scrollport selector=…` / `region=auto-full` stitching later.
-8. **Anonymous interactive controls flagged in snapshots** — a pagination
-   control showing only `✓` forced ordinal addressing. Snapshots should flag
-   repeated unnamed controls and recommend accessible names.
-9. **One non-interactive tools PATH + a `browser-engine` forwarding verb** —
-   `ychrome` was absent from PATH over plain ssh; agents must not rediscover
-   the sibling binary's location per host.
-10. **Stable ctl error codes + retryability** — a transient 400 open-failure
-    was indistinguishable from an invalid request. Machine-readable codes,
-    request ids, retry flags; a proof primitive owns bounded retries.
-
-Related landed tonight: the passkey half of the same family — engine pages
-carry the scoped shim + the engine registers the `yggterm-appctl://` scheme
-(ychrome `467a1fc`), and `ctl fido2 list|grant|deny|shim` answers ceremonies
-agentically (`aabd89d`+`955107a`). The desired end state (one proof command →
-one manifest) builds on items 4, 5, 7, 10.
-
-# THE 6.9 BATCH — found while building the phone's transport
-
-Four tooling defects, none of which blocked the phone lane, all found by using
-the CLI as an instrument rather than by reading it. Each is filed against the
-thing that owns it, not against the lane that tripped over it.
-
-## ⛔⛔ [6.9] `server status --json` IS NOT A FLAG, AND IT FAILS BY GOING QUIET
-
-**Status:** OPEN
-
-*found 2026-08-13 while measuring response weights for the phone*
-
-`server status` already emits JSON. Passing `--json` — which every neighbouring
-verb accepts (`server daemons --json`, `server gate-screen --json`,
-`server perf-summary --json`) — prints usage and leaves **stdout empty**.
-
-**Why this is worse than a plain error.** The natural way to measure a response
-is `server status --json | wc -c`. That returns `0`. A previous session did
-exactly this, got `0` for both `status` and `snapshot`, and wrote the conclusion
-into a design document as a measured fact: *"no daemon is running on the host
-this session sits on."* A daemon was running, with hundreds of sessions. The
-document then carried that as the reason a load-bearing number could not be
-obtained.
-
-⇒ **A flag a tool does not have is indistinguishable from a service that is not
-there, if the only thing you look at is the byte count.**
-
-**Fix:** accept `--json` as a no-op on the verbs that already emit JSON, *or*
-write the usage to stderr and exit non-zero. Either removes the silent-empty
-path. The first is friendlier, because the flag is guessable precisely because
-its neighbours take it.
-
-**Falsifier:** `server status --json | wc -c` returns a number greater than zero,
-or the command exits non-zero.
-
-## ⛔ [6.9] THE ROW-CLEANUP VERB IS NAMED IN THREE PLACES AND EXISTS IN NONE OF THEM
-
-**Status:** OPEN
-
-*found 2026-08-13 cleaning up a throwaway session*
-
-The documented cleanup step for a probe row is written as `session remove`. That
-is not a verb. Three separate corrections are needed before it works:
-
-1. `server session remove …` answers `unsupported server command: session`. The
-   real verb is **`server app session remove`**.
-2. It is app-control, so it only answers **on the host where the GUI runs**. ⭐
-   The error for this is genuinely good — it names the candidate hosts and the
-   exact command to identify the right one. That message is the model the rest of
-   this entry should be held to.
-3. It removes the row **from the GUI**, and the owning daemon still lists the
-   session afterwards. Ending the process took writing `exit` and then a lone
-   carriage return into the PTY.
-
-⇒ Three different questions — *what is the verb*, *where does it answer*, *what
-does it actually remove* — and the documented name answers none of them. This is
-the standing pattern: **a row verb reports the request, not the effect.**
-
-**Fix:** correct the name wherever the cleanup step is written, and say both the
-GUI-host constraint and the fact that removal is a GUI-side operation. If a
-caller wants the runtime gone, that needs to be a separate, named thing.
-
-**Falsifier:** the documented cleanup line, copied verbatim, removes a probe row
-and its runtime.
-
-## ⚠ [6.9] `server attach` DOUBLE-PREFIXES A KEY THAT ALREADY CARRIES A SCHEME
-
-**Status:** OPEN
-
-*found 2026-08-13 creating a throwaway session*
-
-Creating a session with a key of the form `local://<name>` produces a session
-whose key is `local://local://<name>`. It is then addressable only by the
-doubled form, so every later call has to repeat the mistake to work.
-
-**Fix:** strip an existing scheme, or refuse the argument. Silently concatenating
-is the one option that makes the caller carry the error forward.
-
-**Falsifier:** attaching with a scheme-qualified key yields a session listed
-under exactly that key.
-
-## ⛔⛔ [6.9] A REPOSITORY THAT HAS NEVER HOSTED AN AGENT SESSION CANNOT HOST A ROW
-
-**Status:** OPEN
-
-⚠ Root cause NOT found. The inherited explanation is wrong and is falsified
-below; do not build around it.
-
-*reported by the orchestrator 2026-08-13: three attempts to create a row with a
-cwd in one particular repository, three failures to ever consume input, against
-five contemporaneous launches into sibling worktrees that came up normally —
-same host, same verb, same model, same minute*
-
-**What is falsified.** The claim as stated — that this repository cannot host a
-row — is not about the repository and not about the agent CLI. Run directly in
-that directory, the CLI answers a prompt normally and exits zero; the identical
-control in a working worktree behaves the same. So the failure is in the
-**row-launch path**, not in the destination.
-
-**The one hard datum.** No project namespace directory existed for that cwd
-despite three launch attempts, so those launches never reached session
-initialisation at all. A row appeared; nothing behind it started.
-
-**A hypothesis tested and rejected**, recorded so it is not re-derived: the
-obvious candidate is a first-run trust gate on an unseen directory. It does not
-hold. None of the sibling worktrees that host working rows has a trust entry
-either, so the presence or absence of one does not separate the failures from
-the successes.
-
-⚠ **RE-TESTING THAT CWD IS NOW CONTAMINATED.** Probing it created the namespace
-that was previously absent, so it no longer starts from the original condition. A
-clean reproduction needs a cwd that has never hosted an agent session.
-
-**Falsifier:** a row created with a cwd that has never hosted an agent session
-reaches a composer and consumes input.
-
-
-**Status:** OPEN
-
-*measured 2026-08-14 on this seat's own stand-down; the shape is
-[[finding-a-read-back-that-passes-on-its-way-to-being-wrong]]*
-
-A finishing seat ran `ygg-booter.py unsubscribe` **and** `ygg-monitor.py
-unsubscribe` and **read both planes back at 0**. One hour later a coverage sweep
-wrote a fresh booter subscription for the same row — `kind: monitor`, note
-*"unattended delegate, live process"* — and **booted it**. The monitor
-unsubscribe held; the booter one did not.
-
-⛔ **No tool defect — the verbs differ and the weaker one was used.**
-`unsubscribe` means *stop watching now*; **`optout` means *and do not start
-again***, writing `booter-disarmed.tsv`, which **both `subscribe` and `arm`
-screen** (`ygg-booter.py:718`). `optout`'s own docstring names the case: *a
-delegate that finished its work … arming it would resurrect a row that stopped on
-purpose.*
-
-⇒ **A row standing down must `optout --row … --note …`** (or `ygg-claim.sh
---no-booter` from inside). **Fix wanted:** say so at the stand-down step of the
-fleet skill, because the failure is silent and the read-back looks right.
-
-⛔ **THE LOOP, which is why it is filed rather than just fixed locally:** the
-sweep arms a row **because its process is live**, the boot keeps the process
-live, and the standing rule *"a monitor is never finished while the thing it
-watches is live"* then reads as justification. **The watch's own subject becomes
-the evidence for the watch**, and a genuinely finished seat cannot leave by
-unsubscribing.
-
-⭐ **METHOD, and it generalises past the booter: VERIFY A PROHIBITION BY TRYING TO
-VIOLATE IT.** A read-back of 0 passed *both* times — it cannot distinguish "not
-subscribed" from "not subscribed *yet again*". What settled it was attempting the
-thing that must fail: a re-`subscribe` after the opt-out came back **REFUSED**
-with the count still 0. **An absence proves nothing about what will be allowed
-next; only a refusal does.**
-
-
-**Status:** OPEN
-
-*source reading, and the withdrawal of the anomaly that led here, in
-[`idle-cost-model.md`](idle-cost-model.md) §6k-1..§6k-3*
-
-`daemon_should_idle_shutdown` (`daemon.rs:11537`) is careful: if
-`active_client_instance_records` returns `Err` it returns `false` — *if you
-cannot tell whether clients exist, do not retire.*
-
-**The callee guarantees that arm never fires.**
-`active_client_instance_records_from_dir` (`lib.rs:20737`) ends every failure in
-`let Ok(entries) = entries else { return Ok(()) };`, and drops per-entry errors
-with `.flatten()`. It has no `Err` path, so neither does its caller.
-
-⇒ An unreadable client-instances directory — permissions, fd exhaustion, ENOMEM —
-is reported as **an empty set of clients**, which satisfies gate 3 and **permits
-retirement while a client may be connected**. Two halves of one decision disagree
-about what an unreadable directory means and the careless half wins.
-
-⚠ **This is the INVERSE of the "a failing read means it never retires" reading.**
-That one cannot happen today; this one can. Both come from the same `Result` being
-vestigial.
-
-**Fix:** let the callee distinguish *absent* (legitimately no clients ⇒ `Ok`) from
-*unreadable* (⇒ `Err`), so the caller's existing caution becomes reachable.
-
-⛔ **NOT A DEFECT, CLOSED: "a daemon with all three retire gates open did not
-retire".** I filed that and it was wrong twice over. `client_instance_dirs_for_scan`
-scans **every** directory under the client-instances root, so a record filed under
-another endpoint version is still in scope; and `daemon_is_superseded` needs a
-**live** newer daemon, which that home did not have. Records non-empty and not
-superseded ⇒ gate 3 correctly returns `false` indefinitely. Demonstrated: a daemon
-with no record retires at **+90.2 s**, one with a record naming a live process was
-still running at **+204.8 s**.
-⛔⛔ **And the probe that manufactured it: `/proc/<pid>` existence is TRUE FOR A
-ZOMBIE.** The harness called a daemon "still alive at 200 s" that its own trace
-shows retiring at +90.2 s. `/proc/<pid>` answers *has this been reaped*, not *is
-this running* — and calling `poll()` to check is itself what reaps it. **Prefer
-the subject's own lifecycle record over any external liveness probe.**
-
-
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-*Both mechanisms are fixed, falsified RED-before/GREEN-after, and proved on two real daemons of
-different builds in a sandbox `YGGTERM_HOME`. What is owed is the entry's own falsifier on the
-desktop host: restart the daemon under a live agent row, attach to that row from a fresh client,
-and see the scrollback come back with the CLI's pid unchanged. That needs the fix deployed there.*
-
-*Mechanism (a) fixed 2026-08-22. Mechanism (b) — the half the user actually saw — fixed
-2026-08-22 in the same pair of changes as the seat-policy half it needs to work.*
-⇒ **That is the deadlock, and (a) is what supplies it with victims.** ✅ **FIXED 2026-08-22.**
-
-`probe_socket_occupancy` guarded the branch that unlinks a REAL socket file and only that one —
-`refresh_legacy_server_socket_aliases` re-pointed a candidate that was ALREADY a symlink with no
-occupancy question asked at all. So a name only had to be taken once and every later daemon
-perpetuated the loss for free.
-
-⚠⚠ **AND THE PROBE COULD NOT HAVE ANSWERED IT EVEN IF IT HAD BEEN CALLED THERE**, which is
-the part that makes this its own defect rather than a missing call. A probe follows the path, and
-a diverted path leads to the daemon that TOOK the name — which always answers. ⇒ The question
-*"whose address is this name"* has exactly one instrument: the kernel's bind table, which goes on
-reporting the original path long after that path stopped leading there. `socket_sweep`'s census
-already reads it; the alias refresh now asks it, on BOTH branches, once per refresh, and keeps
-the name whenever the census cannot be read.
-
-⭐⭐ **AND PREVENTION RESCUES NOBODY, SO THE DAEMON TAKES ITS NAME BACK.** An unlinked socket
-inode cannot be re-linked to a path by anything, so every daemon already stranded stays stranded
-under prevention alone. A live daemon re-binds its own versioned name instead.
-
-⚠⚠ **AND THE LIMIT ON THAT, STATED BEFORE IT IS BELIEVED.** The reclaim runs INSIDE the daemon
-whose name was taken, so it rescues a daemon that is itself running this build and nobody else.
-The memory finding says stranded daemons *"cannot be rescued by anything"* — that becomes false
-for daemons carrying the fix and stays TRUE for the ones already stranded today, which are running
-older binaries with no reclaim thread in them. ⇒ **The daemon measured on the build host at 29 h
-and 80 pty masters is not saved by this.** Its rows have to be moved or they die with it. What the
-fix guarantees is that the next generation of daemons cannot be put in that position, by either
-half: prevention stops a fixed daemon taking anyone's name, and the reclaim gets a fixed daemon's
-name back if an older one takes it. Reclaiming it is
-a complete cure because everything that looks for a daemon looks by name —
-`reachable_versioned_daemon_statuses` dials the versioned paths, the bridge resolver asks those
-daemons which one owns a runtime key, and the cross-daemon reconcile addresses siblings the same
-way.
-
-⛔ **Two guards, and a wrong `true` in either is this same defect aimed at a different victim.**
-A DIFFERENT real socket file at the name belongs to whoever bound it and is left alone. And a
-RETIRING daemon never re-binds: it unlinked that path itself, for a successor that has not bound
-yet, so taking it back would fail that successor's bind on an address already in use — from the
-process handing over to it.
-
-⚠ **A THIRD PATH EMPTIES THE NAME, and it looks like the innocent case.** A re-pointed alias whose
-target daemon later dies becomes a DANGLING symlink, and the next client to dial it unlinks it
-(`clear_local_daemon_socket_link_escaping_home` — correct behaviour over garbage). The name is then
-ABSENT while its owner is still bound to it: the same stranding with the evidence removed. An
-absent name is also the shape of somebody else's bind window, so it comes back only while the
-KERNEL still names this daemon as bound to it — a daemon that has not bound yet appears nowhere in
-that table at all.
-
-### ⚠⚠ A THIRD INSTRUMENT LYING, AND IT IS THE ENUMERATION VERB ITSELF
-
-`server daemons` — the census written precisely because `server status` answers for one daemon
-and *"the whole daemon-lifecycle problem is about the others"* — **did not list the stranded
-daemon.** Measured on the build host 2026-08-22: the census printed two rows while a third daemon
-was alive with 83 pty masters. It cannot see it, and for the same reason nothing else can: it
-probes the versioned socket PATHS, and every one of them had been re-pointed to the newest
-daemon. ⇒ A daemon that has lost its name is absent from the one instrument whose job is to find
-daemons, so the population looks smaller and healthier than it is. The `/proc/net/unix` bind-name
-read is the cross-check; `ls -la $YGGTERM_HOME/server-*.sock` showing symlinks is the fast tell.
-
-### ⚠ AND THE CONTESTED KEY WAS NOT WHAT IT WAS SAID TO BE
-
-The report reaching this lane said the successor's runtime under the contested key was *"a WRAPPER
-STILL WAITING TO ATTACH"*. Checked against the trace instead of repeated: on the build host the
-key that re-failed every 60 s for 28 hours was a **plain shell** (`exec '/bin/bash' -i`), and no
-attach wrapper is involved in one at any point. The substance survives — the tenant was a
-stand-in, not work — but a fix built on the stated specifics would have keyed on a wrapper that
-is not there. ⇒ **What the tenant IS, and what the fix keys on:** a child this daemon spawned for
-itself, that nobody has ever typed into. Adopted children are the session's own travelling pty and
-are never displaced; a child somebody has typed into is never displaced. The two arms of
-`a_stand_in_yields_the_key_to_the_sessions_own_pty` and
-`a_child_somebody_has_typed_into_is_still_a_conflict` differ by exactly one byte of client input.
 ## ⛔⛔⛔ [11.28] A ROW RESUMES INTO A BLANK SESSION AND KEEPS ITS OLD TITLE — 91% OF ONE CLI'S ROWS
 
 **Status:** OPEN
@@ -25527,7 +25085,6 @@ the local one, and nothing separates them.
 row that never offered the resume — and, on a row that IS resumable, a normal attach with its
 history intact.
 
-
 ## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
 
 **Status:** OPEN
@@ -25564,34 +25121,6 @@ the same binary the fleet runs everywhere, and the ledger and the owned/live spl
 both daemon-side. **Reproduce on a desktop before assuming the scope is wider than the
 evidence.**
 
-
-**Status:** OPEN
-
-`ygg-deliver`'s reap destroys a row whose transcript is ABSENT, on the stated premise
-that such a row *"has never written a word, so it was never briefed and cannot become
-anything"*. Measured during the greeting run: a codex row that had been briefed, had
-run a shell command, and had reported its result **had written no transcript at all**
-— no store file existed for it twenty minutes after birth.
-
-⚖ The premise is calibrated on one CLI. `ygg-spawn` allows 90 s of transcript lag from
-a measurement taken on a CLI that accepts a caller-supplied session id, so its row id
-IS its transcript id from the first byte. Four registered CLIs declare
-`id_assigned_at_birth: false`; they mint their own id and write on their own schedule,
-and until then the row's id addresses nothing. ABSENT is literally true for them and
-the inference drawn from it is false.
-
-⛔ **Not fixed by the FOUND/ABSENT/UNMEASURABLE split**, deliberately — that separated
-"we did not look" from "we looked", and this is a case where we looked in the right
-place and the answer is still not evidence.
-
-⇒ Recommended, and NOT taken here because it needs a measurement this lane does not
-have: find out how long after birth each `id_assigned_at_birth:false` CLI first writes
-a store file, and treat ABSENT inside that window as UNMEASURABLE. **Do not guess the
-threshold** — too short destroys working lanes, too long lets briefless debris hold
-seats, and both failures are silent. A cheaper interim that needs no timing at all:
-ask whether the row has a live agent PROCESS before destroying it, since a row with one
-has manifestly not failed to be born.
-
 ## ⛔ [99.1·99.2] A COMPOSER'S PLACEHOLDER HINT IS COUNTED AS AN UNSENT DRAFT
 
 **Status:** OPEN
@@ -25607,11 +25136,9 @@ refusing to probe, because the probe types a marker and clears the line with Ctr
 and would destroy it"*, and `input-check` answers `consuming_input:false` for the same
 reason.
 
-⛔ **The refusal is correct behaviour on a wrong reading, which is why it is dangerous.**
-The law forbids retrying `submitted:false`, so a spawner that hits this has no way to
-brief the row it just created, and the row then routes to the reap as never-briefed.
-`send` plus a lone carriage return delivers past it, but that path has no draft guard at
-all — it is the workaround, not the fix.
+⛔ **The refusal is correct behaviour on a wrong reading, which is why it is
+dangerous.** The full law — the same verdict structure this entry rides on — is stated
+once, in the unsent-draft entry above; this placeholder case is its twin, not its copy.
 
 ### The root cause, measured in a sandbox on 2026-08-22
 
@@ -25656,6 +25183,3 @@ false` — while a row with one real character typed into it still answers `true
 ⭐ **It is now rehearsable without a desktop.** A sandbox `YGGTERM_HOME` + GUI reproduces
 it in about four minutes (recipe: field guide; aiming the verbs: fleet skill §11.9),
 which is how it was root-caused.
-
-**A second report of the same question, from a different seat.**
-
