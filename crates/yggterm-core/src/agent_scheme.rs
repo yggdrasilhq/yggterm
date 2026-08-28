@@ -463,6 +463,48 @@ pub fn session_kind_for_row(full_path: &str, icon_kind: &str) -> Option<SessionK
         .map(|descriptor| descriptor.kind)
 }
 
+/// The kind a row built from a REMOTE machine's scan is, when the scan spoke a
+/// payload too old to carry the kind itself.
+///
+/// Resolution order, most authoritative first:
+/// 1. `kind_on_wire` — the scanning daemon knew, and said so ([`Some`]);
+/// 2. the path's own registered scheme (agent CLIs);
+/// 3. the path's shell scheme — `local://`, `live::`, `ssh://` are the birth
+///    schemes of PLAIN SHELL rows on the machine that reported them;
+/// 4. a store the path points into ([`agent_cli_for_store_path`]);
+/// 5. `Shell`.
+///
+/// ⛔ **Shell, never Codex, is the terminal answer.** Every one of these
+/// consumers used to `unwrap_or(SessionKind::Codex)`, which labelled the remote
+/// machines' plain shell rows — rows with no transcript at all, because shells
+/// do not write one — as EMPTY CODEX SESSIONS in the cwd tree and on the start
+/// page. Naming a row after the wrong CLI sends its clicks down the wrong
+/// resume path (see [`session_kind_for_row`]); an unattributed row painted as a
+/// shell at least opens nothing and claims nothing.
+pub fn session_kind_for_scanned_row(
+    session_path: &str,
+    kind_on_wire: Option<SessionKind>,
+) -> SessionKind {
+    if let Some(kind) = kind_on_wire {
+        return kind;
+    }
+    if let Some(kind) = session_kind_for_path(session_path) {
+        return kind;
+    }
+    let trimmed = session_path.trim_start();
+    if trimmed.starts_with("local://") {
+        return SessionKind::Shell;
+    }
+    if trimmed.starts_with("live::") || trimmed.starts_with("ssh://") {
+        return SessionKind::SshShell;
+    }
+    if let Some(descriptor) = crate::agent_cli::agent_cli_for_store_path(session_path) {
+        return descriptor.kind;
+    }
+    SessionKind::Shell
+}
+
+
 /// Builds the canonical remote session path for an agent kind, machine key, and session id.
 pub fn remote_agent_session_path(kind: SessionKind, machine_key: &str, session_id: &str) -> String {
     let prefix = remote_agent_row_schemes()
@@ -578,6 +620,62 @@ pub fn predicate_holes_for(predicate: &str) -> impl Iterator<Item = &'static Pre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ⛔ THE PASS 0 LOCK. Every scanned-row consumer used to
+    // `unwrap_or(SessionKind::Codex)`, which labelled the remote machines'
+    // plain shell rows — `local://` births with no transcript at all — as
+    // EMPTY CODEX SESSIONS in the cwd tree and the start page. The resolver
+    // must answer the wire kind first, the schemes next, and SHELL last.
+    #[test]
+    fn a_scanned_row_is_never_minted_into_codex_for_its_path() {
+        use crate::SessionKind;
+        // The wire kind wins over everything, even a parseable path.
+        assert_eq!(
+            session_kind_for_scanned_row(
+                "remote-cc://buildbox/0197c95a-0000-7000-8000-000000000001",
+                Some(SessionKind::Muse),
+            ),
+            SessionKind::Muse,
+            "the scanning daemon's own answer was overridden by a path guess",
+        );
+        // Scheme resolution still works when the peer is old.
+        assert_eq!(
+            session_kind_for_scanned_row(
+                "remote-cc://buildbox/0197c95a-0000-7000-8000-000000000001",
+                None,
+            ),
+            SessionKind::ClaudeCode,
+        );
+        // The shell birth schemes: the exact rows the old fallback converted.
+        assert_eq!(
+            session_kind_for_scanned_row(
+                "local://0197c95a-0000-7000-8000-000000000002",
+                None,
+            ),
+            SessionKind::Shell,
+            "a remote machine's local:// shell row was painted codex",
+        );
+        assert_eq!(
+            session_kind_for_scanned_row(
+                "live::0197c95a-0000-7000-8000-000000000003",
+                None,
+            ),
+            SessionKind::SshShell,
+        );
+        assert_eq!(
+            session_kind_for_scanned_row(
+                "ssh://buildbox/0197c95a-0000-7000-8000-000000000004",
+                None,
+            ),
+            SessionKind::SshShell,
+        );
+        // A path nobody can name is a SHELL — unattributed, neutral — never a
+        // CLI that did not name itself.
+        assert_eq!(
+            session_kind_for_scanned_row("weird://something", None),
+            SessionKind::Shell,
+        );
+    }
 
     #[test]
     fn registry_prefixes_are_unique_and_well_formed() {
