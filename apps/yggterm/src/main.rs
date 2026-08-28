@@ -23,6 +23,10 @@ use yggterm_core::{
     SessionNodeKind, SessionStore, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind,
     append_trace_event, check_for_update, current_version, detect_install_context,
     install_release_update, refresh_desktop_integration,
+    // THE one owner of the MemTotal question — the family bounds in
+    // `yggterm_core::cgroup_family` read the same number this file's scope and
+    // WebKit derivations use, so one host cannot produce two answers.
+    cgroup_family::read_mem_total_kb,
 };
 use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::server_cli::{cli_server_endpoint, ensure_local_server_ready_for_cli};
@@ -1218,6 +1222,38 @@ fn main() -> Result<()> {
         "main_enter",
         serde_json::json!({ "args": args.clone() }),
     );
+    // ⛔ THE FAMILY SHAPE: the GUI's own cgroup subdivides into `gui` / `web` /
+    // `helpers` children, the `memory` controller comes on at the scope, and
+    // the `web` child carries the committed bound the engine's RSS-valued
+    // policy cannot see. The kernel constraint that decides the order — a
+    // cgroup with subtree controllers must hold no internal processes — and
+    // every operation's unprivileged reachability are measured live (see
+    // `yggterm_core::cgroup_family`). Runs only for the GUI, only once the
+    // scope arm says this process is actually bounded: on the plain login
+    // session scope the shape is impossible unprivileged, and pretending
+    // otherwise would just move the failure. An adoption restart that lands
+    // the successor inside the predecessor's `gui` child re-arms the SAME
+    // scope (the parent of the child), which is idempotent by construction.
+    #[cfg(target_os = "linux")]
+    let cgroup_family_report = if args.is_empty() && memory_scope.bounded() {
+        let self_pid = std::process::id() as i32;
+        let own = yggterm_core::cgroup_family::own_cgroup_path(self_pid);
+        // After a first arm this process sits in `<scope>/gui`; the scope root
+        // is then one level up. Before it (fresh private scope) it IS the
+        // scope root.
+        let scope_fs_root = own.as_deref().map(|path| match path.rsplit_once('/') {
+            Some((parent, "gui")) => format!("/sys/fs/cgroup{parent}"),
+            _ => format!("/sys/fs/cgroup{path}"),
+        });
+        let report =
+            scope_fs_root.map(|root| yggterm_core::cgroup_family::arm_family(root, self_pid));
+        if let Some(armed) = report.as_ref().map(|r| r.armed) {
+            yggterm_core::cgroup_family::set_family_armed(armed);
+        }
+        report
+    } else {
+        None
+    };
     // ⛔ WHETHER THIS GUI IS BOUNDED AT ALL, ON THE RECORD, EVERY LAUNCH.
     //
     // `/proc/<pid>/environ` cannot answer it and neither can the binary's
@@ -1236,6 +1272,16 @@ fn main() -> Result<()> {
             "bounded": memory_scope.bounded(),
             "inherited_unit": memory_scope.inherited_unit(),
             "fallback_reason": memory_scope.fallback_reason(),
+            // Absent (null) when the family shape was not ATTEMPTED — one-shots,
+            // an opted-out or unbounded GUI — which is a different finding from
+            // "attempted and refused", and the payload keeps the two apart.
+            "family": cgroup_family_report.as_ref().map(|report| serde_json::json!({
+                "armed": report.armed,
+                "children": report.children,
+                "web_high_bytes": report.web_high_bytes,
+                "web_swap_max_bytes": report.web_swap_max_bytes,
+                "error": report.error,
+            })),
         }),
     );
     let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
@@ -3205,11 +3251,15 @@ enum MemoryScopeOutcome {
     /// ⚠ The two halves of the inheritance travel by DIFFERENT mechanisms: the
     /// marker rides the environment, the bound rides the cgroup. They coincide
     /// for a plain fork and can come apart for anything that carries an
-    /// environment further than it carries a process — at which point trusting
-    /// the marker alone reports `bounded: true` for a GUI in the plain login
-    /// scope. So this variant does not trust it: it carries what
-    /// `/proc/self/cgroup` + `memory.high` actually say.
-    Inherited { unit: String, bounded: bool },
+    /// environment further than it carries a process. So this variant does not
+    /// trust the marker: it carries what `/proc/self/cgroup` + `memory.high`
+    /// actually say, and the entry path only ever constructs it for a scope
+    /// that READS AS BOUNDED — an inherited-but-unbounded reading re-arms a
+    /// fresh private scope instead of returning (measured live: the 3.2.5
+    /// adoption restart left the GUI in `session-<id>.scope` at
+    /// `memory.high = max` with the marker set, and the old early return kept
+    /// it there for life).
+    Inherited { unit: String },
     /// `YGGTERM_MEMORY_SCOPE=0` — a bound was declined, so its absence is not a
     /// fault.
     OptedOut,
@@ -3232,11 +3282,14 @@ impl MemoryScopeOutcome {
     }
 
     /// Whether this process is actually capped. An inherited scope answers from
-    /// the cgroup rather than from the marker that put it on this path.
+    /// the cgroup rather than from the marker that put it on this path — and
+    /// since the entry path re-arms an inherited-unbounded reading instead of
+    /// returning it, an `Inherited` that exists at all is bounded by
+    /// construction.
     fn bounded(&self) -> bool {
         match self {
             Self::Entered => true,
-            Self::Inherited { bounded, .. } => *bounded,
+            Self::Inherited { .. } => true,
             _ => false,
         }
     }
@@ -3386,6 +3439,9 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
     ) {
         return MemoryScopeOutcome::OptedOut;
     }
+    // Set when the marker pointed at an UNBOUNDED cgroup: the re-exec below is
+    // then a RE-ARM, and every failure reason carries the unit it rescued from.
+    let mut rearm_from: Option<String> = None;
     // Idempotent: the child we exec carries this, so it never re-enters.
     //
     // ⛔ BUT THE MARKER IS NOT PROOF OF A BOUND — it only proves that SOMETHING
@@ -3394,19 +3450,42 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
     // `systemd-run` once; anything that carries the environment further than the
     // process would land here with no bound at all. So the answer comes from the
     // cgroup, and the outcome says which of the two happened.
+    //
+    // ⛔ AND AN INHERITED-UNBOUNDED READING IS NOT A PLACE TO STOP — it is the
+    // cue to RE-ARM. Measured live on the GUI host (3.2.5, the adoption
+    // restart onto the roll): the relaunched GUI recorded
+    // `outcome: "inherited", inherited_unit: "session-61736.scope",
+    // bounded: false` — the daemon-spawned successor inherited the marker
+    // through the relaunch chain but NOT the private scope, landed in the
+    // plain login session at `memory.high = max`, and the early return below
+    // kept it there for its whole life. The early return exists for
+    // idempotence — "someone already did the work" — and the honest cgroup
+    // reading is the proof that NOBODY did. So: inherited AND bounded keeps
+    // the early return (a plain fork from a scoped GUI re-enters nothing);
+    // inherited and UNBOUNDED falls through to the `systemd-run` re-exec and
+    // arms a fresh private scope, exactly as a first launch would. The
+    // falsifier for the old shape — "a reading of `bounded: false` means the
+    // marker outlived its bound and the GUI is genuinely uncapped" — is
+    // retired by making that reading act.
     if std::env::var_os(ENV_YGGTERM_MEMORY_SCOPE_ACTIVE).is_some() {
         let (unit, bounded) = current_cgroup_memory_bound();
-        if !bounded {
-            eprintln!(
-                "yggterm: the memory-scope marker is set but this process is in an unbounded \
-                 cgroup ({unit}); running unbounded"
-            );
+        if bounded {
+            return MemoryScopeOutcome::Inherited { unit };
         }
-        return MemoryScopeOutcome::Inherited { unit, bounded };
+        eprintln!(
+            "yggterm: the memory-scope marker is set but this process is in an unbounded \
+             cgroup ({unit}); re-arming a private scope"
+        );
+        rearm_from = Some(unit);
+        // Falls through to the re-exec below. If THAT fails, the Fallback
+        // reasons below name the unit the GUI is being rescued from, so the
+        // trace keeps the whole story: inherited-unbounded, re-arm attempted,
+        // and what refused it.
     }
     let Ok(exe) = std::env::current_exe() else {
-        return MemoryScopeOutcome::Fallback(String::from(
-            "the running binary could not be located",
+        return MemoryScopeOutcome::Fallback(with_rearm_context(
+            rearm_from.as_deref(),
+            String::from("the running binary could not be located"),
         ));
     };
     // ⛔ A DEPLOY REPLACES THIS BINARY WHILE IT IS RUNNING, and `current_exe`
@@ -3416,9 +3495,12 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
     // GUI that crashed on the owner's laptop was running exactly such a deleted
     // binary. Falling through here starts the GUI from the image it already has.
     if !exe.exists() {
-        let reason = format!(
-            "the running binary has been replaced on disk ({}), so no scope could re-exec it",
-            exe.display()
+        let reason = with_rearm_context(
+            rearm_from.as_deref(),
+            format!(
+                "the running binary has been replaced on disk ({}), so no scope could re-exec it",
+                exe.display()
+            ),
         );
         eprintln!("yggterm: {reason}; starting unbounded instead");
         return MemoryScopeOutcome::Fallback(reason);
@@ -3426,6 +3508,7 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
     let policy = memory_scope_policy(read_mem_total_kb());
     let pid = std::process::id();
     if let Err(reason) = memory_scope_preflight(policy, &format!("yggterm-gui-preflight-{pid}")) {
+        let reason = with_rearm_context(rearm_from.as_deref(), reason);
         eprintln!("yggterm: {reason}; starting unbounded instead");
         return MemoryScopeOutcome::Fallback(reason);
     }
@@ -3437,19 +3520,25 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
         .env(ENV_YGGTERM_MEMORY_SCOPE_ACTIVE, "1")
         .exec();
     let reason = format!("exec of systemd-run failed after its probe succeeded ({error})");
+    let reason = with_rearm_context(rearm_from.as_deref(), reason);
     eprintln!(
         "yggterm: could not enter a private memory scope ({error}); starting unbounded instead"
     );
     MemoryScopeOutcome::Fallback(reason)
 }
 
-fn read_mem_total_kb() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    meminfo.lines().find_map(|line| {
-        let rest = line.strip_prefix("MemTotal:")?;
-        rest.split_whitespace().next()?.parse::<u64>().ok()
-    })
+/// Prefix a scope-entry failure with the re-arm context, so a trace that says
+/// `fallback` can also say WHAT the GUI was rescued from when the failure
+/// happened on an inherited-unbounded re-arm rather than a first launch.
+fn with_rearm_context(rearm_from: Option<&str>, reason: String) -> String {
+    match rearm_from {
+        Some(unit) => format!("re-arm after inheriting unbounded {unit}: {reason}"),
+        None => reason,
+    }
 }
+
+// `read_mem_total_kb` lives in `yggterm_core::cgroup_family` now — the family
+// bounds and this file's scope/WebKit derivations must read ONE MemTotal.
 
 #[cfg(target_os = "linux")]
 fn configure_linux_webkit_memory_policy() {
@@ -4756,6 +4845,108 @@ mod tests {
             body.contains("MemoryScopeOutcome::Fallback"),
             "every fall-through must RETURN its reason: an unbounded GUI that \
              does not say so is the defect this exists to prevent"
+        );
+    }
+
+    /// ⛔ AN INHERITED-UNBOUNDED READING MUST RE-ARM, NOT SETTLE.
+    ///
+    /// Caught live on the GUI host (3.2.5): the adoption restart onto a roll
+    /// spawned the successor from the daemon's chain — the successor inherited
+    /// `…_SCOPE_ACTIVE` through that environment but NOT the private cgroup,
+    /// and landed in the plain login session scope at `memory.high = max`.
+    /// The idempotent early return then kept it unbounded for its whole life,
+    /// on exactly the reading (`bounded: false`) that had been named as the
+    /// hazard when the honest readback shipped. Locked at the source because
+    /// the defect IS the control flow: the marker branch may return
+    /// `Inherited` only when the cgroup read says bounded.
+    #[test]
+    fn an_inherited_unbounded_scope_re_arms_instead_of_returning() {
+        let source = include_str!("main.rs");
+        let product = source
+            .split("mod tests {")
+            .next()
+            .expect("main.rs has a product half above its tests");
+        let start = product
+            .find("fn enter_memory_scope_if_requested()")
+            .expect("the scope entry point must exist");
+        let body = &product[start..];
+        let end = body[1..]
+            .find("\nfn ")
+            .map(|at| at + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("if bounded {"),
+            "the marker branch must gate the `Inherited` return on the cgroup \
+             readback being a REAL bound, or the early return re-creates the \
+             unbounded-adoption defect: {body}"
+        );
+        assert!(
+            body.contains("rearm_from = Some(unit)"),
+            "an inherited-unbounded reading must fall through to the re-exec \
+             with the unit on record, not return"
+        );
+        assert!(
+            body.contains("with_rearm_context("),
+            "a re-arm failure must name the unit it was rescued from in the \
+             fallback reason — `fallback` alone cannot be told apart from a \
+             first launch that failed"
+        );
+        // And the honest reading that caught the defect stays on the wire.
+        assert!(
+            body.contains("re-arming a private scope"),
+            "the stderr line must say the re-arm is happening; silence was the \
+             old behaviour"
+        );
+    }
+
+    #[test]
+    fn a_rearm_failure_names_the_unit_it_was_rescued_from() {
+        assert_eq!(
+            super::with_rearm_context(
+                Some("session-61736.scope"),
+                String::from("systemd-run refused a probe scope"),
+            ),
+            "re-arm after inheriting unbounded session-61736.scope: systemd-run \
+             refused a probe scope",
+            "the trace must keep the whole story: inherited-unbounded, re-arm \
+             attempted, and what refused it"
+        );
+        assert_eq!(
+            super::with_rearm_context(None, String::from("first-launch failure")),
+            "first-launch failure",
+            "a first launch has no rescue context and must not grow one"
+        );
+    }
+
+    /// ⛔ THE FAMILY SHAPE MUST BE ON THE STARTUP RECORD.
+    ///
+    /// A bound nobody can see is a bound that rots. The `linux_memory_scope`
+    /// event is the one place every launch already reports, so the family arm
+    /// reports there — as a nested `family` object that is ABSENT (null) when
+    /// the shape was not attempted, because "we did not look" and "it is not
+    /// armed" are different findings.
+    #[test]
+    fn the_startup_scope_event_carries_the_family_shape() {
+        let source = include_str!("main.rs");
+        let product = source
+            .split("mod tests {")
+            .next()
+            .expect("main.rs has a product half above the tests");
+        let start = product
+            .find("\"linux_memory_scope\"")
+            .expect("the scope event must exist");
+        let body = &product[start..start + 1200];
+        assert!(
+            body.contains("\"family\""),
+            "the startup event must carry the family arm report (armed, \
+             children, web bounds, error): {body}"
+        );
+        assert!(
+            body.contains("web_high_bytes") && body.contains("web_swap_max_bytes"),
+            "the committed bound is the WHOLE point — the readback numbers go on \
+             the record, not just an armed flag: {body}"
         );
     }
 

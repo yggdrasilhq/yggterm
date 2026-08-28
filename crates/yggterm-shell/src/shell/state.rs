@@ -37476,6 +37476,39 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             // laptop whose fan is the complaint. The probe owns its own monotonic
             // clock now, and no longer accepts one.
             let samples = probe.observe(&observations);
+            // The family sweep rides the same walk: the WebKit children are born
+            // into `gui` (they inherit the GUI's child) and belong in `web`. Same
+            // two laws as the probe above — no signal write, /proc and cgroupfs
+            // off the UI thread — and by construction it is cheap: a member in
+            // its right child costs one cgroup read per tick, and only a NEW or
+            // misplaced member costs a write.
+            if yggterm_core::cgroup_family::family_armed() {
+                let members: Vec<(i32, String)> = observations
+                    .iter()
+                    .map(|observation| (observation.stat.pid, observation.stat.comm.clone()))
+                    .collect();
+                let migrations = task::spawn_blocking(move || {
+                    yggterm_core::cgroup_family::migrate_misplaced(
+                        members.iter().map(|(pid, comm)| (*pid, comm.as_str())),
+                    )
+                })
+                .await
+                .unwrap_or_default();
+                for migration in &migrations {
+                    append_trace_event(
+                        &perf_home,
+                        "gui",
+                        "memory",
+                        "family_migration",
+                        serde_json::json!({
+                            "pid": migration.pid,
+                            "comm": migration.comm,
+                            "from": migration.from,
+                            "to": migration.to,
+                        }),
+                    );
+                }
+            }
             if samples.is_empty() {
                 // First tick after startup: there is no previous observation, so the
                 // only available number would be a lifetime average. Skip it.

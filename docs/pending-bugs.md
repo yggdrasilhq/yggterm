@@ -6438,56 +6438,98 @@ entry is void and only the unbounded-growth half stands.
 
 **Falsifier:** `yggterm-headless server startpage ls --json`, `server titles ls --json`, and `server cwdtree ls --json` on every fleet host match Python oracles with exit 0 (`check-startpage.py`, `check-titles.py`, `check-cwdtree.py` all exit 0). No shell sessions in startpage/cwdtree; no shorthashes; faithful screenshots show intact headers, bodies, and footers across all CLIs.
 
-## ⛔⛔ [6.7] A RESTARTED GUI REPORTS `entered` / `bounded:true` WITHOUT ARMING ANYTHING — FIXED IN CODE, LIVE PROOF OWED
+## ⛔⛔ [6.7] A RELAUNCHED GUI INHERITS THE MARKER WITHOUT THE BOUND AND STAYS UNBOUNDED FOR LIFE
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-**Falsifier:** after the next GUI restart from a running GUI, the startup trace
-`gui/startup/linux_memory_scope` must read `outcome: "inherited"` with
-`inherited_unit` naming the scope; a reading of `entered` there means the fix did
-not take, and a reading of `bounded: false` means the marker outlived its bound
-and the GUI is genuinely uncapped.
+*The honest-readback fix this entry succeeds (its own live proof collected 2026-08-28
+22:45 on the GUI host, and the entry left with it) turned out to be a WITNESS, not a
+guard: it named the unbounded state and nothing acted on the name.*
 
-**Caught live 2026-08-14 20:17**, restarting the GUI onto a new build:
+**Caught live 2026-08-28 22:45, the GUI host, build 3.2.5, the adoption restart onto the
+3.2.5 roll.** The successor GUI's own startup event — the instrument the previous entry
+shipped — read exactly what it was designed to read:
 
-| instrument | said |
-|---|---|
-| `gui/startup/linux_memory_scope` | `{"outcome":"entered","bounded":true}` |
-| `/proc/<new pid>/cgroup` | `…/yggterm-gui-<the PREVIOUS pid>.scope` |
+```
+gui/startup/linux_memory_scope  {outcome: "inherited",
+                                 inherited_unit: "session-61736.scope",
+                                 bounded: false}
+/proc/<gui pid>/cgroup          session-61736.scope, memory.high = max
+```
 
-⛔ **The two disagreed, and the campaign's stated way of telling them apart is
-the one that fails here.** The recorded rule was *"read the scope's pid against
-the process's pid — that comparison tells 'the cap armed' from 'the cap was
-inherited', and nothing else does"*. Both instruments were consulted and they
-returned opposite verdicts, so neither could settle it.
+⛔ **The marker rode the relaunch chain; the bound did not.** The successor was spawned
+through the adoption/convergence path (a daemon-side relaunch), which carried
+`YGGTERM_MEMORY_SCOPE_ACTIVE` in the environment but NOT the private scope in its
+cgroup. The idempotent branch saw the marker, took the honest readback, printed
+`bounded: false` to a trace — and RETURNED, leaving the GUI unbounded in the plain
+login session for its whole life. The previous entry named this exact shape as the
+hazard ("the marker can outlive the bound … which is precisely the failure this trace
+field was added to make impossible"); the field made it VISIBLE and the early return
+kept it FATAL.
 
-**Mechanism, from the source rather than reasoned:** `server app update restart`
-relaunches the GUI **from inside the running GUI**. The successor therefore
-inherits `YGGTERM_MEMORY_SCOPE_ACTIVE` in its environment and the parent's cgroup
-by fork, hits the idempotent early return in `enter_memory_scope_if_needed`
-(`apps/yggterm/src/main.rs`), and returns `Entered` **without ever executing
-`systemd-run`**. The scope's unit name is `yggterm-gui-{pid}` computed by
-whichever process *did* run it — so the name carries a dead pid for the entire
-life of every restarted GUI.
+**The fix:** an inherited reading now acts on itself. `inherited` AND bounded keeps the
+early return — a plain fork from a scoped GUI must not re-enter anything.
+Inherited and UNBOUNDED falls through to the `systemd-run` re-exec and arms a fresh
+private scope, exactly as a first launch would; if the re-arm fails, the `fallback`
+reason names the unit the GUI was rescued from (`re-arm after inheriting unbounded
+<unit>: …`), so the trace keeps the whole story. The GUI's own scope event
+(`linux_memory_scope` in `apps/yggterm/src/main.rs`) is the one owner of this
+decision. Locked by a source-predicate test: the marker branch may return `Inherited`
+only behind a `bounded` gate, the fall-through carries the unit, and a re-arm failure
+names it.
 
-⛔ **AND THE MARKER CAN OUTLIVE THE BOUND.** The two halves of the inheritance
-travel by different mechanisms — the marker by environment, the ceiling by
-cgroup. A plain fork carries both, which is why this was benign on the day it was
-caught. Anything that carries an environment further than it carries a process
-(a user unit, a relaunch through a daemon that captured the env from an earlier
-GUI) would take the same early return and report `bounded: true` **while sitting
-in the plain login scope at `memory.high = max`** — which is precisely the
-failure this trace field was added to make impossible.
+**Falsifying observation:** on the next GUI restart that arrives through a
+relaunch chain (adoption or update), the startup `linux_memory_scope` event must NOT
+read `bounded: false` while the marker is in play — it must read
+`entered`/`bounded: true` (fresh scope armed) or `inherited`/`bounded: true`
+(plain fork from a scoped GUI). A `fallback` on that restart is acceptable ONLY with
+the re-arm context in its reason.
 
-✅ **Fixed:** the idempotent path now reads `/proc/self/cgroup` + `memory.high`
-instead of trusting the marker, and reports `inherited` with the unit it landed
-in. `max`, empty and unreadable all count as **unbounded** — blind is not
-bounded. Locked by a test shown to fail against a mutated predicate.
+## ⛔⛔ [6.7] THE WEB PLANE HAS NO COMMITTED BOUND — THE FAMILY CHILD SHAPE
 
-⭐ **The reusable half:** an early return added for idempotence answered a
-DIFFERENT question than the one the caller was asking. `Entered` meant "I did the
-work" at the site that created it and "someone did the work" at the site that
-skipped it, and one enum variant covered both.
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*The structural half of the 6.7 leak classification. The engine's own policy is
+RSS-valued and structurally cannot see swap (the settled analysis in the 6.7 family
+narrative, measured 649 → 1 362 MB committed against a flat 586–714 MB RSS band);
+the cgroup bound is the only fix that makes a threshold mean what it says.*
+
+**The falsifier's precondition was measured and held (2026-08-28, GUI host 3.1.72 and
+re-proven on dev + GUI host 3.2.5, throwaway scopes, zero residue):** the private
+scope can be emptied into user-owned children, `+memory` then enables on it (EBUSY
+before the emptying — the internal-process constraint), `memory.high` /
+`memory.swap.max` become writable in the children only after that enable, a forked
+child born into `gui` migrates into `web` clean, and all of it is unprivileged inside
+the `systemd-run --user --scope` unit the GUI already arms.
+
+**The shape (armed at GUI startup, `yggterm_core::cgroup_family` + the scope entry in
+`apps/yggterm/src/main.rs`):**
+
+1. create `gui` / `web` / `helpers` under the private scope;
+2. the GUI migrates ITSELF into `gui` — which is what makes the next step legal;
+3. `+memory` on the scope's `subtree_control`;
+4. the `web` child gets `memory.high` = the engine's own sanctioned single-process
+   share (`MemTotal/8`) and `memory.swap.max` = half of it — derived from the limit
+   the app already applies, not fitted to one host, and strictly inside the family
+   scope's own ceiling so the child bound always engages first;
+5. the render probe's existing `/proc` walk sweeps every later-born family member
+   into its child (WebKit content/network/GPU → `web`, bwrap/glycin/session helpers →
+   `helpers`); the sweep is silent until the arm succeeds and self-heals across pid
+   recycle because nothing is remembered and everything is read.
+
+`MemoryHigh`, never `MemoryMax` — reclaim pressure makes a leak SLOW rather than
+dead, the same ruling the scope bound's derivation carries. Every launch records the
+whole shape on `gui/startup/linux_memory_scope` under `family` (armed, children, the
+bounds AS THE KERNEL CONFIRMED THEM, the error when refused — null when not
+attempted), and each sweep move emits `gui/memory/family_migration`.
+
+**Falsifying observation:** after the roll ships this and the GUI restarts inside its
+private scope, the startup `linux_memory_scope` event must carry
+`family: {armed: true, children: ["gui","web","helpers"], web_high_bytes: >0,
+web_swap_max_bytes: >0}`; `cat <scope>/gui/cgroup.procs` must name the GUI pid;
+WebKit processes must sit in `<scope>/web` (their `family_migration` events, or the
+child's `cgroup.procs`); and `<scope>/web/memory.current` must account live. A
+`family.error` on a healthy private scope is a failure of this entry, loudly.
 
 ## ⛔⛔⛔ [6.7] AUDIT THE SESSION-ONLY RE-ATTACH MACHINERY — ONE SUBSYSTEM BEHIND THE GATES, THE RENDER DIVERGENCE AND THE RESTART STORM
 

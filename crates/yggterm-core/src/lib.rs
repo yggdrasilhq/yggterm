@@ -12,6 +12,7 @@ mod browser;
 // and idempotence — each of which produces plausible garbage rather than an
 // error. See ychrome/docs/collections.md §Import.
 pub mod browser_import;
+pub mod cgroup_family;
 pub mod cli_args;
 pub mod cli_plane;
 pub mod cli_install;
