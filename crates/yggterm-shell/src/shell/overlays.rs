@@ -1081,6 +1081,128 @@ fn LaunchFlagsOverlay(
     }
 }
 
+/// A modal an APP raised from its own contributed pane.
+///
+/// ⛔ **yggterm owns the DIALOG, the app owns the CONTENT** — the same split the
+/// `fido2` presence dialog draws, and the reason this is a platform widget kind
+/// rather than app chrome. The shell supplies the wash, the card, the title bar,
+/// the ✕, the Escape/backdrop dismissal and the stacking; everything inside is
+/// the app's own schema, rendered by the SAME [`AppPaneRailBody`] the rail uses.
+/// yggterm learns nothing about what an app means by any of it.
+///
+/// ⛔ It is in `chrome_transient_over_viewport`, and it has to be: a native child
+/// webview draws above ALL DOM, so a dialog raised over a browsing session is
+/// invisible until the reconciler stashes the surface — the user then reports
+/// that the button does nothing.
+#[component]
+fn AppPaneModalOverlay(
+    snapshot: SharedSnapshot,
+    on_close: EventHandler<MouseEvent>,
+    on_app_pane_action: EventHandler<(String, String, Option<String>)>,
+    on_app_pane_reorder: EventHandler<(String, String, String, Option<String>, Vec<String>)>,
+    on_app_pane_value: EventHandler<(String, String)>,
+    state: Signal<ShellState>,
+) -> Element {
+    let Some(dialog) = snapshot.app_pane_modal.clone() else {
+        return rsx! {};
+    };
+    let palette = snapshot.palette;
+    // The SAME surface, wash and shadow the shell's own rail-raised editors wear
+    // (`LaunchFlagsOverlay`), so a contributed dialog and a yggterm one read as
+    // one product rather than as two vocabularies side by side.
+    let overlay_wash = match snapshot.settings.theme {
+        UiTheme::ZedLight => "rgba(228,237,245,0.03)",
+        UiTheme::ZedDark => "rgba(10,14,18,0.05)",
+    };
+    let editor_surface = match snapshot.settings.theme {
+        UiTheme::ZedLight => "rgb(248,252,255)",
+        UiTheme::ZedDark => "rgb(28,34,41)",
+    };
+    let editor_shadow = match snapshot.settings.theme {
+        UiTheme::ZedLight => {
+            "0 0 0 1px rgba(215,229,243,0.96), 0 0 0 10px rgba(129,188,255,0.18), 0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92)"
+        }
+        UiTheme::ZedDark => {
+            "0 0 0 1px rgba(59,87,112,0.90), 0 0 0 10px rgba(124,200,255,0.16), 0 26px 60px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(68,84,99,0.94)"
+        }
+    };
+    let title = dialog.pane.schema.title.clone();
+    let subtitle = dialog.subtitle.clone();
+    let pane_id = dialog.pane.pane_id.clone();
+    rsx! {
+        div {
+            "data-app-pane-modal-overlay": "1",
+            "data-yggterm-modal-root": "app-pane-modal",
+            style: format!(
+                "position:fixed; inset:0; z-index:98; display:flex; align-items:center; \
+                 justify-content:center; background:{};",
+                overlay_wash
+            ),
+            onmousedown: move |evt| on_close.call(evt),
+            onclick: move |evt| on_close.call(evt),
+            div {
+                "data-app-pane-modal-shell": "{pane_id}",
+                style: format!(
+                    "width:min(620px, calc(100vw - 44px)); max-height:calc(100vh - 56px); \
+                     display:flex; flex-direction:column; \
+                     border-radius:22px; background:{}; color:{}; box-shadow:{}; font-family:{}; \
+                     overflow:hidden;",
+                    editor_surface,
+                    palette.text,
+                    editor_shadow,
+                    interface_font_family()
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; \
+                            gap:12px; padding:16px 16px 8px 16px; flex:0 0 auto;",
+                    div {
+                        style: "display:flex; flex-direction:column; gap:3px; min-width:0;",
+                        div {
+                            "data-app-pane-modal-title": "1",
+                            style: format!(
+                                "font-size:15px; font-weight:800; letter-spacing:-0.01em; color:{};",
+                                palette.text
+                            ),
+                            "{title}"
+                        }
+                        if !subtitle.is_empty() {
+                            div {
+                                "data-app-pane-modal-subtitle": "1",
+                                style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                                "{subtitle}"
+                            }
+                        }
+                    }
+                    button {
+                        "data-app-pane-modal-close": "1",
+                        style: format!(
+                            "border:none; background:transparent; color:{}; font-size:16px; \
+                             font-weight:700; cursor:pointer;",
+                            palette.muted
+                        ),
+                        onclick: move |evt| on_close.call(evt),
+                        "✕"
+                    }
+                }
+                // The app's own schema, drawn by the rail's renderer. `modal:
+                // true` swaps the schema it reads and drops the rail header —
+                // the card above IS the header here.
+                AppPaneRailBody {
+                    snapshot: snapshot.clone(),
+                    pane_id: pane_id.clone(),
+                    modal: true,
+                    on_app_pane_action,
+                    on_app_pane_reorder,
+                    on_app_pane_value,
+                    state,
+                }
+            }
+        }
+    }
+}
+
 /// The marker a row wears for where its flags came from — spec §5.
 ///
 /// Provenance is part of the UI, not a footnote: a row read off a running binary

@@ -4796,6 +4796,45 @@ fn app() -> Element {
                         on_close: move |_| state.with_mut_counted(|shell| shell.set_cli_install_open(false)),
                     }
                 }
+                // A modal an APP raised from its contributed pane. Mounted with
+                // the shell's own rail-raised editors, at their z-index, because
+                // that is what it is: the user opened it from a rail they were
+                // already in. The dialog is yggterm's; everything inside it is
+                // the app's schema.
+                if snapshot.app_pane_modal.is_some() {
+                    AppPaneModalOverlay {
+                        snapshot: snapshot.clone(),
+                        on_close: move |_| state.with_mut_counted(|shell| {
+                            shell.close_app_pane_modal();
+                        }),
+                        on_app_pane_action: {
+                            let desktop = desktop.clone();
+                            move |(pane_id, action, value): (String, String, Option<String>)| {
+                                let desktop = desktop.clone();
+                                spawn(app_pane_run_action(state, desktop, pane_id, action, value));
+                            }
+                        },
+                        on_app_pane_reorder: {
+                            let desktop = desktop.clone();
+                            move |(pane_id, action, moved, parent, order): (
+                                String,
+                                String,
+                                String,
+                                Option<String>,
+                                Vec<String>,
+                            )| {
+                                let desktop = desktop.clone();
+                                spawn(app_pane_run_reorder(
+                                    state, desktop, pane_id, action, moved, parent, order,
+                                ));
+                            }
+                        },
+                        on_app_pane_value: move |(widget_id, value): (String, String)| {
+                            state.with_mut_counted(|shell| shell.set_app_pane_value(&widget_id, value));
+                        },
+                        state,
+                    }
+                }
                 if snapshot.theme_editor_open {
                     ThemeEditorOverlay {
                         snapshot: snapshot.clone(),

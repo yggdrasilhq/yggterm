@@ -692,7 +692,7 @@ impl DesktopService {
     /// background playlist must survive a session switch. On platforms without
     /// the native web-surface host this reads `false` — those platforms have no
     /// surfaces to protect.
-    pub fn web_surface_is_playing_audio(&self, id: u64) -> bool {
+    pub fn web_surface_is_playing_media(&self, id: u64) -> bool {
         #[cfg(not(any(
             target_os = "windows",
             target_os = "macos",
@@ -700,11 +700,18 @@ impl DesktopService {
             target_os = "android"
         )))]
         {
+            // ⛔ The MEDIA predicate, not the audio one, and the name here is
+            // kept only because it is the shell's whole vocabulary for this
+            // fact. WebKitGTK has no `is-playing-video`, so the engine's own
+            // answer is blind to a MUTED video — which is how background video
+            // autoplays almost everywhere, and so was exactly the case the
+            // activity dot existed for and could not see. The page reports the
+            // picture half itself; see `MEDIA_ACTIVITY_SHIM_JS`.
             return self
                 .web_surface_host
                 .borrow()
                 .as_ref()
-                .is_some_and(|host| host.is_playing_audio(id));
+                .is_some_and(|host| host.is_playing_media(id));
         }
         #[cfg(any(
             target_os = "windows",

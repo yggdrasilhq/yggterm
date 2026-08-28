@@ -2247,7 +2247,7 @@ struct WebSurfaceTab {
     loading: bool,
     /// Is this tab's page PLAYING MEDIA right now, as the ENGINE reports it?
     ///
-    /// Written from `webkit_web_view_is_playing_audio` by the native-surface
+    /// Written from `is_playing_media` by the native-surface
     /// reconciler and rendered as the tab's blinking dot when the tab is in the
     /// BACKGROUND — the "which of these rows is making noise" signal.
     ///
@@ -3703,6 +3703,36 @@ fn sidebar_policy_refetch_due(attempts: u32, exhausted_at_ms: Option<u64>, now_m
 }
 
 /// The schema the app-pane renderer is currently drawing.
+/// A shell-owned MODAL an app raised from its own pane.
+///
+/// The split is the one the `fido2` presence dialog already draws: the APP owns
+/// the content (the same widget vocabulary a rail pane declares, computed on the
+/// app's own host) and the SHELL owns the dialog — the wash, the card, the ✕,
+/// Escape, the backdrop, and stashing the native web surface that would
+/// otherwise composite straight over it. yggterm learns nothing about what the
+/// widgets mean, exactly as it learns nothing about a rail pane's.
+///
+/// The pane it was raised from is carried so its actions POST under that pane's
+/// id: a modal is a second VIEW of one pane, never a second pane. What the modal
+/// is ABOUT is the app's business and rides in its action names, the way the
+/// `edit-reveal:` and `copy-row:` grammars already do.
+#[derive(Debug, Clone, PartialEq)]
+struct AppPaneModalState {
+    /// One quiet line under the title. Optional; empty draws nothing.
+    subtitle: String,
+    /// Same shape the rail renders, so ONE renderer draws both and the two can
+    /// never grow apart.
+    pane: AppPaneSchemaState,
+    /// The modal's own drafts, keyed by widget id.
+    ///
+    /// ⛔ A SEPARATE map from `app_pane_values`, and it has to be: applying a
+    /// fresh RAIL schema replaces that map wholesale (which is what drops an
+    /// abandoned password), and the rail keeps refreshing underneath while a
+    /// modal is up. Sharing one map would let a background refresh empty the
+    /// form the user is typing in.
+    values: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct AppPaneSchemaState {
     pane_id: String,
@@ -4573,6 +4603,32 @@ struct AppPaneActionReply {
     /// chrome or the app growing a second copy of yggterm's state.
     #[serde(default)]
     surface_prefs: Option<WebSurfacePrefsPatch>,
+    /// Raise a shell-owned modal over the whole window carrying widgets the app
+    /// declared — see [`AppPaneModalState`]. Present while one is already open
+    /// REPLACES its content, which is how a modal refreshes after one of its own
+    /// actions without flickering closed and open again.
+    #[serde(default)]
+    modal: Option<AppPaneModalSpec>,
+    /// Close the app's modal if one is open. Independent of `modal` so a reply
+    /// can close the dialog and hand back a fresh rail schema in one answer,
+    /// which is what a modal's Save wants to do.
+    #[serde(default)]
+    close_modal: bool,
+}
+
+/// The wire form of [`AppPaneModalState`]. Deliberately the same four fields a
+/// pane schema has, plus a subtitle: an app that can build a pane can build a
+/// modal with no second vocabulary to learn.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+struct AppPaneModalSpec {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    subtitle: String,
+    #[serde(default)]
+    widgets: Vec<AppPaneWidget>,
+    #[serde(default)]
+    footer: Vec<AppPaneWidget>,
 }
 
 /// A pane's request to change yggterm's web-surface preferences. Every field is
@@ -4587,6 +4643,67 @@ struct WebSurfacePrefsPatch {
 
 /// `<control>/pane/<id>` — where the GUI fetches a pane's schema. Kept out of
 /// the OSC so a 1100-row vault never rides the PTY.
+/// Whether this build can raise an app-declared modal (`modal` on an action
+/// reply). Reported to the app on every schema GET and every action POST as
+/// `app_modals`, so a pane can tell a shell that will draw its dialog from one
+/// that will silently drop it.
+///
+/// A constant rather than a version comparison on purpose: the app asks "can
+/// you do this", never "which build are you", and a capability that is answered
+/// by a build number is a capability every caller re-derives.
+const APP_MODALS_SUPPORTED: bool = true;
+
+/// Adopt the values a freshly applied schema declares — the ONE rule the rail
+/// and an app-raised modal both follow.
+///
+/// The app owns every field's value; the GUI's copy is only the user's edits
+/// since the last schema arrived. So an applied schema REPLACES the value map
+/// wholesale — anything the app no longer declares is dropped, which is what
+/// keeps a typed-then-abandoned password from riding along on the next unrelated
+/// action.
+///
+/// `shown` is what the surface is displaying right now, and it decides only
+/// whether a value epoch moves: an app that merely echoes back what the user
+/// typed must not rebuild the node, or the caret jumps out from under them
+/// mid-search.
+fn app_pane_adopt_values(
+    schema: &AppPaneSchema,
+    mounted: Option<&AppPaneSchemaState>,
+    shown: &HashMap<String, String>,
+) -> (HashMap<String, u64>, HashMap<String, String>) {
+    let previous_epochs = mounted
+        .map(|state| state.value_epochs.clone())
+        .unwrap_or_default();
+    let previous_value_keys = mounted
+        .map(|state| app_pane_value_keys(&state.schema.widgets))
+        .unwrap_or_default();
+    let declared_value_keys = app_pane_value_keys(&schema.widgets);
+    let mut value_epochs: HashMap<String, u64> = HashMap::new();
+    let mut values: HashMap<String, String> = HashMap::new();
+    for widget in &schema.widgets {
+        let Some((id, declared)) = widget.declared_value() else {
+            continue;
+        };
+        let epoch = previous_epochs.get(&id).copied().unwrap_or(0);
+        // Identity first, exactly as the document channel does it: a slot that
+        // now holds a different buffer remounts even when the two buffers read
+        // identically. One rule, every channel.
+        let buffer_changed = previous_value_keys.get(&id) != declared_value_keys.get(&id);
+        let unchanged =
+            !buffer_changed && shown.get(&id).is_some_and(|shown| *shown == declared);
+        value_epochs.insert(
+            id.clone(),
+            if unchanged { epoch } else { epoch.wrapping_add(1) },
+        );
+        // A revealed secret reaches the DOM and stops there — see
+        // [`AppPaneWidget::value_is_display_only`].
+        if !widget.value_is_display_only() {
+            values.insert(id, declared);
+        }
+    }
+    (value_epochs, values)
+}
+
 fn app_pane_schema_url(control_url: &str, pane_id: &str) -> String {
     format!("{}/pane/{}", control_url.trim_end_matches('/'), pane_id)
 }
@@ -7145,7 +7262,13 @@ fn web_surface_tab_background_hold_ms() -> Option<u64> {
 /// loop hands over the desktop context and no longer has a media flag it could
 /// get wrong.
 trait WebSurfaceMediaProbe {
-    fn is_playing_audio(&self, native_id: u64) -> bool;
+    /// ⛔ MEDIA, not audio, and the rename is the fix rather than cosmetics.
+    /// This was `is_playing_audio` all the way down to WebKit, which has no
+    /// `is-playing-video` — so a MUTED video answered `false` and neither the
+    /// reap veto nor the background-activity dot could see the one case they
+    /// exist for. The page reports the picture half itself now; the name says
+    /// what the predicate means so the next reader does not have to find out.
+    fn is_playing_media(&self, native_id: u64) -> bool;
 }
 
 /// WHY a realized surface is in this pass's reclaim set.
@@ -7393,7 +7516,7 @@ fn web_surface_background_plan(
             // Engine truth, read at the moment of the decision and for THIS
             // surface — a stale flag, or one read for a different surface, would
             // be worse than none.
-            let media_active = media.is_playing_audio(surface.native_id);
+            let media_active = media.is_playing_media(surface.native_id);
             let action = if web_surface_reap_due(
                 now_ms,
                 surface.stashed_at_ms,
@@ -7626,8 +7749,8 @@ struct LiveWebSurfaceBackgroundHost<'a> {
 }
 
 impl WebSurfaceMediaProbe for LiveWebSurfaceBackgroundHost<'_> {
-    fn is_playing_audio(&self, native_id: u64) -> bool {
-        self.desktop.web_surface_is_playing_audio(native_id)
+    fn is_playing_media(&self, native_id: u64) -> bool {
+        self.desktop.web_surface_is_playing_media(native_id)
     }
 }
 
@@ -7779,7 +7902,7 @@ mod web_surface_reclaim_locks {
     }
 
     impl WebSurfaceMediaProbe for FakeHost {
-        fn is_playing_audio(&self, native_id: u64) -> bool {
+        fn is_playing_media(&self, native_id: u64) -> bool {
             self.audio_probes.borrow_mut().push(native_id);
             self.audible.contains(&native_id)
         }
@@ -8598,8 +8721,8 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             code_lines(&product[media_impl_start + 1..media_impl_end]),
             vec![
-                "fn is_playing_audio(&self, native_id: u64) -> bool {",
-                "self.desktop.web_surface_is_playing_audio(native_id)",
+                "fn is_playing_media(&self, native_id: u64) -> bool {",
+                "self.desktop.web_surface_is_playing_media(native_id)",
                 "}",
             ],
             "the audio veto is reading something other than the engine:\n{media_impl}",
@@ -13627,7 +13750,7 @@ async fn web_surface_native_reconcile_loop(
                     // broken. `is_playing_audio` reads the engine's own media
                     // session, which a detached, unpainted webview still has —
                     // stash is a paint decision and explicitly never a mute.
-                    let media_playing = desktop.web_surface_is_playing_audio(entry.native_id);
+                    let media_playing = desktop.web_surface_is_playing_media(entry.native_id);
                     // The EDGE is written through at once so the dot appears and
                     // disappears on the beat the engine changed its answer. While
                     // the answer stays true the claim is RENEWED on a slow
@@ -16876,6 +16999,9 @@ struct ShellState {
     /// app never sees them until an action is fired, and they are dropped when
     /// the pane closes — a search box or an add-form password does not persist.
     app_pane_values: HashMap<String, String>,
+    /// The app-raised modal on screen, if any. Cleared by Escape, the backdrop,
+    /// the ✕, a `close_modal` reply, and any pane switch.
+    app_pane_modal: Option<AppPaneModalState>,
     /// What the rail was showing before an app's pane took it over.
     ///
     /// A contributed pane is a TENANT of the right panel, not its owner. When the
@@ -17957,6 +18083,8 @@ struct RenderSnapshot {
     /// error from fetching it.
     app_pane_schema: Option<AppPaneSchemaState>,
     app_pane_error: Option<String>,
+    /// The app-raised modal on screen, if any.
+    app_pane_modal: Option<AppPaneModalState>,
     /// The open right-click menu over a contributed rail row, if any.
     app_pane_context_menu: Option<AppPaneContextMenu>,
     /// The open right-click menu over a WebTabs rail row, and the ITEMS it
@@ -19481,6 +19609,7 @@ impl ShellState {
             web_surface_headless_wanted: HashMap::new(),
             sidebar_contributions: HashMap::new(),
             app_pane_schema: None,
+            app_pane_modal: None,
             app_pane_values: HashMap::new(),
             right_panel_mode_before_app_pane: None,
             right_panel_mode_before_web_tabs: None,
@@ -20755,6 +20884,7 @@ impl ShellState {
             apps: launch_anchor_apps,
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
+            app_pane_modal: self.app_pane_modal.clone(),
             app_pane_context_menu: self.app_pane_context_menu.clone(),
             // A rail menu whose surface has gone resolves to no items, and a
             // menu with no items is not a menu: it is an empty undismissable box
@@ -22654,6 +22784,7 @@ impl ShellState {
             self.theme_editor_open,
             self.launch_flags_open,
             self.cli_install_open,
+            self.app_pane_modal.is_some(),
             self.pending_media_capture.is_some(),
             self.pending_fido2.is_some(),
             self.pending_delete.is_some(),
@@ -25024,6 +25155,10 @@ impl ShellState {
     fn clear_app_pane_draft(&mut self) {
         self.app_pane_schema = None;
         self.app_pane_values.clear();
+        // A modal belongs to the pane that raised it. Leaving it up over a pane
+        // that is no longer mounted would post its actions at a pane the app is
+        // no longer drawing.
+        self.app_pane_modal = None;
         self.app_pane_error = None;
         self.app_pane_request_seq = self.app_pane_request_seq.wrapping_add(1);
         // A row menu belongs to the pane it was opened over; a pane hop retires it.
@@ -25051,43 +25186,8 @@ impl ShellState {
             .app_pane_schema
             .as_ref()
             .filter(|state| state.pane_id == pane_id);
-        let previous_epochs = mounted
-            .map(|state| state.value_epochs.clone())
-            .unwrap_or_default();
-        let previous_value_keys = mounted
-            .map(|state| app_pane_value_keys(&state.schema.widgets))
-            .unwrap_or_default();
-        let declared_value_keys = app_pane_value_keys(&schema.widgets);
-        let mut value_epochs: HashMap<String, u64> = HashMap::new();
-        let mut values: HashMap<String, String> = HashMap::new();
-        for widget in &schema.widgets {
-            let Some((id, declared)) = widget.declared_value() else {
-                continue;
-            };
-            let epoch = previous_epochs.get(&id).copied().unwrap_or(0);
-            // Identity first, exactly as the document channel does it: a slot
-            // that now holds a different buffer remounts even when the two
-            // buffers read identically. One rule, both channels.
-            let buffer_changed = previous_value_keys.get(&id) != declared_value_keys.get(&id);
-            // Bump ONLY when the app pushes a value the field is not already
-            // showing. An app that merely echoes back what the user typed (the
-            // search box does exactly this) must not rebuild the node, or the
-            // caret jumps out from under them mid-search.
-            let unchanged = !buffer_changed
-                && self
-                    .app_pane_values
-                    .get(&id)
-                    .is_some_and(|shown| *shown == declared);
-            value_epochs.insert(
-                id.clone(),
-                if unchanged { epoch } else { epoch.wrapping_add(1) },
-            );
-            // A revealed secret reaches the DOM and stops there — see
-            // [`AppPaneWidget::value_is_display_only`].
-            if !widget.value_is_display_only() {
-                values.insert(id, declared);
-            }
-        }
+        let (value_epochs, values) =
+            app_pane_adopt_values(&schema, mounted, &self.app_pane_values);
         self.app_pane_values = values;
         self.app_pane_error = None;
         self.app_pane_schema = Some(AppPaneSchemaState {
@@ -25137,6 +25237,49 @@ impl ShellState {
         declared_now.iter().all(|(id, declared)| {
             self.app_pane_values.get(id).map(String::as_str) == Some(declared.as_str())
         })
+    /// Raise (or refresh) the app-raised modal. The pane id is the pane whose
+    /// action asked for it, so every click inside POSTs under that pane.
+    ///
+    /// Refreshing keeps the SAME value epochs the rail's own refresh keeps, so a
+    /// modal that re-declares a search box the user is typing in does not steal
+    /// the caret — one rule, both surfaces, via [`app_pane_adopt_values`].
+    fn open_app_pane_modal(&mut self, pane_id: &str, spec: AppPaneModalSpec) {
+        let schema = AppPaneSchema {
+            title: spec.title,
+            widgets: spec.widgets,
+            footer: spec.footer,
+            titlebar_switch: None,
+            split_ratio: None,
+        };
+        let mounted = self
+            .app_pane_modal
+            .as_ref()
+            .map(|modal| &modal.pane)
+            .filter(|state| state.pane_id == pane_id);
+        let shown = self
+            .app_pane_modal
+            .as_ref()
+            .map(|modal| modal.values.clone())
+            .unwrap_or_default();
+        let (value_epochs, values) = app_pane_adopt_values(&schema, mounted, &shown);
+        self.app_pane_modal = Some(AppPaneModalState {
+            subtitle: spec.subtitle,
+            pane: AppPaneSchemaState {
+                pane_id: pane_id.to_string(),
+                schema,
+                value_epochs,
+            },
+            values,
+        });
+    }
+    /// Retire the app-raised modal, dropping its drafts with it.
+    ///
+    /// Dropping them is the same rule a pane switch already follows: a value the
+    /// app is no longer declaring must not ride along on some later, unrelated
+    /// action. Returns whether anything was open, so a dismissal that closed
+    /// nothing does not report itself as handled.
+    fn close_app_pane_modal(&mut self) -> bool {
+        self.app_pane_modal.take().is_some()
     }
     /// The heading a pane's toast carries. The app named the pane; yggterm must
     /// not have an opinion about what it is called.
@@ -25154,7 +25297,18 @@ impl ShellState {
         }
         self.app_pane_error = Some(error);
     }
+    /// A contributed field's draft.
+    ///
+    /// Routed to the MODAL's map while one is up, because a modal covers the
+    /// whole window: the rail underneath cannot be typed into, so every keystroke
+    /// that reaches a contributed field belongs to the dialog. That is also what
+    /// keeps a modal's draft out of the rail's map, which a background schema
+    /// refresh is entitled to empty at any moment.
     fn set_app_pane_value(&mut self, widget_id: &str, value: String) {
+        if let Some(modal) = self.app_pane_modal.as_mut() {
+            modal.values.insert(widget_id.to_string(), value);
+            return;
+        }
         self.app_pane_values.insert(widget_id.to_string(), value);
     }
     /// Put a generated name into a renaming row's field.
@@ -26177,6 +26331,22 @@ impl ShellState {
     }
     /// The pane's draft input values, as the action POST carries them. These
     /// leave the GUI only when the user fires an action.
+    /// The drafts an ACTION POST carries — the rail's, with an open modal's laid
+    /// over them.
+    ///
+    /// A modal covers the whole window, so while one is up every contributed
+    /// action came from inside it. Laid OVER rather than replacing: the rail's
+    /// own untouched fields stay true, and a widget id the modal also declares
+    /// resolves to the one the user is actually looking at.
+    fn app_pane_action_values_json(&self) -> serde_json::Value {
+        let mut values = self.app_pane_values_json();
+        if let (Some(modal), Some(map)) = (self.app_pane_modal.as_ref(), values.as_object_mut()) {
+            for (id, value) in &modal.values {
+                map.insert(id.clone(), serde_json::Value::String(value.clone()));
+            }
+        }
+        values
+    }
     fn app_pane_values_json(&self) -> serde_json::Value {
         serde_json::Value::Object(
             self.app_pane_values
@@ -45285,6 +45455,11 @@ fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
         ],
         TopModal::LaunchFlags => &[("Tab", "move"), ("Enter", "apply"), ("Esc", "close")],
         TopModal::CliInstall => &[("Tab", "move"), ("Enter", "install"), ("Esc", "close")],
+        // ⛔ Enter is deliberately NOT advertised and not dispatched: the app
+        // owns what is inside, so yggterm cannot know which of its buttons is
+        // the primary one — and guessing would fire an app action the user did
+        // not aim at. A form's own primary button is one Tab away.
+        TopModal::AppPaneModal => &[("Tab", "move"), ("Esc", "close")],
         TopModal::CopyEdit => &[
             ("Tab", "move"),
             ("Enter", "save"),
@@ -45349,6 +45524,15 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
             if dismiss {
                 state.with_mut_counted(|shell| shell.set_cli_install_open(false));
             }
+            true
+        }
+        TopModal::AppPaneModal => {
+            if dismiss {
+                state.with_mut_counted(|shell| {
+                    shell.close_app_pane_modal();
+                });
+            }
+            // Enter is SWALLOWED rather than acted on — see the hint table.
             true
         }
         TopModal::MediaCapture => {
@@ -47217,6 +47401,14 @@ enum TopModal {
     /// user-raised editors rather than with the page-raised dialogs, for the
     /// same reason they do: the user opened it from a rail they were already in.
     CliInstall,
+    /// A modal an APP raised from its own contributed pane.
+    ///
+    /// It sits with the other RAIL-RAISED editors, above the dialogs a page can
+    /// put up, because **precedence follows paint order** — it is drawn at their
+    /// z-index (98) and the keys must belong to the thing the user can see. A
+    /// camera ask arriving while it is open paints underneath it, so answering
+    /// that ask with Escape would be answering a dialog nobody can read.
+    AppPaneModal,
     /// A page asking for the camera or the microphone. Above `Fido2` in the
     /// stack for the same reason `Fido2` is above `Delete`: it is raised by a
     /// PAGE, at a moment the user did not choose, and the keys must belong to
@@ -47298,7 +47490,10 @@ impl TopModal {
             | TopModal::CopyEdit
             | TopModal::LaunchFlags
             | TopModal::CommandPalette
-            | TopModal::CliInstall => ModalKeyboardMode::Form,
+            | TopModal::CliInstall
+            // An options dialog full of toggles and fields is an editing
+            // surface, whatever the app happens to have put in it.
+            | TopModal::AppPaneModal => ModalKeyboardMode::Form,
             // Command surfaces: pick one of a few actions and be done.
             TopModal::KeymapEditor
             | TopModal::MediaCapture
@@ -47320,6 +47515,7 @@ impl TopModal {
             TopModal::ThemeEditor => "theme-editor",
             TopModal::LaunchFlags => "launch-flags",
             TopModal::CliInstall => "cli-install",
+            TopModal::AppPaneModal => "app-pane-modal",
             TopModal::MediaCapture => "media-capture",
             TopModal::Fido2 => "fido2",
             TopModal::Delete => "delete",
@@ -47339,6 +47535,10 @@ impl TopModal {
             TopModal::ThemeEditor => "Theme",
             TopModal::LaunchFlags => "Launch Flags",
             TopModal::CliInstall => "CLI Install",
+            // ⛔ NOT the app's own title. The breadcrumb is yggterm's chrome and
+            // must read the same whichever app is running; the app's title is
+            // already on the card, an inch away.
+            TopModal::AppPaneModal => "Options",
             TopModal::MediaCapture => "Camera",
             TopModal::Fido2 => "Passkey",
             TopModal::Delete => "Confirm",
@@ -47375,6 +47575,7 @@ fn top_modal_of(
     theme_editor: bool,
     launch_flags: bool,
     cli_install: bool,
+    app_pane_modal: bool,
     media_capture: bool,
     fido2: bool,
     delete: bool,
@@ -47397,6 +47598,9 @@ fn top_modal_of(
     }
     if cli_install {
         return Some(TopModal::CliInstall);
+    }
+    if app_pane_modal {
+        return Some(TopModal::AppPaneModal);
     }
     // A capture ask outranks a passkey ceremony: both are page-initiated, and
     // the one that hands over a microphone must be the one the keys reach.
@@ -47431,6 +47635,7 @@ fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
         snapshot.theme_editor_open,
         snapshot.launch_flags_open,
         snapshot.cli_install_open,
+        snapshot.app_pane_modal.is_some(),
         snapshot.pending_media_capture.is_some(),
         snapshot.pending_fido2.is_some(),
         snapshot.pending_delete.is_some(),
@@ -47525,6 +47730,12 @@ fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
         // landed on the page instead of the backdrop, so the menu could not be
         // dismissed at all on the one surface that draws above all DOM.
         || snapshot.app_pane_context_menu.is_some()
+        // ⛔ An app-raised modal is ALWAYS over a web surface when ychrome raises
+        // it, and a native child webview draws above ALL DOM — so without this
+        // membership the dialog renders BEHIND the page and the user reports
+        // that the button does nothing. Same reason the passkey ceremony and the
+        // capture prompt are in this list.
+        || snapshot.app_pane_modal.is_some()
         // The strip's folder-overflow dropdown is over-viewport chrome too, and
         // now counts as a `top_modal` — every modal must open the cover or it
         // becomes a click-through window under glass (F.1 T10).
@@ -68355,6 +68566,12 @@ async fn app_pane_fetch_schema(
     // renders, and `surface_prefs` on an action reply asks for a change.
     query.push(format!("vertical_tabs={vertical_tabs}"));
     query.push(format!("restore_tabs={restore_tabs}"));
+    // Whether this shell can raise an app modal at all. A capability marker, not
+    // a preference: an app that draws an "Options…" button on a shell too old to
+    // answer it has drawn a dead control, so it needs to be able to ask BEFORE
+    // it declares one. Absent = an older GUI, which is exactly how an app that
+    // has never heard of modals reads it too.
+    query.push(format!("app_modals={APP_MODALS_SUPPORTED}"));
     if !query.is_empty() {
         url = format!("{url}?{}", query.join("&"));
     }
@@ -69202,7 +69419,7 @@ async fn app_pane_run_action_with_order(
             shell.settings.web_surface_vertical_tabs,
             shell.settings.web_surface_restore_tabs,
         );
-        let mut values = shell.app_pane_values_json();
+        let mut values = shell.app_pane_action_values_json();
         let mut value_keys = shell
             .app_pane_schema
             .as_ref()
@@ -69267,6 +69484,13 @@ async fn app_pane_run_action_with_order(
     if let Some(map) = values.as_object_mut() {
         map.insert("vertical_tabs".to_string(), serde_json::json!(prefs.0));
         map.insert("restore_tabs".to_string(), serde_json::json!(prefs.1));
+        // The same capability marker the schema GET carries. An action handler
+        // decides what to RETURN — a modal, or the pane redrawn with the options
+        // inline — and it must not have to remember what the last GET said.
+        map.insert(
+            "app_modals".to_string(),
+            serde_json::json!(APP_MODALS_SUPPORTED),
+        );
     }
     // A reorder's payload: the pane's full new row order, and WHICH GROUP the
     // moved row landed in (`""` = the pane's root band, which is every drop a
@@ -69310,6 +69534,17 @@ async fn app_pane_run_action_with_order(
     };
     if let Some(schema) = reply.schema {
         state.with_mut_counted(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema));
+    }
+    // CLOSE before OPEN, so a reply carrying both retires the old dialog and
+    // raises the new one rather than cancelling itself. An app moving the user
+    // from one modal to another writes exactly that.
+    if reply.close_modal {
+        state.with_mut_counted(|shell| {
+            shell.close_app_pane_modal();
+        });
+    }
+    if let Some(modal) = reply.modal {
+        state.with_mut_counted(|shell| shell.open_app_pane_modal(&pane_id, modal));
     }
     if let Some(toast) = reply.toast {
         state.with_mut_counted(|shell| {
