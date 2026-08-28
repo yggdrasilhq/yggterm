@@ -2,6 +2,10 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **A terminal flooded by an agent's output no longer burns half a core painting it.** An agent session watched across SSH — the product's core scenario — can stream tens of thousands of characters a second into the row you are watching; the paint path was already the fast one, yet the webview missed half its frame deadlines, burned ~50% of a core, and the machine got hot enough to notice. Each terminal surface now tracks its own write throughput: past 10K chars/s it drops to a ~15 fps flood cadence with largest-payload batching (a scrolling log is unreadable above that anyway), typing keeps its realtime echo unconditionally, and the regime transition is traced once per direction so a storm is visible in one query. Under a 20K chars/s flood the render process should now hold well under a quarter of a core with frames on budget.
+
 ## 3.2.0 (2026-08-28)
 
 - **Asking the daemon a question no longer boots the entire desktop — for every verb, not just the client census.** The first fix moved `server app` ahead of the startup preamble; the measurement that followed showed the rest of the surface paying the same bill: every `server remote` spawn — **including `resume-codex`, the agent-resume handoff this product exists to perform** — and every `server terminal` call walked the desktop backend detection, the terminal renderer policy, the accessibility bridge, the WebKit compositing decision and its re-exec'd GL probe (158 ms of EGL init), plus a second full process boot from the allocator's arena tuning. None of it survives contact with a verb whose whole life is one socket request. The preamble now lives where its only reader is: at the GUI fallthrough, immediately before the window opens — a GUI launch still configures and still records its full GL story, and every one-shot verb keeps a single boot with no probe child. The allocator re-exec gained the same gate (long-lived invocations only; the daemon keeps its cap from birth by exact argv). Locked by source-order tests on the verb dispatch and a predicate test on the allocator gate.
