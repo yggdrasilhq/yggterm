@@ -16,6 +16,13 @@ Contributions are welcome.
 6. Sign off every commit with `git commit -s`, which adds a `Signed-off-by:`
    trailer certifying the contribution's origin.
 
+## Contributor licence agreement
+
+**A signed CLA is required before anything is merged.** It is one page: you
+keep your copyright, you certify where the work came from, and you grant the
+licence rights that let the project stay licensable as a single whole. See
+`CLA.md` and add your line to `CLA-signatures.md` in the same pull request.
+
 ## Licensing of what you send
 
 Code you contribute is licensed GPL-3.0-or-later. Documentation you contribute
