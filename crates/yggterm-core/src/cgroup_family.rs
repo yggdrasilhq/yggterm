@@ -445,16 +445,32 @@ fn migrate_misplaced_one(pid: i32, comm: &str) -> bool {
     // the GUI sits in `<scope>/gui`, so the scope root is one level up. A
     // process that is not in `gui` is not running an armed family (a stale
     // flag across an exec boundary) and must not write into a guessed path.
+    // ⛔ `own_cgroup_path` returns the path INSIDE the hierarchy — the
+    // filesystem path needs the mount prefix, or the write lands on a
+    // relative path against the CWD and answers ENOENT (measured live, 3.2.9:
+    // the sweep ticked, classified, and every write went nowhere).
     let Some(own) = own_cgroup_path(std::process::id() as i32) else {
         return false;
     };
-    let Some((scope_root, base)) = own.rsplit_once('/') else {
+    let Some(target) = sweep_target_path(&own, child) else {
         return false;
     };
-    if base != "gui" {
-        return false;
-    }
-    migrate_pid(format!("{scope_root}/{child}"), pid).is_ok()
+    migrate_pid(target, pid).is_ok()
+}
+
+/// The filesystem path a sweep member migrates to, from the arming process's
+/// own cgroup path and the child it belongs in.
+///
+/// ⛔ THE MOUNT PREFIX IS THE TEST. `own_cgroup_path` returns the path INSIDE
+/// the cgroup hierarchy (`/user.slice/…/yggterm-gui-<pid>.scope/gui`); the
+/// filesystem path needs `/sys/fs/cgroup` glued in front, and the first live
+/// sweep shipped without it — every write answered ENOENT against a relative
+/// path while the thread ticked, classified, and "succeeded" at nothing. A
+/// silent no-op is the worst failure a bound can have, so the shape of the
+/// path is locked, not trusted.
+fn sweep_target_path(own_cgroup: &str, child: &str) -> Option<String> {
+    let (scope_root, base) = own_cgroup.rsplit_once('/')?;
+    (base == "gui").then(|| format!("/sys/fs/cgroup{scope_root}/{child}"))
 }
 
 #[cfg(test)]
@@ -696,5 +712,33 @@ mod tests {
         // it must not fight that placement (a self-migration war would spin).
         assert_eq!(family_child_for_comm("yggterm"), None);
         assert_eq!(family_child_for_comm("yggterm-headles"), None, "truncated to 15 bytes too");
+    }
+
+    #[test]
+    fn the_sweep_target_carries_the_mount_prefix_and_only_fires_inside_gui() {
+        // THE 3.2.9 FIRST-SWEEP DEFECT: the migration path was built WITHOUT
+        // the /sys/fs/cgroup mount prefix, so every write answered ENOENT
+        // against a path relative to the process CWD while the thread ticked,
+        // classified correctly, and moved nothing — a silent no-op, the worst
+        // failure a bound can have. The prefix is now the lock.
+        let own = "/user.slice/user-1000.slice/user@1000.service/app.slice/yggterm-gui-123.scope/gui";
+        assert_eq!(
+            sweep_target_path(own, "web"),
+            Some(format!(
+                "/sys/fs/cgroup{own}",
+                own = own.strip_suffix("/gui").expect("the gui child")
+            ) + "/web"),
+            "the target is the sibling web child under the SAME scope, on the \
+             mounted filesystem"
+        );
+        assert_eq!(
+            sweep_target_path(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/yggterm-gui-123.scope",
+                "web"
+            ),
+            None,
+            "a process NOT inside the gui child is not running an armed family: \
+             the sweep must refuse to guess a scope root"
+        );
     }
 }
