@@ -841,6 +841,13 @@ whose keystrokes would drive a running TUI. Regression lock:
 opencode service API. Cold resume of a v2 session cannot work until then, and
 the Issue 26 tab mirror needs the same `ses_…` ids as its CLI-side handle.
 
+**Stopgap landed 2026-08-29 (`62ec8286`):** for self-minting kinds an absent
+probe now opens the CLI's OWN resume picker instead of refusing (both the
+wrapper and the ensure lane; the sweep never marks these kinds missing), so a
+cold opencode row boots into opencode2's own TUI — which re-lists the recent
+sessions in its tab bar — instead of painting a dead-end error. Live-verified
+the same hour on the row this incident was filed from.
+
 **Not covered:** does not change the wrapper verbs' contract (they already
 took the live arm first), does not parse or write the v2 store schema, does
 not alter v1-line opencode.
