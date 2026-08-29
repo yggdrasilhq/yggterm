@@ -68,6 +68,37 @@ switch-back). Residual, not fixed here: the strict fast-ready itself still
 waits on the manifest for a genuinely cold first mount — the felt first-open
 latency is unchanged, only the permanent cold-remount tax is gone.
 
+## ⛔ [11.32] A REMOTE ROW'S SCREEN READ ANSWERS "EMPTY" FROM THE LOCAL DAEMON — THE CLIENT BACKS OFF 2.5s→5s AND THE ROW SITS BLANK AND INPUT-GATED FOR 10+ SECONDS
+
+**Status:** OPEN
+
+**Measured on the GUI host 2026-08-29 12:29 (3.2.12, trace-verified end to end).**
+Opening a remote agent row (`remote-agy://dev/9b5b64b5…`): `mount_open` succeeds
+in 48 ms with `screen_in_host: true`, then the rehydrate asks the LOCAL daemon
+(`endpoint: ~/.yggterm/server-3-2-12.sock`) for the retained screen and is told
+"empty" in 10 ms — too fast for an SSH round trip; the screen lives on the
+REMOTE host's daemon and the local answer never proxies there. The client
+treats "empty" as an empty screen rather than an absent one: TWO parallel
+rehydrate tasks (`retained_rehydrate_begin` ×2 from one begin) each schedule a
+2500 ms retry, `screen_reconcile_skipped_unwritable screen_bytes: 0` repeats,
+`xterm_paint/settle chars: 0 complete: false` with blank frames stacking, the
+input gate reports `stuck_unrestorable` and holds until
+`resume_gate_ceiling` at +4.5 s. Retry 1 (+2.5 s): still empty. A fresh round
+at +13.7 s (`retries_done: 1, delay_ms: 5000` — backoff doubled). The row sat
+blank and untypeable for 14+ seconds while the session's PTY had been alive
+and producing output on the remote host the whole time. 11 `resume_gate_ceiling`
+and 10 `retained_rehydrate_empty` events in one GUI afternoon — this is the
+felt "spawning a new row lags".
+
+**What is owed:** the retained-screen read for a remote session must either
+proxy to the owning host's daemon or answer "unavailable — screen lives on
+remote" so the client fetches from there, instead of an authoritative-sounding
+"empty". Secondary: one begin must schedule one retry (the ×2 parallel tasks
+halve the retry budget and double the noise); the exponential backoff must not
+apply to a screen that exists somewhere — fetch beats wait. Related but
+separate: `was_ever_ready: false` in the stuck-gate payload is the [11.31]
+cancelled-attempt poison and is healed by that fix.
+
 ## ⛔ [CLI] OPENCODE2 SELF-MINTS `ses_…` IDS — THE STORE PROBE CANNOT SEE YGGTERM ROWS (identity rebind owed)
 
 **Status:** OPEN
