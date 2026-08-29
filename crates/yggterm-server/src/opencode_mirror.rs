@@ -27,6 +27,8 @@ use yggterm_core::opencode_service::OpencodeServiceSession;
 
 pub const TAB_SOURCE_METADATA: &str = "opencode-tab-mirror";
 pub const MIRROR_INTERVAL_MS: u64 = 5_000;
+pub const TAB_SESSION_ID_METADATA: &str = "Tab Session Id";
+pub const SPAWN_BUDGET_PER_TICK: usize = 1;
 const VIEWED_METADATA: &str = "Tab Viewed Ms";
 
 /// What a sync tick should do, decided as a pure function so the diff is
@@ -67,7 +69,7 @@ fn owned_tabs_from(
         let Some(ses) = session
             .metadata
             .iter()
-            .find(|m| m.label == "Runtime Session")
+            .find(|m| m.label == TAB_SESSION_ID_METADATA)
             .map(|m| m.value.clone())
         else {
             continue;
@@ -143,17 +145,70 @@ impl YggtermServer {
         let plan = plan_tab_sync(active, &owned);
         let mut spawned = 0usize;
         let mut retired = 0usize;
-        for ses in &plan.spawn {
-            let Ok(key) = self.ensure_remote_runtime_agent_session(
-                crate::SessionKind::OpenCode,
-                &ses.id,
-                ses.directory.as_deref(),
-                false,
-                None,
-                None,
-            ) else {
+        for ses in plan.spawn.iter().take(SPAWN_BUDGET_PER_TICK) {
+            // ⛔ SILENT INSERT, never `ensure_remote_runtime_agent_session`:
+            // ensure ACTIVATES the row and flips the workspace to Terminal —
+            // for a bulk mirror that is an activation and mount storm (4
+            // activations per tick, measured 2026-08-29: open-attempt ×378,
+            // identity sync errors ×1100). A mirrored tab is a PROJECTION
+            // until the user opens it: born Queued, no PTY, no activation.
+            // The launch line resumes the session by its real service id, so
+            // a click opens a window onto exactly that conversation
+            // (multi-client is opencode2's native design).
+            let key = format!("opencode-runtime://{}", ses.id);
+            if self.sessions.contains_key(&key) {
                 continue;
-            };
+            }
+            let target = crate::local_session_target(
+                crate::SessionKind::OpenCode,
+                ses.directory.as_deref(),
+            );
+            let fallback_title = format!("OpenCode tab {}", &ses.id[..ses.id.len().min(12)]);
+            self.insert_live_session_with_launch(
+                &key,
+                &ses.id,
+                crate::SessionKind::OpenCode,
+                &target,
+                Some(
+                    ses.title
+                        .clone()
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or(fallback_title),
+                ),
+                false,
+                false,
+            );
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.launch_command =
+                    crate::remote_persistent_resume_shell_command_with_terminal_appearance(
+                        crate::SessionKind::OpenCode,
+                        &ses.id,
+                        ses.directory.as_deref(),
+                        None,
+                    );
+                session.launch_phase = crate::TerminalLaunchPhase::Queued;
+                session.remote_deploy_state = crate::RemoteDeployState::NotRequired;
+                crate::upsert_session_metadata(
+                    &mut session.metadata,
+                    "Source",
+                    TAB_SOURCE_METADATA.to_string(),
+                );
+                crate::upsert_session_metadata(
+                    &mut session.metadata,
+                    TAB_SESSION_ID_METADATA,
+                    ses.id.clone(),
+                );
+                if let Some(dir) = &ses.directory {
+                    crate::upsert_session_metadata(&mut session.metadata, "Cwd", dir.clone());
+                }
+                if ses.viewed_epoch_ms > 0 {
+                    crate::upsert_session_metadata(
+                        &mut session.metadata,
+                        VIEWED_METADATA,
+                        ses.viewed_epoch_ms.to_string(),
+                    );
+                }
+            }
             spawned += 1;
             if let Some(session) = self.sessions.get_mut(&key) {
                 if let Some(title) = ses.title.as_deref().filter(|t| !t.trim().is_empty()) {
