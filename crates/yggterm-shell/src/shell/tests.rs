@@ -65540,3 +65540,65 @@ mod web_surface_immersion_locks {
         }
     }
 }
+
+// ── Live markdown editing (the styled mirror) ─────────────────────────────
+#[cfg(test)]
+mod live_md_edit_tests {
+    use super::*;
+
+// The reader's block editor renders the draft styled while you type; the
+// decisions below are the pure half of that surface.
+
+#[test]
+fn live_line_kind_reads_the_complete_forms_only() {
+    use super::*;
+    // `#` alone is NOT a heading — the space is what completes the form,
+    // which is the user's `#` + space reveal moment.
+    assert_eq!(live_line_kind("#"), (LiveLineKind::Text, 0));
+    assert_eq!(live_line_kind("# "), (LiveLineKind::Heading, 2));
+    assert_eq!(live_line_kind("### Title"), (LiveLineKind::Heading, 4));
+    assert_eq!(live_line_kind("####No space"), (LiveLineKind::Text, 0));
+    assert_eq!(live_line_kind("#七个字"), (LiveLineKind::Text, 0)); // no space after hashes
+    assert_eq!(live_line_kind("- item"), (LiveLineKind::Bullet, 2));
+    assert_eq!(live_line_kind("1. ordered"), (LiveLineKind::Ordered, 3));
+    assert_eq!(live_line_kind("- [ ] open"), (LiveLineKind::Task, 6));
+    assert_eq!(live_line_kind("- [x] done"), (LiveLineKind::Task, 6));
+    assert_eq!(live_line_kind("> quoted"), (LiveLineKind::Quote, 1));
+    assert_eq!(live_line_kind("plain text"), (LiveLineKind::Text, 0));
+    // Indented forms still classify; the prefix length carries the indent.
+    assert_eq!(live_line_kind("  - nested"), (LiveLineKind::Bullet, 4));
+    assert_eq!(live_line_kind(""), (LiveLineKind::Text, 0));
+}
+
+#[test]
+fn live_inline_segments_toggle_and_keep_markers() {
+    use super::*;
+    let segs = live_inline_segments("a **bold** b");
+    assert_eq!(
+        segs,
+        vec![
+            LiveSeg::Plain("a ".into()),
+            LiveSeg::Marker("**".into()),
+            LiveSeg::Strong("bold".into()),
+            LiveSeg::Marker("**".into()),
+            LiveSeg::Plain(" b".into()),
+        ]
+    );
+    // Code spans: the backticks are markers, the body is Code.
+    let segs = live_inline_segments("x `y` z");
+    assert!(matches!(segs[1], LiveSeg::Marker(ref m) if m == "`"));
+    assert!(matches!(segs[2], LiveSeg::Code(ref t) if t == "y"));
+    // Emphasis with `_`.
+    let segs = live_inline_segments("_soft_");
+    assert!(matches!(segs[1], LiveSeg::Em(ref t) if t == "soft"));
+}
+
+#[test]
+fn live_line_has_open_form_refuses_unclosed_markers() {
+    use super::*;
+    assert!(!live_line_has_open_form("**closed**"));
+    assert!(live_line_has_open_form("**still open"));
+    assert!(live_line_has_open_form("a `tick"));
+    assert!(!live_line_has_open_form("no markers at all"));
+}
+}

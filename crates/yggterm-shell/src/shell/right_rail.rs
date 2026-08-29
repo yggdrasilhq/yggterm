@@ -2489,68 +2489,27 @@ fn EditableMarkdownBody(
             ));
         }
     };
-    let block_hover_css = format!(
-        "[data-md-editable-block]:hover {{ box-shadow: inset 2px 0 0 {}; cursor:text; }}",
-        doc.accent
-    );
     let document_prose = ProseTokens::document();
     let document_ink = doc.prose_ink();
     rsx! {
-        style { "{block_hover_css}" }
         div {
             style: document_reading_typography(),
             for (index, block) in blocks.iter().enumerate() {
                 if editable && *editing.read() == Some(index) {
                     {
-                    let edit_rows = edit_text.read().lines().count().max(3) + 1;
+                    let commit_block = commit.clone();
                     rsx! {
-                    textarea {
+                    LiveMarkdownBlockEditor {
                         key: "md-edit-{index}",
-                        "data-md-block-editor": "{index}",
-                        // In-place feel (user, 2026-07-23, the obsidian
-                        // reference): the editor keeps the READING typography
-                        // and shows no box — a faint accent-tinted background
-                        // marks the active block, so block → editor is a
-                        // reveal of the source text, not a mode jolt.
-                        // ⚠ NOT a left bar: an accent left bar is the
-                        // BLOCKQUOTE vocabulary (user caught the collision —
-                        // "that blue line does not denote editability; on the
-                        // obsidian screenshot that was a quote").
-                        style: format!(
-                            "display:block; width:100%; min-height:48px; box-sizing:border-box; margin:0 0 14px 0; \
-                             padding:6px 10px; border:0; border-radius:8px; \
-                             background:color-mix(in srgb, {} 9%, transparent); color:{}; caret-color:{}; \
-                             {} resize:vertical; outline:none; white-space:pre-wrap; overflow-wrap:anywhere;",
-                            doc.accent, doc.fg, doc.accent, document_reading_typography()
-                        ),
-                        rows: "{edit_rows}",
-                        autofocus: true,
-                        initial_value: "{edit_text.read()}",
-                        oninput: move |evt: FormEvent| edit_text.set(evt.value()),
-                        onkeydown: {
-                            let commit = commit.clone();
-                            move |evt: KeyboardEvent| {
-                                if evt.key() == Key::Escape {
-                                    evt.prevent_default();
-                                    editing.set(None);
-                                } else if evt.key() == Key::Enter
-                                    && evt.modifiers().contains(Modifiers::CONTROL)
-                                {
-                                    evt.prevent_default();
-                                    commit(index, edit_text.peek().clone());
-                                    editing.set(None);
-                                }
-                            }
+                        index: index,
+                        block: block.clone(),
+                        draft: edit_text,
+                        doc: doc.clone(),
+                        on_commit: move |text: String| {
+                            commit_block(index, text);
+                            editing.set(None);
                         },
-                        onblur: {
-                            let commit = commit.clone();
-                            move |_| {
-                                if editing.peek().is_some() {
-                                    commit(index, edit_text.peek().clone());
-                                    editing.set(None);
-                                }
-                            }
-                        },
+                        on_cancel: move |_| editing.set(None),
                     }
                     }
                     }
@@ -2558,6 +2517,12 @@ fn EditableMarkdownBody(
                     div {
                         key: "md-block-{index}",
                         "data-md-editable-block": if editable { "{index}" },
+                        // The ONLY hover affordance is the text cursor. No bar,
+                        // no outline — a hover that announces "this may become
+                        // an editor" with a painted edge was read as damage
+                        // (user, 2026-08-28: "the line is SO UGLY"), and an
+                        // accent left bar is the BLOCKQUOTE vocabulary anyway.
+                        style: if editable { "cursor:text;" } else { "" },
                         onclick: {
                             let source = source.clone();
                             let ranges = ranges.clone();
@@ -2577,6 +2542,393 @@ fn EditableMarkdownBody(
             }
         }
     }
+}
+
+/// ── Live markdown editing: the styled mirror under a transparent textarea ─
+///
+/// The reader's block editor is no longer a raw-ascii detour. The draft
+/// renders STYLED while you type, and a syntax marker turns transparent the
+/// moment its form is complete: type `#`, see the heading; the space that
+/// completes it takes the hash out of view. Commit is the same splice the
+/// split editor uses (one write path), Esc cancels, blur commits.
+///
+/// ⛔ METRICS ARE THE CONTRACT. The textarea and the mirror render the SAME
+/// characters on the SAME box — font, size, weight, line-height,
+/// letter-spacing, padding, pre-wrap — so the caret the textarea owns always
+/// sits on the glyph the mirror paints. Styling that changes advance width is
+/// therefore FORBIDDEN inside a line: markers hide with `color:transparent`
+/// (width kept), bold is `-webkit-text-stroke` (paint, not layout), emphasis
+/// is colour. Weight, family and size changes happen only at BLOCK
+/// granularity, where the textarea wears the same typography as the mirror —
+/// which is also what makes `#` feel like the heading view: a heading block
+/// edits AT heading size and weight.
+#[component]
+fn LiveMarkdownBlockEditor(
+    index: usize,
+    block: MdBlock,
+    mut draft: Signal<String>,
+    doc: DocTheme,
+    on_commit: EventHandler<String>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    let prose = ProseTokens::document();
+    let ink = doc.prose_ink();
+
+    // The typography the WHOLE editor wears — decided live from the draft's
+    // first line, so typing `# ` into a paragraph block promotes the block to
+    // heading typography on the next keystroke, exactly as the reveal
+    // promises. Code blocks stay code.
+    let first_line = draft.read().lines().next().unwrap_or("").to_string();
+    let (kind, prefix_len) = live_line_kind(&first_line);
+    let base = match &block {
+        MdBlock::CodeBlock(_) => {
+            let mut s = prose.code_block_style(&ink);
+            s.push_str(" margin:0; padding:0; border:0; border-radius:0;");
+            s
+        }
+        _ => {
+            if kind == LiveLineKind::Heading {
+                let level = first_line.chars().take_while(|c| *c == '#').count() as u8;
+                format!(
+                    "{} margin:0; padding:0;",
+                    prose.heading_style(level.clamp(1, 4), &ink)
+                )
+            } else if matches!(&block, MdBlock::BlockQuote(_)) || kind == LiveLineKind::Quote {
+                format!(
+                    "color:{}; margin:0; padding:0 0 0 12px; border-left:3px solid {};",
+                    color_mix(doc.muted.clone(), 100),
+                    doc.accent
+                )
+            } else {
+                let mut s = prose.paragraph_style(&ink);
+                s.push_str(" font-size:1em; line-height:1.7; margin:0; padding:0;");
+                s
+            }
+        }
+    };
+    let is_code = matches!(&block, MdBlock::CodeBlock(_));
+
+    // The metrics box: ONE string worn by the mirror and the textarea alike.
+    let metrics = format!(
+        "{base} font-family:inherit; text-align:left; white-space:pre-wrap; overflow-wrap:anywhere; \
+         letter-spacing:normal;"
+    );
+    let mirror_lines: Vec<Element> = render_live_mirror_lines(&draft.read(), doc.clone(), is_code);
+    let mirror_is_empty = mirror_lines.is_empty();
+    let tint = format!("background:color-mix(in srgb, {} 9%, transparent);", doc.accent);
+    rsx! {
+        div {
+            key: "live-md-{index}",
+            "data-md-live-editor": "1",
+            style: format!(
+                "position:relative; {tint} border-radius:8px; padding:6px 10px; margin:0 0 14px 0; \
+                 cursor:text;",
+            ),
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.key() == Key::Escape {
+                    evt.prevent_default();
+                    on_cancel.call(());
+                } else if evt.key() == Key::Enter && evt.modifiers().contains(Modifiers::CONTROL) {
+                    evt.prevent_default();
+                    on_commit.call(draft.peek().clone());
+                }
+            },
+            // THE MIRROR — in flow, so it sizes the block to the draft.
+            div {
+                "aria-hidden": "true",
+                style: format!("{metrics} color:{};", doc.fg),
+                for line in mirror_lines {
+                    {line}
+                }
+                // An empty draft renders one empty line so the caret's row
+                // exists before the first keystroke.
+                if mirror_is_empty {
+                    div { style: "{metrics}", "\u{200b}" }
+                }
+            },
+            // THE TEXTAREA — absolute over the mirror, text transparent, real
+            // caret. It owns typing, selection and the IME; the mirror is the
+            // only visible ink.
+            textarea {
+                key: "live-md-ta",
+                style: format!(
+                    "position:absolute; inset:0; width:100%; height:100%; box-sizing:border-box; \
+                     padding:6px 10px; margin:0; border:0; {metrics} background:transparent; \
+                     color:transparent; caret-color:{}; outline:none; resize:none; overflow:hidden; \
+                     cursor:text;",
+                    doc.accent
+                ),
+                value: "{draft.read()}",
+                autofocus: true,
+                oninput: move |evt: FormEvent| draft.set(evt.value()),
+                onblur: move |_| on_commit.call(draft.peek().clone()),
+            }
+        }
+    }
+}
+
+/// A width-safe colour-mix helper for the mirror's quiet tones.
+fn color_mix(color: String, pct: u32) -> String {
+    format!("color-mix(in srgb, {color} {pct}%, transparent)")
+}
+
+/// ONE line of a live-edited block, classified. Pure — the editor's decisions
+/// are these two answers and both are unit-tested.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub(crate) enum LiveLineKind {
+    Heading,
+    Quote,
+    Bullet,
+    Ordered,
+    Task,
+    Text,
+}
+
+/// (kind, prefix length in chars). The prefix is the SYNTAX prefix — `#`, `>`,
+/// `- `, `1. `, `- [ ] ` — that the mirror may quiet or hide. A form is
+/// complete only with its separating space, which is what makes `#` + space
+/// the reveal moment the user asked for.
+pub(crate) fn live_line_kind(line: &str) -> (LiveLineKind, usize) {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) {
+        let spaces = line[hashes..].len() - line[hashes..].trim_start().len();
+        // The space IS the reveal: `# ` is a heading the instant it lands,
+        // even before a title character exists (the user's example — the
+        // hash leaves the view on the space that completes the form).
+        if spaces >= 1 {
+            let spaces_len = line[hashes..].chars().take_while(|c| *c == ' ').count();
+            return (LiveLineKind::Heading, hashes + spaces_len);
+        }
+    }
+    let indent = line.len() - line.trim_start().len();
+    let rest = &line[indent..];
+    if rest.starts_with("> ") || rest == ">" {
+        return (LiveLineKind::Quote, indent + 1);
+    }
+    if let Some(body) = rest.strip_prefix("- [") {
+        let checked = body.starts_with('x') || body.starts_with('X');
+        let unchecked = body.starts_with(' ');
+        if (checked || unchecked) && body[1..].starts_with(']') && body[2..].starts_with(' ') {
+            return (LiveLineKind::Task, indent + 6);
+        }
+    }
+    for marker in ["- ", "* ", "+ "] {
+        if rest.starts_with(marker) {
+            return (LiveLineKind::Bullet, indent + 2);
+        }
+    }
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && rest[digits..].starts_with(". ") {
+        return (LiveLineKind::Ordered, indent + digits + 2);
+    }
+    (LiveLineKind::Text, 0)
+}
+
+/// Inline markdown of one line, scanned into segments. Markers travel as
+/// `LiveSeg::Marker` so the mirror can paint them transparent while keeping
+/// their width. A marker with no closer on its line stays visible: an
+/// unclosed form is not a form.
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) enum LiveSeg {
+    Marker(String),
+    Plain(String),
+    Strong(String),
+    Em(String),
+    Code(String),
+}
+
+pub(crate) fn live_inline_segments(line: &str) -> Vec<LiveSeg> {
+    fn push_seg(out: &mut Vec<LiveSeg>, st: LiveInlineState, buf: &mut String) {
+        if buf.is_empty() {
+            return;
+        }
+        out.push(match st {
+            LiveInlineState::Plain => LiveSeg::Plain(std::mem::take(buf)),
+            LiveInlineState::Strong => LiveSeg::Strong(std::mem::take(buf)),
+            LiveInlineState::Em => LiveSeg::Em(std::mem::take(buf)),
+            LiveInlineState::Code => LiveSeg::Code(std::mem::take(buf)),
+        });
+    }
+
+    #[derive(PartialEq, Clone, Copy)]
+    enum LiveInlineState {
+        Plain,
+        Strong,
+        Em,
+        Code,
+    }
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut out: Vec<LiveSeg> = Vec::new();
+    let mut buf = String::new();
+    let mut st = LiveInlineState::Plain;
+    let mut i = 0;
+    while i < chars.len() {
+        let two: String = chars[i..].iter().take(2).collect();
+        if st != LiveInlineState::Code && two == "**" {
+            push_seg(&mut out, st, &mut buf);
+            out.push(LiveSeg::Marker("**".into()));
+            st = if st == LiveInlineState::Strong {
+                LiveInlineState::Plain
+            } else {
+                LiveInlineState::Strong
+            };
+            i += 2;
+            continue;
+        }
+        let c = chars[i];
+        if st != LiveInlineState::Code
+            && st != LiveInlineState::Strong
+            && (c == '*' || c == '_')
+        {
+            push_seg(&mut out, st, &mut buf);
+            out.push(LiveSeg::Marker(c.to_string()));
+            st = if st == LiveInlineState::Em {
+                LiveInlineState::Plain
+            } else {
+                LiveInlineState::Em
+            };
+            i += 1;
+            continue;
+        }
+        if c == '`' {
+            push_seg(&mut out, st, &mut buf);
+            out.push(LiveSeg::Marker("`".into()));
+            st = if st == LiveInlineState::Code {
+                LiveInlineState::Plain
+            } else {
+                LiveInlineState::Code
+            };
+            i += 1;
+            continue;
+        }
+        buf.push(c);
+        i += 1;
+    }
+    push_seg(&mut out, st, &mut buf);
+    out
+}
+
+/// Whether an inline STATE is open at end-of-line — an unclosed `**`, `*` or
+/// backtick means its marker(s) must paint VISIBLE (the form is not a form).
+pub(crate) fn live_line_has_open_form(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mut strong = false;
+    let mut em = false;
+    let mut code = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let two: String = chars[i..].iter().take(2).collect();
+        if !code && two == "**" {
+            strong = !strong;
+            i += 2;
+            continue;
+        }
+        let c = chars[i];
+        if !code && !strong && (c == '*' || c == '_') {
+            em = !em;
+            i += 1;
+            continue;
+        }
+        if c == '`' {
+            code = !code;
+        }
+        i += 1;
+    }
+    strong || em || code
+}
+
+/// Render the draft's lines as the mirror. Returns one ELEMENT per line; an
+/// empty draft returns none (the caller lays one blank row).
+fn render_live_mirror_lines(
+    draft: &str,
+    doc: DocTheme,
+    is_code_block: bool,
+) -> Vec<Element> {
+    let mut lines = Vec::new();
+    for (index, line) in draft.lines().enumerate() {
+        let open_form = live_line_has_open_form(line);
+        let (kind, prefix_len) = live_line_kind(line);
+        let muted = color_mix(doc.fg.clone(), 52);
+        let hidden = "color:transparent;";
+        let mut spans: Vec<Element> = Vec::new();
+        let char_offset = |n: usize| -> String {
+            line.chars().take(n).collect::<String>()
+        };
+        let body: String = line.chars().skip(prefix_len).collect();
+        if is_code_block {
+            spans.push(rsx! { span { "{line}" } });
+        } else if prefix_len > 0 {
+            let prefix_text = char_offset(prefix_len);
+            let prefix_style = match kind {
+                LiveLineKind::Heading => hidden.to_string(),
+                LiveLineKind::Quote => format!("color:{muted};"),
+                LiveLineKind::Bullet | LiveLineKind::Ordered | LiveLineKind::Task => {
+                    format!("color:{muted};")
+                }
+                LiveLineKind::Text => String::new(),
+            };
+            spans.push(rsx! {
+                span { style: "{prefix_style}", "{prefix_text}" }
+            });
+            let segs = live_inline_segments(&body);
+            for (si, seg) in segs.iter().enumerate() {
+                let key = format!("{index}-{si}");
+                let element = match seg {
+                    LiveSeg::Marker(m) => rsx! {
+                        span { key: "{key}", style: if open_form { format!("color:{muted};") } else { hidden.to_string() }, "{m}" }
+                    },
+                    LiveSeg::Plain(t) => rsx! {
+                        span { key: "{key}", "{t}" }
+                    },
+                    LiveSeg::Strong(t) => rsx! {
+                        span { key: "{key}", style: format!("-webkit-text-stroke:0.55px {};", doc.fg), "{t}" }
+                    },
+                    LiveSeg::Em(t) => rsx! {
+                        span { key: "{key}", style: format!("color:{};", doc.accent), "{t}" }
+                    },
+                    LiveSeg::Code(t) => rsx! {
+                        span { key: "{key}", style: format!("background:{}; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;", color_mix(doc.muted.clone(), 22)), "{t}" }
+                    },
+                };
+                spans.push(element);
+            }
+        } else {
+            let segs = live_inline_segments(line);
+            for (si, seg) in segs.iter().enumerate() {
+                let key = format!("{index}-{si}");
+                let element = match seg {
+                    LiveSeg::Marker(m) => rsx! {
+                        span { key: "{key}", style: if open_form { format!("color:{muted};") } else { hidden.to_string() }, "{m}" }
+                    },
+                    LiveSeg::Plain(t) => rsx! {
+                        span { key: "{key}", "{t}" }
+                    },
+                    LiveSeg::Strong(t) => rsx! {
+                        span { key: "{key}", style: format!("-webkit-text-stroke:0.55px {};", doc.fg), "{t}" }
+                    },
+                    LiveSeg::Em(t) => rsx! {
+                        span { key: "{key}", style: format!("color:{};", doc.accent), "{t}" }
+                    },
+                    LiveSeg::Code(t) => rsx! {
+                        span { key: "{key}", style: format!("background:{}; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;", color_mix(doc.muted.clone(), 22)), "{t}" }
+                    },
+                };
+                spans.push(element);
+            }
+        }
+        let _ = muted;
+        lines.push(rsx! {
+            div {
+                key: "live-line-{index}",
+                style: "min-height:1em;",
+                for span in spans {
+                    {span}
+                }
+            }
+        });
+    }
+    lines
 }
 
 /// The DOCUMENT SURFACE body: the viewport-placement pane's schema rendered
