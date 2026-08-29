@@ -297,3 +297,34 @@ fn opencode_live_service_fetch() {
         None => panic!("active_sessions returned None — fetch failed inside the client (this is the daemon's exact code path)"),
     }
 }
+
+/// The service session id embedded in a mirror tab row's path, if it is one.
+///
+/// Mirror tab rows are keyed `opencode-runtime://<ses_id>` — the id is the
+/// SERVICE's own (`ses_…`), which is what per-session delivery needs. The
+/// anchor row is uuid-keyed and never matches; no other scheme matches.
+pub fn tab_session_id(session_path: &str) -> Option<&str> {
+    let rest = session_path.strip_prefix("opencode-runtime://")?;
+    rest.starts_with("ses_").then_some(rest)
+}
+
+#[cfg(test)]
+mod tab_id_tests {
+    use super::tab_session_id;
+
+    #[test]
+    fn tab_rows_match_by_service_id_and_anchors_never_do() {
+        assert_eq!(
+            tab_session_id("opencode-runtime://ses_fb29241e2ffefXIbrLj4IVdZ8t"),
+            Some("ses_fb29241e2ffefXIbrLj4IVdZ8t")
+        );
+        // The anchor row is uuid-keyed — never a tab.
+        assert_eq!(
+            tab_session_id("opencode-runtime://81e3b48a-9ef5-41bf-88bb-ae9ac0b8d0a5"),
+            None
+        );
+        // Other schemes never match.
+        assert_eq!(tab_session_id("remote-opencode://dev/ses_abc"), None);
+        assert_eq!(tab_session_id("local://ses_abc"), None);
+    }
+}

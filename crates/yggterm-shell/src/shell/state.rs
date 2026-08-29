@@ -80959,6 +80959,53 @@ async fn process_pending_app_control_requests(
             "command": request.command,
         }),
     );
+    // ⛔ MIRROR TAB ROWS ARE DELIVERED THROUGH THE OPENCODE SERVICE, before
+    // the readiness-gated mount path: an unopened mirror row
+    // (opencode-runtime://ses_…) has NO PTY, so the composer probe would
+    // answer "not consuming input" forever and typed input would vanish
+    // (the "ghost" rows, measured 2026-08-29). The service OWNS the session;
+    // its prompt endpoint queues the text in that session's inbox —
+    // per-session delivery by design. The request is COMPLETED here (the
+    // caller is waiting on the response file) and the trace names the route.
+    if let AppControlCommand::SubmitTerminalPrompt {
+        session_path,
+        data,
+        ..
+    } = &request.command
+    {
+        if let Some(ses_id) = yggterm_core::opencode_service::tab_session_id(session_path) {
+            let delivered =
+                yggterm_core::opencode_service::send_prompt(&home, ses_id, data);
+            let response = AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "submitted": delivered,
+                    "session_path": session_path,
+                    "delivery": if delivered {
+                        "opencode-service-inbox"
+                    } else {
+                        "opencode-service-unreachable"
+                    },
+                    "ses_id": ses_id,
+                })),
+                error: None,
+            };
+            if delivered {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "opencode_mirror",
+                    "tab_prompt_delivered",
+                    json!({ "ses_id": ses_id, "bytes": data.len() }),
+                );
+            }
+            complete_app_control_request(&home, &inflight_path, &response)?;
+            return Ok(true);
+        }
+    }
     let command = request.command.clone();
     let request_id = request.request_id.clone();
     let command_name = command.name().to_string();
