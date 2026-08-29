@@ -850,6 +850,19 @@ opencode-tab-mirror`). Multi-client justification measured: a second
 `opencode2 --session` on a session another TUI had open painted the same
 conversation with no conflict — the service owns state, windows are clients.
 
+**TAB MIRROR LANDED + LIVE (`df977647d` core, `f84ffd0f` silent insert,
+`d41b6c1f` title sync, `d2f445f48` adoption, `5fc4b712` unlimited adoption;
+live-verified 2026-08-29 21:54):** a 5 s daemon chore keeps one row per open
+opencode2 tab — keyed `opencode-runtime://<ses_id>`, born Queued with the
+launch line `opencode2 --session <ses_id>` (no PTY until opened), seated
+under the anchor, titled from the service and re-synced every tick.
+Focus-follow (active row tracks `time.viewed`, gated to the opencode context)
+verified firing live; adoption is UNLIMITED because daemon takeovers restore
+rows without metadata (owned fell 4→1 across one — the mirror self-heals in
+one tick instead of trickling). The mount path for a freshly clicked tab row
+is the last unverified edge: the wrapper resume-by-id is proven from a shell,
+the row-mount context needs one live click to confirm.
+
 **Still open:** the identity rebind (see `pending-bugs.md` [CLI] entry) —
 `id_assigned_at_birth: false` for opencode2 plus store→row mapping through the
 opencode service API. Cold resume of a v2 session cannot work until then, and
