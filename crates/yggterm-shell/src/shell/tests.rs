@@ -38538,6 +38538,118 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
 
+    /// The measured 2026-08-29 pump (`11.32` family, watchdog seam): a mount
+    /// that had succeeded — `mount_open` success, `attach_ready`, daemon
+    /// forward streaming meaningful output — sat Pending because fast-ready is
+    /// structurally ineligible for remote-session rows (the local runtime
+    /// manifest never lists their runtime keys and the content is not
+    /// prompt-like). The retained-fault-recovery watchdog read that Pending as
+    /// a fault and remounted the HEALTHY host twice per burst
+    /// (`MAX_REARMS=2`), bursts repeating every cooldown — each remount a full
+    /// bootstrap_reset + xterm rebuild + `clear_to_empty` + rehydrate, the
+    /// felt per-switch lag. A live streaming host must latch ready and
+    /// consume no remount budget.
+    #[test]
+    fn the_fault_watchdog_latches_ready_instead_of_remounting_a_live_host() {
+        let session_path = "remote-session://dev/watchdog-live-host";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.terminal_attach_in_flight.insert(session_path.to_string());
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-watchdog", 7, "retained_fault_recovery");
+        // The mount succeeded and the daemon forward streamed meaningful
+        // output; fast-ready stays ineligible (no runtime manifest, not
+        // prompt-like) — reproducing the measured Pending-with-live-output
+        // state the watchdog then misread as a fault.
+        shell.mark_terminal_open_attempt_first_meaningful_output_for_session(
+            session_path,
+            "daemon_output",
+            false,
+            false,
+        );
+        // Age the attempt past its rearm threshold.
+        let started = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt")
+            .started_at_ms;
+        shell
+            .terminal_open_attempts
+            .get_mut(&attempt_id)
+            .expect("attempt")
+            .started_at_ms = started.saturating_sub(3_600_000);
+        let now = started + 3_600_000;
+
+        let rearm = shell.rearm_stale_retained_fault_recovery(session_path, now);
+        assert!(
+            !rearm,
+            "a live streaming host must not be remounted by the watchdog"
+        );
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt");
+        assert!(
+            attempt.ready_at_ms.is_some()
+                && matches!(attempt.state, TerminalOpenAttemptState::Ready),
+            "the watchdog must latch ready for a host that already streamed output"
+        );
+        assert_eq!(
+            attempt.rearm_count, 0,
+            "a healthy host consumes no remount budget"
+        );
+        assert!(
+            shell.terminal_session_was_ever_ready(session_path),
+            "the sticky ready proof must survive for the next switch-back"
+        );
+    }
+
+    /// The negative arm: without live output the watchdog is still the
+    /// machinery that rescues a genuinely stuck reveal — the remount budget
+    /// must be consumed exactly as before.
+    #[test]
+    fn the_fault_watchdog_still_remounts_an_attempt_with_no_live_output() {
+        let session_path = "remote-session://dev/watchdog-stuck";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.terminal_attach_in_flight.insert(session_path.to_string());
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-stuck", 8, "retained_fault_recovery");
+        let started = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt")
+            .started_at_ms;
+        shell
+            .terminal_open_attempts
+            .get_mut(&attempt_id)
+            .expect("attempt")
+            .started_at_ms = started.saturating_sub(3_600_000);
+
+        let rearm = shell.rearm_stale_retained_fault_recovery(
+            session_path,
+            started + 3_600_000,
+        );
+        assert!(
+            rearm,
+            "a stuck attempt with no output still needs the watchdog remount"
+        );
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt");
+        assert_eq!(
+            attempt.rearm_count, 1,
+            "the remount budget is consumed by genuinely stuck attempts"
+        );
+    }
+
     /// The 60 s timer raises its toast ITSELF and only then latches the failure,
     /// so resolving the attempt is not enough — the timer has to be told. Both
     /// arms of the stand-down, and both of its refusals.

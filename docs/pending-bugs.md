@@ -70,7 +70,15 @@ latency is unchanged, only the permanent cold-remount tax is gone.
 
 ## ⛔ [11.32] A REMOTE ROW'S SCREEN READ ANSWERS "EMPTY" FROM THE LOCAL DAEMON — THE CLIENT BACKS OFF 2.5s→5s AND THE ROW SITS BLANK AND INPUT-GATED FOR 10+ SECONDS
 
-**Status:** OPEN
+**Status:** OPEN (empty-screen-read half). The watchdog-remount half of this
+entry is **FIXED IN CODE — LIVE PROOF OWED**: `rearm_stale_retained_fault_
+recovery` no longer remounts a host that is already mounted and streaming
+daemon-forwarded output — it latches ready instead
+(`ready_on_fault_watchdog_host_already_live`) and consumes no remount budget.
+Falsifier: on the next build, the warm bursts must stop — no
+`retained_fault_recovery_rearm "watchdog remount"` triplets every cooldown,
+and the `ready_on_fault_watchdog_host_already_live` reason appears in
+`terminal_open_attempt/ready` events.
 
 **Measured on the GUI host 2026-08-29 12:29 (3.2.12, trace-verified end to end).**
 Opening a remote agent row (`remote-agy://dev/9b5b64b5…`): `mount_open` succeeds
@@ -98,6 +106,21 @@ halve the retry budget and double the noise); the exponential backoff must not
 apply to a screen that exists somewhere — fetch beats wait. Related but
 separate: `was_ever_ready: false` in the stuck-gate payload is the [11.31]
 cancelled-attempt poison and is healed by that fix.
+
+**Landed same day (watchdog seam, this commit):** the measured 13:52 burst on
+3.2.14 showed the pump behind the warm-cycle remounts is NOT the hot-warm
+warmer but `retained_fault_recovery`: a mount that succeeded (mount_open +
+attach_ready + daemon-forwarded meaningful output) sat Pending because
+fast-ready is structurally ineligible for remote-session rows (the local
+runtime manifest never lists their runtime keys; content not prompt-like), and
+the watchdog read that Pending as a fault — remounting the healthy host twice
+per burst (`MAX_REARMS=2`), bursts every cooldown. The watchdog now latches
+ready instead of remounting when the attempt has first meaningful
+daemon-forwarded output and the host record still exists
+(`ready_on_fault_watchdog_host_already_live`); a genuinely stuck attempt (no
+output) still consumes the remount budget exactly as before. Locked by
+`the_fault_watchdog_latches_ready_instead_of_remounting_a_live_host` and
+`the_fault_watchdog_still_remounts_an_attempt_with_no_live_output`.
 
 ## ⛔ [CLI] OPENCODE2 SELF-MINTS `ses_…` IDS — THE STORE PROBE CANNOT SEE YGGTERM ROWS (identity rebind owed)
 

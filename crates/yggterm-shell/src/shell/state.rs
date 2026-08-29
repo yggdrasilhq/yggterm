@@ -30818,6 +30818,7 @@ impl ShellState {
         }
         let mut exhausted_budget = false;
         let mut should_rearm = false;
+        let mut saw_live_host_output = false;
         if let Some(attempt_id) = self
             .terminal_open_attempt_by_session
             .get(active_session_path)
@@ -30834,17 +30835,42 @@ impl ShellState {
             {
                 return false;
             }
-            if attempt.rearm_count >= RETAINED_FAULT_RECOVERY_MAX_REARMS {
-                // Exhausted: decide Failed-vs-keep-alive AFTER this borrow ends,
-                // based on whether the daemon still owns the live PTY (a &self call
-                // not allowed during this &mut borrow).
-                exhausted_budget = true;
-            } else {
-                attempt.rearm_count = attempt.rearm_count.saturating_add(1);
-                should_rearm = true;
+            // ⛔ THE HOST MAY ALREADY BE LIVE AND STREAMING. This watchdog
+            // remounts a reveal that is genuinely stuck. A mount whose daemon
+            // forward has already delivered first meaningful output onto an
+            // existing host record is the opposite: the reveal succeeded in
+            // substance and only the ready LATCH is missing — fast-ready is
+            // structurally ineligible there (the local runtime manifest does
+            // not hold remote-session runtime keys, and the content is not
+            // prompt-like), so the attempt sat Pending, the watchdog read the
+            // Pending as a fault, and remounted the healthy host twice per
+            // burst, every cooldown, forever (measured 2026-08-29 13:52 on
+            // the GUI host: mount_open success + attach_ready + daemon output,
+            // then two watchdog remounts at +5 s/+10 s, bursts repeating every
+            // ~2m15s). A live streaming host consumes no remount budget; the
+            // ready latch below resolves the attempt instead.
+            saw_live_host_output = attempt.first_meaningful_output_at_ms.is_some();
+            if !saw_live_host_output {
+                if attempt.rearm_count >= RETAINED_FAULT_RECOVERY_MAX_REARMS {
+                    // Exhausted: decide Failed-vs-keep-alive AFTER this borrow ends,
+                    // based on whether the daemon still owns the live PTY (a &self call
+                    // not allowed during this &mut borrow).
+                    exhausted_budget = true;
+                } else {
+                    attempt.rearm_count = attempt.rearm_count.saturating_add(1);
+                    should_rearm = true;
+                }
             }
         }
         if !should_rearm && !exhausted_budget {
+            if saw_live_host_output
+                && self.terminal_session_host_id(active_session_path).is_some()
+            {
+                self.mark_terminal_open_attempt_ready_for_session(
+                    active_session_path,
+                    "ready_on_fault_watchdog_host_already_live",
+                );
+            }
             return false;
         }
         self.record_terminal_contract_telemetry(
