@@ -215,7 +215,7 @@ const ARMS: &[Arm] = &[
         remote_resume_subcommand: None,
         remote_start_subcommand: None,
         write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
-        binary: "opencode",
+        binary: "opencode2",
         resume_selector_token: "--session",
         re_roots_with_cwd: false,
         // ⛔ EMPTY = a DECLARED store-scan gap (one SQLite db, not a file per
@@ -230,7 +230,7 @@ const ARMS: &[Arm] = &[
         remote_resume_subcommand: Some("resume-opencode"),
         remote_start_subcommand: Some("start-opencode"),
         write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
-        binary: "opencode",
+        binary: "opencode2",
         resume_selector_token: "--session",
         re_roots_with_cwd: false,
         store_globs: &[],

@@ -68,7 +68,39 @@ switch-back). Residual, not fixed here: the strict fast-ready itself still
 waits on the manifest for a genuinely cold first mount — the felt first-open
 latency is unchanged, only the permanent cold-remount tax is gone.
 
+## ⛔ [11.35] THE ETERNAL ATTACH WAIT — AN ORPHANED CLI PROCESS HOLDS A ROW FOREVER AND THE WAIT FLOODS ITS VIEWPORT (codex, any CLI)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED. Falsifier: on the next build, a
+row whose holder is init-reparented prints the ORPHAN wording once (in-place
+reprints, no 12-line flood), ends at the 120 s deadline with the `kill`
+remediation, and after the holder is killed the row attaches normally.
+
+**Measured 2026-08-29 16:00 on the GUI host (owner screenshot).** The
+"Your Weekly Limit Left Run" Codex row sat at `bootstrapping · idle` with its
+viewport flooded by 12+ near-identical banner lines: `yggterm: Codex session …
+is already active outside Yggterm (pid 1959102, 1959169); waiting instead of
+starting a second resume. Close that external terminal…` — counters 12 s →
+108 s. The holder was an ORPHAN: `codex … resume` from two daemon generations
+earlier, reparented to init (ppid 1), its pts long unread — "close that
+external terminal" pointed at a terminal that no longer exists, and the wait
+could never end. Any CLI can be orphaned this way by a daemon death without a
+preserved-owner handover.
+
+**Fixed (this commit):** (1) the holder probe now carries `ppid`; when every
+holder path roots at init the banner names the orphan, says its terminal is
+gone, and gives the one command that releases the session (`kill <pids>` —
+the conversation persists in the session file; a holder that is still working
+must be closed by the reader, never killed for them). The guard classifier
+recognizes the orphan wording, so it is never mistaken for a failed resume.
+(2) The 10 s reprints overwrite their line in place (`\r\x1b[K`) instead of
+stacking a dozen near-identical banner lines per 120 s wait; the deadline and
+release notices terminate the line cleanly. The classification itself is
+unchanged — a genuinely external, live-parent holder still gets the close-the-
+terminal instruction, and the strict no-race policy still holds.
+
+
 ## ⛔ [11.34] THE SQUISH COMPOSITE — A HOST PAINTS MULTIPLE SESSION FRAMES STACKED (correlated with the remount storms; trigger removed this session, canvas-layer lifecycle unproven)
+
 
 **Status:** OPEN — trigger removed ([11.31]+watchdog, shipped 3.2.15/3.2.16);
 canvas-layer lifecycle owes a deliberate repro on the new build.

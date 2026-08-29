@@ -2027,6 +2027,20 @@ struct ExternalCodexResumeProcess {
     /// each consumer, so the wait, the refusal and the message can never
     /// disagree about what they are looking at.
     holder: AgentResumeHolderKind,
+    /// The holder's parent pid, when readable. `Some(1)` means the process was
+    /// reparented to init — its original terminal and owning daemon are gone,
+    /// so "close that external terminal" is not an instruction anyone can act
+    /// on.
+    ppid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_ppid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
 #[cfg(target_os = "linux")]
@@ -2061,6 +2075,7 @@ fn external_agent_resume_processes_for_session(
                 pid,
                 argv0: args.first().cloned().unwrap_or_default(),
                 holder,
+                ppid: linux_proc_ppid(pid),
             })
         })
         .collect::<Vec<_>>();
@@ -2082,6 +2097,7 @@ struct ExternalCodexResumeProcess {
     pid: u32,
     argv0: String,
     holder: AgentResumeHolderKind,
+    ppid: Option<u32>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2149,11 +2165,37 @@ fn remote_resume_external_active_message_with_elapsed(
              corrupt the transcript. Nothing to close.{waited}"
         )
     } else {
-        format!(
-            "yggterm: {display} session {session_id} is already active outside Yggterm (pid {pids}); \
-             waiting instead of starting a second resume. Close that external terminal to let \
-             Yggterm attach.{waited}"
-        )
+        // ⛔ "CLOSE THAT EXTERNAL TERMINAL" IS NOT ALWAYS AN INSTRUCTION. When
+        // every holder was reparented to init (ppid 1), its original terminal
+        // and owning daemon are already gone — reparenting is what a daemon
+        // death WITHOUT a preserved-owner handover does to its CLI children
+        // (measured 2026-08-29 16:00: a codex holder from two daemon
+        // generations earlier, still holding the session, the row flooded with
+        // a wait nobody could end). Name the orphan and the one command that
+        // releases the session; the conversation itself persists in the
+        // session file, so ending an IDLE holder loses nothing — but the
+        // choice stays the reader's, because a holder that is still working
+        // must not be killed for them.
+        // ANY holder reparented to init means the tree was orphaned: a live
+        // yggterm-launched tree hangs under a live daemon or shell, never
+        // under init. (The holder set includes the wrapper AND the real
+        // binary — only the wrapper's parent is init.)
+        let orphaned = processes.iter().any(|process| process.ppid == Some(1));
+        if orphaned {
+            format!(
+                "yggterm: {display} session {session_id} is held by an orphaned {display} \
+                 process (pid {pids}) left behind by an earlier Yggterm restart — its terminal \
+                 is gone, so this wait cannot end on its own. If the process is idle, end it \
+                 with `kill {pids}` (the conversation persists in the session file) and retry; \
+                 if it is still working, close it there when it finishes.{waited}"
+            )
+        } else {
+            format!(
+                "yggterm: {display} session {session_id} is already active outside Yggterm (pid {pids}); \
+                 waiting instead of starting a second resume. Close that external terminal to let \
+                 Yggterm attach.{waited}"
+            )
+        }
     }
 }
 
@@ -2179,13 +2221,19 @@ fn remote_resume_snapshot_is_external_active_guard(bytes: &[u8]) -> bool {
     }
     let external = normalized.contains("already active outside yggterm")
         && normalized.contains("waiting instead of starting a second resume");
+    // ⛔ The ORPHAN wording (every holder reparented to init — its terminal is
+    // gone and no close can release it) must read as the guard's banner too,
+    // or the recovery for it becomes a restart: the one thing the banner
+    // exists to avoid.
+    let orphaned = normalized.contains("held by an orphaned")
+        && normalized.contains("this wait cannot end on its own");
     // ⛔ The 3.0.90 wording AND its predecessor, because a fleet runs several
     // daemon versions at once BY DESIGN — a matcher that only knows the newest
     // spelling goes blind against every older peer still emitting the old one.
     let stranded = normalized.contains("already running under yggterm")
         || (normalized.contains("still held by a yggterm process")
             && normalized.contains("waiting for it to release the session"));
-    external || stranded
+    external || stranded || orphaned
 }
 
 fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) -> ExternalResumeWait {
@@ -2229,6 +2277,7 @@ fn wait_for_external_agent_resume_to_clear(
     let started = Instant::now();
     let mut announced: Option<Instant> = None;
     let mut last_pids = Vec::<u32>::new();
+    let mut in_place = false;
     loop {
         let processes = external_agent_resume_processes_for_session(kind, session_id);
         if processes.is_empty() {
@@ -2246,6 +2295,11 @@ fn wait_for_external_agent_resume_to_clear(
                 // The wait ENDING is as load-bearing as its starting: the
                 // viewport otherwise keeps the last banner and reads as stuck
                 // right up to the moment the agent repaints over it.
+                if in_place {
+                    // The last reprint ended mid-line; terminate it so the
+                    // release notice starts clean.
+                    println!();
+                }
                 println!("yggterm: the session was released; attaching now.");
                 let _ = std::io::stdout().flush();
             }
@@ -2264,6 +2318,11 @@ fn wait_for_external_agent_resume_to_clear(
                     "deadline_secs": EXTERNAL_ACTIVE_WAIT_DEADLINE.as_secs(),
                 }),
             );
+            if in_place {
+                // Terminate the in-place banner before the caller's failure
+                // line, or the Error text appends to the banner's tail.
+                println!();
+            }
             return ExternalResumeWait::DeadlineExpired;
         }
         let pids = processes
@@ -2292,15 +2351,28 @@ fn wait_for_external_agent_resume_to_clear(
                     "policy": "session_survival_before_yggterm_attach",
                 }),
             );
-            println!(
-                "{}",
-                remote_resume_external_active_message_with_elapsed(
-                    kind,
-                    session_id,
-                    &processes,
-                    Some(started.elapsed().as_secs()),
-                )
+            let message = remote_resume_external_active_message_with_elapsed(
+                kind,
+                session_id,
+                &processes,
+                Some(started.elapsed().as_secs()),
             );
+            // ⛔ THE REPRINT IS AN UPDATE OF ONE LINE, NOT A NEW LINE EVERY
+            // CYCLE. The banner re-renders every 10 s with a fresh elapsed
+            // count; `println!` per cycle wrote a dozen growing copies into
+            // the row's transcript per wait (measured 2026-08-29: a codex
+            // holder from two daemon generations earlier flooded the viewport
+            // with 12 near-identical banner lines, and the row's keep-alive
+            // rerun multiplied it). Reprints overwrite the line in place
+            // (carriage return + clear); only a genuinely NEW announcement
+            // (first emission, or the holder pids changed) earns its own line.
+            if announced.is_none() || pids != last_pids {
+                println!("{message}");
+                in_place = false;
+            } else {
+                print!("\r\x1b[K{message}");
+                in_place = true;
+            }
             let _ = std::io::stdout().flush();
             announced = Some(Instant::now());
             last_pids = pids;
@@ -34908,6 +34980,7 @@ mod tests {
                     pid: 42,
                     argv0: "node".to_string(),
                     holder,
+                    ppid: None,
                 }],
             );
             // ⛔ BOTH wordings must read as the guard's banner. A wording the
@@ -34938,6 +35011,7 @@ mod tests {
             pid: 3_942_934,
             argv0: "claude".to_string(),
             holder: super::AgentResumeHolderKind::StrandedYggtermOwned,
+            ppid: None,
         }];
         let message = super::remote_resume_external_active_message_with_elapsed(
             SessionKind::ClaudeCode,
@@ -34963,6 +35037,7 @@ mod tests {
             pid: 42,
             argv0: "node".to_string(),
             holder: super::AgentResumeHolderKind::External,
+            ppid: None,
         }];
         let message = super::remote_resume_external_active_message(
             SessionKind::Codex,
@@ -34977,6 +35052,65 @@ mod tests {
         let message =
             super::remote_resume_external_active_message(SessionKind::Codex, "abc123", &mixed);
         assert!(message.contains("already active outside Yggterm"), "{message}");
+
+        // ⛔ THE ORPHAN ARM (2026-08-29): every holder reparented to init — the
+        // "close that external terminal" instruction pointed at a terminal
+        // that no longer exists, and the wait could never end. The wording
+        // must name the orphan, give the one command that releases the
+        // session, and still be recognised by the guard's classifier (an
+        // unrecognised banner reads as a FAILED resume, whose recovery is a
+        // restart).
+        let orphans = [
+            super::ExternalCodexResumeProcess {
+                pid: 1_959_102,
+                argv0: "node".to_string(),
+                holder: super::AgentResumeHolderKind::External,
+                ppid: Some(1),
+            },
+            super::ExternalCodexResumeProcess {
+                pid: 1_959_169,
+                argv0: "codex".to_string(),
+                holder: super::AgentResumeHolderKind::External,
+                ppid: Some(1_959_102),
+            },
+        ];
+        let message = super::remote_resume_external_active_message_with_elapsed(
+            SessionKind::Codex,
+            "abc123",
+            &orphans,
+            Some(108),
+        );
+        assert!(
+            message.contains("orphaned") && message.contains("kill 1959102, 1959169"),
+            "the orphan wording must name the holders and the one command that \
+             releases the session: {message}"
+        );
+        assert!(
+            !message.contains("Close that external terminal"),
+            "there is no external terminal to close: {message}"
+        );
+        assert!(
+            super::remote_resume_snapshot_is_external_active_guard(message.as_bytes()),
+            "the orphan banner must still read as the guard's banner, not a \
+             failed resume"
+        );
+        // A LIVE parent (the user's own terminal) keeps the external wording:
+        // the instruction CAN be acted on there.
+        let live = [super::ExternalCodexResumeProcess {
+            pid: 42,
+            argv0: "node".to_string(),
+            holder: super::AgentResumeHolderKind::External,
+            ppid: Some(777),
+        }];
+        let message = super::remote_resume_external_active_message(
+            SessionKind::Codex,
+            "abc123",
+            &live,
+        );
+        assert!(
+            message.contains("Close that external terminal"),
+            "a holder with a live parent still has a terminal to close: {message}"
+        );
     }
 
     #[cfg(unix)]
