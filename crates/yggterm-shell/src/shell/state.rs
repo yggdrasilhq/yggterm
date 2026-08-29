@@ -80976,7 +80976,9 @@ async fn process_pending_app_control_requests(
         if let Some(ses_id) = yggterm_core::opencode_service::tab_session_id(session_path) {
             // ⛔ The registration lives under the USER home, not the yggterm
             // home — `home` here is the perf/settings dir (~/.yggterm).
-            let user_home = dirs::home_dir().unwrap_or_else(|| home.clone());
+            let user_home = std::path::PathBuf::from(
+                std::env::var("HOME").unwrap_or_else(|_| home.display().to_string()),
+            );
             let delivered =
                 yggterm_core::opencode_service::send_prompt(&user_home, ses_id, data);
             let response = AppControlResponse {
