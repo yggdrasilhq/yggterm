@@ -10444,13 +10444,20 @@ impl YggtermServer {
         // succeeded. The store is now consulted only to choose
         // resume-vs-picker for a row nothing holds.
         let live_runtime_held = self.sessions.contains_key(&key);
+        // ⛔ A self-minting kind's absent probe opens the CLI's OWN resume
+        // picker instead of refusing — see `remote_resume_absent_opens_picker`
+        // and the wrapper twin below. The probe still runs: a present answer
+        // (a rebind landed) resumes exactly as before.
+        let picker_fallback = remote_resume_absent_opens_picker(kind);
         let saved_session_exists = live_runtime_held
             || remote_saved_agent_session_exists(kind, session_id)?;
-        if remote_require_existing_refusal_allowed(
-            live_runtime_held,
-            saved_session_exists,
-            require_existing,
-        ) {
+        if !picker_fallback
+            && remote_require_existing_refusal_allowed(
+                live_runtime_held,
+                saved_session_exists,
+                require_existing,
+            )
+        {
             anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
         }
         if saved_session_exists {
@@ -11771,6 +11778,17 @@ impl YggtermServer {
                 .map(|runtime_key| self.sessions.contains_key(&runtime_key))
                 .unwrap_or(false)
             {
+                if session_metadata_value(session, "Saved Session").as_deref() == Some("missing") {
+                    recovered_remote_live_session = Some(session.session_path.clone());
+                }
+                return None;
+            }
+            // ⛔ And a SELF-MINTING kind is never marked missing at all: its
+            // store is keyed by ids the CLI minted, so absence is not evidence
+            // (opencode2's v2 store probes absent even for real ids). An
+            // absent probe resolves to the CLI's own picker at launch, not to
+            // a mark this plane cannot retract.
+            if remote_resume_absent_opens_picker(session.kind) {
                 if session_metadata_value(session, "Saved Session").as_deref() == Some("missing") {
                     recovered_remote_live_session = Some(session.session_path.clone());
                 }
@@ -13811,6 +13829,23 @@ fn remote_require_existing_refusal_allowed(
     require_existing: bool,
 ) -> bool {
     require_existing && !saved_session_exists && !live_runtime_held
+}
+
+/// Whether a store-absent answer for THIS kind opens the CLI's own resume
+/// picker instead of refusing a `--require-existing` restore.
+///
+/// ⛔ Self-minting CLIs (`id_assigned_at_birth: false`) never store yggterm's
+/// birth id: their stores are keyed by ids the CLI minted over RPC or sqlite,
+/// and the row's id is a rebind that may not have landed. Absence is then
+/// weak evidence — measured 2026-08-29 on opencode2's v2 preview, where the
+/// scanner cannot read the store schema at all and even a REAL `ses_…` id
+/// probes absent — and a refusal dead-ends a row whose CLI is perfectly able
+/// to list its own sessions. The picker lists only real sessions and starts
+/// nothing silently, so `--require-existing`'s intent (never fabricate a
+/// session) survives. Birth-id kinds (Claude Code and the resume-flag births)
+/// keep the refusal: their stores ARE keyed by the row id, so absence is real.
+fn remote_resume_absent_opens_picker(kind: SessionKind) -> bool {
+    agent_cli_descriptor(kind).is_some_and(|descriptor| !descriptor.id_assigned_at_birth)
 }
 
 fn remote_resume_seed_fallback_text(session: &ManagedSessionView) -> Option<String> {
@@ -20632,7 +20667,17 @@ pub fn run_remote_resume_agent(
         return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
     }
     let saved_session_exists = remote_saved_agent_session_exists(kind, session_id)?;
-    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
+    // ⛔ A SELF-MINTING CLI never stores yggterm's birth id, so an absent
+    // probe is not evidence of absence — measured 2026-08-29 on opencode2's
+    // v2 preview, where the scanner cannot read the store schema at all and
+    // even a REAL `ses_…` id probes absent. For these kinds the honest cold
+    // answer is the CLI's OWN resume picker — it lists only real sessions and
+    // starts nothing silently — never a dead-end refusal.
+    if !remote_resume_absent_opens_picker(kind)
+        && remote_resume_requires_missing_saved_session_failure(
+            require_existing,
+            saved_session_exists,
+        )
     {
         anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
     }
@@ -34111,7 +34156,7 @@ mod tests {
         parse_recent_context_sections, parse_stored_transcript,
         push_preview_block, remote_bootstrap_install_command, remote_cache_key,
         remote_command_cache, remote_direct_attach_launch_command,
-        remote_require_existing_refusal_allowed,
+        remote_require_existing_refusal_allowed, remote_resume_absent_opens_picker,
         remote_resume_requires_missing_saved_session_failure,
         remote_resume_runtime_output_mismatches_managed_session,
         remote_resume_runtime_output_requires_restart, remote_resume_shell_command,
@@ -39691,6 +39736,30 @@ mod tests {
         // A present transcript never refuses, held or not.
         assert!(!remote_require_existing_refusal_allowed(true, true, true));
         assert!(!remote_require_existing_refusal_allowed(false, true, true));
+    }
+
+    #[test]
+    fn self_minting_clis_open_the_picker_on_absence_and_birth_id_clis_refuse() {
+        // Self-minting (id_assigned_at_birth:false): absence must open the
+        // CLI's own picker, never refuse — the probe answers about an id the
+        // CLI never stored (measured 2026-08-29: opencode2's v2 store probes
+        // even REAL ses_… ids absent).
+        assert!(remote_resume_absent_opens_picker(SessionKind::OpenCode));
+        assert!(remote_resume_absent_opens_picker(SessionKind::Codex));
+        assert!(remote_resume_absent_opens_picker(SessionKind::CodexLiteLlm));
+        assert!(remote_resume_absent_opens_picker(SessionKind::Muse));
+        assert!(remote_resume_absent_opens_picker(SessionKind::Antigravity));
+        // Birth-id kinds: their stores ARE keyed by the row id; absence is
+        // real and the refusal stands.
+        assert!(!remote_resume_absent_opens_picker(
+            SessionKind::ClaudeCode
+        ));
+        assert!(!remote_resume_absent_opens_picker(SessionKind::Pi));
+        assert!(!remote_resume_absent_opens_picker(SessionKind::Kimi));
+        assert!(!remote_resume_absent_opens_picker(SessionKind::QwenCode));
+        assert!(!remote_resume_absent_opens_picker(
+            SessionKind::GrokBuild
+        ));
     }
 
     #[test]
