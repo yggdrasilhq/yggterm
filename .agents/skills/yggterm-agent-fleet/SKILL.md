@@ -1069,8 +1069,35 @@ tested by more than one agent goes through `ygg-ci`.
 - `integration` is *ephemeral* — never pushed, never landed. Lanes land via
   `ship`/merge queue on `main`; ci auto-unsubscribes lanes already in `main`.
 - Build artefacts stay under the scratch worktree's `target/`; no `/tmp` (RAM tmpfs) per `AGENTS.md`.
-- A conflict excludes only that lane and is reported in the build record
-  (`~/.yggterm/relay/ci/builds/<id>.json`) and in `status`.
+
+**Conflicts — deterministic, no guessing, no extra turns:**
+
+*Same file, different hunks:* `git merge` auto-merges — both lanes land in the
+integration build. No conflict.
+
+*Same hunk:* `tick` merges subs in enlist order per `ygg-ci.py:703`. First
+wins, second `merge --abort`s, is **excluded only**, and is recorded as
+`conflicts:[{lane,reason:conflict}]` in `~/.yggterm/relay/ci/builds/<id>.json`
+and in `ygg-ci.py status --json → last_build.conflicts` and `ci.log`. Build
+still runs/deploys with the merged subset — one conflict never blocks other
+agents. `no-remote-branch` (not yet pushed) is recorded the same way and
+simply skipped until the push appears.
+
+Your lane in `conflicts` → **you** fix it, `ygg-ci` retries automatically:
+
+```sh
+ygg-ci.py status --json | python3 -m json.tool  # is my lane in last_build.conflicts?
+git fetch origin
+git rebase origin/main          # or: git rebase --onto origin/<winner> if stacked
+# fix hunks, git add && git rebase --continue
+git push --force-with-lease origin lane/foo
+# next tick (≤300s or `ygg-ci.py tick --project yggterm`) merges clean — no unsubscribe needed
+```
+
+Do **not** `unsubscribe` a conflicted lane to "clear" it — that drops you from
+the next build. Do **not** re-subscribe — the subscription stays, the watcher
+re-merges the new `tip` on the next dirty check. Only `unsubscribe` when the
+work is done or the lane has landed on `main` (then `ygg-ci` auto-removes it).
 
 ## 4. Correspondence — any session can reach any other
 
