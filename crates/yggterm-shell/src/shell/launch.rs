@@ -3728,7 +3728,12 @@ fn app() -> Element {
                         // entered — user-rejected 2026-07-10.)
                         onmouseenter: move |_| {
                             if titlebar_auto_hide_enabled {
-                                autohide_reveal(
+                                // Dwell-gated: the pointer must REST on the
+                                // sensor before the titlebar reveals. A
+                                // fraction-of-a-second brush across the top
+                                // edge (driving a TUI's own tab bar) must not
+                                // pop chrome over the session — user 2026-08-29.
+                                autohide_dwell_reveal(
                                     titlebar_autohide_hovered,
                                     titlebar_autohide_lingering,
                                     titlebar_autohide_linger_generation,
@@ -3743,7 +3748,11 @@ fn app() -> Element {
                         // crosses it.
                         onmousemove: move |_| {
                             if titlebar_auto_hide_enabled && !titlebar_autohide_hovered() {
-                                autohide_reveal(
+                                // Movement inside the sensor asks for the same
+                                // dwell — the pending dwell is NOT restarted
+                                // (micro-movement would starve it); a rest
+                                // after a slide-in still reveals.
+                                autohide_dwell_reveal(
                                     titlebar_autohide_hovered,
                                     titlebar_autohide_lingering,
                                     titlebar_autohide_linger_generation,
@@ -3754,6 +3763,7 @@ fn app() -> Element {
                             if !titlebar_auto_hide_enabled {
                                 return;
                             }
+                            autohide_cancel_dwell();
                             autohide_handle_mouse_leave(
                                 titlebar_autohide_hovered,
                                 titlebar_autohide_lingering,

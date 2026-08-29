@@ -1526,6 +1526,17 @@ const SIDEBAR_OVERLAY_RADIUS_PX: f64 = 10.0;
 /// full width and owns the corner, so a sidebar must never paint over it.
 const SIDEBAR_AUTOHIDE_Z_INDEX: u32 = 170;
 const AUTOHIDE_LINGER_MS: u64 = 420;
+/// How long the pointer must REST on an auto-hidden edge's sensor before the
+/// panel reveals. A pass-through (driving a TUI's own tab bar under the top
+/// edge, reaching for something past the window) must NOT reveal — measured
+/// frustration 2026-08-29: the reveal was instant on entry, so fractions of a
+/// second on the strip popped the titlebar over the session.
+const TITLEBAR_AUTOHIDE_DWELL_MS: u64 = 300;
+/// One dwell per edge at a time. Movement INSIDE the sensor re-fires the
+/// request and must not restart the clock (micro-movements would starve it);
+/// only entry starts it, and leave cancels it.
+static TITLEBAR_AUTOHIDE_DWELL_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 const UPDATE_CTA_CSS: &str = r#"
 @keyframes yggterm-update-ellipsis-pulse {
   0%, 20% { opacity: 0.28; }
@@ -48190,6 +48201,38 @@ fn autohide_handle_mouse_leave(
     if let Some(generation) = autohide_begin_linger(hovered, lingering, linger_generation) {
         autohide_spawn_linger_task(hovered, lingering, linger_generation, generation);
     }
+}
+
+/// Dwell-gated sensor reveal for the TITLEBAR top edge: the pointer must REST
+/// on the sensor for `TITLEBAR_AUTOHIDE_DWELL_MS` before the reveal fires.
+/// Entry starts the clock; movement inside is a no-op (the pending dwell is
+/// not restarted, or micro-movement would starve it); leave cancels both the
+/// pending dwell and the clock.
+fn autohide_dwell_reveal(
+    mut hovered: Signal<bool>,
+    mut lingering: Signal<bool>,
+    mut linger_generation: Signal<u64>,
+) {
+    use std::sync::atomic::Ordering;
+    if TITLEBAR_AUTOHIDE_DWELL_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    linger_generation.set(linger_generation() + 1);
+    let generation = linger_generation();
+    spawn(async move {
+        sleep(Duration::from_millis(TITLEBAR_AUTOHIDE_DWELL_MS)).await;
+        TITLEBAR_AUTOHIDE_DWELL_PENDING.store(false, Ordering::SeqCst);
+        if linger_generation() == generation {
+            hovered.set(true);
+            lingering.set(false);
+        }
+    });
+}
+
+/// Leave cancels a pending dwell: the pointer is gone, so the reveal must not
+/// fire even if the dwell task has not woken yet.
+fn autohide_cancel_dwell() {
+    TITLEBAR_AUTOHIDE_DWELL_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 /// The three visual states a sidebar (left tree / right rail) can be in.
 ///
