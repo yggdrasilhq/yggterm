@@ -429,17 +429,8 @@ third-party apps must LINK is MPL; the application is GPL.
 
 Copyright 2026 Avikalpa Kundu <avi@gour.top>.
 
-yggterm was Apache-2.0 until 2026-08-01. Releases published under that licence
-keep it — relicensing cannot retract a grant already made — but everything from
-that commit onward is GPL-3.0-or-later. Using yggterm, including commercially
-and including inside a company, carries no obligation; distributing a modified
-version does.
-
 `LICENSE-APACHE` is still here, and it is not a second licence for yggterm. It is
 the licence text for the third-party code vendored under `vendor/` and
 `third_party/`, which keeps its own terms. `THIRD-PARTY-NOTICES.md` and
 `docs/DEPENDENCY-LICENCES.md` say what that is and what it obliges.
 
-Contributions need a signed CLA, because this project is also licensed
-commercially. See `CONTRIBUTING.md` and `CLA.md` — it is a page, you keep your
-copyright, and it takes one line to sign.

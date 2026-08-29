@@ -118,56 +118,6 @@ cluster doing the rewrite, and never inferred from which rows *look* idle. A
 clean working tree with a live agent in it is indistinguishable from an idle
 repo, and reading one as the other is the mistake this note exists to prevent.
 
-## ⛔⛔ THE yggterm PHONE — FOUR CALLS SETTLED IN ONE SITTING (2026-08-10)
-
-**Settled by the owner** in the session that closed ADR-0001. Facts and the
-licence rows live in `~/git/gour.top/docs/venture/ip-register.md` (rows 127, 128
-and the new `yggterm-protocol` row); this file records only that HE decided it.
-
-| | the call |
-|---|---|
-| **Price** | **Free app** (1 host, no push) **+ $35/yr service** (unlimited hosts + push + relay + sync). Chosen over a paid app precisely because a paid-only app would charge for *the ability to use your own machine*, which his own boundary forbids |
-| **App licence** | **Proprietary**, linking his own crates **under sole copyright**. The register's long-standing "OPEN: GPL-3.0 + App Store exception vs proprietary" is now CLOSED |
-| **Stack** | **Rust core + native UI** — UniFFI bindings, Jetpack Compose now, SwiftUI later. ⛔ **Dioxus mobile REJECTED** by all three architects and every judge |
-| **Channel** | **Stores primary, Obtainium alongside** — Google developer verification lands Sept 2026 in four countries and global 2027, and iOS has no sideload path outside the EU |
-
-### ⛔⛔ AND THE ONE HE CORRECTED ME ON — it is the durable half
-
-I recommended extracting `yggterm-protocol` into **libyggterm as MPL-2.0** so the
-proprietary phone app could link it. **He refused**, and quoted the estate's own
-standing rule back at me:
-
-> *"On libyggterm and MPL. The separation was made for OUR reuse boss. It was a
-> fiasco of licences and we went through it."*
-
-That was correct on both counts, and the second is the one an agent will re-derive:
-
-1. **It was unnecessary.** A licence is a grant to *others*; it does not bind the
-   holder. He owns every GPL line in the product — verified, not assumed:
-   `cargo license` over 680 crates finds the only GPL-3.0-or-later crates are his
-   own eight, no AGPL and no GPL-2.0-only anywhere, and `CLA-signatures.md`
-   carries exactly one signature. So he can publish a crate GPL **and** compile
-   it into a closed app at the same time, relicensing nothing.
-2. **It would have spent the moat.** `ip-register.md` row 116: *"every crate
-   moved out of the GPL fence is moat spent."* MPL would have granted **every
-   competitor** the right to link yggterm's wire into *their* proprietary phone
-   client. The one thing worth keeping fenced is exactly the thing I proposed to
-   unfence.
-
-⇒ **`yggterm-protocol` is still extracted — for ENGINEERING reasons only** (the
-67-variant `ServerRequest` is trapped inside a 25,131-line `daemon.rs`) — and it
-**stays GPL-3.0-or-later in `~/gh/yggterm`**.
-
-⚠ **The condition that makes all of this work, and it is free exactly once:** the
-CLA. The first outside contribution merged without a signature permanently ends
-the right to ship that code closed. It belongs in CI as a merge-blocking check,
-not in a document.
-
-⛔ **No App Store exception is to be drafted.** That instrument exists for a
-*third party* shipping someone else's GPL code (VLC, 2011). Blink Shell is the
-live counter-precedent: GPL-3.0, public source, $19.99/yr on the App Store,
-lawful because the rights holder is the one shipping it.
-
 ## ⛔⛔ A GUI RESTART NEEDS NO PERMISSION — EXCEPT ON AN ACTIVE ychrome ROW (2026-08-10)
 
 **Settled by the owner, verbatim:** *"Alwasy do GUI restart. Please write it in
@@ -469,44 +419,6 @@ kind list without removing the capability is the work; it is filed in
 ⚖ The flip belongs to the codex session's own surface: a **codex ↔ Anything**
 slider in settings (`spec-settings-model-providers.md`), never a separate row in
 the session menu.
-
-## ★★★ NO REPO MAY CARRY TWO LICENCE CLAIMS, AND GADGETS GATES GOING PUBLIC (2026-08-07)
-
-**Settled by the user, verbatim:** *"Such duplicity of licenses must be force
-push delete cleaned and only then proceeded. In case on any new projects
-entering the public space always gadgets should analyze what the license
-should be and then we proceed."*
-
-Two rules, and they answer different questions.
-
-1. **Duplicity is cleaned by rewriting history, not by fixing forward.** A repo
-   whose `LICENSE` says one thing and whose `README`/`AGENTS.md` says another is
-   not "mostly right" — it is two answers to one question, and the permissive
-   one is the one a reader relies on. The fix is a history rewrite plus a force
-   push, so no commit anywhere in the lineage carries the contradiction.
-2. **Nothing of his goes public until gadgets has decided its licence**, and
-   the answer is a row in `~/git/gour.top/docs/venture/ip-register.md` (§THE
-   LAUNCH GATE, Step 0). Steer phrase: *"continue the gadgets campaign"*.
-
-⚖ **This overrode a verdict an agent had written the same day** — *"fix forward
-+ a dated NOTICE erratum; never a rewrite, never a public statement."* That
-verdict is still correct about what a rewrite achieves **legally**: relicensing
-retracts no grant already made, and a rewrite only shrinks the discoverable
-surface. It was answering "can we take the offer back", and the answer is still
-no. The user is answering a different question — "may the repo keep contradicting
-itself" — and the answer is no. Both hold, and the honest record of each
-exposure window lives in the register, which is private.
-
-⛔ **Do not add a public erratum when cleaning duplicity.** An erratum
-re-publishes the claim it corrects, which is the opposite of the instruction.
-The record goes in the register.
-
-**Executed the same day:** yedit rewritten across all 13 commits and
-force-pushed (tip `fbf1540`); cellulose and paper **deleted** at his direction
-(*"far far superceded in concept"*, cellulose's name reserved for a fresh repo
-later); charts's `app/` carved out of its root Apache grant; the orphaned Apache
-`yggdrasil-build-main` tree deleted. Full detail in the register's §THE LICENCE
-SWEEP.
 
 ## ★★★ A RUNNING SESSION KEEPS ITS START-PAGE CARD (2026-08-06) — REVERSES A 2026-05-26 CALL
 
