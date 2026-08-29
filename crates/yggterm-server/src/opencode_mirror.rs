@@ -143,6 +143,30 @@ impl YggtermServer {
     ) {
         let owned = owned_tabs_from(&self.sessions);
         let plan = plan_tab_sync(active, &owned);
+        // ⛔ A tick whose silence is indistinguishable from not having run is
+        // the §7 sin in mirror form: report EVERY tick — counts, not contents
+        // (no ids, no titles) — so "why did nothing happen" is answerable
+        // from the trace alone. Every 12th tick in detail, the rest a line.
+        if let Ok(home_dir) = crate::resolve_yggterm_home() {
+            static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 12 == 0 {
+                yggterm_core::append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "opencode_mirror",
+                    "tick_state",
+                    serde_json::json!({
+                        "active_tabs": active.len(),
+                        "active_ids": active.iter().map(|s| s.id.len()).collect::<Vec<_>>().len(),
+                        "owned": owned.len(),
+                        "plan_spawn": plan.spawn.len(),
+                        "plan_retire": plan.retire.len(),
+                        "plan_focus": plan.focus.is_some(),
+                    }),
+                );
+            }
+        }
         let mut spawned = 0usize;
         let mut retired = 0usize;
         for ses in plan.spawn.iter().take(SPAWN_BUDGET_PER_TICK) {
