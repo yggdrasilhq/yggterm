@@ -277,3 +277,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+#[ignore] // hits the LIVE service on this host — run explicitly: cargo test -p yggterm-core --lib -- --ignored opencode_live
+fn opencode_live_service_fetch() {
+    let home = std::env::var("HOME").expect("HOME is set for a live-service probe");
+    let reg = service_registration(&std::path::PathBuf::from(&home));
+    println!("registration: {:?}", reg.as_ref().map(|r| r.url.clone()));
+    assert!(reg.is_some(), "no service registration — is opencode2 running?");
+    let sessions = active_sessions(&std::path::PathBuf::from(&home));
+    match sessions {
+        Some(list) => {
+            println!("active sessions: {}", list.len());
+            for s in &list {
+                println!("  {} | {:?} | dir {:?}", &s.id[..s.id.len().min(24)], s.title.as_deref().unwrap_or(""), s.directory.as_deref().unwrap_or(""));
+            }
+            assert!(!list.is_empty(), "service reachable but zero active tabs");
+        }
+        None => panic!("active_sessions returned None — fetch failed inside the client (this is the daemon's exact code path)"),
+    }
+}
