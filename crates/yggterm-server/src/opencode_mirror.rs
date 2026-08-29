@@ -194,7 +194,16 @@ impl YggtermServer {
         }
         let mut spawned = 0usize;
         let mut retired = 0usize;
-        for ses in plan.spawn.iter().take(SPAWN_BUDGET_PER_TICK) {
+        // ⛔ ADOPTION IS UNLIMITED; ONLY NEW INSERTS ARE BUDGETED. Daemon
+        // takeovers restore rows WITHOUT their metadata (measured 2026-08-29:
+        // owned fell 4→1 across a takeover), so after every generation the
+        // whole active set re-enters plan.spawn as adoptions. Budgeting them
+        // made post-takeover convergence crawl at one row per tick. Adoption
+        // is metadata-only on rows that already exist — it costs nothing and
+        // must complete in one tick; the budget gates only genuinely NEW
+        // inserts (the cold-trickle guard the budget was written for).
+        let mut insert_budget = SPAWN_BUDGET_PER_TICK;
+        for ses in plan.spawn.iter() {
             // ⛔ SILENT INSERT, never `ensure_remote_runtime_agent_session`:
             // ensure ACTIVATES the row and flips the workspace to Terminal —
             // for a bulk mirror that is an activation and mount storm (4
@@ -206,9 +215,10 @@ impl YggtermServer {
             // (multi-client is opencode2's native design).
             let key = format!("opencode-runtime://{}", ses.id);
             if self.sessions.contains_key(&key) {
-                // Already seeded (an earlier build may have created it without
-                // the stamp) — ADOPT: stamp ownership and the session id so the
-                // next tick recognizes it. Metadata-only, never budgeted.
+                // Already seeded (an earlier build or a pre-takeover
+                // generation may have created it without the stamp) — ADOPT:
+                // stamp ownership and the session id so the next tick
+                // recognizes it. Metadata-only, never budgeted.
                 if let Some(session) = self.sessions.get_mut(&key) {
                     let needs_stamp = !session
                         .metadata
@@ -255,6 +265,10 @@ impl YggtermServer {
                 false,
                 false,
             );
+            if insert_budget == 0 {
+                continue;
+            }
+            insert_budget -= 1;
             if let Some(session) = self.sessions.get_mut(&key) {
                 session.launch_command =
                     crate::remote_persistent_resume_shell_command_with_terminal_appearance(
