@@ -13440,6 +13440,16 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
     let Some(home) = dirs::home_dir() else {
         return Ok(false);
     };
+    // ⛔ A keyed membership index (muse, antigravity, opencode) is the reader
+    // the descriptor itself declares — consult it BEFORE the glob walk. For a
+    // single-DB store the glob roots are EMPTY, so the walk answered `false`
+    // for every id (measured 2026-08-29: a REAL opencode `ses_…` id probed
+    // absent while the service served it). Unreadable store → fail open, the
+    // same choice the declared-gap arm above makes: `false` here false-deaths
+    // a live row, which is the failure this function exists to avoid.
+    if let Some(index) = descriptor.store_membership_index {
+        return Ok(index(&home, session_id).unwrap_or(true));
+    }
     Ok(descriptor
         .store_roots_absolute(&home)
         .iter()

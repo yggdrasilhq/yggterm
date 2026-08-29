@@ -2467,7 +2467,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
-        store_membership_index: None,
+        store_membership_index: Some(opencode_store_index_holds_session),
         live_session_marker: None,
         read_live_store_title: None,
         remote_live_store_title: None,
@@ -4659,6 +4659,43 @@ fn muse_store_index_holds_session(home: &Path, session_id: &str) -> Option<bool>
         .prepare("SELECT 1 FROM sessions WHERE session_id = ?1;")
         .ok()?;
     stmt.exists(rusqlite::params![session_id]).ok()
+}
+
+/// Does opencode's own SQLite store hold `session_id`?
+///
+/// ⛔ Reads `session_v2` FIRST and falls back to the v1-era `session` table:
+/// the v2 preview writes new sessions to `session_v2` and stops writing
+/// `session` (measured 2026-08-29 — `session` held 3 stale rows while the
+/// service served 11, so a `session`-only probe answered "absent" for a REAL
+/// `ses_…` id and a live row was refused as "no longer available on this
+/// machine"). `None` = this host cannot answer (no DB, unreadable) — callers
+/// must never read it as absence.
+pub fn opencode_store_index_holds_session(home: &Path, session_id: &str) -> Option<bool> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let conn = open_cli_index_readonly(&home.join(".local/share/opencode/opencode.db"))?;
+    for table in ["session_v2", "session"] {
+        let present = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()?;
+        if present == 0 {
+            continue;
+        }
+        let sql = format!("SELECT 1 FROM {table} WHERE id = ?1;");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            match stmt.exists(rusqlite::params![session_id]) {
+                Ok(true) => return Some(true),
+                Ok(false) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+    Some(false)
 }
 
 /// Does Antigravity hold `session_id`?
@@ -7528,6 +7565,66 @@ mod tests {
         assert!(!crate::screen_text_shows_agent_question_picker(
             " nothing here is a picker\n"
         ));
+    }
+
+    #[test]
+    fn opencode_index_reads_v2_first_and_never_answers_about_a_blind_table() {
+        let home = std::env::temp_dir().join(format!("ygg-oc-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let oc_dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&oc_dir).unwrap();
+        let conn = rusqlite::Connection::open(oc_dir.join("opencode.db")).unwrap();
+        // The measured 2026-08-29 shape: the v1-era table holds STALE rows and
+        // stops receiving writes once the service migrates to session_v2.
+        conn.execute(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, \
+             time_updated INTEGER, time_created INTEGER);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, title, time_updated, time_created) \
+             VALUES ('ses_v1only0000000000000000000x', '/home/user/proj', 'v1 session', 1, 1);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, \
+             directory TEXT, title TEXT, time_updated INTEGER, time_created INTEGER);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, parent_id, directory, title, time_updated, \
+             time_created) VALUES ('ses_realv2id0000000000000001', 'p1', NULL, \
+             '/home/user/proj', 'v2 session', 1787984001574, 1787937064362);",
+            [],
+        )
+        .unwrap();
+
+        // A real v2 id is FOUND — the defect this locks: the v1-only reader
+        // answered "absent" for ids the service actively served.
+        assert_eq!(
+            opencode_store_index_holds_session(&home, "ses_realv2id0000000000000001"),
+            Some(true)
+        );
+        // A v1-era id is still found through the fallback table.
+        assert_eq!(
+            opencode_store_index_holds_session(&home, "ses_v1only0000000000000000000x"),
+            Some(true)
+        );
+        // A genuinely absent id is a definite no, not unknown.
+        assert_eq!(
+            opencode_store_index_holds_session(&home, "ses_missing000000000000000001x"),
+            Some(false)
+        );
+        // No DB at all → the store cannot answer (never absence).
+        let empty = std::env::temp_dir().join(format!("ygg-oc-idx-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(opencode_store_index_holds_session(&empty, "ses_whatever00000000001"), None);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]

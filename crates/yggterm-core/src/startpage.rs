@@ -344,9 +344,40 @@ fn scan_opencode_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
     ) else {
         return;
     };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT id, directory, title, time_updated, time_created FROM session",
-    ) else {
+    // ⛔ The v2 preview writes NEW sessions to `session_v2` and stops writing
+    // the v1-era `session` table (measured 2026-08-29: `session` held 3 stale
+    // rows while the service served 11 — every yggterm reader of `session`
+    // was blind to 8 of them, and the membership probe answered "absent" for
+    // a REAL `ses_…` id). Read the v2 table first and fall back to the v1
+    // table only when the service has never migrated (an older install).
+    //
+    // v2 timestamp columns are MILLISECONDS since epoch (verified against the
+    // service's own `/api/session` output); the v1 table's are seconds.
+    //
+    // `parent_id` marks CHILD sessions (opencode's sub-agent primitive), not
+    // peer conversations — the durable projection is about resumable peer
+    // sessions, so children are filtered at the reader, never deleted.
+    let has_v2 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_v2'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    let (query, times_are_ms) = if has_v2 {
+        (
+            "SELECT id, directory, title, time_updated, time_created FROM session_v2 \
+             WHERE parent_id IS NULL OR parent_id = ''",
+            true,
+        )
+    } else {
+        (
+            "SELECT id, directory, title, time_updated, time_created FROM session",
+            false,
+        )
+    };
+    let Ok(mut stmt) = conn.prepare(query) else {
         return;
     };
     let Ok(rows) = stmt.query_map([], |row| {
@@ -369,11 +400,18 @@ fn scan_opencode_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
         } else {
             directory.clone()
         };
-        // time_updated/created are seconds since epoch (INTEGER NOT NULL in schema)
         let epoch_ms = if time_updated > 0 {
-            (time_updated as u128) * 1000
+            if times_are_ms {
+                time_updated as u128
+            } else {
+                (time_updated as u128) * 1000
+            }
         } else if time_created > 0 {
-            (time_created as u128) * 1000
+            if times_are_ms {
+                time_created as u128
+            } else {
+                (time_created as u128) * 1000
+            }
         } else {
             0
         };
@@ -1382,6 +1420,73 @@ mod scan_truth_tests {
     /// The in-process net, which does not depend on a clock at all: the titles
     /// sweep writes a title and rescans to verify its own work, and those two
     /// steps can be closer together than any filesystem timestamp resolves.
+    #[test]
+    fn opencode_scan_reads_session_v2_and_skips_child_sessions() {
+        // Regression lock, 2026-08-29: the v2 preview writes new sessions to
+        // `session_v2` and stops writing the v1-era `session` table, so the
+        // v1-only reader served 3 of 11 sessions and the cwd tree lost the
+        // rest. The reader must prefer `session_v2`, read its MILLISECOND
+        // timestamps as ms, and project peer sessions only (`parent_id` marks
+        // opencode's child/sub-agent primitive, not a resumable peer).
+        let home = scratch("opencode-v2-scan");
+        let oc = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&oc).unwrap();
+        let conn = rusqlite::Connection::open(oc.join("opencode.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, \
+             time_updated INTEGER, time_created INTEGER);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, title, time_updated, time_created) VALUES \
+             ('ses_v1legacy0000000000000001', '/home/user/proj', 'legacy', 1700000000, \
+             1699999999);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, \
+             directory TEXT, title TEXT, time_updated INTEGER, time_created INTEGER);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, parent_id, directory, title, time_updated, \
+             time_created) VALUES \
+             ('ses_tab0000000000000000001', 'p1', NULL, '/home/user/proj', \
+             'peer session', 1787984001574, 1787937064362), \
+             ('ses_child00000000000000001', 'p1', 'ses_tab0000000000000000001', \
+             '/home/user/proj', 'child run', 1787984002574, 1787937065362);",
+            [],
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        scan_opencode_sessions(&home, &mut out);
+        let ids: Vec<&str> = out.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"ses_tab0000000000000000001"),
+            "the v2 peer session must be projected, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"ses_child00000000000000001"),
+            "child (sub-agent) sessions are not durable peers"
+        );
+        assert!(
+            !ids.contains(&"ses_v1legacy0000000000000001"),
+            "when session_v2 exists it is the authority; the stale v1 table must not \
+             resurrect rows the service migrated"
+        );
+        // v2 timestamps are MILLISECONDS: recency must not be inflated x1000.
+        let peer = out
+            .iter()
+            .find(|r| r.session_id == "ses_tab0000000000000000001")
+            .unwrap();
+        assert_eq!(peer.modified_epoch_ms, 1787984001574);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn a_title_write_drops_the_memo_in_this_process() {
         let home = scratch("invalidate");
