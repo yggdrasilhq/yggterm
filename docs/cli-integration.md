@@ -836,6 +836,20 @@ held row re-attaches through the resume command — never the resume picker,
 whose keystrokes would drive a running TUI. Regression lock:
 `a_live_runtime_row_cannot_be_refused_on_a_store_absence`.
 
+**Tab mirror LANDED (`df977647d`):** a daemon chore (5 s, service IO outside
+the daemon lock) keeps one yggterm row per OPEN opencode2 tab — keyed
+`opencode-runtime://<ses_id>`, seeded through ensure with the launch line
+`opencode2 --session <ses_id>` (no PTY until opened), seated directly below
+the opencode TUI anchor row, titled from the service's session title.
+Switching tabs in the TUI moves the active row (focus-follow on per-session
+`time.viewed`, gated to fire only while the opencode context is already
+active, so it never yanks the viewport); a closed tab retires its row —
+unless the user opened it, in which case it is a window and closes only when
+the user closes it. The mirror touches only rows it created (`Source:
+opencode-tab-mirror`). Multi-client justification measured: a second
+`opencode2 --session` on a session another TUI had open painted the same
+conversation with no conflict — the service owns state, windows are clients.
+
 **Still open:** the identity rebind (see `pending-bugs.md` [CLI] entry) —
 `id_assigned_at_birth: false` for opencode2 plus store→row mapping through the
 opencode service API. Cold resume of a v2 session cannot work until then, and
