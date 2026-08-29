@@ -2,12 +2,14 @@
 # scripts/deploy-dev.sh — Deterministic dev binary deployment and drift detection.
 #
 # ⛔ WHY THIS EXISTS:
-# During development and active iteration, yggterm has four canonical binary paths
+# During development and active iteration, yggterm has canonical binary paths
 # on every host:
 #   1. ~/.local/bin/yggterm
 #   2. ~/.local/bin/yggterm-headless
-#   3. ~/.yggterm/bin/yggterm
-#   4. ~/.yggterm/bin/yggterm-headless
+#   3. ~/.local/bin/ynpm
+#   4. ~/.yggterm/bin/yggterm
+#   5. ~/.yggterm/bin/yggterm-headless
+#   6. ~/.yggterm/bin/ynpm
 #
 # When developers or agents deploy ad-hoc (e.g. `scp target/release/yggterm host:~/.local/bin/`),
 # they often miss ~/.yggterm/bin or yggterm-headless, or fail to restart the daemon.
@@ -224,8 +226,10 @@ if [ "$CHECK_ONLY" = 1 ]; then
       PATHS=(
         "$HOME/.local/bin/yggterm"
         "$HOME/.local/bin/yggterm-headless"
+        "$HOME/.local/bin/ynpm"
         "$HOME/.yggterm/bin/yggterm"
         "$HOME/.yggterm/bin/yggterm-headless"
+        "$HOME/.yggterm/bin/ynpm"
       )
       DRIFT=0
       for p in "${PATHS[@]}"; do
@@ -253,6 +257,12 @@ if [ "$CHECK_ONLY" = 1 ]; then
           DRIFT=1
         fi
       fi
+      if [ -n "${HASHES[$HOME/.local/bin/ynpm]:-}" ] && [ -n "${HASHES[$HOME/.yggterm/bin/ynpm]:-}" ]; then
+        if [ "${HASHES[$HOME/.local/bin/ynpm]}" != "${HASHES[$HOME/.yggterm/bin/ynpm]}" ]; then
+          echo "  ⛔ DRIFT: ~/.local/bin/ynpm and ~/.yggterm/bin/ynpm binary hashes differ!"
+          DRIFT=1
+        fi
+      fi
       if [ -x "$HOME/.yggterm/bin/yggterm-headless" ]; then
         echo "  [running daemons]"
         "$HOME/.yggterm/bin/yggterm-headless" server daemons 2>/dev/null | sed "s/^/    /" || echo "    <none>"
@@ -276,18 +286,19 @@ fi
 
 # Build step if requested
 if [ "$DO_BUILD" = 1 ]; then
-  log "building $BUILD_PROFILE binaries: yggterm, yggterm-headless..."
+  log "building $BUILD_PROFILE binaries: yggterm, yggterm-headless, ynpm..."
   if [ "$BUILD_PROFILE" = "release" ]; then
-    cargo build --release --bin yggterm --bin yggterm-headless
+    cargo build --release --bin yggterm --bin yggterm-headless --bin ynpm
   else
-    cargo build --bin yggterm --bin yggterm-headless
+    cargo build --bin yggterm --bin yggterm-headless --bin ynpm
   fi
 fi
 
 GUI_SRC="$FROM/yggterm"
 HL_SRC="$FROM/yggterm-headless"
+YNPM_SRC="$FROM/ynpm"
 
-for f in "$GUI_SRC" "$HL_SRC"; do
+for f in "$GUI_SRC" "$HL_SRC" "$YNPM_SRC"; do
   if [ ! -x "$f" ]; then
     err "missing executable build product: $f (run with --build or cargo build --$BUILD_PROFILE)"
     exit 1
@@ -296,13 +307,15 @@ done
 
 GUI_VER=$("$GUI_SRC" --version 2>/dev/null || echo "unknown")
 HL_VER=$("$HL_SRC" --version 2>/dev/null || echo "unknown")
-if [ "$GUI_VER" != "$HL_VER" ]; then
-  err "binary version mismatch: yggterm=$GUI_VER vs yggterm-headless=$HL_VER"
+YNPM_VER=$("$YNPM_SRC" --version 2>/dev/null || echo "unknown")
+if [ "$GUI_VER" != "$HL_VER" ] || [ "$GUI_VER" != "$YNPM_VER" ]; then
+  err "binary version mismatch: yggterm=$GUI_VER vs yggterm-headless=$HL_VER vs ynpm=$YNPM_VER"
   exit 1
 fi
 
 GUI_MD5=$(md5sum "$GUI_SRC" | awk '{print $1}')
 HL_MD5=$(md5sum "$HL_SRC" | awk '{print $1}')
+YNPM_MD5=$(md5sum "$YNPM_SRC" | awk '{print $1}')
 BUILD_COMMIT="unknown"
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
   BUILD_COMMIT=$(git -C "$REPO" rev-parse --short=12 HEAD)
@@ -314,6 +327,7 @@ fi
 log "source build: $GUI_VER (commit: $BUILD_COMMIT)"
 log "  yggterm:          md5 ${GUI_MD5:0:12}... ($GUI_SRC)"
 log "  yggterm-headless: md5 ${HL_MD5:0:12}... ($HL_SRC)"
+log "  ynpm:             md5 ${YNPM_MD5:0:12}... ($YNPM_SRC)"
 log "deploying to ${#HOSTS[@]} host(s): ${HOSTS[*]}"
 
 push_binary() {
@@ -354,6 +368,8 @@ for host in "${HOSTS[@]}"; do
   push_binary "$host" "$HL_SRC" "\$HOME/.local/bin/yggterm-headless" "$HL_MD5" || DEPLOY_FAILED=1
   push_binary "$host" "$GUI_SRC" "\$HOME/.yggterm/bin/yggterm" "$GUI_MD5" || DEPLOY_FAILED=1
   push_binary "$host" "$HL_SRC" "\$HOME/.yggterm/bin/yggterm-headless" "$HL_MD5" || DEPLOY_FAILED=1
+  push_binary "$host" "$YNPM_SRC" "\$HOME/.local/bin/ynpm" "$YNPM_MD5" || DEPLOY_FAILED=1
+  push_binary "$host" "$YNPM_SRC" "\$HOME/.yggterm/bin/ynpm" "$YNPM_MD5" || DEPLOY_FAILED=1
 
   # Convergence / stack restart
   if [ "$RESTART" = 1 ] && [ "$DEPLOY_FAILED" = 0 ]; then

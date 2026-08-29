@@ -7339,6 +7339,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ynpm"
+version = "3.2.19"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

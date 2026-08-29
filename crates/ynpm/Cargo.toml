@@ -1,0 +1,21 @@
+[package]
+name = "ynpm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+# The yggdrasilhq package manager. Deliberately a SEPARATE binary and not a
+# `yggterm server` verb: it must run on every fleet host (including hosts with
+# no daemon and no GUI), from a shell, before yggterm itself may even be
+# installed - which is exactly what an in-app verb cannot do. See
+# docs/ynpm.md for the contract.
+[[bin]]
+name = "ynpm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
