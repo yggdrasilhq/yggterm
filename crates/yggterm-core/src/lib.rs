@@ -5,6 +5,7 @@ pub mod app_registry;
 /// `New {Machine} {Thing}` — the birth-title convention, in ONE place because
 /// it was in two and an app spawn silently missed the builder.
 pub mod birth_title;
+pub mod opencode_service;
 mod browser;
 // Bringing a decade of history OUT of the browsers that hold it: Chromium's
 // `History`/`Bookmarks` and Firefox's `places.sqlite`, in-process through
