@@ -1,6 +1,6 @@
 ---
 name: yggterm-agent-fleet
-description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign (§1), before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before trusting any row-management verb's own success field (§7), before HANDING OFF a campaign to a successor (§8 — the baton relay, and how to write the brief), before messaging another campaign or recovering a stalled one (§9 — cross-talk and the single `continue`), and before driving a row that is not answering (§11 — the PER-CLI NUANCES register, one subsection per agent CLI, covering the startup gates and menus that hold a row before its composer). ⛔ §11 is written to GROW: hitting an undocumented CLI quirk obliges you to append it there in the same session, because a session's discipline resets at every launch and the register's does not.
+description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, to build through the fleet's single-build plane (ygg-ci) instead of per-worktree `cargo build`, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign (§1), before building any gitcoding project (ygg-ci §3c — the single integration build on dev), before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before trusting any row-management verb's own success field (§7), before HANDING OFF a campaign to a successor (§8 — the baton relay, and how to write the brief), before messaging another campaign or recovering a stalled one (§9 — cross-talk and the single `continue`), and before driving a row that is not answering (§11 — the PER-CLI NUANCES register, one subsection per agent CLI, covering the startup gates and menus that hold a row before its composer). ⛔ §11 is written to GROW: hitting an undocumented CLI quirk obliges you to append it there in the same session, because a session's discipline resets at every launch and the register's does not.
 ---
 
 # You are running inside yggterm. Here is what that gives you.
@@ -19,6 +19,29 @@ this skill is the contract for all four:
 ⚠ **These are load-bearing for long work.** A campaign that outlives one context
 window survives only by handing itself off — and a handoff that is not VERIFIED
 is a campaign that silently stops. That has happened; §3 exists because of it.
+
+### Fleet skill classes — base vs gated
+
+Not every verb in this skill is for every turn. Four planes are **gated** and
+only run when the user tells you to, or when `msgGraph`/`MEMORY.md` makes it
+obvious a campaign needs them:
+
+| gated plane | when it runs |
+|---|---|
+| **orchestrator** (§10) | a wave of parallel lanes, clustered by locality, explicitly scoped |
+| **row claiming** (§1 `ygg-claim.sh`) | the first act of a relay/succeed, or when a fresh row must be named |
+| **relay** (§8) | a campaign hands itself off to a successor |
+| **sub-session / delegate spawn** (§3) | you own the work and are fanning it out |
+
+Everything else in this skill is **base** and every agent is expected to know
+it without being told: `ygg-babysit.py` / `ygg-booter.py` / `ygg-monitor.py`
+for liveness, `ygg-memory` for cross-harness memory, `ygg-board`/`msgGraph`
+for fleet talk, **`ygg-ci.py` for building** (§3c — the single fleet build
+plane), and the row verbs `server app rows` / `server app terminal` for
+addressing. **Any gitcoding project (cargo, npm, make) should build through
+`ygg-ci`, not with a bare `cargo build` in a worktree** — per-worktree builds
+collide on `target/`, trip the deploy lease, and replace the daemon other
+agents are testing (see §3c).
 
 ---
 
@@ -983,6 +1006,71 @@ claim was derived FROM before you let it raise your confidence.
 
 ⚖ **Whose job:** the session that SPAWNED it. Not the delegate — it cannot reap itself after its
 last turn — and not the next human to notice.
+
+## 3c. ygg-ci — the fleet SINGLE-BUILD plane (like booter/monitor)
+
+`ygg-ci.py` is the detached build watcher, same shape as `ygg-booter.py` and
+`ygg-monitor.py`: a subscription lives outside the session that asked for it,
+and a timer on `dev` wakes it without burning a core.
+
+**Why not `cargo build` in your worktree.** `yggterm` is a GUI + daemon that
+*replaces* the fleet's running binaries (6 paths on 3 hosts, `deploy-spec.md`
+§0–§4). Two worktrees building in parallel interleave `target/` artefacts,
+fight over the deploy lease (`scripts/deploy-fleet.sh` §lease), and replace the
+daemon other agents are testing — measured 2026-08-27: a stale checkout wrote
+`3.1.60` over `3.1.61` fleet-wide with four green ✅. **A per-worktree build is
+the per-session watchdog that can only watch itself — dead in the case that
+matters.** `ygg-ci` fixes it by collapsing `N` lanes into **one integration
+build on one host**.
+
+| fact | law |
+|---|---|
+| **Auto host is `dev`** | all ci builds run on `dev`, by tune default. Other hosts subscribe over `ssh dev`. |
+| **One build, many testers** | the watcher merges `origin/main` + every subscribed `lane/*` into an ephemeral worktree under `~/.yggterm/scratchpad/ci`, `cargo build --release` once, then `scripts/deploy-fleet.sh` (the same script a human uses, which proves identity via `md5sum /proc/<pid>/exe` and converges the fleet) — so one artefact is tested by every agent that enrolled. |
+| **Fleet-aware** | `deploy-fleet.sh` already sweeps `dev + $(ygg-live-host.sh) + oc`, verifies read-back checksums, and holds the deploy lease. `ygg-ci` just calls it; no second deploy path. |
+| **Timer, not a burn** | `watch` sleeps `interval` (default `300s`, tunable per project) and each `tick` does `fetch + stat` only; a clean tick costs no build. `subscribe` auto-spawns the watcher if none is alive — same arm shape as booter `ygg-booter.py:80`. |
+| **Any gitcoding project** | project recipe lives in `~/.yggterm/relay/ci/ci.json` (`repo`, `build`, `deploy`, `interval`, `host`). An agent tunes it in place; the watcher picks it up next tick. `yggterm` is the default recipe; `make`, `npm run build`, or any shell command works for other repos. |
+| **Subscribe = next build** | when the service is present, other agents can subscribe to it. An agent asks it to take their commits on the next run; the watcher aggregates on the next `tick`. |
+
+```sh
+# enroll your lane — do this AFTER pushing the lane branch
+ygg-ci.py subscribe --lane lane/foo/bar --project yggterm
+# or: ssh dev ygg-ci.py subscribe --lane lane/foo/bar --project yggterm
+
+ygg-ci.py list --project yggterm          # who is enrolled
+ygg-ci.py status --json                   # watcher alive? held? last build?
+ygg-ci.py tick --project yggterm --dry-run  # what WOULD merge (no build)
+ygg-ci.py tick --project yggterm          # one integration pass now
+ygg-ci.py unsubscribe --lane lane/foo/bar --project yggterm  # when done
+
+# tune how a project builds — any agent can do this, it lands for everyone
+ygg-ci.py tune --project yggterm --interval 300 --build "cargo build --release" --deploy "scripts/deploy-fleet.sh" --repo ~/gh/yggterm
+ygg-ci.py tune --project myapp --repo ~/gh/myapp --build "npm run build" --deploy "" --interval 600
+ygg-ci.py config --project yggterm --json
+
+# the OFF switches — same shape as booter
+ygg-ci.py disarm --hours 4 --note "red main"   # keep subs, refuse to build
+ygg-ci.py arm
+ygg-ci.py hold --until 2h --reason "main is red"  # fleet-wide build hold
+ygg-ci.py hold --clear
+```
+
+**Tuning.** `tune` writes `~/.yggterm/relay/ci/ci.json`. A per-repo `.ygg-ci.json`
+is also honoured if present. The interval is read fresh each loop so a retune
+needs no watcher restart. `DEFAULT_INTERVAL=300` — same reason booter is `300`:
+the cache-burning cost is in the *build*, not the poll.
+
+**When NOT to use it.** A pure one-off probe (`cargo test --lib foo`) stays
+local. Anything that would replace `~/.local/bin/yggterm*`, the daemon, or be
+tested by more than one agent goes through `ygg-ci`.
+
+**Contracts (yggterm):**
+- The checkout must be a descendant of `origin/main` (`deploy-fleet.sh` refuses otherwise).
+- `integration` is *ephemeral* — never pushed, never landed. Lanes land via
+  `ship`/merge queue on `main`; ci auto-unsubscribes lanes already in `main`.
+- Build artefacts stay under the scratch worktree's `target/`; no `/tmp` (RAM tmpfs) per `AGENTS.md`.
+- A conflict excludes only that lane and is reported in the build record
+  (`~/.yggterm/relay/ci/builds/<id>.json`) and in `status`.
 
 ## 4. Correspondence — any session can reach any other
 
