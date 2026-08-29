@@ -2,10 +2,9 @@
 
 Generated with `cargo license --avoid-dev-deps`. **Regenerate when `Cargo.lock` changes.**
 
-yggterm is **GPL-3.0-or-later**. The question this manifest answers is therefore
-*"is anything here GPL-INCOMPATIBLE?"* — not *"is there any copyleft?"*, which is
-what it answered ***. Copyleft dependencies are
-permitted now; only incompatible licences are not.
+yggterm is **GPL-3.0-or-later**. The question this manifest answers is
+*"is anything here GPL-INCOMPATIBLE?"* — copyleft dependencies are permitted;
+only incompatible licences are defects.
 
 **Last audited 2026-08-02: no GPL-incompatible licence in the tree**, across
 680 crates. Nothing under CDDL, EPL, SSPL, BUSL, Commons Clause, AGPL,
