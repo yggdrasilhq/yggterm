@@ -214,10 +214,14 @@ pub fn send_prompt(home: &PathBuf, session_id: &str, text: &str) -> bool {
     let Some(registration) = service_registration(home) else {
         return false;
     };
+    // ⛔ Body shape is BUILD-specific: the installed beta-18684 wants
+    // `{"text": …}` at the TOP level (verified live 2026-08-29 — the nested
+    // `{"prompt": {…}}` from the repo's openapi revision 400s with
+    // `Missing key at ["text"]`). 200 returns the created user message.
     service_post(
         &registration,
         &format!("/api/session/{session_id}/prompt"),
-        &serde_json::json!({ "prompt": { "text": text } }),
+        &serde_json::json!({ "text": text }),
     )
 }
 
