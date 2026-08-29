@@ -68,6 +68,44 @@ switch-back). Residual, not fixed here: the strict fast-ready itself still
 waits on the manifest for a genuinely cold first mount — the felt first-open
 latency is unchanged, only the permanent cold-remount tax is gone.
 
+## ⛔ [11.33] USING YCHROME, THE VIEWPORT YANKS TO A TERMINAL SHOWING A CLIPBOARD IMAGE PATH — TWO MACHINES, BOTH SEAMS FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED (this commit). Falsifier: while a
+web surface is up and an image is on the clipboard, a paste addressed to that
+surface must NOT stage a PNG nor write a path into any terminal — no
+`clipboard_paste_image` telemetry for a paste whose event target is outside
+the terminal host; and no `session/activation` with
+`origin_site attach_seed_remote_snapshot` may change the GUI's adopted active
+session after a user click.
+
+**Machine A — cross-surface paste theft (shell JS).** The terminal pane's
+clipboard handler was registered at `window`, `host`, AND `document` level,
+all capture-phase, so it heard every paste in the UI. Its
+`pasteEventBelongsToTerminal` guard then accepted a paste whose
+`document.activeElement` still named the terminal's helper textarea — but
+right-click "copy image" on a web surface never moves focus, so the stale
+focus check passed for a paste the user was spending on ychrome. With an image
+on the clipboard, the flow staged a PNG into `~/.yggterm/clipboard/` and typed
+its path into the terminal session, with `focusTerminal()` retries stealing
+focus back — the owner's felt "viewport switches to terminal view showing
+`clipboard-….png` while I am using ychrome" (measured 2026-08-29 14:56:16,
+`clipboard_paste_image` telemetry, exact path). Fix: a paste whose event
+target lies outside the terminal host is never the terminal's — only a
+targetless paste falls back to the focus heuristics. Locked by the source-lock
+addition in the paste-guard test.
+
+**Machine B — the daemon-side attach seed yanked the viewport back after the
+user's own click (daemon).** `attach_terminal_ensure` with
+`seed_remote_snapshot` called the ACTIVATING launch
+(`ActivationOrigin::app_control("attach_seed_remote_snapshot")`), re-pointing
+the daemon's active session; the GUI adopt path followed it. Measured in the
+same window: the owner clicked to another row at 14:56:41 and the seed
+yanked the active session to `remote-session://dev/51608076…` at 14:56:43.953
+— and it re-asserted on every attach (14:47:23, 14:49:38, 14:54:18). Fix: the
+attach seed always uses `request_terminal_launch_for_path_preserving_active`
+— runtime plumbing must not move the active session; the user's own click
+already supplied the activation.
+
 ## ⛔ [11.32] A REMOTE ROW'S SCREEN READ ANSWERS "EMPTY" FROM THE LOCAL DAEMON — THE CLIENT BACKS OFF 2.5s→5s AND THE ROW SITS BLANK AND INPUT-GATED FOR 10+ SECONDS
 
 **Status:** OPEN (empty-screen-read half). The watchdog-remount half of this

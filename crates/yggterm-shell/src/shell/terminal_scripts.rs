@@ -9176,6 +9176,22 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (target && host.contains(target)) {{
                     return true;
                 }}
+                // ⛔ A PASTE ADDRESSED ELSEWHERE IS NEVER THE TERMINAL'S — even
+                // when a stale document.activeElement still names the helper
+                // textarea. Right-click "copy image" on a web surface never
+                // moves focus, so the next Ctrl+V the user spends on that
+                // surface dispatched here with the terminal textarea still
+                // nominally focused; this handler claimed it (capture phase),
+                // staged the clipboard IMAGE, and typed its path into the
+                // session — the felt "viewport yanked to a terminal showing a
+                // clipboard path while I was using ychrome" (measured
+                // 2026-08-29 14:56). If the event carries a resolvable target
+                // outside this host, it belongs to that surface; only a
+                // targetless paste (nothing focused) may fall back to the
+                // focus heuristics below.
+                if (target) {{
+                    return false;
+                }}
                 if (helperTextarea && active === helperTextarea) {{
                     return true;
                 }}

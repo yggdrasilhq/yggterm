@@ -8878,15 +8878,18 @@ impl DaemonRuntime {
                 "attach",
                 "request_terminal_launch",
             );
-            if seed_remote_snapshot {
-                self.server.request_terminal_launch_for_path(
-                    path,
-                    ActivationOrigin::app_control("attach_seed_remote_snapshot"),
-                );
-            } else {
-                self.server
-                    .request_terminal_launch_for_path_preserving_active(path);
-            }
+            // ⛔ AN ATTACH SEED IS RUNTIME PLUMBING, NOT USER INTENT — it must
+            // never move the active session. Measured 2026-08-29 14:56 on the
+            // GUI host: the seed's activating launch re-pointed the daemon's
+            // active session 2.5 s AFTER the user had clicked another row, and
+            // the GUI adopt path yanked the viewport with it — repeatedly, on
+            // every attach (origin_site attach_seed_remote_snapshot). The
+            // seed's job is to prepare the runtime; the user's own click (or
+            // handoff gesture) already supplied the activation, and the GUI
+            // adopt path must follow the user, not the attach order. Always
+            // preserve the active session here.
+            self.server
+                .request_terminal_launch_for_path_preserving_active(path);
         }
         let runtime_path = self.terminal_runtime_key_for_path(path);
         let preserved_owner_status = self

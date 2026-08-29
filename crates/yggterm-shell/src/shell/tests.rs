@@ -20336,6 +20336,13 @@ console.log('ok');
             script.contains("if (!event || !inputEnabled || !hostOwnsActiveTerminalInput()) {")
         );
         assert!(script.contains("if (target && host.contains(target)) {"));
+        assert!(
+            script.contains("A PASTE ADDRESSED ELSEWHERE IS NEVER THE TERMINAL'S")
+                && script.contains("if (target) {"),
+            "a paste whose event target lies outside this terminal host belongs to \
+             that surface — the stale-activeElement fallback must not claim \
+             cross-surface pastes (the clipboard-image viewport yank)"
+        );
         assert!(script.contains("if (!pasteEventBelongsToTerminal(event)) {"));
         assert!(script.contains("const stopTerminalClipboardEvent = (event) => {"));
         assert!(script.contains("const clipboardPasteEventSummary = (event) => {"));
