@@ -41,6 +41,19 @@ sweep skips/retracts the missing-mark for live rows, with the regression lock
 (`resume-<slug>`) already had the live-first arm; only the probe-first callers
 were broken.
 
+**Second half landed 2026-08-29 (`62ec8286`), after the restart cascade turned
+every opencode row cold:** for a SELF-MINTING kind (`id_assigned_at_birth:
+false` — codex, codex-litellm, opencode, muse, antigravity) an absent probe
+now opens the CLI's OWN resume picker, in the wrapper AND the ensure lane, and
+the sweep never marks these kinds missing (stale marks are retracted). The
+refusal was provably a lie for them — the store is keyed by ids the CLI minted,
+and the v2 scanner cannot even read the schema (a REAL `ses_…` id probes
+absent, measured). Birth-id kinds (claude-code, pi, kimi, qwen, grok) keep the
+refusal: their stores ARE keyed by the row id, so absence is real. Regression
+lock: `self_minting_clis_open_the_picker_on_absence_and_birth_id_clis_refuse`.
+Live-verified: the previously dead row now boots to opencode2's own TUI with
+its recent sessions in its tab bar.
+
 **What remains open (this entry):** the identity rebind. opencode2 must be
 declared self-minting (`id_assigned_at_birth: false`) and the runtime-identity
 rebind (the Issue 16 machinery, fleet-wide since the muse/antigravity fixes)
