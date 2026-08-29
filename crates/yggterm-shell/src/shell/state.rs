@@ -28239,21 +28239,55 @@ impl ShellState {
         else {
             return false;
         };
-        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
-            return false;
-        };
         // Only an attempt that is still WAITING may be cancelled. One that
         // already reached ready, already latched a failure, or was already
         // cancelled has an outcome, and an outcome has exactly one owner.
-        if attempt.latched_failure_reason.is_some()
-            || attempt.ready_at_ms.is_some()
-            || !matches!(
-                attempt.state,
-                TerminalOpenAttemptState::Pending | TerminalOpenAttemptState::Recovering
-            )
-        {
+        let waiting = self
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .is_some_and(|attempt| {
+                attempt.latched_failure_reason.is_none()
+                    && attempt.ready_at_ms.is_none()
+                    && matches!(
+                        attempt.state,
+                        TerminalOpenAttemptState::Pending | TerminalOpenAttemptState::Recovering
+                    )
+            });
+        if !waiting {
             return false;
         }
+        // ⛔ THE HOST MAY ALREADY BE LIVE. The skip that leads here means the
+        // session lost active — not that its mount failed. Measured on the GUI
+        // host 2026-08-29 11:06: an attempt whose mount_open had succeeded ~400 ms
+        // in and whose daemon forward was already streaming meaningful output
+        // sat Pending (the strict fast-ready refused on a stale runtime-status
+        // manifest), then was cancelled here 16 s later — destroying the ready
+        // proof. `was_ever_ready` stayed false forever, `is_retained_live`
+        // clause C stayed dead, and EVERY switch-back to the session
+        // cold-remounted (bootstrap_reset + full xterm rebuild + backlog
+        // replay, ~200-400 ms of UI-thread stall each); clicks around a sticky
+        // UI compounded that into the UI-block storm. Daemon-forwarded
+        // meaningful output is not an observer's guess about the PTY — it is
+        // the PTY's own bytes arriving through the owning daemon's forward.
+        // With the host record still present, latch ready instead of
+        // cancelling: the reveal the attempt was waiting for already
+        // happened. Returning false is honest — the attempt was not
+        // cancelled; the "ready" attempt event + the reveal outcome carry the
+        // resolution.
+        let saw_live_host_output = self
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .is_some_and(|attempt| attempt.first_meaningful_output_at_ms.is_some());
+        if saw_live_host_output && self.terminal_session_host_id(session_path).is_some() {
+            self.mark_terminal_open_attempt_ready_for_session(
+                session_path,
+                "ready_on_inactive_cancel_host_already_live",
+            );
+            return false;
+        }
+        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
+            return false;
+        };
         attempt.latched_failure_at_ms = Some(current_millis());
         attempt.latched_failure_reason = Some(reason.to_string());
         attempt.state = TerminalOpenAttemptState::Cancelled;
