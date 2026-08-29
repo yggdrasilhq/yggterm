@@ -756,6 +756,37 @@ impl DesktopService {
         }
     }
 
+    /// Surface `id`'s page icon, as the engine's own favicon database serves
+    /// it (PNG bytes), or `None` while the database has nothing — and on
+    /// platforms without the native web-surface host, always. The first poll
+    /// for a page URI kicks an async answer; see
+    /// [`crate::web_surface::WebSurfaceHost::page_favicon`].
+    pub fn web_surface_page_favicon(&self, id: u64) -> Option<Vec<u8>> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .and_then(|host| host.page_favicon(id));
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
     /// Drain the popups pages opened from inside surfaces (a link
     /// middle-clicked, ctrl-clicked, `target="_blank"`, or `window.open`).
     ///

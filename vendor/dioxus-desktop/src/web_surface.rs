@@ -1956,6 +1956,27 @@ pub struct WebSurfaceHost {
     /// holds them (see `prune_contexts`) — the last surface leaving still tears
     /// the context down, exactly as before, just no longer the only surface.
     contexts: Rc<RefCell<HashMap<String, Rc<RefCell<WebContext>>>>>,
+    /// Per-surface page icons, as the engine's own favicon database last
+    /// served them: PNG bytes, or `None` once a request was made and the
+    /// database had nothing yet. Written by the async `get_favicon` callback
+    /// and the `favicon-changed` bell; read by `page_favicon` per reconcile
+    /// tick. The database is per CONTEXT (per profile jar), so what lands
+    /// here is the profile's own store answering — never a fetch the shell
+    /// invented.
+    favicon_pngs: Rc<RefCell<HashMap<u64, Option<Vec<u8>>>>>,
+    /// The page URI each surface's CURRENT favicon request was made for. The
+    /// re-arm vocabulary: an entry differing from the surface's live URI (or
+    /// missing) means the next `page_favicon` poll kicks a fresh request, and
+    /// the `favicon-changed` bell clears entries so a changed answer is
+    /// re-asked. Also the STALENESS CHECK the callback reads: an answer for a
+    /// URI the surface has since left is dropped.
+    favicon_requests: Rc<RefCell<HashMap<u64, String>>>,
+    /// Engine contexts whose favicon database has its `favicon-changed` bell
+    /// wired. One handler per CONTEXT (the database object is per context and
+    /// dies with it), keyed by `web_context_key`; `prune_contexts` forgets a
+    /// key when its context dies so a future context for the same jar wires a
+    /// fresh bell instead of trusting a dead handler.
+    favicon_wired: RefCell<std::collections::HashSet<String>>,
     /// Native surface ids. The HOST allocates them, because it is no longer the
     /// only thing that creates surfaces: a popup is born inside a WebKit signal
     /// handler, and two allocators would eventually hand out the same id.
@@ -4473,6 +4494,9 @@ impl WebSurfaceHost {
             last_glass_holes: RefCell::new(None),
             surfaces: Rc::new(RefCell::new(HashMap::new())),
             contexts: Rc::new(RefCell::new(HashMap::new())),
+            favicon_pngs: Rc::new(RefCell::new(HashMap::new())),
+            favicon_requests: Rc::new(RefCell::new(HashMap::new())),
+            favicon_wired: RefCell::new(std::collections::HashSet::new()),
             next_id: Rc::new(Cell::new(1)),
             popups: Rc::new(RefCell::new(Vec::new())),
             trace_batches: Rc::new(RefCell::new(Vec::new())),
@@ -4511,6 +4535,101 @@ impl WebSurfaceHost {
 
     /// Surface `id`'s last-reported page theme color as CSS text, if the page
     /// has declared or painted one yet.
+    /// Surface `id`'s page icon, as the engine's own favicon database last
+    /// served it: PNG bytes, or `None` while the database has nothing to
+    /// serve. The DATABASE is the source — per context, i.e. per profile jar,
+    /// on disk — never a fetch this layer invented, so an ephemeral (temporary
+    /// profile) surface reads `None` forever: a private window keeps no
+    /// icons, exactly like every browser.
+    ///
+    /// ASYNC BY NECESSITY: `get_favicon` answers on a callback the database
+    /// schedules, so the shell polls here per reconcile tick and the first
+    /// poll for a page URI KICKS the request, reporting `None` until the
+    /// callback lands — an icon appears a tick or two after the database has
+    /// one. A URI change re-arms; a load finishing re-arms through the
+    /// `favicon-changed` bell (wired once per context in `open`), which is
+    /// when an icon normally first exists.
+    pub fn page_favicon(&self, id: u64) -> Option<Vec<u8>> {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        let page_uri = self
+            .surfaces
+            .borrow()
+            .get(&id)
+            .and_then(|surface| surface.webview.webview().uri().map(|uri| uri.to_string()))?;
+        if page_uri.is_empty() {
+            return None;
+        }
+        let needs_request = {
+            let mut requests = self.favicon_requests.borrow_mut();
+            match requests.get(&id) {
+                Some(requested) if requested == &page_uri => false,
+                _ => {
+                    requests.insert(id, page_uri.clone());
+                    true
+                }
+            }
+        };
+        if needs_request {
+            // Parked at `None` for the re-armed URI: whatever the previous
+            // page's icon was must not ride under a URI it does not belong to.
+            self.favicon_pngs.borrow_mut().insert(id, None);
+            self.request_page_favicon(id, &page_uri);
+        }
+        self.favicon_pngs.borrow().get(&id).cloned().flatten()
+    }
+
+    /// Kick ONE async `get_favicon` for surface `id` at `page_uri`. The
+    /// callback writes the PNG bytes back only if the surface is still asking
+    /// for this URI; the `favicon-changed` bell owns everything after that.
+    fn request_page_favicon(&self, id: u64, page_uri: &str) {
+        use webkit2gtk::{FaviconDatabaseExt as _, WebContextExt as _, WebViewExt as _};
+        use wry::WebViewExtUnix as _;
+        let surfaces = self.surfaces.borrow();
+        let Some(surface) = surfaces.get(&id) else {
+            return;
+        };
+        let Some(database) = surface
+            .webview
+            .webview()
+            .context()
+            .and_then(|context| context.favicon_database())
+        else {
+            // No database: the ephemeral-context case. Nothing to ask, ever.
+            return;
+        };
+        drop(surfaces);
+
+        let pngs = self.favicon_pngs.clone();
+        let requests = self.favicon_requests.clone();
+        let uri = page_uri.to_string();
+        // The call takes a borrow, the closure takes the string by move —
+        // two claims on one binding cannot share a call expression, so the
+        // call borrows a temporary copy that dies when the call returns.
+        let uri_for_call = uri.clone();
+        database.favicon(
+            uri_for_call.as_str(),
+            None::<&gtk::gio::Cancellable>,
+            move |answer| {
+                let Ok(icon) = answer else {
+                    // "No entry yet" is the common case mid-load; the bell
+                    // re-arms when the database grows one.
+                    return;
+                };
+                let mut png = Vec::new();
+                if icon.write_to_png(&mut png).is_err() {
+                    return;
+                }
+                // The surface moved on since the request: the answer is for a
+                // page nobody is asking about any more.
+                if requests.borrow().get(&id).map(String::as_str) != Some(uri.as_str()) {
+                    return;
+                }
+                pngs.borrow_mut().insert(id, Some(png));
+            },
+        );
+    }
+
     pub fn page_theme_color(&self, id: u64) -> Option<String> {
         self.theme_colors.borrow().get(&id).cloned()
     }
@@ -5341,6 +5460,46 @@ impl WebSurfaceHost {
             // reconciler gives that surface the whole window.
             connect_fullscreen_signals(&webview.webview(), id, &self.fullscreen);
         }
+        // THE FAVICON DATABASE'S CHANGE BELL — wired ONCE PER ENGINE CONTEXT,
+        // the first time that context gains a surface here. When the
+        // database's answer for a page changes (an icon arriving after the
+        // load, or changing later), WebKit emits `favicon-changed`; the bell
+        // re-arms every surface whose CURRENT request names that page, so the
+        // next reconcile tick re-asks the database instead of caching "no
+        // icon yet" forever — without it, a FIRST visit to a site would never
+        // grow its icon at all, because during the load the database has no
+        // entry and nothing after the load would re-ask.
+        {
+            use webkit2gtk::{FaviconDatabaseExt as _, WebContextExt as _, WebViewExt as _};
+            use wry::WebViewExtUnix as _;
+            if let Some(key) = ctx_key.as_ref() {
+                let wired = self.favicon_wired.borrow().contains(key.as_str());
+                let database = webview
+                    .webview()
+                    .context()
+                    .and_then(|context| context.favicon_database());
+                if !wired && database.is_some() {
+                    let database = database.unwrap();
+                    let pngs = self.favicon_pngs.clone();
+                    let requests = self.favicon_requests.clone();
+                    database.connect_favicon_changed(move |_db, page_uri, _origin| {
+                        let page_uri = page_uri.to_string();
+                        let mut requests = requests.borrow_mut();
+                        for (surface_id, requested) in requests.iter_mut() {
+                            if requested == &page_uri {
+                                // Re-arm: the empty string can never match a
+                                // polled URI, so the next `page_favicon` poll
+                                // sees a difference and asks the database
+                                // again.
+                                requested.clear();
+                                pngs.borrow_mut().remove(surface_id);
+                            }
+                        }
+                    });
+                    self.favicon_wired.borrow_mut().insert(key.clone());
+                }
+            }
+        }
         // `window.close()`: the page's report (the engine will not tell us) plus
         // the native signal in case it ever does. What the shell DOES with it is
         // the shell's call — a normal tab may not close itself.
@@ -5407,6 +5566,12 @@ impl WebSurfaceHost {
     /// takes an engine that is about to be wanted again.
     pub fn prune_contexts(&self) {
         retain_held_contexts(&mut self.contexts.borrow_mut());
+        // A context's favicon bell dies with the context. Forget the key now,
+        // so a future context for the same jar wires a fresh bell instead of
+        // this set silently claiming one is already wired.
+        self.favicon_wired
+            .borrow_mut()
+            .retain(|key| self.contexts.borrow().contains_key(key));
     }
 
     /// How many distinct `WebContext`s are alive right now.

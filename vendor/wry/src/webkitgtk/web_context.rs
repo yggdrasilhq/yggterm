@@ -51,6 +51,20 @@ impl WebContextImpl {
     if let Some(cache_model) = configured_cache_model() {
       context.set_cache_model(cache_model);
     }
+    if let Some(data_directory) = data_directory {
+      // THE FAVICON DATABASE. WebKitGTK creates none unless a directory was
+      // configured on the context, so a persistent profile opts in here and
+      // an ephemeral context (new_ephemeral, which never runs this) keeps
+      // none — a private window keeps no icons, exactly like every browser.
+      // Must be set BEFORE the context's first webview is created, which
+      // this is; the engine reads icons back through `favicon_database()`.
+      let favicon_dir = data_directory
+        .join("favicons")
+        .to_string_lossy()
+        .into_owned();
+      use webkit2gtk::WebContextExt as _;
+      context.set_favicon_database_directory(Some(favicon_dir.as_str()));
+    }
 
     Self::create_context(context)
   }

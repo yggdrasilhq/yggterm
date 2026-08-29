@@ -1272,13 +1272,23 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     style: web_tab_activity_dot_style(loading, media_playing),
                 }
             });
-            // THE group glyph, from its one owner — filled when the group is
-            // open, outline when it is shut, exactly as the cwd tree three
-            // pixels away draws it. ⛔ `None`, not `rsx!{}`, on every other row:
-            // an EMPTY element is not an absent slot, and it reserved a 20px
-            // icon box plus its gap on every tab row in the rail (user report
-            // 2026-07-31).
-            let icon = expanded.map(|expanded| rsx! { RowFolderIcon { expanded } });
+            // THE ROW'S LEADING MARK is the page's FAVICON, from the engine's
+            // own database — every row wears its page's icon, a group's head
+            // row included, which is exactly what the old folder glyph was
+            // standing in for (user report: "there should not be a folder
+            // icon in the row header"). `None` on a row the database has
+            // served nothing for yet — never loaded, still loading, or an
+            // ephemeral profile, which keeps no icons — and an ABSENT slot,
+            // not an empty element: an empty element reserved a 20px icon box
+            // plus its gap on every tab row in the rail (user report
+            // 2026-07-31). The always-laid-out mark COLUMN in
+            // `SessionStyleRow` keeps every title aligned either way, and the
+            // loading/media dot rides it as before — a corner badge once an
+            // icon shares the column, centered when it does not.
+            let icon = tab
+                .as_ref()
+                .and_then(|tab| tab.favicon_png.as_deref())
+                .map(|png| rsx! { WebTabFaviconIcon { png: png.to_vec() } });
             let expander = expanded.map(|expanded| rsx! {
                 button {
                     "data-web-tab-group-expand": "{tab_id}",
@@ -1514,6 +1524,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
         // vocabulary even when the left sidebar (its other declaration site) is
         // not mounted.
         style { "{STATUS_DOT_BLINK_CSS}" }
+        // The scrollbar contract: a scrollbar that LAYS OUT beside the rows
+        // instead of overlaying them — the fix that gives the right-edge verbs
+        // their clicks back. Declared with the rail so it can never be
+        // unmounted separately from the scroller it styles.
+        style { "{WEB_TABS_SCROLL_CSS}" }
         div {
             "data-web-tabs-rail": "1",
             style: "display:flex; flex-direction:column; gap:8px; min-height:0; flex:1 1 auto;",
@@ -1626,6 +1641,18 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             div {
                 // gap:2px replaces the old per-row margins — list rhythm is the
                 // LIST's job now that rows come from the shared engine.
+                //
+                // `data-web-tabs-scroll` is the SCROLLBAR CONTRACT'S hook (see
+                // `WEB_TABS_SCROLL_CSS`): the rows' verbs — a group's ✕ and +
+                // and the collapse chevron — sit at this container's right
+                // edge, exactly where an overlay scrollbar paints and HIT-TESTS,
+                // so with the default themed scrollbar the last ~14px of every
+                // row swallowed clicks and the user could not close a row or
+                // collapse a group at all (user report 2026-08-29). Styling the
+                // scrollbar switches WebKit to a scrollbar that LAYS OUT —
+                // content shrinks beside it, nothing sits under it, and every
+                // verb is clickable all the way to the edge.
+                "data-web-tabs-scroll": "1",
                 style: "flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding-right:2px; \
                         display:flex; flex-direction:column; gap:2px;",
                 // ONE list, in the model's order: folders (with their tabs)
@@ -1637,6 +1664,23 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     {row_view(row)}
                 }
             }
+        }
+    }
+}
+/// A web tab's FAVICON, as a leading mark: the engine's PNG bytes in a
+/// data URL, drawn at 16px in the row's 20px mark column. The rounded clip is
+/// the browser favicon shape; `pointer-events:none` keeps the mark from
+/// becoming a dead click-shadow over the row's own hit area — the row is the
+/// click target, the mark is paint.
+#[component]
+fn WebTabFaviconIcon(png: Vec<u8>) -> Element {
+    let data_url = format!("data:image/png;base64,{}", BASE64_STANDARD.encode(png));
+    rsx! {
+        img {
+            src: "{data_url}",
+            width: "16",
+            height: "16",
+            style: "display:block; border-radius:4px; pointer-events:none;",
         }
     }
 }

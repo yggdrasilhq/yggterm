@@ -732,6 +732,22 @@ functions and the `SessionStyleRow` component in shell.rs.
   and the row dutifully reserves its box. That is precisely how every web-tab
   row in the rail came to carry a 20px icon box and a chevron gap it never
   drew.
+- **A row's leading mark is the page's own identity, or nothing.** The web-tab
+  rail's rows (a group's head row included) wear the page's FAVICON from the
+  engine's own database — never a folder glyph standing in for a page, and
+  never an invented icon (user report 2026-08-29: "there should not be a
+  folder icon in the row header"). A row the database has served nothing for
+  has an ABSENT mark: the always-laid-out mark column keeps titles aligned and
+  the loading/media dot rides it.
+- **A SCROLLER WHOSE ROWS CARRY RIGHT-EDGE VERBS MAY NOT USE AN OVERLAY
+  SCROLLBAR.** An overlay scrollbar paints and hit-tests over the right strip
+  of its content, so on the web-tab rail it silently swallowed every click on
+  a row's ✕ / + / chevron — the user could not close a row or collapse a group
+  at all (2026-08-29). The contract: the scroller is stamped
+  `data-web-tabs-scroll` and styled by `WEB_TABS_SCROLL_CSS` (fixed 9px slot,
+  viewport tokens); a STYLED scrollbar lays out beside the rows instead of
+  over them. Any future scroller whose right edge is interactive inherits this
+  rule, not a copy.
 - Selection tint is the palette's `accent_soft` everywhere. Never a
   per-consumer mix.
 - Trailing actions use `session_row_action_button_style`; a trailing pill uses
@@ -768,8 +784,8 @@ functions and the `SessionStyleRow` component in shell.rs.
     name so the chip cannot come back quietly.
   - **The rule reaches every row family from ONE owner**, which is why this bug
     presented in three places at once: the yggterm sidebar cwdtree, ychrome's
-    tab-rail folder rows (whose expand / new-folder / + / delete buttons sit in
-    the same `actions` container) and yedit's tree all wear it. Fix the owner,
+    tab-rail group rows (whose expand / + / ✕ buttons sit in the same
+    `actions` container) and yedit's tree all wear it. Fix the owner,
     every surface inherits; there is no per-app copy to chase.
   - **THREE reveal triggers, and all three are required**: row `:hover`, the row
     being active/selected, and `:focus-within` on the ROW. Mouse-only would

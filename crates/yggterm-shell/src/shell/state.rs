@@ -1015,6 +1015,37 @@ const STATUS_DOT_BLINK_VAR: &str = "--yggterm-status-dot-blink";
 /// stylesheet must outrank the element.
 const STATUS_DOT_BLINK_CSS: &str = ":root.yggterm-blink-off \
      [style*=\"--yggterm-status-dot-blink\"] { opacity: 0 !important; }";
+/// The web tabs rail's SCROLLBAR CONTRACT. The rail's row list is the one
+/// scroller whose rows carry verbs at the container's right edge — a group
+/// head's ✕ and +, its collapse chevron, the count badge — and an overlay
+/// scrollbar paints and HIT-TESTS over exactly that strip, so with the default
+/// themed scrollbar the user could not close a row or collapse a group at all
+/// (user report 2026-08-29). Styling `::-webkit-scrollbar` switches WebKit off
+/// the overlay path onto a scrollbar that LAYS OUT: the content box shrinks
+/// beside it, nothing sits under it, every verb is clickable to the edge.
+///
+/// Tokens are the terminal viewport's own (`terminal_scripts.rs`, the
+/// xterm-viewport block): fixed 9px slot, transparent track, neutral slate
+/// thumb at rest that deepens on hover. Same width at rest and engaged —
+/// WebKit's default fattens the scrollbar mid-drag, which shifted the thumb
+/// under the pointer and read as chunk; the transparent border trims the
+/// VISIBLE thumb instead, the way the viewport's does.
+const WEB_TABS_SCROLL_CSS: &str = r#"
+[data-web-tabs-scroll]::-webkit-scrollbar { width: 9px; height: 0; background: transparent; }
+[data-web-tabs-scroll]::-webkit-scrollbar-track { background: transparent; }
+[data-web-tabs-scroll]::-webkit-scrollbar-thumb {
+  background: rgba(120, 142, 166, 0.36);
+  border-radius: 5px;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  min-height: 24px;
+}
+[data-web-tabs-scroll]::-webkit-scrollbar-thumb:hover {
+  background: rgba(150, 172, 196, 0.78);
+  background-clip: padding-box;
+}
+[data-web-tabs-scroll]::-webkit-scrollbar-corner { background: transparent; }
+"#;
 /// Installs the one blink clock, once per webview. Idempotent by the window
 /// flag, because the rule above is emitted by three different surfaces and any
 /// of them may mount first.
@@ -2287,6 +2318,17 @@ struct WebSurfaceTab {
     /// never shorten a surface's life, and a lapsed lease simply returns it to
     /// the normal hold. `None` = unleased.
     lease_until_ms: Option<u64>,
+    /// This tab's page icon, verbatim PNG bytes from the engine's own favicon
+    /// database (WebKitGTK's per-profile store). Written from the ENGINE by
+    /// the native-surface reconciler — the only place that hears the database
+    /// — and rendered as the row's leading mark in the tab rail (the head row
+    /// of a group included: the icon names the page, which is what the retired
+    /// folder glyph was standing in for). `None` = the database has served
+    /// nothing yet: never loaded, still loading, or an ephemeral profile,
+    /// which keeps no icons. Not persisted: the database lives on disk per
+    /// profile and answers again within a tick or two of the first poll after
+    /// a restart.
+    favicon_png: Option<Vec<u8>>,
 }
 /// Whether a teardown that is releasing `held_here` handles to this egress
 /// tunnel is releasing the LAST ones, and may therefore kill the child.
@@ -6101,6 +6143,11 @@ struct WebSurfaceOverlayTabView {
     /// to disagree about. The freshness gate is resolved here too, so no paint
     /// site ever sees a raw flag it could believe for too long.
     media_playing: bool,
+    /// The page's favicon, straight off the tab model — PNG bytes the engine's
+    /// own database served. `None` = no icon yet (never loaded, still loading,
+    /// or an ephemeral profile, which keeps none). The tab rail renders it as
+    /// EVERY row's leading mark, a group's head row included.
+    favicon_png: Option<Vec<u8>>,
 }
 /// The name a tab ROW shows, in one place. Precedence: the name the USER gave
 /// it, then the page's own title, then the app tab's app name / the URL host.
@@ -6736,6 +6783,10 @@ struct AppliedWebSurface {
     /// Same edge discipline as `loading`: only a change is written through, so
     /// a page sitting still costs no re-render.
     page_theme_color: Option<String>,
+    /// Last engine-reported page ICON (PNG bytes) — the poll baseline for the
+    /// tab rail's favicon. Same edge discipline: only a change is written
+    /// through, so a page sitting still costs no re-render.
+    page_favicon: Option<Vec<u8>>,
     /// Which incarnation of this (session, tab) the webview is. Bumped on every
     /// CREATE, never reused, published in the handle so an agent can tell that
     /// the surface it addressed was destroyed and rebuilt underneath it (F3).
@@ -6806,6 +6857,7 @@ impl AppliedWebSurface {
             loading: want_visible,
             page_title: String::new(),
             page_theme_color: None,
+            page_favicon: None,
             media_playing: false,
             media_seen_ms: 0,
             generation: next_web_surface_generation(),
@@ -6860,6 +6912,7 @@ impl AppliedWebSurface {
             loading: true,
             page_title: String::new(),
             page_theme_color: None,
+            page_favicon: None,
             media_playing: false,
             media_seen_ms: 0,
             generation: next_web_surface_generation(),
@@ -7865,6 +7918,7 @@ mod web_surface_reclaim_locks {
             page_url: String::new(),
             page_title: String::new(),
             page_theme_color: None,
+            page_favicon: None,
             media_playing: false,
             media_seen_ms: 0,
             generation: 1,
@@ -13853,6 +13907,23 @@ async fn web_surface_native_reconcile_loop(
                             let mut writable = state;
                             writable.with_mut(|shell| {
                                 shell.set_web_tab_theme_color(&key.0, key.1, page_theme_color);
+                            });
+                        }
+                        // The PAGE'S ICON, from the engine's own favicon
+                        // database. Same edge discipline as the loading light
+                        // and the theme color: the poll KICKS the database's
+                        // async answer on a URI change (inside the engine) and
+                        // the model is written through only when the bytes
+                        // actually changed, so a page sitting still costs no
+                        // render. A stashed surface skips this whole block and
+                        // its row keeps the last icon it earned — the database
+                        // answers again within a tick or two of the reveal.
+                        let page_favicon = desktop.web_surface_page_favicon(entry.native_id);
+                        if entry.page_favicon != page_favicon {
+                            entry.page_favicon = page_favicon.clone();
+                            let mut writable = state;
+                            writable.with_mut(|shell| {
+                                shell.set_web_tab_favicon(&key.0, key.1, page_favicon);
                             });
                         }
                         if url_changed || title_changed {
@@ -21247,6 +21318,7 @@ impl ShellState {
             media_seen_ms: 0,
             theme_color: None,
             lease_until_ms: None,
+            favicon_png: None,
             script_opened: false,
             // The app tab is nobody's child.
             opener: None,
@@ -21361,6 +21433,7 @@ impl ShellState {
                 media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
+                favicon_png: None,
                 script_opened: false,
                 // A restored tab is a URL in a tree; the browsing session that
                 // opened it is over, so it belongs to no group.
@@ -21519,6 +21592,7 @@ impl ShellState {
             media_seen_ms: 0,
             theme_color: None,
             lease_until_ms: None,
+            favicon_png: None,
             script_opened: false,
             // The app tab is nobody's child.
             opener: None,
@@ -22893,6 +22967,7 @@ impl ShellState {
                 media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
+                favicon_png: None,
                 script_opened: false,
                 opener: placement.opener,
             },
@@ -23000,6 +23075,7 @@ impl ShellState {
                 media_seen_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
+                favicon_png: None,
                 // A script opened it, so a script may close it.
                 script_opened: true,
                 opener: placement.opener,
@@ -23751,6 +23827,7 @@ impl ShellState {
                     tab.media_seen_ms,
                     now_ms,
                 ),
+                favicon_png: tab.favicon_png.clone(),
             })
             .collect();
         // ENGINE TRUTH. The shell's own stack only ever recorded navigations the
@@ -23876,6 +23953,23 @@ impl ShellState {
             && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
         {
             tab.theme_color = theme_color;
+        }
+    }
+    /// Write the ENGINE's favicon answer onto a tab. Twin of
+    /// [`ShellState::set_web_tab_theme_color`] and the ONE writer of
+    /// `WebSurfaceTab::favicon_png`: the reconciler calls it on a real edge
+    /// (the database served different bytes), so a row's icon can never
+    /// disagree with the page's own database.
+    fn set_web_tab_favicon(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        favicon_png: Option<Vec<u8>>,
+    ) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.favicon_png = favicon_png;
         }
     }
     /// Ask for a vertical-tabs mode change — the entry point for every control
@@ -73353,6 +73447,7 @@ mod web_do_verb_tests {
                 page_url: String::new(),
                 page_title: String::new(),
                 page_theme_color: None,
+                page_favicon: None,
                 generation: native_id,
             }
         }

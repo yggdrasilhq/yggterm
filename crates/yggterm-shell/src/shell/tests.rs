@@ -1506,6 +1506,7 @@ mod tests {
                     loading_since_ms: 0,
                     theme_color: None,
                     lease_until_ms: None,
+                    favicon_png: None,
                     script_opened: false,
                     opener: None,
                 }],
@@ -55046,6 +55047,7 @@ mod webtabs_menu_switcher_locks {
             // inconsistently.
             group_size: 0,
             loading: false,
+            favicon_png: None,
         }
     }
 
@@ -56167,12 +56169,15 @@ mod webtabs_menu_switcher_locks {
             "an empty element in a row slot reserves a box for nothing; pass \
              None:\n{rail}"
         );
-        // …and the slots that DO draw are named here, so this cannot pass by
-        // the rail simply having stopped drawing folders.
+        // …and the mark slot that DOES draw is the favicon, driven by whether
+        // the database has served one — `.map` over an Option, so a tab
+        // without an icon passes `None`, never an empty element. The folder
+        // glyph this slot used to fill is retired (user report 2026-08-29:
+        // the row header wears the page's icon, not a folder).
         assert!(
-            rail.contains("expanded.map(|expanded| rsx! { RowFolderIcon { expanded } })"),
-            "a group HEAD still fills the mark column with the shared glyph — \
-             and only a head, because `expanded` is None on every other row:\n{rail}"
+            rail.contains(".and_then(|tab| tab.favicon_png.as_deref())"),
+            "the row's mark is driven by the database's answer, so an \
+             iconless row is an ABSENT slot:\n{rail}"
         );
         // The trailing verbs are CONDITIONAL (the "+" only on a head, the ✕ only
         // once the app tab holds a real page), and when neither is there the
@@ -56238,13 +56243,19 @@ mod webtabs_menu_switcher_locks {
             rail.contains("RowDisclosureChevron { expanded }"),
             "the folder's triangle is the SHARED chevron, not a private glyph"
         );
-        // …and the FOLDER GLYPH beside it, from the same one owner the cwd
-        // tree draws. A rail that drew its own folder path would be the one
-        // thing the user reported: a tree that does not look like the tree
-        // three pixels away.
+        // …and the row's MARK is the page's FAVICON, drawn by the one favicon
+        // component — a group head's row header included, which is what
+        // retired the folder glyph here (user report 2026-08-29). A rail that
+        // drew its own icon shape would be the one thing the user reported: a
+        // mark that names nothing.
         assert!(
-            rail.contains("RowFolderIcon { expanded }"),
-            "a folder row's icon is the SHARED folder glyph:\n{rail}"
+            rail.contains("WebTabFaviconIcon { png: png.to_vec() }"),
+            "a row's icon is the SHARED favicon mark:\n{rail}"
+        );
+        assert!(
+            !rail.contains("RowFolderIcon"),
+            "the folder glyph is retired from the tab rail — the head row's \
+             mark is the page's favicon now, or an absent slot"
         );
         assert!(
             !rail.contains("M1.9 5.2C1.9"),
@@ -58177,6 +58188,7 @@ mod webtabs_menu_switcher_locks {
             loading_since_ms: 0,
             theme_color: None,
             lease_until_ms: None,
+            favicon_png: None,
             script_opened: false,
             opener: None,
         }
@@ -60955,6 +60967,150 @@ mod webtabs_menu_switcher_locks {
                 .count(),
             feeds.len() + 1,
             "one definition + exactly one conversion per placement feed: {feeds:?}"
+        );
+    }
+
+    // -- FAVICONS — the row's leading mark is the page's own icon, from the
+    // engine's favicon database, on EVERY row including a group's head. The
+    // folder glyph is retired from this rail (user report 2026-08-29: "there
+    // should not be a folder icon in the row header").
+
+    /// The engine's answer lands on the tab model and reaches the overlay view
+    /// the rail renders — the head row included — and only the tab it names.
+    #[test]
+    fn the_engine_favicon_lands_on_the_tab_and_reaches_the_rail_view() {
+        let mut shell = shell_with_group();
+        let png = b"png-bytes".to_vec();
+        shell.set_web_tab_favicon("local://ws", 1, Some(png.clone()));
+        let overlay = shell
+            .snapshot()
+            .active_web_surface_overlay
+            .expect("the surface is live");
+        let head = overlay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == 1)
+            .expect("the head row exists");
+        assert_eq!(
+            head.favicon_png.as_deref(),
+            Some(png.as_slice()),
+            "the head's icon is the database's answer, verbatim — the row \
+             header wears the page's favicon, not a folder glyph"
+        );
+        let member = overlay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == 2)
+            .expect("the member row exists");
+        assert!(
+            member.favicon_png.is_none(),
+            "a write names ONE tab — a sibling the database has not answered \
+             for stays without a mark"
+        );
+    }
+
+    /// The database can take an answer back (a URI re-armed to a page with no
+    /// icon yet): `None` clears the same path it arrived on.
+    #[test]
+    fn a_cleared_favicon_leaves_the_model_by_the_same_door() {
+        let mut shell = shell_with_group();
+        shell.set_web_tab_favicon("local://ws", 2, Some(b"png".to_vec()));
+        shell.set_web_tab_favicon("local://ws", 2, None);
+        let overlay = shell
+            .snapshot()
+            .active_web_surface_overlay
+            .expect("the surface is live");
+        let member = overlay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == 2)
+            .expect("the member row exists");
+        assert!(
+            member.favicon_png.is_none(),
+            "a cleared answer clears the view — the row falls back to the \
+             absent-slot shape, never the last page's icon"
+        );
+    }
+
+    /// A stale edge (tab closed between poll and write) is a no-op, not a
+    /// panic and not a write into whichever tab now owns the id's slot.
+    #[test]
+    fn a_favicon_edge_for_a_tab_that_is_gone_writes_nothing() {
+        let mut shell = shell_with_group();
+        shell.set_web_tab_favicon("local://ws", 99, Some(b"png".to_vec()));
+        let overlay = shell
+            .snapshot()
+            .active_web_surface_overlay
+            .expect("the surface is live");
+        assert!(
+            overlay.tabs.iter().all(|tab| tab.favicon_png.is_none()),
+            "no tab wears another tab's icon"
+        );
+    }
+
+    // -- THE WIRING + THE SCROLLBAR CONTRACT — the seams a pure function
+    // cannot reach, judged as evidence that a wiring moved.
+    //
+    // The SCROLLBAR is the user-facing half of the fix: the rail's rows carry
+    // verbs at the scroller's right edge (a head's ✕ and +, the collapse
+    // chevron), and WebKit's default overlay scrollbar paints and HIT-TESTS
+    // over exactly that strip, so no click at the right of any row could land
+    // (user report 2026-08-29). The contract: the scroller is stamped
+    // `data-web-tabs-scroll`, the rail ships `WEB_TABS_SCROLL_CSS`, and that
+    // CSS styles the scrollbar FOR THAT STAMP — styling is what moves WebKit
+    // off the overlay path onto a scrollbar that lays out beside the rows.
+    #[test]
+    fn the_rails_scroller_is_stamped_and_its_scrollbar_contract_ships() {
+        let product = product_source();
+        let joined = product.join("\n");
+        for needle in [
+            // The scroller itself, stamped...
+            "\"data-web-tabs-scroll\": \"1\",",
+            // ...the contract rendered with the rail (never unmountable
+            // separately from the scroller it styles)...
+            "style { \"{WEB_TABS_SCROLL_CSS}\" }",
+            // ...and the contract names the stamp and FIXES the slot width —
+            // an unstamped rule would style some other scroller, and an
+            // unfixed width would re-introduce the rest-state drag shift the
+            // terminal viewport's scrollbar already learned about.
+            "[data-web-tabs-scroll]::-webkit-scrollbar { width: 9px;",
+            "[data-web-tabs-scroll]::-webkit-scrollbar-thumb {",
+        ] {
+            assert!(
+                joined.contains(needle),
+                "the tab rail's scrollbar contract lost a seam: {needle}"
+            );
+        }
+    }
+
+    /// The reconciler polls the engine's favicon answer and writes the model
+    /// through on an edge — the same feed shape the theme color and the
+    /// loading light use. Losing either line leaves every row iconless (or
+    /// stale) while every lock above stays green.
+    #[test]
+    fn the_favicon_feed_is_wired_from_the_engine_to_the_model() {
+        let product = product_source();
+        for needle in [
+            "desktop.web_surface_page_favicon(entry.native_id);",
+            "shell.set_web_tab_favicon(&key.0, key.1, page_favicon);",
+        ] {
+            assert!(
+                product.iter().any(|line| line.contains(needle)),
+                "the favicon feed lost its call site: {needle}"
+            );
+        }
+    }
+
+    /// The rail renders the favicon as the row's mark. (The folder glyph's
+    /// absence is the shared-engine lock's business — this one says what the
+    /// mark IS, not only what it is not.)
+    #[test]
+    fn the_rail_draws_favicons_as_the_rows_mark() {
+        let product = product_source();
+        let rail = function_body(&product, "fn WebTabsRailBody(");
+        assert!(
+            rail.contains("WebTabFaviconIcon { png: png.to_vec() }"),
+            "the rail's rows wear the page's icon:\n{rail}"
         );
     }
 }

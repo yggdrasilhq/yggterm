@@ -669,6 +669,27 @@ ychrome-specific:
   state back in its reply schema so the switch lands under the finger. The next
   GET re-reads the truth from the GUI.
 
+### Row marks are favicons, and the scrollbar lays out (2026-08-29)
+
+Two owner-directed fixes to the rail's rows:
+
+- **Every row wears its page's favicon** — a group's head row included; the
+  folder glyph is retired from the header. The icon comes from the ENGINE's
+  own WebKit favicon database (per profile jar, on disk): the engine configures
+  the database when a context is built, serves PNG bytes through
+  `web_surface_page_favicon`, and the reconciler writes the tab model through
+  on a change edge. A row the database has served nothing for (never loaded,
+  still loading, or an ephemeral profile — private windows keep no icons)
+  shows NO mark, not a substitute glyph. Not persisted: the database answers
+  again within a tick or two of the first poll after a restart.
+- **The rail's scrollbar lays out instead of overlaying.** The rows' verbs (a
+  head's ✕ and +, the collapse chevron) sit at the scroller's right edge —
+  exactly where the default overlay scrollbar paints and HIT-TESTS, so none of
+  those clicks could land ("I cannot do anything towards the right of each
+  row"). The scroller is stamped `data-web-tabs-scroll` and styled by
+  `WEB_TABS_SCROLL_CSS`; a styled scrollbar takes layout space, the rows shrink
+  beside it, and every verb is clickable to the edge.
+
 ### Classic mode, and the switch out of vertical
 
 The classic strip has nowhere to draw a folder, so it renders **root tabs only**;
@@ -884,8 +905,10 @@ Also imported from the URL table, not only from `visits`: Chromium expires visit
 rows at ~90 days while `urls.last_visit_time` survives, so for an old profile
 that table is most of what is left. Two passes, one dedupe.
 
-Not covered yet: Session Buddy's JSON export (spec §Import lists it), favicons,
-and Chromium's `Bookmarks` `date_added` (folders and order are preserved; the
+Not covered yet: Session Buddy's JSON export (spec §Import lists it), other
+browsers' favicons (the tab rail's own icons are a different mechanism — they
+come from the engine's WebKit favicon database, see Vertical tabs), and
+Chromium's `Bookmarks` `date_added` (folders and order are preserved; the
 per-item timestamp is not carried into the item line).
 
 ## Renderer and security
