@@ -38461,6 +38461,83 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(entry.outcome, "failed");
     }
 
+    /// The measured 2026-08-29 GUI-host UI-block storm (`11.31`): a mount that had
+    /// succeeded and was streaming daemon-forwarded meaningful output had its
+    /// open attempt cancelled by the inactive-skip 16 s later ("stopped being
+    /// the active terminal before its host could mount" — FALSE: the host HAD
+    /// mounted). Cancelling destroyed the ready proof — `was_ever_ready` false
+    /// forever, retained-live clause C dead — so every switch-back to the
+    /// session cold-remounted (bootstrap_reset + full xterm rebuild + backlog
+    /// replay, ~200-400 ms of UI stall per click) until the UI blocked in
+    /// ~2 s gaps. A live host must latch ready, not be discarded as unmounted.
+    #[test]
+    fn cancelling_an_inactive_attempt_with_a_live_host_latches_ready_not_cancelled() {
+        let other_active_path = "local://reveal-cancel-live-host-active";
+        let session_path = "local://reveal-cancel-live-host";
+        let bootstrap = test_shell_bootstrap_with_active_session(other_active_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        // The host record exists: the mount epoch was assigned (the mount_open
+        // had succeeded by the time the cancel fired in the measured trace).
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-live-host", 4, "startup_restore");
+        // Real session content arrived through the daemon's forward, but the
+        // strict fast-ready refuses on the absent runtime-status manifest —
+        // reproducing the exact measured Pending-with-live-output window.
+        shell.mark_terminal_open_attempt_first_meaningful_output_for_session(
+            session_path,
+            "daemon_output",
+            false,
+            false,
+        );
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt");
+        assert!(
+            attempt.ready_at_ms.is_none()
+                && attempt.first_meaningful_output_at_ms.is_some()
+                && matches!(attempt.state, TerminalOpenAttemptState::Pending),
+            "scaffold must reproduce the measured pending-with-live-output state"
+        );
+
+        // The inactive-skip cancel fires while another session is active.
+        let cancelled = shell
+            .cancel_terminal_open_attempt_for_inactive_session(
+                session_path,
+                "the reveal was cancelled: this session stopped being the active terminal",
+            );
+        assert!(
+            !cancelled,
+            "a live host must not be discarded as 'stopped before its host could mount'"
+        );
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt");
+        assert!(
+            attempt.ready_at_ms.is_some()
+                && matches!(attempt.state, TerminalOpenAttemptState::Ready),
+            "the attempt must latch ready — the reveal it waited for already happened"
+        );
+        assert!(
+            shell.terminal_session_was_ever_ready(session_path),
+            "the sticky ready proof must survive for the next switch-back"
+        );
+
+        // The user clicks back: the open path retains the session (the MRU was
+        // fed by the post-activation retains), and retained-live clause C —
+        // the hot reveal — must now recognize the host as revealable, so the
+        // switch takes the same-epoch reveal instead of a cold remount.
+        shell.note_terminal_activation_mru(session_path);
+        shell.retain_terminal_session_path(session_path);
+        assert!(
+            shell.terminal_session_is_retained_live(session_path),
+            "clause C must see host + was_ever_ready + daemon ownership: no remount"
+        );
+    }
+
     /// The 60 s timer raises its toast ITSELF and only then latches the failure,
     /// so resolving the attempt is not enough — the timer has to be told. Both
     /// arms of the stand-down, and both of its refusals.

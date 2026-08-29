@@ -18,6 +18,56 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.31] A LIVE HOST CANCELLED AS "INACTIVE" LOSES ITS READY PROOF FOREVER — EVERY SWITCH-BACK COLD-REMOUNTS (the 2026-08-29 UI-block storm on the GUI host)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The observation that would falsify it: on the next build, a switch away and
+back to any row whose first mount was cancelled by the inactive-skip must NOT
+emit `bootstrap_reset` on the switch-back — `ytrace` count of
+`terminal_mount/bootstrap_reset` per row-switch returns to ~0, and the
+`ready_on_inactive_cancel_host_already_live` reason appears in
+`terminal_open_attempt/ready` events.
+
+**Root cause, measured on the GUI host 2026-08-29 (owner caught it live: "I
+just had a mega ui block and had to close and start yggterm").** The 10:47 roll relaunched
+the GUI on 3.2.12; from 11:05 to 11:33 the incident storm ran at 2-second
+repeating block gaps with blocks/min climbing 1→14 while the owner clicked
+between rows (mouse clicks — the keystroke count in the window was zero), and
+the GUI was killed at 11:33:55. The chain: a row's first mount began its open
+attempt, the mount itself succeeded (`mount_open` ~400 ms in), and the daemon
+forward streamed meaningful output — but the strict fast-ready refused to latch
+because the polled runtime-status manifest did not yet list the brand-new PTY.
+The attempt sat Pending; when the owner clicked another row, the inactive-skip
+cancel fired 16 s later with the reason "this session stopped being the active
+terminal before its host could mount" — false, and destructive: no Ready ever
+latched, so `terminal_sessions_reached_ready` (the sticky set) and
+`ready_at_ms` stayed empty, `terminal_session_host_reusable_for_reveal` stayed
+false forever, retained-live clause C stayed dead, and EVERY later click on
+that row took the full cold path — `bootstrap_reset` + xterm recreate + veil +
+backlog replay, ~220–400 ms of UI-thread stall each (`ui_block gap_ms=222`,
+`input/loop_block held_ms=172` per switch, measured in the same trace). Two
+cooperating frames made it a storm: the felt latency invited more clicking, and
+the two-row alternation re-triggered the path each time. The mount-identity
+`:1` stability in the trace is the epoch map's `or_insert(1)` default, not
+host reuse — nothing was reused.
+
+**Landed (this commit):** `cancel_terminal_open_attempt_for_inactive_session`
+now refuses to discard an attempt whose host record is still present and which
+has already observed first meaningful (daemon-forwarded) output — it latches
+Ready instead (`ready_on_inactive_cancel_host_already_live`). The daemon's
+forwarded bytes are the PTY's own data path, not a polled observer, so they
+prove the thing the stale manifest could not. The reveal machinery is
+unchanged; clause C simply becomes reachable, which is what
+[[finding-hot-switch-latency-remount]] already designed and what this trace
+showed never engaging. Locked by
+`cancelling_an_inactive_attempt_with_a_live_host_latches_ready_not_cancelled`
+(scaffold reproduces the exact Pending-with-live-output state, asserts the
+ready latch, the sticky proof, and clause C recognizing the host on the
+switch-back). Residual, not fixed here: the strict fast-ready itself still
+waits on the manifest for a genuinely cold first mount — the felt first-open
+latency is unchanged, only the permanent cold-remount tax is gone.
+
 ## ⛔ [CLI] OPENCODE2 SELF-MINTS `ses_…` IDS — THE STORE PROBE CANNOT SEE YGGTERM ROWS (identity rebind owed)
 
 **Status:** OPEN
