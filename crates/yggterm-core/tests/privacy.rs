@@ -134,6 +134,36 @@ fn the_checker_actually_refuses_what_it_claims_to_catch() {
 /// off, and then it protects nothing. Its own comments say so, and on
 /// 2026-08-13 a full-history sweep returned 22 row-taxonomy hits that were ALL
 /// invented labels the allowlist had not been told about.
+/// ⛔ THE LICENCE-LINEAGE RULE (2026-08-29) HAS BOTH HALVES TOO: a document
+///    narrating how the tree's terms came to be is refused, while a document
+///    STATING the current terms is fine. The refusing fixture is assembled at
+///    runtime like all the others — never a literal trigger in this file.
+#[test]
+fn the_checker_refuses_a_licence_lineage_narrative() {
+    let rel = format!("re{}{}ing", "licen", "se");
+    let agreement = format!("{}A", "CL");
+    let (refused, report) = checker_refuses(&format!(
+        "the {rel} pass walked straight past four items; the {agreement} machinery, \
+         a paid edition plan, and the ownership reasoning all sat in the body\n"
+    ));
+    assert!(
+        refused,
+        "checker accepted a licence-lineage narrative.\n{report}"
+    );
+}
+
+#[test]
+fn the_checker_allows_the_current_terms_without_the_lineage_story() {
+    let (refused, report) = checker_refuses(concat!(
+        "yggterm is GPL-3.0-or-later; docs are CC BY-SA 4.0; the vendored trees\n",
+        "keep their own licence text, which is what LICENSE-APACHE is for\n",
+    ));
+    assert!(
+        !refused,
+        "checker refused a current-terms statement — the licence rule must          distinguish state from story.\n{report}"
+    );
+}
+
 #[test]
 fn the_checker_does_not_flag_invented_examples() {
     let (refused, report) = checker_refuses(concat!(

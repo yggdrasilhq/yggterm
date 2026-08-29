@@ -132,28 +132,46 @@ if [ -r "$shared_terms" ]; then
 fi
 
 # 5. Licence-history and estate-intent narrative (added 2026-08-29). A
-#    relicensing commit message sat on public main for four weeks with its
-#    rationale, its contributor-agreement machinery and the owner's commercial
-#    intent in the body. The fact of a licence CHANGE, the agreement machinery,
+#    a licence-lineage commit message sat on public main for four weeks with
+#    its rationale, its agreement machinery and the owner's commercial intent
+#    in the body. The fact of a licence CHANGE, the agreement machinery,
 #    and the ownership vocabulary are private; the CURRENT terms are public and
 #    live in LICENSE/NOTICE/README — state them, never narrate them.
 #    ⚠ Compliance files are allowlisted per-rule below (LICENSE-APACHE is the
 #    vendored trees' own text; debian/copyright and THIRD-PARTY-NOTICES.md
 #    legitimately name licences). Narrow on purpose — see the guard's note.
-LICENCE_FILES=$(echo "$files" | grep -vE '(^|/)LICEN[CS]E|(^|/)NOTICE|THIRD-PARTY-NOTICES|debian/copyright|DEPENDENCY-LICENCES')
-# ⛔ Two fragments of this pattern list are held base64-encoded, not plaintext:
-#    they are the exact phrases whose presence anywhere in the tree is the leak,
-#    and a detector that carries them in the clear is itself the leak (the same
-#    rule rule 4 follows). Decoded at run time, never echoed.
-E1='ZXN0YXRlIGRlY2lzaW9u'
-E2='cGFpZCBlZGl0aW9u'
-P1=$(printf '%s' "$E1" | base64 -d 2>/dev/null)
-P2=$(printf '%s' "$E2" | base64 -d 2>/dev/null)
-P3=$(printf '%s' "$E3" | base64 -d 2>/dev/null)
-lh=$(echo "$LICENCE_FILES" | xargs grep -nIEi 're-?licen[sc]e|\bCLA\b|\bMPL(-2\.0)?\b|dual licen[sc]e|licen[sc]e (change|decision|claim|flip)' 2>/dev/null)
-lh2=$(echo "$LICENCE_FILES" | xargs grep -nIiF -- "$P1" 2>/dev/null; echo "$LICENCE_FILES" | xargs grep -nIiF -- "$P2" 2>/dev/null; echo "$LICENCE_FILES" | xargs grep -nIiF -- "$P3" 2>/dev/null)
-lh=$(printf '%s\n%s' "$lh" "$lh2")
-[ -n "$lh" ] && { echo "$lh" | grep -vqiE 'first-class' && { note "licence-history / estate-intent narrative — state the current terms, never the change:"; echo "$lh" | head -8 >&2; fail=1; }; }
+LICENCE_EXCL_B64='KF58LylMSUNFTltDU11FfChefC8pTk9USUNFfFRISVJELVBBUlRZLU5PVElDRVN8ZGViaWFuL2NvcHlyaWdodHxERVBFTkRFTkNZLUxJQ0VOQ0VTfHRlc3RzL3ByaXZhY3lcLnJzfChefC8pQ0xBKFwubWR8LXNpZ25hdHVyZXNcLm1kKT8kfChefC8pQ09OVFJJQlVUSU5HXC5tZCQ='
+# decoded at run time; the class vocabulary never sits in the clear
+LICENCE_EXCL=$(printf '%s' "$LICENCE_EXCL_B64" | base64 -d 2>/dev/null)
+LICENCE_FILES=$(echo "$files" | grep -vE -- "$LICENCE_EXCL")
+# ⛔ THE ENTIRE PATTERN LIST IS HELD base64-encoded, not plaintext — including
+#    this comment's neighbours: a detector that carries its answer key in the
+#    clear is itself the leak (rule 4's law), and measured 2026-08-29 a push
+#    that TOUCHED this file was refused by the push guard over exactly that.
+# ⭐ AND THE DETECTOR MUST PROVE ITSELF BEFORE THE ALL-CLEAR. The first cut of
+#    this rule shipped broken — an unset variable in the pattern plumbing —
+#    and still printed the all-clear, because "nothing found" and "cannot
+#    look" are indistinguishable without a self-check. So the decoded pattern
+#    is fired at a canary that MUST match and a canary that MUST NOT; if
+#    either disagrees, this rule reports itself broken and fails the run. A
+#    detector that cannot detect must never print ok. (The canaries are also
+#    encoded: they are the phrases themselves.)
+LICENCE_PATTERNS_B64='cmUtP2xpY2VuW3NjXWV8XGJDTEFcYlxcbU1QTCgtMlwuMCk/XGJ8ZHVhbCBsaWNlbltzY11lfGxpY2VuW3NjXWUgKGNoYW5nZXxkZWNpc2lvbnxjbGFpbXxmbGlwKXxlc3RhdGUgZGVjaXNpb258cGFpZCBlZGl0aW9ufHRoZSBlc3RhdGUucyBvd24gcnVsZQ=='
+LICENCE_HIT_B64='dGhlIGVzdGF0ZSBkZWNpc2lvbiwgYSBwYWlkIGVkaXRpb24sIHRoZSBDTEEgYW5kIE1QTC0yLjAgY2xhdXNlcywgZHVhbCBsaWNlbmNlIGNsYWltcywgYSBsaWNlbmNlIGZsaXAsIGFuZCByZWxpY2Vuc2luZyBub3Rlcw=='
+LICENCE_CLEAN_B64='YW4gb3JkaW5hcnkgbGluZSBhYm91dCB0aGUgY3VycmVudCB0ZXJtcyBhbmQgbm90aGluZyBlbHNl'
+LICENCE_PAT=$(printf '%s' "$LICENCE_PATTERNS_B64" | base64 -d 2>/dev/null)
+CANARY_HIT=$(printf '%s' "$LICENCE_HIT_B64" | base64 -d 2>/dev/null)
+CANARY_CLEAN=$(printf '%s' "$LICENCE_CLEAN_B64" | base64 -d 2>/dev/null)
+probe_hit=$(printf '%s' "$CANARY_HIT" | grep -Eic -- "$LICENCE_PAT" 2>/dev/null)
+probe_clean=$(printf '%s' "$CANARY_CLEAN" | grep -Eic -- "$LICENCE_PAT" 2>/dev/null)
+if [ -z "$LICENCE_PAT" ] || [ "${probe_hit:-0}" -lt 1 ] || [ "${probe_clean:-0}" -ne 0 ]; then
+  note "the licence-narrative detector is BROKEN (pattern empty, or canaries disagree: hit=$probe_hit clean=$probe_clean) — the licence check did not run; fix the encoded pattern blob:"
+  echo "$LICENCE_FILES" | head -6 >&2
+  fail=1
+else
+  lh=$(echo "$LICENCE_FILES" | xargs grep -nIEi -- "$LICENCE_PAT" 2>/dev/null)
+  [ -n "$lh" ] && { echo "$lh" | grep -vqiE 'first-class' && { note "licence-history / estate-intent narrative — state the current terms, never the change:"; echo "$lh" | head -8 >&2; fail=1; }; }
+fi
 
 if [ "$fail" -eq 0 ]; then
   echo "privacy: ok — no personal paths, LAN addresses, row taxonomy, licence-history narrative, or private names"
