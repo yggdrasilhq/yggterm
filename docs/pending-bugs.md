@@ -68,7 +68,44 @@ switch-back). Residual, not fixed here: the strict fast-ready itself still
 waits on the manifest for a genuinely cold first mount — the felt first-open
 latency is unchanged, only the permanent cold-remount tax is gone.
 
-## ⛔ [11.33] USING YCHROME, THE VIEWPORT YANKS TO A TERMINAL SHOWING A CLIPBOARD IMAGE PATH — TWO MACHINES, BOTH SEAMS FIXED
+## ⛔ [11.34] THE SQUISH COMPOSITE — A HOST PAINTS MULTIPLE SESSION FRAMES STACKED (correlated with the remount storms; trigger removed this session, canvas-layer lifecycle unproven)
+
+**Status:** OPEN — trigger removed ([11.31]+watchdog, shipped 3.2.15/3.2.16);
+canvas-layer lifecycle owes a deliberate repro on the new build.
+
+**Measured 2026-08-29 15:39-15:47 on the GUI host (owner screenshot
+`clipboard-1787998148681-…png` + live `server app state`).** The viewport
+showed ONE host compositing multiple session frames side by side: the active
+row's transcript left, a squeezed opencode footer strip mid-screen, a second
+region right — text visibly cut at each region's edge. Live DOM at the same
+time: the four retained hosts (`live::66ad47b2`, `local://1dee4988`,
+`local://bcc4ba28`, `remote-opencode://dev/0d84d522`) each reported
+`host_metrics … width=1360 height=1184 visible=true` — the hide plane
+(`terminal_visible` = `terminal_surface_visible && is_focused_session` for
+non-split panes) had left ALL of them unhidden in the terminal layer, and the
+active host (`remote-session://dev/51608076…`) carried
+`canvas_count: 3, visible_canvas_layer_count: 3, hidden_canvas_layer_count: 0`
+— three canvas layers stacked in one host, each painted with different
+content. Grids were never wrong (169/170×65 everywhere; DOM and PTY agreed) —
+the squish is a COMPOSITE of stale frames, not a geometry bug.
+
+**Correlation:** the composite window coincided with the tail of the remount
+storms ([11.31]/watchdog) — `bootstrap_reset` bursts + watchdog remounts on
+exactly these rows minutes before. On 3.2.16 with those fixes shipped, a fresh
+daemon+GUI renders one full-width canvas, no composite (verified by
+`--region terminal` screenshot at 15:54).
+
+**What is owed:** a deliberate repro on ≥3.2.16 (flip fast among rows with
+active output, force remount bursts if needed) and, if the composite
+reappears, the canvas-layer lifecycle fix in the mount wipe path
+(`mount_init_wipe` clears the host, but the layers counted here survive
+somewhere else — find who owns them: xterm canvas addon vs the frame
+compositor's own layers) so a remount retires every prior canvas. The
+`canvas_layers` telemetry enumeration (state.rs `canvasLayerEntries`) is not
+wired into `server app state` — wire it so the next occurrence is one query
+deep.
+
+
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED (this commit). Falsifier: while a
 web surface is up and an image is on the clipboard, a paste addressed to that
@@ -77,6 +114,8 @@ surface must NOT stage a PNG nor write a path into any terminal — no
 the terminal host; and no `session/activation` with
 `origin_site attach_seed_remote_snapshot` may change the GUI's adopted active
 session after a user click.
+
+## ⛔ [11.33] USING YCHROME, THE VIEWPORT YANKS TO A TERMINAL SHOWING A CLIPBOARD IMAGE PATH — TWO MACHINES, BOTH SEAMS FIXED
 
 **Machine A — cross-surface paste theft (shell JS).** The terminal pane's
 clipboard handler was registered at `window`, `host`, AND `document` level,
