@@ -848,6 +848,35 @@ cold opencode row boots into opencode2's own TUI — which re-lists the recent
 sessions in its tab bar — instead of painting a dead-end error. Live-verified
 the same hour on the row this incident was filed from.
 
+**Store blindness root-caused + fixed (`36d0744e`):** the v2 preview writes
+new sessions to a **`session_v2`** table and stops writing the v1-era
+`session` table (3 stale rows vs 11 served) — every yggterm reader of
+`session` was blind, and the saved-session probe answered "absent" for REAL
+`ses_…` ids because opencode's glob roots are empty (one SQLite file is not a
+directory). `scan_opencode_sessions` now prefers `session_v2` (ms timestamps,
+child/sub-agent sessions filtered), `opencode_store_index_holds_session` is
+the descriptor's membership index, and the remote probe consults the declared
+index before the (empty) glob walk.
+
+**Service plane substrate landed (`d3e74119`):** `opencode_service` in core —
+discovery from the CLI's own registration file
+(`~/.local/state/opencode/service.json`, fallback spellings; carries url +
+password), HTTP **Basic** auth (`opencode` : password — `packages/opencode/
+src/server/auth.ts` in the opencode repo; raw unauthenticated GETs 401), the
+active-tabs join (`GET /api/session/active` = open tabs; joined with
+`GET /api/session` for title/directory/times, sorted by viewed recency), and
+per-session `view`/`prompt` verbs. The mirror facts the next lane needs: the
+TUI publishes tab switches as **`tui.session.select`** events on
+`GET /api/event` (SSE), `time.viewed` per session is the poll-side focus
+signal, and the TUI's own per-cwd tab registry is
+`~/.local/state/opencode/beta/tui/tabs.json`. Cold resume of a real id is
+`opencode2 --session <ses_id>`.
+
+**⚠ Deploy note (2026-08-29):** the fix reached disk but the daemon's
+hot-restart was BLOCKED by 17 working sessions (correct — it protects live
+work). `server status` shows `running_build_id` < `on_disk_build_id` until a
+restart lands it; verify against the RUNNING ids, never the deploy output.
+
 **Not covered:** does not change the wrapper verbs' contract (they already
 took the live arm first), does not parse or write the v2 store schema, does
 not alter v1-line opencode.
