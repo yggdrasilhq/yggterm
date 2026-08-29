@@ -280,6 +280,51 @@ per-tab rows need exactly these `ses_…` ids as their CLI-side handle.
 **Not covered:** v1-line opencode (`opencode-ai`, abandoned) kept the old
 behavior; no store schema is parsed or written; no transcript is copied.
 
+## ⛔ [CLI] OPENCODE TAB-MIRROR ROWS MOUNT-THRASH — the chore freeze and the mount retry loop
+
+**Status:** OPEN
+
+**What shipped (`df977647d`, 3.2.15):** the Issue 26 tab mirror — a 5 s daemon
+chore mirrors each open opencode2 tab into a real row
+(`opencode-runtime://<ses_id>`, seeded via ensure, launch
+`opencode2 --session <ses_id>`, seated under the anchor, focus-follow on
+`time.viewed`). Unit-tested diff; engaged-row protection; service IO off the
+daemon lock.
+
+**Live failure (2026-08-29 16:25, dev):** the first real apply created 2 of 4
+tab rows (keys and service titles correct — the mirror core WORKS), then the
+chore thread froze mid-apply (marker + `attachment_sweep` stop together;
+verbs stay healthy, so the runtime lock is free — a hang in the spawn path,
+not a lock deadlock). Independently, the two created rows entered a mount
+retry loop: `ui/terminal_open_attempt` ×378, runtime spawns ×51,
+`terminal_identity/sync_error` ×1100 in 15 min — each attempt spawns the
+resume and EOFs without usable output, and the GUI retries.
+
+**Mitigation applied:** the two rows were removed (churn stopped within one
+tick — zero attempts/errors/births in the following 30 s) and the mirror is
+PAUSED by a far-future marker at `~/.yggterm/opencode-tab-mirror.tick`
+(delete that file after the fix to re-enable; the gate skips while the
+marker is in the future).
+
+**What the fix must answer (measure, don't guess):**
+1. WHERE the chore hung: `ensure_remote_runtime_agent_session` was called for
+   the 3rd tab under the daemon lock and never returned. Its tail past the
+   metadata block was never audited — if it requests a terminal launch or
+   waits on readiness, that IO must leave the lock and the chore.
+2. WHY the mount EOFs: the launch line is the ssh-wrapper resume
+   (`resume-opencode <ses_id> --require-existing`); the wrapper's
+   external-holder scan does not see opencode2 tabs (the TUI process carries
+   no session id on its cmdline), so a second TUI spawns — verified working
+   from a shell — but inside the row-mount path it EOFs without output. Mount
+   context vs shell context is the difference to isolate.
+3. Budget: at most ONE ensure per tick, and never for a session whose row
+   already exists (re-check the `Runtime Session` metadata label ensure
+   actually writes — the owned-scan reads that label).
+
+**Not covered:** the store layer (session_v2 reader + membership index) and
+the service substrate are correct and stay; the anchor row and picker
+fallback are unaffected.
+
 ## ⛔ [11.0] A PLAIN SHELL ROW CAN SURFACE AS AN EMPTY CODEX SESSION — THE IDENTITY-WIRING FAULT (PASS 0 ITEM 3)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
