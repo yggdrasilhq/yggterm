@@ -244,6 +244,22 @@ impl YggtermServer {
                 retired += 1;
             }
         }
+        // Title sync: the row name IS the tab name. The service title is
+        // authoritative for mirror rows (the human renames tabs in the TUI,
+        // not in the sidebar), so drift is corrected every tick.
+        for ses in active {
+            let Some(title) = ses.title.as_deref().filter(|t| !t.trim().is_empty()) else {
+                continue;
+            };
+            let Some(tab) = owned.get(&ses.id) else {
+                continue;
+            };
+            if let Some(session) = self.sessions.get_mut(&tab.key) {
+                if session.title != title {
+                    session.title = title.to_string();
+                }
+            }
+        }
         let mut focused = None;
         if let Some(ses_id) = &plan.focus {
             // Follow the human's tab switch only while they are already in
