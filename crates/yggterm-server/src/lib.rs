@@ -33,6 +33,7 @@ mod app_control_web_cli;
 // COPIED into each binary, so a verb added to one answered "unsupported app
 // control command" from the other. See `app_control_cli`.
 pub mod app_control_cli;
+pub mod opencode_mirror;
 // THE `server <verb>` surface's shared implementations. ⛔ Per-verb, NOT a
 // wholesale collapse — see the module note for why this surface differs from
 // `server app`.

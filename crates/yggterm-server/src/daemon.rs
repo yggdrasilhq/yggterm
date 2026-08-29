@@ -21246,6 +21246,38 @@ fn run_managed_cli_fleet_sweep_chore_if_due(
         crate::run_managed_cli_fleet_refresh(&targets, crate::ManagedCliRefreshMode::Scheduled);
 }
 
+/// The OpenCode tab mirror chore: marker-gated (5 s) like every other sweep
+/// here. The two service HTTP GETs happen on the chore thread with NO runtime
+/// lock held; only the row-plane diff runs under the lock.
+fn run_opencode_tab_mirror_if_due(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    home_dir: &Path,
+) {
+    let marker = home_dir.join("opencode-tab-mirror.tick");
+    let now = crate::current_millis_u64();
+    let last = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if now.saturating_sub(last) < crate::opencode_mirror::MIRROR_INTERVAL_MS {
+        return;
+    }
+    let _ = std::fs::write(&marker, now.to_string());
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    // A service that has never run here leaves no registration; the mirror
+    // simply does not apply on such a host.
+    if yggterm_core::opencode_service::service_registration(&home).is_none() {
+        return;
+    }
+    let Some(active) = yggterm_core::opencode_service::active_sessions(&home) else {
+        return;
+    };
+    let mut guard = lock_daemon_runtime(runtime, "opencode_tab_mirror");
+    guard.server.apply_opencode_tab_mirror(&active);
+}
+
 /// GATE #8 startup hook: run the superseded-daemon takeover once, off the
 /// accept path, under the runtime lock (see
 /// [`DaemonRuntime::takeover_superseded_daemon_state`]), then sweep dead
@@ -21707,6 +21739,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     crate::current_millis_u64(),
                     chore_started_at.elapsed().as_millis() as u64,
                 );
+                // The OpenCode tab mirror: one yggterm row per open
+                // opencode2 session tab (Issue Heading 26). Fetch happens
+                // OUTSIDE the lock; only the row-plane diff runs under it.
+                run_opencode_tab_mirror_if_due(&runtime, &chore_home_dir);
                 match run_background_copy_chore(
                     &runtime,
                     generation_enabled,
