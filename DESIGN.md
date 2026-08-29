@@ -945,7 +945,7 @@ virtualised list, where the rows they are dragging across may not be mounted.
 #### The conversation is a SHARED component set, and it lives in `yggui`
 
 ⛔ **This surface is not shell markup.** It is
-`yggui::conversation` in libyggterm (MPL-2.0) — `ConversationColumn`,
+`yggui::conversation` in libyggterm — `ConversationColumn`,
 `UserTurn`, `AssistantTurn`, `SystemTurn`, `WorkGroup`, `WorkRow`, `DiffStat`,
 `ChangedFileChips`, `TurnDivider`, `WorkingIndicator`,
 `ConversationEmptyState`, all reading from one `ConversationTokens`. yggterm's

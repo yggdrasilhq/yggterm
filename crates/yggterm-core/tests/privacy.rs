@@ -140,7 +140,7 @@ fn the_checker_does_not_flag_invented_examples() {
         "invented home paths: /home/user /home/user/proj /home/example\n",
         "a CI path: /home/runner/work/repo\n",
         "documentation ranges: 192.0.2.10 198.51.100.4 203.0.113.9\n",
-        "invented lane labels: \"1.1 atlasstore: records\" \"5.1 lumenstore: vendor research\"\n",
+        "invented lane labels: \"1.1 atlasstore: records\" \"5.1 sandboxes: vendor research\"\n",
         "and \"7.2 topicb: continue\" and \"3 widgets: refactor\"\n",
     ));
     assert!(

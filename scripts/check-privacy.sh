@@ -89,7 +89,7 @@ h=$(hits '\b(192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[
 #    flagging exactly the behaviour it exists to encourage. That is the failure
 #    the paragraph above predicts, so: when you invent a label, add it here in
 #    the same commit.
-SYNTHETIC='"[0-9]+(\.[0-9]+)? (widgets|gadgets|sprockets|cogs|levers|spindles|yggterm|demo|sample|project|alpha|beta|gamma|thing|probe|foo|bar|atlasstore|lumenstore|topic[a-z]*|records|word)(:|\b)'
+SYNTHETIC='"[0-9]+(\.[0-9]+)? (widgets|gadgets|sprockets|cogs|levers|spindles|yggterm|demo|sample|project|alpha|beta|gamma|thing|probe|foo|bar|atlasstore|topic[a-z]*|records|word)(:|\b)'
 h=$(hits '"[0-9]+(\.[0-9]+)? [a-z][a-z0-9_-]{2,}: ' | grep -vE "$SYNTHETIC")
 [ -n "$h" ] && { note "numbered row-taxonomy fixture names a real lane — use an invented label:"; echo "$h" | head -12 >&2; }
 
@@ -131,7 +131,31 @@ if [ -r "$shared_terms" ]; then
   done < "$shared_terms"
 fi
 
+# 5. Licence-history and estate-intent narrative (added 2026-08-29). A
+#    relicensing commit message sat on public main for four weeks with its
+#    rationale, its contributor-agreement machinery and the owner's commercial
+#    intent in the body. The fact of a licence CHANGE, the agreement machinery,
+#    and the ownership vocabulary are private; the CURRENT terms are public and
+#    live in LICENSE/NOTICE/README — state them, never narrate them.
+#    ⚠ Compliance files are allowlisted per-rule below (LICENSE-APACHE is the
+#    vendored trees' own text; debian/copyright and THIRD-PARTY-NOTICES.md
+#    legitimately name licences). Narrow on purpose — see the guard's note.
+LICENCE_FILES=$(echo "$files" | grep -vE '(^|/)LICEN[CS]E|(^|/)NOTICE|THIRD-PARTY-NOTICES|debian/copyright|DEPENDENCY-LICENCES')
+# ⛔ Two fragments of this pattern list are held base64-encoded, not plaintext:
+#    they are the exact phrases whose presence anywhere in the tree is the leak,
+#    and a detector that carries them in the clear is itself the leak (the same
+#    rule rule 4 follows). Decoded at run time, never echoed.
+E1='ZXN0YXRlIGRlY2lzaW9u'
+E2='cGFpZCBlZGl0aW9u'
+P1=$(printf '%s' "$E1" | base64 -d 2>/dev/null)
+P2=$(printf '%s' "$E2" | base64 -d 2>/dev/null)
+P3=$(printf '%s' "$E3" | base64 -d 2>/dev/null)
+lh=$(echo "$LICENCE_FILES" | xargs grep -nIEi 're-?licen[sc]e|\bCLA\b|\bMPL(-2\.0)?\b|dual licen[sc]e|licen[sc]e (change|decision|claim|flip)' 2>/dev/null)
+lh2=$(echo "$LICENCE_FILES" | xargs grep -nIiF -- "$P1" 2>/dev/null; echo "$LICENCE_FILES" | xargs grep -nIiF -- "$P2" 2>/dev/null; echo "$LICENCE_FILES" | xargs grep -nIiF -- "$P3" 2>/dev/null)
+lh=$(printf '%s\n%s' "$lh" "$lh2")
+[ -n "$lh" ] && { echo "$lh" | grep -vqiE 'first-class' && { note "licence-history / estate-intent narrative — state the current terms, never the change:"; echo "$lh" | head -8 >&2; fail=1; }; }
+
 if [ "$fail" -eq 0 ]; then
-  echo "privacy: ok — no personal paths, LAN addresses, row taxonomy, or private names"
+  echo "privacy: ok — no personal paths, LAN addresses, row taxonomy, licence-history narrative, or private names"
 fi
 exit $fail

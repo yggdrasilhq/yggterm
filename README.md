@@ -417,9 +417,8 @@ Each release artifact should also ship with a checksum.
 - `debian/`: Debian package metadata
 
 Not here, deliberately: `yggui`, `yggui-contract` and `emd-renderer` live in
-[`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm) under
-MPL-2.0 and are consumed as a git dependency pinned to one tag. A library that
-third-party apps must LINK is MPL; the application is GPL.
+[`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm) and are
+consumed as a git dependency pinned to one tag.
 
 ## License
 

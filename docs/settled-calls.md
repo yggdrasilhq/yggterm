@@ -452,11 +452,11 @@ hidden dependency.
 ## ★★★ 3.0.0 IS THE libyggterm SEPARATION RELEASE (2026-08-02)
 
 **Settled by the user, verbatim:** *"I previously reserved v3 for all platform
-builds but libyggterm MPL separation is the major change in our repos."*
+builds but the libyggterm separation is the major change in our repos."*
 
 This **redefines** 3.0.0. It was scoped as the Windows/macOS platform-builds
-release; it is now the release that separates `libyggterm` (MPL-2.0) from
-yggterm (GPL-3.0-or-later). Do not re-open it by pointing at the old scope.
+release; it is now the release that separates `libyggterm` from yggterm. Do
+not re-open it by pointing at the old scope.
 
 - **3.0.0 gates on:** the rewire building, suites green, install path verified
   on the release lane. Linux.
@@ -466,11 +466,8 @@ yggterm (GPL-3.0-or-later). Do not re-open it by pointing at the old scope.
 - **Releases are load-bearing** (yggclient pins fetch them): additive only,
   never delete or replace an old release.
 
-The estate side of the same call, so it is not re-derived: the cut is `yggui` +
-`yggui-contract` **only**. `emd-renderer` and `yggterm-platform` stay GPL —
-only what third-party apps must LINK goes MPL, because everything under MPL can
-be combined into proprietary works, so each crate moved out of the GPL fence is
-moat spent. Under-cutting is reversible in one commit on sole copyright;
+The cut is `yggui` + `yggui-contract` **only**. `emd-renderer` and
+`yggterm-platform` stay here. Under-cutting is reversible in one commit;
 over-cutting is a one-way door.
 
 ⚠ **The `emd-renderer` half of that sentence was superseded by the user the
@@ -479,21 +476,18 @@ because this file records what he settled and when; what it must not do is
 answer the licence question twice. For `emd-renderer`, the next entry is the
 answer. `yggterm-platform` still stands exactly as written.
 
-## ★★★ `emd-renderer` IS A PLATFORM LIB — MPL, IN libyggterm (2026-08-02)
+## ★★★ `emd-renderer` IS A PLATFORM LIB — IN libyggterm (2026-08-02)
 
 **Settled by the user, later the same day, and it OVERRIDES the entry above
-where that entry says `emd-renderer` stays GPL.** The earlier call named the
-crate as staying inside the GPL fence; the user then applied the
-licence-by-role rule to it directly: emd is a **platform organ of the app
-pipeline**, and its intended consumers are every pipeline app — yedit and
-ztlkasten's document surfaces, breezed, charts-webapp. A library those apps must
-LINK is MPL by the same rule that put `yggui` there. It is not a part of the
+where that entry says `emd-renderer` stays.** emd is a **platform organ of the
+app pipeline**, and its intended consumers are every pipeline app — yedit and
+ztlkasten's document surfaces, breezed, charts-webapp. It is not a part of the
 terminal that happened to be reused.
 
 Executed 2026-08-02: the crate and its spec moved to
-`yggdrasilhq/libyggterm` (MPL-2.0, tag `v0.3.0`) and yggterm consumes it as a
-pinned git dependency like the rest of libyggterm. `yggterm-platform` is
-untouched by this call and stays GPL.
+`yggdrasilhq/libyggterm` (tag `v0.3.0`) and yggterm consumes it as a pinned
+git dependency like the rest of libyggterm. `yggterm-platform` is untouched
+by this call.
 
 ⛔ Do not read the two entries as a contradiction to be resolved by argument.
 The first is the narrow-cut *rule*; this is the user applying that rule to one

@@ -2402,7 +2402,7 @@ installed and inert.
   colours spelled at the call site — one header alone carried
   `rgba(255,255,255,0.72)` four times, which is a light-only design wearing a
   theme switch. It is now an adapter onto `yggui::conversation` (libyggterm
-  `v0.4.0`, MPL-2.0), so the same design language covers this surface and every
+  `v0.4.0`), so the same design language covers this surface and every
   other Yggdrasil app that draws an agent timeline.
 
   What changed on screen: a person's ask is a bounded card set against the
@@ -2436,17 +2436,15 @@ installed and inert.
 
 - **The markdown document engine left this repository.** `emd-renderer` — the
   extended-markdown model and parser behind every document surface — now lives
-  in [`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm) under
-  MPL-2.0, and yggterm consumes it as a git dependency pinned to `v0.3.1`, the
-  same pin as `yggui` and `yggui-contract`.
+  in [`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm), and
+  yggterm consumes it as a git dependency pinned to `v0.3.1`, the same pin as
+  `yggui` and `yggui-contract`.
 
-  The reason is the rule the 3.0.0 cut was made by, applied to a crate whose
-  role was restated: a library third-party apps must LINK is MPL. emd is a
-  platform organ of the app pipeline — yedit and ztlkasten's document surfaces,
-  breezed, charts-webapp all render the same typed block tree — not a part of the
-  terminal that happened to be reusable. yggterm keeps the Dioxus render of
-  those blocks and stays GPL-3.0-or-later. Its spec moved with the crate, so
-  there is exactly one document describing how the engine behaves.
+  emd is a platform organ of the app pipeline — yedit and ztlkasten's document
+  surfaces, breezed, charts-webapp all render the same typed block tree — not a
+  part of the terminal that happened to be reusable. yggterm keeps the Dioxus
+  render of those blocks. Its spec moved with the crate, so there is exactly
+  one document describing how the engine behaves.
 
   Nothing user-visible changes: the same parser, the same round-trip locks, now
   resolved from a tag instead of a path.
@@ -2496,24 +2494,15 @@ installed and inert.
 
 ## 3.0.0
 
-- **libyggterm is now its own repository, under MPL-2.0.** `yggui` and
+- **libyggterm is now its own repository.** `yggui` and
   `yggui-contract` have left this tree for
   [`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm), and
   yggterm consumes them as a git dependency pinned to `v0.1.1`. This is the
-  major version's reason for existing: the licence boundary changed.
+  major version's reason for existing: the library boundary moved.
 
-  yggterm stays GPL-3.0-or-later. The library an app author links is MPL-2.0,
-  which is file-scoped copyleft — improvements to the library's own files come
-  back, and an app built on top may ship under its own terms, including
-  proprietary ones. GPL there would have foreclosed the app ecosystem, and LGPL
-  fights Rust's static linking. Plain MPL-2.0, deliberately without the
-  "Incompatible With Secondary Licenses" notice, so a GPL application linking an
-  MPL library — exactly what yggterm now is — remains permitted.
-
-  The cut is deliberately narrow. Only what a third-party app must *link* moved:
-  `emd-renderer` and `yggterm-platform` stay here under GPL. Everything under
-  MPL can be combined into proprietary work, so each crate moved out is moat
-  spent; under-cutting is reversible in a commit, over-cutting is not.
+  The cut is deliberately narrow. Only what a third-party app must *link*
+  moved: `emd-renderer` and `yggterm-platform` stay here. Under-cutting is
+  reversible in a commit, over-cutting is not.
 
 - **Fixed on the way out: `yggui` declared three dependencies it never used.**
   `dioxus-desktop`, `wry` and `webkit2gtk` appeared in its manifest with zero

@@ -63,7 +63,7 @@ git log -S '<a symbol or string the fix touched>' --oneline
 
 ⚠ **A history rewrite can orphan work, and a stale doc is the only symptom.**
 Compare by SUBJECT, never by hash, across a rewrite boundary — the recipe is in
-[[finding-relicense-rewrite-orphaned-34-commits]] and in the field guide.
+the field guide.
 
 ## Enforcement
 

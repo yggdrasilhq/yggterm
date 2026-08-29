@@ -1662,7 +1662,7 @@ use emd_renderer::{MdBlock, MdInline, parse_markdown_blocks, top_level_block_ran
 use yggui::prose::AnalyticalTextRole;
 
 // The typed markdown model + parser live in `emd-renderer`, which is no longer
-// in this tree: it moved to libyggterm (MPL-2.0) on 2026-08-02, because the
+// in this tree: it moved to libyggterm on 2026-08-02, because the
 // markdown-superset engine is a platform organ every pipeline app links —
 // yedit and ztlkasten's document surfaces, breezed, charts-webapp — not a part of
 // the terminal. Its spec moved with it and is the one owner of how it behaves:

@@ -33,7 +33,7 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 # ytrace — DTrace-like probe bus (yggterm → ytop). Own repo MIT. Pinned to main until v0.2 tag.
 ytrace = { git = "https://github.com/yggdrasilhq/ytrace", branch = "main" }
-# libyggterm — extracted 2026-08-02, MPL-2.0. Pinned to a tag so a clean clone
+# libyggterm — extracted 2026-08-02. Pinned to a tag so a clean clone
 # of yggterm always builds; bump the tag here and nowhere else. For working on
 # both trees at once, use a local [patch] in .cargo/config.toml (git-ignored) —
 # never commit a path override, that is how a repo stops building from a clone.
@@ -44,9 +44,8 @@ ytrace = { git = "https://github.com/yggdrasilhq/ytrace", branch = "main" }
 yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.1" }
 yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.1" }
 # emd (extended markdown) — the document model + parser. Left this tree for
-# libyggterm on 2026-08-02 and is MPL-2.0 there: it is the document engine of
-# the app pipeline (yedit, ztlkasten, breezed, charts-webapp), and a library apps
-# must LINK is MPL by the licence-by-role rule. Spec lives with the crate.
+# libyggterm on 2026-08-02: it is the document engine of the app pipeline
+# (yedit, ztlkasten, breezed, charts-webapp). Spec lives with the crate.
 emd-renderer = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.1" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
