@@ -54,26 +54,51 @@ pub(crate) struct OwnedTab {
 /// The mirror's own rows, read back OUT of the row plane (Source metadata) —
 /// the mirror keeps no second bookkeeping, so its state and the rows can
 /// never disagree.
+/// The session id a row carries for this mirror, if it is one of ours.
+///
+/// ⛔ ADOPTION BY KEY SHAPE, measured 2026-08-29: rows created before the
+/// stamp existed (and rows whose metadata did not survive a daemon takeover)
+/// carry NO `Tab Session Id` — `owned` read 0 while 3 live mirror rows were
+/// on screen, so every tab looked new forever and nothing converged. The key
+/// shape is the identity: an OpenCode row keyed `opencode-runtime://ses_…`
+/// embeds the SERVICE's own id (uuid-keyed rows are anchors or phantoms and
+/// are never adopted).
+fn mirror_tab_session_id(kind: crate::SessionKind, key: &str, stamped: Option<&str>) -> Option<String> {
+    if kind != crate::SessionKind::OpenCode {
+        return None;
+    }
+    if let Some(ses) = stamped.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(ses.to_string());
+    }
+    let rest = key.strip_prefix("opencode-runtime://")?;
+    rest.starts_with("ses_").then(|| rest.to_string())
+}
+
 fn owned_tabs_from(
     sessions: &std::collections::BTreeMap<String, crate::ManagedSessionView>,
 ) -> std::collections::HashMap<String, OwnedTab> {
     let mut out = std::collections::HashMap::new();
     for (key, session) in sessions {
+        let Some(ses) = mirror_tab_session_id(
+            session.kind,
+            key,
+            session
+                .metadata
+                .iter()
+                .find(|m| m.label == TAB_SESSION_ID_METADATA)
+                .map(|m| m.value.as_str()),
+        ) else {
+            continue;
+        };
         let is_mirror = session
             .metadata
             .iter()
-            .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA);
-        if !is_mirror {
-            continue;
-        }
-        let Some(ses) = session
-            .metadata
-            .iter()
-            .find(|m| m.label == TAB_SESSION_ID_METADATA)
-            .map(|m| m.value.clone())
-        else {
-            continue;
-        };
+            .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
+            || session
+                .metadata
+                .iter()
+                .any(|m| m.label == TAB_SESSION_ID_METADATA)
+            || ses.starts_with("ses_");
         let engaged = session.terminal_process_id.is_some()
             || matches!(
                 session.launch_phase,
@@ -181,6 +206,34 @@ impl YggtermServer {
             // (multi-client is opencode2's native design).
             let key = format!("opencode-runtime://{}", ses.id);
             if self.sessions.contains_key(&key) {
+                // Already seeded (an earlier build may have created it without
+                // the stamp) — ADOPT: stamp ownership and the session id so the
+                // next tick recognizes it. Metadata-only, never budgeted.
+                if let Some(session) = self.sessions.get_mut(&key) {
+                    let needs_stamp = !session
+                        .metadata
+                        .iter()
+                        .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA);
+                    if needs_stamp {
+                        crate::upsert_session_metadata(
+                            &mut session.metadata,
+                            "Source",
+                            TAB_SOURCE_METADATA.to_string(),
+                        );
+                        crate::upsert_session_metadata(
+                            &mut session.metadata,
+                            TAB_SESSION_ID_METADATA,
+                            ses.id.clone(),
+                        );
+                        if let Some(dir) = &ses.directory {
+                            crate::upsert_session_metadata(
+                                &mut session.metadata,
+                                "Cwd",
+                                dir.clone(),
+                            );
+                        }
+                    }
+                }
                 continue;
             }
             let target = crate::local_session_target(
@@ -470,5 +523,51 @@ mod tests {
         )]);
         let plan = plan_tab_sync(&active, &settled);
         assert_eq!(plan.focus, None, "quiet tick — nothing to follow");
+    }
+}
+
+#[cfg(test)]
+mod adoption_tests {
+    use super::*;
+
+    #[test]
+    fn adoption_is_by_key_shape_and_never_touches_uuid_anchors() {
+        // Stamped rows answer directly.
+        assert_eq!(
+            mirror_tab_session_id(
+                crate::SessionKind::OpenCode,
+                "opencode-runtime://ses_abc000000000000000000001",
+                Some("ses_abc000000000000000000001"),
+            ),
+            Some("ses_abc000000000000000000001".to_string())
+        );
+        // ⛔ THE ADOPTION CASE, measured 2026-08-29: rows created before the
+        // stamp existed carry no metadata at all — the key IS the identity.
+        assert_eq!(
+            mirror_tab_session_id(
+                crate::SessionKind::OpenCode,
+                "opencode-runtime://ses_abc000000000000000000001",
+                None,
+            ),
+            Some("ses_abc000000000000000000001".to_string())
+        );
+        // uuid-keyed rows are anchors or phantoms — never mirror rows.
+        assert_eq!(
+            mirror_tab_session_id(
+                crate::SessionKind::OpenCode,
+                "opencode-runtime://0d841111-1111-4111-8111-111111111111",
+                None,
+            ),
+            None
+        );
+        // Other kinds are never mirror rows.
+        assert_eq!(
+            mirror_tab_session_id(
+                crate::SessionKind::ClaudeCode,
+                "opencode-runtime://ses_abc000000000000000000001",
+                None,
+            ),
+            None
+        );
     }
 }
