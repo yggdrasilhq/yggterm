@@ -27,6 +27,25 @@ ytrace detach --app yggterm <id>
 
 Grammar (the whole language): `category/name [where expr] [-> @agg(expr), ...] [by path, ...] [keep path, ...] [ring N]` — aggs `count sum min max avg quantize`; bare paths are header fields (`duration_ms`, `component`, `category`, `name`, `clock`), payload fields are `payload.x.y`.
 
+## Provider identity + the attach canary (0.2.1)
+
+A process may build SEVERAL Providers of one app (yggterm builds four: narrative
+trace, perf, row governor, host panic). Since 0.2.1 they all JOIN one control
+plane per `(app, pid)` — one socket, one script engine, one registry row whose
+`probes` list is the union. The registry row and every control answer carry an
+immutable `gen` (+ catalogue `digest`), and the CLI runs an attach canary
+BEFORE installing a script:
+
+- registry `gen` ≠ live `gen` → **REFUSED** (stale registry row or impostor socket);
+- the clause's probe absent from the live catalogue → **REFUSED** (it would drain zero forever) — script the file plane (`ytrace query`) instead if the probe is genuinely unregistered;
+- a pre-0.2.1 provider answers no identity → attach proceeds **unverified** with a warning (mixed versions mid-roll).
+
+⛔ A `✗ … REFUSED` line is the instrument protecting you from the confident
+false zero — before 0.2.1 the same attach silently succeeded and drained
+`fired=0/matched=0/schema_miss=0` forever (the 2026-08-30 multi-provider
+audit). Never bypass it by hand-crafting socket requests without checking the
+catalogue.
+
 ## The laws (why this instrument doesn't lie)
 
 - **Scripts see every firing, unsampled.** Sampling is a file-stream policy; a quantize that saw 1:50 of fast frames would be a lying instrument.

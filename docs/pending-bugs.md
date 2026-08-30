@@ -18,6 +18,46 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.37] THE SCRIPT PLANE COULD ATTACH TO THE WRONG PROVIDER AND DRAIN A CONFIDENT FALSE ZERO — FOUR PROVIDERS SHARED ONE SOCKET (found by the gpt-tracing audit)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The observation that would falsify it: on the next yggterm build (carrying
+ytrace 0.2.1, `c64a962`), `ytrace registry --json` shows every live yggterm
+row with `socket_gen` + `catalogue_digest` and a STABLE multi-domain probe
+list (the union — `daemon_request/*`, `render/*`, `governor/*`, `host/panic`,
+and `trace/*` together, no longer flip-flopping to only `trace/*` between
+16-second reads); `ytrace attach --app yggterm 'nonexistent/probe -> @count'`
+REFUSES naming the catalogue instead of attaching; and `ls
+/run/user/<uid>/ytrace/` holds ONE `yggterm-<pid>.sock` per pid.
+
+The defect, found and live-proven by the gpt-tracing research audit
+(2026-08-30; board `research/ytrace` ACK-55b082081c, door
+`campaign-gpt-tracing.md`): yggterm builds FOUR ytrace Providers of one app
+(narrative trace, perf, row governor, host panic), and each bound the same
+`<app>-<pid>.sock` — every bind unlinked the previous LIVE listener (its
+attached scripts stranded on an unreachable inode) and the registry's single
+`(app,pid)` row flip-flopped its probe catalogue to whichever provider
+emitted first after the 15 s heartbeat gate (3 ⇄ 33 probes with no restart,
+re-witnessed on the build host the same day). A script resolved through that
+registry — e.g. `daemon_request/snapshot -> @count` — was ACCEPTED by the
+wrong engine and drained `fired=0/matched=0/schema_miss=0` while the file
+plane counted 53 and 24 matching records in the overlapping windows: a
+confident false zero produced by the instrument itself.
+
+The fix lives in ytrace so every caller inherits it (upstream `c64a962`):
+`control::acquire` makes all providers of a process JOIN one control plane
+(one socket, one engine, one registry row whose catalogue is the union);
+`ping`/`catalogue`/`attach` carry an immutable `gen` + catalogue `digest`;
+registry rows carry them; the CLI runs an attach canary that REFUSES on a
+registry/socket generation mismatch or a probe absent from the live
+catalogue, and degrades to "unverified" (warning) against pre-0.2.1
+providers. Locked upstream by the audit reproduction as a regression test
+(`second_acquire_joins_the_first_engine_instead_of_rebinding`,
+`many_providers_one_process_one_control_plane`) and proven live on the 0.2.1
+CLI before the yggterm rebuild: owned probe attaches, foreign probe refuses,
+stale-gen row refuses, old provider warns + attaches.
+
 ## ⛔ [11.31] A LIVE HOST CANCELLED AS "INACTIVE" LOSES ITS READY PROOF FOREVER — EVERY SWITCH-BACK COLD-REMOUNTS (the 2026-08-29 UI-block storm on the GUI host)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
