@@ -16166,6 +16166,10 @@ where
             json!({
                 "label": label,
                 "queue_delay_ms": started_at_ms.saturating_sub(queued_at_ms),
+                // Total UI-thread wait (spawn → resume). The attribution
+                // datum for ui_block incidents of this class — see the
+                // interactive_request twin below (measured 2026-08-30).
+                "ui_wait_ms": current_millis().saturating_sub(queued_at_ms),
             }),
         );
     }
@@ -16568,6 +16572,13 @@ where
         json!({
             "label": label,
             "queue_delay_ms": started_at_ms.saturating_sub(queued_at_ms),
+            // Total UI-thread wait: spawn → worker → resume. This is the
+            // number a ui_block incident of this class needs — measured
+            // 2026-08-30 (maiden ytrace run): a background_live_session_
+            // snapshot cycle whose worker took 2323ms produced a 1157ms UI
+            // loop gap, and attribution required hand-joining three records.
+            // With this field the dispatch event alone answers it.
+            "ui_wait_ms": current_millis().saturating_sub(queued_at_ms),
         }),
     );
     result
