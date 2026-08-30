@@ -1138,3 +1138,19 @@ opencode, kimi and grok live rows kept their birth names for a whole session
 Coverage locks extended the contract the same commit: a new local reader with
 a remote arm demands a remote probe (codex/pi/grok/opencode probes added);
 codex-litellm correctly carries NO probe — it has no remote arm.
+
+### ⚠ FILED (next unit): the LLM title rescue is codex-gated
+
+`YggtermCore::generate_title_for_session_path` (server/src/lib.rs caller at
+daemon.rs:13754) refuses any transcript that fails `is_codex_session_file`,
+and resolves identity via `read_codex_session_identity` — so the rescue (the
+designed last resort for `TitleAuthority::Generated` kinds) never fires for
+Muse/Pi/Grok/OpenCode/Kimi rows whose own store carries no usable title
+(measured: muse zero-content sessions hold `New session`/`hi`, correctly
+filtered, and then nothing rescues them). Fix shape: a
+`generate_title_for_transcript(session_id, cwd, path, force)` that skips the
+codex identity parse (the caller — the chore candidate — already holds both),
+gates on ANY descriptor's `store_path_is_session_file`, and requires the
+candidate to carry a real transcript path (muse live rows may need the
+`Storage` stamp their reader can already locate via
+`find_muse_session_jsonl_in`).
