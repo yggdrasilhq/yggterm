@@ -47149,6 +47149,89 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn a_local_spawn_is_refused_while_a_live_process_holds_the_conversation() {
+        // THE AGY FORK PROMPT, AT THE STATE LAYER. The local launch funnel
+        // must refuse a resume whose conversation a live process already
+        // holds — the hot restart keeps the CLI's children alive, and the
+        // second spawn is what printed agy's fork-or-corrupt warning naming
+        // the ghost holder. The holder here is a REAL process whose argv is
+        // exactly `agy --conversation <id>` (a PATH shim named `agy`), so the
+        // /proc scan sees what production sees.
+        let id = "a25499c0-f85e-4c5e-9323-e08cfe1be9ea";
+        let shim_dir = std::env::temp_dir().join(format!("yggterm-agy-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("agy");
+        // ⛔ NO `exec` here: exec would REPLACE the shim's argv with
+        // ["sleep","30"] and the /proc scan would see no agy-shaped process.
+        // Plain `sleep` keeps the shim alive with its own argv.
+        std::fs::write(&shim, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut holder = std::process::Command::new(&shim)
+            .args(["--conversation", &format!("session_{id}")])
+            .env("PATH", format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap_or_default()))
+            .spawn()
+            .expect("spawn fake agy holder");
+        // Give the /proc scan a moment to see the child with its final argv.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let runtime_key = "local://00000000-0000-4000-8000-00000000ag00";
+        let row_uuid = "00000000-0000-4000-8000-00000000ag00";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.to_string(),
+            id: row_uuid.to_string(),
+            title: "agy-runtime://00000000-0000-4000-8000-00000000ag00".to_string(),
+            kind: SessionKind::Antigravity,
+            keep_alive: false,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/tmp/workspace".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        // The rebound row: real conversation id + resume-shaped command.
+        {
+            let session = server.sessions.get_mut(runtime_key).unwrap();
+            session.id = format!("session_{id}");
+            session.launch_command =
+                format!("cd '/tmp/workspace' && agy --conversation 'session_{id}'");
+        }
+
+        let refusal = server.local_agent_cli_launch_refusal_for_path(runtime_key);
+        let refusal = refusal.unwrap_or_default();
+        assert!(
+            refusal.contains("already held") && refusal.contains("PID"),
+            "a live holder must be refused BY PID: {refusal}"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let _ = std::fs::remove_dir_all(&shim_dir);
+
+        // After the holder dies the funnel stops refusing (the binary check
+        // may still refuse for other reasons in some environments, so only
+        // assert the holder phrase is gone).
+        let after = server.local_agent_cli_launch_refusal_for_path(runtime_key);
+        assert!(
+            after.as_deref().map(|r| !r.contains("already held")).unwrap_or(true),
+            "a dead holder must not refuse the spawn: {:?}",
+            after
+        );
+    }
+
+    #[test]
     fn a_rebound_muse_row_resumes_the_real_session_across_a_restart() {
         // The falsifier, end to end at the state layer: a row born with the
         // yggterm uuid must, once bound to the id its CLI actually minted,
