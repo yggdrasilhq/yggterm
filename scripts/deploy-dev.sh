@@ -382,6 +382,27 @@ for host in "${HOSTS[@]}"; do
       fi
     '
     run_on_host "$host" "$RESTART_CMD" | sed 's/^/    /' || warn "stack restart on $host returned non-zero"
+
+    # ⛔ VERIFY CONVERGENCE — the restart verb returns Ok when the REQUEST
+    # round-trips, which says nothing about whether the OPERATION happened
+    # (the field-guide Ok(()) trap, deploy edition). The daemon owns sessions
+    # and may legitimately survive a stack restart; but then the fleet is
+    # running the previous binary while this script claims convergence, and
+    # every proof taken afterwards measures someone else's code. Ask the
+    # daemon's own census, which reports its build commit and flags a binary
+    # replaced underneath it.
+    VERIFY_CMD='
+      sleep 3
+      OUT=$("$HOME/.local/bin/yggterm-headless" server daemons 2>/dev/null || "$HOME/.yggterm/bin/yggterm-headless" server daemons 2>/dev/null)
+      echo "$OUT" | grep -q "REPLACED ON DISK" && echo "DRIFT: running daemon executes a binary that no longer exists on disk"
+      RUNNING_BUILD=$(echo "$OUT" | awk "/^\\*/{print \$4; exit}")
+      if [ -n "$RUNNING_BUILD" ] && [ -n "'"$BUILD_COMMIT"'" ] && [ "${RUNNING_BUILD:0:8}" != "${BUILD_COMMIT:0:8}" ]; then
+        echo "DRIFT: daemon runs build ${RUNNING_BUILD:0:8} but deployed ${BUILD_COMMIT:0:8} — daemon owns sessions and survived the restart; upgrade it explicitly (session handover), do not trust this deploy for daemon-side behavior"
+      else
+        echo "converged: daemon build ${RUNNING_BUILD:0:8} matches deployment"
+      fi
+    '
+    run_on_host "$host" "$VERIFY_CMD" | sed 's/^/    /'
   fi
 done
 
