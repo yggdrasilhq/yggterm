@@ -9216,6 +9216,67 @@ impl YggtermServer {
     /// launch error. A launch that cannot run must fail BY NAME instead of
     /// handing the user a shell that impersonates it.
     pub fn local_agent_cli_launch_refusal_for_path(&self, path: &str) -> Option<String> {
+        // ⛔ THE SECOND-SPAWN GATE, LOCAL DOOR (the agy fork prompt,
+        // 2026-08-30). This funnel is the one place every local agent launch
+        // passes before a PTY is spawned, and until now it checked only that
+        // the binary exists. A resume whose conversation is ALREADY HELD by a
+        // live process — the hot restart that keeps the CLI's children alive,
+        // or the twin-row case where two rows name one conversation — reached
+        // the CLI, which printed its own fork-or-corrupt warning naming the
+        // ghost holder ("presence: held by another process"). The same
+        // descriptor-driven holder scan the remote door and the wrapper lanes
+        // use decides here: a live holder is refused BY PID, never raced.
+        #[cfg(target_os = "linux")]
+        if let Some(session) = self
+            .resolve_session_storage_key(path)
+            .and_then(|key| self.sessions.get(key))
+        {
+            let descriptor = agent_cli_descriptor(session.kind);
+            let resume_capable = descriptor.is_some_and(|d| !d.id_assigned_at_birth)
+                || matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
+            let carries_id = descriptor
+                .map(|d| {
+                    let token = d.resume_selector_token();
+                    !token.is_empty() && session.launch_command.contains(token)
+                })
+                .unwrap_or(false);
+            if resume_capable && carries_id && !session.id.trim().is_empty() {
+                let holders =
+                    external_agent_resume_processes_for_session(session.kind, &session.id);
+                if !holders.is_empty() {
+                    let display = descriptor
+                        .map(|d| d.display_name)
+                        .unwrap_or("Agent")
+                        .to_string();
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "local_launch",
+                            "external_active_refused_local_spawn",
+                            serde_json::json!({
+                                "session_path": path,
+                                "session_id": session.id,
+                                "kind": format!("{:?}", session.kind),
+                                "pids": holders.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                                "policy": "session_survival_before_yggterm_attach",
+                            }),
+                        );
+                    }
+                    return Some(format!(
+                        "{} session {} is already held by a live process (PID{}). \
+                         Attaching a second process to it would corrupt the transcript — \
+                         the surviving session owns this conversation.",
+                        display,
+                        session.id,
+                        holders
+                            .iter()
+                            .map(|p| format!(" {}", p.pid))
+                            .collect::<String>(),
+                    ));
+                }
+            }
+        }
         let tool = self.local_managed_cli_tool_for_session_path(path)?;
         local_agent_cli_missing_binary_refusal(tool)
     }

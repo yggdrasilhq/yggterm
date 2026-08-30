@@ -276,7 +276,7 @@ const ARMS: &[Arm] = &[
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
         // ⛔ EMPTY = declared gap (md5(cwd) buckets), see the descriptor.
-        store_globs: &[],
+        store_globs: &[".kimi-code/sessions/*/*/state.json"],
     },
     Arm {
         kind: SessionKind::Kimi,
@@ -289,7 +289,7 @@ const ARMS: &[Arm] = &[
         binary: "kimi",
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
-        store_globs: &[],
+        store_globs: &[".kimi-code/sessions/*/*/state.json"],
     },
     Arm {
         kind: SessionKind::Muse,
