@@ -31964,26 +31964,22 @@ mod tests {
             ["remote-cc://example-host/aaaa".to_string()].into();
         let mut confirmed = std::collections::HashSet::new();
         // First tick: both remote-cc rows selected (aaaa working, bbbb
-        // unconfirmed). The kimi row is refused with a reason (below) — it is
-        // the declared no-reader gap.
+        // unconfirmed) and the kimi row too — every CLI carries a measured
+        // reader + probe now (2026-08-30), so nothing is refused here anymore.
         let picked = super::remote_store_title_poll_decisions(&sessions, &working, &confirmed);
         assert_eq!(
             polled_paths(&picked),
-            vec!["remote-cc://example-host/aaaa", "remote-cc://example-host/bbbb"]
+            vec![
+                "remote-cc://example-host/aaaa",
+                "remote-cc://example-host/bbbb",
+                "remote-session://example-host/dddd",
+            ]
         );
         assert_eq!(picked[0].machine_key, "example-host");
         assert_eq!(picked[0].session_id, "aaaa");
-        // ⛔⛔ THE DEFECT'S OWN ASSERTION, retargeted 2026-08-30. Codex (the
-        // original pinned kind) is MEASURED now — its remote rows are polled.
-        // Kimi is the declared no-reader gap: it must be REPORTED as skipped
-        // for that reason, never silently dropped the way the CC-only kind
-        // check did. Silence here is what let a remote row of every other CLI
-        // keep its birth name with nothing anywhere recording the refusal.
-        assert_eq!(
-            skip_outcome(&picked, "remote-session://example-host/dddd"),
-            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader),
-            "a CLI with no remote probe is skipped WITH A REASON, not dropped"
-        );
+        // (The SkippedNoReader refusal this block used to pin is RETIRED:
+        // every CLI is measured now — see the reader full-coverage lock in
+        // `a_local_row_of_a_cli_with_no_measured_reader_says_so`.)
         // Once confirmed, an idle row is no longer polled; a working row still is.
         confirmed.insert(super::remote_title_confirmation_key(
             "remote-cc://example-host/aaaa",
@@ -31994,7 +31990,14 @@ mod tests {
             "bbbb",
         ));
         let picked = super::remote_store_title_poll_decisions(&sessions, &working, &confirmed);
-        assert_eq!(polled_paths(&picked), vec!["remote-cc://example-host/aaaa"]);
+        assert_eq!(
+            polled_paths(&picked),
+            vec![
+                "remote-cc://example-host/aaaa",
+                "remote-session://example-host/dddd",
+            ],
+            "aaaa is working; dddd is idle but unconfirmed — both poll; bbbb settled"
+        );
         assert_eq!(
             skip_outcome(&picked, "remote-cc://example-host/bbbb"),
             Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedTitleSettled)
@@ -32069,24 +32072,36 @@ mod tests {
         owner_titled[0].title_is_explicit = true;
         owner_titled[0].title = "11.15 [daemon-burn]".to_string();
         let picked = super::remote_store_title_poll_decisions(&owner_titled, &working, &confirmed);
-        assert!(
-            polled_paths(&picked).is_empty(),
+        // (dddd still polls here — it is idle-unconfirmed and legitimate; the
+        // lock is about the OWNER-TITLED row, so assert on aaaa itself.)
+        assert_eq!(
+            skip_outcome(&picked, "remote-cc://example-host/aaaa"),
+            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedOwnerTitled),
             "an owner-titled working row must not be polled: the write is refused, \
              so every poll re-detects the same permanently-unsatisfiable delta"
         );
-        assert_eq!(
-            skip_outcome(&picked, "remote-cc://example-host/aaaa"),
-            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedOwnerTitled)
+        assert!(
+            !polled_paths(&picked)
+                .iter()
+                .any(|path| *path == "remote-cc://example-host/aaaa"),
+            "an owner-titled row must never appear in the poll list"
         );
 
         // ⚠ The empty-title arm: `title_is_explicit` with nothing in the title
         // protects nothing, so the row is still polled rather than stranded.
+        // (dddd polls alongside it — idle-unconfirmed — per the contract.)
         let mut explicit_but_blank = sessions.clone();
         explicit_but_blank[0].title_is_explicit = true;
         explicit_but_blank[0].title = "   ".to_string();
         let picked =
             super::remote_store_title_poll_decisions(&explicit_but_blank, &working, &confirmed);
-        assert_eq!(polled_paths(&picked), vec!["remote-cc://example-host/aaaa"]);
+        assert_eq!(
+            polled_paths(&picked),
+            vec![
+                "remote-cc://example-host/aaaa",
+                "remote-session://example-host/dddd",
+            ]
+        );
     }
 
     /// ⛔⛔ THE REGRESSION GATE FOR THE FILED DEFECT: **a remote row for any CLI
@@ -32196,34 +32211,17 @@ mod tests {
                 descriptor.display_name
             );
         }
-        let kimi = make(
-            "remote-session://example-host/kimi",
-            "eeee",
-            crate::SessionKind::Kimi,
-        );
-        let kimi_descriptor = yggterm_core::agent_cli::agent_cli_descriptor(kimi.kind)
-            .expect("Kimi is registered");
-        assert!(kimi_descriptor.read_live_store_title.is_none());
-        let (_, detail) = super::local_store_title_skip(kimi_descriptor, &kimi, &working)
-            .expect("the local chore does not serve a remote row");
-        assert_eq!(
-            detail.get("served_by").and_then(|value| value.as_str()),
-            Some("nobody"),
-            "a CLI with no remote probe must be reported as unserved, not passed \
-             to a chore that will drop it"
-        );
-        let picked = super::remote_store_title_poll_decisions(
-            std::slice::from_ref(&kimi),
-            &working,
-            &confirmed,
-        );
-        assert!(polled_paths(&picked).is_empty());
-        assert_eq!(
-            skip_outcome(&picked, "remote-session://example-host/kimi"),
-            Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader),
-            "the reason must reach the trace; a bare `continue` is what hid this \
-             defect through a 40,000-event window"
-        );
+        // ⛔ THE GAP IS EMPTY NOW (2026-08-30): every registered CLI carries a
+        // measured local reader, so "nobody" titles nothing — pin that as the
+        // contract instead of pinning one gap CLI.
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            assert!(
+                descriptor.read_live_store_title.is_some(),
+                "{}: a registered CLI with no local title reader titles its live \
+                 rows nobody — wire the reader and keep this lock",
+                descriptor.display_name
+            );
+        }
     }
 
     /// ⛔ The local chore still serves LOCAL rows of every CLI, including the
@@ -32231,37 +32229,21 @@ mod tests {
     /// remote half by narrowing the local one would trade one silence for
     /// another.
     #[test]
+    #[test]
     fn a_local_row_of_a_cli_with_no_measured_reader_says_so() {
-        // Retargeted 2026-08-30: GrokBuild (the original pinned kind) is
-        // MEASURED now — Kimi is the declared no-reader gap.
-        let template = {
-            let mut server = crate::YggtermServer::new(
-                false,
-                crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
-                yggui_contract::UiTheme::ZedLight,
+        // RETIRED AS A GAP TEST 2026-08-30 and promoted to the full-coverage
+        // contract it was reaching for: every registered CLI now carries a
+        // measured local reader, so the local chore serves EVERY local agent
+        // row and the SkippedNoReader outcome is unreachable by construction.
+        // (The original pinned GrokBuild, then Kimi; both got readers.)
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            assert!(
+                descriptor.read_live_store_title.is_some(),
+                "{}: no local title reader — its live rows would wear their birth \
+                 names for the life of the session",
+                descriptor.display_name
             );
-            server.start_local_session(crate::SessionKind::Kimi, Some("/home/user/proj"), None);
-            server.live_sessions()[0].clone()
-        };
-        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(crate::SessionKind::Kimi)
-            .expect("Kimi is registered");
-        assert!(
-            descriptor.read_live_store_title.is_none(),
-            "this test describes the UNMEASURED case; kimi is the last declared \
-             gap — wire its reader and retarget this rather than deleting it"
-        );
-        let (outcome, detail) =
-            super::local_store_title_skip(descriptor, &template, &std::collections::HashSet::new())
-                .expect("a CLI with no reader is skipped");
-        assert_eq!(
-            outcome,
-            yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader
-        );
-        assert!(
-            detail.get("title_authority").is_some(),
-            "the skip must carry who owns this CLI's title, because a \
-             store-authoritative CLI with no reader is a row nothing can name"
-        );
+        }
     }
 
     /// The unchanged-source gate, which is what stops an unchanged session

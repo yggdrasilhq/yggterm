@@ -92,9 +92,14 @@ pub struct StartpageDurableRow {
 /// sessions will be invisible" on every run while `scan_opencode_sessions` and
 /// `scan_kimi_sessions` were reading them perfectly well.
 pub fn kind_has_dedicated_scanner(kind: crate::SessionKind) -> bool {
+    // ⛔ Kimi left this set 2026-08-30: its installed CLI (kimi-code 0.27)
+    // writes `~/.kimi-code/sessions/*/*/state.json` — glob-expressible, so the
+    // generic walk + `read_kimi_code_store_entry` own it, and the old
+    // `scan_kimi_sessions` (which read the DEAD `~/.kimi/` home the installed
+    // CLI never touches) is gone.
     matches!(
         kind,
-        crate::SessionKind::OpenCode | crate::SessionKind::Kimi | crate::SessionKind::Antigravity
+        crate::SessionKind::OpenCode | crate::SessionKind::Antigravity
     )
 }
 
@@ -279,10 +284,6 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
         );
         if descriptor.kind == crate::SessionKind::OpenCode {
             scan_opencode_sessions(home, &mut out);
-            continue;
-        }
-        if descriptor.kind == crate::SessionKind::Kimi {
-            scan_kimi_sessions(home, &mut out, &mut seen_paths);
             continue;
         }
         if descriptor.kind == crate::SessionKind::Antigravity {
@@ -477,109 +478,6 @@ fn scan_opencode_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
             storage_path: db_path.display().to_string(),
             display_path,
         });
-    }
-}
-
-fn scan_kimi_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>, seen: &mut HashSet<PathBuf>) {
-    // Kimi buckets: ~/.kimi/sessions/<md5(cwd)>/<session-id>/context.jsonl
-    // Reverse map lives in ~/.kimi/kimi.json work_dirs[].path
-    let kimi_json_path = home.join(".kimi/kimi.json");
-    let sessions_root = home.join(".kimi/sessions");
-    if !sessions_root.exists() {
-        return;
-    }
-    // Build md5 -> cwd map from kimi.json
-    let mut md5_to_cwd: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    if let Ok(content) = std::fs::read_to_string(&kimi_json_path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(work_dirs) = v.get("work_dirs").and_then(|w| w.as_array()) {
-                for wd in work_dirs {
-                    if let Some(p) = wd.get("path").and_then(|s| s.as_str()) {
-                        let md5_hex = format!("{:x}", md5::compute(p.as_bytes()));
-                        md5_to_cwd.insert(md5_hex, p.to_string());
-                    }
-                }
-            }
-        }
-    }
-    // Also walk all bucket dirs and fallback to unknown if not in map (handles md5 buckets not in work_dirs)
-    let Ok(buckets) = std::fs::read_dir(&sessions_root) else {
-        return;
-    };
-    for bucket_entry in buckets.flatten() {
-        let bucket_path = bucket_entry.path();
-        if !bucket_path.is_dir() {
-            continue;
-        }
-        let bucket_name = bucket_entry.file_name().to_string_lossy().to_string();
-        let cwd = md5_to_cwd.get(&bucket_name).cloned().unwrap_or_else(|| {
-            // Fallback: unknown cwd, use home; but still surface the session so divergence is visible
-            // rather than silently dropping it. The cwd tree will hang it at home.
-            home.display().to_string()
-        });
-        let Ok(sessions) = std::fs::read_dir(&bucket_path) else {
-            continue;
-        };
-        for sess_entry in sessions.flatten() {
-            let sess_path = sess_entry.path();
-            if !sess_path.is_dir() {
-                continue;
-            }
-            let session_id = sess_entry.file_name().to_string_lossy().to_string();
-            if session_id.trim().is_empty() {
-                continue;
-            }
-            let context_path = sess_path.join("context.jsonl");
-            if !context_path.exists() {
-                continue;
-            }
-            if !seen.insert(context_path.clone()) {
-                continue;
-            }
-            // Noise check: skip empty placeholder
-            if is_noise_session_file(&context_path) {
-                continue;
-            }
-            let modified_epoch_ms = std::fs::metadata(&context_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            // Title: kimi stores no title in context.jsonl system prompt; use generated or heuristic fallback
-            let generated = StartpageDurableRow::load_generated_title(&session_id);
-            let filtered_gen = generated.clone().filter(|s| {
-                !crate::looks_like_generated_fallback_title(s)
-                    && !crate::looks_like_low_signal_generated_copy(s)
-            });
-            // Heuristic from tail context if available
-            let heuristic = crate::titles::extract_tail_context(&context_path)
-                .ok()
-                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
-                .filter(|s| {
-                    !crate::looks_like_generated_fallback_title(s)
-                        && !crate::looks_like_low_signal_generated_copy(s)
-                });
-            let effective_title = filtered_gen.clone().or(heuristic.clone());
-            let title = filtered_gen.clone();
-            let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::Kimi);
-            let display_path = descriptor
-                .and_then(|d| d.remote_row_scheme)
-                .map(|s| format!("{}{}", s, session_id))
-                .unwrap_or_else(|| context_path.display().to_string());
-            out.push(StartpageDurableRow {
-                session_id: session_id.clone(),
-                cwd: cwd.clone(),
-                title,
-                generated_title: filtered_gen,
-                effective_title,
-                detail: None,
-                kind: crate::SessionKind::Kimi,
-                modified_epoch_ms,
-                storage_path: context_path.display().to_string(),
-                display_path,
-            });
-        }
     }
 }
 
@@ -1582,7 +1480,10 @@ mod scan_truth_tests {
             );
         }
         assert!(kind_has_dedicated_scanner(crate::SessionKind::OpenCode));
-        assert!(kind_has_dedicated_scanner(crate::SessionKind::Kimi));
+        assert!(
+            !kind_has_dedicated_scanner(crate::SessionKind::Kimi),
+            "kimi's store moved to ~/.kimi-code and is glob-expressible now"
+        );
         assert!(!kind_has_dedicated_scanner(crate::SessionKind::Codex));
     }
 
