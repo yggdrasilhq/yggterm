@@ -1041,6 +1041,11 @@ pub enum RemoteStoreLocators {
     /// answers "no title in store" for exactly the rows a person is looking
     /// at, which is the same reading as the defect it was written to repair.
     StoreGlobsAndCliHomeFiles(&'static [&'static str]),
+    /// One fixed `$HOME`-relative path — for a CLI whose title lives in a
+    /// shared DATABASE rather than in session files, where the glob arms have
+    /// nothing to resolve (OpenCode declares no store globs; its titles live
+    /// in `~/.local/share/opencode/opencode.db`).
+    HomeRelative(&'static str),
 }
 
 /// How a live session of a CLI is recognised from a path its process holds open.
@@ -1455,6 +1460,7 @@ impl AgentCliDescriptor {
                 .map(|glob| (*glob).to_string())
                 .chain(self.cli_home_file_locators(names))
                 .collect(),
+            RemoteStoreLocators::HomeRelative(path) => vec![(*path).to_string()],
         }
     }
 
@@ -1895,8 +1901,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        // Owner spec 2026-06-06: codex titles are YGGTERM-owned. The 12s
+        // title chore serves live codex rows from the cached title or the
+        // rollout's first real user prompt (the wrappers skipped).
+        read_live_store_title: Some(read_codex_live_store_title),
+        remote_live_store_title: Some(CODEX_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
@@ -2008,7 +2017,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        read_live_store_title: None,
+        // Owner spec 2026-06-06: codex titles are YGGTERM-owned. The 12s
+        // title chore serves live codex rows from the cached title or the
+        // rollout's first real user prompt (the wrappers skipped).
+        read_live_store_title: Some(read_codex_live_store_title),
+        // ⛔ Codex-LiteLLM has no remote arm — its remote-*:// rows never
+        // exist, so a probe here would be dead weight the coverage lock
+        // rightly refuses.
         remote_live_store_title: None,
     },
     AgentCliDescriptor {
@@ -2368,8 +2383,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_pi_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        // The 12-second title chore serves live pi rows from the session's
+        // own jsonl (header id == file name uuid — measured 2026-08-30).
+        read_live_store_title: Some(read_pi_live_store_title),
+        remote_live_store_title: Some(PI_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::OpenCode,
@@ -2469,8 +2486,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_no_store_entry,
         store_membership_index: Some(opencode_store_index_holds_session),
         live_session_marker: None,
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        // opencode2 self-titles prompted sessions in session_v2 (the scanner
+        // reads the same column); the chore reads it for live rows too.
+        read_live_store_title: Some(read_opencode_live_store_title),
+        remote_live_store_title: Some(OPENCODE_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::QwenCode,
@@ -2746,6 +2765,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_no_store_entry,
         store_membership_index: None,
         live_session_marker: None,
+        // ⛔ DECLARED GAP (2026-08-30): kimi keeps no per-session title store
+        // we could find — ~/.kimi/kimi.json is a work_dirs reverse map with
+        // last_session_id only. Live rows stay on the LLM-rescue path.
         read_live_store_title: None,
         remote_live_store_title: None,
     },
@@ -3282,8 +3304,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_grok_build_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        // Grok keeps summary.json per session directory; the chore reads the
+        // session's own summary for live rows.
+        read_live_store_title: Some(read_grok_live_store_title),
+        remote_live_store_title: Some(GROK_REMOTE_TITLE_PROBE),
     },
 ];
 
@@ -3794,6 +3818,286 @@ fn read_antigravity_live_store_title(home: &Path, session_id: &str) -> Option<St
 /// [`AgentCliDescriptor::read_live_store_title`] for Muse.
 /// Looks in `~/.local/share/muse/session-index.db` (sessions table: workspace_root, title, updated_at_us)
 /// and falls back to `~/.local/share/muse/sessions/**/<session_id>/session.jsonl`.
+/// The cached yggterm-side title for a session id (`~/.yggterm/session-titles.db`
+/// — the LLM/heuristic chore's own output), filtered the way every reader must
+/// filter it: a poisoned or placeholder-shaped cache row is NOT a title.
+fn cached_session_title(session_id: &str) -> Option<String> {
+    let db_path = dirs::home_dir()?.join(".yggterm/session-titles.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT title FROM session_titles WHERE session_id = ?1 LIMIT 1")
+        .ok()?;
+    let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+    let row = rows.next().ok()??;
+    let title: Option<String> = row.get(0).ok();
+    title
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| !crate::looks_like_generated_fallback_title(s))
+        .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
+}
+
+/// The FIRST REAL USER PROMPT in a codex rollout — the title codex sessions
+/// deserve (owner spec 2026-06-06: yggterm owns codex titles; the transcript's
+/// own opening prompt is the honest one).
+///
+/// ⛔ The rollout's first `role:"user"` item is NOT the prompt: codex writes
+/// the AGENTS.md/instructions block and environment context as user messages
+/// first (measured 2026-08-30 — a rollout whose first user item is the whole
+/// fleet steer file). Skip those wrappers; take the first user text that is
+/// neither, clean it to one line, and refuse fallback/low-signal shapes.
+fn codex_first_real_user_prompt(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for (index, line) in reader.lines().enumerate() {
+        // The real prompt is near the top; a bound keeps this cheap no matter
+        // how long the rollout grows.
+        if index > 400 {
+            return None;
+        }
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            continue;
+        }
+        let payload = value.get("payload")?;
+        if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let text = payload
+            .get("content")
+            .and_then(|content| content.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("text"))
+                    .filter_map(|text| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        let Some(text) = text else { continue };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let is_wrapper = lower.starts_with("# agents.md")
+            || lower.contains("<user_instructions>")
+            || lower.contains("<environment_context>")
+            || lower.contains("<permissions")
+            || lower.contains("<turn_context>")
+            || lower.starts_with("<instructions>");
+        if is_wrapper {
+            continue;
+        }
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with('<')
+                || line.starts_with("```")
+            {
+                continue;
+            }
+            let candidate: String = {
+                let mut end = line
+                    .char_indices()
+                    .nth(120)
+                    .map(|(offset, _)| offset)
+                    .unwrap_or(line.len());
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                line[..end].trim_end().to_string()
+            };
+            if candidate.is_empty()
+                || crate::looks_like_generated_fallback_title(&candidate)
+                || crate::looks_like_low_signal_generated_copy(&candidate)
+            {
+                continue;
+            }
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Find one file under `root` (bounded depth) whose FILE NAME ends with
+/// `suffix`. Read-dir only — no file is opened to match.
+fn find_file_by_suffix(root: &Path, depth: u8, suffix: &str) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut directories = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            directories.push(path);
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(suffix))
+        {
+            return Some(path);
+        }
+    }
+    // Newest-first would be nicer, but correctness first: any match IS the
+    // session's own file — ids are unique per CLI store.
+    for directory in directories {
+        if let Some(found) = find_file_by_suffix(&directory, depth - 1, suffix) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Codex and Codex-LiteLLM:
+/// the cached yggterm title (LLM chore output, filtered), else the rollout's
+/// first real user prompt. This is what lets the 12-second title chore serve
+/// LIVE codex rows — before it they kept their birth names for the whole
+/// session, because no reader existed to ask the transcript.
+fn read_codex_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    if let Some(title) = cached_session_title(session_id) {
+        return Some(title);
+    }
+    let descriptor = agent_cli_descriptor(SessionKind::Codex)?;
+    let sessions_root = descriptor
+        .store_roots_absolute(home)
+        .into_iter()
+        .next()?;
+    let rollout = find_file_by_suffix(&sessions_root, 4, &format!("-{session_id}.jsonl"))?;
+    title_without_fallbacks(codex_first_real_user_prompt(&rollout))
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for OpenCode: the v2 store's
+/// own title column (opencode2 self-titles every prompted session — measured
+/// 2026-08-30), v1 table as a legacy tail.
+fn read_opencode_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let db_path = home.join(".local/share/opencode/opencode.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    for table in ["session_v2", "session"] {
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT title FROM {table} WHERE id = ?1 LIMIT 1"
+        )) else {
+            continue;
+        };
+        let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+        if let Ok(Some(row)) = rows.next() {
+            let title: Option<String> = row.get(0).ok();
+            if let Some(title) = title
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .filter(|s| !crate::looks_like_generated_fallback_title(s))
+                .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
+            {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Pi: the session jsonl's
+/// own store entry (header id == file name uuid — measured 2026-08-30), whose
+/// title is already extracted and filtered by the scan reader.
+fn read_pi_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let descriptor = agent_cli_descriptor(SessionKind::Pi)?;
+    let sessions_root = descriptor
+        .store_roots_absolute(home)
+        .into_iter()
+        .next()?;
+    let session_file = find_file_by_suffix(&sessions_root, 2, &format!("{session_id}.jsonl"))?;
+    let entry = read_pi_store_entry(&session_file)?;
+    title_without_fallbacks(entry.title)
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Grok Build: the session
+/// directory's own store entry (`summary.json`'s session summary; grok keeps
+/// one directory per session under its URL-encoded cwd roots).
+fn read_grok_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let descriptor = agent_cli_descriptor(SessionKind::GrokBuild)?;
+    let sessions_root = descriptor
+        .store_roots_absolute(home)
+        .into_iter()
+        .next()?;
+    // `.grok/sessions/<encoded-cwd>/<id>/summary.json` — the directory named
+    // for the session sits one level below the glob root.
+    let session_dir = find_dir_by_name(&sessions_root, 2, session_id)?;
+    let entry = read_grok_build_store_entry(&session_dir.join("summary.json"))?;
+    title_without_fallbacks(entry.title)
+}
+
+/// A candidate title that has survived every fallback/placeholder shape check.
+/// One filter chain, so a reader cannot forget one arm.
+fn title_without_fallbacks(title: Option<String>) -> Option<String> {
+    title
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| !crate::looks_like_generated_fallback_title(s))
+        .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
+}
+
+/// Depth-bounded directory search: the directory whose NAME is exactly
+/// `name`. Read-dir only — nothing is opened to match.
+fn find_dir_by_name(root: &Path, depth: u8, name: &str) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut directories = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if entry.file_name().to_str() == Some(name) {
+                return Some(path);
+            }
+            directories.push(path);
+        }
+    }
+    for directory in directories {
+        if let Some(found) = find_dir_by_name(&directory, depth - 1, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn read_muse_live_store_title(home: &Path, session_id: &str) -> Option<String> {
     let db_path = home.join(".local/share/muse/session-index.db");
     if db_path.exists() {
@@ -3962,8 +4266,242 @@ for session_id in ids:
 /// answer for every conversation that has had a turn. A remote row that only
 /// the transcript could name reports `no_title_in_store`, which is true and
 /// cheap; guessing it would have cost a store walk per tick.
-const QWEN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
-    script: QWEN_REMOTE_TITLE_SCRIPT,
+/// The codex/codex-litellm remote title script: find the session's rollout by
+/// file-name suffix and answer the FIRST REAL USER PROMPT — the same skip the
+/// local reader does (`codex_first_real_user_prompt`): the rollout's first
+/// user item is the AGENTS.md/instructions wrapper, never the prompt.
+const CODEX_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+globs = [v for v in argv[:split] if v.strip()]
+ids = [v for v in argv[split + 1:] if v.strip()]
+if not ids:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+WRAPPER_MARKS = ('<user_instructions>', '<environment_context>', '<permissions', '<turn_context>')
+
+def first_real_prompt(path):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+            for i, line in enumerate(fh):
+                if i > 400:
+                    return None
+                try:
+                    v = json.loads(line)
+                except Exception:
+                    continue
+                if v.get('type') != 'response_item':
+                    continue
+                p = v.get('payload') or {}
+                if p.get('role') != 'user':
+                    continue
+                c = p.get('content')
+                if not isinstance(c, list):
+                    continue
+                text = '\n'.join(x.get('text', '') for x in c if isinstance(x, dict))
+                t = text.strip()
+                if not t:
+                    continue
+                low = t.lower()
+                if low.startswith('# agents.md') or low.startswith('<instructions>'):
+                    continue
+                if any(m in low for m in WRAPPER_MARKS):
+                    continue
+                for ln in text.splitlines():
+                    ln = ln.strip()
+                    if not ln or ln.startswith(('#', '<', '`')):
+                        continue
+                    return ln[:120]
+    except Exception:
+        return None
+    return None
+
+for sid in ids:
+    found = None
+    for g in globs:
+        try:
+            matches = home.glob(g)
+        except Exception:
+            continue
+        for p in matches:
+            if p.is_file() and p.name.endswith('-' + sid + '.jsonl'):
+                t = first_real_prompt(p)
+                if t:
+                    found = t
+                    break
+        if found:
+            break
+    if found:
+        print(json.dumps({'session_id': sid, 'candidates': [found]}, ensure_ascii=False))
+"#;
+
+const CODEX_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: CODEX_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
+
+/// Pi's remote twin: the session jsonl's own first user message (transcript
+/// shape: `type:"message"`, `message.role:"user"`, `message.content[].text`).
+const PI_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+globs = [v for v in argv[:split] if v.strip()]
+ids = [v for v in argv[split + 1:] if v.strip()]
+if not ids or not globs:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+
+def first_prompt(path):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+            for i, line in enumerate(fh):
+                if i > 400:
+                    return None
+                try:
+                    v = json.loads(line)
+                except Exception:
+                    continue
+                if v.get('type') != 'message':
+                    continue
+                m = v.get('message') or {}
+                if m.get('role') != 'user':
+                    continue
+                c = m.get('content')
+                if not isinstance(c, list):
+                    continue
+                text = '\n'.join(x.get('text', '') for x in c if isinstance(x, dict))
+                for ln in text.splitlines():
+                    ln = ln.strip()
+                    if not ln or ln.startswith(('#', '<', '`')):
+                        continue
+                    return ln[:120]
+    except Exception:
+        return None
+    return None
+
+for g in globs:
+    try:
+        matches = home.glob(g)
+    except Exception:
+        continue
+    for p in matches:
+        if not p.is_file():
+            continue
+        name = p.stem
+        sid = name.rsplit('_', 1)[-1]
+        if sid in wanted:
+            t = first_prompt(p)
+            if t:
+                print(json.dumps({'session_id': sid, 'candidates': [t]}, ensure_ascii=False))
+"#;
+
+const PI_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: PI_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
+
+/// Grok's remote twin: the session directory's `summary.json` — its own
+/// model-generated title first, the session summary as the fallback, exactly
+/// like the local reader.
+const GROK_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+globs = [v for v in argv[:split] if v.strip()]
+ids = [v for v in argv[split + 1:] if v.strip()]
+if not ids or not globs:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+
+def clean(value):
+    if not isinstance(value, str):
+        return None
+    t = value.strip()
+    return t or None
+
+for g in globs:
+    try:
+        matches = home.glob(g)
+    except Exception:
+        continue
+    for p in matches:
+        try:
+            v = json.load(open(p, 'r', encoding='utf-8', errors='ignore'))
+        except Exception:
+            continue
+        info = v.get('info') or {}
+        sid = info.get('id') or p.parent.name
+        if sid not in wanted:
+            continue
+        candidates = [clean(v.get('generated_title')), clean(v.get('session_summary'))]
+        candidates = [c for c in candidates if c]
+        if candidates:
+            print(json.dumps({'session_id': sid, 'candidates': candidates}, ensure_ascii=False))
+"#;
+
+const GROK_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: GROK_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
+
+/// OpenCode's remote twin: the shared opencode.db's own title column
+/// (session_v2, then the v1 table). The db path is fixed relative to $HOME —
+/// the descriptor declares no store globs, so the locators list is empty and
+/// this script never uses argv's locator half.
+const OPENCODE_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sqlite3, sys
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+ids = [v for v in argv[argv.index('--') + 1:] if v.strip()]
+if not ids:
+    sys.exit(0)
+db = os.path.expanduser('~/.local/share/opencode/opencode.db')
+if not os.path.exists(db):
+    sys.exit(0)
+conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+cur = conn.cursor()
+for sid in ids:
+    row = None
+    for table in ('session_v2', 'session'):
+        try:
+            cur.execute(f'SELECT title FROM {table} WHERE id = ?', (sid,))
+            row = cur.fetchone()
+        except Exception:
+            row = None
+        if row and row[0] and str(row[0]).strip():
+            break
+    if row and row[0]:
+        title = str(row[0]).strip()
+        if title.lower().startswith('new session - '):
+            continue
+        print(json.dumps({'session_id': sid, 'candidates': [title]}, ensure_ascii=False))
+conn.close()
+"#;
+
+const OPENCODE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: OPENCODE_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::HomeRelative(".local/share/opencode/opencode.db"),
+    choose: first_non_empty_candidate,
+};
+
+const QWEN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {    script: QWEN_REMOTE_TITLE_SCRIPT,
     // The title lives in the session's OWN chat file; Qwen keeps no shared index
     // beside it, so there is nothing to union in.
     locators: RemoteStoreLocators::StoreGlobs,
@@ -6179,6 +6717,101 @@ mod tests {
             (agy.choose)(&["<USER_REQUEST>\nRefactor the CSV import\n</USER_REQUEST>".to_string()]),
             Some("Refactor the CSV import".to_string())
         );
+    }
+
+    /// Build a fixture Antigravity home and run one CLI's remote probe against
+    /// it, exactly as the daemon does: locators, `--`, then ids.
+    ///
+    /// ⛔ **The script is the half no other test could reach.** Every lock
+    /// above reads the registry — which locators resolve, that the argv
+    /// separator is honoured — and every one of them was GREEN while the
+    /// script read two stores that are empty for a live row. A probe is only
+    /// wired when something has run it against a store shaped like the real
+    /// one.
+    #[test]
+    fn a_codex_live_title_skips_the_instructions_wrapper() {
+        // Measured 2026-08-30: a codex rollout's FIRST role:"user" item is the
+        // AGENTS.md/instructions block, not the prompt. The live-title reader
+        // must skip the wrapper or every codex row gets titled with the fleet
+        // steer file.
+        let home =
+            std::env::temp_dir().join(format!("yggterm-codex-title-{}", uuid::Uuid::new_v4()));
+        let dir = home.join(".codex/sessions/2026/08/30");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "01a05190-b999-79d1-9f13-1c12abcdef01";
+        let wrapper = r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /home/user/proj\n\n<INSTRUCTIONS>\nfleet laws live here\n</INSTRUCTIONS>"}}]}"##;
+        let prompt = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the agy restart bug please"}]}}"#;
+        let meta = r#"{"type":"session_meta","payload":{"id":"SESSION","cwd":"/home/user/proj"}}"#;
+        std::fs::write(
+            dir.join(format!("rollout-2026-08-30T12-00-00-{id}.jsonl")),
+            format!("{meta}\n{wrapper}\n{prompt}\n"),
+        )
+        .unwrap();
+
+        // The cache lookup consults the machine's real session-titles.db; a
+        // fresh random id cannot be cached there, so the rollout arm answers.
+        assert_eq!(
+            read_codex_live_store_title(&home, id).as_deref(),
+            Some("Fix the agy restart bug please"),
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_opencode_live_title_reads_the_v2_store_and_refuses_placeholders() {
+        let home =
+            std::env::temp_dir().join(format!("yggterm-oc-title-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        let db = home.join(".local/share/opencode/opencode.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE session_v2 (id text PRIMARY KEY, title text)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('ses_ok', 'Continuing the fleet build')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('ses_new', 'New session - 2026-08-30T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_opencode_live_store_title(&home, "ses_ok").as_deref(),
+            Some("Continuing the fleet build"),
+            "opencode2 self-titles prompted sessions; the chore must read it"
+        );
+        assert_eq!(
+            read_opencode_live_store_title(&home, "ses_new"),
+            None,
+            "a never-prompted session's placeholder is not a title"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_grok_live_title_reads_the_session_directory_summary() {
+        let home =
+            std::env::temp_dir().join(format!("yggterm-grok-title-{}", uuid::Uuid::new_v4()));
+        let session_dir = home
+            .join(".grok/sessions/%2Fhome%2Fuser%2Fproj")
+            .join("01a041db-f8f6-7743-ad18-abfcbe13a9b1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("summary.json"),
+            r#"{"info":{"id":"01a041db-f8f6-7743-ad18-abfcbe13a9b1","cwd":"/home/user/proj"},"generated_title":"Parser Edge Case Hardening","session_summary":"Hardened the parser edge cases.","num_messages":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_grok_live_store_title(&home, "01a041db-f8f6-7743-ad18-abfcbe13a9b1").as_deref(),
+            Some("Parser Edge Case Hardening"),
+            "grok's own generated title travels to the live row"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Build a fixture Antigravity home and run one CLI's remote probe against
