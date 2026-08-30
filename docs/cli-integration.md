@@ -1079,3 +1079,78 @@ the user-visible restart bug, one actor deep. Fix next: the launch/ensure path
 must not reset a self-minting row's id to its key's uuid when the two differ
 (rebound), and must re-derive through the vouching builder — with
 `cli/resume_decision` recording every rebirth so the fix is provable.
+
+---
+
+## Issue Heading 29: title integration for every CLI — the heuristic polluter, and live-title readers for the six uncovered CLIs (2026-08-30)
+
+Owner: *only Claude Code's title integration is sort of bullet proof; Codex
+and Muse also fail.*
+
+### Measured map (the messageboard post, ACK-6ad55132b5, carries the same table)
+
+| CLI | Own store title? | yggterm reads it |
+|---|---|---|
+| Claude Code | yes (rollout summaries) | local reader + remote probe — bullet proof |
+| Qwen Code | yes | local reader + remote probe |
+| agy / Antigravity | yes (`conversation_summaries.db`) | local reader + remote probe |
+| OpenCode2 | **yes** (`session_v2.title`, real self-titles) | scanner only — descriptor said `Generated` (drift) |
+| Grok Build | yes (`summary.json` `generated_title`, often empty) | scan only |
+| Codex / Codex-LiteLLM | **no** — owner spec 2026-06-06: yggterm OWNS these | scan only (first prompt / LLM) |
+| Muse | first prompt only (`session-index.db.title`; `New session` when empty) | local reader + remote probe |
+| Pi | no (transcript jsonl only) | scan only |
+| Kimi | none found (`~/.kimi/kimi.json` is a work_dirs map) | dedicated scanner only |
+
+### The polluter (all CLIs): the heuristic arm cached yggterm's own banner
+
+`generate_for_context`/`generate_for_session` fall back to
+`heuristic_title_from_context` when LLM settings are not ready (or when the
+LLM answer is low-signal) — and the heuristic arm **stored and returned its
+answer unfiltered**. The context is often the terminal's own screen, so
+yggterm's attach phrasing ("Muse Code Stays Attached Daemon") and CLI UI lines
+became cached titles in `~/.yggterm/session-titles.db` (source='heuristic'),
+shadowing real store titles on every read. 77 heuristic rows; 31 poisoned;
+purged 2026-08-30 (manual/LLM rows untouched). Fixed at both heuristic sites:
+the same `title_is_low_signal_for_cwd` verdict the LLM arm applies now gates
+store-and-return. Also added to the shared fallback recognizer: opencode2's
+never-prompted shape `New session - <ISO>`.
+
+### Live-title readers wired (the 12-second chore now serves every live row)
+
+`read_live_store_title` existed for only four CLIs; codex, codex-litellm, pi,
+opencode, kimi and grok live rows kept their birth names for a whole session
+(`SkippedNoReader`). Wired, each reusing its CLI's own truth:
+
+* **Codex / Codex-LiteLLM** — cached yggterm title → the rollout's FIRST REAL
+  USER PROMPT (`codex_first_real_user_prompt`): the rollout's first `user`
+  item is the AGENTS.md/instructions wrapper (measured), which the reader
+  skips before cleaning. One remote probe script serves both (per-CLI store
+  globs resolve at runtime).
+* **OpenCode2** — `session_v2.title` by id (v1 table as tail), placeholder
+  shape refused. New `RemoteStoreLocators::HomeRelative` hands the shared db
+  path to the remote probe (no store globs to resolve).
+* **Pi** — the session jsonl's own store entry (header id == file-name uuid).
+* **Grok Build** — the session directory's `summary.json` (generated_title →
+  session_summary).
+* **Kimi** — ⛔ declared gap: no per-session title store found
+  (`~/.kimi/kimi.json` is a work_dirs map); rows stay on the LLM-rescue path.
+
+Coverage locks extended the contract the same commit: a new local reader with
+a remote arm demands a remote probe (codex/pi/grok/opencode probes added);
+codex-litellm correctly carries NO probe — it has no remote arm.
+
+### ⚠ FILED (next unit): the LLM title rescue is codex-gated
+
+`YggtermCore::generate_title_for_session_path` (server/src/lib.rs caller at
+daemon.rs:13754) refuses any transcript that fails `is_codex_session_file`,
+and resolves identity via `read_codex_session_identity` — so the rescue (the
+designed last resort for `TitleAuthority::Generated` kinds) never fires for
+Muse/Pi/Grok/OpenCode/Kimi rows whose own store carries no usable title
+(measured: muse zero-content sessions hold `New session`/`hi`, correctly
+filtered, and then nothing rescues them). Fix shape: a
+`generate_title_for_transcript(session_id, cwd, path, force)` that skips the
+codex identity parse (the caller — the chore candidate — already holds both),
+gates on ANY descriptor's `store_path_is_session_file`, and requires the
+candidate to carry a real transcript path (muse live rows may need the
+`Storage` stamp their reader can already locate via
+`find_muse_session_jsonl_in`).

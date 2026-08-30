@@ -820,6 +820,18 @@ impl SessionTitleResolver {
 
         if !settings_ready(settings) {
             if let Some(title) = heuristic_title_from_context(context) {
+                // ⛔ THE HEURISTIC ARM IS THE POISONER'S MOUTH. `context` is
+                // whatever the caller had — often the terminal's own screen,
+                // which carries YGGTERM's attach/status phrasing ("Muse Code
+                // Stays Attached Daemon") or the CLI's UI lines ("Your Weekly
+                // Limit Left Run"). Caching one of those as a title poisoned
+                // session-titles.db for every reader (measured 2026-08-30,
+                // source='heuristic' rows circulating for weeks). The same
+                // low-signal verdict the LLM arm applies gates the heuristic
+                // arm too: refuse to store or return it.
+                if title_is_low_signal_for_cwd(&title, cwd) {
+                    return Ok(None);
+                }
                 self.store
                     .put_title(session_id, cwd, &title, "heuristic", "heuristic")?;
                 return Ok(Some(title));
@@ -892,6 +904,12 @@ impl SessionTitleResolver {
         }
         if !settings_ready(settings) {
             if let Some(title) = heuristic_title_from_context(&context) {
+                // ⛔ Same gate as `generate_for_context`: the transcript tail
+                // can carry our own banner phrasing; never cache it as a
+                // title (the poisoned source='heuristic' rows of 2026-08-30).
+                if title_is_low_signal_for_cwd(&title, cwd) {
+                    return Ok(None);
+                }
                 self.store
                     .put_title(session_id, cwd, &title, "heuristic", "heuristic")?;
                 return Ok(Some(title));
@@ -1859,6 +1877,33 @@ mod tests {
             heuristic_title_from_context(&context).as_deref(),
             Some("Live Title Generation")
         );
+    }
+
+    #[test]
+    fn a_status_banner_phrase_is_never_cached_as_a_title() -> Result<()> {
+        // THE POISONER'S REGRESSION TEST (2026-08-30): the heuristic arm of
+        // both generate paths used to cache and return yggterm's own banner
+        // phrasing as a title — 'Muse Code Stays Attached Daemon' lived in
+        // session-titles.db for weeks and shaded every reader. The heuristic
+        // arm now applies the same low-signal verdict the LLM arm does.
+        // 'New Session' is fallback-shaped BY THE SAME TABLE the guard asks,
+        // so if the guard is removed this test fails on Some("New Session").
+        let home = temp_title_home("banner-guard");
+        fs::create_dir_all(&home)?;
+        let resolver = SessionTitleResolver::new(&home)?;
+        let titled = resolver.generate_for_context(
+            &AppSettings::default(),
+            "session-banner",
+            "/home/user/gh/yggterm",
+            "new session",
+            false,
+        )?;
+        assert_eq!(
+            titled, None,
+            "a placeholder-shaped heuristic answer must not be stored or returned"
+        );
+        let _ = fs::remove_dir_all(home);
+        Ok(())
     }
 
     fn temp_title_home(name: &str) -> PathBuf {
@@ -3487,6 +3532,9 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let new_muse_placeholder = lower.starts_with("new muse code session")
         || lower.starts_with("new antigravity session")
         || lower == "new session";
+    // opencode2's own never-prompted shape (measured 2026-08-30): the bare
+    // "new session" entry above cannot see the ISO suffix the CLI appends.
+    let opencode_new_session_placeholder = lower.starts_with("new session - ");
     let raw_path_title = compact.starts_with('/') || compact.contains("/home/") || compact.starts_with("c:\\");
 
     prefixed_session_uuid
@@ -3502,6 +3550,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         || yggterm_generic_placeholder
         || yggterm_orch_cli_placeholder
         || new_muse_placeholder
+        || opencode_new_session_placeholder
         || looks_like_low_signal_generated_title(compact)
 }
 

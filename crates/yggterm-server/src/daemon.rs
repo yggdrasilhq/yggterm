@@ -31957,13 +31957,15 @@ mod tests {
             make(
                 "remote-session://example-host/dddd",
                 "dddd",
-                crate::SessionKind::Codex,
+                crate::SessionKind::Kimi,
             ),
         ];
         let working: std::collections::HashSet<String> =
             ["remote-cc://example-host/aaaa".to_string()].into();
         let mut confirmed = std::collections::HashSet::new();
-        // First tick: both remote-cc rows selected (aaaa working, bbbb unconfirmed).
+        // First tick: both remote-cc rows selected (aaaa working, bbbb
+        // unconfirmed). The kimi row is refused with a reason (below) — it is
+        // the declared no-reader gap.
         let picked = super::remote_store_title_poll_decisions(&sessions, &working, &confirmed);
         assert_eq!(
             polled_paths(&picked),
@@ -31971,11 +31973,12 @@ mod tests {
         );
         assert_eq!(picked[0].machine_key, "example-host");
         assert_eq!(picked[0].session_id, "aaaa");
-        // ⛔⛔ THE DEFECT'S OWN ASSERTION. A remote codex row is a CLI with no
-        // measured remote probe: it must be REPORTED as skipped for that
-        // reason, never silently dropped the way the CC-only kind check did.
-        // Silence here is what let a remote row of every other CLI keep its
-        // birth name with nothing anywhere recording the refusal.
+        // ⛔⛔ THE DEFECT'S OWN ASSERTION, retargeted 2026-08-30. Codex (the
+        // original pinned kind) is MEASURED now — its remote rows are polled.
+        // Kimi is the declared no-reader gap: it must be REPORTED as skipped
+        // for that reason, never silently dropped the way the CC-only kind
+        // check did. Silence here is what let a remote row of every other CLI
+        // keep its birth name with nothing anywhere recording the refusal.
         assert_eq!(
             skip_outcome(&picked, "remote-session://example-host/dddd"),
             Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader),
@@ -32156,10 +32159,12 @@ mod tests {
             "the chore the local one handed it to must actually poll it"
         );
 
-        // ⚠ And the honest half: a CLI whose remote store nobody has measured
+        // ⛔ And the honest half: a CLI whose remote store nobody has measured
         // is still served by NOBODY — but it now SAYS so on both sides instead
         // of falling through two `continue`s. A declared gap is findable; a
-        // silent one is what shipped.
+        // silent one is what shipped. Codex was this test's gap until
+        // 2026-08-30; Kimi is the declared gap now (no per-session title
+        // store found to read).
         let codex = make(
             "remote-session://example-host/bbbb",
             "bbbb",
@@ -32171,18 +32176,50 @@ mod tests {
             .expect("the local chore does not serve a remote row");
         assert_eq!(
             detail.get("served_by").and_then(|value| value.as_str()),
+            Some("remote_store_chore"),
+            "codex is MEASURED now: its remote rows are handed to the remote chore"
+        );
+        // The remaining declared gap, and the full-coverage contract: every
+        // remote-armed kind with a local reader is served by the remote chore,
+        // and every kind without a reader is refused WITH A REASON.
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let Some(_) = descriptor.read_live_store_title else {
+                continue;
+            };
+            if !descriptor.has_remote_arm() {
+                continue;
+            }
+            assert!(
+                descriptor.remote_live_store_title.is_some(),
+                "{}: a measured local reader with a remote arm but no remote probe \
+                 titles its remote rows nobody",
+                descriptor.display_name
+            );
+        }
+        let kimi = make(
+            "remote-session://example-host/kimi",
+            "eeee",
+            crate::SessionKind::Kimi,
+        );
+        let kimi_descriptor = yggterm_core::agent_cli::agent_cli_descriptor(kimi.kind)
+            .expect("Kimi is registered");
+        assert!(kimi_descriptor.read_live_store_title.is_none());
+        let (_, detail) = super::local_store_title_skip(kimi_descriptor, &kimi, &working)
+            .expect("the local chore does not serve a remote row");
+        assert_eq!(
+            detail.get("served_by").and_then(|value| value.as_str()),
             Some("nobody"),
             "a CLI with no remote probe must be reported as unserved, not passed \
              to a chore that will drop it"
         );
         let picked = super::remote_store_title_poll_decisions(
-            std::slice::from_ref(&codex),
+            std::slice::from_ref(&kimi),
             &working,
             &confirmed,
         );
         assert!(polled_paths(&picked).is_empty());
         assert_eq!(
-            skip_outcome(&picked, "remote-session://example-host/bbbb"),
+            skip_outcome(&picked, "remote-session://example-host/kimi"),
             Some(yggterm_core::cli_plane::CliTitleOutcome::SkippedNoReader),
             "the reason must reach the trace; a bare `continue` is what hid this \
              defect through a 40,000-event window"
@@ -32195,21 +32232,23 @@ mod tests {
     /// another.
     #[test]
     fn a_local_row_of_a_cli_with_no_measured_reader_says_so() {
+        // Retargeted 2026-08-30: GrokBuild (the original pinned kind) is
+        // MEASURED now — Kimi is the declared no-reader gap.
         let template = {
             let mut server = crate::YggtermServer::new(
                 false,
                 crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
                 yggui_contract::UiTheme::ZedLight,
             );
-            server.start_local_session(crate::SessionKind::GrokBuild, Some("/home/user/proj"), None);
+            server.start_local_session(crate::SessionKind::Kimi, Some("/home/user/proj"), None);
             server.live_sessions()[0].clone()
         };
-        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(crate::SessionKind::GrokBuild)
-            .expect("GrokBuild is registered");
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(crate::SessionKind::Kimi)
+            .expect("Kimi is registered");
         assert!(
             descriptor.read_live_store_title.is_none(),
-            "this test describes the UNMEASURED case; wire Muse's reader and \
-             retarget it rather than deleting it"
+            "this test describes the UNMEASURED case; kimi is the last declared \
+             gap — wire its reader and retarget this rather than deleting it"
         );
         let (outcome, detail) =
             super::local_store_title_skip(descriptor, &template, &std::collections::HashSet::new())
