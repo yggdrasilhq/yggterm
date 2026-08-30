@@ -990,3 +990,92 @@ separator, so it needs converting before RFC-3339 will accept it, and
 never-written rows carry `0001-01-01` and clamp to 0. Every row used to be
 stamped with the DB **file's** mtime — one shared fake recency for the whole
 store, which moved every time the CLI touched it.
+
+---
+
+## Issue Heading 28: agy (Antigravity) restart births a fresh conversation; startpage under-shows live agy sessions (2026-08-30)
+
+Owner symptoms: *row title and metadata not integrated with agy; on restart the
+agy session dies and either a new agy session is spawned or a buggy-titled one
+spawns which says the original session is still owned by a PID and continuing
+would corrupt the transcript; startpage and folders do not correctly reflect
+agy sessions.*
+
+### Root causes, measured 2026-08-30 on the live store
+
+1. **Restart → fresh conversation (the rebind gap).** agy mints its
+   conversation id POST-first-turn (`id_assigned_at_birth: false`): the birth
+   command carries NO id, so the runtime-identity rebind's string-replace
+   (`repoint_stored_launch_command_session_id`) was a no-op, no `Storage` stamp
+   ever existed for the row, and restore kept the id-less birth command — the
+   first cold attach after every restart spawned a NEW conversation under the
+   old row's title while the real transcript was orphaned. Fixed twice over:
+   the rebind now rebuilds the command through the vouching builder
+   (`apply_agent_runtime_session_id_to_live_session`), and restore gained the
+   self-minting kinds' arm (rebound id ⇒ resume command, phantom ⇒ traced
+   re-birth).
+2. **The "owned by a PID / transcript corrupt" warning = our gate was
+   codex-shaped.** `agent_resume_args_match_session` routed every kind but
+   Claude Code through the codex matcher, so an `agy --conversation <id>`
+   holder was invisible to the second-resume gate (`ensure_remote_runtime_agent_session`,
+   `wait_for_external_agent_resume_to_clear`); the second spawn reached agy and
+   agy printed its own corruption warning. The gate is now descriptor-driven
+   (`descriptor_resume_args_match_session`): binary + `resume_selector_token()`
+   + id, the same SSOT the composer reads — agy AND muse holders are now seen,
+   classified (external vs stranded-yggterm-owned) and refused with the
+   PID-naming message.
+3. **Startpage/cwdtree hid every LIVE agy conversation.** The scan's retain
+   gate used `conversation_summaries` as the sole durability witness, but agy
+   writes the index row LATE — measured this day, both of the day's live
+   conversations had NO row while their brain transcripts held turns. The gate
+   now follows the membership probe's law: the DB verdict stands for ids it
+   KNOWS (the 2026-07-14 batch burst stays hidden); for an id it has never
+   heard of, the artifact decides — a transcript (not a birth-minted
+   `conversations/<id>.db`) is evidence. The remote ssh mirror
+   (`REMOTE_AGY_SCAN_SCRIPT`) changed in lockstep.
+4. **The live-title reader's third fallback was doubly dead** (old
+   `transcript.jsonl` spelling against every root — 552 of ~607 brain dirs hold
+   only `transcript_full.jsonl`), so rows with an empty summaries title AND no
+   history line fell to the LLM rescue as if the store had nothing — e.g. a
+   live row wearing `Remote Antigravity 514c4d23` while its transcript held the
+   real first prompt. The reader now tries `transcript_full.jsonl` first per
+   root. (Kept: the any-scratch durability rule — re-measured, the 499
+   mixed-root rows are ALL the old batch burst, "Transcribe Video File
+   Content" ×84; the rule is correct.)
+5. **WAL blind-read hardening.** `antigravity_durable_ids` swallows per-row
+   errors (`rows.flatten()`) and had no busy timeout: a store read that failed
+   halfway answered with the rows it managed to read — a truncated index
+   reading as truth. Now: 400 ms busy timeout, any row error fails OPEN
+   (`None`), and the scan probe records `db_readable:false`.
+
+### The probe battery (cli-integration plane)
+
+Wired and registered (registered == wired — dead names mislead):
+`cli/scan` (per-agy-scan counts: `db_present/db_readable/db_rows/db_durable/
+walked/retained/rows/home_cwd`), `cli/scan_total` (duration + per-kind row
+counts — the first record to read when startpage/cwdtree disagree with the
+store), `cli/resume_decision` (per resume: slug, vouch `vouched|absent|
+unanswerable`, action `resume|rebirth`), plus the pre-existing `cli/codex_geometry`.
+Battery for a live agy pass:
+
+```sh
+ytrace attach --app yggterm 'cli/scan -> @count keep slug,db_readable,rows,retained'
+ytrace attach --app yggterm 'cli/resume_decision -> @count by payload.action,payload.vouch'
+ytrace attach --app yggterm 'cli where payload.slug == "agy" -> @count by payload.name'
+```
+
+### ⚠ FILED, NOT FIXED: the restart round-trip has a later actor that recomposes from the key
+
+At the state layer (`a_rebound_agy_row_restores_as_the_resume_its_conversation_names`,
+2026-08-30): rebind rebuilds the resume ✓, persist carries the rebound id ✓,
+`restored_local_runtime_id` resolves it ✓ — but a later actor in the same
+round-trip recomposes the row from its KEY: the persist-side repair pass inside
+`persisted_state_for_update_restart` re-restores a key-id row, and the
+post-restore launch of the active row recomposes a fresh birth command
+(`agy '<preset flags>'`, no selector) over the rebuilt resume, resetting
+`session.id` to the key uuid. `local_runtime_id_from_key(key)` then vouches
+`Some(false)` (the birth uuid is agy's phantom) ⇒ re-birth ⇒ fresh spawn —
+the user-visible restart bug, one actor deep. Fix next: the launch/ensure path
+must not reset a self-minting row's id to its key's uuid when the two differ
+(rebound), and must re-derive through the vouching builder — with
+`cli/resume_decision` recording every rebirth so the fix is provable.

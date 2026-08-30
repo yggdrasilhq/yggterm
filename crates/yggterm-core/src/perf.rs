@@ -89,13 +89,17 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }
-        // Per-CLI wiring faults (Claude gold, Muse bad, agy + all others, codex hiccups) — same ytrace bus.
+        // Per-CLI wiring faults — same ytrace bus. Registered == wired: a name
+        // here that nothing emits is a probe that refuses attach after a fresh
+        // start and lies about coverage. `codex_geometry` (viewport squish
+        // repair), `resume_decision` (the resume-or-rebirth fork every non-CC
+        // resume passes through), `scan`/`scan_total` (the per-CLI store-scan
+        // counts that verdict startpage/cwdtree truth).
         for probe in [
-            "cli/agy_title",
-            "cli/agy_resume",
             "cli/codex_geometry",
-            "cli/codex_resume",
-            "cli/persisted_identity",
+            "cli/resume_decision",
+            "cli/scan",
+            "cli/scan_total",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }

@@ -664,6 +664,58 @@ pub fn emit_birth(
     crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "birth", payload);
 }
 
+/// What the store answered when the composer asked it to vouch for a resume
+/// id — the third moment of a CLI row's life in v2 grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliResumeVouch {
+    /// The CLI's own store holds the id: resume it.
+    Vouched,
+    /// Consulted and absent: re-birth the row rather than resume a phantom.
+    /// This is the arm that prevents agy's silent empty-replacement
+    /// conversation (`warning: conversation … not found` → brand-new
+    /// session, exit 0).
+    Absent,
+    /// The store could not be read; resume anyway (the fail-open contract —
+    /// re-birthing because a store could not be READ would destroy live
+    /// sessions on every remote row).
+    Unanswerable,
+}
+
+impl CliResumeVouch {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vouched => "vouched",
+            Self::Absent => "absent",
+            Self::Unanswerable => "unanswerable",
+        }
+    }
+}
+
+/// The resume-or-rebirth decision, emitted at the ONE builder every non-CC
+/// resume flows through, so a phantom resume — the silent-conversation-
+/// replacement class — is a count on a probe instead of a missing transcript
+/// somebody notices later. Bounded by row-open events, not by ticks.
+pub fn emit_resume_decision(
+    component: &str,
+    kind: SessionKind,
+    session_id: &str,
+    vouch: CliResumeVouch,
+    re_birth: bool,
+) {
+    if agent_cli_descriptor(kind).is_none() {
+        return;
+    }
+    let payload = json!({
+        "session_id": session_id,
+        "slug": slug_of(kind),
+        "kind": format!("{kind:?}"),
+        "vouch": vouch.label(),
+        "action": if re_birth { "rebirth" } else { "resume" },
+        "id_origin": CliIdOrigin::declared_for(kind).label(),
+    });
+    crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "resume_decision", payload);
+}
+
 /// A persisted row was restored, and RE-KEYED on the way in.
 ///
 /// The fourth moment of a CLI row's life, and the one that had no vocabulary at
