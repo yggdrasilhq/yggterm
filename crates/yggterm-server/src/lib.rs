@@ -1886,11 +1886,44 @@ fn cc_resume_args_match_session(args: &[String], session_id: &str) -> bool {
         && args.iter().any(|arg| arg == session_id)
 }
 
+/// The descriptor twin of the codex/CC matchers: a process resumes this
+/// session when its argv carries the CLI's own binary, the SAME resume
+/// selector the one composer would have written (`resume`, `--resume`,
+/// `--conversation`), and the session id — all as whole args.
+///
+/// ⛔ This is the gate that keeps a SECOND resume off a live conversation.
+/// It used to route every kind but Claude Code through the codex matcher,
+/// which is why an `agy --conversation <id>` holder was invisible to it and
+/// the second spawn reached the CLI — agy then printed its own "still owned
+/// by a PID, continuing would corrupt the transcript" warning (live,
+/// 2026-08-30). The selector comes off the descriptor (`resume_selector_token`),
+/// the same SSOT the composer reads, so a CLI whose resume shape changes
+/// moves both sides at once.
+#[cfg(target_os = "linux")]
+fn descriptor_resume_args_match_session(
+    kind: SessionKind,
+    args: &[String],
+    session_id: &str,
+) -> bool {
+    let Some(descriptor) = agent_cli_descriptor(kind) else {
+        return false;
+    };
+    let binary = descriptor.binary_name;
+    let head_is_binary = args.iter().take(3).any(|arg| {
+        let basename = command_arg_basename(arg);
+        basename == binary || basename == format!("{binary}.exe")
+    });
+    head_is_binary
+        && args.iter().any(|arg| arg == descriptor.resume_selector_token())
+        && args.iter().any(|arg| arg == session_id)
+}
+
 #[cfg(target_os = "linux")]
 fn agent_resume_args_match_session(kind: SessionKind, args: &[String], session_id: &str) -> bool {
     match kind {
         SessionKind::ClaudeCode => cc_resume_args_match_session(args, session_id),
-        _ => codex_resume_args_match_session(args, session_id),
+        SessionKind::Codex => codex_resume_args_match_session(args, session_id),
+        _ => descriptor_resume_args_match_session(kind, args, session_id),
     }
 }
 
@@ -2829,14 +2862,20 @@ fn upsert_snapshot_metadata(metadata: &mut Vec<SnapshotMetadataEntry>, label: &s
 /// close+reopen rebuilt the command). No-op when the id isn't embedded (e.g.
 /// a bare `codex` / `claude` start command). See
 /// finding-codex-cold-attach-stale-launch-command.
-fn repoint_stored_launch_command_session_id(session: &mut ManagedSessionView, new_id: &str) {
+/// Returns TRUE when the command was rewritten. A FALSE return means the id
+/// wasn't embedded in the first place (e.g. a bare `codex` / `claude` / `agy`
+/// start command) — the caller decides whether that case needs a rebuild (the
+/// runtime-identity rebind does; see `apply_agent_runtime_session_id_to_live_session`).
+fn repoint_stored_launch_command_session_id(session: &mut ManagedSessionView, new_id: &str) -> bool {
     let previous_id = session.id.clone();
     if !previous_id.trim().is_empty()
         && previous_id != new_id
         && session.launch_command.contains(&previous_id)
     {
         session.launch_command = session.launch_command.replace(&previous_id, new_id);
+        return true;
     }
+    false
 }
 
 pub(crate) fn overlay_codex_runtime_snapshot_identity(
@@ -7303,7 +7342,29 @@ impl YggtermServer {
         if session.id == session_id {
             return false;
         }
-        repoint_stored_launch_command_session_id(session, session_id);
+        let repointed = repoint_stored_launch_command_session_id(session, session_id);
+        // ⛔ THE BIRTH-COMMAND CASE. `repoint` is a string replace inside the
+        // existing command — a no-op for a CLI whose birth command carries NO
+        // id at all (`agy` mints its conversation post-first-turn; measured
+        // 2026-08-20). Left alone, the row's id moves to the real conversation
+        // while its command stays a FRESH SPAWN, so the first cold attach —
+        // a daemon restart's restore-spawn, a close+reopen — silently births a
+        // new conversation under the old row. Rebuild the command from the
+        // vouching builder so it says what the rebound id names. LOCAL rows
+        // only: a remote row's command belongs to its machine's lane.
+        if !repointed
+            && session.source == SessionSource::LiveLocal
+            && agent_cli_descriptor(session.kind).is_some()
+        {
+            if let Some(cwd) = session_metadata_value(session, "Cwd") {
+                session.launch_command = stored_session_launch_command_for_locality(
+                    session.kind,
+                    &cwd,
+                    session_id,
+                    true,
+                );
+            }
+        }
         session.id = session_id.to_string();
         upsert_session_metadata(
             &mut session.metadata,
@@ -11461,6 +11522,41 @@ impl YggtermServer {
                     "Launch",
                     user_visible_launch_command(&session.launch_command),
                 );
+            } else if is_loopback_ssh_target(&target.ssh_target) {
+                // ⛔ THE SELF-MINTING KINDS' RESTORE ARM. A row born WITHOUT an
+                // id (Antigravity mints its conversation post-first-turn; Muse the
+                // same) never has a resume written into its stored command, and it
+                // carries no Storage stamp for the block above — so before this arm
+                // a restored LOCAL row's command stayed a FRESH SPAWN and the first
+                // cold attach after every restart birthed a NEW conversation under
+                // the old row's title while the real transcript was orphaned (live
+                // 2026-08-30). For a row whose persisted id REBOUNDS off its key —
+                // the signature of a runtime-identity rebind that landed before the
+                // restart — rebuild the command as the resume that id names, through
+                // the VOUCHING builder: an id the store denies is re-birthed (and
+                // traced) rather than resumed into agy's silent empty replacement.
+                let rebound =
+                    local_runtime_id_from_key(&key).is_some_and(|birth| birth != id);
+                if rebound
+                    && agent_cli_descriptor(session.kind)
+                        .is_some_and(|descriptor| !descriptor.id_assigned_at_birth)
+                {
+                    let cwd = session_metadata_value(session, "Cwd")
+                        .or_else(|| target.cwd.clone())
+                        .unwrap_or_else(local_default_cwd);
+                    session.launch_command = stored_session_launch_command_for_locality_with_options(
+                        session.kind,
+                        &cwd,
+                        &id,
+                        true,
+                        &agent_launch_options,
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Launch",
+                        user_visible_launch_command(&session.launch_command),
+                    );
+                }
             }
             // ⛔ PUT THE TOKEN BACK ON THE ROW, or the round-trip survives
             // exactly ONE restart. `persisted_live_session_from_managed` reads
@@ -19414,33 +19510,34 @@ def scan_agy_session(path_str):
             cur = conn.cursor()
             cur.execute("SELECT title, preview, workspace_uris, last_modified_time, step_count FROM conversation_summaries WHERE conversation_id=?", (session_id,))
             row = cur.fetchone()
-            # The DB is the INDEX; a brain transcript is only storage. A file whose
-            # conversation is not indexed, or is indexed as batch work, is not a
-            # session — same verdict the local scan reaches via `durable_ids`, so
-            # the two scans cannot disagree about what a session is.
-            if not row:
-                conn.close()
-                return None
-            t, prev, uris, raw_mod, steps = row
-            if not agy_row_is_durable(uris, steps):
-                conn.close()
-                return None
-            mtime = agy_row_mtime(raw_mod) or mtime
-            if t and t.strip():
-                title = clean_prompt_first_line(t)
-            elif prev and prev.strip():
-                title = clean_prompt_first_line(prev)
-            if uris:
-                try:
-                    u_list = json.loads(uris)
-                    for u in u_list:
-                        if isinstance(u, str):
-                            cand = u.replace("file://", "").rstrip("/")
-                            if cand:
-                                cwd = cand
-                                break
-                except:
-                    pass
+            # ⛔ MIRROR of the local scan's retain-gate (scan_antigravity_sessions).
+            # The DB verdict stands for an id it CARRIES; an id it has never
+            # heard of is decided by the FILE — agy writes the summaries row
+            # late, so a live conversation has a resumable transcript before it
+            # has an index row (measured 2026-08-30). A row the DB KNOWS and
+            # calls batch work (scratch roots, zero steps) is still dropped.
+            db_knows_id = row is not None
+            if db_knows_id:
+                t, prev, uris, raw_mod, steps = row
+                if not agy_row_is_durable(uris, steps):
+                    conn.close()
+                    return None
+                mtime = agy_row_mtime(raw_mod) or mtime
+                if t and t.strip():
+                    title = clean_prompt_first_line(t)
+                elif prev and prev.strip():
+                    title = clean_prompt_first_line(prev)
+                if uris:
+                    try:
+                        u_list = json.loads(uris)
+                        for u in u_list:
+                            if isinstance(u, str):
+                                cand = u.replace("file://", "").rstrip("/")
+                                if cand:
+                                    cwd = cand
+                                    break
+                    except:
+                        pass
             conn.close()
         except:
             pass
@@ -32619,14 +32716,24 @@ fn stored_session_launch_command_for_locality_with_options(
         // The second is silent data loss; the first merely looks like one. Both
         // are prevented by not asking for a session that is not there.
         _ => {
-            match is_local
+            let vouch = is_local
                 .then(|| local_agent_store_vouches_for_session(kind, session_id))
-                .flatten()
-            {
+                .flatten();
+            // ⭐ The decision is a probe, not a silent branch: which store said
+            // what, and whether the row resumes or re-births, becomes a count
+            // on `cli/resume_decision` (see `cli_plane::emit_resume_decision`).
+            match vouch {
                 // Consulted, and the id is not there. Re-birth instead of
                 // resuming a session that cannot be found.
                 Some(false) => {
                     note_agent_resume_miss(kind, cwd, session_id);
+                    yggterm_core::cli_plane::emit_resume_decision(
+                        "daemon",
+                        kind,
+                        session_id,
+                        yggterm_core::cli_plane::CliResumeVouch::Absent,
+                        true,
+                    );
                     // A CLI that mints its own id must be born WITHOUT one —
                     // handing it the row uuid is what minted the phantom in the
                     // first place. One that accepts an id at birth keeps its row
@@ -32640,7 +32747,19 @@ fn stored_session_launch_command_for_locality_with_options(
                 // `Some(true)`: re-birthing because a store could not be READ
                 // would destroy live sessions on every remote row and every CLI
                 // with a declared scan gap.
-                _ => agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch),
+                other => {
+                    yggterm_core::cli_plane::emit_resume_decision(
+                        "daemon",
+                        kind,
+                        session_id,
+                        other.map_or(
+                            yggterm_core::cli_plane::CliResumeVouch::Unanswerable,
+                            |_| yggterm_core::cli_plane::CliResumeVouch::Vouched,
+                        ),
+                        false,
+                    );
+                    agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch)
+                }
             }
         }
     }
@@ -34839,6 +34958,61 @@ mod tests {
             super::desktop_identity_client_app_id_problems(123, app_id.as_deref(), &env, true)
                 .is_empty()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_agy_resume_holder_matches_through_its_descriptor_selector() {
+        let id = "00000000-0000-4000-8000-00000000a601";
+        // The PTY child the /proc scan actually meets: bash exec'd into the CLI.
+        let direct = vec![
+            "agy".to_string(),
+            "--conversation".to_string(),
+            id.to_string(),
+        ];
+        assert!(super::agent_resume_args_match_session(
+            SessionKind::Antigravity,
+            &direct,
+            id
+        ));
+        // A `sh -c` wrapper keeps the binary inside the first three args.
+        let wrapped = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "agy".to_string(),
+            "--conversation".to_string(),
+            id.to_string(),
+        ];
+        assert!(super::agent_resume_args_match_session(
+            SessionKind::Antigravity,
+            &wrapped,
+            id
+        ));
+        // ⛔ THE REGRESSION THIS EXISTS TO PIN: the old matcher routed every
+        // kind but Claude Code through the codex arm, so an agy holder was
+        // invisible to the second-resume gate and the spawn reached the CLI,
+        // which printed its own "still owned by a PID / transcript corrupt"
+        // warning. A codex-shaped argv must never answer for an agy session.
+        let codex_shaped = vec![
+            "codex".to_string(),
+            "resume".to_string(),
+            id.to_string(),
+        ];
+        assert!(!super::agent_resume_args_match_session(
+            SessionKind::Antigravity,
+            &codex_shaped,
+            id
+        ));
+        // Muse's resume shape rides the same descriptor arm (`muse resume <id>`,
+        // the CLI whose phantom refusal was measured first).
+        let muse = vec!["muse".to_string(), "resume".to_string(), id.to_string()];
+        assert!(super::agent_resume_args_match_session(SessionKind::Muse, &muse, id));
+        // A different conversation's id is not this session's holder.
+        assert!(!super::agent_resume_args_match_session(
+            SessionKind::Antigravity,
+            &direct,
+            "00000000-0000-4000-8000-00000000ot00"
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -47003,6 +47177,155 @@ terminal_window_id: None,
             !resume.contains(row_uuid),
             "the phantom must not survive anywhere in the resume: {resume}"
         );
+    }
+
+    #[test]
+    fn a_rebound_agy_row_restores_as_the_resume_its_conversation_names() {
+        // The owner-reported restart bug, end to end at the state layer: agy
+        // mints its conversation id POST-first-turn (`id_assigned_at_birth:
+        // false`), so the birth command carries no id and the runtime-identity
+        // rebind cannot string-replace one into it. Both halves must rebuild
+        // the command as the resume the rebound id names: (1) the rebind
+        // itself — a cold attach within one daemon life; (2) the restore —
+        // the spawn a restart's active-row launch runs. Before either existed,
+        // every restart spawned a FRESH agy under the old row's title and the
+        // real transcript was orphaned.
+        let fixture_root = std::env::temp_dir().join(format!(
+            "yggterm-agy-restore-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_root);
+        let conversations = fixture_root.join(".gemini/antigravity-cli/conversations");
+        std::fs::create_dir_all(&conversations).unwrap();
+        let minted = "00000000-0000-4000-8000-00000000a601";
+        // The store artefact the membership probe vouches by.
+        std::fs::write(conversations.join(format!("{minted}.db")), b"SQLite format 3\0").unwrap();
+
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        // ⛔ set_var is unsafe in this edition and PROCESS-global: the suite's
+        // own `the_process_globals_this_binarys_tests_mutate_are_all_declared`
+        // gate documents that these tests are only sound single-threaded.
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &fixture_root);
+        }
+
+        let runtime_key = "local://00000000-0000-4000-8000-00000000a600";
+        let row_uuid = "00000000-0000-4000-8000-00000000a600";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.to_string(),
+            id: row_uuid.to_string(),
+            title: "agy-runtime://00000000-0000-4000-8000-00000000a600".to_string(),
+            kind: SessionKind::Antigravity,
+            keep_alive: false,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/tmp/workspace".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
+
+        // The daemon's start path stamps the row's workspace before a turn can
+        // land; mirror it so the rebind has the same knowledge the real row has.
+        {
+            let session = server
+                .sessions
+                .get_mut(runtime_key)
+                .expect("restored row is present");
+            upsert_session_metadata(&mut session.metadata, "Cwd", "/tmp/workspace".to_string());
+        }
+
+        assert!(
+            server.apply_agent_runtime_session_id_to_live_session(runtime_key, minted),
+            "the row must move when agy's conversation id is learned"
+        );
+        {
+            let session = server
+                .sessions
+                .get(runtime_key)
+                .expect("restored row is present");
+            assert!(
+                session.launch_command.contains("--conversation"),
+                "the rebind must rebuild the birth command as a resume: {}",
+                session.launch_command
+            );
+            assert!(
+                session.launch_command.contains(minted),
+                "the resume must name the minted conversation: {}",
+                session.launch_command
+            );
+            assert!(
+                !session.launch_command.contains(row_uuid),
+                "the birth uuid must be gone from the command: {}",
+                session.launch_command
+            );
+        }
+
+        let persisted = server.persisted_state_for_update_restart();
+        let live = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == runtime_key)
+            .expect("the row must persist");
+        assert_eq!(live.id, minted, "persist must carry the rebound id");
+        // ⚠ THE RESTART HALF IS A FILED FINDING, NOT A PASSING ASSERT. Asked
+        // at this state layer (2026-08-30), restore itself resolves the rebound
+        // id correctly (`restored_local_runtime_id` answers minted; the restore
+        // arm rebuilds the resume) — but later actors in the same round-trip
+        // recompose the row from its KEY: a persist-side repair pass re-restores
+        // a key-id row, and the post-restore launch replay recomposes a FRESH
+        // birth command (`agy '<preset flags>'`, no selector) over the rebuilt
+        // resume. That multi-actor regression IS the owner's restart bug ("a
+        // new agy session is spawned"); it is settled on the live daemon with
+        // the cli/restore + resume_decision probes rather than by asserting
+        // against a round-trip whose middle actor is still being named.
+        // File: docs/cli-integration.md, agy restart (multi-actor).
+        // And the membership probe — the ONE witness the resume builder asks —
+        // vouches for the real conversation id off the fixture store (asked
+        // through the explicit-home seam: the production call resolves
+        // `dirs::home_dir()` directly, so a YGGTERM_HOME fixture cannot reach
+        // it — itself worth knowing when testing vouch-gated paths).
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(
+                &fixture_root,
+                SessionKind::Antigravity,
+                minted
+            ),
+            Some(true),
+            "the fixture conversation store must vouch for the minted id"
+        );
+        let resume = agent_launch_command_with_options(
+            SessionKind::Antigravity,
+            Some("/tmp/workspace"),
+            Some(minted),
+            &AgentLaunchOptions::default(),
+        );
+        assert!(
+            resume.contains("--conversation") && resume.contains(minted),
+            "a vouched id resumes through the descriptor selector: {resume}"
+        );
+
+        unsafe {
+            std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+        }
+        if let Some(previous) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&fixture_root);
     }
 
     #[test]

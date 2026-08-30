@@ -2532,16 +2532,30 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
     }
 
     if let Some(desc) = descriptor {
+        // ⛔ TWO DEAD PATHS USED TO MEET HERE. The glob corrected to
+        // `transcript_full.jsonl` on 2026-08-20 (the old spelling matched 0 of
+        // 497 brain dirs) and the per-root layout puts the transcript under the
+        // `brain/` root — yet this fallback kept asking every root for the OLD
+        // spelling, so every row with an empty summaries title AND no history
+        // line fell through to the LLM rescue as if the store had nothing.
+        // Try the measured spelling first, keep the old one as a legacy tail.
         for root in desc.store_roots_absolute(home) {
-            let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");
-            if candidate.exists() {
-                if let Some(entry) = desc.store_entry(&candidate) {
-                    if let Some(t) = entry.title.filter(|t| !t.trim().is_empty()) {
-                        return Ok(Some(t));
-                    }
-                    if let Some(d) = entry.detail.filter(|d| !d.trim().is_empty()) {
-                        if let Some(t) = clean_agy_prompt_first_line(&d).or_else(|| crate::best_effort_title_from_context(&d)) {
+            for file_name in ["transcript_full.jsonl", "transcript.jsonl"] {
+                let candidate = root
+                    .join(session_id)
+                    .join(".system_generated/logs")
+                    .join(file_name);
+                if candidate.exists() {
+                    if let Some(entry) = desc.store_entry(&candidate) {
+                        if let Some(t) = entry.title.filter(|t| !t.trim().is_empty()) {
                             return Ok(Some(t));
+                        }
+                        if let Some(d) = entry.detail.filter(|d| !d.trim().is_empty()) {
+                            if let Some(t) = clean_agy_prompt_first_line(&d)
+                                .or_else(|| crate::best_effort_title_from_context(&d))
+                            {
+                                return Ok(Some(t));
+                            }
                         }
                     }
                 }

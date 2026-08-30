@@ -192,7 +192,7 @@ are profiling).
   `cwd_tree` occurrence is required dual presence, while two of either is a
   per-view defect.
 - `ytrace tail --category cli --since 30m --json` — the universal CLI chain:
-  `birth`, `launch`, `identity_poll`, `title`/`title_sweep`,
+  `birth`, `launch`, `resume_decision`, `identity_poll`, `title`/`title_sweep`,
   `projection`/`projection_sweep`, `restore`, plus the on-demand
   `startpage_observers/faithful_read`. That Startpage event separates its
   bounded GUI witnesses (`daemon_snapshot_available`, `app_state_available`,
@@ -202,6 +202,15 @@ are profiling).
   on its birth id without another state change. `projection` carries no title
   text, only title quality and kind/icon agreement; the sweep names every
   registered CLI even when its row count is zero.
+  `resume_decision` (2026-08-30) records the resume-or-rebirth fork with the
+  store's vouch verdict (`vouched|absent|unanswerable`) for every non-CC
+  resume — a rebirth of a rebound id is the restart-spawns-a-new-session bug,
+  visible here instead of as a missing transcript. `cli/scan` /
+  `cli/scan_total` carry the per-CLI store-scan counts
+  (`db_rows/db_durable/walked/retained/home_cwd`) — when startpage or the cwd
+  tree disagrees with the store, read these first: counts here mean the
+  divergence was born in the scan; counts here but not on screen mean the
+  projection.
 - **`identity_*` events are the identity-provenance witnesses** (Pass 0):
   `identity_runtime_overlay` fires whenever a row's birth id is REWRITTEN to the
   real CLI id (codex/claude overlays) — `from_id`/`to_id` both named, so a row

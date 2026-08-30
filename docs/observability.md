@@ -70,11 +70,19 @@ sampling policy and clock are attached before the first emission:
 | attach faults | `terminal_mount/retained_rehydrate_{skipped_live_connected,skipped_pre_resize,skipped_inactive,begin,empty,retry_scheduled,refused}` | wall | always |
 | title lifecycle | `title/{untitled_session,resolve_attempt,llm_rescue,cli_store_hit,generation}` | wall | always |
 | input latency | `input/{keystroke,pty,render,loop_block,unconsumed}` | wall | always |
-| per-CLI wiring | `cli/{agy_title,agy_resume,codex_geometry,codex_resume,persisted_identity}` | wall | always |
+| per-CLI wiring | `cli/{codex_geometry,resume_decision,scan,scan_total}` | wall | always |
 | web surface & sidebar | `web_surface/{liveness,lifecycle}`, `sidebar/liveness` | wall | always |
 
 `resource_governor.rs:59` registers three more from the daemon: `row_resource/{hot,oom}` (cpu) and
 `daemon/resource_governor` (wall).
+
+⚖ **Registered == wired.** A name in the table that nothing emits is a probe that refuses attach
+after a fresh start and lies about coverage — the 2026-08-30 agy pass replaced four registered-but-
+never-emitted `cli/*` names with the four now wired: `cli/scan` (per-agy-scan counts: DB rows, DB
+durable, walked, retained, home-cwd fallbacks — the startpage/cwdtree lie detector's input),
+`cli/scan_total` (one record per whole scan: duration + per-kind row counts),
+`cli/resume_decision` (the resume-or-rebirth fork with the store's vouch verdict, from
+`cli_plane::emit_resume_decision`), and `cli/codex_geometry` (pre-existing, viewport squish repair).
 
 Every `render/*` sample carries both web-surface planes. The reconciler plane is
 `web_surface_views_{visible,stashed}`. The engine readback plane is

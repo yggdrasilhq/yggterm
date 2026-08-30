@@ -255,6 +255,7 @@ pub fn take_durable_scan_memo_counts() -> (usize, usize, usize) {
 /// one entry per readable session file, using the descriptor's own
 /// `read_store_entry` so title/cwd semantics stay single-sourced.
 pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
+    let scan_started = std::time::Instant::now();
     let mut out = Vec::new();
     let mut seen_paths = HashSet::<PathBuf>::new();
     // Generation check FIRST, before a single file is read: a title written
@@ -328,6 +329,26 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
         let mut memo = durable_scan_memo().lock().unwrap_or_else(|e| e.into_inner());
         memo.rows.retain(|path, _| seen_paths.contains(path));
     }
+    // ⭐ The whole-scan witness: one record per scan naming how many durable
+    // rows each CLI contributed and what the scan cost. When the startpage or
+    // the cwd tree disagrees with what a shell in the store can see, this is
+    // the first record to read — it says whether the divergence was born in
+    // the scan (counts here) or in the projection (counts here but not on
+    // screen).
+    let mut by_kind = std::collections::BTreeMap::<String, usize>::new();
+    for row in &out {
+        *by_kind.entry(format!("{:?}", row.kind)).or_default() += 1;
+    }
+    crate::perf::ytrace_emit_event(
+        "startpage",
+        "cli",
+        "scan_total",
+        serde_json::json!({
+            "duration_ms": scan_started.elapsed().as_millis() as u64,
+            "rows": out.len(),
+            "by_kind": by_kind,
+        }),
+    );
     out
 }
 
@@ -622,11 +643,20 @@ pub fn antigravity_row_is_durable(workspace_uris: &str, step_count: i64) -> bool
     !roots.iter().any(|root| crate::path_is_ephemeral_scratch(root))
 }
 
-/// The conversation ids the summaries DB says are resumable sessions.
-///
+/// The conversation ids the summaries DB says are resumable sessions, with the
+/// counts the scan probe reports. `known` is EVERY id the DB carries a row
+/// for, durable or not — it is what separates "the DB judged this id and
+/// found it unworthy" (stay hidden) from "the DB has never heard of this id"
+/// (the artifact decides).
+struct AntigravityDurabilityIndex {
+    durable: HashSet<String>,
+    known: HashSet<String>,
+    rows_seen: usize,
+}
+
 /// Returns `None` when there is no readable DB, which is the signal to leave
 /// the file walk ungated rather than silently show nothing.
-fn antigravity_durable_ids(db_path: &Path) -> Option<HashSet<String>> {
+fn antigravity_durable_ids(db_path: &Path) -> Option<AntigravityDurabilityIndex> {
     if !db_path.exists() {
         return None;
     }
@@ -637,6 +667,10 @@ fn antigravity_durable_ids(db_path: &Path) -> Option<HashSet<String>> {
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
+    // ⛔ The store is WAL and agy holds it open while it runs. A read-only
+    // reader that meets a busy write answers NOTHING rather than an error it
+    // could name; give the lock a beat to clear before giving up.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(400));
     let mut stmt = conn
         .prepare("SELECT conversation_id, workspace_uris, step_count FROM conversation_summaries")
         .ok()?;
@@ -648,12 +682,32 @@ fn antigravity_durable_ids(db_path: &Path) -> Option<HashSet<String>> {
             Ok((id, uris, steps))
         })
         .ok()?;
-    Some(
-        rows.flatten()
-            .filter(|(id, uris, steps)| !id.trim().is_empty() && antigravity_row_is_durable(uris, *steps))
-            .map(|(id, _, _)| id)
-            .collect(),
-    )
+    let mut durable = HashSet::new();
+    let mut known = HashSet::new();
+    let mut rows_seen = 0usize;
+    // ⛔ `rows.flatten()` used to stand here, which swallowed per-row errors: a
+    // store read that failed halfway answered with the rows it managed to read
+    // — a TRUNCATED index reading as truth, with every conversation missing
+    // from the tail silently vanishing from the startpage and the tree. Any
+    // row error fails OPEN instead: `None` leaves the file walk ungated, the
+    // same honest answer an absent DB gets, and the scan probe records the
+    // unreadable read so the anomaly is visible rather than survived.
+    for row in rows {
+        let (id, uris, steps) = row.ok()?;
+        rows_seen += 1;
+        if id.trim().is_empty() {
+            continue;
+        }
+        known.insert(id.clone());
+        if antigravity_row_is_durable(&uris, steps) {
+            durable.insert(id);
+        }
+    }
+    Some(AntigravityDurabilityIndex {
+        durable,
+        known,
+        rows_seen,
+    })
 }
 
 fn scan_antigravity_sessions(
@@ -664,11 +718,21 @@ fn scan_antigravity_sessions(
     let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::Antigravity);
     let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
     // The DB is the INDEX of conversations; a brain transcript is only storage.
-    // So the durable verdict is taken once, from the DB, and gates BOTH the file
-    // walk and the DB rows. Without this the two paths disagree: a batch
+    // The durable verdict is taken once, from the DB, and gates BOTH the file
+    // walk and the DB rows — without this the two paths disagree: a batch
     // conversation filtered out of the DB half would walk straight back in
     // through its transcript file.
-    let durable_ids = antigravity_durable_ids(&db_path);
+    //
+    // ⛔ BUT ONLY FOR IDS THE DB KNOWS. Measured 2026-08-30: both of the day's
+    // LIVE conversations had NO row in `conversation_summaries` — agy writes
+    // the index row late — so gating the walk on the DB alone hid every active
+    // agy session from the startpage and the cwd tree while its own store held
+    // a resumable transcript (the same lateness the membership probe already
+    // documents at `antigravity_store_index_holds_session`). The verdict order
+    // is now: the DB's verdict stands for an id it CARRIES (batch/scratch rows
+    // stay hidden); for an id it has never heard of, the walked ARTIFACT is
+    // the verdict — it exists, and `agy --conversation <id>` accepts it.
+    let durability = antigravity_durable_ids(&db_path);
     if let Some(desc) = descriptor {
         let mut walked = Vec::new();
         for root in desc.store_roots_absolute(home) {
@@ -676,9 +740,19 @@ fn scan_antigravity_sessions(
                 walk_and_collect(desc, &root, &mut walked, seen);
             }
         }
-        if let Some(ids) = durable_ids.as_ref() {
-            walked.retain(|row| ids.contains(&row.session_id));
+        let walked_before_gate = walked.len();
+        if let Some(index) = durability.as_ref() {
+            walked.retain(|row| {
+                index.durable.contains(&row.session_id)
+                    || (!index.known.contains(&row.session_id)
+                        // ⛔ A per-conversation `conversations/<id>.db` is minted
+                        // at BIRTH, before any turn — it is not evidence that a
+                        // session happened. For an id the DB has never heard of,
+                        // only a transcript (or a legacy export) is.
+                        && !row.storage_path.ends_with(".db"))
+            });
         }
+        let retained_after_gate = walked.len();
         // ⛔ One conversation can have MORE THAN ONE file — its per-conversation
         // DB, a brain transcript, and a legacy `.antigravitycli/<id>.json` all
         // resolve to the same id. Deduping by first path made filesystem walk
@@ -705,6 +779,34 @@ fn scan_antigravity_sessions(
                 merged.push(candidate);
             }
         }
+        // ⭐ THE SCAN-TRUTH PROBE. Every number a lie detector needs to ask
+        // "does the startpage reflect the store?" in one record: how many
+        // conversations the summaries DB holds, how many it calls durable, how
+        // many files the walk found, what the durability gate kept, and how
+        // the merged projection filed them. An unreadable DB reads
+        // `db_readable:false` with the walk UNGATED — visible here instead of
+        // silently survived (the `antigravity_durable_ids` fail-open contract).
+        let home_cwd = merged
+            .iter()
+            .filter(|row| row.cwd == home.display().to_string())
+            .count();
+        crate::perf::ytrace_emit_event(
+            "startpage",
+            "cli",
+            "scan",
+            serde_json::json!({
+                "slug": desc.slug,
+                "db_present": db_path.exists(),
+                "db_readable": durability.is_some(),
+                "db_rows": durability.as_ref().map(|index| index.rows_seen),
+                "db_known": durability.as_ref().map(|index| index.known.len()),
+                "db_durable": durability.as_ref().map(|index| index.durable.len()),
+                "walked": walked_before_gate,
+                "retained": retained_after_gate,
+                "rows": merged.len(),
+                "home_cwd": home_cwd,
+            }),
+        );
         out.append(&mut merged);
     }
 
@@ -1193,6 +1295,128 @@ mod scan_truth_tests {
             Some("Trace persistent Antigravity row identity"),
             "the transcript title must enrich the earlier per-conversation DB projection"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // agy writes the summaries index row LATE — measured 2026-08-30, both of
+    // the day's live conversations had no row at all while their brain
+    // transcripts held turns. An id the DB has never heard of is decided by
+    // its artifact, but ONLY by turn-bearing evidence: the per-conversation
+    // `.db` is minted at birth and proves nothing.
+    #[test]
+    fn a_conversation_the_db_never_indexed_is_decided_by_its_transcript() {
+        let tmp = std::env::temp_dir().join(format!("ygg_scan_unindexed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // The DB exists and knows OTHER conversations — just not these two.
+        summaries_db(
+            &tmp,
+            &[("unrelated", r#"["file:///home/user/proj/sample"]"#, 14)],
+        );
+        let live_id = "aabbccdd-1122-4333-8444-556677889900";
+        let brain = tmp
+            .join(".gemini/antigravity-cli/brain")
+            .join(live_id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&brain).unwrap();
+        std::fs::write(
+            brain.join("transcript_full.jsonl"),
+            b"{\"type\":\"USER_INPUT\",\"content\":\"Today is Aug 30.\"}\n",
+        )
+        .unwrap();
+        // A conversation that was OPENED but never prompted: only the birth-
+        // minted per-conversation `.db` exists.
+        let birthed = tmp.join(".gemini/antigravity-cli/conversations");
+        std::fs::create_dir_all(&birthed).unwrap();
+        std::fs::write(
+            birthed.join("eeeeffff-1122-4333-8444-556677889900.db"),
+            b"SQLite format 3\0",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        scan_antigravity_sessions(&tmp, &mut out, &mut seen);
+        let ids: Vec<&str> = out.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&live_id),
+            "a live conversation with turns must scan before its index row lands, got {ids:?}"
+        );
+        let live = out.iter().find(|r| r.session_id == live_id).unwrap();
+        assert_eq!(
+            live.effective_title.as_deref(),
+            Some("Today is Aug 30."),
+            "the transcript owns the title the index does not have yet"
+        );
+        assert!(
+            !ids.contains(&"eeeeffff-1122-4333-8444-556677889900"),
+            "a birth-minted .db with no turns is not a session: {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // The verdict the DB has already given stands: a conversation it indexes as
+    // batch work stays hidden even when a transcript is sitting right there.
+    // Without this half, every batch burst would walk straight back in.
+    #[test]
+    fn an_indexed_batch_conversation_stays_hidden_despite_its_transcript() {
+        let tmp = std::env::temp_dir().join(format!("ygg_scan_batchdb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let id = "99990000-1122-4333-8444-556677889900";
+        summaries_db(
+            &tmp,
+            &[(id, r#"["file:///home/user/proj/sample","file:///tmp/tmpbatch"]"#, 6)],
+        );
+        let brain = tmp
+            .join(".gemini/antigravity-cli/brain")
+            .join(id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&brain).unwrap();
+        std::fs::write(
+            brain.join("transcript_full.jsonl"),
+            b"{\"type\":\"USER_INPUT\",\"content\":\"Transcribe Video File Content\"}\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        scan_antigravity_sessions(&tmp, &mut out, &mut seen);
+        assert!(
+            out.iter().all(|r| r.session_id != id),
+            "the DB's batch verdict must not be overruled by the artifact"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // The chore's live-title reader and the scan must be able to see the same
+    // conversation. The reader's third fallback asked every store root for the
+    // OLD `transcript.jsonl` spelling — dead since the 2026-08-20 glob fix —
+    // so a row with an empty summaries title AND no history line fell through
+    // to the LLM rescue as if the store had nothing.
+    #[test]
+    fn the_live_title_reader_finds_the_transcript_the_glob_spelling_named() {
+        let tmp = std::env::temp_dir().join(format!("ygg_scan_title_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        summaries_db(&tmp, &[]);
+        let id = "77aa0000-1122-4333-8444-556677889900";
+        let logs = tmp
+            .join(".gemini/antigravity-cli/brain")
+            .join(id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // ONLY the measured spelling — the shape half the real store holds.
+        std::fs::write(
+            logs.join("transcript_full.jsonl"),
+            b"{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>Refactor the CSV import</USER_REQUEST>\"}\n",
+        )
+        .unwrap();
+
+        let title = crate::read_antigravity_session_title(&tmp, id)
+            .expect("read succeeds")
+            .expect("the transcript holds a title");
+        assert_eq!(title, "Refactor the CSV import");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
