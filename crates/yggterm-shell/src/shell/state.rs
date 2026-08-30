@@ -66158,6 +66158,41 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                     const hostText = bufferText ? '' : String(host.textContent || '').trim().slice(0, 4096);
                     const terminalText = bufferText || hostText;
                     const canvasCount = host.querySelectorAll('canvas').length;
+                    // [11.34] THE COMPOSITE PROOF, PER LAYER. The squish family
+                    // is not a geometry bug — it is N canvas layers stacked in
+                    // one host, each painted with different content, all
+                    // visible. The counts alone say "3 layers"; only the array
+                    // says whether they disagree. Same shape as the
+                    // canvasLayerSummary the sibling builders carry (no ink
+                    // sampling here — the quick path stays cheap), capped at 8.
+                    const canvasLayerEntries = Array.from(host.querySelectorAll('canvas')).slice(0, 8).map((canvas, index) => {
+                        const style = window.getComputedStyle(canvas);
+                        const rect = canvas.getBoundingClientRect();
+                        const visible = (
+                            String(style.display || '') !== 'none'
+                            && String(style.visibility || '') !== 'hidden'
+                            && String(style.opacity || '') !== '0'
+                            && Number(rect.width || 0) > 0
+                            && Number(rect.height || 0) > 0
+                        );
+                        return {
+                            index,
+                            class_name: String(canvas.className || ''),
+                            width: Number(canvas.width || 0),
+                            height: Number(canvas.height || 0),
+                            rect: {
+                                left: Number(rect.left.toFixed(2)),
+                                top: Number(rect.top.toFixed(2)),
+                                width: Number(rect.width.toFixed(2)),
+                                height: Number(rect.height.toFixed(2)),
+                            },
+                            display: String(style.display || ''),
+                            opacity: String(style.opacity || ''),
+                            visibility: String(style.visibility || ''),
+                            z_index: String(style.zIndex || ''),
+                            visible,
+                        };
+                    });
                     const cursorBaseRect = screenRect || viewportRect || hostRect;
                     const cursorVisibleRowIndex = (
                         cursorLineIndex != null
@@ -66241,8 +66276,12 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         window_focused_at_last_watchdog: mountedHost ? Boolean(mountedHost.windowFocusedAtLastWatchdog) : null,
                         mounted_entry_host_connected: Boolean(mountedHost && mountedHost.host && mountedHost.host.isConnected),
                         canvas_count: canvasCount,
-                        visible_canvas_layer_count: canvasCount,
-                        hidden_canvas_layer_count: 0,
+                        visible_canvas_layer_count: canvasLayerEntries.filter((layer) => layer.visible).length,
+                        hidden_canvas_layer_count: canvasLayerEntries.filter((layer) => !layer.visible).length,
+                        // The per-layer array: what turns "3 canvases" into
+                        // "three canvases painted with different content, all
+                        // visible" — the composite verdict, one query deep.
+                        canvas_layers: canvasLayerEntries,
                         // COLD-MOUNT VEIL, VISIBLE TO A PROBE (2026-07-31).
                         // THIS is the builder that feeds `active_terminal_hosts`
                         // in `server app state` — the one an agent actually

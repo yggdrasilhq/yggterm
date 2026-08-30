@@ -183,10 +183,20 @@ active output, force remount bursts if needed) and, if the composite
 reappears, the canvas-layer lifecycle fix in the mount wipe path
 (`mount_init_wipe` clears the host, but the layers counted here survive
 somewhere else — find who owns them: xterm canvas addon vs the frame
-compositor's own layers) so a remount retires every prior canvas. The
-`canvas_layers` telemetry enumeration (state.rs `canvasLayerEntries`) is not
-wired into `server app state` — wire it so the next occurrence is one query
-deep.
+compositor's own layers) so a remount retires every prior canvas.
+
+**Wired (2026-08-30):** the per-layer `canvas_layers` array now rides the
+`active_terminal_hosts[]` entries of `server app state` — per index, class,
+size, on-screen rect, display/visibility/opacity and z, capped at 8 — so the
+composite verdict ("three canvases painted with different content, all
+visible") is one query deep. ⚠ The live-caught subtlety: the array existed in
+the sibling describe-state builders since May, but the builder an agent's
+query actually reaches is the QUICK-FALLBACK one (`active_terminal_hosts`
+from `snapshot_mode terminal-quick-fallback`; the full DOM capture times out
+under load), and that builder carried counts only — visible was hardcoded to
+`canvasCount`, hidden to 0. The array now lives in the feeding builder, the
+counts derive from it, and the source-contract test pins the pairing (same
+trap shape as the veil probe, which documented it first).
 
 
 

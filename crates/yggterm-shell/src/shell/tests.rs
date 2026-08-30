@@ -12460,6 +12460,23 @@ console.log('ok');
             probe_at > host_object_at.saturating_sub(4_000),
             "the veil probe must sit inside the host object that reaches active_terminal_hosts"
         );
+        // [11.34] THE COMPOSITE PROOF RIDES THE SAME BUILDER. The squish is N
+        // canvas layers stacked in one host, all visible; the counts alone
+        // cannot say whether the layers disagree. Live-caught 2026-08-30: the
+        // per-layer array existed in the sibling builders since May while the
+        // one feeding `active_terminal_hosts` answered without it, so every
+        // squish report died unevidenced. Same pairing rule as the veil probe.
+        let canvas_layers_at = feeding_builder
+            .rfind("canvas_layers: canvasLayerEntries")
+            .expect(
+                "the builder that feeds active_terminal_hosts must carry the per-layer \
+                 canvas_layers array — without it a squish composite is one query short \
+                 of a verdict",
+            );
+        assert!(
+            canvas_layers_at > host_object_at.saturating_sub(4_000),
+            "canvas_layers must sit inside the same host object that reaches active_terminal_hosts"
+        );
         // The hard cap has exactly one source of truth.
         assert!(script.contains(&format!(
             "Date.now() - veilAttachedAtMs >= {COLD_MOUNT_VEIL_HARD_CAP_MS}"
