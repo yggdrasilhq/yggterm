@@ -159,6 +159,24 @@ pub fn plan_tab_sync(
     }
 }
 
+/// The honest display title for a mirrored session. The v2 preview writes
+/// the placeholder `New session - <iso>` until the first prompt lands, which
+/// reads as a generic weird row name (owner, 2026-08-30) — for those, the
+/// working directory's own name is the meaningful handle.
+fn mirror_display_title(ses: &OpencodeServiceSession) -> Option<String> {
+    let raw = ses.title.as_deref()?.trim();
+    if raw.is_empty() || raw.starts_with("New session") {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn directory_display_name(directory: Option<&String>) -> Option<String> {
+    let dir = directory?;
+    let name = dir.rsplit('/').find(|seg| !seg.is_empty())?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 impl YggtermServer {
     /// Apply one mirror tick UNDER THE DAEMON LOCK. All service IO happened
     /// before this call (`fetch` in the chore, which holds no lock).
@@ -302,8 +320,13 @@ impl YggtermServer {
             }
             spawned += 1;
             if let Some(session) = self.sessions.get_mut(&key) {
-                if let Some(title) = ses.title.as_deref().filter(|t| !t.trim().is_empty()) {
-                    session.title = title.to_string();
+                let display = mirror_display_title(ses)
+                    .or_else(|| directory_display_name(ses.directory.as_ref())
+                        .map(|d| format!("{d} — new session")));
+                if let Some(title) = display {
+                    if !session.title_is_explicit {
+                        session.title = title;
+                    }
                 }
                 crate::upsert_session_metadata(
                     &mut session.metadata,
@@ -337,17 +360,43 @@ impl YggtermServer {
         }
         // Title sync: the row name IS the tab name. The service title is
         // authoritative for mirror rows (the human renames tabs in the TUI,
-        // not in the sidebar), so drift is corrected every tick.
+        // not in the sidebar), so drift is corrected every tick — placeholders
+        // excepted (a never-prompted session's `New session - <iso>` would
+        // UN-name a row; its directory name holds the handle instead).
         for ses in active {
-            let Some(title) = ses.title.as_deref().filter(|t| !t.trim().is_empty()) else {
+            let Some(title) = mirror_display_title(ses) else {
                 continue;
             };
             let Some(tab) = owned.get(&ses.id) else {
                 continue;
             };
             if let Some(session) = self.sessions.get_mut(&tab.key) {
-                if session.title != title {
-                    session.title = title.to_string();
+                if !session.title_is_explicit && session.title != title {
+                    session.title = title;
+                }
+            }
+        }
+        // Anchor-as-header: the opencode TUI row becomes its tab group's
+        // header, titled by the tab the human is looking at (most recently
+        // viewed) — the owner's contract, 2026-08-30. A hand-titled anchor is
+        // respected and left alone.
+        if let Some(anchor_key) = self.opencode_anchor_key() {
+            let explicit = self
+                .sessions
+                .get(&anchor_key)
+                .map(|a| a.title_is_explicit)
+                .unwrap_or(true);
+            if !explicit {
+                if let Some(newest) = active
+                    .iter()
+                    .filter(|s| s.viewed_epoch_ms > 0)
+                    .max_by_key(|s| s.viewed_epoch_ms)
+                {
+                    if let Some(title) = mirror_display_title(newest) {
+                        if let Some(anchor) = self.sessions.get_mut(&anchor_key) {
+                            anchor.title = title;
+                        }
+                    }
                 }
             }
         }
@@ -424,15 +473,23 @@ impl YggtermServer {
 
     /// The live opencode TUI row (the mirror's seating anchor) and the next
     /// free sub-seat under it: `<anchor outline>.<n+1>`.
+    fn opencode_anchor_key(&self) -> Option<String> {
+        self.sessions
+            .values()
+            .find(|s| {
+                s.kind == crate::SessionKind::OpenCode
+                    && s.session_path.starts_with("opencode-runtime://")
+                    && !s
+                        .metadata
+                        .iter()
+                        .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
+            })
+            .map(|a| a.session_path.clone())
+    }
+
     fn next_opencode_tab_seat(&self) -> Option<String> {
-        let anchor = self.sessions.values().find(|s| {
-            s.kind == crate::SessionKind::OpenCode
-                && s.session_path.starts_with("opencode-runtime://")
-                && !s
-                    .metadata
-                    .iter()
-                    .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
-        })?;
+        let anchor_key = self.opencode_anchor_key()?;
+        let anchor = self.sessions.get(&anchor_key)?;
         let base = anchor.outline_prefix.clone().unwrap_or_default();
         if base.is_empty() {
             return None;

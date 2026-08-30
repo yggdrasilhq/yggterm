@@ -21481,6 +21481,35 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     // derives our address from our VERSION, so it can knock the moment we exist.
     #[cfg(target_os = "linux")]
     spawn_pty_handoff_listener(home_dir.clone(), Arc::clone(&runtime));
+    {
+        // The OpenCode tab mirror's FAST loop: 1s cadence so tab spawn/
+        // switch/close converge within the owner's 1-2s expectation
+        // (docs/cli-integration.md Issue Heading 26). The chore-loop hook
+        // (run_opencode_tab_mirror_if_due) stays as the idle-backoff
+        // fallback; this dedicated loop is the primary driver. The service
+        // fetch runs OUTSIDE the runtime lock; apply takes try_lock so a
+        // busy daemon skips a tick instead of stalling (the next tick is
+        // 1s away — skipping is always safe here).
+        let home_dir = home_dir.clone();
+        let runtime = runtime.clone();
+        std::thread::Builder::new()
+            .name("yggterm-opencode-mirror".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(1_000));
+                let home = home_dir.clone();
+                if yggterm_core::opencode_service::service_registration(&home).is_none() {
+                    continue;
+                }
+                let Some(active) = yggterm_core::opencode_service::active_sessions(&home)
+                else {
+                    continue;
+                };
+                if let Ok(mut guard) = runtime.try_lock() {
+                    guard.server.apply_opencode_tab_mirror(&active);
+                }
+            })
+            .expect("spawn opencode mirror loop");
+    }
     // And the other half: once a newer daemon exists, give it everything and go.
     #[cfg(target_os = "linux")]
     spawn_superseded_self_retire_sweep(
