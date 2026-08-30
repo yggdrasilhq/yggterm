@@ -1154,3 +1154,30 @@ gates on ANY descriptor's `store_path_is_session_file`, and requires the
 candidate to carry a real transcript path (muse live rows may need the
 `Storage` stamp their reader can already locate via
 `find_muse_session_jsonl_in`).
+
+### Kimi re-homed: the installed CLI writes `~/.kimi-code`, not `~/.kimi` (2026-08-30)
+
+Measured against the INSTALLED kimi (0.27.0, `~/.kimi-code/bin/kimi`): every
+kimi path in this descriptor pointed at the PREVIOUS kimi's home — the
+installed CLI never touches `~/.kimi`, which is why kimi rows had no store
+title at all. The live store is
+`~/.kimi-code/sessions/wd_<slug>_<hash>/session_<uuid>/` with `state.json`
+(`title` = first prompt, `isCustomTitle` on rename, `workDir`, timestamps)
+and `agents/main/wire.jsonl`. Verified end-to-end against the owner's
+litellm endpoint: `kimi -m chatgpt/gpt-5.6-luna -p …` creates the session,
+`state.json` carries the title, and yggterm's scan/reader/probe all read
+that file. Kimi left the dedicated-scanner set (the store is
+glob-expressible now); the old `scan_kimi_sessions` (dead home) is gone.
+Resume flag stays `--resume` (the CLI's own resume hint prints `-r`).
+
+### ⛔ The second-spawn gate now covers the LOCAL door (the agy fork prompt)
+
+`local_agent_cli_launch_refusal_for_path` — the funnel every local agent
+launch passes — previously checked only that the binary exists. A resume
+whose conversation is already held by a live process (hot restart keeping
+the CLI's children alive; twin rows naming one conversation) reached the
+CLI, which printed its own fork-or-corrupt warning naming the ghost holder.
+The funnel now runs the descriptor-driven holder scan
+(`external_agent_resume_processes_for_session`) and refuses BY PID
+(`external_active_refused_local_spawn` trace event,
+policy session_survival_before_yggterm_attach).

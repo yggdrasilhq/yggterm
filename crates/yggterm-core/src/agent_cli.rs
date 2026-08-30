@@ -2757,19 +2757,25 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Resume replays only the last 5 turns to the screen; the full history
         // stays on disk, so the PTY is NOT a faithful re-derivation.
         content_rederives_on_resume: false,
-        session_store_globs: &[],
+        // ⛔⛔ THE STORE MOVED UNDER US (measured 2026-08-30, kimi 0.27.0):
+        // kimi-code writes `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<uuid>/`,
+        // one directory per session with `state.json` (title, workDir,
+        // createdAt/updatedAt, isCustomTitle) and `agents/main/wire.jsonl`.
+        // Everything earlier in this descriptor described `~/.kimi/` — the
+        // PREVIOUS kimi's home — which the installed CLI never touches, so
+        // yggterm's kimi rows read a dead store.
+        session_store_globs: &[".kimi-code/sessions/*/*/state.json"],
         store_excluded_name_fragments: &[],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: None,
-        read_store_entry: read_no_store_entry,
+        read_store_entry: read_kimi_code_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        // ⛔ DECLARED GAP (2026-08-30): kimi keeps no per-session title store
-        // we could find — ~/.kimi/kimi.json is a work_dirs reverse map with
-        // last_session_id only. Live rows stay on the LLM-rescue path.
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        // The session's own state.json carries `title` (the first prompt,
+        // `isCustomTitle` when the user renamed) — read it for live rows too.
+        read_live_store_title: Some(read_kimi_live_store_title),
+        remote_live_store_title: Some(KIMI_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -4098,6 +4104,58 @@ fn find_dir_by_name(root: &Path, depth: u8, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// [`read_store_entry`] for Kimi Code 0.27+: the session directory's
+/// `state.json` carries everything — `title` (the first prompt;
+/// `isCustomTitle` when renamed), `workDir`, `createdAt`/`updatedAt` — and
+/// the session id is the grandparent directory's own name (`session_<uuid>`).
+fn read_kimi_code_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let session_dir = path.parent()?.file_name()?.to_str()?.to_string();
+    if session_dir.is_empty() {
+        return None;
+    }
+    let cwd = value
+        .get("workDir")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Recency from the state.json FILE: kimi rewrites it every turn, so the
+    // mtime is the session's own clock without a second RFC3339 parse.
+    Some(AgentStoreEntry {
+        session_id: session_dir,
+        cwd: if cwd.is_empty() {
+            dirs::home_dir()?.display().to_string()
+        } else {
+            cwd
+        },
+        modified_epoch_ms: modified_epoch_ms_of(path),
+        title: title_without_fallbacks(title),
+        detail: None,
+    })
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Kimi: the session
+/// directory's `state.json` `title` (the first prompt; `isCustomTitle` when
+/// the user renamed). Measured 2026-08-30 against kimi 0.27.0's real store.
+fn read_kimi_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let sessions_root = home.join(".kimi-code/sessions");
+    if !sessions_root.exists() {
+        return None;
+    }
+    let session_dir = find_dir_by_name(&sessions_root, 2, session_id)?;
+    let entry = read_kimi_code_store_entry(&session_dir.join("state.json"))?;
+    title_without_fallbacks(entry.title)
+}
+
 fn read_muse_live_store_title(home: &Path, session_id: &str) -> Option<String> {
     let db_path = home.join(".local/share/muse/session-index.db");
     if db_path.exists() {
@@ -4464,6 +4522,41 @@ const GROK_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
 /// (session_v2, then the v1 table). The db path is fixed relative to $HOME —
 /// the descriptor declares no store globs, so the locators list is empty and
 /// this script never uses argv's locator half.
+/// Kimi's remote twin: the session directory's `state.json` — its own
+/// `title` (the first prompt; `isCustomTitle` when renamed), matched by the
+/// session directory's name, exactly like the local reader.
+const KIMI_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+globs = [v for v in argv[:argv.index('--')] if v.strip()]
+ids = [v for v in argv[argv.index('--') + 1:] if v.strip()]
+if not ids or not globs:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+seen = set()
+for g in globs:
+    try:
+        matches = home.glob(g)
+    except Exception:
+        continue
+    for p in matches:
+        try:
+            v = json.load(open(p, 'r', encoding='utf-8', errors='ignore'))
+        except Exception:
+            continue
+        sid = p.parent.name
+        if sid not in wanted or sid in seen:
+            continue
+        title = v.get('title')
+        if isinstance(title, str) and title.strip():
+            seen.add(sid)
+            print(json.dumps({'session_id': sid, 'candidates': [title.strip()]}, ensure_ascii=False))
+"#;
+
 const OPENCODE_REMOTE_TITLE_SCRIPT: &str = r#"
 import json, os, sqlite3, sys
 argv = sys.argv[1:]
@@ -4498,6 +4591,12 @@ conn.close()
 const OPENCODE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     script: OPENCODE_REMOTE_TITLE_SCRIPT,
     locators: RemoteStoreLocators::HomeRelative(".local/share/opencode/opencode.db"),
+    choose: first_non_empty_candidate,
+};
+
+const KIMI_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: KIMI_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobs,
     choose: first_non_empty_candidate,
 };
 
@@ -6789,6 +6888,31 @@ mod tests {
             read_opencode_live_store_title(&home, "ses_new"),
             None,
             "a never-prompted session's placeholder is not a title"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_kimi_live_title_reads_the_session_state_json() {
+        // kimi 0.27 moved to ~/.kimi-code and writes a real per-session
+        // state.json (title = first prompt, workDir, isCustomTitle). The old
+        // integration watched ~/.kimi — a home the installed CLI never
+        // touches — which is why kimi rows had no store title at all.
+        let home =
+            std::env::temp_dir().join(format!("yggterm-kimi-title-{}", uuid::Uuid::new_v4()));
+        let session_dir = home
+            .join(".kimi-code/sessions/wd_user-proj_ab12cd34")
+            .join("session_6c9d662b-d553-4d4e-a4f8-e10aeb810bbf");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("state.json"),
+            r#"{"title":"Fix the kimi store drift","workDir":"/home/user/proj","isCustomTitle":false,"createdAt":"2026-08-30T18:32:21.620Z","updatedAt":"2026-08-30T18:40:00.000Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_kimi_live_store_title(&home, "session_6c9d662b-d553-4d4e-a4f8-e10aeb810bbf")
+                .as_deref(),
+            Some("Fix the kimi store drift"),
         );
         let _ = std::fs::remove_dir_all(&home);
     }
