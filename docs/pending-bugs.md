@@ -68,9 +68,58 @@ switch-back). Residual, not fixed here: the strict fast-ready itself still
 waits on the manifest for a genuinely cold first mount — the felt first-open
 latency is unchanged, only the permanent cold-remount tax is gone.
 
+## ⛔ [11.36] A 40-SECOND WHOLE-PROCESS GUI FREEZE HAS NO SURVIVING WITNESS — THE BLOCK INCIDENT NOW CARRIES THE KERNEL COUNTERS THAT VERDICT IT (the GUI host)
+
+**Status:** OPEN
+
+The instrument landed in this commit; the freeze itself remains unroot-caused
+by design: the next occurrence now classifies itself.
+
+**Measured 2026-08-29 17:21:05→17:21:46 IST on the GUI host (3.2.17 build, pid
+977466).** The GUI process's ENTIRE event stream — every thread, background
+workers included — went silent for 40.7 s, then flushed in one compressed
+burst (watchdog drain, three `describe_rows`, four `remote_machine_refresh`
+completions, focus + repaint). The block watchdog independently measured a
+37.3 s UI-thread gap in the same second — two witnesses, one process-wide
+wall. Ruled out from the same trace window: no app-control request hung (all
+≤0.2 s), no hot_restart (it ran at 17:45:15, the daemon swap), the DAEMON
+streamed through the window (largest gap 8.8 s — the stall was GUI-local, not
+machine-wide), no kernel OOM/hung-task lines, no WebKit crash in the journal.
+Ruled in as suspects, UNDECIDABLE from the surviving evidence: a bounded-cgroup
+reclaim wall (the 6.7 family bound lives exactly on this process; vmstat shows
+live swap in/out on the host) versus a stop/scheduler wedge versus a swap
+storm. The decisive files are GONE: systemd destroys the GUI's scope dir on
+exit, and `memory.events` + `memory.pressure` die with it — the one witness
+that could verdict the 6.7-wall hypothesis cannot be read after the fact.
+
+**Fixed (this commit):** the ui/block incident payload now carries a
+`witness` block, read by the watchdog thread (which the UI thread cannot
+block) at BOTH ends of every measured stall — pre on the first poll inside
+the stall, post at recovery — with the saturating delta across the gap:
+`min_flt`/`maj_flt` (/proc/self/stat), `voluntary_ctxt`/`nonvoluntary_ctxt`
+(/proc/self/status), and the process's OWN cgroup v2 `memory.events`
+(`cg_high`/`cg_max`/`cg_oom`) + `memory.pressure` (`psi_some_total_us`/
+`psi_full_total_us`), joined off the `0::` line. Absent readings serialize as
+null, never zero — a zero would testify "no throttling" when the truth is "no
+reading". On the next freeze the delta verdicts the class: fault + cgroup/PSI
+jumps ⇒ reclaim wall (the 6.7 bound is the suspect and the bound's numbers
+are already in the trace); maj_flt alone ⇒ swap storm; flat context switches
+⇒ stop/scheduler wedge (go find the stopper). Parsers are fixture-tested;
+a one-sided or unparseable reading degrades that field to null, and the
+incident files whether or not any witness reads. This is deliberately NOT a
+fix for the freeze: no symptom patch without a verdict, and the verdict is
+one occurrence away.
+
+Residuals parked: the GUI host carries five stale `yggterm-gui-*.scope` dirs from
+dead GUIs (systemd never reaped them — hygiene, convergence lane's door);
+the incident-snapshots dir is reused per version and held nothing for the
+3.2.17 freeze (the snapshot mechanism keys to different incidents).
+
 ## ⛔ [11.35] THE ETERNAL ATTACH WAIT — AN ORPHANED CLI PROCESS HOLDS A ROW FOREVER AND THE WAIT FLOODS ITS VIEWPORT (codex, any CLI)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED. Falsifier: on the next build, a
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Falsifier: on the next build, a
 row whose holder is init-reparented prints the ORPHAN wording once (in-place
 reprints, no 12-line flood), ends at the 120 s deadline with the `kill`
 remediation, and after the holder is killed the row attaches normally.
@@ -102,7 +151,9 @@ terminal instruction, and the strict no-race policy still holds.
 ## ⛔ [11.34] THE SQUISH COMPOSITE — A HOST PAINTS MULTIPLE SESSION FRAMES STACKED (correlated with the remount storms; trigger removed this session, canvas-layer lifecycle unproven)
 
 
-**Status:** OPEN — trigger removed ([11.31]+watchdog, shipped 3.2.15/3.2.16);
+**Status:** OPEN
+
+Trigger removed ([11.31]+watchdog, shipped 3.2.15/3.2.16);
 canvas-layer lifecycle owes a deliberate repro on the new build.
 
 **Measured 2026-08-29 15:39-15:47 on the GUI host (owner screenshot
@@ -139,15 +190,17 @@ deep.
 
 
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (this commit). Falsifier: while a
+## ⛔ [11.33] USING YCHROME, THE VIEWPORT YANKS TO A TERMINAL SHOWING A CLIPBOARD IMAGE PATH — TWO MACHINES, BOTH SEAMS FIXED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Landed this commit. Falsifier: while a
 web surface is up and an image is on the clipboard, a paste addressed to that
 surface must NOT stage a PNG nor write a path into any terminal — no
 `clipboard_paste_image` telemetry for a paste whose event target is outside
 the terminal host; and no `session/activation` with
 `origin_site attach_seed_remote_snapshot` may change the GUI's adopted active
 session after a user click.
-
-## ⛔ [11.33] USING YCHROME, THE VIEWPORT YANKS TO A TERMINAL SHOWING A CLIPBOARD IMAGE PATH — TWO MACHINES, BOTH SEAMS FIXED
 
 **Machine A — cross-surface paste theft (shell JS).** The terminal pane's
 clipboard handler was registered at `window`, `host`, AND `document` level,
@@ -179,7 +232,9 @@ already supplied the activation.
 
 ## ⛔ [11.32] A REMOTE ROW'S SCREEN READ ANSWERS "EMPTY" FROM THE LOCAL DAEMON — THE CLIENT BACKS OFF 2.5s→5s AND THE ROW SITS BLANK AND INPUT-GATED FOR 10+ SECONDS
 
-**Status:** OPEN (empty-screen-read half). The watchdog-remount half of this
+**Status:** OPEN
+
+The empty-screen-read half is open; the watchdog-remount half of this
 entry is **FIXED IN CODE — LIVE PROOF OWED**: `rearm_stale_retained_fault_
 recovery` no longer remounts a host that is already mounted and streaming
 daemon-forwarded output — it latches ready instead

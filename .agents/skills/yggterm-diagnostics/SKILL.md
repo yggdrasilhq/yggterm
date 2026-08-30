@@ -95,6 +95,23 @@ are profiling).
   delta between two samples. Use the example reader only for an unregistered test
   process: `cargo run -p yggterm-core --example render_top -- <gui-pid> 15000`.
 
+- **ui/block incidents and their `witness` — the freeze verdict, in one event.** The
+  block watchdog lives OFF the UI thread (it pings a stamp the UI thread stores); a
+  stall measured from inside the stall reads zero. Every filed incident carries
+  `gap_ms`, `blocks_per_min`, `last_activity` (best-effort attribution — the LAST
+  traced act before the gap, not necessarily the cause), and since [11.36] a
+  `witness` block: kernel counters read at BOTH ends of the stall (pre on the first
+  watchdog poll inside it, post at recovery) with the saturating delta —
+  `min_flt`/`maj_flt`, `voluntary_ctxt`/`nonvoluntary_ctxt`, the process's own
+  cgroup v2 `cg_high`/`cg_max`/`cg_oom` + `psi_*_total_us`. Verdicts: faults +
+  cgroup/PSI jumps ⇒ bounded-cgroup reclaim wall; `maj_flt` alone ⇒ swap storm;
+  context switches flat across a long gap ⇒ stop/scheduler wedge (find the stopper).
+  Absent fields are `null`, never zero. ⚠ A frozen trace writer compresses the
+  recovery into one burst — the GUI's event stream going silent while the DAEMON's
+  keeps flowing is the signature of a GUI-local (not machine-wide) stall. The dead
+  process's cgroup is unrecoverable (systemd deletes the scope), which is exactly
+  why the counters must ride the incident.
+
 - `server snapshot` — the daemon view. `active_session` (and `live_sessions[]`) carry
   per-session `launch_phase`, `remote_deploy_state`, **`pty_cols`/`pty_rows`** (the SQUISH
   gauge — the PTY's real grid), and **`terminal_lines`** (the daemon's authoritative
