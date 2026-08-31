@@ -806,6 +806,12 @@ are already two — and a forgotten door silently re-traps the user.
   accelerator bridge makes — one command, however the key arrived.
 - **A new chord is one row plus one terminus arm.** Nothing in the vendored host
   changes.
+- **Reload is one engine verb with familiar routes.** `Ctrl+Shift+R` and the
+  legacy `Ctrl+F5` both claim `web.reload.hard`, whose terminus calls WebKit's
+  `reload_bypass_cache`; neither may degrade into an ordinary reload nonce.
+  The page context menu contributes **Reload without cache** immediately after
+  WebKit's native Reload row and relays the same command id. Keep ordering in
+  the generic host and meaning in the shell-owned contribution table.
 
 ⚠ **Chrome that floats over a page must declare `data-covers-web-surface`.**
 Under glass the input region is the window MINUS the page holes PLUS the declared

@@ -19335,11 +19335,15 @@ fn open_web_surface_tab(
 /// entry to it — so screenshot, which is a page verb a human reaches for with
 /// the mouse, had no mouse route and existed only as an agent-control command.
 ///
-/// These four are the same four regions the ychrome engine's `/engine/shot`
-/// takes, in the same order, and that is not a coincidence: a human clicking
-/// "Full page" and an agent sending `region=full` must get the same picture, so
-/// the vocabulary is one vocabulary.
+/// The first row is the cache-breaking sibling of WebKit's native Reload. The
+/// host inserts this whole contributed list immediately after that native row,
+/// so it is followed by a separator before the four capture tools. Those four
+/// are the same regions the ychrome engine's `/engine/shot` takes, in the same
+/// order: a human clicking "Full page" and an agent sending `region=full` must
+/// get the same picture, so the vocabulary is one vocabulary.
 const WEB_PAGE_MENU_ITEMS: &[(&str, &str)] = &[
+    ("web.reload.hard", "Reload without cache"),
+    ("", ""),
     ("web.shot.viewport", "Screenshot visible area"),
     ("web.shot.full", "Screenshot full page"),
     ("web.shot.element", "Screenshot this element"),
@@ -19791,6 +19795,15 @@ fn web_shot_output_path(home: &std::path::Path, kind: &str) -> std::path::PathBu
 /// four regions differ only in what they hand it, so "full page" and "this
 /// element" cannot drift into taking their pictures differently.
 fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
+    match id {
+        "web.reload.hard" => {
+            // One terminus for keyboard and mouse: the menu item is only
+            // another route to the engine's existing cache-bypass verb.
+            let _ = dispatch_web_page_chord(state, "web.reload.hard");
+            return;
+        }
+        _ => {}
+    }
     let Ok((_, native_id)) = resolve_live_web_surface(&state, None) else {
         return;
     };

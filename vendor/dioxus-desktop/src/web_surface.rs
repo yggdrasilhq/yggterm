@@ -3108,8 +3108,9 @@ fn connect_seat_input_observer(webkit: &webkit2gtk::WebView, surface_id: u64) {
 //
 // **The item list is DATA, pushed from the shell** ([`WebSurfaceHost::
 // set_page_menu_items`]), exactly like the claimed-chord table. Nothing here
-// knows what any entry MEANS: this layer appends the labels it was given and
-// relays the id that was clicked, with the click point in CSS pixels. Adding an
+// knows what any entry MEANS: this layer inserts the labels it was given after
+// WebKit's native Reload row and relays the id that was clicked, with the click
+// point in CSS pixels. Adding an
 // entry is a row in the shell's list plus an arm at the shell's terminus;
 // nothing in this file changes.
 
@@ -3241,7 +3242,9 @@ fn connect_page_menu_contributor(
     items: &Rc<RefCell<Vec<PageMenuItem>>>,
     notify: &Rc<RefCell<Option<Rc<dyn Fn(PageMenuInvocation)>>>>,
 ) {
-    use webkit2gtk::{ContextMenuExt as _, HitTestResultExt as _, WebViewExt as _};
+    use webkit2gtk::{
+        ContextMenuExt as _, ContextMenuItemExt as _, HitTestResultExt as _, WebViewExt as _,
+    };
     let items = items.clone();
     let notify = notify.clone();
     webkit.connect_context_menu(move |view, menu, event, hit| {
@@ -3254,12 +3257,20 @@ fn connect_page_menu_contributor(
         let zoom = if zoom > 0.0 { zoom } else { 1.0 };
         let (raw_x, raw_y) = event.coords().unwrap_or((0.0, 0.0));
         let (x, y) = (raw_x / zoom, raw_y / zoom);
-        let link_uri = hit.link_uri().map(|uri: gtk::glib::GString| uri.to_string());
+        let link_uri = hit
+            .link_uri()
+            .map(|uri: gtk::glib::GString| uri.to_string());
 
-        menu.append(&webkit2gtk::ContextMenuItem::new_separator());
+        let default_actions = menu
+            .items()
+            .iter()
+            .map(|item| item.stock_action())
+            .collect::<Vec<_>>();
+        let mut insert_at = page_menu_insert_position_after_reload(&default_actions);
         for item in contributed {
             if item.id.is_empty() {
-                menu.append(&webkit2gtk::ContextMenuItem::new_separator());
+                menu.insert(&webkit2gtk::ContextMenuItem::new_separator(), insert_at);
+                insert_at += 1;
                 continue;
             }
             // A fresh action per invocation. The name only has to be unique
@@ -3287,14 +3298,51 @@ fn connect_page_menu_contributor(
                     });
                 });
             }
-            menu.append(&webkit2gtk::ContextMenuItem::from_gaction(
-                &action,
-                &item.label,
-                None,
-            ));
+            menu.insert(
+                &webkit2gtk::ContextMenuItem::from_gaction(&action, &item.label, None),
+                insert_at,
+            );
+            insert_at += 1;
         }
         false
     });
+}
+
+/// The insertion point for shell-contributed page commands.
+///
+/// Reload-adjacent commands belong immediately after WebKit's native Reload.
+/// Some context-specific menus omit Reload; in that case preserving every
+/// native row and appending is the safe fallback.
+fn page_menu_insert_position_after_reload(actions: &[webkit2gtk::ContextMenuAction]) -> i32 {
+    actions
+        .iter()
+        .position(|action| *action == webkit2gtk::ContextMenuAction::Reload)
+        .map(|position| position + 1)
+        .unwrap_or(actions.len()) as i32
+}
+
+#[cfg(test)]
+mod page_menu_position_tests {
+    use super::page_menu_insert_position_after_reload;
+    use webkit2gtk::ContextMenuAction;
+
+    #[test]
+    fn contributed_page_commands_begin_immediately_after_native_reload() {
+        let actions = [
+            ContextMenuAction::GoBack,
+            ContextMenuAction::GoForward,
+            ContextMenuAction::Reload,
+            ContextMenuAction::Copy,
+            ContextMenuAction::InspectElement,
+        ];
+        assert_eq!(page_menu_insert_position_after_reload(&actions), 3);
+    }
+
+    #[test]
+    fn a_menu_without_native_reload_appends_contributed_commands() {
+        let actions = [ContextMenuAction::Copy, ContextMenuAction::InspectElement];
+        assert_eq!(page_menu_insert_position_after_reload(&actions), 2);
+    }
 }
 
 /// One step of the clean-ALT-tap state machine. Pure so the contract is

@@ -3397,16 +3397,19 @@ mod tests {
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("shell.rs must define the page-menu terminus");
         for (id, label) in WEB_PAGE_MENU_ITEMS {
+            if id.is_empty() {
+                assert!(
+                    label.is_empty(),
+                    "a separator has no id and must not carry an inert label"
+                );
+                continue;
+            }
             assert!(
                 dispatch.contains(&format!("{id:?} =>")),
                 "the page menu offers {label:?} ({id:?}) but the terminus has \
                  no arm for it — the entry would do nothing:\n{dispatch}"
             );
-            assert!(
-                !label.is_empty() && !id.is_empty(),
-                "a contributed entry needs both an id and a label; the empty id \
-                 is reserved for a separator"
-            );
+            assert!(!label.is_empty(), "a contributed command needs a label");
         }
         // The four regions of the page menu are the four regions of the
         // ychrome engine's `/engine/shot`, in one vocabulary — a human
@@ -3671,6 +3674,48 @@ JSON.stringify({{
                 legacy.id
             );
         }
+    }
+
+    /// Hard reload keeps both browser spellings users already know.
+    ///
+    /// `Ctrl+Shift+R` was the first spelling wired here, but Chromium-era
+    /// muscle memory is not the only browser contract: Ctrl+F5 has meant
+    /// "reload without cache" for decades. Both must reach the ONE engine
+    /// verb, never the ordinary reload nonce.
+    #[test]
+    fn hard_reload_has_modern_and_legacy_browser_spellings() {
+        for chord in ["Ctrl+Shift+R", "Ctrl+F5"] {
+            let row = WEB_PAGE_CHORDS
+                .iter()
+                .find(|row| row.chord == chord)
+                .unwrap_or_else(|| panic!("{chord} must be claimed over a focused page"));
+            assert_eq!(
+                row.id, "web.reload.hard",
+                "{chord} must bypass cache rather than becoming an ordinary reload"
+            );
+            assert!(!row.focus_shell, "hard reload must leave focus on the page");
+        }
+    }
+
+    /// The page menu puts the cache-breaking sibling directly after WebKit's
+    /// native Reload row. The host inserts the contributed list at that point,
+    /// so its first row must be the hard reload and the screenshot tools must
+    /// remain a separate group.
+    #[test]
+    fn page_menu_starts_with_hard_reload_then_separates_capture_tools() {
+        assert_eq!(
+            WEB_PAGE_MENU_ITEMS.first(),
+            Some(&("web.reload.hard", "Reload without cache"))
+        );
+        assert_eq!(
+            WEB_PAGE_MENU_ITEMS.get(1),
+            Some(&("", "")),
+            "capture tools must be separated from navigation commands"
+        );
+        assert_eq!(
+            WEB_PAGE_MENU_ITEMS.get(2),
+            Some(&("web.shot.viewport", "Screenshot visible area"))
+        );
     }
 
     /// A REBIND is honoured, and an inexpressible chord is refused rather than

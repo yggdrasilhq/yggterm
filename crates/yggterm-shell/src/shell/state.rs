@@ -50737,9 +50737,9 @@ struct WebPageChord {
 /// ## Why these and not others
 ///
 /// The four the user named are here (F5, Ctrl+R, Ctrl+T, F12), plus the
-/// siblings a hand reaches for in the same breath: the second spelling of each
-/// (Ctrl+Shift+R, Ctrl+Shift+I), the address bar (Ctrl+L), and closing a tab
-/// (Ctrl+W). `Ctrl+N`/`Ctrl+Shift+N` are deliberately absent — this browser has
+/// siblings a hand reaches for in the same breath: both hard-reload spellings
+/// (Ctrl+Shift+R, Ctrl+F5), Ctrl+Shift+I, the address bar (Ctrl+L), and closing
+/// a tab (Ctrl+W). `Ctrl+N`/`Ctrl+Shift+N` are deliberately absent — this browser has
 /// no window to open — and `Ctrl+P` stays absent for the reason it always has:
 /// there is no print path to route it to.
 const WEB_PAGE_CHORDS: &[WebPageChord] = &[
@@ -50765,6 +50765,11 @@ const WEB_PAGE_CHORDS: &[WebPageChord] = &[
     // cache, which is the entire reason a user reaches for it.
     WebPageChord {
         chord: "Ctrl+Shift+R",
+        id: "web.reload.hard",
+        focus_shell: false,
+    },
+    WebPageChord {
+        chord: "Ctrl+F5",
         id: "web.reload.hard",
         focus_shell: false,
     },

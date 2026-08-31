@@ -399,7 +399,7 @@ them is a verb the app already had with a mouse-only route:
 | Chord | Verb | Where it is served |
 |---|---|---|
 | `F5`, `Ctrl+R` | reload the active tab | `web_surface_reload_active_tab` — the ⟳ button's own owner |
-| `Ctrl+Shift+R` | hard reload (bypass cache) | the engine: `reload_bypass_cache` |
+| `Ctrl+Shift+R`, `Ctrl+F5` | hard reload (bypass cache) | the engine: `reload_bypass_cache` |
 | `Ctrl+T` | new tab, typing-ready in the address bar | `open_web_surface_tab` — THE UI opener |
 | `Ctrl+L` | focus + select the address bar | `focus_web_omnibox` |
 | `Ctrl+W` | close the active tab | the row menu's own close plan |
@@ -434,10 +434,15 @@ given and relays the id that was clicked, and it knows what none of them mean.
 Adding an entry is a row in `WEB_PAGE_MENU_ITEMS` plus an arm at
 `dispatch_web_page_menu`; nothing in `web_surface.rs` changes.
 
-Four entries, using the ychrome engine's four `/engine/shot` region names. The
-shared vocabulary does not mean the detached engine owns these captures: the
-GUI host owns the visible page, and a human clicking "full page" and an agent
-sending `server app web screenshot` must get the same picture:
+The first contributed entry is **Reload without cache**. The host inserts the
+contributed block immediately after WebKit's native Reload item, then a divider
+separates it from the capture tools. Both this mouse route and the two keyboard
+spellings terminate at the engine's one `reload_bypass_cache` verb.
+
+The remaining four entries use the ychrome engine's four `/engine/shot` region
+names. The shared vocabulary does not mean the detached engine owns these
+captures: the GUI host owns the visible page, and a human clicking "full page"
+and an agent sending `server app web screenshot` must get the same picture:
 
 - **Screenshot visible area** — `SnapshotRegion::Visible`
 - **Screenshot full page** — `SnapshotRegion::FullDocument`
