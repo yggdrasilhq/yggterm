@@ -5827,9 +5827,9 @@ impl WebSurfaceHost {
 
         // WebKit's HTTP-cache bypass does not evict its separate, persistent
         // favicon database. Clear that database as part of the explicit hard
-        // reload contract, then re-arm this surface's async favicon request so
-        // the tab model drops the old bytes and accepts the icon fetched by
-        // the new load. WebKit exposes only a database-wide clear, not a
+        // reload contract, then re-arm every async favicon request so each tab
+        // model drops its old bytes and accepts the next database answer.
+        // WebKit exposes only a database-wide clear, not a
         // per-page eviction, so re-arm every local icon answer as well: tabs
         // on the cleared context re-fetch, and other contexts answer from
         // their still-populated databases on the next reconcile tick.
