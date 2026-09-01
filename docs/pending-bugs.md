@@ -20,7 +20,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.38] THE GUI BURNS UP TO A CORE AND THE WEBVIEW RETENTION CLIMBS ~300 MB/h UNDER STREAMING — AND THE FLOOD REGIME'S ENGAGEMENT IS UNVERIFIABLE (the owner's heat + leak report)
 
-**Status:** OPEN — attribution measured 2026-08-31/09-01, fixes scoped into three lanes
+**Status:** OPEN
+
+Measured 2026-08-31/09-01; fixes scoped into the three lanes below.
 
 The measured shape (the GUI host, yggterm 3.2.2x, one live agent row
 streaming 16 KB chunks at ~4/s):
@@ -63,7 +65,9 @@ CPU.
 
 ## ⛔ [11.40] THE DAEMON LIVES INSIDE A DEAD GUI's CGROUP SCOPE, AND GRAVEYARD SCOPES CAPTURE UNRELATED TENANTS — the swap root (the 6.7 daemon half)
 
-**Status:** OPEN — measured 2026-08-30/09-01 on the GUI host; structural fix owed
+**Status:** OPEN
+
+Measured 2026-08-30/09-01 on the GUI host; the structural fix is owed.
 
 The 6.7 family shape gave the GUI its own scope with kernel-confirmed bounds
 (root high ~3.7 GiB, `web/` 1856 MiB + swap.max 944 MiB). The DAEMON was
