@@ -24,6 +24,14 @@
 /// is the code that ships — not a transcription of it.
 const TRACE_EMITTER_JS: &str = include_str!("trace_emitter.js");
 
+/// The frame-hash probe's client half, shared verbatim between the shipped
+/// script and `tools/xterm-harness/frame_hash_probe.test.js` — the same
+/// reason the trace emitter lives in its own `.js` file: code that only
+/// exists as a Rust string literal can be tested by nothing. The daemon twin
+/// of the canonical form it hashes is `yggterm-server::frame_hash`; both
+/// pin the same test vector.
+const FRAME_HASH_PROBE_JS: &str = include_str!("frame_hash_probe.js");
+
 fn terminal_eval_script(
     host_id: &str,
     theme: &TerminalTheme,
@@ -241,6 +249,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
         }};
 {trace_emitter_js}
+{frame_hash_probe_js}
         // ── xterm.js probes (layer=xterm) ──────────────────────────────────
         // These serve the open ghost-frame / glyph-soup entry in
         // docs/pending-bugs.md, whose fix direction asks for "the xterm.js write
@@ -1896,6 +1905,109 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const notifyOsc9Disposable = registerTerminalNotifyOsc(9, "osc9");
         const notifyOsc777Disposable = registerTerminalNotifyOsc(777, "osc777");
+        // The mouse-mode probe (crates/yggterm-shell/src/mouse_mode_probe.rs):
+        // witness every DECSET 1000/1002/1003/1006 transition the client's
+        // parser actually applies. OBSERVER-ONLY — the handler always returns
+        // false so xterm.js applies the mode exactly as it would have; a probe
+        // that consumed a sequence would BE the bug it watches for.
+        // Transition-only: lastMouseModeReport dedups re-assertions, because
+        // scrollback replay re-parses historical DECSETs in order and a replay
+        // must stay silent unless the final state differs from what was last
+        // reported. Carries mode + enabled, never screen content.
+        const mouseModeProbeDisposables = (() => {{
+            try {{
+                if (!term || !term.parser || typeof term.parser.registerCsiHandler !== 'function') {{
+                    return [];
+                }}
+                const witnessedMouseModes = {{ 1000: true, 1002: true, 1003: true, 1006: true }};
+                const lastMouseModeReport = {{ 1000: false, 1002: false, 1003: false, 1006: false }};
+                const witnessMouseMode = (enabled) => (params) => {{
+                    try {{
+                        for (const p of params) {{
+                            const mode = Array.isArray(p) ? p[0] : p;
+                            if (!witnessedMouseModes[mode] || lastMouseModeReport[mode] === enabled) {{
+                                continue;
+                            }}
+                            lastMouseModeReport[mode] = enabled;
+                            sendTerminalEvent({{ kind: "mouse_mode", mode: mode, enabled: enabled }});
+                        }}
+                    }} catch (_probeError) {{
+                        // A probe failure must never disturb the parse path.
+                    }}
+                    return false;
+                }};
+                return [
+                    term.parser.registerCsiHandler({{ prefix: '?', final: 'h' }}, witnessMouseMode(true)),
+                    term.parser.registerCsiHandler({{ prefix: '?', final: 'l' }}, witnessMouseMode(false)),
+                ];
+            }} catch (_probeError) {{
+                return [];
+            }}
+        }})();
+        // ── the frame-hash probe's pairing state + hook (frame_hash_probe.js)
+        // ───────────────────────────────────────────────────────────────────
+        // The daemon's authoritative-grid hash arrives as a `frame_hash`
+        // command whenever it CHANGES; this side stores it and, at each write
+        // flush settle, pairs it with the client's own applied-frame hash.
+        // A mismatch at quiescence while at-bottom IS artifacting — the
+        // ghost family's objective signature, no pixels needed.
+        let frameHashDaemonHash = null;
+        let frameHashLastStateKey = '';
+        let frameHashLastEmitMs = 0;
+        const maybePairFrameHash = (hasPendingWrites) => {{
+            try {{
+                if (!window.__yggtermFrameHash || !term) {{
+                    return;
+                }}
+                if (frameHashDaemonHash === null) {{
+                    // No daemon hash yet (older daemon or first read pending):
+                    // nothing to pair against, and one-sided hashing is noise.
+                    return;
+                }}
+                if (hasPendingWrites) {{
+                    // Not quiescent — the applied buffer legitimately lags the
+                    // daemon while the bridge drains. Streaming mismatch is
+                    // expected, never evidence.
+                    return;
+                }}
+                const reading = window.__yggtermFrameHash.frameHashOf(term);
+                if (!reading) {{
+                    return;
+                }}
+                // A scrolled-back viewport shows history the daemon's screen
+                // does not hold; that mismatch is not artifacting, so the
+                // verdict gates on atBottom (which rides in every event).
+                const mismatch = reading.atBottom && reading.hash !== frameHashDaemonHash;
+                const stateKey = frameHashDaemonHash + '|' + reading.hash + '|'
+                    + (mismatch ? 'm' : 'a');
+                const nowMs = Date.now();
+                const stateChanged = stateKey !== frameHashLastStateKey;
+                // Emission discipline: a changed pair always emits; a PERSISTING
+                // mismatch re-announces at 1 Hz so it cannot be missed; steady
+                // agreement stays silent.
+                if (!stateChanged) {{
+                    if (!mismatch) {{
+                        return;
+                    }}
+                    if (nowMs - frameHashLastEmitMs < 1000) {{
+                        return;
+                    }}
+                }}
+                frameHashLastStateKey = stateKey;
+                frameHashLastEmitMs = nowMs;
+                sendTerminalEvent({{
+                    kind: "frame_hash",
+                    daemon_hash: frameHashDaemonHash,
+                    client_hash: reading.hash,
+                    cols: term.cols,
+                    rows: term.rows,
+                    at_bottom: reading.atBottom,
+                    mismatch: mismatch
+                }});
+            }} catch (_probeError) {{
+                // A probe failure must never disturb the flush path.
+            }}
+        }};
         // libyggterm web-surface control (ychrome pilot): OSC 7717 with payload
         // `web-surface;<action>;<base64 json>`. The PTY byte relay is the
         // transport (works identically for local and remote sessions); the OSC
@@ -10767,6 +10879,11 @@ fn terminal_eval_script_with_canvas_renderer(
                 : null;
             if (currentEntry) {{
                 currentEntry.writeBridgeInFlight = false;
+                // The frame-hash probe pairs at flush settle — this is the
+                // quiescence point the mismatch verdict is defined at.
+                maybePairFrameHash(
+                    String(currentEntry.writeBridgePendingData || '').length > 0
+                );
                 if (flushElapsedMs !== null) {{
                     currentEntry.writeBridgeFlushMaxElapsedMs = Math.max(
                         Number(currentEntry.writeBridgeFlushMaxElapsedMs || 0),
@@ -12175,6 +12292,11 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 const forceLowLatencyWrite = terminalPayloadShouldFlushImmediately(incomingWriteData);
                 schedulePendingWriteFlush(forceLowLatencyWrite);
+            }} else if (message.kind === "frame_hash") {{
+                // The frame-hash probe's daemon half arrived (frame_hash.rs):
+                // store it; the pairing + emission happen at the next flush
+                // settle, never inline in the command loop.
+                frameHashDaemonHash = typeof message.hash === 'string' ? message.hash : null;
             }} else if (message.kind === "set_input_enabled") {{
                 setInputEnabled(Boolean(message.enabled), Boolean(message.focus), true, 'rust_policy');
                 emitHostHealth();
@@ -12182,6 +12304,7 @@ fn terminal_eval_script_with_canvas_renderer(
         }}
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,
+        frame_hash_probe_js = FRAME_HASH_PROBE_JS,
         font_size = theme.font_size,
         background = background,
         foreground = foreground,

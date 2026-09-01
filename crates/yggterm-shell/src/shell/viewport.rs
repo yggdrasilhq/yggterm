@@ -4787,6 +4787,7 @@ fn TerminalCanvas(
                         _post_resize_output_seen,
                         _last_resize_seq,
                         _resync_required,
+                        _screen_hash,
                     )| {
                         (
                             chunks
@@ -6192,6 +6193,10 @@ fn TerminalCanvas(
             let mut current_terminal_rows = 0_u16;
             let mut last_sent_terminal_resize_cols = 0_u16;
             let mut last_sent_terminal_resize_rows = 0_u16;
+            // The frame-hash probe's last FORWARDED daemon hash (frame_hash.rs):
+            // forwarded to the client only on change, so a hot poll loop adds no
+            // command traffic between content changes.
+            let mut last_forwarded_screen_hash: Option<String> = None;
             // The daemon read runs on its own task so the select loop stays free to
             // service keystrokes while it is out. Depth 1 plus the `in_flight` latch
             // keeps exactly one read outstanding, so cursor advance stays sequential.
@@ -6207,6 +6212,7 @@ fn TerminalCanvas(
                     bool,
                     u64,
                     bool,
+                    Option<String>,
                 )>,
             )>(2);
             let mut terminal_read_in_flight = false;
@@ -9288,6 +9294,53 @@ fn TerminalCanvas(
                                     }
                                 }
                             }
+                            Ok(TerminalJsEvent::MouseMode { mode, enabled }) => {
+                                // The mouse-mode probe (mouse_mode_probe.rs): the
+                                // client's parser applied a DECSET mouse-tracking
+                                // transition. A content-free witness — mode +
+                                // enabled + session, nothing from the screen.
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    crate::mouse_mode_probe::TRACE_EVENT_NAME,
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "mode": mode,
+                                        "enabled": enabled,
+                                    }),
+                                );
+                            }
+                            Ok(TerminalJsEvent::FrameHash {
+                                daemon_hash,
+                                client_hash,
+                                cols,
+                                rows,
+                                at_bottom,
+                                mismatch,
+                            }) => {
+                                // The frame-hash probe's client half
+                                // (frame_hash_probe.js): the applied viewport hash
+                                // paired against the daemon's authoritative-grid
+                                // hash. Emission is already throttled client-side;
+                                // a mismatch while at-bottom is the ghost family's
+                                // objective signature — record it verbatim.
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "frame_hash_probe",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "daemon_hash": daemon_hash,
+                                        "client_hash": client_hash,
+                                        "cols": cols,
+                                        "rows": rows,
+                                        "at_bottom": at_bottom,
+                                        "mismatch": mismatch,
+                                    }),
+                                );
+                            }
                             Ok(TerminalJsEvent::ContextMenu { client_x, client_y }) => {
                                 let x = if client_x.is_finite() { client_x } else { 18.0 };
                                 let y = if client_y.is_finite() { client_y } else { 60.0 };
@@ -10394,7 +10447,22 @@ fn TerminalCanvas(
                                 post_resize_output_seen,
                                 last_resize_seq,
                                 resync_required,
+                                screen_hash,
                             )) => {
+                                // Frame-hash probe forwarding (frame_hash.rs): the
+                                // daemon's authoritative-grid hash rides every read;
+                                // it is passed to the client ONLY on change. The JS
+                                // half pairs it with its own applied-frame hash at
+                                // the next flush settle and emits the probe event.
+                                if let Some(hash) = screen_hash.as_ref()
+                                    && last_forwarded_screen_hash.as_deref()
+                                        != Some(hash.as_str())
+                                {
+                                    last_forwarded_screen_hash = Some(hash.clone());
+                                    let _ = eval.send(TerminalJsCommand::FrameHash {
+                                        hash: hash.clone(),
+                                    });
+                                }
                                 // Cold-reveal backlog drain telemetry: a single
                                 // read that returns a large accumulated backlog
                                 // (paused/trickled reads while the session kept
@@ -16662,6 +16730,10 @@ async fn terminal_read_async(
     // layer 2). Carried through to the read-bridge; the re-attach action lands in a
     // follow-up.
     bool,
+    // The frame-hash probe's daemon half (frame_hash.rs) — the daemon's
+    // authoritative-grid hash, forwarded to the client half for the
+    // flush-settle pairing. `None` = this daemon does not answer the probe.
+    Option<String>,
 )> {
     run_dedicated_terminal_io("terminal_read", trace_home, move || {
         terminal_read(&endpoint, &session_path, cursor)

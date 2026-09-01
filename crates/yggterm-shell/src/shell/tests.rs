@@ -15639,6 +15639,116 @@ console.log('ok');
     }
 
     #[test]
+    fn the_mouse_mode_probe_witnesses_decset_transitions_at_the_parse_boundary() {
+        // ACT V (research/opencode-integration board): "clicks do nothing" was
+        // undebuggable because nothing witnessed whether the TUI ever asked for
+        // mouse events. The probe registers at the escape-parse boundary
+        // (registerCsiHandler on DECSET ?h/?l), reports ONLY transitions for the
+        // witnessed modes, and must stay a pure observer: returning false leaves
+        // xterm.js to apply the mode exactly as before.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains(
+                "term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, witnessMouseMode(true))"
+            ),
+            "the probe must witness DECSET SET at the parse boundary"
+        );
+        assert!(
+            script.contains(
+                "term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, witnessMouseMode(false))"
+            ),
+            "the probe must witness DECSET RESET at the parse boundary"
+        );
+        // The witnessed set lives in ONE place per language; the guard ties the
+        // JS literal to the Rust table so widening one silently cannot fork them.
+        let expected_witnessed = format!(
+            "witnessedMouseModes = {{ {} }};",
+            crate::mouse_mode_probe::WITNESSED_MOUSE_MODES
+                .iter()
+                .map(|m| format!("{m}: true"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let expected_last = format!(
+            "lastMouseModeReport = {{ {} }};",
+            crate::mouse_mode_probe::WITNESSED_MOUSE_MODES
+                .iter()
+                .map(|m| format!("{m}: false"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            script.contains(&expected_witnessed),
+            "the JS witness table must enumerate exactly WITNESSED_MOUSE_MODES"
+        );
+        assert!(
+            script.contains(&expected_last),
+            "the JS dedup table must cover exactly WITNESSED_MOUSE_MODES"
+        );
+        assert!(
+            script.contains("sendTerminalEvent({ kind: \"mouse_mode\""),
+            "the witness must emit the mouse_mode event kind"
+        );
+        let probe_at = script
+            .find("witnessMouseMode = (enabled)")
+            .expect("the mouse-mode witness closure exists");
+        let probe_body = &script[probe_at..probe_at + 1500];
+        assert!(
+            probe_body.contains("return false;"),
+            "the observing handler must return false — a probe never consumes"
+        );
+        // Transition-only: scrollback replay re-parses historical DECSETs in
+        // order, so re-asserting an already-reported state must stay silent.
+        assert!(
+            script.contains("lastMouseModeReport[mode] === enabled"),
+            "the probe must dedup re-assertions"
+        );
+    }
+
+    #[test]
+    fn the_frame_hash_probe_pairs_daemon_and_client_frames_at_flush_settle() {
+        // ACT V (research/opencode-integration board): the ghost family
+        // (stitched stale frames, re-wrapped rows, orphaned fragments) needed
+        // an objective artifact detector. The wiring is a three-leg chain and
+        // every leg must be present: the client-half module shipped verbatim,
+        // the `frame_hash` command storing the daemon hash, and the flush-
+        // settle pairing that emits the verdict.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("__yggtermFrameHash"),
+            "the client-half module (frame_hash_probe.js) must ship in the glue"
+        );
+        assert!(
+            script.contains("message.kind === \"frame_hash\""),
+            "the daemon hash command must be consumed by the client"
+        );
+        assert!(
+            script.contains("const maybePairFrameHash = (hasPendingWrites)"),
+            "the pairing hook must be defined in the glue"
+        );
+        assert_eq!(
+            script.matches("maybePairFrameHash(").count(),
+            1,
+            "the pairing hook must be CALLED from the flush settle (the definition \
+             binds with ' = (' and does not match this pattern)"
+        );
+        assert!(
+            script.contains("if (hasPendingWrites) {"),
+            "pairing must wait for quiescence — a lagging bridge is not artifacting"
+        );
+        assert!(
+            script.contains("reading.atBottom && reading.hash !== frameHashDaemonHash"),
+            "the mismatch verdict must gate on atBottom — scrolled-back history is not a ghost"
+        );
+        assert!(
+            script.contains("frameHashLastEmitMs < 1000"),
+            "a persisting mismatch must re-announce at 1 Hz so it cannot be missed"
+        );
+    }
+
+    #[test]
     fn terminal_osc52_copy_suppresses_replay_and_dedupes_c_plus_p() {
         // finding-osc52-copy-chime-replay-refire: switching into a session replays
         // its buffered scrollback through the SAME parser, so a prior OSC 52 in that

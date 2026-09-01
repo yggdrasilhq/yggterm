@@ -26,6 +26,7 @@ mod render_attribution;
 // user's terminal blank and un-typeable". The 60 s failure timer is armed per
 // BOOTSTRAP identity; the gate is re-armed per RECOVERY, so every re-arm after
 // the first used to be uncapped. This ceiling follows the gate.
+mod mouse_mode_probe;
 mod resume_gate;
 // Phase 1 of the consolidated scroll-controller: the canonical, regression-locked
 // DECISION spec (mode + transitions). The JS wiring (Phase 2) mirrors it. Marked

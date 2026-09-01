@@ -108,6 +108,50 @@ pub struct TerminalReadResult {
     /// the gap was SILENT — the middle simply vanished
     /// (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
     pub resync_required: bool,
+    /// The frame-hash probe's daemon half (`frame_hash.rs`): a content hash
+    /// of the authoritative viewport grid + cursor, memoized like the screen
+    /// snapshot. The client pairs it with its own applied-frame hash; a
+    /// mismatch at quiescence IS artifacting, no pixels. `None` means the
+    /// daemon could not answer — absent is not zero.
+    pub screen_hash: Option<String>,
+}
+
+/// WHO asked for a resize — ACT V's resize-initiator field
+/// (research/opencode-integration board): the ghost triad needed to know which
+/// client viewport drove each grid change, so a resize seam can be attributed
+/// to the client that caused it.
+///
+/// `None` means NO client asked — a daemon-internal repair, a startup
+/// resync, a chore nudge. Absent is not anonymous: the trace events spell
+/// the difference, because "nobody asked" and "somebody unidentified asked"
+/// are different findings.
+#[derive(Debug, Clone)]
+pub struct ResizeOrigin {
+    /// `"active"` (a full client — the user's GUI, an agent CLI), `"shadow"`
+    /// (a read-only viewer; one that asks for a resize is refused upstream,
+    /// so seeing one here is itself a finding), or `"daemon"` (an internal
+    /// repair the daemon performed on a client's behalf — e.g. the
+    /// reattach grid resync).
+    pub role: &'static str,
+    /// The client's optional stable label from the wire envelope. The GUI
+    /// sends none today, so this is usually `None` — the field exists so the
+    /// moment a client starts labelling itself, the resize trail already
+    /// carries it.
+    pub client_id: Option<String>,
+}
+
+impl ResizeOrigin {
+    /// The JSON fields every resize trace event carries, derived once so the
+    /// emitters cannot drift: `client_role`/`client_id` name the asking
+    /// client (both `null` when no client asked), `hash_before` is the
+    /// authoritative-grid hash just before the resize applied — the seam the
+    /// ghost family lives at.
+    pub(crate) fn trace_fields(&self) -> serde_json::Value {
+        serde_json::json!({
+            "client_role": self.role,
+            "client_id": self.client_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1637,11 +1681,23 @@ pub fn submit_prompt_echo_verified_with(
 
 impl TerminalManager {
     pub fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
+        self.resize_with_origin(key, cols, rows, None)
+    }
+
+    /// Resize with the asking client stamped onto the trace events. Daemon-
+    /// internal callers use [`Self::resize`] (origin `None` = nobody asked).
+    pub fn resize_with_origin(
+        &self,
+        key: &str,
+        cols: u16,
+        rows: u16,
+        origin: Option<&ResizeOrigin>,
+    ) -> Result<()> {
         let session = self
             .sessions
             .get(key)
             .with_context(|| format!("terminal session not found: {key}"))?;
-        session.resize(cols, rows)
+        session.resize_with_origin(cols, rows, origin)
     }
 
     /// Current PTY grid (cols, rows) for a session, as tracked by the runtime.
@@ -2056,6 +2112,11 @@ struct PtySessionRuntime {
     /// Memo for [`PtySessionRuntime::screen_snapshot`], keyed by
     /// [`ScreenSnapshotKey`] — every input the snapshot is a function of.
     screen_snapshot_memo: Arc<Mutex<Option<(ScreenSnapshotKey, Arc<str>)>>>,
+    /// Memo for [`PtySessionRuntime::screen_content_hash`] — the frame-hash
+    /// probe's daemon half. Keyed by the snapshot key PLUS the cursor, which
+    /// can move without a write only via escapes (already covered by
+    /// `output_seq`) but is hashed INTO the value, so it rides the key.
+    screen_hash_memo: Arc<Mutex<Option<(ScreenSnapshotKey, (u16, u16), String)>>>,
     /// The latest libyggterm OSC 7717 declare per verb, lifted off this
     /// session's stream by the daemon itself. The GUI's xterm parser reads the
     /// same bytes, but only while a client host is mounted — this copy is what
@@ -3105,6 +3166,7 @@ impl PtySessionRuntime {
             current_rows,
             screen_state,
             screen_snapshot_memo: Arc::new(Mutex::new(None)),
+            screen_hash_memo: Arc::new(Mutex::new(None)),
             app_declares,
             reader_park: park,
             launch_command: launch_command.to_string(),
@@ -3425,6 +3487,39 @@ impl PtySessionRuntime {
         }
     }
 
+    /// The frame-hash probe's daemon half (`frame_hash.rs`): a content hash
+    /// of the authoritative viewport grid + cursor. Memoized on the snapshot
+    /// key (which covers every write, resize and model change) plus the
+    /// cursor, so a hot poll loop pays one mutex compare between content
+    /// changes — a probe must never become the perturbation. `None` on lock
+    /// failure: the probe ANSWERS nothing rather than answering a stale or
+    /// empty hash (absent is not zero).
+    fn screen_content_hash(&self) -> Option<String> {
+        let key = self.screen_snapshot_key();
+        let (rows, cursor, model_cols) = {
+            let mut screen_state = self.screen_state.lock().ok()?;
+            let cursor = screen_state.parser.screen().cursor_position();
+            let rows = screen_state.vt_screen_plain_rows();
+            let model_cols = screen_state.size().1;
+            (rows, cursor, model_cols)
+        };
+        if let Some((memo_key, memo_cursor, memo_hash)) = self
+            .screen_hash_memo
+            .lock()
+            .ok()?
+            .as_ref()
+            && *memo_key == key
+            && *memo_cursor == cursor
+        {
+            return Some(memo_hash.clone());
+        }
+        let hash = crate::frame_hash::frame_hash(&rows, model_cols, cursor);
+        if let Ok(mut memo) = self.screen_hash_memo.lock() {
+            *memo = Some((key, cursor, hash.clone()));
+        }
+        Some(hash)
+    }
+
     fn render_screen_snapshot(&self, pty_cols: u16) -> String {
         // BOTH WIDTHS, read under one lock. The model's is what the text was
         // formatted against (so it is where a wrapped line breaks); the PTY's is
@@ -3738,6 +3833,7 @@ impl PtySessionRuntime {
             post_resize_output_seen: self.post_resize_output_seen(),
             last_resize_seq: self.last_resize_seq(),
             resync_required,
+            screen_hash: self.screen_content_hash(),
         }
     }
 
@@ -3890,10 +3986,28 @@ impl PtySessionRuntime {
         before.saturating_sub(retained)
     }
 
+    /// A daemon-internal resize (nobody asked): the trace events answer
+    /// `client_role: null`. Client-driven resizes go through
+    /// [`Self::resize_with_origin`].
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.resize_with_origin(cols, rows, None)
+    }
+
+    fn resize_with_origin(
+        &self,
+        cols: u16,
+        rows: u16,
+        origin: Option<&ResizeOrigin>,
+    ) -> Result<()> {
         if cols == 0 || rows == 0 {
             bail!("terminal size must be greater than zero");
         }
+        // The frame-hash seam datum: the authoritative-grid hash just BEFORE
+        // this resize applied. Paired with the after-hash in the trace events,
+        // this is what makes a ghost born at the seam attributable to the
+        // resize rather than to the stream around it. Memoized, and resize is
+        // rare — the probe must not become the perturbation.
+        let hash_before = self.screen_content_hash();
         let previous_cols = self.current_cols.load(Ordering::SeqCst);
         let previous_rows = self.current_rows.load(Ordering::SeqCst);
         let master = self.master.lock().expect("pty master lock poisoned");
@@ -3925,6 +4039,8 @@ impl PtySessionRuntime {
                         "rows": rows,
                         "actual_cols": cols,
                         "actual_rows": rows,
+                        "hash_before": hash_before,
+                        "origin": origin.map(|o| o.trace_fields()),
                     }),
                 );
                 return Ok(());
@@ -3932,6 +4048,7 @@ impl PtySessionRuntime {
             if let Ok(mut screen_state) = self.screen_state.lock() {
                 screen_state.resize(rows, cols);
             }
+            let hash_after = self.screen_content_hash();
             trace_terminal_event(
                 "resize_screen_model_repaired",
                 serde_json::json!({
@@ -3940,6 +4057,9 @@ impl PtySessionRuntime {
                     "rows": rows,
                     "stale_model_cols": screen_model_size.map(|(_, model_cols)| model_cols),
                     "stale_model_rows": screen_model_size.map(|(model_rows, _)| model_rows),
+                    "hash_before": hash_before,
+                    "hash_after": hash_after,
+                    "origin": origin.map(|o| o.trace_fields()),
                 }),
             );
             return Ok(());
@@ -3955,6 +4075,8 @@ impl PtySessionRuntime {
                     "cached_rows": previous_rows,
                     "actual_cols": observed_before.map(|(actual_cols, _)| actual_cols),
                     "actual_rows": observed_before.map(|(_, actual_rows)| actual_rows),
+                    "hash_before": hash_before,
+                    "origin": origin.map(|o| o.trace_fields()),
                 }),
             );
         }
@@ -3976,6 +4098,7 @@ impl PtySessionRuntime {
         let seq = self.seq.load(Ordering::SeqCst);
         self.last_resize_seq.store(seq, Ordering::SeqCst);
         self.resize_count.fetch_add(1, Ordering::SeqCst);
+        let hash_after = self.screen_content_hash();
         trace_terminal_event(
             if observed_after == Some((cols, rows)) || observed_after.is_none() {
                 "resize"
@@ -3994,6 +4117,9 @@ impl PtySessionRuntime {
                 "actual_after_rows": observed_after.map(|(_, actual_rows)| actual_rows),
                 "effective_cols": effective_cols,
                 "effective_rows": effective_rows,
+                "hash_before": hash_before,
+                "hash_after": hash_after,
+                "origin": origin.map(|o| o.trace_fields()),
             }),
         );
         Ok(())
@@ -5929,6 +6055,64 @@ PY"#;
         assert!(repaired.contains("LEFTEDGE"));
         assert!(!repaired.contains("GHOSTCOL"));
 
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    /// THE FRAME-HASH PROBE'S DAEMON HALF, ON A REAL PTY (ACT V,
+    /// research/opencode-integration board). The hash must be STABLE across
+    /// consecutive reads (a hot poll loop must not re-walk the grid) and MOVE
+    /// when the content moves. Cursor sensitivity is pinned at the canonical
+    /// form (`canonical_frame_text` tests + the harness's JS twin), not here —
+    /// a real PTY cannot guarantee a cursor-only move as a settled state.
+    #[test]
+    fn screen_content_hash_is_stable_content_sensitive_and_cursor_sensitive() {
+        let gate = std::env::temp_dir().join(format!(
+            "yggterm-frame-hash-gate-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_file(&gate);
+        let runtime = PtySessionRuntime::spawn(
+            "local://frame-hash",
+            &format!(
+                "printf 'BASELINE'; \
+                 while [ ! -f '{gate}' ]; do sleep 0.05; done; \
+                 printf '\\033[1;1H\\033[2KCHANGED'; sleep 600",
+                gate = gate.display()
+            ),
+            None,
+            Some((40, 8)),
+        )
+        .expect("spawn frame-hash test runtime");
+
+        wait_for_screen_snapshot(&runtime, "the first paint", |screen| {
+            screen.contains("BASELINE")
+        });
+        let first = runtime.screen_content_hash().expect("hash of a live grid");
+        assert_eq!(
+            first,
+            runtime.screen_content_hash().expect("second hash"),
+            "an untouched grid must hash identically (the memo hit)"
+        );
+        assert!(
+            first.starts_with("fnv32:"),
+            "the hash names its algorithm: {first}"
+        );
+
+        // Cursor-only move: CUP without painting. Same characters on the
+        // grid, different cursor → different hash.
+        std::fs::write(&gate, b"go").expect("open the gate");
+        wait_for_screen_snapshot(&runtime, "the repaint", |screen| {
+            screen.contains("CHANGED")
+        });
+        settle_pty_output(&runtime);
+        let moved = runtime.screen_content_hash().expect("hash after repaint");
+        assert_ne!(
+            first, moved,
+            "a content change must move the hash (memo invalidated by output_seq)"
+        );
+
+        let _ = std::fs::remove_file(&gate);
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 

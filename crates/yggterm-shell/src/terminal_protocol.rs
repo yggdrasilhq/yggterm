@@ -42,6 +42,13 @@ pub(crate) enum TerminalJsCommand {
     Write {
         data: String,
     },
+    /// The frame-hash probe's daemon half (frame_hash.rs): the daemon's
+    /// authoritative-grid hash, forwarded to the client half which pairs it
+    /// with its own applied-frame hash at the next flush settle. Witness
+    /// payload only — the client never acts on it beyond pairing.
+    FrameHash {
+        hash: String,
+    },
     DropUnfocusedTuiFrame {
         tail: String,
         chars: usize,
@@ -106,6 +113,27 @@ pub(crate) enum TerminalJsEvent {
     Resize {
         cols: u16,
         rows: u16,
+    },
+    /// The mouse-mode probe fired: the client's xterm.js parser just applied
+    /// a DECSET transition for a witnessed mouse-tracking mode. See
+    /// `mouse_mode_probe.rs` for the witness contract (observer-only,
+    /// transition-only).
+    MouseMode {
+        mode: u16,
+        enabled: bool,
+    },
+    /// The frame-hash probe's client half (frame_hash_probe.js): the applied
+    /// viewport hash paired with the last forwarded daemon hash. A mismatch
+    /// at quiescence while at-bottom IS artifacting — objectively, no pixels.
+    /// `daemon_hash` is `None` when no daemon hash has arrived yet (older
+    /// daemon): the event then witnesses the client stream only.
+    FrameHash {
+        daemon_hash: Option<String>,
+        client_hash: String,
+        cols: u16,
+        rows: u16,
+        at_bottom: bool,
+        mismatch: bool,
     },
     Clipboard {
         action: String,
@@ -388,6 +416,21 @@ enum TerminalJsEventWire {
         cols: u16,
         rows: u16,
     },
+    MouseMode {
+        mode: u16,
+        enabled: bool,
+    },
+    FrameHash {
+        #[serde(default)]
+        daemon_hash: Option<String>,
+        client_hash: String,
+        cols: u16,
+        rows: u16,
+        #[serde(default)]
+        at_bottom: bool,
+        #[serde(default)]
+        mismatch: bool,
+    },
     Clipboard {
         action: String,
         chars: usize,
@@ -587,6 +630,24 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             TerminalJsEventWire::Input { data } => TerminalJsEvent::Input { data },
             TerminalJsEventWire::ReadNudge { reason } => TerminalJsEvent::ReadNudge { reason },
             TerminalJsEventWire::Resize { cols, rows } => TerminalJsEvent::Resize { cols, rows },
+            TerminalJsEventWire::MouseMode { mode, enabled } => {
+                TerminalJsEvent::MouseMode { mode, enabled }
+            }
+            TerminalJsEventWire::FrameHash {
+                daemon_hash,
+                client_hash,
+                cols,
+                rows,
+                at_bottom,
+                mismatch,
+            } => TerminalJsEvent::FrameHash {
+                daemon_hash,
+                client_hash,
+                cols,
+                rows,
+                at_bottom,
+                mismatch,
+            },
             TerminalJsEventWire::Clipboard {
                 action,
                 chars,

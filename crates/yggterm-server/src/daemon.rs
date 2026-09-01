@@ -4164,6 +4164,13 @@ pub enum ServerResponse {
         // deserializes as `false`, and older clients ignore it.
         #[serde(default)]
         resync_required: bool,
+        /// The frame-hash probe's daemon half (`frame_hash.rs`): the
+        /// authoritative grid hash for the client to pair against its own
+        /// applied-frame hash. `serde(default)` keeps it cross-version safe;
+        /// `None` = this daemon does not answer the probe (older build or
+        /// lock failure), never an empty hash.
+        #[serde(default)]
+        screen_hash: Option<String>,
     },
     TerminalSnapshot {
         text: String,
@@ -9302,7 +9309,18 @@ impl DaemonRuntime {
             if nudge_rows != rows {
                 let _ = self.terminals.resize(&runtime_path, cols, nudge_rows);
             }
-            let resized = self.terminals.resize(&runtime_path, cols, rows);
+            // This repair is a DAEMON act on a client's attach — the helper has
+            // no client identity in scope, so the origin names the daemon
+            // rather than pretending a client asked.
+            let resized = self.terminals.resize_with_origin(
+                &runtime_path,
+                cols,
+                rows,
+                Some(&crate::terminal::ResizeOrigin {
+                    role: "daemon",
+                    client_id: None,
+                }),
+            );
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -11456,6 +11474,7 @@ impl DaemonRuntime {
                             post_resize_output_seen,
                             last_resize_seq,
                             resync_required,
+                            screen_hash,
                         )) => {
                             return Ok(ServerResponse::TerminalStream {
                                 cursor,
@@ -11466,6 +11485,7 @@ impl DaemonRuntime {
                                 post_resize_output_seen,
                                 last_resize_seq,
                                 resync_required,
+                                screen_hash,
                             });
                         }
                         Err(error) => {
@@ -11535,6 +11555,7 @@ impl DaemonRuntime {
                     post_resize_output_seen: stream.post_resize_output_seen,
                     last_resize_seq: stream.last_resize_seq,
                     resync_required: stream.resync_required,
+                    screen_hash: stream.screen_hash,
                 }
             }
             ServerRequest::TerminalSnapshot { path } => {
@@ -11980,7 +12001,20 @@ impl DaemonRuntime {
                         }
                     }
                 }
-                self.terminals.resize(&runtime_path, cols, rows)?;
+                // ACT V resize-initiator: stamp WHO asked onto the resize trace
+                // events (role + optional client label). The role gate already
+                // refused shadows upstream, so a shadow name here would be a
+                // finding in itself.
+                let resize_origin = crate::terminal::ResizeOrigin {
+                    role: if identity.role == ClientRole::Shadow {
+                        "shadow"
+                    } else {
+                        "active"
+                    },
+                    client_id: identity.client_id.clone(),
+                };
+                self.terminals
+                    .resize_with_origin(&runtime_path, cols, rows, Some(&resize_origin))?;
                 // XTERM-BUG: squish-and-bottom-paint-on-reresume — persist the grid so a
                 // later daemon-process restart re-resumes EVERY session at its real grid
                 // (not DEFAULT 120x36). FLUSH SYNCHRONOUSLY on change: relying on the next
@@ -18531,6 +18565,7 @@ pub fn terminal_read(
     bool,
     u64,
     bool,
+    Option<String>,
 )> {
     match send_request(
         endpoint,
@@ -18548,6 +18583,7 @@ pub fn terminal_read(
             post_resize_output_seen,
             last_resize_seq,
             resync_required,
+            screen_hash,
         } => Ok((
             cursor,
             chunks,
@@ -18557,6 +18593,7 @@ pub fn terminal_read(
             post_resize_output_seen,
             last_resize_seq,
             resync_required,
+            screen_hash,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal stream response: {:?}", other),
@@ -22977,6 +23014,7 @@ fn daemon_request_response(
                     post_resize_output_seen,
                     last_resize_seq,
                     resync_required,
+                    screen_hash,
                 )) => {
                     return ServerResponse::TerminalStream {
                         cursor,
@@ -22987,6 +23025,7 @@ fn daemon_request_response(
                         post_resize_output_seen,
                         last_resize_seq,
                         resync_required,
+                        screen_hash,
                     };
                 }
                 Err(error) => {
@@ -28453,6 +28492,44 @@ mod tests {
             "the forwarding (preserved-owner) TerminalResize branch must record the \
              client's grid locally, or a stale persisted grid re-pins the remote PTY \
              on the next ensure (broken bottom)"
+        );
+    }
+
+    /// ACT V resize-initiator (research/opencode-integration board): the
+    /// ghost triad needed to know WHICH client drove each grid change. The
+    /// local TerminalResize arm must build a `ResizeOrigin` from the wire
+    /// identity and call `resize_with_origin` — a plain `resize` here would
+    /// silently answer every future "who asked" question with "nobody".
+    #[test]
+    fn terminal_resize_arm_stamps_the_asking_client_onto_the_trace() {
+        let source = include_str!("daemon.rs");
+        let resize_block = source
+            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
+            .expect("TerminalResize handler present");
+        assert!(
+            resize_block.contains("ResizeOrigin {"),
+            "the local resize arm must build a ResizeOrigin"
+        );
+        assert!(
+            resize_block.contains("resize_with_origin(&runtime_path, cols, rows, Some(&resize_origin))"),
+            "the local resize arm must pass the origin through to the trace events"
+        );
+        assert!(
+            resize_block.contains("identity.role == ClientRole::Shadow"),
+            "the origin's role must come from the WIRE identity, not be hardcoded"
+        );
+        // The reattach grid resync has no client in scope and must say so —
+        // "daemon" is a truthful answer; an anonymous "active" is not.
+        let ensure_block = source
+            .split("fn ensure_terminal_for_path_with_initial_size_and_seed")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ensure_session_end").next())
+            .expect("ensure-with-initial-size body present");
+        assert!(
+            ensure_block.contains("role: \"daemon\""),
+            "the daemon-internal grid resync must stamp role \"daemon\", not a client role"
         );
     }
 
@@ -36249,8 +36326,17 @@ mod tests {
         // not theirs. The obligation to re-cut belongs to the commit that
         // changes the shape; when it is missed, the cost is paid by whoever
         // runs the suite next, which is everyone.
-        const STAMPED_AT_VERSION: &str = "3.2.0";
-        const STAMPED_SHAPE_HASH: u64 = 0xa134672e9c226177;
+        // Re-cut for 3.2.26 (lane oc-act5): `TerminalStream` gained
+        // `screen_hash` — the frame-hash probe's daemon half (ACT V,
+        // research/opencode-integration board). `#[serde(default)]`, so an
+        // older daemon's absence deserializes as `None` = "the probe did not
+        // answer", never an empty hash; and an older CLIENT ignores the
+        // unknown field. Which is precisely why the version must move with
+        // the shape: two builds of one version answering TerminalRead with
+        // different payloads is the lost-PTY latch storm this stamp exists
+        // to prevent.
+        const STAMPED_AT_VERSION: &str = "3.2.35";
+        const STAMPED_SHAPE_HASH: u64 = 0x5080c63f7dfb6471;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

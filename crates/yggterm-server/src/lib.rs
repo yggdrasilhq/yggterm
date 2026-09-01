@@ -34,6 +34,7 @@ mod app_control_web_cli;
 // control command" from the other. See `app_control_cli`.
 pub mod app_control_cli;
 pub mod opencode_mirror;
+mod frame_hash;
 // THE `server <verb>` surface's shared implementations. ⛔ Per-verb, NOT a
 // wholesale collapse — see the module note for why this surface differs from
 // `server app`.
@@ -22656,7 +22657,8 @@ fn terminal_read_with_local_daemon_recovery(
     endpoint: &ServerEndpoint,
     path: &str,
     cursor: u64,
-) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool)> {
+) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool, Option<String>)>
+{
     let mut last_error = None::<anyhow::Error>;
     for attempt in 0..=5_u64 {
         match terminal_read(endpoint, path, cursor) {
@@ -22767,6 +22769,9 @@ fn bridge_remote_runtime_session_stdio(
             // with a leading underscore until that re-attach lands so this plumbing
             // is a pure no-op carry.
             _resync_required,
+            // The frame-hash probe's daemon half; the raw bridge does not pair
+            // frames (it has no xterm buffer), so it carries nothing.
+            _screen_hash,
         ) = terminal_read_with_local_daemon_recovery(endpoint, path, cursor)?;
         let chunks_have_visible_text = chunks
             .iter()
