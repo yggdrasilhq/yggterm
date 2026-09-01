@@ -18,45 +18,84 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [11.37] THE SCRIPT PLANE COULD ATTACH TO THE WRONG PROVIDER AND DRAIN A CONFIDENT FALSE ZERO — FOUR PROVIDERS SHARED ONE SOCKET (found by the gpt-tracing audit)
+## ⛔ [11.38] THE GUI BURNS UP TO A CORE AND THE WEBVIEW RETENTION CLIMBS ~300 MB/h UNDER STREAMING — AND THE FLOOD REGIME'S ENGAGEMENT IS UNVERIFIABLE (the owner's heat + leak report)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN — attribution measured 2026-08-31/09-01, fixes scoped into three lanes
 
-The observation that would falsify it: on the next yggterm build (carrying
-ytrace 0.2.1, `c64a962`), `ytrace registry --json` shows every live yggterm
-row with `socket_gen` + `catalogue_digest` and a STABLE multi-domain probe
-list (the union — `daemon_request/*`, `render/*`, `governor/*`, `host/panic`,
-and `trace/*` together, no longer flip-flopping to only `trace/*` between
-16-second reads); `ytrace attach --app yggterm 'nonexistent/probe -> @count'`
-REFUSES naming the catalogue instead of attaching; and `ls
-/run/user/<uid>/ytrace/` holds ONE `yggterm-<pid>.sock` per pid.
+The measured shape (the GUI host, yggterm 3.2.2x, one live agent row
+streaming 16 KB chunks at ~4/s):
 
-The defect, found and live-proven by the gpt-tracing research audit
-(2026-08-30; board `research/ytrace` ACK-55b082081c, door
-`campaign-gpt-tracing.md`): yggterm builds FOUR ytrace Providers of one app
-(narrative trace, perf, row governor, host panic), and each bound the same
-`<app>-<pid>.sock` — every bind unlinked the previous LIVE listener (its
-attached scripts stranded on an unreachable inode) and the registry's single
-`(app,pid)` row flip-flopped its probe catalogue to whichever provider
-emitted first after the 15 s heartbeat gate (3 ⇄ 33 probes with no restart,
-re-witnessed on the build host the same day). A script resolved through that
-registry — e.g. `daemon_request/snapshot -> @count` — was ACCEPTED by the
-wrong engine and drained `fired=0/matched=0/schema_miss=0` while the file
-plane counted 53 and 24 matching records in the overlapping windows: a
-confident false zero produced by the instrument itself.
+* **Heat:** GUI `core_fraction 0.44` sustained while streaming (`render/gui`
+  12.6 CPU-s/min + `render/web_content` 11 CPU-s/min in the WebKit renderer);
+  idle bursts to ~28% GUI + 18% WebKit with ZERO input traffic — episodic
+  chore+paint churn, nothing sustained per-thread (pidstat clean at idle).
+* **Retention, not a hard leak:** WebKit renderer RSS 907 → 1051 MB over 20
+  min while streaming, then 997 → 762 MB when the stream eased (GC recovers);
+  GUI committed_kb tripled 304 → 928 MB in 2 h (the `render/gui` minute
+  windows carry `committed_kb` — the standing curve). The GUI process itself
+  was STABLE (+92 kB/5 min) — the growth is renderer-side. Canvas layers are
+  xterm-normal (3, ~19 MB — not the [11.34] composite family); scrollback is
+  capped at 10k lines (~20–40 MB plateau) ⇒ the feed is per-chunk allocation
+  in the JS write/flush path outpacing GC.
+* **The single suspected root of both:** the flood regime exists exactly for
+  this (write cadence → 66 ms/~15 fps at >10K chars/s, edge-triggered
+  `flood_mode`), but its engagement could not be verified: 23 full-canvas
+  frames measured in a 1018 ms window (43 ms/frame > the 66 ms budget), the
+  edge record goes to the terminal debug-event stream (not the ytrace plane),
+  the describe-state timing fields answer `null` (the quick-fallback builder
+  skips them), and the ytrace generations only held hours (fixed same-day by
+  ytrace 0.2.3 — 4 GiB window).
+* **Riding finding:** `cli/refresh_managed_codex` spans up to **175 s**
+  (bimodal: p50 0 s / max 175 s over 30 min, `refresh_managed_all_install`
+  161–168 s) — daemon-plane blocking chores of the `background_copy_chore`
+  family; they are also CPU bursts.
 
-The fix lives in ytrace so every caller inherits it (upstream `c64a962`):
-`control::acquire` makes all providers of a process JOIN one control plane
-(one socket, one engine, one registry row whose catalogue is the union);
-`ping`/`catalogue`/`attach` carry an immutable `gen` + catalogue `digest`;
-registry rows carry them; the CLI runs an attach canary that REFUSES on a
-registry/socket generation mismatch or a probe absent from the live
-catalogue, and degrades to "unverified" (warning) against pre-0.2.1
-providers. Locked upstream by the audit reproduction as a regression test
-(`second_acquire_joins_the_first_engine_instead_of_rebinding`,
-`many_providers_one_process_one_control_plane`) and proven live on the 0.2.1
-CLI before the yggterm rebuild: owned probe attaches, foreign probe refuses,
-stale-gen row refuses, old provider warns + attaches.
+Lanes: (A) the write path — verify flood engagement from the live row with
+the script plane (`xterm_render/frame_window keep payload.count,
+payload.window_ms ring 64` + the flush-cadence aggregates; ytrace 0.2.2's
+self-truthing catalogue makes these attachable), and if it is not engaging,
+fix the gate; (B) the renderer allocation rate — batch per-chunk writes,
+consider adaptive scrollback during flood; (C) decompose the 175 s
+`refresh_managed_*` chore. The falsifier for the whole entry: with a row
+streaming >10K chars/s, the GUI stays under ~15 fps canvas repaints AND the
+renderer RSS plateaus within one GC cycle; at idle the GUI sits under 5%
+CPU.
+
+## ⛔ [11.40] THE DAEMON LIVES INSIDE A DEAD GUI's CGROUP SCOPE, AND GRAVEYARD SCOPES CAPTURE UNRELATED TENANTS — the swap root (the 6.7 daemon half)
+
+**Status:** OPEN — measured 2026-08-30/09-01 on the GUI host; structural fix owed
+
+The 6.7 family shape gave the GUI its own scope with kernel-confirmed bounds
+(root high ~3.7 GiB, `web/` 1856 MiB + swap.max 944 MiB). The DAEMON was
+never given the same treatment — and worse, it inherits whichever GUI scope
+spawned it: the live daemon (`yggterm-headless server daemon`, ppid 1)
+answered from `/yggterm-gui-1536835.scope/gui` — a scope whose GUI is DEAD.
+Every process the daemon spawns (agent CLIs, ychrome, yedit daemon) lands in
+a dead GUI's scope: measured graveyards — `yggterm-gui-4827.scope` (GUI from
+Aug 27) hosting `yedit --daemon`, two ychrome processes and interactive
+bashes, with **204,045 memory.high throttle events** accumulated in its
+crisis era; `yggterm-gui-3734037.scope` (Aug 29) hosting claude + agy rows.
+Measured live consequences: an evening of GUI stalls 1–4.7 s each
+(`maj_flt` 19–526 per stall on the GUI's own swapped pages — the [11.36]
+witness blocks classify them; ~59 ≥1 s witnessed stalls in one evening,
+p95 2 s over 6 h), the aftermath of swap-out during pressure windows; and
+the throttle churn risk for every tenant of a stale-bound scope. Deltas over
+60 s show the graveyards quiet NOW — the structural risk, not an active fire.
+
+The fix (the launch plane): the daemon daemonizes into its OWN scope
+(`yggterm-daemon-<pid>.scope`) with the 6.7 family shape (daemon/ + children
+for the agent-CLI plane), so (a) the daemon's committed series gets its
+kernel-confirmed bound (the owed 6.7 half — agent CLIs are the heavy plane),
+(b) daemon-spawned processes stop inheriting dead GUI scopes, (c) a GUI
+restart stops entangling the daemon's lifetime. Plus a rehome remediation
+for the existing graveyards (move the stranded pids — the owner's live
+yedit/ychrome/agent rows — into sane scopes; a verb, not a hand edit).
+Falsifier: on the next build, `/proc/<daemon-pid>/cgroup` names a
+daemon-owned scope; a GUI restart leaves the daemon's cgroup path unchanged;
+no process spawned by the daemon lands in a `yggterm-gui-*` scope whose
+original GUI is gone.
+
+
 
 ## ⛔ [11.31] A LIVE HOST CANCELLED AS "INACTIVE" LOSES ITS READY PROOF FOREVER — EVERY SWITCH-BACK COLD-REMOUNTS (the 2026-08-29 UI-block storm on the GUI host)
 
