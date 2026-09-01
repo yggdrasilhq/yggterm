@@ -1819,7 +1819,9 @@ root cause never named.
 - **INLINED FACTS — do not re-derive.** Versions, paths, row ids, baselines, what
   shipped, what was already falsified. Be exhaustive; this is the context gift.
 - **OPEN QUESTIONS — research these.** Name the unknowns and the instruments that
-  answer them. Research, subagents and fan-out are all in scope here.
+  answer them. Investigation, file work and fan-out are all in scope here — but the
+  mechanism is this skill's, not the harness's subagent tool (see the ban at the top):
+  a brief may say "investigate X", never "use your harness subagents to investigate X".
 
 ⇒ **What is worth forbidding is re-deriving a SETTLED fact, never investigating
 an UNSETTLED one.** ⚠ And *"do not re-derive"* is not *"do not verify"* — an
