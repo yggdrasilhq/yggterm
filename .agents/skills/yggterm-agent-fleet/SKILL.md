@@ -20,11 +20,13 @@ this skill is the contract for all four:
 window survives only by handing itself off — and a handoff that is not VERIFIED
 is a campaign that silently stops. That has happened; §3 exists because of it.
 
-### Fleet skill classes — base vs gated
+### Fleet skill classes — base vs gated (and the harness-subagent ban)
 
-Not every verb in this skill is for every turn. Four planes are **gated** and
+**⛔ Never use the harness's own subagent primitive for complex jobs.** Opencode `subagent`, Claude Code subagents, and any harness-provided `subagent`/`task` tool are **token-hungry (3–10× cost, cold cache), primitive (no row address, no verify, no reap), and bypass the fleet's verification.** For multi-step, multi-file, or cross-repo work: decompose via files + `msgGraph` posts in your own session. For read-only recon you may use a short-lived helper, but prefer in-session tools unless the campaign explicitly authorizes a fleet spawn.
+
+Not every verb in this skill is for every turn. Four planes are **gated-alpha** and
 only run when the user tells you to, or when `msgGraph`/`MEMORY.md` makes it
-obvious a campaign needs them:
+obvious a campaign needs them — **and while the row-primitive stability work is in flight, they are additionally blocked by the root steer (`yggterm-steer:primitive`): do not spawn/message/claim/relay/orchestrate unless the human explicitly says so in this session:**
 
 | gated plane | when it runs |
 |---|---|
@@ -36,12 +38,14 @@ obvious a campaign needs them:
 Everything else in this skill is **base** and every agent is expected to know
 it without being told: `ygg-babysit.py` / `ygg-booter.py` / `ygg-monitor.py`
 for liveness, `ygg-memory` for cross-harness memory, `ygg-board`/`msgGraph`
-for fleet talk, **`ygg-ci.py` for building** (§3c — the single fleet build
-plane), and the row verbs `server app rows` / `server app terminal` for
-addressing. **Any gitcoding project (cargo, npm, make) should build through
+for fleet talk — **use `msgGraph` liberally, each row is the primitive org unit** (see root steer `yggterm-steer:primitive` + `yggterm-steer:msgboard` for the `boards/README.md` guardrails: append-only, provenance UUID+harness, post≠law, verify-before-relay, graduate-to-memory), **`ygg-ci.py` for building** (§3c — the single fleet build
+plane), the context gauge (§2, beta — consult before stop/relay), and the row verbs `server app rows` / `server app terminal` for
+addressing (gated while alpha). **Any gitcoding project (cargo, npm, make) should build through
 `ygg-ci`, not with a bare `cargo build` in a worktree** — per-worktree builds
 collide on `target/`, trip the deploy lease, and replace the daemon other
 agents are testing (see §3c).
+
+**Primitive graph (token-efficient):** `L0 stable` = msgGraph + gauge + file/memory hub → `L0 alpha` = row (daemon PTY+identity) → `L1 gated` = relay/orchestrator/seat/spawn-verify/cross-talk → `L2 composition` = campaign/lore/binding. The board is the emergent swarm plane; the row is the gated compute plane. When the blocker lifts, §1/§3/§8/§10 become the contract.
 
 ---
 
