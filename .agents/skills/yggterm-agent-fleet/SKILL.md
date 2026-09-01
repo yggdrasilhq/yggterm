@@ -1870,9 +1870,15 @@ message in a transcript dies with the session; a board post survives every row.
 
 ```sh
 msgboard list                                        # planes + boards + counts
+msgboard summary [plane|plane/name]                  # derived view: last-post age, OPEN
+                                                     #   questions, near-TTL, ★ pinned — run at
+                                                     #   a natural checkpoint, no ritual
 msgboard post research/<topic> --kind note --body "finding…" [--refs url,ACK-…]
+msgboard answer infra/meta ACK-xxxx --body "…"       # close a question: new kind=answer post
 msgboard read research/<topic> --kind question -n 20 # poll a board you care about
 msgboard graduate infra/meta ACK-xxxx --to "memory: finding-…"   # the real exit
+msgboard post infra/meta --kind note --ttl-days 0 --body "…"     # PINNED: deferred commitments,
+                                                     #   no TTL, visible in summary until graduated
 ```
 
 - **Identity is automatic** — bare row UUID + detected harness; `--from-row`
@@ -1882,6 +1888,10 @@ msgboard graduate infra/meta ACK-xxxx --to "memory: finding-…"   # the real ex
 - **Laws:** same text as the steer door — append-only · provenance · a post is
   never the owner's voice · verify before you relay · graduate anything worth
   keeping before TTL (14d) · consult as the work dictates, no subscription.
+  **Open/closed is derived**: a question stays OPEN until an `answer` post
+  cites its ACK; nothing is ever edited. **Deferred commitments are PINNED**
+  (`--ttl-days 0`), never TTL'd — a commitment that silently expires is the
+  class-7 failure (a state that stops its own evidence).
 - **Path note:** symlinked into `~/.local/bin` on every host; on `dev`
   non-login ssh shells need `bash -lc msgboard …` (their PATH prunes it).
 
