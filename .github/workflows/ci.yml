@@ -93,6 +93,9 @@ jobs:
           cargo test -p yggterm-server --no-default-features versioned_server_status_probe_paths_dedupe_symlink_aliases_before_status
           cargo test -p yggterm-server --no-default-features remote_preview_refresh_uses_cached_scan_without_remote_io_for_live_session
           cargo test -p yggterm-shell --no-default-features linux_desktop_app_id_ignores_update_handoff_multi_window_env
+          cargo test -p yggterm-shell --no-default-features hard_reload_has_modern_and_legacy_browser_spellings
+          cargo test -p yggterm-shell --no-default-features page_menu_starts_with_hard_reload_then_separates_capture_tools
+          cargo test -p dioxus-desktop page_menu_position_tests
           cargo test -p yggterm-shell --no-default-features retained_ready_remote_host_reuses_bootstrap_on_focus_return
           cargo test -p yggterm-shell --no-default-features remote_resume_bootstrap_epoch_stays_stable_until_failure
           cargo test -p yggterm-shell --no-default-features active_retained_remote_session_does_not_bootstrap_again_on_focus_return
