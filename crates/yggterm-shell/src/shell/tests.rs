@@ -65964,4 +65964,176 @@ mod web_surface_immersion_locks {
             );
         }
     }
+
+    // ============================================================================
+    // SECTION: SSOT fs-integration probes — the durable projection may not lie
+    // ----------------------------------------------------------------------------
+    // Owner directive 2026-09-01, after a screenshot caught opencode durable rows
+    // wearing plain-shell icons while the store held 36 of them. The owner's
+    // words, paraphrased: if cli transcripts are not understood by yggterm, cli
+    // integration is doomed. Each probe exists so the next drift is caught by a
+    // red test instead of a screenshot.
+    // Each probe walks one link of the chain
+    //     store → core scan → machine index → sidebar row → icon / card
+    // over EVERY registered CLI, and fails the moment a link answers from a guess
+    // instead of the SSOT.
+    // ============================================================================
+
+    /// A machine-index fixture with one scanned session whose shape matches what
+    /// `remote_scanned_session_from_durable` serves on the wire.
+    fn ssot_scanned_session(path: &str, kind: Option<SessionKind>) -> yggterm_server::RemoteScannedSession {    yggterm_server::RemoteScannedSession {
+            session_path: path.to_string(),
+            session_id: "ses_probe0000000000000000000".to_string(),
+            cwd: "/home/user/gh/probe".to_string(),
+            started_at: "2026-09-01T00:00:00Z".to_string(),
+            modified_epoch: 1_788_000_000,
+            event_count: 8,
+            user_message_count: 4,
+            assistant_message_count: 4,
+            title_hint: "SSOT probe".to_string(),
+            recent_context: String::new(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: false,
+            kind,
+            title_is_explicit: false,
+            storage_path: "/home/user/.local/share/probe/store".to_string(),
+        }
+    }
+
+    fn ssot_machine_with(sessions: Vec<yggterm_server::RemoteScannedSession>) -> yggterm_server::RemoteMachineSnapshot {
+        yggterm_server::RemoteMachineSnapshot {
+            machine_key: "probehost".to_string(),
+            label: "probehost".to_string(),
+            ssh_target: "probehost".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            health: yggterm_server::RemoteMachineHealth::Healthy,
+            sessions,
+            apps: Vec::new(),
+            cli_presence: Vec::new(),
+        }
+    }
+
+    /// LINK: machine index → sidebar row. The synthesizer must carry the kind the
+    /// scanner knew into the row. Hardcoding `None` re-clothes every CLI the icon
+    /// ladder has no arm for — measured 2026-09-01: opencode durable rows drew as
+    /// plain shells.
+    #[test]
+    fn ssot_the_machine_index_row_keeps_the_kind_the_scanner_knew() {
+        let machine = ssot_machine_with(vec![ssot_scanned_session(
+            "remote-opencode://probehost/ses_probe0000000000000000000",
+            Some(SessionKind::OpenCode),
+        )]);
+        let scanned = &machine.sessions[0];
+        let row = crate::shell::browser_row_for_remote_scanned_session(&machine, scanned, &HashMap::new());
+        assert_eq!(
+            row.session_kind,
+            Some(SessionKind::OpenCode),
+            "a scanned kind must survive into the sidebar row — None sends the row \
+             down the path ladder, which answers from guesses"
+        );
+        assert_eq!(
+            tree_icon_kind(&row),
+            yggterm_core::agent_cli::row_icon_kind(SessionKind::OpenCode).unwrap(),
+            "an opencode durable row must draw the opencode mark, not a shell's",
+        );
+    }
+
+    /// The worst-case sidebar row: `session_kind: None`, exactly the shape a
+    /// builder that lost the kind emits.
+    fn ssot_sidebar_row_of_unknown_kind(path: &str) -> BrowserRow {
+        BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: path.to_string(),
+            label: String::new(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: String::new(),
+            descendant_sessions: 1,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        }
+    }
+
+    /// LINK: sidebar row → icon. Walk EVERY registered agent scheme with the
+    /// worst-case row (`session_kind: None`) — the icon ladder must still answer
+    /// with the CLI's own mark, because a hand ladder that predates a CLI cannot
+    /// be allowed to re-clothe it as a shell.
+    #[test]
+    fn ssot_every_registered_agent_scheme_survives_the_icon_ladder_with_its_own_mark() {
+        for scheme in yggterm_core::agent_scheme::SESSION_PATH_SCHEMES {
+            if !scheme.agent || scheme.kind.is_none() {
+                continue;
+            }
+            let kind = scheme.kind.expect("checked above");
+            let expected = yggterm_core::agent_cli::row_icon_kind(kind)
+                .unwrap_or_else(|| panic!("{kind:?}: an agent CLI must have an icon slug"));
+            let row = ssot_sidebar_row_of_unknown_kind(scheme.example);
+            assert_eq!(
+                tree_icon_kind(&row),
+                expected,
+                "scheme {} (kind {kind:?}) must draw its own mark from the path alone",
+                scheme.prefix,
+            );
+            let expected_glyph =
+                yggterm_core::agent_cli::agent_cli_descriptor(kind).map(|d| d.icon_glyph);
+            assert_eq!(
+                tree_icon_glyph(&row),
+                expected_glyph,
+                "scheme {} (kind {kind:?}) must draw its own glyph from the path alone",
+                scheme.prefix,
+            );
+        }
+    }
+
+    /// LINK: machine index → startpage card. A scheme the registry knows keeps its
+    /// own kind on the card; a scheme it does NOT know stays `None` — never
+    /// Codex, because a row named after the wrong CLI clicks down the wrong
+    /// resume path ([[agent_scheme::session_kind_for_row]]).
+    #[test]
+    fn ssot_the_startpage_card_keeps_registered_kinds_and_never_defaults_to_codex() {
+        let machine = ssot_machine_with(vec![]);
+        let mut scanned = ssot_scanned_session(
+            "remote-opencode://probehost/ses_probe0000000000000000000",
+            Some(SessionKind::OpenCode),
+        );
+        let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new());
+        assert_eq!(row.session_kind, Some(SessionKind::OpenCode));
+
+        scanned.session_path = "remote-mystery://probehost/ses_probe0000000000000000000".to_string();
+        scanned.kind = None;
+        let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new());
+        assert_ne!(
+            row.session_kind,
+            Some(SessionKind::Codex),
+            "an unresolvable scheme must stay unknown, never be named Codex"
+        );
+    }
+
+    /// REGISTRY self-consistency: every CLI's remote row scheme must resolve back
+    /// to its own kind, or every consumer built on `session_kind_for_path`
+    /// (cards, icons, resume routing) silently mislabels that CLI.
+    #[test]
+    fn ssot_every_cli_remote_row_scheme_resolves_to_its_own_kind() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let Some(scheme) = descriptor.remote_row_scheme else {
+                continue;
+            };
+            let path = format!("{scheme}probe0123456789abcdef");
+            assert_eq!(
+                yggterm_core::agent_scheme::session_kind_for_path(&path),
+                Some(descriptor.kind),
+                "{scheme}: the scheme must resolve to {:?} or the projection lies \
+                 about that CLI everywhere the path is the only evidence",
+                descriptor.kind,
+            );
+        }
+    }
 }

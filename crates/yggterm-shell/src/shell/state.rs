@@ -43546,7 +43546,14 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             expanded: false,
             session_id: Some(scanned.session_id.clone()),
             session_cwd: Some(scanned.cwd.clone()),
-            session_kind: None,
+            // ⛔ THE KIND THE SCANNER KNEW, NOT A GUESS. This used to hardcode
+            // `None`, throwing away `scanned.kind` — so every durable row the
+            // machine index served fell down `tree_icon_kind`'s path ladder,
+            // which has no arm for the newer CLI schemes and drew them as
+            // plain shells (owner screenshot 2026-09-01: opencode rows in
+            // terminal clothing). `None` means unknown per the field's own
+            // doc; a known kind is never re-unknowned on the way to the tree.
+            session_kind: scanned.kind,
         });
     }
     // SSOT: any registered agent scheme (agy-runtime://, remote-agy://, etc.)

@@ -1609,6 +1609,25 @@ mod scan_truth_tests {
             .find(|r| r.session_id == "ses_tab0000000000000000001")
             .unwrap();
         assert_eq!(peer.modified_epoch_ms, 1787984001574);
+
+        // SSOT IDENTITY (owner directive 2026-09-01): one SQLite store serves
+        // MANY sessions, so the row's identity path must name the SESSION
+        // (the store scheme + id), never the shared db file — two rows
+        // wearing the same path collapse in every path-keyed consumer
+        // (dedup, tree grouping, open-by-path).
+        assert_eq!(
+            peer.display_path,
+            "remote-opencode://ses_tab0000000000000000001",
+            "the durable identity must be per-session, not the shared db file"
+        );
+        let mut paths: Vec<&str> = out.iter().map(|r| r.display_path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(
+            paths.len(),
+            out.len(),
+            "two durable rows must never share one identity path"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -767,8 +767,13 @@ fn browser_row_for_remote_scanned_session(
     short_ids: &HashMap<String, String>,
 ) -> BrowserRow {
     let label = remote_scanned_session_label(session, short_ids);
-    let session_kind = yggterm_core::agent_scheme::session_kind_for_path(&session.session_path)
-        .or(Some(SessionKind::Codex));
+    // ⛔ NO DEFAULT CLI. This used to be `lookup.or(Some(SessionKind::Codex))`,
+    // so a row whose scheme the registry had not met was PRESENTED as Codex —
+    // the wrong button, the wrong brand colour, and the wrong resume path on
+    // click. `session_kind_for_row`'s own doc says it plainly: naming a row
+    // after the wrong CLI sends its clicks down the wrong resume path. A
+    // genuinely unknown kind stays `None` and the card stays generic.
+    let session_kind = yggterm_core::agent_scheme::session_kind_for_path(&session.session_path);
     BrowserRow {
         kind: BrowserRowKind::Session,
         full_path: session.session_path.clone(),

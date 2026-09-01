@@ -29844,6 +29844,47 @@ fn try_acquire_remote_scan_lock(
     }
 }
 
+/// How long `server remote durable-sessions` waits for the scan lock before
+/// giving up. The holder is the target's own daemon chore mid-scan — seconds,
+/// not minutes — so a bounded wait converts the old instant-refusal (which the
+/// caller answered by falling back to the LEGACY scanner, silently dropping
+/// every CLI the legacy scripts predate) into a normal core_ssot answer.
+const REMOTE_SCAN_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
+const REMOTE_SCAN_LOCK_WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// [`try_acquire_remote_scan_lock`], but WAITING: poll until the lock frees or
+/// the deadline passes. Returns `None` only after the full timeout, so a caller
+/// that treats `None` as "scan in progress" has genuinely waited its turn.
+fn wait_acquire_remote_scan_lock(
+    yggterm_home: &Path,
+    requested_home: &Path,
+    timeout: Duration,
+) -> anyhow::Result<Option<RemoteScanLockGuard>> {
+    let started = Instant::now();
+    loop {
+        if let Some(guard) = try_acquire_remote_scan_lock(yggterm_home, requested_home)? {
+            let waited_ms = started.elapsed().as_millis() as u64;
+            if waited_ms > 0 {
+                append_trace_event(
+                    yggterm_home,
+                    "remote",
+                    "scan",
+                    "lock_wait_acquired",
+                    json!({
+                        "requested_home": requested_home.display().to_string(),
+                        "waited_ms": waited_ms,
+                    }),
+                );
+            }
+            return Ok(Some(guard));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        std::thread::sleep(REMOTE_SCAN_LOCK_WAIT_POLL);
+    }
+}
+
 /// Print this host's libyggterm app registry, one `AppManifest` per line.
 ///
 /// The SSH-invoked half of [`fetch_remote_machine_apps`]. It reads the SAME
@@ -29956,10 +29997,18 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
 pub fn run_remote_durable_sessions() -> anyhow::Result<()> {
     let yggterm_home = resolve_yggterm_home()?;
     let agent_home = yggterm_core::startpage::agent_store_home(&yggterm_home);
-    let Some(_scan_lock) = try_acquire_remote_scan_lock(&yggterm_home, &agent_home)? else {
+    // WAIT for the lock (bounded): an instant refusal here is what made the
+    // caller fall back to the legacy scanner, silently dropping every CLI the
+    // legacy scripts predate — the machine index flip-flopped between
+    // core_ssot and legacy_compat on the SAME healthy host (measured in the
+    // trace 2026-09-01: dev alternated 809/196 as the lock raced).
+    let Some(_scan_lock) =
+        wait_acquire_remote_scan_lock(&yggterm_home, &agent_home, REMOTE_SCAN_LOCK_WAIT_TIMEOUT)?
+    else {
         anyhow::bail!(
-            "remote durable-session scan already in progress for {}",
-            agent_home.display()
+            "remote durable-session scan still in progress for {} after {}s of waiting",
+            agent_home.display(),
+            REMOTE_SCAN_LOCK_WAIT_TIMEOUT.as_secs()
         );
     };
     let live_runtime_ids = live_remote_runtime_codex_session_ids(&yggterm_home);
@@ -51504,4 +51553,59 @@ terminal_window_id: None,
         }
     }
 
+}
+
+#[cfg(test)]
+mod remote_scan_lock_wait_tests {
+    use super::*;
+
+    /// THE FLIP KILLER (SSOT probe, owner directive 2026-09-01): the
+    /// durable-sessions verb must WAIT for the scan lock instead of refusing
+    /// instantly. The instant refusal is what made the caller fall back to
+    /// the LEGACY scanner — silently dropping every CLI the legacy scripts
+    /// predate — so a healthy host's machine index flip-flopped between
+    /// core_ssot 809 and legacy_compat 196 in the trace, and opencode
+    /// vanished from the GUI whenever legacy won.
+    #[test]
+    fn wait_acquire_remote_scan_lock_waits_for_the_holder_then_acquires() {
+        let home =
+            std::env::temp_dir().join(format!("yggterm-lock-wait-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("temp home");
+        let requested = home.join("store");
+
+        // Held lock + short timeout: the waiter gives up at the deadline and
+        // no sooner — it actually waited rather than insta-refusing.
+        let held = try_acquire_remote_scan_lock(&home, &requested)
+            .expect("lock machinery works")
+            .expect("a free lock acquires instantly");
+        let started = std::time::Instant::now();
+        let waited = wait_acquire_remote_scan_lock(&home, &requested, Duration::from_millis(400))
+            .expect("wait machinery works");
+        assert!(waited.is_none(), "a held lock must not acquire inside the timeout");
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the wait must actually wait"
+        );
+        drop(held);
+
+        // Released mid-wait: a waiter blocked on the holder acquires the
+        // moment it frees — the exact shape the ssh verb needs when the
+        // target's own daemon chore holds the lock mid-scan.
+        let holder = try_acquire_remote_scan_lock(&home, &requested)
+            .expect("lock machinery works")
+            .expect("a free lock acquires instantly");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(holder);
+        });
+        let waited = wait_acquire_remote_scan_lock(&home, &requested, Duration::from_secs(10))
+            .expect("wait machinery works");
+        assert!(
+            waited.is_some(),
+            "a lock released inside the wait window must be acquired by the waiter"
+        );
+        releaser.join().expect("releaser thread");
+        let _ = fs::remove_dir_all(&home);
+    }
 }

@@ -1212,10 +1212,10 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
                 "muse"
             } else if row.full_path.starts_with("remote-agy://") {
                 "antigravity"
-            } else if row.full_path.starts_with("remote-grok://") {
-                "grok"
-            } else if row.full_path.starts_with("remote-kimi://") {
-                "kimi"
+            // ⛔ NO hand arms for grok/kimi/opencode/qwen/pi: the drifted
+            //    `remote-grok => "grok"` arm (registry says "grok-build") is
+            //    exactly how a restated table lies — the registry fallback
+            //    below answers from the ONE owner of the answer.
             } else if row.full_path.starts_with("local://") {
                 "terminal"
             } else if row.full_path.starts_with("ssh://") {
@@ -1223,7 +1223,18 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
             } else if row.full_path.starts_with("remote-session://") {
                 "session"
             } else {
-                "terminal"
+                // Registry fallback BEFORE the terminal default: a scheme the
+                // ladder above has no arm for (remote-opencode://, the newer
+                // remote-qwen/remote-pi shapes, …) is still a REGISTERED agent
+                // scheme, and a hand ladder that predates a CLI must not
+                // re-clothe it as a shell. Measured 2026-09-01: opencode rows
+                // wore the terminal icon because only their kind was missing.
+                match yggterm_core::agent_scheme::session_kind_for_path(&row.full_path)
+                    .and_then(yggterm_core::agent_cli::row_icon_kind)
+                {
+                    Some(icon) => icon,
+                    None => "terminal",
+                }
             }
         }
         BrowserRowKind::Group => {
@@ -1269,10 +1280,6 @@ fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
                 Some("M_")
             } else if row.full_path.starts_with("remote-agy://") {
                 Some("A_")
-            } else if row.full_path.starts_with("remote-grok://") {
-                Some("G_")
-            } else if row.full_path.starts_with("remote-kimi://") {
-                Some("K_")
             } else if row.full_path.starts_with("codex-litellm://")
                 || is_codex_litellm_storage_session_path(&row.full_path)
                 || row.full_path.starts_with("codex://")
@@ -1281,7 +1288,15 @@ fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
             {
                 Some(">_")
             } else {
-                Some("$_")
+                // Registry fallback before the shell default — the same law
+                // as tree_icon_kind's ladder: a hand ladder that predates a
+                // CLI must not answer for it.
+                match yggterm_core::agent_scheme::session_kind_for_path(&row.full_path).and_then(
+                    |kind| yggterm_core::agent_cli::agent_cli_descriptor(kind),
+                ) {
+                    Some(descriptor) => Some(descriptor.icon_glyph),
+                    None => Some("$_"),
+                }
             }
         }
         _ => None,
