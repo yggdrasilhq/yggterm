@@ -19588,7 +19588,8 @@ impl ShellState {
         // ([[campaign-split-view-groups]] persistence restore).
         let restored_split_groups = settings.split_groups.clone();
         let restored_row_arrangement = settings.row_arrangement.clone();
-        let mut browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
+        let mut browser =
+            SessionBrowserState::new(bootstrap.browser_tree.clone().prune_store_container_leaves());
         // A persisted user collapse outranks a stale expanded entry for the
         // same synthetic path (the two can disagree when an auto-reveal
         // expanded a machine after the user collapsed it).
@@ -33957,7 +33958,7 @@ impl ShellState {
     /// collapsed, which is why a collapsed local machine root kept re-expanding
     /// even though the collapse was persisted (finding-sidebar-collapse-not-persisted).
     fn replace_browser_tree(&mut self, tree: SessionNode) {
-        self.browser = SessionBrowserState::new(tree);
+        self.browser = SessionBrowserState::new(tree.prune_store_container_leaves());
         self.browser
             .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
     }

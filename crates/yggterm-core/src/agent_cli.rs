@@ -871,6 +871,13 @@ pub struct AgentCliDescriptor {
     /// A glob cannot express "not containing", and codex writes `.bak.` copies
     /// beside real transcripts.
     pub store_excluded_name_fragments: &'static [&'static str],
+    /// Files that ARE the store itself — one sqlite db for every session —
+    /// home-relative (`.local/share/opencode/opencode.db`). A cli whose
+    /// durable store is ONE file cannot express row identity as a path, so
+    /// its rows must be keyed by the store SCHEME + session id; a leaf whose
+    /// path is one of these files is a stale persisted shape, never a
+    /// session. Empty for file-per-session CLIs.
+    pub durable_store_files: &'static [&'static str],
     /// WHY this CLI's past sessions are not listed in the cwd tree, when
     /// [`Self::session_store_globs`] is empty.
     ///
@@ -1497,6 +1504,28 @@ impl AgentCliDescriptor {
             .any(|fragment| path.contains(fragment.as_str()))
     }
 
+    /// Whether `path` IS one of this CLI's durable store FILES (the one
+    /// sqlite db for a one-file CLI) — the stale persisted identity a row
+    /// must never carry, since the store holds EVERY session and a path-keyed
+    /// consumer cannot tell siblings apart. Home-relative declaration, so
+    /// both `/home/u/<entry>` and a bare `<entry>` match.
+    pub fn durable_store_file_is(&self, path: &str) -> bool {
+        let trimmed = path.trim();
+        self.durable_store_files.iter().any(|file| {
+            trimmed.ends_with(file.trim_start_matches('/'))
+                || trimmed.ends_with(&format!("/{}", file.trim_start_matches('/')))
+        })
+    }
+
+    /// The one owner of "is this path a stale store-container identity" —
+    /// a declared durable store FILE of some CLI. File-per-session CLIs
+    /// declare none and never match (their store paths are directories).
+    pub fn path_is_durable_store_container(path: &str) -> bool {
+        AGENT_CLIS
+            .iter()
+            .any(|descriptor| descriptor.durable_store_file_is(path))
+    }
+
     /// The prefix of `path` up to and including this CLI's home directory
     /// (the segment ABOVE the store root), e.g. `/home/user/.codex`. `None` when
     /// `path` is not in this CLI's store.
@@ -1896,6 +1925,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // rollout-2026-07-25T…-<uuid>.jsonl`, so the depth is not fixed.
         session_store_globs: &[".codex/sessions/**/rollout-*.jsonl"],
         store_excluded_name_fragments: &[".bak."],
+        durable_store_files: &[],
         store_scan_gap: None,
         store_home_env_override: Some(crate::ENV_YGGTERM_CODEX_HOME),
         read_store_entry: read_codex_store_entry,
@@ -2010,6 +2040,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         content_rederives_on_resume: true,
         session_store_globs: &[".codex-litellm/sessions/**/rollout-*.jsonl"],
         store_excluded_name_fragments: &[".bak."],
+        durable_store_files: &[],
         store_scan_gap: None,
         // No override: only `resolve_codex_home` consults an env var, and it
         // relocates `.codex` alone. Preserving that exactly.
@@ -2253,6 +2284,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // -home-user-gh-yggterm/<session-uuid>.jsonl`. Exactly one level.
         session_store_globs: &[".claude/projects/*/*.jsonl"],
         store_excluded_name_fragments: &[],
+        durable_store_files: &[],
         store_scan_gap: None,
         store_home_env_override: None,
         read_store_entry: read_claude_code_store_entry,
@@ -2377,6 +2409,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `id`, `cwd` and `timestamp`.
         session_store_globs: &[".pi/agent/sessions/*/*.jsonl"],
         store_excluded_name_fragments: &[],
+        durable_store_files: &[],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: None,
@@ -2480,6 +2513,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         content_rederives_on_resume: false,
         session_store_globs: &[],
         store_excluded_name_fragments: &[],
+        // The ONE durable store file — every session lives in this sqlite db,
+        // so row identity is the store scheme + session id, never this path.
+        durable_store_files: &[".local/share/opencode/opencode.db"],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: None,
@@ -2610,6 +2646,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `<sessionId>.runtime.json` sits beside the transcript in the same
         // directory and is not a transcript.
         store_excluded_name_fragments: &[".runtime."],
+        durable_store_files: &[],
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_qwen_store_entry,
@@ -2766,6 +2803,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // yggterm's kimi rows read a dead store.
         session_store_globs: &[".kimi-code/sessions/*/*/state.json"],
         store_excluded_name_fragments: &[],
+        durable_store_files: &[],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: None,
@@ -2918,6 +2956,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `route_facts.cwd` in the JSONL is the fallback when the DB is absent.
         session_store_globs: &[".local/share/muse/sessions/**/session.jsonl"],
         store_excluded_name_fragments: &["/subagent/", "/tool-outputs/"],
+        durable_store_files: &[],
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_muse_store_entry,
@@ -3094,6 +3133,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             ".antigravitycli/*.json",
         ],
         store_excluded_name_fragments: &["-shm", "-wal"],
+        durable_store_files: &[],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: None,
@@ -3303,6 +3343,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         session_store_globs: &[".grok/sessions/*/*/summary.json"],
         // The `.lock` siblings are not matched by the glob, so nothing to exclude.
         store_excluded_name_fragments: &[],
+        durable_store_files: &[],
         // grok reads `GROK_SANDBOX` for the sandbox profile; nothing in its help
         // or its strings relocates the HOME, which stays `~/.grok`.
         store_home_env_override: None,

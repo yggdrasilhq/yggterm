@@ -236,6 +236,39 @@ pub enum SessionNodeKind {
     Document,
 }
 
+impl SessionNode {
+    /// Drop session leaves whose identity is a CLI STORE CONTAINER — the
+    /// shared sqlite db or a store root file — rather than a per-session
+    /// path. One-sqlite CLIs (opencode, muse) once persisted rows keyed by
+    /// the store file itself, and every such leaf collides with its siblings
+    /// in every path-keyed consumer (dedup, open-by-path, copy-generation).
+    /// The real sessions are re-served with proper per-session identities by
+    /// the machine index, so pruning the stale leaves loses nothing.
+    /// Measured 2026-09-02: 28 sidebar rows carried
+    /// `~/.local/share/opencode/opencode.db` as their `full_path`.
+    pub fn prune_store_container_leaves(self) -> Self {
+        let children: Vec<SessionNode> = self
+            .children
+            .into_iter()
+            .filter_map(|child| {
+                let is_session_leaf = child.kind == SessionNodeKind::CodexSession
+                    && child.children.is_empty();
+                let child_path = child.path.display().to_string();
+                let is_store_container =
+                    crate::agent_cli::AgentCliDescriptor::path_is_durable_store_container(
+                        &child_path,
+                    );
+                if is_session_leaf && is_store_container {
+                    None
+                } else {
+                    Some(child.prune_store_container_leaves())
+                }
+            })
+            .collect();
+        Self { children, ..self }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     home: PathBuf,
@@ -4811,5 +4844,122 @@ mod tests {
             !body.contains("scan_all_durable_sessions(home)"),
             "the yggterm home must never reach the durable scan directly"
         );
+    }
+}
+
+#[cfg(test)]
+mod store_container_identity_tests {
+    use super::*;
+
+    /// SSOT probe (owner directive 2026-09-01): a session leaf whose identity
+    /// is the shared STORE FILE (opencode.db) is a stale persisted shape —
+    /// every such leaf collides with its siblings in path-keyed consumers.
+    /// The prune drops exactly those leaves and nothing else: groups recurse,
+    /// session files inside a store survive, non-store leaves survive.
+    #[test]
+    fn prune_drops_store_container_leaves_and_keeps_everything_else() {
+        let store_db = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/home/user"))
+            .join(".local/share/opencode/opencode.db");
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".into(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/home/user"),
+            session_id: None,
+            cwd: None,
+            session_kind: None,
+            detail: None,
+            children: vec![
+                // A stale persisted leaf wearing the shared db file as identity.
+                SessionNode {
+                    kind: SessionNodeKind::CodexSession,
+                    name: "stale".into(),
+                    title: Some("stale db-path row".into()),
+                    document_kind: None,
+                    group_kind: None,
+                    path: store_db.clone(),
+                    session_id: Some("ses_stale".into()),
+                    cwd: None,
+                    session_kind: Some(SessionKind::OpenCode),
+                    detail: None,
+                    children: vec![],
+                },
+                // A GROUP inside a store dir (the store dir itself) recurses.
+                SessionNode {
+                    kind: SessionNodeKind::Group,
+                    name: "store dir".into(),
+                    title: None,
+                    document_kind: None,
+                    group_kind: None,
+                    path: dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("/home/user"))
+                        .join(".local/share/opencode"),
+                    session_id: None,
+                    cwd: None,
+                    session_kind: None,
+                    detail: None,
+                    children: vec![SessionNode {
+                        kind: SessionNodeKind::Group,
+                        name: "inner group".into(),
+                        title: None,
+                        document_kind: None,
+                        group_kind: None,
+                        path: PathBuf::from("/home/user/proj"),
+                        session_id: None,
+                        cwd: None,
+                        session_kind: None,
+                        detail: None,
+                        children: vec![],
+                    }],
+                },
+                // A plain folder group with a session leaf survives.
+                SessionNode {
+                    kind: SessionNodeKind::Group,
+                    name: "proj".into(),
+                    title: None,
+                    document_kind: None,
+                    group_kind: None,
+                    path: PathBuf::from("/home/user/proj"),
+                    session_id: None,
+                    cwd: None,
+                    session_kind: None,
+                    detail: None,
+                    children: vec![SessionNode {
+                        kind: SessionNodeKind::CodexSession,
+                        name: "keep".into(),
+                        title: Some("real session".into()),
+                        document_kind: None,
+                        group_kind: None,
+                        path: PathBuf::from("/home/user/proj/session.jsonl"),
+                        session_id: Some("ses_keep".into()),
+                        cwd: None,
+                        session_kind: Some(SessionKind::Codex),
+                        detail: None,
+                        children: vec![],
+                    }],
+                },
+            ],
+        };
+
+        let pruned = tree.prune_store_container_leaves();
+        let names: Vec<&str> = pruned.children.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            !names.contains(&"stale"),
+            "the store-container leaf must be pruned: {names:?}"
+        );
+        let store_dir = pruned
+            .children
+            .iter()
+            .find(|c| c.name == "store dir")
+            .expect("a store DIR group recurses, not pruned");
+        assert_eq!(store_dir.children.len(), 1, "its inner group survives");
+        assert!(
+            names.contains(&"proj"),
+            "unrelated groups survive"
+        );
+        assert_eq!(pruned.children.len(), 2, "exactly the stale leaf went away");
     }
 }
