@@ -183,6 +183,28 @@ are profiling).
   means NOTHING was armed, with the daemon's reason alongside.
 - `server trace tail` — the event trace (daemon + `ui` events). Time-order it to see a
   reveal/reconcile/replay sequence. (Rotates — grep `~/.yggterm/trace/*.jsonl` for older.)
+- **The ACT V ghost/glyph/squish instruments** (opencode-integration turn;
+  observability-only — the next campaign owns the declarations):
+  - `mouse_mode_probe` (ui/terminal_mount, per client surface): every DECSET
+    1000/1002/1003/1006 transition the client's xterm.js parser actually
+    applied, transition-only (scrollback replay stays silent). The "clicks do
+    nothing" symptom decomposes: NO events ⇒ the TUI never armed mouse mode;
+    `enabled:true` then nothing ⇒ the mode armed but events were dropped.
+    Source: `mouse_mode_probe.rs`; observer-only (`return false`), guard-tested.
+  - `frame_hash_probe` (ui/terminal_mount): pairs the daemon's authoritative
+    grid hash (fnv1a32 over plain rows + cursor, `frame_hash.rs`) with the
+    client's applied-frame hash (`frame_hash_probe.js`, shared verbatim with
+    `tools/xterm-harness/frame_hash_probe.test.js` — ONE canonical form, ONE
+    pinned test vector asserted on BOTH sides). A mismatch at quiescence while
+    `at_bottom:true` IS artifacting, no pixels. Emission: changed pairs always;
+    a persisting mismatch re-announces at 1 Hz; agreement is silent. A
+    `mismatch:false` stream alongside a ghost REPORT means the ghost is NOT
+    character-level — look at glyphs/attributes, not the grid.
+  - Resize-initiator fields on every `resize*` trace event (server/terminal_runtime):
+    `origin.client_role` (`active`/`shadow`/`daemon`) + `origin.client_id`
+    (wire envelope label; the GUI sends none today) + `hash_before`/`hash_after`
+    at the seam. `null` origin = a daemon-internal repair; a `shadow` role here
+    is a finding in itself (the role gate refuses shadow resizes upstream).
 - `server app rows` — browser/sidebar rows. For every agent row, read
   `session_kind` + `session_kind_source`, `title_quality`, `icon_kind` +
   `expected_icon_kind`, and `icon_matches_session_kind`. These are the FINAL
