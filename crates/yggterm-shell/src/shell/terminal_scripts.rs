@@ -1954,6 +1954,17 @@ fn terminal_eval_script_with_canvas_renderer(
         let frameHashDaemonHash = null;
         let frameHashLastStateKey = '';
         let frameHashLastEmitMs = 0;
+        let frameHashRequestInFlight = false;
+        // QUIETNESS: a pairing is only honest when the surface has been
+        // silent — no queued writes for >=800ms — so the daemon hash fetched
+        // at request time describes the same frame the client holds.
+        const frameHashQuietAndStable = () => {{
+            const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+            if (!entry) return false;
+            if (String(entry.writeBridgePendingData || '').length > 0) return false;
+            const lastQueued = Number(entry.lastWriteQueuedAtMs || 0);
+            return (Date.now() - lastQueued) >= 800;
+        }};
         const maybePairFrameHash = (hasPendingWrites) => {{
             try {{
                 if (!window.__yggtermFrameHash || !term) {{
@@ -1967,7 +1978,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (hasPendingWrites) {{
                     // Not quiescent — the applied buffer legitimately lags the
                     // daemon while the bridge drains. Streaming mismatch is
-                    // expected, never evidence.
+                    // expected, never evidence. Ask for a FRESH hash once the
+                    // surface has gone quiet: one in-flight request at a time.
+                    if (!frameHashRequestInFlight && frameHashQuietAndStable()) {{
+                        frameHashRequestInFlight = true;
+                        sendTerminalEvent({{ kind: "frame_hash_request" }});
+                    }}
                     return;
                 }}
                 const reading = window.__yggtermFrameHash.frameHashOf(term);
@@ -12303,6 +12319,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 // command loop is never blocked), not at some later flush
                 // whose content would already be newer than the hash.
                 frameHashDaemonHash = typeof message.hash === 'string' ? message.hash : null;
+                frameHashRequestInFlight = false;
                 setTimeout(() => {{ maybePairFrameHash(false); }}, 0);
             }} else if (message.kind === "set_input_enabled") {{
                 setInputEnabled(Boolean(message.enabled), Boolean(message.focus), true, 'rust_policy');

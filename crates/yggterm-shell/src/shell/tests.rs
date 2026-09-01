@@ -15730,9 +15730,9 @@ console.log('ok');
         );
         assert_eq!(
             script.matches("maybePairFrameHash(").count(),
-            1,
-            "the pairing hook must be CALLED from the flush settle (the definition \
-             binds with ' = (' and does not match this pattern)"
+            2,
+            "the pairing hook must be CALLED exactly twice: on the frame_hash \
+             arrival (caught-up instant) and at the flush settle"
         );
         assert!(
             script.contains("if (hasPendingWrites) {"),

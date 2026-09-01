@@ -9318,8 +9318,7 @@ fn TerminalCanvas(
                                 rows,
                                 at_bottom,
                                 mismatch,
-                            }) => {
-                                // The frame-hash probe's client half
+                            }) => {                                // The frame-hash probe's client half
                                 // (frame_hash_probe.js): the applied viewport hash
                                 // paired against the daemon's authoritative-grid
                                 // hash. Emission is already throttled client-side;
@@ -9340,6 +9339,41 @@ fn TerminalCanvas(
                                         "mismatch": mismatch,
                                     }),
                                 );
+                            }
+                            Ok(TerminalJsEvent::FrameHashRequest) => {
+                                // The client half went quiet and wants a FRESH
+                                // authoritative hash to pair against (a hash
+                                // forwarded at read time may predate the burst
+                                // it just drained). One round trip, honest by
+                                // construction: the daemon hashes its model
+                                // NOW, the client pairs its stable buffer now.
+                                match terminal_read_async(
+                                    endpoint.clone(),
+                                    runtime_session_path.clone(),
+                                    cursor,
+                                    &trace_home,
+                                )
+                                .await
+                                {
+                                    Ok((_, _, _, _, _, _, _, _, Some(fresh))) => {
+                                        let _ = eval.send(TerminalJsCommand::FrameHash {
+                                            hash: fresh,
+                                        });
+                                    }
+                                    Ok((..)) => {}
+                                    Err(error) => {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "frame_hash_request_failed",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "error": error.to_string(),
+                                            }),
+                                        );
+                                    }
+                                }
                             }
                             Ok(TerminalJsEvent::ContextMenu { client_x, client_y }) => {
                                 let x = if client_x.is_finite() { client_x } else { 18.0 };

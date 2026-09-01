@@ -122,6 +122,10 @@ pub(crate) enum TerminalJsEvent {
         mode: u16,
         enabled: bool,
     },
+    /// The client half asks for a FRESH authoritative hash: its buffer has
+    /// been quiet long enough to pair honestly, and a hash forwarded at read
+    /// time may predate the very burst it just drained.
+    FrameHashRequest,
     /// The frame-hash probe's client half (frame_hash_probe.js): the applied
     /// viewport hash paired with the last forwarded daemon hash. A mismatch
     /// at quiescence while at-bottom IS artifacting — objectively, no pixels.
@@ -420,6 +424,7 @@ enum TerminalJsEventWire {
         mode: u16,
         enabled: bool,
     },
+    FrameHashRequest,
     FrameHash {
         #[serde(default)]
         daemon_hash: Option<String>,
@@ -633,6 +638,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             TerminalJsEventWire::MouseMode { mode, enabled } => {
                 TerminalJsEvent::MouseMode { mode, enabled }
             }
+            TerminalJsEventWire::FrameHashRequest => TerminalJsEvent::FrameHashRequest,
             TerminalJsEventWire::FrameHash {
                 daemon_hash,
                 client_hash,
