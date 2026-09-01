@@ -57608,7 +57608,7 @@ mod webtabs_menu_switcher_locks {
         blank.effective_url = String::new();
         let tabs = vec![tab(0, "app", None, false), blank];
         let items = menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1));
-        for id in ["webtab-reload", "webtab-copy-url"] {
+        for id in ["webtab-reload", "webtab-reload-hard", "webtab-copy-url"] {
             let item = items
                 .iter()
                 .find(|item| item.id == id)
@@ -57631,8 +57631,32 @@ mod webtabs_menu_switcher_locks {
         assert!(
             items
                 .iter()
-                .filter(|item| item.id == "webtab-reload" || item.id == "webtab-copy-url")
+                .filter(|item| {
+                    item.id == "webtab-reload"
+                        || item.id == "webtab-reload-hard"
+                        || item.id == "webtab-copy-url"
+                })
                 .all(|item| !item.disabled),
+        );
+
+        let page_actions: Vec<_> = items
+            .iter()
+            .filter(|item| !item.separator)
+            .map(|item| (item.id.as_str(), item.label.as_str()))
+            .collect();
+        let reload_at = page_actions
+            .iter()
+            .position(|(id, _)| *id == "webtab-reload")
+            .expect("normal reload is drawn");
+        assert_eq!(
+            page_actions.get(reload_at + 1),
+            Some(&("webtab-reload-hard", "Reload (drop cache)")),
+            "the cache-breaking reload must be a separate option immediately after Reload"
+        );
+        assert_eq!(
+            web_tab_menu_action(&WebTabMenuTarget::Tab(1), "webtab-reload-hard"),
+            Some(WebTabMenuAction::HardReloadTab(1)),
+            "the hard-reload row must keep the id of the tab that was right-clicked"
         );
 
         // The reload verb aims at the row that was clicked, not at whatever is

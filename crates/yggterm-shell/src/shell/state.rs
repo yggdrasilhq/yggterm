@@ -25799,6 +25799,7 @@ impl ShellState {
             WebTabMenuAction::NewTab
             | WebTabMenuAction::NewTabAbove(_)
             | WebTabMenuAction::ReopenClosedTabs
+            | WebTabMenuAction::HardReloadTab(_)
             | WebTabMenuAction::CopyTabUrl(_) => return false,
             WebTabMenuAction::DuplicateTab(tab_id) => {
                 // The app tab is not copyable, and that refusal lives HERE where

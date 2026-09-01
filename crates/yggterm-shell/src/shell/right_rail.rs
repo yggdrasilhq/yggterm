@@ -6469,7 +6469,7 @@ fn web_tab_count_phrase(count: usize, noun: &str) -> String {
 /// app menus", and those read create → act on this thing → arrange → destroy:
 ///
 ///   create      New tab · New tab above this one · Reopen closed tabs
-///   page        Reload · Copy URL · Duplicate tab · Split with active tab
+///   page        Reload · Reload (drop cache) · Copy URL · Duplicate tab · Split with active tab
 ///   arrange     Move to group ▸ · (on a head) Expand/Collapse · Ungroup
 ///   destroy     Close tab · Close N other tabs · Close N tabs below
 ///
@@ -6540,6 +6540,14 @@ fn web_tab_menu_items(
                 reload.disabled("this tab has not gone anywhere yet")
             } else {
                 reload
+            });
+            let hard_reload =
+                RowMenuItem::new("webtab-reload-hard", "Reload (drop cache)", 'h')
+                    .icon(ShellIcon::Reload);
+            items.push(if tab.effective_url.trim().is_empty() {
+                hard_reload.disabled("this tab has not gone anywhere yet")
+            } else {
+                hard_reload
             });
             let copy_url =
                 RowMenuItem::new("webtab-copy-url", "Copy URL", 'u').icon(ShellIcon::Copy);
@@ -6798,6 +6806,7 @@ enum WebTabMenuAction {
     NewTabAbove(u64),
     ReopenClosedTabs,
     ReloadTab(u64),
+    HardReloadTab(u64),
     CopyTabUrl(u64),
     CloseTab(u64),
     CloseOtherTabs(u64),
@@ -6835,6 +6844,7 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
                 "webtab-new-above" => Some(WebTabMenuAction::NewTabAbove(tab)),
                 "webtab-reopen" => Some(WebTabMenuAction::ReopenClosedTabs),
                 "webtab-reload" => Some(WebTabMenuAction::ReloadTab(tab)),
+                "webtab-reload-hard" => Some(WebTabMenuAction::HardReloadTab(tab)),
                 "webtab-copy-url" => Some(WebTabMenuAction::CopyTabUrl(tab)),
                 "webtab-close" => Some(WebTabMenuAction::CloseTab(tab)),
                 "webtab-close-others" => Some(WebTabMenuAction::CloseOtherTabs(tab)),
@@ -6882,6 +6892,7 @@ fn web_tab_menu_close_plan(tabs: &[WebTabScopeRow], action: &WebTabMenuAction) -
         | WebTabMenuAction::NewTabAbove(_)
         | WebTabMenuAction::ReopenClosedTabs
         | WebTabMenuAction::ReloadTab(_)
+        | WebTabMenuAction::HardReloadTab(_)
         | WebTabMenuAction::CopyTabUrl(_)
         | WebTabMenuAction::DuplicateTab(_)
         | WebTabMenuAction::MoveToGroup(_, _)
@@ -7811,6 +7822,25 @@ fn dispatch_web_tab_menu_action(
     }
     // The verbs that need the Signal.
     match &action {
+        WebTabMenuAction::HardReloadTab(tab_id) => {
+            let result = web_surface_native_id_for(&session_path, *tab_id)
+                .ok_or_else(|| {
+                    "web surface not live (session backgrounded or not yet revealed)".to_string()
+                })
+                .and_then(|native_id| {
+                    dioxus_desktop::window().reload_web_surface_bypass_cache(native_id)
+                });
+            if let Err(error) = result {
+                state.with_mut_counted(|shell| {
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "Could Not Reload Without Cache",
+                        error,
+                    )
+                });
+            }
+            return;
+        }
         // Both open through the ONE UI opener, so a tab opened from the menu is
         // typing-ready exactly like one opened from a "+" — which is the whole
         // "on new tab ANYWHERE in the tree the focus should be on the URL input
