@@ -57520,6 +57520,7 @@ mod webtabs_menu_switcher_locks {
                 "webtab-reopen",
                 "--",
                 "webtab-reload",
+                "webtab-reload-hard",
                 "webtab-copy-url",
                 "webtab-duplicate",
                 "webtab-split",
