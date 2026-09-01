@@ -12298,9 +12298,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 schedulePendingWriteFlush(forceLowLatencyWrite);
             }} else if (message.kind === "frame_hash") {{
                 // The frame-hash probe's daemon half arrived (frame_hash.rs):
-                // store it; the pairing + emission happen at the next flush
-                // settle, never inline in the command loop.
+                // the read that carried it returned NO chunks, so this surface
+                // is caught up — pair right now (deferred to a task so the
+                // command loop is never blocked), not at some later flush
+                // whose content would already be newer than the hash.
                 frameHashDaemonHash = typeof message.hash === 'string' ? message.hash : null;
+                setTimeout(() => {{ maybePairFrameHash(false); }}, 0);
             }} else if (message.kind === "set_input_enabled") {{
                 setInputEnabled(Boolean(message.enabled), Boolean(message.focus), true, 'rust_policy');
                 emitHostHealth();
