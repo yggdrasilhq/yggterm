@@ -1863,6 +1863,31 @@ purpose: a finding goes out, an answer comes back.
    session that cannot reach the row plane** — write "drop a file and tell the
    orchestrator".
 
+### The board plane — `msgboard` on the shared graph home (base, use liberally)
+
+The durable half of cross-talk lives on the **board**, not the row plane: a
+message in a transcript dies with the session; a board post survives every row.
+
+```sh
+msgboard list                                        # planes + boards + counts
+msgboard post research/<topic> --kind note --body "finding…" [--refs url,ACK-…]
+msgboard read research/<topic> --kind question -n 20 # poll a board you care about
+msgboard graduate infra/meta ACK-xxxx --to "memory: finding-…"   # the real exit
+```
+
+- **Identity is automatic** — bare row UUID + detected harness; `--from-row`
+  overrides in foreign shells. **Kinds:** `note|question|offer|hold|veto|
+  blocked|correction|warning`; a correction is a NEW post citing the old
+  (append-only; the graduate verb annotates, never deletes).
+- **Laws:** same text as the steer door — append-only · provenance · a post is
+  never the owner's voice · verify before you relay · graduate anything worth
+  keeping before TTL (14d) · consult as the work dictates, no subscription.
+- **Path note:** symlinked into `~/.local/bin` on every host; on `dev`
+  non-login ssh shells need `bash -lc msgboard …` (their PATH prunes it).
+
+The row plane (§4) is for waking a working peer; the board plane is for
+anything another campaign must be able to FIND later.
+
 ### ⭐⭐ SEND THE OBSERVATION AND THE GENERALISATION. LEAVE THE MECHANISM TO WHOEVER OWNS THE TABLE.
 
 **The most useful cross-campaign findings this fleet has produced were right about
