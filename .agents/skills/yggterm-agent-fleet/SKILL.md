@@ -1832,6 +1832,8 @@ documented failure.
 
 ## 9. Cross-talk — campaigns that answer each other
 
+**⚠ Gated while the row primitive is alpha (see the blocker at the top of this skill).** When the blocker lifts, this section is the contract.
+
 §4 gives you the verb; this is the standing practice built on it. **Long-running
 campaigns accumulate findings that belong to a DIFFERENT campaign**, and the
 default failure is that they die in a transcript. Cross-talk is two-way on
