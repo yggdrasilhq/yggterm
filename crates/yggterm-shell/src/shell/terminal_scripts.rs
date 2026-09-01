@@ -1982,16 +1982,20 @@ fn terminal_eval_script_with_canvas_renderer(
                     + (mismatch ? 'm' : 'a');
                 const nowMs = Date.now();
                 const stateChanged = stateKey !== frameHashLastStateKey;
-                // Emission discipline: a changed pair always emits; a PERSISTING
-                // mismatch re-announces at 1 Hz so it cannot be missed; steady
+                // Emission discipline: a changed pair emits at most every
+                // 250ms (a busy row changes the pair every flush — an
+                // uncapped changed-pair stream was measured at ~27 events
+                // per minute on one active row); a PERSISTING mismatch
+                // re-announces at 1 Hz so it cannot be missed; steady
                 // agreement stays silent.
-                if (!stateChanged) {{
-                    if (!mismatch) {{
-                        return;
-                    }}
-                    if (nowMs - frameHashLastEmitMs < 1000) {{
-                        return;
-                    }}
+                if (nowMs - frameHashLastEmitMs < 250) {{
+                    return;
+                }}
+                if (!stateChanged && !mismatch) {{
+                    return;
+                }}
+                if (!stateChanged && nowMs - frameHashLastEmitMs < 1000) {{
+                    return;
                 }}
                 frameHashLastStateKey = stateKey;
                 frameHashLastEmitMs = nowMs;

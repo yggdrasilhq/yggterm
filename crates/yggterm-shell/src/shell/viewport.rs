@@ -10454,7 +10454,15 @@ fn TerminalCanvas(
                                 // it is passed to the client ONLY on change. The JS
                                 // half pairs it with its own applied-frame hash at
                                 // the next flush settle and emits the probe event.
-                                if let Some(hash) = screen_hash.as_ref()
+                                // ⛔ Forward only when this read returned NO chunks:
+                                // the client is then fully caught up, so a settle-
+                                // time mismatch is REAL. Forwarding on a chunked
+                                // read pairs the client against a daemon that is
+                                // already one burst ahead — a healthy busy row
+                                // would mismatch forever (measured: 1459/1459
+                                // false mismatches on one active shell row).
+                                if chunks.is_empty()
+                                    && let Some(hash) = screen_hash.as_ref()
                                     && last_forwarded_screen_hash.as_deref()
                                         != Some(hash.as_str())
                                 {
