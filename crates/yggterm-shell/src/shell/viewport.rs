@@ -19336,8 +19336,10 @@ fn open_web_surface_tab(
 /// the mouse, had no mouse route and existed only as an agent-control command.
 ///
 /// The first row is the cache-breaking sibling of WebKit's native Reload. The
-/// host inserts this whole contributed list immediately after that native row,
-/// so it is followed by a separator before the four capture tools. Those four
+/// host guarantees the native row exists and inserts this whole contributed
+/// list immediately after it, so the page menu always presents two distinct,
+/// adjacent choices: normal Reload, then Reload without cache. A separator
+/// follows before the four capture tools. Those four
 /// are the same regions the ychrome engine's `/engine/shot` takes, in the same
 /// order: a human clicking "Full page" and an agent sending `region=full` must
 /// get the same picture, so the vocabulary is one vocabulary.

@@ -3266,7 +3266,21 @@ fn connect_page_menu_contributor(
             .iter()
             .map(|item| item.stock_action())
             .collect::<Vec<_>>();
-        let mut insert_at = page_menu_insert_position_after_reload(&default_actions);
+        let (mut insert_at, native_reload_missing) =
+            page_menu_insert_position_after_reload(&default_actions);
+        if native_reload_missing {
+            // WebKit omits Reload from some hit-test-specific menus. A page
+            // reload is still a page verb, and the shell's cache-bypassing
+            // sibling only makes sense beside it, so restore the ENGINE'S
+            // stock action rather than growing a second shell implementation.
+            menu.insert(
+                &webkit2gtk::ContextMenuItem::from_stock_action(
+                    webkit2gtk::ContextMenuAction::Reload,
+                ),
+                insert_at,
+            );
+            insert_at += 1;
+        }
         for item in contributed {
             if item.id.is_empty() {
                 menu.insert(&webkit2gtk::ContextMenuItem::new_separator(), insert_at);
@@ -3311,19 +3325,35 @@ fn connect_page_menu_contributor(
 /// The insertion point for shell-contributed page commands.
 ///
 /// Reload-adjacent commands belong immediately after WebKit's native Reload.
-/// Some context-specific menus omit Reload; in that case preserving every
-/// native row and appending is the safe fallback.
-fn page_menu_insert_position_after_reload(actions: &[webkit2gtk::ContextMenuAction]) -> i32 {
-    actions
+/// Some context-specific menus omit Reload. In that case the caller inserts
+/// WebKit's own stock Reload at the end, then begins the contributed block
+/// immediately after it. The bool says whether that restoration is required.
+fn page_menu_insert_position_after_reload(
+    actions: &[webkit2gtk::ContextMenuAction],
+) -> (i32, bool) {
+    match actions
         .iter()
         .position(|action| *action == webkit2gtk::ContextMenuAction::Reload)
-        .map(|position| position + 1)
-        .unwrap_or(actions.len()) as i32
+    {
+        Some(position) => ((position + 1) as i32, false),
+        None => (actions.len() as i32, true),
+    }
+}
+
+fn rearm_favicons_after_database_clear(
+    pngs: &RefCell<HashMap<u64, Option<Vec<u8>>>>,
+    requests: &RefCell<HashMap<u64, String>>,
+) {
+    requests.borrow_mut().clear();
+    pngs.borrow_mut().clear();
 }
 
 #[cfg(test)]
 mod page_menu_position_tests {
-    use super::page_menu_insert_position_after_reload;
+    use super::{
+        page_menu_insert_position_after_reload, rearm_favicons_after_database_clear,
+    };
+    use std::{cell::RefCell, collections::HashMap};
     use webkit2gtk::ContextMenuAction;
 
     #[test]
@@ -3335,13 +3365,32 @@ mod page_menu_position_tests {
             ContextMenuAction::Copy,
             ContextMenuAction::InspectElement,
         ];
-        assert_eq!(page_menu_insert_position_after_reload(&actions), 3);
+        assert_eq!(page_menu_insert_position_after_reload(&actions), (3, false));
     }
 
     #[test]
-    fn a_menu_without_native_reload_appends_contributed_commands() {
+    fn a_menu_without_native_reload_restores_it_before_contributed_commands() {
         let actions = [ContextMenuAction::Copy, ContextMenuAction::InspectElement];
-        assert_eq!(page_menu_insert_position_after_reload(&actions), 2);
+        assert_eq!(page_menu_insert_position_after_reload(&actions), (2, true));
+    }
+
+    #[test]
+    fn hard_reload_rearms_every_cached_favicon_after_the_database_is_cleared() {
+        let pngs = RefCell::new(HashMap::from([
+            (7, Some(vec![1, 2, 3])),
+            (8, Some(vec![4, 5, 6])),
+        ]));
+        let requests = RefCell::new(HashMap::from([
+            (7, "https://example.test/old".to_string()),
+            (8, "https://other.test/".to_string()),
+        ]));
+
+        rearm_favicons_after_database_clear(&pngs, &requests);
+
+        assert!(!pngs.borrow().contains_key(&7));
+        assert!(!requests.borrow().contains_key(&7));
+        assert!(!pngs.borrow().contains_key(&8));
+        assert!(!requests.borrow().contains_key(&8));
     }
 }
 
@@ -5770,11 +5819,32 @@ impl WebSurfaceHost {
     /// would answer the key with something the user can already do, which is
     /// worse than not claiming it.
     pub fn reload_bypass_cache(&self, id: u64) -> Result<(), String> {
-        use webkit2gtk::WebViewExt as _;
+        use webkit2gtk::{FaviconDatabaseExt as _, WebContextExt as _, WebViewExt as _};
         use wry::WebViewExtUnix as _;
         let surfaces = self.surfaces.borrow();
         let surface = surfaces.get(&id).ok_or("no such surface")?;
-        surface.webview.webview().reload_bypass_cache();
+        let webview = surface.webview.webview();
+
+        // WebKit's HTTP-cache bypass does not evict its separate, persistent
+        // favicon database. Clear that database as part of the explicit hard
+        // reload contract, then re-arm this surface's async favicon request so
+        // the tab model drops the old bytes and accepts the icon fetched by
+        // the new load. WebKit exposes only a database-wide clear, not a
+        // per-page eviction, so re-arm every local icon answer as well: tabs
+        // on the cleared context re-fetch, and other contexts answer from
+        // their still-populated databases on the next reconcile tick.
+        if let Some(database) = webview
+            .context()
+            .and_then(|context| context.favicon_database())
+        {
+            database.clear();
+        }
+        rearm_favicons_after_database_clear(
+            self.favicon_pngs.as_ref(),
+            self.favicon_requests.as_ref(),
+        );
+
+        webview.reload_bypass_cache();
         Ok(())
     }
 
