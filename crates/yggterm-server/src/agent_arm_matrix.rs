@@ -620,6 +620,23 @@ fn contains_in_order(text: &str, tokens: &[&str]) -> bool {
     true
 }
 
+/// The session id the RESUME arm exercises for `kind`.
+///
+/// ⛔ OpenCode's own composer contract (2026-09-02, `ses_` guard): the CLI's
+/// service rejects any session id that does not start with `ses`, and the
+/// composer DEGRADES such a resume to a fresh launch. Exercising the shared
+/// uuid example against that arm asserted the OLD contract and has been red
+/// since the guard landed (it merged red on main — measured 2026-09-02
+/// 22:3x, clean `origin/main`). The arm exercises what the CLI actually
+/// accepts; the degraded-phantom shape is locked separately in the
+/// composer's own tests.
+fn arm_resume_example_id(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::OpenCode => "ses_11111111222233334444555555555555",
+        _ => ARM_SESSION_ID,
+    }
+}
+
 #[test]
 fn every_arm_builds_the_invocation_its_descriptor_declares() {
     let quoted_id = format!("'{ARM_SESSION_ID}'");
@@ -632,7 +649,9 @@ fn every_arm_builds_the_invocation_its_descriptor_declares() {
             arm.name(),
         );
 
-        let resume = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), ARM_SESSION_ID);
+        let resume_id = arm_resume_example_id(arm.kind);
+        let quoted_id = format!("'{resume_id}'");
+        let resume = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), resume_id);
         let tail = invocation_tail(&resume);
         assert!(
             contains_in_order(tail, &[arm.binary, arm.resume_selector_token, &quoted_id]),
