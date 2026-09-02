@@ -133,7 +133,7 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
                 }
                 // Daemon-measured last activity per live row (2026-09-02 fs-truth
                 // law): the freshest honest epoch a live row can carry.
-                let live_activity_by_id: std::collections::HashMap<String, u128> = snapshot_opt
+                let live_activity_by_id: std::collections::HashMap<String, u64> = snapshot_opt
                     .as_ref()
                     .map(|snap| {
                         snap.live_sessions
@@ -185,7 +185,7 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
                     // stale-but-known mtime from being *lowered*.
                     let epoch_ms = live_activity_by_id
                         .get(&row.session_id)
-                        .copied()
+                        .map(|ms| *ms as u128)
                         .or_else(|| {
                             remote_epoch_by_id
                                 .get(&row.session_id)
@@ -577,7 +577,7 @@ fn try_faithful_startpage_rows(
             // row is when the DAEMON last saw it active
             // (`last_activity_epoch_ms` on the snapshot's live rows); `0` when
             // even that is unknown — honest unknown, ranked honestly last.
-            let live_activity_ms: Option<u128> = {
+            let live_activity_ms: Option<u64> = {
                 let snapshot_json = snapshot_json.as_ref();
                 snapshot_json.and_then(|v| {
                     v.get("live_sessions")
@@ -592,7 +592,7 @@ fn try_faithful_startpage_rows(
                                 .and_then(|s| {
                                     s.get("last_activity_epoch_ms")
                                         .and_then(|v| v.as_u64())
-                                        .map(|ms| ms as u128)
+                                        .map(|ms| ms as u64)
                                 })
                         })
                 })
@@ -605,7 +605,7 @@ fn try_faithful_startpage_rows(
                 effective_title: label.clone(),
                 detail: None,
                 kind,
-                modified_epoch_ms: live_activity_ms.unwrap_or(0),
+                modified_epoch_ms: live_activity_ms.map(|ms| ms as u128).unwrap_or(0),
                 storage_path: if storage_path.is_empty() {
                     display_path.clone()
                 } else {
@@ -653,7 +653,7 @@ fn try_faithful_startpage_rows(
     // lookup, taking the MAX with the store/scan epoch — a live row's store
     // mtime can lag the running CLI by exactly the time since its last write,
     // and the daemon saw the PTY more recently than that.
-    let live_activity_by_id: std::collections::HashMap<String, u128> = snapshot_json
+    let live_activity_by_id: std::collections::HashMap<String, u64> = snapshot_json
         .as_ref()
         .and_then(|v| v.get("live_sessions"))
         .and_then(|l| l.as_array())
@@ -666,7 +666,7 @@ fn try_faithful_startpage_rows(
                     }
                     s.get("last_activity_epoch_ms")
                         .and_then(|v| v.as_u64())
-                        .map(|ms| (id, ms as u128))
+                        .map(|ms| (id, ms))
                 })
                 .collect()
         })
@@ -688,7 +688,7 @@ fn try_faithful_startpage_rows(
             || live_set.contains(&format!("local://{}", row.session_id));
         let epoch_ms = live_activity_by_id
             .get(&row.session_id)
-            .copied()
+            .map(|ms| *ms as u128)
             .or_else(|| {
                 remote_epoch_by_id
                     .get(&row.session_id)

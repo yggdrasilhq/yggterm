@@ -199,7 +199,7 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
                     // truthful epoch is the daemon's own last-activity measurement
                     // for the row (`last_activity_epoch_ms` on the snapshot's live
                     // rows); `0` when unknown — honest unknown, ranked honestly.
-                    let live_activity_ms: Option<u128> = snapshot_opt
+                    let live_activity_ms: Option<u64> = snapshot_opt
                         .as_ref()
                         .and_then(|snap| {
                             snap.live_sessions
@@ -218,7 +218,7 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
                         effective_title: label.clone(),
                         detail: None,
                         kind,
-                        modified_epoch_ms: live_activity_ms.unwrap_or(0),
+                        modified_epoch_ms: live_activity_ms.map(|ms| ms as u128).unwrap_or(0),
                         storage_path: if storage_path.is_empty() { display_path.clone() } else { storage_path },
                         display_path: display_path.clone(),
                     };
