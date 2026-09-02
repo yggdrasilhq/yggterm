@@ -8817,11 +8817,14 @@ impl DaemonRuntime {
         // npm-provisionable CLI it kicks the background install this refusal then
         // tells the user to wait for.
         if let Some(refusal) = self.server.local_agent_cli_launch_refusal_for_path(path) {
-            self.server.record_launch_refusal_for_path(
-                path,
-                &refusal,
-                "CLI binary not installed",
-            );
+            // The funnel answers for two refusal classes; the Status stamp must
+            // not call a held-conversation refusal a missing binary.
+            let status = if refusal.contains("already held") {
+                "conversation held by a live session"
+            } else {
+                "CLI binary not installed"
+            };
+            self.server.record_launch_refusal_for_path(path, &refusal, status);
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
