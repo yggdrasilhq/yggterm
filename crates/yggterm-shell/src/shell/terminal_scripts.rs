@@ -43,6 +43,7 @@ fn terminal_eval_script(
         initial_input_enabled,
         terminal_xterm_canvas_renderer_enabled(),
         &terminal_xterm_renderer_policy_reason(),
+        false,
     )
 }
 
@@ -71,8 +72,16 @@ fn terminal_eval_script_with_pinned_grid(
     initial_input_enabled: bool,
     pinned_grid: Option<(u64, u64)>,
     initial_grid: Option<(u64, u64)>,
+    suppress_mouse_tracking: bool,
 ) -> String {
-    let script = terminal_eval_script(host_id, theme, initial_input_enabled);
+    let script = terminal_eval_script_with_canvas_renderer(
+        host_id,
+        theme,
+        initial_input_enabled,
+        terminal_xterm_canvas_renderer_enabled(),
+        &terminal_xterm_renderer_policy_reason(),
+        suppress_mouse_tracking,
+    );
     let mut prefix = String::new();
     if let Some((cols, rows)) = initial_grid {
         prefix.push_str(&format!(
@@ -132,6 +141,7 @@ fn terminal_eval_script_with_canvas_renderer(
     initial_input_enabled: bool,
     canvas_renderer_enabled: bool,
     renderer_policy_reason: &str,
+    suppress_mouse_tracking: bool,
 ) -> String {
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
@@ -176,6 +186,8 @@ fn terminal_eval_script_with_canvas_renderer(
         serde_json::to_string(&canvas_renderer_enabled).expect("serialize canvas renderer flag");
     let renderer_policy_reason =
         serde_json::to_string(renderer_policy_reason).expect("serialize renderer policy reason");
+    let suppress_mouse_tracking =
+        serde_json::to_string(&suppress_mouse_tracking).expect("serialize mouse suppress flag");
     let terminal_write_frame_ms = terminal_write_frame_ms();
     let terminal_active_write_frame_ms = terminal_active_write_frame_ms();
     let terminal_active_animation_write_frame_ms =
@@ -1921,20 +1933,40 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 const witnessedMouseModes = {{ 1000: true, 1002: true, 1003: true, 1006: true }};
                 const lastMouseModeReport = {{ 1000: false, 1002: false, 1003: false, 1006: false }};
+                // ⛔ SUPPRESS (registry: suppresses_mouse_tracking — opencode
+                // arms 1003+1006 and then ignores its own mouse reports): when
+                // true, a PURE mouse DECSET is CONSUMED so xterm never arms
+                // tracking; the wheel then translates to cursor keys for that
+                // CLI instead of dying in a mode nobody reads. Purely mouse
+                // DECSETs only — anything else (alt-screen, bracketed paste)
+                // passes through untouched.
+                const suppressMouse = {suppress_mouse_tracking};
                 const witnessMouseMode = (enabled) => (params) => {{
+                    let allWitnessed = Array.isArray(params) && params.length > 0;
                     try {{
                         for (const p of params) {{
                             const mode = Array.isArray(p) ? p[0] : p;
-                            if (!witnessedMouseModes[mode] || lastMouseModeReport[mode] === enabled) {{
+                            if (!witnessedMouseModes[mode]) {{
+                                allWitnessed = false;
+                                continue;
+                            }}
+                            if (lastMouseModeReport[mode] === enabled) {{
                                 continue;
                             }}
                             lastMouseModeReport[mode] = enabled;
-                            sendTerminalEvent({{ kind: "mouse_mode", mode: mode, enabled: enabled }});
+                            sendTerminalEvent({{ kind: "mouse_mode", mode: mode, enabled: enabled, suppressed: suppressMouse }});
                         }}
                     }} catch (_probeError) {{
                         // A probe failure must never disturb the parse path.
+                        allWitnessed = false;
                     }}
-                    return false;
+                    if (!suppressMouse) {{
+                        // The observer law: a probe never consumes.
+                        return false;
+                    }}
+                    // The registry-suppressed arm consumes only PURE mouse
+                    // DECSETs — the wheel then belongs to alternate scroll.
+                    return allWitnessed;
                 }};
                 return [
                     term.parser.registerCsiHandler({{ prefix: '?', final: 'h' }}, witnessMouseMode(true)),

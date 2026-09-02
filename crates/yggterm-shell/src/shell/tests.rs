@@ -2476,6 +2476,7 @@ mod tests {
             true,
             true,
             "test",
+            false,
         );
         assert!(
             host.contains("data-document-surface"),
@@ -9602,6 +9603,32 @@ JSON.stringify({{
         // it, this is the cheapest possible guard against a total blackout.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        // ⛔ THE MOUSE-SUPPRESSION CONTRACT (owner, 2026-09-02): the default
+        // script never consumes a DECSET (pure observer), and the suppressed
+        // variant consumes ONLY pure mouse DECSETs — the flag must be a
+        // literal the client can read, not a behavior buried in a closure.
+        assert!(
+            script.contains("const suppressMouse = false;"),
+            "default script must leave mouse tracking armed"
+        );
+        let suppressed = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test",
+            true,
+        );
+        assert!(
+            suppressed.contains("const suppressMouse = true;"),
+            "suppressed script must carry the flag for the probe handler"
+        );
+        assert!(
+            suppressed.contains("if (!suppressMouse) {")
+                && suppressed.contains("return allWitnessed;"),
+            "suppression must consume only PURE mouse DECSETs, leaving every \
+             other DECSET to xterm untouched"
+        );
         let dir = std::env::temp_dir().join(format!(
             "ygg-script-check-{}-{}",
             std::process::id(),
@@ -9987,7 +10014,7 @@ console.log('ok');
     fn pinned_grid_script_prepends_only_for_a_read_only_viewer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let unpinned =
-            terminal_eval_script_with_pinned_grid("yggterm-terminal-test", &theme, true, None, None);
+            terminal_eval_script_with_pinned_grid("yggterm-terminal-test", &theme, true, None, None, false);
         assert!(
             !unpinned.contains("__yggtermShadowPinnedGrid ="),
             "the user's own GUI owns the PTY and must keep fitting to its window"
@@ -10003,6 +10030,7 @@ console.log('ok');
             true,
             Some((168, 63)),
             None,
+            false,
         );
         assert!(pinned.contains("window.__yggtermShadowPinnedGrid = { cols: 168, rows: 63 };"));
         assert!(
@@ -10026,6 +10054,7 @@ console.log('ok');
             true,
             None,
             Some((169, 65)),
+            false,
         );
         assert!(
             seeded.contains("window.__yggtermInitialGrid = { cols: 169, rows: 65 };"),
@@ -10049,12 +10078,13 @@ console.log('ok');
         // is unconditional by design (it spreads an empty object when the
         // global is absent), so the pre-existing default path is unchanged.
         let plain = terminal_eval_script_with_pinned_grid(
-            "yggterm-terminal-test",
-            &theme,
-            true,
-            None,
-            None,
-        );
+                "yggterm-terminal-test",
+                &theme,
+                true,
+                None,
+                None,
+                false,
+            );
         assert!(
             !plain.contains("window.__yggtermInitialGrid ="),
             "no birth grid, no assignment — the pre-existing default path is unchanged"
@@ -20016,7 +20046,7 @@ console.log('ok');
         ));
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason");
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false);
         assert!(script.contains("const canvasRendererEnabled = false;"));
         assert!(script.contains("let webglAddonAvailable = Boolean(window.WebglAddon"));
         assert!(script.contains("if (canvasRendererEnabled && webglAddonAvailable"));
@@ -20102,9 +20132,9 @@ console.log('ok');
     fn terminal_eval_script_runtime_gates_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let disabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason");
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false);
         let enabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false);
         assert!(disabled.contains("const canvasRendererEnabled = false;"));
         assert!(enabled.contains("const canvasRendererEnabled = true;"));
         assert!(enabled.contains(
@@ -20120,7 +20150,7 @@ console.log('ok');
         // call sites still exist but early-return; full code removal is a follow-up.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false);
         assert!(script.contains("const softwareCanvasLayerOptimizationAllowed = () => false;"));
         assert!(script.contains("applySoftwareCanvasLayerOptimization('initial_mount');"));
     }
@@ -20129,7 +20159,7 @@ console.log('ok');
     fn terminal_eval_script_keeps_codex_prompt_and_cursor_xterm_owned() {
         let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false);
         assert!(!script.contains(".yggterm-canvas-input-line-overlay"));
         assert!(!script.contains(".yggterm-canvas-cursor-overlay"));
         assert!(!script.contains("overlay.className = 'yggterm-canvas-input-line-overlay'"));
@@ -20166,6 +20196,7 @@ console.log('ok');
             true,
             true,
             "test_reason",
+            false,
         );
         assert!(script.contains("pattern: 'glyph_gap_rows'"));
         assert!(
@@ -20208,6 +20239,7 @@ console.log('ok');
             true,
             true,
             "test_reason",
+            false,
         );
         assert!(
             script.contains("term.unicode.activeVersion = '11';"),
@@ -20255,6 +20287,7 @@ console.log('ok');
             true,
             true,
             "test_reason",
+            false,
         );
         assert!(script.contains("window.__yggtermRafGapMonitor"));
         assert!(script.contains("pattern: 'stale_atlas_paint'"));
@@ -20382,6 +20415,7 @@ console.log('ok');
             true,
             true,
             "test_reason",
+            false,
         );
         assert!(script.contains("&& hostIsActive"));
         assert!(script.contains("'canvas_blank_with_buffer_text_background'"));
@@ -20394,7 +20428,7 @@ console.log('ok');
     fn terminal_eval_script_can_opt_into_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false);
         assert!(script.contains("const canvasRendererEnabled = true;"));
     }
 

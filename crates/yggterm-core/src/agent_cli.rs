@@ -5813,6 +5813,22 @@ pub fn row_icon_kind(kind: SessionKind) -> Option<&'static str> {
     })
 }
 
+/// Whether yggterm should SUPPRESS this CLI's mouse-tracking DECSETs
+/// (1000/1002/1003/1006) at the client, so the wheel translates to cursor
+/// keys (alternate scroll) and clicks stay inert instead of emitting mouse
+/// reports the CLI never acts on.
+///
+/// ⛔ MEASURED, not guessed (owner, 2026-09-02): the opencode v2 TUI arms
+/// 1003 + 1006 (the ACT V mouse-mode probe witnesses the DECSETs live) and
+/// then does nothing with wheel or click reports — the owner navigates it
+/// with the keyboard because the mouse is dead on every surface. Suppressing
+/// the arm lets the client's alternate-scroll own the pointer instead. A CLI
+/// that genuinely handles mouse reports must NOT be listed here; flip this
+/// off the day upstream opencode handles its own mouse mode.
+pub fn suppresses_mouse_tracking(kind: SessionKind) -> bool {
+    matches!(kind, SessionKind::OpenCode)
+}
+
 pub fn agent_cli_for_store_path(path: &str) -> Option<&'static AgentCliDescriptor> {
     AGENT_CLIS
         .iter()
