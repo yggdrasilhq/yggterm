@@ -6696,7 +6696,7 @@ impl DaemonRuntime {
             session.last_activity_epoch_ms = self
                 .terminals
                 .session_idle_for_ms(&runtime_path)
-                .map(|idle_ms| (now_ms.saturating_sub(idle_ms)) as u128);
+                .map(|idle_ms| now_ms.saturating_sub(idle_ms));
             // ⛔ ONLY where this daemon has no answer of its own. A scrape of a
             // screen we own is the freshest truth there is; a proxied flag may
             // be up to one refresh old, so it fills a hole and never overwrites.
