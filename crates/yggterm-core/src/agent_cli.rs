@@ -5829,6 +5829,27 @@ pub fn suppresses_mouse_tracking(kind: SessionKind) -> bool {
     matches!(kind, SessionKind::OpenCode)
 }
 
+/// The wheel sequences for a suppressed-mouse CLI's alternate scroll, and how
+/// much wheel delta one emitted key is worth.
+///
+/// ⛔ MEASURED PER CLI, never assumed (owner, 2026-09-02): the first cut sent
+/// cursor keys — the standard alternate-scroll answer — and did nothing for
+/// opencode, because opencode does not bind arrows to message scrolling at
+/// all. Its own keybind table (read from the installed binary) binds
+/// `messages_page_up: pageup` / `messages_page_down: pagedown`, with line
+/// scrolls on ctrl+alt+y/e. So opencode's wheel is PageUp/PageDown, one key
+/// per ~120 px of accumulated wheel (a trackpad fires dozens of small deltas;
+/// one page per raw event would fling the transcript away).
+///
+/// Return: (wheel-up sequence, wheel-down sequence, accumulate-px; 0 = emit
+/// per event, line-precise — the cursor-keys default).
+pub fn alternate_scroll_keys(kind: SessionKind) -> (&'static str, &'static str, u32) {
+    match kind {
+        SessionKind::OpenCode => ("\x1b[5~", "\x1b[6~", 120),
+        _ => ("\x1b[A", "\x1b[B", 0),
+    }
+}
+
 pub fn agent_cli_for_store_path(path: &str) -> Option<&'static AgentCliDescriptor> {
     AGENT_CLIS
         .iter()
