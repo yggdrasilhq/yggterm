@@ -1207,3 +1207,71 @@ detector derives the `yggterm {CLI}` placeholder family from the registry
 (both hyphenated and spaced spellings — the hand list is how "yggterm
 opencode" leaked), and the rail resolves a low-signal stored title through
 the same humanized fallback the row label ends at (pending-bugs [11.41]).
+
+## Issue Heading 30: the metadata plane speaks each CLI's dynamicity language (2026-09-02)
+
+Owner directive: *"We need to make metadata integration with each CLI perfect
+and then address the row title issues of each CLI. Most CLIs can switch
+session midway with internal mechanisms. Yggterm should detect that and our
+metadata system should understand their dynamicity language. Specially
+opencode is very dynamic."*
+
+### Measured defects behind this issue (all live 2026-09-02)
+
+1. **The metadata pane's Title field dropped CLI titles and showed lies.** The
+   pane printed `session.title` raw: a stored CLI session with no carried
+   title rendered NO Title line, and rows restored from persistence kept the
+   forbidden `Remote {CLI} {shorthash}` shape for days because every title
+   chore tick recorded `no_title_in_store` and stopped — the detector KNEW
+   the title was machine copy, but nothing ever INSERTED a replacement.
+2. **The pane's Session id line showed the row uuid as a session id.** For a
+   uuid-keyed OpenCode anchor row that uuid is a seat, not a session id; the
+   label was a hand match covering two CLIs.
+3. **A Dynamic CLI's retitle never landed.** OpenCode rewrites session titles
+   for their whole life (auto-title after the first prompt, human rename in
+   the TUI, fork names); the title chore's settle-skip (idle + well-formed
+   title ⇒ never polled again) froze last week's name on the row forever.
+4. **The anchor was "first row that qualified", not the live TUI.** With four
+   uuid rows and one real TUI the anchor-as-header title landed on an
+   arbitrary dead row.
+5. **Nothing surfaced which session a TUI is rendering right now** — the
+   anchor's whole point, invisible to the metadata pane.
+
+### The contract, as landed
+
+* **Title mutability is a per-CLI registry fact**
+  (`agent_cli::title_mutability`): `Dynamic` for OpenCode (the one measured
+  retiler), `Static` for every CLI not yet measured as one — extend the match
+  with the measurement, never a guess. A Dynamic CLI's non-owner-set title is
+  NEVER "settled": the chore polls every tick, and the store-agrees check
+  keeps a quiet tick write-free.
+* **A store-silent row wearing a detector-caught fallback gets the birth
+  title INSERTED** (`CliTitleOutcome::InsertedBirthTitle`), per the ACT VII
+  lesson: a detector that filters the lie is half a fix. A row wearing a
+  real-looking title with a silent store is left alone.
+* **The pane's session-id line resolves in registry order**: the CLI store id
+  (`session_metadata_label`) → the tab mirror's id → the row uuid — labelled
+  by the registry (`OpenCode Session`, `Codex Session`, …), never a hand
+  match.
+* **Dynamicity is metadata**: the mirror stamps `Viewing Tab Session Id` on
+  the anchor every tick (the session the human is LOOKING at, from the
+  service's focus stream) and clears it when the service goes quiet — a stale
+  "Viewing" claim would be a lie about the present. The pane shows it as
+  "Viewing session" (and a tab row's own id as "Mirrored session").
+* **The anchor is the LIVE TUI**: selection prefers a row with a pid or a
+  running phase; the first-qualified order survives only as the fallback for
+  a set with no live TUI.
+
+### What this issue does NOT cover
+
+* The identity language (which session id a row is bound to mid-flight) —
+  that is the existing rebind machinery (CC `/clear`, codex resume, the
+  runtime-id poll) and the tab mirror's focus-follow; this issue only
+  SURFACES the dynamic state, it does not add a new switch detector.
+* The phantom-resume defect: uuid-keyed OpenCode rows restored via
+  `resume-opencode <row-uuid>` boot TUIs on session ids no store ever held
+  (measured live 2026-09-02: three such TUIs running). The birth-title
+  insertion stops the lie on the row, not the ether resume itself; that
+  repair belongs to the restore path and is filed in pending-bugs.
+* Restore metadata naming the wrong CLI's verb (`resume-codex` on an OpenCode
+  row) is fixed on the fs-truth lane (bug B1) and merges separately.

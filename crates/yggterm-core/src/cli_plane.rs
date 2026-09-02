@@ -219,6 +219,15 @@ impl CliTitleChore {
 pub enum CliTitleOutcome {
     /// The CLI's own store answered and the row was renamed.
     PickedUp,
+    /// The store was asked about this id and had nothing — and the row was
+    /// wearing a detector-caught fallback, so the chore inserted the birth
+    /// title instead of leaving the lie on the row. The daemon-side half of
+    /// the ACT VII lesson: a detector that filters the lie is half a fix —
+    /// the replacement must be INSERTED, else the stale label rides the
+    /// preserve path forever (measured live 2026-09-02: opencode anchor rows
+    /// answering `Remote OpenCode {shorthash}` for days because every tick
+    /// recorded `no_title_in_store` and stopped there).
+    InsertedBirthTitle,
     /// The store was asked about this id and had nothing. A real miss.
     NoTitleInStore,
     /// The store could not be consulted at all — ssh refused, host down,
@@ -246,6 +255,7 @@ impl CliTitleOutcome {
     pub fn label(self) -> &'static str {
         match self {
             Self::PickedUp => "picked_up",
+            Self::InsertedBirthTitle => "inserted_birth_title",
             Self::NoTitleInStore => "no_title_in_store",
             Self::StoreUnreachable => "store_unreachable",
             Self::SkippedNoReader => "skipped_no_reader",
@@ -258,6 +268,7 @@ impl CliTitleOutcome {
     /// Every arm, for the lock tests and for a reader building a dashboard.
     pub const ALL: &'static [Self] = &[
         Self::PickedUp,
+        Self::InsertedBirthTitle,
         Self::NoTitleInStore,
         Self::StoreUnreachable,
         Self::SkippedNoReader,
@@ -274,7 +285,10 @@ impl CliTitleOutcome {
     pub fn leaves_row_untitled(self) -> bool {
         !matches!(
             self,
-            Self::PickedUp | Self::SkippedOwnerTitled | Self::SkippedTitleSettled
+            Self::PickedUp
+                | Self::InsertedBirthTitle
+                | Self::SkippedOwnerTitled
+                | Self::SkippedTitleSettled
         )
     }
 }

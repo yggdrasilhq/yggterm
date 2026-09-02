@@ -25534,6 +25534,24 @@ the local one, and nothing separates them.
 row that never offered the resume — and, on a row that IS resumable, a normal attach with its
 history intact.
 
+### OpenCode twin, measured live 2026-09-02 (metadata campaign) — same class, one more door
+
+The GUI host held FOUR uuid-keyed `opencode-runtime://` rows whose ids exist in NEITHER
+opencode store table (`session_v2` 38 rows, `session` 3 rows — checked by id), and THREE
+`opencode2 --auto --session <row-uuid>` TUIs RUNNING on those ids right now, plus resume
+wrappers still alive. The restore path executed the row's Connect line (`resume-opencode
+<uuid> --require-existing`) at every generation and opencode2 accepted the unknown id with
+`--auto` — the ether spawn is not a one-time accident, it re-fires on every restore. The
+titles were the shorthash lie (`Remote OpenCode {hash}`, birth-title insertion now landed)
+or a stale v1-era title. The metadata pane showed the row uuid as "Session id" (fixed same
+wave: registry-labelled identity resolution).
+
+⇒ This is [11.28]'s fix direction confirmed on a second CLI: **the existence check must ask
+the store the CLI actually resumes from, and a LOCAL id must be answerable locally.** For
+opencode the store is the service + `session_v2`/`session` by id; a uuid that answers in
+neither must refuse the restore or demote the row before the Connect line is offered. The
+restore-metadata half (wrong CLI's verb) is fixed on the fs-truth lane (bug B1).
+
 ## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
 
 **Status:** OPEN

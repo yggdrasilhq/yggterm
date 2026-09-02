@@ -5198,6 +5198,58 @@ fn session_metadata_title(session: &ManagedSessionView, cwd: &str) -> Option<Str
         .filter(|title| !title.trim().is_empty())
         .or_else(|| (!raw.is_empty()).then(|| raw.to_string()))
 }
+/// The session-id line the metadata pane shows for one row: WHICH id and
+/// under WHAT name, resolved once so the pane and any reader agree.
+///
+/// ⛔ THE CLI'S OWN SESSION ID OUTRANKS THE ROW UUID, AND THE LABEL IS THE
+/// REGISTRY'S, NOT A HAND MATCH. The pane used to read the "UUID" metadata and
+/// hand-name two kinds — so an OpenCode row displayed its row uuid under a
+/// generic "Session id" label, and for a uuid-keyed anchor row that uuid is
+/// NOT a session id at all (measured live 2026-09-02: four uuid rows whose
+/// "UUID" was the row's birth seat). Order: the CLI store id the plane stamped
+/// (`session_metadata_label`), then the tab mirror's id, then the row uuid,
+/// then the row id — each labelled as what it is.
+pub(crate) fn metadata_session_identity(
+    session: &ManagedSessionView,
+) -> Option<(&'static str, String)> {
+    let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(session.kind);
+    let label = descriptor
+        .map(|d| d.session_metadata_label)
+        .unwrap_or("Session id");
+    let store_id = descriptor
+        .map(|d| metadata_value(session, d.session_metadata_label))
+        .filter(|value| !value.trim().is_empty());
+    if let Some(value) = store_id {
+        return Some((label, value.trim().to_string()));
+    }
+    let tab_id = metadata_value(session, "Tab Session Id");
+    if !tab_id.trim().is_empty() {
+        return Some((label, tab_id.trim().to_string()));
+    }
+    let uuid = metadata_value(session, "UUID");
+    (!uuid.trim().is_empty()).then(|| (label, uuid.trim().to_string()))
+}
+
+/// The dynamicity lines the pane shows for one row: an OpenCode tab row names
+/// its session; the TUI anchor names whichever session the human is LOOKING at
+/// right now (the mirror refreshes it every tick from the service's focus
+/// stream). Absent entries stay absent — a row that is not part of a tab
+/// group has nothing dynamic to say.
+pub(crate) fn metadata_dynamicity_entries(
+    session: &ManagedSessionView,
+) -> Vec<(&'static str, String)> {
+    [
+        ("Viewing Tab Session Id", "Viewing session"),
+        ("Tab Session Id", "Mirrored session"),
+    ]
+    .iter()
+    .filter_map(|(metadata_label, display_label)| {
+        let value = metadata_value(session, metadata_label);
+        (!value.trim().is_empty()).then(|| (*display_label, value.trim().to_string()))
+    })
+    .collect()
+}
+
 /// Build the view-aware "useful" metadata panel from the rich snapshot fields
 /// (kind, host/source, pty grid, pid, working state) plus the genuinely useful
 /// daemon metadata entries (cwd, restore command, resume id, transcript stats),
@@ -5293,22 +5345,23 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
             value: pid.to_string(),
         });
     }
-    let resume_id = {
-        let uuid = metadata_value(session, "UUID");
-        if uuid.trim().is_empty() {
-            session.id.clone()
-        } else {
-            uuid
-        }
-    };
-    if !resume_id.trim().is_empty() {
+    {
+        let (id_label, id_value) =
+            metadata_session_identity(session).unwrap_or(("Session id", session.id.clone()));
         runtime.push(SessionMetadataEntry {
-            label: match kind {
-                SessionKind::Codex | SessionKind::CodexLiteLlm => "Codex session",
-                SessionKind::ClaudeCode => "Claude Code session",
-                _ => "Session id",
-            },
-            value: resume_id.trim().to_string(),
+            label: id_label,
+            value: id_value,
+        });
+    }
+    // The CLI's dynamicity, as far as this row carries it: an OpenCode tab row
+    // names its session; the TUI anchor names whichever session the human is
+    // LOOKING at right now (the mirror refreshes it every tick from the
+    // service's focus stream). Absent entries stay absent — a row that is not
+    // part of a tab group has nothing dynamic to say.
+    for (display_label, value) in metadata_dynamicity_entries(session) {
+        runtime.push(SessionMetadataEntry {
+            label: display_label,
+            value,
         });
     }
 
