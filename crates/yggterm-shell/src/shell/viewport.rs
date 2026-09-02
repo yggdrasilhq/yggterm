@@ -6003,6 +6003,7 @@ fn TerminalCanvas(
                 pinned_grid,
                 initial_grid,
                 yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
+                yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
             ));
             append_trace_event(
                 &trace_home,

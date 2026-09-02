@@ -44,6 +44,7 @@ fn terminal_eval_script(
         terminal_xterm_canvas_renderer_enabled(),
         &terminal_xterm_renderer_policy_reason(),
         false,
+        ("\x1b[A", "\x1b[B", 0),
     )
 }
 
@@ -73,6 +74,7 @@ fn terminal_eval_script_with_pinned_grid(
     pinned_grid: Option<(u64, u64)>,
     initial_grid: Option<(u64, u64)>,
     suppress_mouse_tracking: bool,
+    alt_scroll: (&'static str, &'static str, u32),
 ) -> String {
     let script = terminal_eval_script_with_canvas_renderer(
         host_id,
@@ -81,6 +83,7 @@ fn terminal_eval_script_with_pinned_grid(
         terminal_xterm_canvas_renderer_enabled(),
         &terminal_xterm_renderer_policy_reason(),
         suppress_mouse_tracking,
+        alt_scroll,
     );
     let mut prefix = String::new();
     if let Some((cols, rows)) = initial_grid {
@@ -142,6 +145,7 @@ fn terminal_eval_script_with_canvas_renderer(
     canvas_renderer_enabled: bool,
     renderer_policy_reason: &str,
     suppress_mouse_tracking: bool,
+    alt_scroll: (&'static str, &'static str, u32),
 ) -> String {
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
@@ -188,6 +192,11 @@ fn terminal_eval_script_with_canvas_renderer(
         serde_json::to_string(renderer_policy_reason).expect("serialize renderer policy reason");
     let suppress_mouse_tracking =
         serde_json::to_string(&suppress_mouse_tracking).expect("serialize mouse suppress flag");
+    let alt_scroll_up =
+        serde_json::to_string(alt_scroll.0).expect("serialize alt-scroll up sequence");
+    let alt_scroll_down =
+        serde_json::to_string(alt_scroll.1).expect("serialize alt-scroll down sequence");
+    let alt_scroll_accum_px = alt_scroll.2;
     let terminal_write_frame_ms = terminal_write_frame_ms();
     let terminal_active_write_frame_ms = terminal_active_write_frame_ms();
     let terminal_active_animation_write_frame_ms =
@@ -4675,6 +4684,8 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
         }}
         let wheelEventCount = 0;
+        let altScrollAccumDeltaY = 0;
+        let altScrollLastAtMs = 0;
         let scrollEventCount = 0;
         let dataEventCount = 0;
         let readNudgeCount = 0;
@@ -8466,25 +8477,50 @@ fn terminal_eval_script_with_canvas_renderer(
             const deltaLines = Math.max(1, Math.round(Math.abs(event.deltaY) / 40));
             revealSoftwareCanvasLinkLayer('wheel');
             if (alternateScrollApplies()) {{
-                // Alternate scroll: wheel up/down becomes cursor up/down so a
-                // fullscreen TUI (opencode and friends) scrolls its content.
-                // Honors DECCKM (application cursor keys) and the input gate —
-                // this is USER INPUT, not a viewport opinion. A TUI that armed
-                // mouse tracking never lands here: it gets real mouse reports
-                // through its own mode instead.
+                // Alternate scroll: the wheel becomes the CLI's own SCROLL
+                // keys so a fullscreen TUI (opencode and friends) scrolls its
+                // content. The sequences are REGISTRY facts measured per CLI
+                // (`alternate_scroll_keys` — opencode scrolls on
+                // pageup/pagedown and binds arrows to nothing), not the
+                // generic cursor-keys guess. Gated by the same input gate as
+                // typing — this is USER INPUT, not a viewport opinion.
                 try {{
                     if (inputEnabled) {{
-                        const applicationCursor = Boolean(
-                            term && term.modes && term.modes.applicationCursorKeysMode
-                        );
-                        const key = event.deltaY > 0
-                            ? (applicationCursor ? '\\u001bOB' : '\\u001b[B')
-                            : (applicationCursor ? '\\u001bOA' : '\\u001b[A');
-                        markTerminalInputHot('alt_scroll_wheel');
-                        sendTerminalEvent({{ kind: 'input', data: key.repeat(deltaLines) }});
-                        if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
-                            window.__yggtermXtermHosts[hostId].altScrollWheelEvents =
-                                Number(window.__yggtermXtermHosts[hostId].altScrollWheelEvents || 0) + 1;
+                        const emitKey = (down) => {{
+                            markTerminalInputHot('alt_scroll_wheel');
+                            sendTerminalEvent({{ kind: 'input', data: down ? {alt_scroll_down} : {alt_scroll_up} }});
+                            if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                                window.__yggtermXtermHosts[hostId].altScrollWheelEvents =
+                                    Number(window.__yggtermXtermHosts[hostId].altScrollWheelEvents || 0) + 1;
+                            }}
+                        }};
+                        if ({alt_scroll_accum_px} > 0) {{
+                            // Page-shaped keys: accumulate the wheel delta and
+                            // emit one key per threshold — a trackpad fires
+                            // dozens of small deltas and one page per raw
+                            // event would fling the transcript away.
+                            const now = Date.now();
+                            if (now - altScrollLastAtMs > 500) {{
+                                altScrollAccumDeltaY = 0;
+                            }}
+                            altScrollLastAtMs = now;
+                            altScrollAccumDeltaY += Number(event.deltaY || 0);
+                            if (Math.abs(altScrollAccumDeltaY) >= {alt_scroll_accum_px}) {{
+                                const down = altScrollAccumDeltaY > 0;
+                                altScrollAccumDeltaY = 0;
+                                emitKey(down);
+                            }}
+                        }} else {{
+                            // Cursor-key mode: line-precise, per event.
+                            const key = (event.deltaY > 0
+                                ? {alt_scroll_down}
+                                : {alt_scroll_up}).repeat(deltaLines);
+                            markTerminalInputHot('alt_scroll_wheel');
+                            sendTerminalEvent({{ kind: 'input', data: key }});
+                            if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                                window.__yggtermXtermHosts[hostId].altScrollWheelEvents =
+                                    Number(window.__yggtermXtermHosts[hostId].altScrollWheelEvents || 0) + 1;
+                            }}
                         }}
                     }}
                 }} catch (_altScrollError) {{
