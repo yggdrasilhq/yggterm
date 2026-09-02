@@ -8473,14 +8473,30 @@ fn terminal_eval_script_with_canvas_renderer(
                 // xterm starts on the normal buffer knowing nothing, while the
                 // TUI on the far end of the PTY is still fullscreen — it never
                 // re-says its buffer DECSETs for a client it cannot see. Until
-                // THIS mount observes a real buffer state, the kind recorded by
-                // the PREVIOUS mount of this session is the best available
-                // truth; without it the wheel gate stayed closed after every
-                // switch-in (the owner's dead-mouse report). The next real
-                // DECSET overwrites the belief.
+                // THIS mount witnesses a genuine buffer transition, the kind
+                // recorded by the PREVIOUS mount of this session is the best
+                // available truth; without it the wheel gate stayed closed
+                // after every switch-in (the owner's dead-mouse report).
+                //
+                // ⛔ The seed rules until a GENUINE transition, not until the
+                // first observation. The first version keyed on
+                // `lastObservedBufferKind === null`, but
+                // `trackTerminalVisualState('constructed')` observes 'normal'
+                // on the mount's first frame — the seed died within
+                // milliseconds and the gate never opened (measured live: the
+                // owner still on I-beam after the seed shipped). A live
+                // 'alternate' always wins; otherwise the seed rules while
+                // `bufferTransitionCount === 0`, which is exactly "no genuine
+                // transition witnessed this mount". On suppressed-mouse mounts
+                // no genuine transition can occur (the DECSETs are consumed at
+                // the parser), so the seed correctly persists there.
                 let kind = currentBufferKind();
-                if (kind === 'unknown' || lastObservedBufferKind === null) {{
-                    kind = lastKnownBufferKindSeed || kind;
+                if (
+                    kind !== 'alternate'
+                    && bufferTransitionCount === 0
+                    && lastKnownBufferKindSeed
+                ) {{
+                    kind = lastKnownBufferKindSeed;
                 }}
                 if (kind !== 'alternate') {{
                     return false;
