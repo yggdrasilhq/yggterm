@@ -94,13 +94,13 @@ fn start_page_recent_rows_from_browser_rows(
 /// row inherits the mtime of the transcript it is a running instance of.
 fn start_page_scanned_last_used_epochs(snapshot: &RenderSnapshot) -> HashMap<String, i64> {
     let mut epochs = scanned_last_used_epochs_by_session_id(&snapshot.remote_machines);
-    // ⛔ LIVE ROWS CARRY THEIR OWN TRUTH (2026-09-02 fs-truth fix): the daemon
+    // ⛔ LIVE ROWS CARRY THEIR OWN TRUTH (2026-09-02 fs-truth law): the daemon
     // stamps each live row with when its PTY was last ACTIVE
-    // (`last_activity_epoch_ms`, seconds here). A live row the scan has no
-    // store row for — a brand-new session, a probe row — used to answer 0 and
-    // depended on the old live-first tier to be seen at all; now its own
-    // activity clock ranks it, exactly like every durable row's mtime does.
-    // Newest sighting wins, matching the scan map above.
+    // (`last_activity_epoch_ms`, seconds here). It answers ONLY for rows the
+    // stores cannot answer — a brand-new session, a probe row with no scan
+    // fact — because PTY activity ticks on repaints and echoes, and letting it
+    // override the store let a composer-idle row outrank durably fresher work
+    // (measured 16:2x). Store fact wins; live activity fills the hole.
     for session in &snapshot.live_sessions {
         let Some(ms) = session.last_activity_epoch_ms else {
             continue;
@@ -109,10 +109,7 @@ fn start_page_scanned_last_used_epochs(snapshot: &RenderSnapshot) -> HashMap<Str
         if epoch <= 0 || session.id.trim().is_empty() {
             continue;
         }
-        epochs
-            .entry(session.id.trim().to_string())
-            .and_modify(|existing| *existing = (*existing).max(epoch))
-            .or_insert(epoch);
+        epochs.entry(session.id.trim().to_string()).or_insert(epoch);
     }
     epochs
 }

@@ -52,6 +52,14 @@ from pathlib import Path
 # write-lag between the CLI's last store flush and the verb's read.
 RE_STAMP_SKEW_MS = 10 * 60 * 1000
 
+# An ORDER inversion only counts as a lie when the truth gap exceeds this.
+# Live rows carry the daemon's PTY-activity clock while the store carries the
+# CLI's write clock; the two legitimately disagree by seconds on a busy host
+# (a row writes its store a beat after its last keystroke, and the store of an
+# idle row is touched by service maintenance). Sub-minute inversions are that
+# noise; the lies this gauge exists for are minutes-to-days.
+ORDER_TOLERANCE_MS = 90 * 1000
+
 # Live rows with no store row at all cannot be judged for recency truth from
 # the stores alone; they are reported, not failed.
 HEADLESS_TIMEOUT = 120
@@ -65,13 +73,30 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def CODEX_ID_RE():
+    import re
+    return re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+    )
+
+
 def walk_codex(home: Path):
+    # ⛔ Key by the SESSION UUID the verbs key by — the rollout filename is
+    # `rollout-<birth-timestamp>-<uuid>.jsonl`, so the uuid is the hex run in
+    # the stem, NOT the whole stem (keying the whole stem made the oracle
+    # answer "unknown store fact" for every codex row and silently fall back
+    # to the PTY-activity clock, comparing two different truths). Sessions
+    # with several rollouts take the NEWEST write — the store's own answer to
+    # "when was this session last used".
     out = {}
+    uuid_re = CODEX_ID_RE()
     for p in glob.glob(str(home / ".codex/sessions/**/rollout-*.jsonl"), recursive=True):
-        sid = Path(p).stem.rsplit("-", 1)[-1]
-        # The filename carries a timestamp prefix and the UUID tail; the id is
-        # the whole filename stem — use it whole, matching the Rust reader.
-        out[Path(p).stem] = int(os.path.getmtime(p) * 1000)
+        match = uuid_re.search(Path(p).stem)
+        if not match:
+            continue
+        mtime = int(os.path.getmtime(p) * 1000)
+        existing = out.get(match.group(0).lower())
+        out[match.group(0).lower()] = max(existing or 0, mtime)
     return out
 
 
@@ -181,21 +206,25 @@ def check_rows(label, rows, truth, live_activity, verdicts):
     for row in rows:
         sid = row.get("session_id", "")
         claimed = int(row.get("modified_epoch_ms") or 0)
+        # ⛔ THE FS TRUTH IS THE STORE (owner law): a row the stores know is
+        # judged by its STORE epoch alone. The daemon's PTY-activity fact fills
+        # in only for rows the stores cannot answer (live-only): PTY activity
+        # ticks on repaints and echoes, and folding it into store-known rows
+        # compared one clock against another and cried wolf on sub-minute
+        # inversions (measured 16:4x).
         fact_ms = None
         if sid in truth and truth[sid]["epoch_ms"] > 0:
             fact_ms = truth[sid]["epoch_ms"]
-        if sid in live_activity:
-            # The daemon's own PTY clock is the freshest honest fact about a
-            # live row — take the newer of it and the store fact.
-            fact_ms = max(fact_ms or 0, live_activity[sid])
+        elif sid in live_activity:
+            fact_ms = live_activity[sid]
         if fact_ms is not None:
             known.append((sid, claimed, fact_ms))
             if claimed - fact_ms > RE_STAMP_SKEW_MS:
                 stamp_lies += 1
                 verdicts.append(
                     f"FAIL[{label}] STAMP LIE: {kind_of(row)} {sid[:20]} claims "
-                    f"{claimed} but the newest fact (store/daemon activity) says "
-                    f"{fact_ms} (+{(claimed - fact_ms) // 1000}s of invented recency)"
+                    f"{claimed} but the store says {fact_ms} "
+                    f"(+{(claimed - fact_ms) // 1000}s of invented recency)"
                 )
     # A2 — THE SCAN-STAMP COLLAPSE SIGNATURE. The measured lie (2026-09-02):
     # every live row re-stamped with the scan's own millisecond. Genuinely
@@ -215,10 +244,12 @@ def check_rows(label, rows, truth, live_activity, verdicts):
                 f"millisecond {stamp} (e.g. {', '.join(s[:18] for s in sids[:4])}) — "
                 f"scan-time stamping, not usage truth"
             )
-    # Order lie: among rows with a known fact, claimed order must equal truth order.
+    # Order lie: among rows with a known fact, claimed order must equal truth
+    # order — with [ORDER_TOLERANCE_MS] of slack for the two honest clocks
+    # (PTY activity vs store write) disagreeing by seconds on a live host.
     truth_rank = sorted(known, key=lambda item: item[2], reverse=True)
     for (sid_a, claimed_a, fact_a), (sid_b, claimed_b, fact_b) in zip(truth_rank, truth_rank[1:]):
-        if claimed_b > claimed_a:
+        if claimed_b > claimed_a and fact_a - fact_b > ORDER_TOLERANCE_MS:
             inversions += 1
             verdicts.append(
                 f"FAIL[{label}] ORDER LIE: {sid_b[:20]} (truth {fact_b}, claimed {claimed_b}) "
