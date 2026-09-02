@@ -86,8 +86,27 @@ struct Arm {
 }
 
 const ARM_SESSION_ID: &str = "11111111-2222-3333-4444-555555555555";
+/// The ses_-shaped fixture id the OpenCode arm resumes with.
+///
+/// ⛔ A uuid here is the RED matrix on every host, measured 2026-09-02: the
+/// ses_ guard (70329d66b — "never compose a resume with a non-ses_ id")
+/// deliberately degrades an OpenCode resume carrying a birth-style uuid to a
+/// fresh launch, because opencode2's service rejects anything not `ses_`-
+/// shaped. The arm's contract is what the CLI ACTUALLY accepts, so the
+/// OpenCode arm must exercise the id shape its service mints.
+const OPENCODE_ARM_SESSION_ID: &str = "ses_arm0000000000000000000001";
 const ARM_CWD: &str = "/home/user/gh/yggterm";
 const ARM_MACHINE: &str = "dev";
+
+/// The session id each arm's RESUME composition must be exercised with: the
+/// id shape that arm's CLI actually accepts (see OPENCODE_ARM_SESSION_ID).
+fn arm_resume_session_id(kind: SessionKind) -> &'static str {
+    if kind == SessionKind::OpenCode {
+        OPENCODE_ARM_SESSION_ID
+    } else {
+        ARM_SESSION_ID
+    }
+}
 
 const ARMS: &[Arm] = &[
     Arm {
@@ -620,26 +639,8 @@ fn contains_in_order(text: &str, tokens: &[&str]) -> bool {
     true
 }
 
-/// The session id the RESUME arm exercises for `kind`.
-///
-/// ⛔ OpenCode's own composer contract (2026-09-02, `ses_` guard): the CLI's
-/// service rejects any session id that does not start with `ses`, and the
-/// composer DEGRADES such a resume to a fresh launch. Exercising the shared
-/// uuid example against that arm asserted the OLD contract and has been red
-/// since the guard landed (it merged red on main — measured 2026-09-02
-/// 22:3x, clean `origin/main`). The arm exercises what the CLI actually
-/// accepts; the degraded-phantom shape is locked separately in the
-/// composer's own tests.
-fn arm_resume_example_id(kind: SessionKind) -> &'static str {
-    match kind {
-        SessionKind::OpenCode => "ses_11111111222233334444555555555555",
-        _ => ARM_SESSION_ID,
-    }
-}
-
 #[test]
 fn every_arm_builds_the_invocation_its_descriptor_declares() {
-    let quoted_id = format!("'{ARM_SESSION_ID}'");
     for arm in ARMS {
         let descriptor = agent_cli_descriptor(arm.kind).expect("registered CLI");
         assert_eq!(
@@ -648,10 +649,10 @@ fn every_arm_builds_the_invocation_its_descriptor_declares() {
             "{}: the arm and the registry disagree about the executable",
             arm.name(),
         );
+        let session_id = arm_resume_session_id(arm.kind);
+        let quoted_id = format!("'{session_id}'");
 
-        let resume_id = arm_resume_example_id(arm.kind);
-        let quoted_id = format!("'{resume_id}'");
-        let resume = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), resume_id);
+        let resume = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), session_id);
         let tail = invocation_tail(&resume);
         assert!(
             contains_in_order(tail, &[arm.binary, arm.resume_selector_token, &quoted_id]),
@@ -729,7 +730,7 @@ fn locality_does_not_fork_the_invocation() {
 
     for arm in ARMS {
         compare_arm_against_twin("resume", arm, |kind| {
-            persistent_agent_resume_command(kind, Some(ARM_CWD), ARM_SESSION_ID)
+            persistent_agent_resume_command(kind, Some(ARM_CWD), arm_resume_session_id(kind))
         });
         compare_arm_against_twin("launch", arm, |kind| {
             agent_launch_command(kind, Some(ARM_CWD), None)
