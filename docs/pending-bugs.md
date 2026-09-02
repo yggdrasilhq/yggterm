@@ -18,6 +18,130 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.39] A GUI RESTART LEAVES AN IDLE FULLSCREEN TUI'S VIEWPORT BLANK FOR ~40s — THE "SLOW TERMINAL REVEAL"
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Owner report with screenshots (2026-09-02 ~10:30): after a yggterm GUI restart a
+remote opencode row mounted EMPTY, then popped its frame in ~39.5s later (the
+GUI's own "Slow terminal reveal" toast measured it). Root, measured across the
+GUI host's event trace + the owning machine's daemon trace for the remote
+opencode row in the repo working dir:
+
+1. A fullscreen TUI repaints only on input, a REAL winsize change, or its own
+   timers. After a restart the row mounts through the retained-live arm, whose
+   `terminal_startup_resize_repair` asks for the SAME grid the PTY already
+   holds (172×65 in the trace).
+2. The kernel delivers SIGWINCH only when the winsize CHANGES; the daemon
+   honestly answered `resize_noop` — so nobody signalled the TUI and it slept
+   on, while the client's xterm sat empty (the raw-stream bridge defers
+   first paint to the next TUI flush by design).
+
+Fix: the resize wire request carries `#[serde(default)] repaint: bool`. A
+repaint request at identical geometry bounces the PTY winsize one row and
+restores it — two real SIGWINCHes — and the TUI repaints its CURRENT frame
+through the ordinary byte stream, so the client's first paint is the TUI's own
+pixels, never a re-rendering. The startup repair and the post-attach redraw
+nudge both send it; shadows never ask (D8). Locked by
+`repaint_nudge_wakes_an_idle_fullscreen_tui_where_an_identical_resize_cannot`
+(mock-tui `--scenario winch-repaint`: a TUI that repaints ONLY on SIGWINCH —
+the identical resize must produce ZERO bytes, the nudge must produce a new
+frame). Trace witness: `resize_repaint_nudge`.
+
+**Falsifier:** restart the GUI with an idle opencode row and click it — the
+viewport must paint the TUI's current frame within the normal reveal budget
+(no multi-second blank), and the daemon trace shows one
+`resize_repaint_nudge` per mount where `resize_noop` used to be.
+
+## ⛔ [11.41] THE SSOT SESSION-TITLE LAW — A ROW, ITS RAIL AND ITS SNAPSHOT ANSWERED WITH THREE DIFFERENT NAMES
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Owner directive (2026-09-02): "no Opencode spawn should say yggterm opencode.
+It should say the title of the session or, in the new-spawn case, `New
+{machine} OpenCode` like the metadata sidebar says. The metadata title and the
+row title must match." Measured on one live row (`d4090efe…`, cwd
+`~/gh/yggterm`): daemon snapshot title `Remote OpenCode d4090efe` (the
+shorthash shape the title law already forbids, stamped by the remote-resume
+fallback in lib.rs), sidebar row label `Yggterm OpenCode` (composed by
+`humanized_terminal_title` from the cwd leaf + CLI name — a shape the
+low-signal detector's HAND LIST never covered for the newer CLIs), metadata
+rail `New dev OpenCode` (the birth title). Three composers, one question.
+
+Fix, one source: `humanized_terminal_title` returns the BIRTH title
+(`yggterm_core::agent_cli::new_row_birth_title`) for every agent kind — the
+exact string the rail shows — and never composes `{directory} {CLI}` again
+(shells keep their directory composition); the daemon's two
+`Remote {display} {shorthash}` fallbacks stamp the birth title like the spawn
+path; the low-signal detector derives the `yggterm {CLI}` placeholder family
+from the registry (both spellings) so already-stored lies regenerate; the
+rail's Title entry resolves a low-signal raw title through the same
+humanized fallback the row ends at, so legacy-stamped rows agree too.
+
+**Falsifier:** every opencode row without a real title shows `New {machine}
+OpenCode` in the sidebar AND the rail, on one string, and
+`looks_like_generated_fallback_title("Yggterm OpenCode")` is true (it was
+false — that false negative was the leak).
+
+## ⛔ [11.42] DELETING A ROW IN THE LIVE RAIL PULLS THE ROWS BELOW THE GROUP UP TO SIT RIGHT AFTER THE LAST NUMBERED SEAT
+
+**Status:** OPEN
+
+Owner report (2026-09-02): with two birth-titled `New {machine} OpenCode`-
+shaped rows (rendered "Yggterm OpenCode" by the leak above) grouped near a
+`New {machine} Yedit` row, deleting any one of those rows makes the rows
+below the group "morbidly" jump to just after the `99.1` seat. Not yet
+reproduced by an agent; the suspect plane is the row-order ledger +
+outline-seat interaction (`row_order_ledger.rs` `record_live_order`/
+`placement_for`, `row_set_outline` grouping): a close that re-records the
+rendered order (or a re-seat that derives child prefixes) may re-anchor the
+unnumbered tail against the last numbered row instead of preserving their
+slots.
+
+**What would falsify it being fixed:** delete one member of that group and the
+rows below keep exactly the positions they had (the ledger records the same
+order minus the deleted row); a second delete moves nothing else.
+
+## ⛔ [11.43] THE VIEWPORT SWITCHES ITSELF TO THE STARTPAGE VIEW AFTER SOME TIME
+
+**Status:** OPEN
+
+Owner report (2026-09-02): "after some time, from time to time, my viewport
+changes to startpage view" — recurring, timer-shaped, reproducible enough that
+he expects it to come back. Not yet root-caused. Suspect plane: the GUI's
+periodic chores (snapshot refresh / hot-update convergence / auto-titlebar
+dwell) racing `WorkspaceViewMode` — a chore landing while the active session
+is briefly absent from a snapshot could flip the view to startpage and never
+flip back.
+
+**What would falsify it being fixed:** an hour of idle use with zero
+uncommanded `WorkspaceViewMode` transitions (telemetry +
+`active_view_mode` in `server app state` sampled before/after each chore
+tick).
+
+## ⛔ [11.44] IN A FULLSCREEN TUI WITHOUT MOUSE TRACKING THE WHEEL IS DEAD — NO ALTERNATE-SCROLL TRANSLATION
+
+**Status:** OPEN
+
+Owner report (2026-09-02): "in those opencode sessions, I cannot move up or
+down — yggterm does not recognize it is a fullscreen TUI." Code-read
+agrees: the scroll controller special-cases the alternate buffer only to HIDE
+its own gutter/overlay (`scrollControllerReason = 'alternate_screen'`); when
+the TUI has not armed mouse tracking (DECSET 1000/1002/1003/1006 — the ACT V
+mouse-mode probe now witnesses the truth per row) nothing translates wheel
+events into the cursor keys the TUI understands, so scrolling is a no-op.
+Wanted: alternate-scroll translation (wheel → up/down keys) in the alternate
+buffer whenever mouse tracking is OFF, driven by the same observed mode state
+the probe already carries — per-CLI surface model welcome (opencode is a
+window-GUI TUI; codex is inline; agy is dual: inline over a shell view OR
+fullscreen TUI), but the wheel law should key off the OBSERVED buffer + mouse
+mode, not the registry.
+
+**What would falsify it being fixed:** in an idle opencode TUI with the mouse
+probe reporting tracking off, wheel-up/down scrolls the conversation (keys
+arrive at the PTY); in a mouse-tracking TUI, wheel events arrive as mouse
+reports and nothing scrolls locally.
+
 ## ⛔ [11.38] THE GUI BURNS UP TO A CORE AND THE WEBVIEW RETENTION CLIMBS ~300 MB/h UNDER STREAMING — AND THE FLOOD REGIME'S ENGAGEMENT IS UNVERIFIABLE (the owner's heat + leak report)
 
 **Status:** OPEN

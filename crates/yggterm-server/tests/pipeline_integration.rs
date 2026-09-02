@@ -283,6 +283,74 @@ fn alt_screen_session_delivers_screen_content() {
     );
 }
 
+/// ⛔ THE BLANK-REVEAL CONTRACT (owner, 2026-09-02). An idle fullscreen TUI
+/// repaints only on a REAL winsize change: the kernel ignores a same-size
+/// re-set, so an identical-geometry resize must reach the child as nothing —
+/// and the repaint nudge (bounce one row, restore) must wake it. This is the
+/// whole difference between a restarted GUI staring at a blank viewport for
+/// 39.5s and the TUI's current frame arriving as ordinary bytes.
+#[test]
+fn repaint_nudge_wakes_an_idle_fullscreen_tui_where_an_identical_resize_cannot() {
+    let mut mgr = TerminalManager::new();
+    let key = "test://winch-repaint";
+    mgr.ensure_session(key, &launch("--scenario winch-repaint"), None)
+        .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    std::thread::sleep(Duration::from_millis(300));
+    let baseline = read_from_zero(&mgr, key);
+    assert!(
+        baseline.contains("WINCH_FRAME_0"),
+        "the initial alt-screen frame must arrive first"
+    );
+
+    // 1. The OLD LIE: an identical-geometry resize signals nobody.
+    let (cols, rows) = mgr.session_size(key).expect("session size");
+    mgr.resize(key, cols, rows).expect("identical resize");
+    std::thread::sleep(Duration::from_millis(500));
+    let after_noop = read_from_zero(&mgr, key);
+    assert_eq!(
+        after_noop.len(),
+        baseline.len(),
+        "an identical-geometry resize must not produce a byte"
+    );
+
+    // 2. THE FIX: the repaint nudge bounces the winsize; the TUI repaints.
+    //    ⚠ read() re-serializes the vt100 screen model, so reads are not
+    //    append-only — compare FRAME COUNTERS, never byte offsets.
+    let max_frame = |text: &str| {
+        text.match_indices("WINCH_FRAME_")
+            .filter_map(|(ix, _)| {
+                text[ix + "WINCH_FRAME_".len()..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        max_frame(&after_noop),
+        0,
+        "no repaint may have happened before the nudge"
+    );
+    mgr.repaint_nudge_session(key, None).expect("repaint nudge");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let data = read_from_zero(&mgr, key);
+        if max_frame(&data) >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the TUI must repaint after the nudge; tail {:?}",
+            &data[data.len().saturating_sub(160)..]
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn normal_buffer_scrollback_is_retained_end_to_end() {
     let mut mgr = TerminalManager::new();

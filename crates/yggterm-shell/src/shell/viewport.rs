@@ -12102,6 +12102,35 @@ fn TerminalCanvas(
                                         }),
                                     );
                                     let _ = eval.send(TerminalJsCommand::Refit);
+                                    // ⛔ THE BLANK-REVEAL REPAINT (owner,
+                                    // 2026-09-02): Refit only refits OUR
+                                    // xterm — an idle fullscreen TUI never
+                                    // repaints on it, so the reveal waited
+                                    // for the TUI's own next flush (measured:
+                                    // 39.5s "slow terminal reveal"). Ask the
+                                    // daemon for a repaint nudge: an
+                                    // identical-geometry winsize bounce, two
+                                    // real SIGWINCHes, and the TUI's CURRENT
+                                    // frame arrives as ordinary bytes — the
+                                    // first paint is the TUI's own pixels,
+                                    // never a re-rendering. Fires once per
+                                    // attach (the latch above); shadows never
+                                    // ask (D8: no SIGWINCH from a viewer).
+                                    if !client_is_shadow_viewer() {
+                                        let repaint_endpoint = endpoint.clone();
+                                        let repaint_path = session_path.clone();
+                                        let repaint_cols = current_terminal_cols;
+                                        let repaint_rows = current_terminal_rows;
+                                        spawn(async move {
+                                            let _ = terminal_resize_repaint_async(
+                                                repaint_endpoint,
+                                                repaint_path,
+                                                repaint_cols,
+                                                repaint_rows,
+                                            )
+                                            .await;
+                                        });
+                                    }
                                     append_trace_event(
                                         &trace_home,
                                         "ui",
@@ -12111,7 +12140,7 @@ fn TerminalCanvas(
                                             "session_path": session_path.clone(),
                                             "cols": current_terminal_cols,
                                             "rows": current_terminal_rows,
-                                            "server_resize": false,
+                                            "server_resize": !client_is_shadow_viewer(),
                                         }),
                                     );
                                     read_poll_ms = 45;
@@ -17288,6 +17317,26 @@ async fn terminal_resize_async(
         .map_err(|error| anyhow!("joining terminal resize task: {error}"))?
         .map(|_| ())
 }
+/// The repaint twin: identical geometry still bounces the PTY winsize so an
+/// idle fullscreen TUI repaints into the attaching client (blank-reveal fix).
+async fn terminal_resize_repaint_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    if client_is_shadow_viewer() {
+        // Same D8 rule as [`terminal_resize_async`]: a viewer must never
+        // SIGWINCH the user's live frame.
+        return Ok(());
+    }
+    task::spawn_blocking(move || {
+        terminal_resize_repaint(&endpoint, &session_path, cols, rows, true)
+    })
+    .await
+    .map_err(|error| anyhow!("joining terminal repaint task: {error}"))?
+    .map(|_| ())
+}
 fn spawn_terminal_startup_resize_repair(
     endpoint: ServerEndpoint,
     runtime_session_path: String,
@@ -17302,7 +17351,16 @@ fn spawn_terminal_startup_resize_repair(
     }
     tokio::spawn(async move {
         sleep(Duration::from_millis(180)).await;
-        match terminal_resize_async(endpoint, runtime_session_path, cols, rows).await {
+        // ⛔ REPAINT, NOT RESIZE (the blank-reveal fix, owner 2026-09-02):
+        // after a GUI restart the startup repair asks for the SAME grid the
+        // PTY already holds — an honest resize answers `resize_noop`, the
+        // kernel never signals the child, and an idle fullscreen TUI sleeps
+        // on (measured: the opencode viewport blank for 39.5s after a GUI
+        // restart, then popping in when the TUI happened to flush). The
+        // repaint flag makes the daemon bounce the winsize at identical
+        // geometry — two real SIGWINCHes — and the TUI's current frame
+        // arrives as ordinary bytes.
+        match terminal_resize_repaint_async(endpoint, runtime_session_path, cols, rows).await {
             Ok(()) => {
                 append_trace_event(
                     &trace_home,
@@ -17313,6 +17371,7 @@ fn spawn_terminal_startup_resize_repair(
                         "session_path": visible_session_path,
                         "cols": cols,
                         "rows": rows,
+                        "repaint": true,
                         "source": source,
                     }),
                 );

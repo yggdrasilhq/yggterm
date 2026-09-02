@@ -50915,7 +50915,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // ⛔ the pure form: the live title store must not decide a unit test
         let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
 
-        assert_eq!(label, "Samplenotes Codex");
+        // THE SSOT LAW (owner, 2026-09-02): an agent row's fallback is its
+        // birth title — `New {machine} {CLI}` — never a cwd-composed name and
+        // never a shorthash. (This path's cure for the shorthash era used to
+        // be "Samplenotes Codex"; the birth title is strictly more
+        // informative: it names the machine too.)
+        assert_eq!(label, "New dev Codex");
         assert!(!label.contains("6d8cdd5"));
     }
 
@@ -50934,7 +50939,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
 
         let label = live_session_label(&[], &session, &short_ids);
 
-        assert_eq!(label, "Samplenotes Codex");
+        // THE SSOT LAW (owner, 2026-09-02): birth title, never cwd-composed,
+        // never the shorthash the stored "Remote Codex 6d8cdd5" fallback wore.
+        assert_eq!(label, "New dev Codex");
         assert!(!label.contains("6d8cdd5"));
     }
 

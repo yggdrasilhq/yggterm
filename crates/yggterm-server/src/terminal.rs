@@ -1700,6 +1700,18 @@ impl TerminalManager {
         session.resize_with_origin(cols, rows, origin)
     }
 
+    /// Force an idle fullscreen TUI to repaint its frame (the blank-reveal
+    /// fix). Bounces the PTY winsize at the session's CURRENT grid; the TUI's
+    /// repaint then flows to every attached client through the ordinary byte
+    /// stream. Errors when the session is unknown, like [`Self::resize`].
+    pub fn repaint_nudge_session(&self, key: &str, origin: Option<&ResizeOrigin>) -> Result<()> {
+        let session = self
+            .sessions
+            .get(key)
+            .with_context(|| format!("terminal session not found: {key}"))?;
+        session.repaint_nudge(origin)
+    }
+
     /// Current PTY grid (cols, rows) for a session, as tracked by the runtime.
     /// Exposed for restart/re-resume size-preservation checks and tests.
     pub fn session_size(&self, key: &str) -> Option<(u16, u16)> {
@@ -3991,6 +4003,60 @@ impl PtySessionRuntime {
     /// [`Self::resize_with_origin`].
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.resize_with_origin(cols, rows, None)
+    }
+
+    /// Identical-geometry resize that still makes the child REPAINT.
+    ///
+    /// ⛔ WHY THIS EXISTS (owner, 2026-09-02 — "after restart of yggterm the
+    /// opencode viewport is blank, then after some time it appears"): a
+    /// fullscreen TUI owns its whole frame and repaints only on input, a real
+    /// resize, or its own timers. A fresh client attaching to an IDLE TUI has
+    /// an empty surface and — until the TUI happens to flush — nothing arrives
+    /// (measured: a 39.5s "slow terminal reveal"). The kernel delivers
+    /// SIGWINCH only when the winsize CHANGES, so an honest re-set of the same
+    /// size is silent — every identical client resize answered `resize_noop`
+    /// and the TUI slept on. The nudge bounces one row and restores it: two
+    /// real SIGWINCHes, and the TUI repaints its CURRENT frame through the
+    /// ordinary byte stream — the client's first paint is the TUI's own
+    /// pixels, not a re-rendering of the daemon's model.
+    pub fn repaint_nudge(&self, origin: Option<&ResizeOrigin>) -> Result<()> {
+        let cols = self.current_cols.load(Ordering::SeqCst);
+        let rows = self.current_rows.load(Ordering::SeqCst);
+        if cols == 0 || rows == 0 {
+            bail!("repaint nudge before the first real resize: no grid to bounce");
+        }
+        let master = self.master.lock().expect("pty master lock poisoned");
+        let bounced_rows = rows.saturating_sub(1).max(1);
+        master
+            .resize(PtySize {
+                rows: bounced_rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("repaint nudge: shrinking pty")?;
+        master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("repaint nudge: restoring pty")?;
+        // The grid ends exactly where it started, so the caches are already
+        // right; only the trace says anything happened.
+        trace_terminal_event(
+            "resize_repaint_nudge",
+            serde_json::json!({
+                "path": self.key,
+                "cols": cols,
+                "rows": rows,
+                "bounced_rows": bounced_rows,
+                "hash_before": self.screen_content_hash(),
+                "origin": origin.map(|o| o.trace_fields()),
+            }),
+        );
+        Ok(())
     }
 
     fn resize_with_origin(

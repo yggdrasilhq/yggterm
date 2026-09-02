@@ -200,7 +200,7 @@ pub use daemon::{
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
     declare_session_tenancy,
     terminal_app_declares, terminal_ensure, terminal_history, terminal_read, terminal_resize,
-    hot_restart_gate_screens, terminal_restart, terminal_tenants,
+    terminal_resize_repaint, hot_restart_gate_screens, terminal_restart, terminal_tenants,
     terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
@@ -10689,16 +10689,18 @@ impl YggtermServer {
             }
         }
         let target = local_session_target(kind, cwd);
-        let fallback_title = format!(
-            "Remote {display} {}",
-            session_id.chars().take(8).collect::<String>()
-        );
+        // ⛔ THE BIRTH TITLE IS THE ONLY FALLBACK (owner SSOT law, 2026-09-02):
+        // this used to stamp `Remote {display} {8-hex}` — the shorthash shape
+        // the title law forbids — onto every runtime row born without a title,
+        // and the metadata rail then showed the shorthash while the sidebar
+        // row showed its own derived name. One fallback, one shape: the same
+        // `New {machine} {CLI}` birth title the spawn path stamps.
         let title = self
             .sessions
             .get(&key)
             .map(|session| session.title.clone())
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(fallback_title);
+            .unwrap_or_else(|| local_live_session_default_title(kind));
         if !self.sessions.contains_key(&key) {
             self.insert_live_session_with_launch(
                 &key,
@@ -10879,17 +10881,14 @@ impl YggtermServer {
             }
         }
         let target = local_session_target(kind, cwd);
+        // ⛔ Same SSOT law as the ensure twin above: the birth title, never the
+        // `Remote {display} {shorthash}` shape.
         let title = self
             .sessions
             .get(&key)
             .map(|session| session.title.clone())
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "Remote {display} {}",
-                    session_id.chars().take(8).collect::<String>()
-                )
-            });
+            .unwrap_or_else(|| local_live_session_default_title(kind));
         if !self.sessions.contains_key(&key) {
             self.insert_live_session_with_launch(
                 &key,

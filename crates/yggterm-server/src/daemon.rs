@@ -4093,6 +4093,14 @@ pub enum ServerRequest {
         path: String,
         cols: u16,
         rows: u16,
+        /// ⛔ Identical-geometry repaint request (`serde(default)` = false, so
+        /// an older client is unaffected and an older daemon ignores the
+        /// field). True means: if the PTY is already at this grid, bounce the
+        /// winsize anyway so an idle fullscreen TUI repaints its frame into
+        /// the attaching client — the blank-reveal fix. A DIFFERENT grid
+        /// resizes normally (the change itself signals the child).
+        #[serde(default)]
+        repaint: bool,
     },
     TerminalRestart {
         path: String,
@@ -11960,7 +11968,12 @@ impl DaemonRuntime {
                     &data,
                 );
             }
-            ServerRequest::TerminalResize { path, cols, rows } => {
+            ServerRequest::TerminalResize {
+                path,
+                cols,
+                rows,
+                repaint,
+            } => {
                 // BORN-AT-THE-VIEWPORT'S-GRID: a resize is the only moment a
                 // client tells the daemon how big a terminal is on its screen.
                 // Record it here — ABOVE both branches, so the forwarding
@@ -11972,7 +11985,13 @@ impl DaemonRuntime {
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
-                    match terminal_resize(&owner_endpoint, &runtime_path, cols, rows) {
+                    match terminal_resize_repaint(
+                        &owner_endpoint,
+                        &runtime_path,
+                        cols,
+                        rows,
+                        repaint,
+                    ) {
                         Ok(_) => {
                             // SSOT (PTY-grid divergence / broken-bottom): the ATTACHED
                             // client's viewport is authoritative for the grid. The owner
@@ -12013,22 +12032,33 @@ impl DaemonRuntime {
                     },
                     client_id: identity.client_id.clone(),
                 };
-                self.terminals
-                    .resize_with_origin(&runtime_path, cols, rows, Some(&resize_origin))?;
-                // XTERM-BUG: squish-and-bottom-paint-on-reresume — persist the grid so a
-                // later daemon-process restart re-resumes EVERY session at its real grid
-                // (not DEFAULT 120x36). FLUSH SYNCHRONOUSLY on change: relying on the next
-                // periodic persist cycle lost the grid when the daemon was killed/handed-off
-                // (auto-update, deploy) between the resize and the flush → the successor
-                // defaulted to 120x36 → squish. Only flush when the grid actually changed
-                // (avoids drag-resize write storms). See campaign D1.
-                if self.server.record_session_pty_grid(&path, cols, rows) {
-                    let _ = self.persist_state_only();
+                if repaint && self.terminals.has_session(&runtime_path) {
+                    // ⛔ THE BLANK-REVEAL FIX: an identical-geometry repaint
+                    // request bounces the PTY winsize so an idle fullscreen
+                    // TUI repaints into the attaching client. A different
+                    // grid falls through to the ordinary resize below (the
+                    // change itself signals the child).
+                    self.terminals
+                        .repaint_nudge_session(&runtime_path, Some(&resize_origin))?;
+                    ServerResponse::Ack { message: None }
+                } else {
+                    self.terminals
+                        .resize_with_origin(&runtime_path, cols, rows, Some(&resize_origin))?;
+                    // XTERM-BUG: squish-and-bottom-paint-on-reresume — persist the grid so a
+                    // later daemon-process restart re-resumes EVERY session at its real grid
+                    // (not DEFAULT 120x36). FLUSH SYNCHRONOUSLY on change: relying on the next
+                    // periodic persist cycle lost the grid when the daemon was killed/handed-off
+                    // (auto-update, deploy) between the resize and the flush → the successor
+                    // defaulted to 120x36 → squish. Only flush when the grid actually changed
+                    // (avoids drag-resize write storms). See campaign D1.
+                    if self.server.record_session_pty_grid(&path, cols, rows) {
+                        let _ = self.persist_state_only();
+                    }
+                    // Run #19: pin the remote daemon's PTY explicitly too — the
+                    // implicit SIGWINCH→ssh→bridge chain is not reliable.
+                    self.forward_remote_pty_resize(&path, cols, rows);
+                    ServerResponse::Ack { message: None }
                 }
-                // Run #19: pin the remote daemon's PTY explicitly too — the
-                // implicit SIGWINCH→ssh→bridge chain is not reliable.
-                self.forward_remote_pty_resize(&path, cols, rows);
-                ServerResponse::Ack { message: None }
             }
             ServerRequest::TerminalRestart {
                 path,
@@ -18881,12 +18911,26 @@ pub fn terminal_resize(
     cols: u16,
     rows: u16,
 ) -> Result<Option<String>> {
+    terminal_resize_repaint(endpoint, path, cols, rows, false)
+}
+
+/// Resize, optionally as a REPAINT nudge (`repaint` = true): an identical
+/// geometry still bounces the PTY winsize so an idle fullscreen TUI repaints
+/// into the attaching client — the blank-reveal fix (owner, 2026-09-02).
+pub fn terminal_resize_repaint(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    cols: u16,
+    rows: u16,
+    repaint: bool,
+) -> Result<Option<String>> {
     expect_ack(send_request(
         endpoint,
         &ServerRequest::TerminalResize {
             path: path.to_string(),
             cols,
             rows,
+            repaint,
         },
     )?)
 }
@@ -28407,7 +28451,7 @@ mod tests {
             "TerminalRestart must fall back to the persisted session grid before DEFAULT 120x36"
         );
         let resize_block = source
-            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .split("ServerRequest::TerminalResize {\n                path,\n                cols,\n                rows,\n                repaint,\n            } =>")
             .nth(1)
             .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
             .expect("TerminalResize handler present");
@@ -28446,7 +28490,7 @@ mod tests {
              desktop's grid before DEFAULT 120x36"
         );
         let resize_block = source
-            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .split("ServerRequest::TerminalResize {\n                path,\n                cols,\n                rows,\n                repaint,\n            } =>")
             .nth(1)
             .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
             .expect("TerminalResize handler present");
@@ -28472,7 +28516,7 @@ mod tests {
     fn terminal_resize_forwarding_branch_records_client_grid() {
         let source = include_str!("daemon.rs");
         let resize_block = source
-            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .split("ServerRequest::TerminalResize {\n                path,\n                cols,\n                rows,\n                repaint,\n            } =>")
             .nth(1)
             .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
             .expect("TerminalResize handler present");
@@ -28504,7 +28548,7 @@ mod tests {
     fn terminal_resize_arm_stamps_the_asking_client_onto_the_trace() {
         let source = include_str!("daemon.rs");
         let resize_block = source
-            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .split("ServerRequest::TerminalResize {\n                path,\n                cols,\n                rows,\n                repaint,\n            } =>")
             .nth(1)
             .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
             .expect("TerminalResize handler present");
@@ -29150,6 +29194,7 @@ mod tests {
                 path: "p".into(),
                 cols: 80,
                 rows: 24,
+                repaint: false,
             },
             ServerRequest::TerminalEnsure { path: "p".into() },
             ServerRequest::FocusLive {
@@ -36335,8 +36380,8 @@ mod tests {
         // the shape: two builds of one version answering TerminalRead with
         // different payloads is the lost-PTY latch storm this stamp exists
         // to prevent.
-        const STAMPED_AT_VERSION: &str = "3.2.35";
-        const STAMPED_SHAPE_HASH: u64 = 0x5080c63f7dfb6471;
+        const STAMPED_AT_VERSION: &str = "3.2.37";
+        const STAMPED_SHAPE_HASH: u64 = 0x265fd851f47ecb21;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
