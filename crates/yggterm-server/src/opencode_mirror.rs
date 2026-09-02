@@ -430,6 +430,71 @@ impl YggtermServer {
                     }
                 }
             }
+            // Issue 31 probe: the tick's identity decision, on the plane. The
+            // anchor the picker chose, how many rows qualified, what the
+            // service is viewing, what the anchor is bound to — and the
+            // verdict. `diverged` (bound ≠ viewing, no rebind on this build)
+            // forces emission: it is the event the 2026-09-03 four-stale-rows
+            // incident needed and no instrument could give.
+            let anchor_row = self.sessions.get(&anchor_key);
+            let anchor_live = anchor_row.is_some_and(|a| {
+                a.terminal_process_id.is_some()
+                    || matches!(
+                        a.launch_phase,
+                        crate::TerminalLaunchPhase::Running
+                            | crate::TerminalLaunchPhase::RemoteBootstrap
+                    )
+            });
+            let bound = anchor_row.map(|a| a.id.clone());
+            let decision = if !anchor_live {
+                "anchor_not_live"
+            } else if viewing.is_none() {
+                "no_viewing"
+            } else if bound.as_deref() == viewing.as_deref() {
+                "in_sync"
+            } else {
+                "diverged"
+            };
+            if spawned > 0
+                || retired > 0
+                || plan.focus.is_some()
+                || decision == "diverged"
+            {
+                yggterm_core::cli_plane::emit_mirror_tick(
+                    "daemon",
+                    crate::SessionKind::OpenCode,
+                    yggterm_core::cli_plane::CliMirrorTickDecision {
+                        anchor: Some(anchor_key.as_str()),
+                        candidates: self.opencode_anchor_candidates().len(),
+                        viewing: viewing.as_deref(),
+                        bound: bound.as_deref(),
+                        decision,
+                        active_tabs: active.len(),
+                    },
+                );
+            }
+        } else {
+            // No row qualified as anchor at all — and a tick that cannot name
+            // its anchor is exactly as interesting as a diverged one: the
+            // mirror is running with nothing to steer.
+            if spawned > 0 || retired > 0 || plan.focus.is_some() {
+                yggterm_core::cli_plane::emit_mirror_tick(
+                    "daemon",
+                    crate::SessionKind::OpenCode,
+                    yggterm_core::cli_plane::CliMirrorTickDecision {
+                        anchor: None,
+                        candidates: 0,
+                        viewing: active
+                            .iter()
+                            .filter(|s| s.viewed_epoch_ms > 0)
+                            .max_by_key(|s| s.viewed_epoch_ms)
+                            .map(|s| s.id.as_str()),
+                        bound: None,
+                        decision: "no_anchor",
+                        active_tabs: active.len(),
+                    },
+                );
+            }
         }
         let mut focused = None;
         if let Some(ses_id) = &plan.focus {
@@ -504,6 +569,20 @@ impl YggtermServer {
 
     /// The live opencode TUI row (the mirror's seating anchor) and the next
     /// free sub-seat under it: `<anchor outline>.<n+1>`.
+    fn opencode_anchor_candidates(&self) -> Vec<&crate::ManagedSessionView> {
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.kind == crate::SessionKind::OpenCode
+                    && s.session_path.starts_with("opencode-runtime://")
+                    && !s
+                        .metadata
+                        .iter()
+                        .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
+            })
+            .collect()
+    }
+
     fn opencode_anchor_key(&self) -> Option<String> {
         // ⛔ THE ANCHOR IS THE LIVE TUI, NOT THE FIRST ROW THAT QUALIFIES.
         // The original predicate took the first OpenCode row without the
@@ -514,18 +593,7 @@ impl YggtermServer {
         // real TUI kept its stale name. Prefer a row that is actually
         // RUNNING; only a set with no live TUI at all falls back to the
         // historical first-qualified order.
-        let candidates: Vec<&crate::ManagedSessionView> = self
-            .sessions
-            .values()
-            .filter(|s| {
-                s.kind == crate::SessionKind::OpenCode
-                    && s.session_path.starts_with("opencode-runtime://")
-                    && !s
-                        .metadata
-                        .iter()
-                        .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
-            })
-            .collect();
+        let candidates = self.opencode_anchor_candidates();
         candidates
             .iter()
             .find(|s| {

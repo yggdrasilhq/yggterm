@@ -33147,6 +33147,26 @@ fn stored_session_launch_command_for_locality_with_options(
                     let birth_id = agent_cli_descriptor(kind)
                         .is_some_and(|descriptor| descriptor.id_assigned_at_birth)
                         .then_some(session_id);
+                    // Issue 31 probe: the resume the descriptor declares was
+                    // refused by the store and a rebirth is composed instead.
+                    // Expected (resume on the declared selector) vs actual (a
+                    // launch; an id rides along only for a CLI born WITH one).
+                    if let Some(descriptor) = agent_cli_descriptor(kind) {
+                        yggterm_core::cli_plane::emit_launch_contract(
+                            "daemon",
+                            kind,
+                            descriptor.resume_selector_token(),
+                            yggterm_core::cli_plane::CliInvocationShape {
+                                action: "launch",
+                                selector: "",
+                                carries_id: birth_id.is_some(),
+                                re_roots_with_cwd: false,
+                                extra_arg_tokens: 0,
+                                persistent: false,
+                            },
+                            yggterm_core::cli_plane::CliLaunchContractBreach::StoreAbsentRebirth,
+                        );
+                    }
                     agent_launch_command_with_options(kind, Some(cwd), birth_id, launch)
                 }
                 // Vouched for, or unanswerable. ⛔ `None` must behave exactly like

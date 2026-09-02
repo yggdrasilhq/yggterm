@@ -10260,6 +10260,33 @@ impl DaemonRuntime {
                         } else {
                             "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string()
                         };
+                        // Issue 31 probe: a requested restart that did NOT
+                        // happen, on the ytrace bus. Bounded by restart
+                        // requests (rare), never by ticks — always emitted.
+                        if force {
+                            let gate_blockers = self.hot_update_idle_gate_blockers(
+                                &owned_terminal_session_keys,
+                            );
+                            let mut blocker_kinds: Vec<&str> = gate_blockers
+                                .iter()
+                                .map(|blocker| blocker.kind.as_str())
+                                .collect();
+                            blocker_kinds.sort_unstable();
+                            blocker_kinds.dedup();
+                            yggterm_core::perf::ytrace_emit_event(
+                                "daemon",
+                                "daemon",
+                                "idle_gate_eval",
+                                serde_json::json!({
+                                    "site": "hot_restart_request",
+                                    "blocker_count": gate_blockers.len(),
+                                    "blocker_kinds": blocker_kinds,
+                                    "settled": false,
+                                    "deferred_polls": 0,
+                                    "head_blocker": gate_blockers.first().map(|blocker| blocker.session_key.clone()),
+                                }),
+                            );
+                        }
                         return Ok(ServerResponse::Error { message });
                     }
                     // NO idle gate here. This handoff PRESERVES every runtime —
@@ -14193,6 +14220,7 @@ fn run_background_copy_chore(
         perf_home,
         working_paths,
         mid_turn_paths,
+        working_edge_signals,
         attachment_sweep,
     ) = {
         let mut runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
@@ -14223,6 +14251,11 @@ fn run_background_copy_chore(
         // split costs no extra screen reads.
         let mut working_paths: HashSet<String> = HashSet::new();
         let mut mid_turn_paths: HashSet<String> = HashSet::new();
+        // Issue 31 probe inputs: per-row working verdict with BOTH sub-signals,
+        // carried out from under the lock so the edge emit below never runs
+        // while the runtime is held.
+        let mut working_edge_signals: HashMap<String, (SessionKind, bool, bool, bool)> =
+            HashMap::new();
         for session in runtime.server.live_sessions() {
             let runtime_path = runtime.terminal_runtime_key_for_path(&session.session_path);
             let screen_working = runtime
@@ -14239,6 +14272,10 @@ fn run_background_copy_chore(
             if screen_working || recently_active {
                 working_paths.insert(session.session_path.clone());
             }
+            working_edge_signals.insert(
+                session.session_path.clone(),
+                (session.kind, screen_working || recently_active, screen_working, recently_active),
+            );
         }
         let attachment_sweep = collect_agent_attachment_sweep(&mut runtime);
         (
@@ -14250,9 +14287,48 @@ fn run_background_copy_chore(
             runtime.store.home_dir().to_path_buf(),
             working_paths,
             mid_turn_paths,
+            working_edge_signals,
             attachment_sweep,
         )
     };
+    // Issue 31 probe: the daemon working-verdict TRANSITIONS per row. Edge
+    // state lives in a process-global map pruned to the currently-live set
+    // every pass (a row that is gone stops being reported, and the map can
+    // never outgrow the live set). A row observed working for the first time
+    // emits; a first-seen-idle row does not (birth-idle is not a transition).
+    // Lock-free here: the runtime lock was released with the block above, and
+    // the ytrace bus never blocks.
+    {
+        static WORKING_EDGE_LAST: std::sync::OnceLock<
+            std::sync::Mutex<HashMap<String, bool>>,
+        > = std::sync::OnceLock::new();
+        let mut last = WORKING_EDGE_LAST
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for (path, (kind, working, screen_signal, recency_signal)) in &working_edge_signals {
+            let previous = last.get(path).copied();
+            if previous != Some(*working) && (*working || previous.is_some()) {
+                yggterm_core::cli_plane::emit_working_edge(
+                    "daemon",
+                    *kind,
+                    path,
+                    *working,
+                    *screen_signal,
+                    *recency_signal,
+                );
+            }
+            last.insert(path.clone(), *working);
+        }
+        last.retain(|path, _| working_edge_signals.contains_key(path));
+        if let Ok(mut guard) = WORKING_EDGE_LAST
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+        {
+            *guard = last;
+        }
+    }
     // A `PerfGuard`, not a `PerfSpan`: the tree load and the update build
     // below both `?`, and a chore that failed after a multi-second disk walk
     // is precisely the run worth a duration — an explicit `finish` at the
@@ -20176,6 +20252,32 @@ fn spawn_disk_binary_version_poll(
                             "deferred_polls": deferred_polls,
                             "poll_interval_ms": POLL_INTERVAL_MS,
                             "blockers": blockers,
+                        }),
+                    );
+                    // Issue 31 probe: the same deferral decision on the ytrace
+                    // bus, so `ytrace tail --category daemon` answers "why
+                    // hasn't the new build taken over" without grepping jsonl.
+                    // Blocker CLASSES plus the head blocker only: the full
+                    // list already lives on the trace event above, and a
+                    // second full copy would double its bytes.
+                    let mut blocker_kinds: Vec<&str> = blockers
+                        .iter()
+                        .map(|blocker| blocker.kind.as_str())
+                        .collect();
+                    blocker_kinds.sort_unstable();
+                    blocker_kinds.dedup();
+                    yggterm_core::perf::ytrace_emit_event(
+                        "daemon",
+                        "daemon",
+                        "idle_gate_eval",
+                        serde_json::json!({
+                            "site": "cold_shutdown_poll",
+                            "retire_trigger": retire_trigger,
+                            "blocker_count": blockers.len(),
+                            "blocker_kinds": blocker_kinds,
+                            "settled": settled,
+                            "deferred_polls": deferred_polls,
+                            "head_blocker": blockers.first().map(|blocker| blocker.session_key.clone()),
                         }),
                     );
                     deferred_polls_since_logged = 0;
