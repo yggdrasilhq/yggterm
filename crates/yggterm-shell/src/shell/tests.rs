@@ -66271,4 +66271,70 @@ mod web_surface_immersion_locks {
             );
         }
     }
+
+    /// ⛔ LIVE-DATA REPRO (owner row d4090efe, 2026-09-02): a remote opencode
+    /// row whose direct title is the shorthash shape ("Remote OpenCode
+    /// d4090efe") and whose carried label is the cwd-composed lie
+    /// ("Yggterm OpenCode") must come out of enrichment as the birth title —
+    /// the kind-aware fallback slot, not the stale carried label.
+    #[test]
+    fn enrich_replaces_a_carried_cwd_composed_label_with_the_birth_title() {
+        let live_sessions = vec![ManagedSessionView {
+            id: "0e12ab34-1111-4222-8333-444444444444".to_string(),
+            session_path: "remote-opencode://dev/0e12ab34-1111-4222-8333-444444444444".to_string(),
+            title: "Remote OpenCode 0e12ab34".to_string(),
+            kind: SessionKind::OpenCode,
+            host_label: "dev".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview { older_available: false, summary: vec![], blocks: vec![] },
+            metadata: vec![SessionMetadataEntry { label: "Cwd", value: "/home/user/proj/yggterm".to_string() }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            limit_wait: false,
+            awaiting_user_choice: false,
+            input_unanswered_ms: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        }];
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "remote-opencode://dev/0e12ab34-1111-4222-8333-444444444444".to_string(),
+            label: "Yggterm OpenCode".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Yggterm OpenCode".to_string()),
+            depth: 0,
+            host_label: "dev".to_string(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("0e12ab34-1111-4222-8333-444444444444".to_string()),
+            session_cwd: Some("/home/user/proj/yggterm".to_string()),
+            session_kind: None,
+        }];
+        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[], &BTreeMap::new(), &BTreeMap::new());
+        eprintln!("REPRO label = {:?}", rows[0].label);
+        eprintln!("REPRO session_title = {:?}", rows[0].session_title);
+        assert_eq!(rows[0].label, "New dev OpenCode", "the birth title must replace the preserved lie");
+    }
 }
