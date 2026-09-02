@@ -188,6 +188,57 @@ Never wait on human if clear directive exists.
         # CRITICAL CHECK: Gemini-only steer must NOT be pushed to claude_memory!
         check("harness sync DID NOT push steer-gemini to claude dir", not (claude_dir / "steer-gemini-subagent-dispatch.md").exists())
 
+        # 10. Muse adapter resolves the XDG native store, never another harness's.
+        fake_home = (tmp_root / "fakehome").resolve()
+        muse_projects = fake_home / ".local" / "share" / "muse" / "memory" / "projects"
+        slug_core = "home-user-proj"
+        slug_dir = muse_projects / f"{slug_core}-0123456789abcdef"
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        lookalike = muse_projects / f"{slug_core}-closed-aaaaaaaaaaaaaaa1"
+        lookalike.mkdir(parents=True, exist_ok=True)
+
+        muse_adapter = mod.get_harness_adapter("muse", home=fake_home)
+        check("muse adapter rooted at XDG store",
+              str(muse_adapter.project_root) == str(muse_projects))
+        resolved = muse_adapter.local_dir("-" + slug_core)
+        check("muse adapter resolves slug dir",
+              resolved is not None and resolved == slug_dir)
+        check("muse adapter never resolves under .claude",
+              resolved is not None and ".claude" not in str(resolved))
+        check("muse adapter matches lookalike exactly, not by prefix",
+              muse_adapter.local_dir("-" + slug_core + "-closed") == lookalike)
+        check("muse adapter returns None for unknown namespace",
+              muse_adapter.local_dir("-no-such-workspace") is None)
+        check("muse adapter returns None for global namespace",
+              muse_adapter.local_dir(mod.GLOBAL_NAMESPACE) is None)
+        # Ambiguous duplicate slug cores must not sync anywhere.
+        (muse_projects / f"{slug_core}-bbbbbbbbbbbbbbb2").mkdir(parents=True, exist_ok=True)
+        check("muse adapter returns None on ambiguous slug cores",
+              muse_adapter.local_dir("-" + slug_core) is None)
+
+        # 11. Muse sync_namespace end-to-end against an isolated hub.
+        closed_ns = "-" + slug_core + "-closed"
+        (lookalike / "closed-note.md").write_text("# closed\n", encoding="utf-8")
+        muse_hub = tmp_root / "musehub"
+        muse_adapter.sync_namespace(muse_hub, "muse", closed_ns)
+        check("muse sync ingested native note to hub",
+              (muse_hub / "namespaces" / closed_ns / "closed-note.md").exists())
+        hub_door_src = tmp_root / "muse-hub-door.md"
+        hub_door_src.write_text("# hub door\n", encoding="utf-8")
+        args_pub.root = str(muse_hub)
+        args_pub.harness = "muse"
+        args_pub.ns = closed_ns
+        args_pub.file = str(hub_door_src)
+        mod.cmd_publish(args_pub)
+        muse_adapter.sync_namespace(muse_hub, "muse", closed_ns)
+        check("muse sync delivered hub door to slug dir",
+              (lookalike / "muse-hub-door.md").exists())
+        before = sorted(p.name for p in muse_projects.iterdir())
+        check("muse sync of unknown namespace is a no-op",
+              muse_adapter.sync_namespace(muse_hub, "muse", "-no-such-workspace") == (0, 0, 0))
+        check("muse sync of unknown namespace created no dirs",
+              sorted(p.name for p in muse_projects.iterdir()) == before)
+
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
