@@ -179,20 +179,27 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
                     let is_live = live_set.contains(&row.display_path)
                         || live_set.contains(&row.storage_path)
                         || remote_epoch_by_id.contains_key(&row.session_id);
-                    // Same truth fold as the faithful path (2026-09-02): daemon
-                    // last-activity outranks nothing — it IS the row's freshest
-                    // epoch when present; max() with the store epoch keeps a
-                    // stale-but-known mtime from being *lowered*.
-                    let epoch_ms = live_activity_by_id
+                    // ⛔ THE FS TRUTH IS THE STORE (owner law, refined after
+                    // live measurement): the row's claim is max(local store
+                    // mtime, machine-scan epoch) — two mirrors of one truth.
+                    // The daemon's PTY-activity clock fills ONLY rows the
+                    // stores cannot answer: PTY activity ticks on repaints and
+                    // echoes, and letting it outrank durable store activity let
+                    // a composer-idle row rank above a row that had actually
+                    // worked more recently (measured 16:2x).
+                    let store_or_scan = remote_epoch_by_id
                         .get(&row.session_id)
-                        .map(|ms| *ms as u128)
-                        .or_else(|| {
-                            remote_epoch_by_id
-                                .get(&row.session_id)
-                                .map(|e| (*e as u128) * 1000)
-                        })
+                        .map(|e| (*e as u128) * 1000)
                         .unwrap_or(row.modified_epoch_ms)
                         .max(row.modified_epoch_ms);
+                    let epoch_ms = if store_or_scan == 0 {
+                        live_activity_by_id
+                            .get(&row.session_id)
+                            .map(|ms| *ms as u128)
+                            .unwrap_or(0)
+                    } else {
+                        store_or_scan
+                    };
                     let epoch = i64::try_from(epoch_ms / 1000).unwrap_or(0);
                     candidates.push((row, is_live, true, epoch, String::new(), idx));
                 }
@@ -686,16 +693,22 @@ fn try_faithful_startpage_rows(
             || live_set.contains(&format!("remote-cc://{}", row.session_id))
             || live_set.contains(&format!("remote-session://{}", row.session_id))
             || live_set.contains(&format!("local://{}", row.session_id));
-        let epoch_ms = live_activity_by_id
+        // ⛔ Same store-first fold as the headless path: the stores (local
+        // mtime, machine scan) are the fs truth; the daemon's PTY-activity
+        // clock answers only for live-only rows (see the headless comment).
+        let store_or_scan = remote_epoch_by_id
             .get(&row.session_id)
-            .map(|ms| *ms as u128)
-            .or_else(|| {
-                remote_epoch_by_id
-                    .get(&row.session_id)
-                    .map(|e| (*e as u128) * 1000)
-            })
+            .map(|e| (*e as u128) * 1000)
             .unwrap_or(row.modified_epoch_ms)
             .max(row.modified_epoch_ms);
+        let epoch_ms = if store_or_scan == 0 {
+            live_activity_by_id
+                .get(&row.session_id)
+                .map(|ms| *ms as u128)
+                .unwrap_or(0)
+        } else {
+            store_or_scan
+        };
         let epoch = i64::try_from(epoch_ms / 1000).unwrap_or(0);
         let in_scope = if scope_is_live_sessions {
             is_live
