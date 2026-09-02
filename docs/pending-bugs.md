@@ -121,21 +121,31 @@ tick).
 
 ## ⛔ [11.44] IN A FULLSCREEN TUI WITHOUT MOUSE TRACKING THE WHEEL IS DEAD — NO ALTERNATE-SCROLL TRANSLATION
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Owner report (2026-09-02): "in those opencode sessions, I cannot move up or
 down — yggterm does not recognize it is a fullscreen TUI." Code-read
-agrees: the scroll controller special-cases the alternate buffer only to HIDE
-its own gutter/overlay (`scrollControllerReason = 'alternate_screen'`); when
-the TUI has not armed mouse tracking (DECSET 1000/1002/1003/1006 — the ACT V
-mouse-mode probe now witnesses the truth per row) nothing translates wheel
-events into the cursor keys the TUI understands, so scrolling is a no-op.
-Wanted: alternate-scroll translation (wheel → up/down keys) in the alternate
-buffer whenever mouse tracking is OFF, driven by the same observed mode state
-the probe already carries — per-CLI surface model welcome (opencode is a
-window-GUI TUI; codex is inline; agy is dual: inline over a shell view OR
-fullscreen TUI), but the wheel law should key off the OBSERVED buffer + mouse
-mode, not the registry.
+agreed: the scroll controller special-cased the alternate buffer only to HIDE
+its own gutter/overlay (`scrollControllerReason = 'alternate_screen'`), and
+`shouldHandleWheel` handed every alternate-buffer wheel straight to
+xterm.js — which has no scrollback to move, so the wheel was dead.
+
+Fix: alternate-scroll translation in the wheel handler — when the active
+buffer is the alternate buffer AND the TUI's observed mouse tracking mode is
+`none` (read live from `term.modes.mouseTrackingMode`, the same truth the
+ACT V mouse-mode probe witnesses), wheel up/down is translated into cursor
+up/down (`\u001b[A/B`, or the application-cursor forms under DECCKM), one
+line per wheel notch, gated by the same input gate as typing. A TUI that
+armed mouse tracking never lands here — it receives real mouse reports
+through its own mode. A per-CLI surface model (opencode = window-GUI TUI;
+codex = inline; agy = dual) remains welcome for OTHER decisions, but the
+wheel law keys off the OBSERVED buffer + mouse mode, not the registry.
+
+**What would falsify it being fixed:** in an idle opencode TUI with the mouse
+probe reporting tracking off, wheel-up/down scrolls the conversation (the
+translated keys arrive at the PTY; the host's `altScrollWheelEvents` counter
+climbs); in a mouse-tracking TUI, wheel events arrive as mouse reports and
+nothing scrolls locally.
 
 **What would falsify it being fixed:** in an idle opencode TUI with the mouse
 probe reporting tracking off, wheel-up/down scrolls the conversation (keys

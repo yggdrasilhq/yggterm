@@ -8379,11 +8379,28 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }} catch (_error) {{}}
         }};
+        // ⛔ ALTERNATE SCROLL (owner, 2026-09-02 — "I cannot move up or down
+        // in those opencode sessions"): in the alternate buffer xterm.js has
+        // no scrollback to move, so the wheel was dead unless the TUI armed
+        // mouse tracking. When the buffer is alternate AND tracking is off,
+        // the wheel must TRANSLATE to cursor keys instead of being dropped.
+        const alternateScrollApplies = () => {{
+            try {{
+                if (currentBufferKind() !== 'alternate') {{
+                    return false;
+                }}
+                const modes = term && term.modes ? term.modes : null;
+                const tracking = String((modes && modes.mouseTrackingMode) || 'none');
+                return tracking === 'none';
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
         const shouldHandleWheel = (event) => {{
             if (!event || !hostOwnsActiveTerminalInput()) {{
                 return false;
             }}
-            if (terminalOwnsWheelInput()) {{
+            if (terminalOwnsWheelInput() && !alternateScrollApplies()) {{
                 return false;
             }}
             const target = event.target;
@@ -8416,6 +8433,38 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             const deltaLines = Math.max(1, Math.round(Math.abs(event.deltaY) / 40));
             revealSoftwareCanvasLinkLayer('wheel');
+            if (alternateScrollApplies()) {{
+                // Alternate scroll: wheel up/down becomes cursor up/down so a
+                // fullscreen TUI (opencode and friends) scrolls its content.
+                // Honors DECCKM (application cursor keys) and the input gate —
+                // this is USER INPUT, not a viewport opinion. A TUI that armed
+                // mouse tracking never lands here: it gets real mouse reports
+                // through its own mode instead.
+                try {{
+                    if (inputEnabled) {{
+                        const applicationCursor = Boolean(
+                            term && term.modes && term.modes.applicationCursorKeysMode
+                        );
+                        const key = event.deltaY > 0
+                            ? (applicationCursor ? '\\u001bOB' : '\\u001b[B')
+                            : (applicationCursor ? '\\u001bOA' : '\\u001b[A');
+                        markTerminalInputHot('alt_scroll_wheel');
+                        sendTerminalEvent({{ kind: 'input', data: key.repeat(deltaLines) }});
+                        if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                            window.__yggtermXtermHosts[hostId].altScrollWheelEvents =
+                                Number(window.__yggtermXtermHosts[hostId].altScrollWheelEvents || 0) + 1;
+                        }}
+                    }}
+                }} catch (_altScrollError) {{
+                    // A failed translation must not turn into a viewport jump.
+                }}
+                event.preventDefault();
+                if (event.stopImmediatePropagation) {{
+                    event.stopImmediatePropagation();
+                }}
+                event.stopPropagation();
+                return;
+            }}
             const activeBuffer = term && term.buffer ? term.buffer.active : null;
             const wheelDebug = {{
                 delta_y: Number(event.deltaY || 0),
