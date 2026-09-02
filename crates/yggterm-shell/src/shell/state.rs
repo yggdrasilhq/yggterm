@@ -83364,6 +83364,16 @@ async fn process_pending_app_control_requests(
                     let terminal_appearance_for_task = terminal_appearance.clone();
                     let launch_for_task = launch_options.clone();
                     let seat_for_task = seat.clone();
+                    // ⛔ THE FLAG TRAVELS TO THE DAEMON — a viewport decision is
+                    // made where the viewport state lives. Passing `--no-activate`
+                    // through used to stop HERE: the daemon read no flag on the
+                    // wire, born the row ACTIVE, and the next reap of that row
+                    // cleared an active session the user had never left — the
+                    // "random startpage spawn" (GUI host 2026-09-02 18:17,
+                    // usability probe local://93f088d6). The client-side
+                    // preserved-view restore below still runs, but it is the
+                    // SECOND half of the contract, not the whole of it.
+                    let activate_requested = activate.unwrap_or(true);
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_local",
                         &home,
@@ -83377,6 +83387,7 @@ async fn process_pending_app_control_requests(
                                 Some(&terminal_appearance_for_task),
                                 &launch_for_task,
                                 &seat_for_task,
+                                activate_requested,
                             )
                         },
                     )

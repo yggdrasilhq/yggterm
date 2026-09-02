@@ -10432,6 +10432,29 @@ impl YggtermServer {
         title_hint: Option<&str>,
         launch: &AgentLaunchOptions,
     ) -> String {
+        self.start_local_session_with_launch_options_and_activation(
+            kind, cwd, title_hint, launch, true,
+        )
+    }
+
+    /// [`Self::start_local_session_with_launch_options`], with the viewport
+    /// decision made explicit.
+    ///
+    /// `activate == false` is the `--no-activate` contract: the row is born,
+    /// seated, and NOT made the active session — the user's view does not
+    /// move, and the row's PTY starts lazily on first open. This is the
+    /// daemon half of a decision that used to exist only client-side, which
+    /// is how a `--no-activate` usability probe took the active session
+    /// (GUI host 2026-09-02 18:17) and its reap dropped the user onto the
+    /// startpage.
+    pub fn start_local_session_with_launch_options_and_activation(
+        &mut self,
+        kind: SessionKind,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        launch: &AgentLaunchOptions,
+        activate: bool,
+    ) -> String {
         let uuid = Uuid::new_v4().to_string();
         let key = match kind {
             SessionKind::SshShell => format!("live::{uuid}"),
@@ -10451,7 +10474,7 @@ impl YggtermServer {
             &target,
             Some(title),
             true,
-            true,
+            activate,
             launch,
         );
         key
@@ -42003,6 +42026,98 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), Some(active.as_str()));
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
         assert_eq!(server.live_session_order, vec![active, inactive]);
+    }
+
+    /// ⛔ THE RANDOM-STARTPAGE-HIJACK REGRESSION (GUI host 2026-09-02 18:17).
+    /// A `--no-activate` usability probe was born ACTIVE because the daemon
+    /// half of the flag did not exist; when the probe was reaped six seconds
+    /// later, `remove_live_session` cleared an active session the user had
+    /// never left, and the GUI fell to the startpage mid-keystroke. The
+    /// daemon-side honor lives in
+    /// [`YggtermServer::start_local_session_with_launch_options_and_activation`];
+    /// this test pins BOTH halves of the contract: a no-activate birth moves
+    /// nothing, an activating birth still takes the viewport.
+    #[test]
+    fn start_local_session_no_activate_birth_leaves_active_session_untouched() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let target = crate::local_session_target(SessionKind::Shell, Some("/home/user"));
+        let active = "local://active-shell".to_string();
+        server.insert_live_session_with_launch(
+            &active,
+            "active-shell",
+            SessionKind::Shell,
+            &target,
+            Some("active".to_string()),
+            false,
+            false,
+        );
+        server.active_session_path = Some(active.clone());
+        server.active_view_mode = WorkspaceViewMode::Terminal;
+
+        // The probe's birth: `--no-activate` (activate = false).
+        let probe = server.start_local_session_with_launch_options_and_activation(
+            SessionKind::Shell,
+            Some("/home/user"),
+            Some("Agent unnamed shell: usability level-4 input probe"),
+            &AgentLaunchOptions::default(),
+            false,
+        );
+
+        // The row EXISTS (the create succeeded) …
+        assert!(server.sessions.contains_key(&probe));
+        // … and the user's view DID NOT MOVE — the whole point of the flag.
+        assert_eq!(server.active_session_path(), Some(active.as_str()));
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
+
+        // The activating birth (every human door) still takes the viewport.
+        let activated =
+            server.start_local_session_with_launch_options_and_activation(
+                SessionKind::Shell,
+                Some("/home/user"),
+                None,
+                &AgentLaunchOptions::default(),
+                true,
+            );
+        assert_eq!(server.active_session_path(), Some(activated.as_str()));
+    }
+
+    /// The wire cannot lose the flag silently in EITHER direction: an
+    /// OLD-shaped request (no `activate` field, pre-3.2.39 client) must still
+    /// parse and read as activate-on-create, and an explicit `false` must
+    /// survive the round trip. `serde(default)` + `Option` is the contract.
+    #[test]
+    fn start_local_session_request_activate_field_defaults_to_activate_on_create() {
+        use crate::ServerRequest;
+        let legacy = serde_json::json!({
+            "kind": "start_local_session",
+            "session_kind": "shell",
+        });
+        let parsed: ServerRequest = serde_json::from_value(legacy)
+            .expect("a pre-activate-field request must still parse");
+        match parsed {
+            ServerRequest::StartLocalSession { activate, .. } => {
+                assert_eq!(activate, None, "absent field reads as None (=> true)");
+            }
+            other => panic!("wrong request variant parsed: {other:?}"),
+        }
+
+        let explicit = serde_json::json!({
+            "kind": "start_local_session",
+            "session_kind": "shell",
+            "activate": false,
+        });
+        let parsed: ServerRequest = serde_json::from_value(explicit)
+            .expect("an explicit activate=false must parse");
+        match parsed {
+            ServerRequest::StartLocalSession { activate, .. } => {
+                assert_eq!(activate, Some(false), "--no-activate must survive the wire");
+            }
+            other => panic!("wrong request variant parsed: {other:?}"),
+        }
     }
 
     #[test]

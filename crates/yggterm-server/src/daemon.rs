@@ -3838,6 +3838,25 @@ pub enum ServerRequest {
         /// shows up as a visible mismatch, not silence.
         #[serde(default)]
         launch_options: Option<AgentLaunchOptions>,
+        /// `false` ⇒ `--no-activate`: the row is born WITHOUT taking the
+        /// user's viewport. serde(default) + Option = `None` reads as `true`,
+        /// so an older client that cannot name the flag keeps the activate-
+        /// on-create behavior, and a NEW client talking to an OLDER daemon
+        /// degrades to the old activate behavior (visible, not silent: the
+        /// row takes the viewport) rather than losing the row.
+        ///
+        /// ⛔ WHY THIS FIELD EXISTS — measured on the GUI host 2026-09-02
+        /// 18:17: a `terminal new --no-activate` usability probe was born
+        /// ACTIVE because this wire had no way to carry the flag. The daemon
+        /// moved the active session onto the probe (`insert_live_session_
+        /// with_launch_options` activation); when the probe was reaped six
+        /// seconds later, `remove_live_session` cleared the active pointer of
+        /// a session the user had never left, and the GUI fell to the
+        /// startpage — the owner's "random startpage spawn". A viewport
+        /// decision has to be made where the viewport state lives, and the
+        /// wire is how the decision travels there.
+        #[serde(default)]
+        activate: Option<bool>,
     },
     SwitchAgentSessionMode {
         path: String,
@@ -11124,7 +11143,14 @@ impl DaemonRuntime {
                 insert_after,
                 outline_prefix,
                 launch_options,
+                activate,
             } => {
+                // `--no-activate` is honored WHERE THE VIEWPORT STATE LIVES —
+                // here, not client-side. The pre-fix flow let a `--no-activate`
+                // probe take the active session (and a later reap of that row
+                // cleared it, dropping the user to the startpage); see the
+                // field's own note on [`ServerRequest::StartLocalSession`].
+                let activate = activate.unwrap_or(true);
                 // Phantom-spawn investigation: record that this birth was
                 // GUI/IPC-initiated (vs an internal server-side creation) —
                 // pairs with the live_session_birth chokepoint trace.
@@ -11140,22 +11166,31 @@ impl DaemonRuntime {
                             "title_hint": title_hint,
                             "insert_after": insert_after,
                             "launch_options": launch_options,
+                            "activate": activate,
                         }),
                     );
                 }
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
-                let key = self.server.start_local_session_with_launch_options(
-                    session_kind,
-                    cwd.as_deref(),
-                    title_hint.as_deref(),
-                    &launch_options.unwrap_or_default(),
-                );
+                let key = self
+                    .server
+                    .start_local_session_with_launch_options_and_activation(
+                        session_kind,
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                        &launch_options.unwrap_or_default(),
+                        activate,
+                    );
                 self.server.seat_created_live_session(
                     &key,
                     outline_prefix.as_deref(),
                     insert_after.as_deref(),
                 );
-                if self.server.active_session_supports_terminal() {
+                // With `--no-activate` the active session did not move, so the
+                // active row is NOT the row we just created — ensuring "the
+                // active terminal" here would ensure somebody else's row, and
+                // the new row's PTY stays LAZY by contract (born on first
+                // open). Only an activating create owns its launch.
+                if activate && self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
                 self.persist()?;
@@ -18181,6 +18216,7 @@ pub fn start_local_session_with_launch_options(
             insert_after: None,
             outline_prefix: None,
             launch_options: (!launch.is_empty()).then(|| launch.clone()),
+            activate: None,
         },
     )?)
 }
@@ -18194,6 +18230,11 @@ pub fn start_local_session_with_launch_options(
 /// though the wire had carried that field since the context menu needed it.
 /// **That is why every agent-spawned row landed at the head**, and why the
 /// owner ended up dragging one back into position by hand.
+///
+/// `activate` carries the `--no-activate` decision to the daemon, where the
+/// viewport state lives — the GUI-side restore alone left the daemon's active
+/// pointer on the new row, which is how a `--no-activate` probe ended up
+/// owning the active session (GUI host 2026-09-02 18:17).
 pub fn start_local_session_seated(
     endpoint: &ServerEndpoint,
     kind: SessionKind,
@@ -18202,6 +18243,7 @@ pub fn start_local_session_seated(
     terminal_appearance: Option<&str>,
     launch: &AgentLaunchOptions,
     seat: &crate::RowSeatRequest,
+    activate: bool,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
@@ -18213,6 +18255,7 @@ pub fn start_local_session_seated(
             insert_after: seat.insert_after.clone(),
             outline_prefix: seat.outline_prefix.clone(),
             launch_options: (!launch.is_empty()).then(|| launch.clone()),
+            activate: Some(activate),
         },
     )?)
 }
@@ -18235,6 +18278,7 @@ pub fn start_local_session_placed(
             insert_after: insert_after.map(ToOwned::to_owned),
             outline_prefix: None,
             launch_options: None,
+            activate: None,
         },
     )?)
 }
@@ -36338,8 +36382,20 @@ mod tests {
         // the shape: two builds of one version answering TerminalRead with
         // different payloads is the lost-PTY latch storm this stamp exists
         // to prevent.
-        const STAMPED_AT_VERSION: &str = "3.2.35";
-        const STAMPED_SHAPE_HASH: u64 = 0x5080c63f7dfb6471;
+        // Re-cut for 3.2.39 (lane trace/startpage-hijack): `StartLocalSession`
+        // gained `activate` — the daemon half of `--no-activate`, so an
+        // agent-plane create can be born WITHOUT taking the user's viewport
+        // (the "random startpage spawn", GUI host 2026-09-02 18:17: a
+        // `--no-activate` usability probe was born active because the wire
+        // could not carry the flag, and its reap dropped the owner onto the
+        // startpage). `#[serde(default)]` + Option: an older daemon ignores
+        // the field and activates as before; an older client never sends it.
+        // Which is precisely why the version must move with the shape: two
+        // builds of one version answering StartLocalSession with different
+        // viewport outcomes is the lost-PTY latch storm this stamp exists to
+        // prevent.
+        const STAMPED_AT_VERSION: &str = "3.2.39";
+        const STAMPED_SHAPE_HASH: u64 = 0x1022be69ffce0943;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
