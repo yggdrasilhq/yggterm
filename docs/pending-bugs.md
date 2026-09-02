@@ -5602,6 +5602,26 @@ below a third.
 
 **Status:** OPEN
 
+**RE-MEASURED 2026-09-02 22:30–23:44 (guihost, the owner's freeze report —
+"UI freeze while browsing with ychrome, force-restarted"):** 160 `ui/block`
+spans in ~50 min, **p50 541 ms / p95 1,670 ms / max 3,340 ms, 105 s total
+blocked** — an order over this entry's bar (≤1/min, p95 ≤ 50 ms). Shape, from
+the per-minute census: a churn storm 22:57–23:01 (~110 blocks of 300–600 ms —
+the post-restart adoption window), an escalation 23:04–23:06 (blocks reaching
+2,069 / 3,365 ms), and the freeze tail 23:36–23:43 — `app_control/watchdog_
+spawned` 580 ms, `daemon_recovery/current_daemon_existing_before_cleanup`
+**3,365 ms**, `app_control/request_begin` 464 ms, `terminal_mount/js_ready`
+750 ms, **`web_surface/popup_adopted` 226 ms** (a ychrome popup adopted
+mid-browse), then the owner's force restart. Witness census across the window:
+`terminal_mount/*` (switching) and `app_control/*` (verbs/modals) are the
+top named predecessors — exactly this entry's two halves — with ~47 idle
+blocks naming nothing. Composed with tonight's deploy churn (four GUI
+restarts 19:44–20:5x, see the deploy-churn law in the campaign door) and
+`cli/refresh_managed_codex` blocking spans escalating 189 s → 229 s → **438 s**
+across three perf incidents. The freeze force-restart is the saturation
+presentation this entry already documented; the ychrome popup adoption as a
+UI-thread block witness is NEW evidence for the [11.24] web-surface lane.
+
 First measured 2026-08-20, with the `ui/block` watchdog live.
 
 The UI-block watchdog now names what the zero-incident freeze class was. In its first 30 minutes
@@ -25825,3 +25845,59 @@ ignores `null` when the GUI holds a session view and the daemon has never
 held a non-null active since this GUI attached. (a) is the SSOT-honest one:
 the pointer should live where the state lives, and after a restart it lives
 nowhere until the GUI gives it back.
+
+---
+
+## ⛔ [interrupted-orphan] THE EXPIRED-SWAP RECORD OUTLIVES EVERY THREAD THAT COULD AGE IT OUT, AND THE GATE REFUSES ON A DEAD LETTER
+
+**Status:** PARTIALLY FIXED 2026-09-02 — the expiry sweeper (own thread) and
+the gate's expiry-awareness landed on `lane/dev/interrupted-expiry`; the
+LINGER itself (root cause) is OPEN.
+
+Measured live on dev, 2026-09-02, TWICE the same day:
+
+1. ~20:31 — pid 3509741 (3.2.37) wrote `hot-restart-interrupted.json` naming
+   5 sessions, then its forced cold shutdown "took the preserving path and
+   lingered; poll thread exited before the expiry sweeper could run" (the
+   fs-truth campaign's trace words, `hot_restart_repair_expired_resolved_manually`,
+   resolved by hand 20:55 after verifying all 5 rows alive on live PTYs).
+2. 21:31 — pid 3196949 (3.2.40) wrote the record naming 2 opencode rows
+   (active 160s before), began the same forced shutdown, and LINGERED: the
+   daemon is still serving at 23:30 while its poll thread never ran again
+   (no expiry sweep at 21:41, no forced-deadline verdict at 22:01/22:31/23:01,
+   no `binary_replaced` retire despite two deploys installing newer binaries
+   at 22:41 and 23:08). The record blocked every deploy at the
+   `deploy-fleet.sh` gate from 22:49 (first refusal in ci.log) until removed
+   by hand before the 23:08 deploy passed; named rows verified `working` on
+   live PTYs of the surviving writer first.
+
+**The three strata:**
+
+- *The linger (OPEN, root cause).* A forced swap that writes the record must
+  either complete or die; "took the preserving path and lingered" leaves a
+  zombie that serves requests but can never retire (`binary_replaced` is a
+  poll-loop trigger), never force-swap, never age the record. Deploys then
+  install binaries that nothing ever loads. The request-path hot restart
+  (`server monitor --scenario hot-restart`) answered `deferred:
+  session_survival_required` and has no retry of its own — a deferred
+  same-version swap needs a re-request, and only the dead poll loop would
+  ever re-arm one.
+- *The expiry drop depended on the dying thread (FIXED).* The expired arm of
+  `take_repairable` was reachable only from `dispatch_interrupted_session_
+  repairs`, whose only caller was the poll loop. New:
+  `spawn_interrupted_record_expiry_sweeper` — a standalone 60s thread running
+  `hot_restart_repair::sweep_expired`, same loud
+  `hot_restart_repair_expired` verdict, collision-free by construction (an
+  expired record is never dispatched, so no batch can be in flight on one).
+- *The gate refused on a dead letter (FIXED).* `deploy-fleet.sh` refused
+  whenever the file existed, whatever its age. Now: fresh (≤10 min) ⇒ refuse
+  as before; expired ⇒ proceed over a loud warning (the successor drops the
+  record on arrival); unreadable ⇒ refuse (an unreadable list is not an empty
+  one).
+
+⇒ What remains: root-cause the preserving-path linger (why the shutdown
+neither completed nor exited) and give a deferred same-version swap a
+re-arming retry that does not depend on the poll thread. Until then every
+forced-swap linger needs the hand-resolution protocol: verify the named rows
+on live PTYs, archive the record to scratchpad, trace
+`hot_restart_repair_expired_resolved_manually`, remove.

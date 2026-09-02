@@ -20831,6 +20831,71 @@ impl Drop for HotRestartRepairInFlight {
     }
 }
 
+/// §5's expiry law on a thread of its own — the poll thread provably dies.
+///
+/// Measured live (dev, 2026-09-02, twice the same day): a forced swap wrote the
+/// interrupted-sessions record, the shutdown took the preserving path and
+/// lingered, and the disk-binary poll thread exited before
+/// [`take_repairable`]'s expired arm could run again — leaving a daemon that
+/// served every request while no code path could age the record out. Each
+/// stranded record then refused every deploy at the gate for hours
+/// (`hot-restart-interrupted.json` stranded 21:31→23:20; the 20:31 orphan
+/// needed the same hand resolution) on a repair that was already dead by its
+/// own 10-minute law.
+///
+/// [`dispatch_interrupted_session_repairs`] keeps its in-flight flag and its
+/// runtime lock; this sweeper only ever touches a record past
+/// [`hot_restart_repair::REPAIR_WINDOW_MS`], which dispatch can never be
+/// acting on (an expired record is never dispatched, so no batch can be in
+/// flight against one) — the two cannot collide.
+#[cfg(target_os = "linux")]
+fn spawn_interrupted_record_expiry_sweeper(home_dir: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("interrupted-expiry".into())
+        .spawn({
+            let home_dir = home_dir.clone();
+            move || {
+                const SWEEP_INTERVAL_MS: u64 = 60_000;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(SWEEP_INTERVAL_MS));
+                    let now_ms = current_millis_u64();
+                    let Some((age_ms, sessions)) =
+                        hot_restart_repair::sweep_expired(&home_dir, now_ms)
+                    else {
+                        continue;
+                    };
+                    // ⛔ Loud, never silent — the same verdict the dispatch arm
+                    // writes. A repair that aged out is a `continue` the owner was
+                    // promised and did not get, and the only way anyone learns
+                    // that is here.
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "hot_restart_repair_expired",
+                        serde_json::json!({
+                            "age_ms": age_ms,
+                            "window_ms": hot_restart_repair::REPAIR_WINDOW_MS,
+                            "sessions": sessions,
+                            "sweeper": "standalone_expiry_thread",
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                        }),
+                    );
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "lifecycle",
+            "interrupted_record_expiry_sweeper_spawn_failed",
+            serde_json::json!({ "error": error.to_string() }),
+        );
+    }
+}
+
 /// How long the repair waits for a re-resumed agent to start consuming input.
 ///
 /// The echo-verified submit is what makes this safe: a just-resumed agent CLI
@@ -22287,6 +22352,12 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // for days until the user runs `server retire-stale-daemons`.
         #[cfg(target_os = "linux")]
         spawn_disk_binary_version_poll(endpoint.clone(), home_dir.clone(), runtime.clone());
+        // The expiry sweeper must NOT live inside the poll thread: that thread
+        // provably exits mid-linger after a forced swap (the exact state that
+        // strands the interrupted-sessions record), and an expiry law whose only
+        // executor is the thread most likely to die is no law. Own thread.
+        #[cfg(target_os = "linux")]
+        spawn_interrupted_record_expiry_sweeper(home_dir.clone());
         spawn_superseded_daemon_takeover(runtime.clone());
         let (client_outcome_tx, client_outcome_rx) =
             std::sync::mpsc::channel::<Result<DaemonRequestOutcome>>();
