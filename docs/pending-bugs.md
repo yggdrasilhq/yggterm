@@ -25771,8 +25771,19 @@ before touching the vocabulary.
 
 ## ⛔ [startpage-hijack-D] POST-RESTART NULL-ACTIVE WINDOW — the first snapshot adopt yanks the restored view to the startpage
 
-**Status:** OPEN — measured 2026-09-02 19:40–19:44, guihost, on the 3.2.39 GUI
-(running the [11.43] falsifier).
+**Status:** FIXED IN CODE — lane `trace/startpage-hijack` (`8a1847763`): the
+GUI now CLOSES the desync instead of adopting the null (focus the held
+session daemon-side via `FocusLive`, adopt the post-focus snapshot; pure
+decision predicate unit-tested). LIVE PROOF OWED on the next natural GUI
+restart: the trace gains `restored_active_pushed_to_daemon` in the
+post-restart window and no `apply_snapshot_adopt_daemon_view` null-adopt
+follows. One nuance measured while testing: the client-side apply has a
+fallback that keeps a LIVE row when the daemon's active is null (the row is
+re-inserted from `active_session` and/or the first-live fallback fires), so
+the felt startpage at 18:18 came through the remove-path's Rendered+None
+([startpage-hijack-C]) rather than the adopt alone — D remains real as the
+desync itself (daemon pointer null ≠ user view) and as the churn feeder B
+fed on.
 
 After a GUI restart the DAEMON's active pointer is `null` until the first user
 click (the GUI restores its own view client-side; nothing has re-armed the
