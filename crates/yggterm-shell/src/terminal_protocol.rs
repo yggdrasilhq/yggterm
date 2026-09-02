@@ -126,6 +126,14 @@ pub(crate) enum TerminalJsEvent {
     MouseMode {
         mode: u16,
         enabled: bool,
+        /// ⭐ Whether the mount script CONSUMED this DECSET instead of applying
+        /// it (registry `suppresses_mouse_tracking`). Constructed, never
+        /// deserialized — no serde attribute here (the wire twin carries it
+        /// serde-defaulted). WITHOUT this field the trace silently drops the
+        /// probe's key datum — the witness event then cannot tell an applied
+        /// arm from a suppressed one, which is exactly the question the mouse
+        /// contract is argued on.
+        suppressed: bool,
     },
     /// The client half asks for a FRESH authoritative hash: its buffer has
     /// been quiet long enough to pair honestly, and a hash forwarded at read
@@ -436,6 +444,14 @@ enum TerminalJsEventWire {
     MouseMode {
         mode: u16,
         enabled: bool,
+        /// ⭐ Whether the mount script CONSUMED this DECSET instead of applying
+        /// it (registry `suppresses_mouse_tracking`). serde(default): older
+        /// in-page scripts predate the field. WITHOUT this field the trace
+        /// silently drops the probe's key datum — the witness event then
+        /// cannot tell an applied arm from a suppressed one, which is exactly
+        /// the question the mouse contract is argued on.
+        #[serde(default)]
+        suppressed: bool,
     },
     FrameHashRequest,
     FrameHash {
@@ -650,8 +666,8 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             TerminalJsEventWire::Input { data } => TerminalJsEvent::Input { data },
             TerminalJsEventWire::ReadNudge { reason } => TerminalJsEvent::ReadNudge { reason },
             TerminalJsEventWire::Resize { cols, rows } => TerminalJsEvent::Resize { cols, rows },
-            TerminalJsEventWire::MouseMode { mode, enabled } => {
-                TerminalJsEvent::MouseMode { mode, enabled }
+            TerminalJsEventWire::MouseMode { mode, enabled, suppressed } => {
+                TerminalJsEvent::MouseMode { mode, enabled, suppressed }
             }
             TerminalJsEventWire::FrameHashRequest => TerminalJsEvent::FrameHashRequest,
             TerminalJsEventWire::FrameHash {

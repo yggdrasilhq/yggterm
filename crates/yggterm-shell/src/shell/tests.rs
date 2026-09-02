@@ -10111,8 +10111,8 @@ console.log('ok');
             "the seed must be assigned before the mount script body"
         );
         assert!(
-            buffer_seeded.contains("lastKnownBufferKindSeed || kind"),
-            "the wheel gate must consume the seed"
+            buffer_seeded.contains("bufferTransitionCount === 0"),
+            "the seed must rule until a GENUINE transition — keying on first observation dies on the mount's first frame (trackTerminalVisualState('constructed')) and the gate never opened"
         );
         assert!(
             !plain.contains("lastKnownBufferKindSeed = \"alternate\";"),

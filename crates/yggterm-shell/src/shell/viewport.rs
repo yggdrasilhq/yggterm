@@ -9317,11 +9317,15 @@ fn TerminalCanvas(
                                     }
                                 }
                             }
-                            Ok(TerminalJsEvent::MouseMode { mode, enabled }) => {
+                            Ok(TerminalJsEvent::MouseMode { mode, enabled, suppressed }) => {
                                 // The mouse-mode probe (mouse_mode_probe.rs): the
-                                // client's parser applied a DECSET mouse-tracking
+                                // client's parser saw a DECSET mouse-tracking
                                 // transition. A content-free witness — mode +
                                 // enabled + session, nothing from the screen.
+                                // `suppressed` says whether the mount CONSUMED
+                                // the DECSET (registry suppresses_mouse_tracking)
+                                // instead of applying it — the field the mouse
+                                // contract is argued on.
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -9331,6 +9335,7 @@ fn TerminalCanvas(
                                         "session_path": session_path.clone(),
                                         "mode": mode,
                                         "enabled": enabled,
+                                        "suppressed": suppressed,
                                     }),
                                 );
                             }
