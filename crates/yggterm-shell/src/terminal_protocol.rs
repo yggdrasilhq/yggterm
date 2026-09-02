@@ -94,6 +94,11 @@ pub(crate) enum TerminalJsEvent {
         /// burst with no session change), empty when none. Logged as a
         /// `render_fail_pattern` trace event for later inspection.
         render_anomaly: String,
+        /// ⭐ [startpage-hijack-D sibling] The mount's last observed buffer
+        /// kind (`alternate` | `normal` | `unknown`) — recorded per session
+        /// and seeded back at the next mount, because fullscreen TUIs never
+        /// re-say their buffer DECSETs after a client remount.
+        buffer_kind: String,
     },
     Paint {
         child_count: usize,
@@ -399,6 +404,14 @@ enum TerminalJsEventWire {
         visible_nonblank_rows: u16,
         #[serde(default)]
         render_anomaly: String,
+        /// ⭐ [startpage-hijack-D sibling] The mount's last observed buffer
+        /// kind (`alternate` | `normal` | `unknown`). Persisted per session
+        /// and seeded back at the next mount: fullscreen TUIs never re-say
+        /// their buffer DECSETs after a client remount, and the alternate-
+        /// scroll wheel gate needs the belief. serde(default): an older
+        /// in-page script simply omits it.
+        #[serde(default)]
+        buffer_kind: String,
     },
     Paint {
         child_count: usize,
@@ -600,6 +613,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 render_health_recovery_pending,
                 visible_nonblank_rows,
                 render_anomaly,
+                buffer_kind,
             } => TerminalJsEvent::HostHealth {
                 cursor_line_text,
                 text_tail,
@@ -614,6 +628,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 render_health_recovery_pending,
                 visible_nonblank_rows,
                 render_anomaly,
+                buffer_kind,
             },
             TerminalJsEventWire::Paint {
                 child_count,

@@ -17309,6 +17309,16 @@ struct ShellState {
     terminal_attach_in_flight: HashSet<String>,
     terminal_bootstrap_owner_by_session: HashMap<String, String>,
     terminal_bootstrap_lease_by_session: HashMap<String, String>,
+    /// ⭐ [startpage-hijack-D sibling] The LAST OBSERVED terminal buffer kind
+    /// per session (`"alternate"` | `"normal"`), captured from the mount's
+    /// own HostHealth tick. A fullscreen TUI arms its buffer + mouse DECSETs
+    /// once and never re-says so; a client REMOUNT (switch out, switch in)
+    /// therefore rebuilds xterm on the normal buffer with no mode knowledge,
+    /// which closed the alternate-scroll wheel gate until the TUI happened to
+    /// repaint a mode change — the owner's "mouse breaks after switching".
+    /// The seed re-opens the gate from the first wheel event; the next real
+    /// DECSET observation corrects it.
+    terminal_last_buffer_kinds: HashMap<String, String>,
     terminal_resume_ready_paths: HashSet<String>,
     /// Rows whose terminal ensure has ALREADY FAILED, and the exact launch the
     /// failure was about.
@@ -19806,6 +19816,7 @@ impl ShellState {
             terminal_attach_in_flight: HashSet::new(),
             terminal_bootstrap_owner_by_session: HashMap::new(),
             terminal_bootstrap_lease_by_session: HashMap::new(),
+            terminal_last_buffer_kinds: HashMap::new(),
             terminal_resume_ready_paths: HashSet::new(),
             terminal_ensure_failed: HashMap::new(),
             input_gate_denied_since_ms: HashMap::new(),
@@ -28955,6 +28966,22 @@ impl ShellState {
                 // decide, exactly as before this fix.
             }
         }
+    }
+
+    /// [startpage-hijack-D] Record the last observed terminal buffer kind for
+    /// a session (from the mount's HostHealth tick).
+    fn record_terminal_buffer_kind(&mut self, session_path: &str, kind: &str) {
+        if kind.is_empty() || kind == "unknown" {
+            return;
+        }
+        self.terminal_last_buffer_kinds
+            .insert(session_path.to_string(), kind.to_string());
+    }
+
+    fn last_known_terminal_buffer_kind(&self, session_path: &str) -> Option<String> {
+        self.terminal_last_buffer_kinds
+            .get(session_path)
+            .cloned()
     }
 
     fn apply_snapshot_result_without_request(

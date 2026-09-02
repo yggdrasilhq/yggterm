@@ -45,6 +45,7 @@ fn terminal_eval_script(
         &terminal_xterm_renderer_policy_reason(),
         false,
         ("\x1b[A", "\x1b[B", 0),
+        None,
     )
 }
 
@@ -76,6 +77,32 @@ fn terminal_eval_script_with_pinned_grid(
     suppress_mouse_tracking: bool,
     alt_scroll: (&'static str, &'static str, u32),
 ) -> String {
+    terminal_eval_script_with_pinned_grid_seeded(
+        host_id,
+        theme,
+        initial_input_enabled,
+        pinned_grid,
+        initial_grid,
+        suppress_mouse_tracking,
+        alt_scroll,
+        None,
+    )
+}
+
+/// The seeded form: carries the session's last observed buffer kind so the
+/// alternate-scroll wheel gate re-opens after a switch-in ([startpage-hijack-D]
+/// sibling). The un-seeded wrapper stays for every caller that has nothing to
+/// say about buffers.
+fn terminal_eval_script_with_pinned_grid_seeded(
+    host_id: &str,
+    theme: &TerminalTheme,
+    initial_input_enabled: bool,
+    pinned_grid: Option<(u64, u64)>,
+    initial_grid: Option<(u64, u64)>,
+    suppress_mouse_tracking: bool,
+    alt_scroll: (&'static str, &'static str, u32),
+    initial_buffer_kind: Option<&str>,
+) -> String {
     let script = terminal_eval_script_with_canvas_renderer(
         host_id,
         theme,
@@ -84,6 +111,7 @@ fn terminal_eval_script_with_pinned_grid(
         &terminal_xterm_renderer_policy_reason(),
         suppress_mouse_tracking,
         alt_scroll,
+        initial_buffer_kind,
     );
     let mut prefix = String::new();
     if let Some((cols, rows)) = initial_grid {
@@ -146,6 +174,7 @@ fn terminal_eval_script_with_canvas_renderer(
     renderer_policy_reason: &str,
     suppress_mouse_tracking: bool,
     alt_scroll: (&'static str, &'static str, u32),
+    initial_buffer_kind: Option<&str>,
 ) -> String {
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
@@ -192,6 +221,10 @@ fn terminal_eval_script_with_canvas_renderer(
         serde_json::to_string(renderer_policy_reason).expect("serialize renderer policy reason");
     let suppress_mouse_tracking =
         serde_json::to_string(&suppress_mouse_tracking).expect("serialize mouse suppress flag");
+    let last_known_buffer_kind_seed = serde_json::to_string(
+        initial_buffer_kind.unwrap_or(""),
+    )
+    .expect("serialize last known buffer kind seed");
     let alt_scroll_up =
         serde_json::to_string(alt_scroll.0).expect("serialize alt-scroll up sequence");
     let alt_scroll_down =
@@ -4819,6 +4852,13 @@ fn terminal_eval_script_with_canvas_renderer(
         let bufferTransitionCount = 0;
         let cursorHiddenToggleCount = 0;
         let lastObservedBufferKind = null;
+        // ⭐ [startpage-hijack-D sibling] The buffer kind the PREVIOUS mount of
+        // this session observed. Until THIS mount observes a real buffer state
+        // (`lastObservedBufferKind !== null`), the alternate-scroll wheel gate
+        // reads the seed — a fullscreen TUI never re-says its buffer DECSETs
+        // for a client it cannot see, and without the seed the gate stayed
+        // closed after every switch-in.
+        let lastKnownBufferKindSeed = {last_known_buffer_kind_seed};
         let lastObservedCursorHidden = null;
         let lastVisualTransitionReason = '';
         const coreService = () => {{
@@ -8429,7 +8469,20 @@ fn terminal_eval_script_with_canvas_renderer(
         // the wheel must TRANSLATE to cursor keys instead of being dropped.
         const alternateScrollApplies = () => {{
             try {{
-                if (currentBufferKind() !== 'alternate') {{
+                // ⭐ [startpage-hijack-D sibling] THE SEED. A fresh mount's
+                // xterm starts on the normal buffer knowing nothing, while the
+                // TUI on the far end of the PTY is still fullscreen — it never
+                // re-says its buffer DECSETs for a client it cannot see. Until
+                // THIS mount observes a real buffer state, the kind recorded by
+                // the PREVIOUS mount of this session is the best available
+                // truth; without it the wheel gate stayed closed after every
+                // switch-in (the owner's dead-mouse report). The next real
+                // DECSET overwrites the belief.
+                let kind = currentBufferKind();
+                if (kind === 'unknown' || lastObservedBufferKind === null) {{
+                    kind = lastKnownBufferKindSeed || kind;
+                }}
+                if (kind !== 'alternate') {{
                     return false;
                 }}
                 const modes = term && term.modes ? term.modes : null;
@@ -11803,6 +11856,10 @@ fn terminal_eval_script_with_canvas_renderer(
                     renderHealth.reason,
                     visibleNonblankRows < 3,
                     renderAnomaly,
+                    // ⭐ A pure buffer-kind flip must re-send the health tick —
+                    // the GUI persists this kind per session and seeds the next
+                    // mount with it.
+                    currentBufferKind(),
                 ]);
                 if (nextKey === lastHostHealthKey) {{
                     return;
@@ -11824,6 +11881,13 @@ fn terminal_eval_script_with_canvas_renderer(
                     render_health_recovery_pending: renderHealth.recovery_pending,
                     visible_nonblank_rows: Math.max(0, Math.min(65535, Math.round(visibleNonblankRows))),
                     render_anomaly: renderAnomaly,
+                    // ⭐ [startpage-hijack-D sibling] The observed buffer kind,
+                    // reported every health tick so the GUI can persist it per
+                    // session and seed the NEXT mount with it — a fullscreen
+                    // TUI never re-says its buffer DECSETs after a client
+                    // remount, and the alternate-scroll wheel gate needs the
+                    // belief (the owner's "mouse breaks after switching").
+                    buffer_kind: currentBufferKind(),
                     // XTERM-BUG: webgl-stale-atlas-garble — did the glyph-atlas
                     // defence run? Both counters existed in the page and were
                     // reported by nothing, so the owner's garbled-viewport report

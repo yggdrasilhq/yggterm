@@ -23,15 +23,16 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
+import uuid
 from pathlib import Path
 
 DEFAULT_MEMORY_ROOT = Path(os.environ.get("YGGTERM_MEMORY_ROOT", Path.home() / ".yggterm" / "memory"))
-BACKUP_ROOT = Path.home() / ".yggterm" / "memory-backups"
 ARCHIVE_ROOT = Path.home() / ".yggterm" / "memory-archive"
-LOCK_FILE = DEFAULT_MEMORY_ROOT / ".ygg-memory.lock"
 
 # ⛔ THE FLEET ROSTER IS CONFIGURATION, NOT A CONSTANT. It used to be the
 # literal string of three host aliases, hardcoded here as the `--mesh` default
@@ -83,15 +84,1042 @@ STEERING_HEADER = """# Memory Index
 > One line, one door. Detail belongs in the target file, never here.
 """
 
+GLOBAL_NAMESPACE = "_global"
+MANAGED_BLOCK_BEGIN = "<!-- BEGIN yggterm-memory -->"
+MANAGED_BLOCK_END = "<!-- END yggterm-memory -->"
 
-def _flock_open(lock_path: Path):
+
+def memory_bridge(harness: str) -> str:
+    """Small always-loaded door; the hub remains the room and source of truth."""
+    canonical = normalize_harness_name(harness)
+    return (
+        f"{MANAGED_BLOCK_BEGIN}\n"
+        "## Yggterm fleet memory\n\n"
+        "Yggterm synchronizes semantic memory before managed CLI startup and by a catch-up timer. "
+        "Before deep recall, after a handover, or whenever another machine or CLI may have learned "
+        f"something, run `ygg-memory status --harness {canonical}` and `ygg-memory diff --harness {canonical}`, then open only the relevant door "
+        "with `ygg-memory get --file <name>`. Publish durable findings through `ygg-memory publish`; "
+        "never copy credentials, sessions, databases, indexes, or lock files between machines.\n\n"
+        f"This harness name is `{canonical}`. The current project namespace is derived from the cwd.\n"
+        f"{MANAGED_BLOCK_END}"
+    )
+
+
+def strip_managed_block(content: str) -> str:
+    pattern = re.compile(
+        rf"\n?{re.escape(MANAGED_BLOCK_BEGIN)}.*?{re.escape(MANAGED_BLOCK_END)}\n?",
+        re.DOTALL,
+    )
+    return pattern.sub("\n", content).strip()
+
+
+def write_managed_block(
+    path: Path,
+    harness: str,
+    user_content: str | None = None,
+    managed_block: str | None = None,
+) -> bool:
+    """Preserve user-owned text and replace only yggterm's delimited block."""
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    base = strip_managed_block(existing) if user_content is None else user_content.strip()
+    block = managed_block if managed_block is not None else memory_bridge(harness)
+    rendered = ((base + "\n\n") if base else "") + block + "\n"
+    if rendered == existing:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(rendered, encoding="utf-8")
+    temp.replace(path)
+    return True
+
+
+def native_document_content(
+    harness: str,
+    label: str,
+    payload: str,
+    *,
+    target_harness: str | None = None,
+    native_path: str | None = None,
+) -> str:
+    target = target_harness or harness
+    path_line = f"native_path: {urllib.parse.quote(native_path, safe='/._~-')}\n" if native_path else ""
+    return (
+        "---\n"
+        f"name: native-{harness}-{label}\n"
+        f"description: Native {harness} {label}, synchronized across the working fleet.\n"
+        "type: user\n"
+        f"target_harness: {target}\n"
+        + path_line
+        + "---\n\n"
+        "<!-- yggterm-native-payload -->\n"
+        + payload.rstrip()
+        + "\n"
+    )
+
+
+def native_document_payload(content: str) -> str:
+    marker = "<!-- yggterm-native-payload -->"
+    return content.split(marker, 1)[1].lstrip("\n") if marker in content else content
+
+
+def text_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def version_for_digest(root: Path, namespace: str, filename: str, digest: str | None) -> str | None:
+    if not digest:
+        return None
+    found = None
+    for record in read_journal_entries(root, namespace=namespace):
+        if record.get("file") == filename and record.get("digest") == digest:
+            found = record.get("version_id")
+    return found
+
+
+def _safe_native_relative(raw: str) -> Path | None:
+    decoded = urllib.parse.unquote(raw)
+    relative = Path(decoded)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    return relative
+
+
+def _native_document_path(content: str) -> Path | None:
+    match = re.search(r"^native_path:[ \t]*(.+)$", content, re.MULTILINE)
+    return _safe_native_relative(match.group(1).strip()) if match else None
+
+
+def _sync_native_document(
+    root: Path,
+    harness: str,
+    path: Path,
+    namespace: str,
+    filename: str,
+    label: str,
+    *,
+    target_harness: str,
+    managed_block: str | None,
+    native_path: str | None = None,
+) -> tuple[int, int, int]:
+    """Three-way synchronize one sanctioned native Markdown document.
+
+    ``managed_block=None`` means a pure semantic document: restore the exact
+    payload without injecting a bridge. Instruction/MEMORY files pass a block
+    that remains adapter-owned and is stripped before change detection.
+    """
+    hub = get_namespace_dir(root, namespace) / filename
+    local_exists = path.is_file()
+    raw_local = path.read_text(encoding="utf-8") if local_exists else ""
+    local_payload = strip_managed_block(raw_local) if managed_block is not None else raw_local.rstrip()
+    semantic_local_exists = local_exists if managed_block is None else bool(local_payload)
+    hub_exists = hub.is_file()
+    hub_payload = native_document_payload(hub.read_text(encoding="utf-8")).rstrip() if hub_exists else ""
+    local_digest = text_sha256(local_payload) if semantic_local_exists else None
+    hub_digest = text_sha256(hub_payload) if hub_exists else None
+
+    watermark = load_watermark(root, harness)
+    state_key = f"{namespace}/{filename}"
+    state = watermark.setdefault("native_documents", {}).setdefault(state_key, {})
+    base_digest = state.get("delivered_payload_digest", state.get("delivered_digest"))
+    base_version = state.get("delivered_version")
+    ingested = delivered = deleted = 0
+
+    def publish_local(causal_base: str | None) -> None:
+        nonlocal ingested, deleted
+        if semantic_local_exists:
+            hub.write_text(
+                native_document_content(
+                    harness,
+                    label,
+                    local_payload,
+                    target_harness=target_harness,
+                    native_path=native_path,
+                ),
+                encoding="utf-8",
+            )
+            action = "upsert"
+            ingested += 1
+        else:
+            if hub.exists():
+                hub.unlink()
+            action = "delete"
+            deleted += 1
+        append_journal_entry(
+            root,
+            namespace,
+            filename,
+            "user",
+            action,
+            harness,
+            f"Native {harness} {label}",
+            target_harness=target_harness,
+            base_version=causal_base,
+        )
+        materialize_store(root)
+
+    if base_digest is None:
+        if semantic_local_exists and not hub_exists:
+            publish_local(None)
+        elif semantic_local_exists and hub_exists and local_digest != hub_digest:
+            # Two pre-existing stores have no common delivery base. Keep both.
+            publish_local(None)
+    else:
+        local_changed = (local_digest != base_digest) if semantic_local_exists else True
+        hub_changed = (hub_digest != base_digest) if hub_exists else True
+        if local_changed and not hub_changed:
+            publish_local(base_version or version_for_digest(root, namespace, filename, file_sha256(hub) if hub_exists else None))
+        elif local_changed and hub_changed and local_digest != hub_digest:
+            # Both descend from the delivered base. The event graph retains two
+            # heads and materialize_store makes the conflict observable.
+            publish_local(base_version)
+
+    hub_exists = hub.is_file()
+    hub_content = hub.read_text(encoding="utf-8") if hub_exists else ""
+    hub_payload = native_document_payload(hub_content).rstrip() if hub_exists else ""
+    final_digest = text_sha256(hub_payload) if hub_exists else None
+    if managed_block is None:
+        rendered = hub_payload + ("\n" if hub_payload else "")
+        existing = path.read_text(encoding="utf-8") if path.is_file() else None
+        if hub_exists and existing != rendered:
+            if path.is_file():
+                backup_native_file(root, harness, namespace, path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(path.suffix + ".tmp")
+            temp.write_text(rendered, encoding="utf-8")
+            temp.replace(path)
+            delivered += 1
+        elif not hub_exists and path.exists():
+            backup_native_file(root, harness, namespace, path)
+            path.unlink()
+            delivered += 1
+    else:
+        before = path.read_text(encoding="utf-8") if path.is_file() else None
+        write_managed_block(path, harness, hub_payload if hub_exists else "", managed_block)
+        if before != path.read_text(encoding="utf-8"):
+            delivered += 1
+
+    if final_digest is None:
+        state.clear()
+    else:
+        state["delivered_payload_digest"] = final_digest
+        state["delivered_hub_digest"] = file_sha256(hub)
+        state["delivered_version"] = version_for_digest(root, namespace, filename, state["delivered_hub_digest"])
+    save_watermark(root, watermark)
+    return ingested, delivered, deleted
+
+
+def sync_instruction_document(root: Path, harness: str, path: Path) -> tuple[int, int, int]:
+    """Synchronize one CLI-owned global instruction file without owning user text."""
+    return _sync_native_document(
+        root,
+        harness,
+        path,
+        GLOBAL_NAMESPACE,
+        f"native-{harness}-global-instructions.md",
+        "global instructions",
+        target_harness=harness,
+        managed_block=memory_bridge(harness),
+    )
+
+
+def backup_native_file(root: Path, harness: str, namespace: str, path: Path) -> None:
+    """Content-addressed safety copy only when an adapter will mutate a file."""
+    if not path.is_file():
+        return
+    digest = file_sha256(path)
+    target = root.parent / "memory-backups" / harness / namespace / path.name / f"{digest}.md"
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+
+
+def _sync_native_tree(
+    root: Path,
+    harness: str,
+    namespace: str,
+    directory: Path,
+    prefix: str,
+    *,
+    target_harness: str,
+    exclude=None,
+) -> tuple[int, int, int]:
+    """Mirror semantic Markdown files while leaving indexes/state outside it."""
+    exclude = exclude or (lambda _relative: False)
+    local = {}
+    if directory.is_dir():
+        for candidate in directory.rglob("*.md"):
+            relative = candidate.relative_to(directory)
+            if not exclude(relative):
+                local[relative.as_posix()] = candidate
+
+    hub = {}
+    hub_dir = get_namespace_dir(root, namespace)
+    pattern = f"native-{harness}-{prefix}-*.md"
+    for candidate in hub_dir.glob(pattern):
+        relative = _native_document_path(candidate.read_text(encoding="utf-8", errors="replace"))
+        if relative is not None and not exclude(relative):
+            hub[relative.as_posix()] = candidate.name
+
+    ingested = delivered = deleted = 0
+    for relative in sorted(set(local) | set(hub)):
+        safe_relative = _safe_native_relative(relative)
+        if safe_relative is None:
+            continue
+        filename = hub.get(relative)
+        if filename is None:
+            slug = re.sub(r"[^a-z0-9]+", "-", safe_relative.stem.lower()).strip("-")[:40] or "memory"
+            key = hashlib.sha256(relative.encode()).hexdigest()[:12]
+            filename = f"native-{harness}-{prefix}-{key}-{slug}.md"
+        inc, outc, delc = _sync_native_document(
+            root,
+            harness,
+            directory / safe_relative,
+            namespace,
+            filename,
+            f"{prefix} {relative}",
+            target_harness=target_harness,
+            managed_block=None,
+            native_path=relative,
+        )
+        ingested += inc
+        delivered += outc
+        deleted += delc
+    return ingested, delivered, deleted
+
+
+def ingest_read_only_native_document(
+    root: Path,
+    harness: str,
+    path: Path,
+    filename: str,
+    label: str,
+    *,
+    target_harness: str = "all",
+) -> tuple[int, int, int]:
+    """Export generated semantic output without ever writing it back directly."""
+    watermark = load_watermark(root, harness)
+    state = watermark.setdefault("read_only_native", {}).setdefault(filename, {})
+    hub = get_namespace_dir(root, GLOBAL_NAMESPACE) / filename
+    if path.is_file():
+        payload = path.read_text(encoding="utf-8", errors="replace")
+        digest = text_sha256(payload)
+        if state.get("digest") != digest:
+            hub.write_text(
+                native_document_content(harness, label, payload, target_harness=target_harness),
+                encoding="utf-8",
+            )
+            append_journal_entry(
+                root,
+                GLOBAL_NAMESPACE,
+                filename,
+                "user",
+                "upsert",
+                harness,
+                f"Native {harness} {label}",
+                target_harness=target_harness,
+            )
+            state["digest"] = digest
+            save_watermark(root, watermark)
+            return 1, 0, 0
+    elif state:
+        if hub.exists():
+            hub.unlink()
+        append_journal_entry(
+            root,
+            GLOBAL_NAMESPACE,
+            filename,
+            "user",
+            "delete",
+            harness,
+            f"deleted native {harness} {label}",
+            target_harness=target_harness,
+        )
+        state.clear()
+        save_watermark(root, watermark)
+        return 0, 0, 1
+    return 0, 0, 0
+
+
+class HarnessMemoryAdapter:
+    """The one harness-specific owner of native-memory I/O."""
+
+    name = "unknown"
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        """Return namespaces, ingested, delivered, deleted."""
+        raise NotImplementedError
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        raise NotImplementedError
+
+
+class ProjectMemoryAdapter(HarnessMemoryAdapter):
+    """Adapter for CLIs whose native memory is one directory per project."""
+
+    def __init__(self, harness: str, project_root: Path):
+        self.name = harness
+        self.project_root = project_root
+
+    def local_dir(self, namespace: str) -> Path:
+        return self.project_root / namespace / "memory"
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        return _sync_project_memory_namespace(root, harness, namespace, self.local_dir(namespace))
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        namespaces = set()
+        for directory in (root / "namespaces").glob("*"):
+            if directory.is_dir():
+                namespaces.add(directory.name)
+        if self.project_root.exists():
+            for directory in self.project_root.glob("*/memory"):
+                namespaces.add(directory.parent.name)
+        ingested = delivered = deleted = 0
+        for namespace in sorted(namespaces):
+            inc, outc, delc = self.sync_namespace(root, harness, namespace)
+            ingested += inc
+            delivered += outc
+            deleted += delc
+        return len(namespaces), ingested, delivered, deleted
+
+
+class InstructionBridgeAdapter(HarnessMemoryAdapter):
+    """Backend for CLIs whose durable cross-session surface is instructions."""
+
+    def __init__(self, harness: str, instruction_path: Path):
+        self.name = harness
+        self.instruction_path = instruction_path
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        return sync_instruction_document(root, self.name, self.instruction_path)
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        ingested, delivered, deleted = self.sync_namespace(root, harness, GLOBAL_NAMESPACE)
+        return 1, ingested, delivered, deleted
+
+
+class AntigravityMemoryAdapter(InstructionBridgeAdapter):
+    """Antigravity always loads AGENTS.md plus each Markdown rule file."""
+
+    def __init__(self, home: Path):
+        super().__init__("antigravity", home / ".agents" / "AGENTS.md")
+        self.rules_dir = home / ".agents" / "rules"
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        inc, outc, delc = sync_instruction_document(root, self.name, self.instruction_path)
+        i2, o2, d2 = _sync_native_tree(
+            root,
+            self.name,
+            GLOBAL_NAMESPACE,
+            self.rules_dir,
+            "rule",
+            target_harness=self.name,
+        )
+        return inc + i2, outc + o2, delc + d2
+
+
+class ClaudeMemoryAdapter(ProjectMemoryAdapter):
+    def __init__(self, home: Path):
+        super().__init__("claude", home / ".claude" / "projects")
+        self.home = home
+        self.instruction_path = home / ".claude" / "CLAUDE.md"
+
+    def local_dir(self, namespace: str) -> Path:
+        if namespace == GLOBAL_NAMESPACE:
+            return self.home / ".claude" / "memory"
+        return super().local_dir(namespace)
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        inc, outc, delc = _sync_project_memory_namespace(root, harness, namespace, self.local_dir(namespace))
+        i2, o2, d2 = sync_instruction_document(root, self.name, self.instruction_path)
+        return inc + i2, outc + o2, delc + d2
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        namespaces = {
+            directory.name for directory in (root / "namespaces").glob("*") if directory.is_dir()
+        }
+        if self.project_root.exists():
+            namespaces.update(directory.parent.name for directory in self.project_root.glob("*/memory"))
+        namespaces.add(GLOBAL_NAMESPACE)
+        ingested = delivered = deleted = 0
+        for namespace in sorted(namespaces):
+            inc, outc, delc = _sync_project_memory_namespace(
+                root, harness, namespace, self.local_dir(namespace)
+            )
+            ingested += inc
+            delivered += outc
+            deleted += delc
+        inc, outc, delc = sync_instruction_document(root, self.name, self.instruction_path)
+        return len(namespaces), ingested + inc, delivered + outc, deleted + delc
+
+
+class MuseMemoryAdapter(ProjectMemoryAdapter):
+    """Muse native memory lives under the XDG data dir.
+
+    Personal and personal-project scopes are Claude-compatible Markdown in
+    ``~/.local/share/muse/memory/projects/<slug>/``, where ``<slug>`` is the
+    workspace path slug plus a 16-hex disambiguator (``home-user-proj``
+    plus hash for ``/home/user/proj``). The suffix cannot be derived from
+    the namespace, so it is resolved by directory scan; namespaces with zero
+    or ambiguous matches are skipped — never synced against a guessed path,
+    and never against another harness's store. ``--local-dir`` remains an
+    explicit operator override that bypasses resolution.
+    """
+
+    SLUG_SUFFIX_RE = re.compile(r"-[0-9a-f]{16}$")
+
+    def __init__(self, home: Path):
+        super().__init__("muse", home / ".local" / "share" / "muse" / "memory" / "projects")
+        self.home = home
+
+    def resolve_slug_dir(self, namespace: str) -> Path | None:
+        core = namespace[1:] if namespace.startswith("-") else namespace
+        if not core or not self.project_root.is_dir():
+            return None
+        matches = [
+            d for d in self.project_root.iterdir()
+            if d.is_dir()
+            and (m := self.SLUG_SUFFIX_RE.search(d.name)) is not None
+            and d.name[: m.start()] == core
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def local_dir(self, namespace: str) -> Path | None:
+        if namespace == GLOBAL_NAMESPACE:
+            return None
+        return self.resolve_slug_dir(namespace)
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        native = self.local_dir(namespace)
+        if native is None:
+            return 0, 0, 0
+        return _sync_project_memory_namespace(root, harness, namespace, native)
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        namespaces = {d.name for d in (root / "namespaces").glob("*") if d.is_dir()}
+        if self.project_root.is_dir():
+            for d in self.project_root.iterdir():
+                if d.is_dir() and (m := self.SLUG_SUFFIX_RE.search(d.name)) is not None:
+                    namespaces.add("-" + d.name[: m.start()])
+        ingested = delivered = deleted = synced = 0
+        for namespace in sorted(namespaces):
+            if self.local_dir(namespace) is None:
+                continue
+            inc, outc, delc = self.sync_namespace(root, harness, namespace)
+            synced += 1
+            ingested += inc
+            delivered += outc
+            deleted += delc
+        return synced, ingested, delivered, deleted
+
+
+class KimiMemoryAdapter(HarnessMemoryAdapter):
+    """Kimi has no self-memory DB; user skills are its safe global bridge."""
+
+    name = "kimi"
+
+    def __init__(self, home: Path):
+        self.skill_path = home / ".kimi" / "skills" / "yggterm-memory" / "SKILL.md"
+
+    def _ensure_skill(self) -> int:
+        content = (
+            "---\n"
+            "name: yggterm-memory\n"
+            "description: Mandatory fleet-memory door for startup, recall, handovers, and durable learning; use ygg-memory before claiming context is unavailable.\n"
+            "---\n\n"
+            "# Yggterm fleet memory\n\n"
+            + memory_bridge("kimi")
+        )
+        if self.skill_path.is_file() and self.skill_path.read_text(encoding="utf-8") == content:
+            return 0
+        self.skill_path.parent.mkdir(parents=True, exist_ok=True)
+        self.skill_path.write_text(content, encoding="utf-8")
+        return 1
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        return 0, self._ensure_skill(), 0
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        return 1, 0, self._ensure_skill(), 0
+
+
+class QwenMemoryAdapter(HarnessMemoryAdapter):
+    """Qwen Code 0.21.14 managed auto-memory: native topic docs + rebuilt index."""
+
+    name = "qwen"
+
+    def __init__(self, home: Path, cwd: Path):
+        self.home = home
+        self.cwd = cwd.resolve()
+        self.instruction_path = home / ".qwen" / "QWEN.md"
+
+    @staticmethod
+    def _git_root(cwd: Path) -> Path:
+        current = cwd.resolve()
+        while current.parent != current:
+            if (current / ".git").exists():
+                return current
+            current = current.parent
+        return cwd.resolve()
+
+    @staticmethod
+    def _sanitize_cwd(path: Path) -> str:
+        return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+    def project_memory_dir(self, cwd: Path | None = None) -> Path:
+        project = self._git_root((cwd or self.cwd).resolve())
+        return self.home / ".qwen" / "projects" / self._sanitize_cwd(project) / "memory"
+
+    def user_memory_dir(self) -> Path:
+        return self.home / ".qwen" / "memories"
+
+    @staticmethod
+    def _qwen_type(kind: str) -> str:
+        if kind in {"user", "feedback", "project", "reference"}:
+            return kind
+        if kind in {"campaign", "spec"}:
+            return "project"
+        return "reference"
+
+    def _project(self, root: Path, harness: str, namespace: str, memory_dir: Path) -> tuple[int, int, int]:
+        ns_dir = get_namespace_dir(root, namespace)
+        target = memory_dir / "pinned" / "yggterm"
+        target.mkdir(parents=True, exist_ok=True)
+        expected = set()
+        delivered = deleted = 0
+        for door in sorted(ns_dir.glob("*.md")):
+            if door.name == "MEMORY.md":
+                continue
+            original = door.read_text(encoding="utf-8")
+            kind, summary, target_h = extract_metadata_and_summary(original, door.name)
+            if not matches_target_harness(target_h, harness):
+                continue
+            expected.add(door.name)
+            projected = (
+                "---\n"
+                f"type: {self._qwen_type(kind)}\n"
+                f"name: {Path(door.name).stem}\n"
+                f"description: {summary.replace(chr(10), ' ')[:120]}\n"
+                "---\n\n"
+                + original
+            )
+            dest = target / door.name
+            if not dest.is_file() or dest.read_text(encoding="utf-8") != projected:
+                dest.write_text(projected, encoding="utf-8")
+                delivered += 1
+        for old in target.glob("*.md"):
+            if old.name not in expected:
+                old.unlink()
+                deleted += 1
+        self._rebuild_index(memory_dir)
+        return 0, delivered, deleted
+
+    @staticmethod
+    def _frontmatter_value(content: str, key: str) -> str:
+        match = re.search(rf"^{re.escape(key)}:[ \t]*(.+)$", content, re.MULTILINE)
+        return match.group(1).strip().strip('"\'') if match else ""
+
+    def _rebuild_index(self, memory_dir: Path) -> None:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for doc in sorted(memory_dir.rglob("*.md")):
+            if doc.name == "MEMORY.md":
+                continue
+            content = doc.read_text(encoding="utf-8", errors="replace")
+            if not content.startswith("---\n"):
+                continue
+            kind = self._frontmatter_value(content, "type")
+            if kind not in {"user", "feedback", "project", "reference"}:
+                continue
+            title = self._frontmatter_value(content, "name") or kind
+            description = self._frontmatter_value(content, "description") or kind
+            rel = doc.relative_to(memory_dir).as_posix()
+            rel = urllib.parse.quote(rel, safe="/._~-")
+            line = f"- [{title}]({rel}) — {description}".replace("\n", " ")
+            lines.append(line[:149] + "…" if len(line) > 150 else line)
+        rendered = "\n".join(lines[:200])
+        index = memory_dir / "MEMORY.md"
+        if not index.is_file() or index.read_text(encoding="utf-8") != rendered:
+            index.write_text(rendered, encoding="utf-8")
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        memory_dir = self.project_memory_dir()
+        inc, outc, delc = _sync_native_tree(
+            root,
+            harness,
+            namespace,
+            memory_dir,
+            "project",
+            target_harness="all",
+            exclude=lambda relative: relative.name == "MEMORY.md" or relative.parts[:2] == ("pinned", "yggterm"),
+        )
+        i1, o1, d1 = self._project(root, harness, namespace, memory_dir)
+        inc, outc, delc = inc + i1, outc + o1, delc + d1
+        i0, o0, d0 = _sync_native_tree(
+            root,
+            harness,
+            GLOBAL_NAMESPACE,
+            self.user_memory_dir(),
+            "user",
+            target_harness="all",
+            exclude=lambda relative: relative.name == "MEMORY.md" or relative.parts[:2] == ("pinned", "yggterm"),
+        )
+        i3, o3, d3 = self._project(root, harness, GLOBAL_NAMESPACE, self.user_memory_dir())
+        i2, o2, d2 = sync_instruction_document(root, self.name, self.instruction_path)
+        return inc + i0 + i2 + i3, outc + o0 + o2 + o3, delc + d0 + d2 + d3
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        pairs = {detect_namespace(self.cwd): self.project_memory_dir()}
+        hub_namespaces = [path.name for path in (root / "namespaces").glob("*") if path.is_dir()]
+        for memory_dir in (self.home / ".qwen" / "projects").glob("*/memory"):
+            for namespace in hub_namespaces:
+                if self._sanitize_cwd(Path(namespace)) == memory_dir.parent.name:
+                    pairs[namespace] = memory_dir
+                    break
+        ingested = delivered = deleted = 0
+        for namespace, memory_dir in sorted(pairs.items()):
+            inc, outc, delc = _sync_native_tree(
+                root,
+                harness,
+                namespace,
+                memory_dir,
+                "project",
+                target_harness="all",
+                exclude=lambda relative: relative.name == "MEMORY.md" or relative.parts[:2] == ("pinned", "yggterm"),
+            )
+            i1, o1, d1 = self._project(root, harness, namespace, memory_dir)
+            inc, outc, delc = inc + i1, outc + o1, delc + d1
+            ingested += inc
+            delivered += outc
+            deleted += delc
+        i0, o0, d0 = _sync_native_tree(
+            root,
+            harness,
+            GLOBAL_NAMESPACE,
+            self.user_memory_dir(),
+            "user",
+            target_harness="all",
+            exclude=lambda relative: relative.name == "MEMORY.md" or relative.parts[:2] == ("pinned", "yggterm"),
+        )
+        i3, o3, d3 = self._project(root, harness, GLOBAL_NAMESPACE, self.user_memory_dir())
+        i2, o2, d2 = sync_instruction_document(root, self.name, self.instruction_path)
+        return len(pairs) + 1, ingested + i0 + i2 + i3, delivered + o0 + o2 + o3, deleted + d0 + d2 + d3
+
+
+class GrokMemoryAdapter(HarnessMemoryAdapter):
+    """Grok 1.0.5 native MEMORY.md; SQLite/session state remains CLI-owned."""
+
+    name = "grok"
+
+    def __init__(self, home: Path, cwd: Path):
+        self.home = home
+        self.cwd = cwd.resolve()
+        self.memory_root = home / ".grok" / "memory"
+        self.config_path = home / ".grok" / "config.toml"
+
+    def _enable(self) -> None:
+        content = self.config_path.read_text(encoding="utf-8") if self.config_path.is_file() else ""
+        section = re.search(r"(?ms)^\[memory\]\n(.*?)(?=^\[|\Z)", content)
+        if section:
+            body = section.group(1)
+            if re.search(r"(?m)^enabled\s*=", body):
+                body = re.sub(r"(?m)^enabled\s*=.*$", "enabled = true", body)
+            else:
+                body = "enabled = true\n" + body
+            updated = content[: section.start(1)] + body + content[section.end(1) :]
+        else:
+            updated = content.rstrip() + ("\n\n" if content.strip() else "") + "[memory]\nenabled = true\n"
+        if updated != content:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            self.config_path.write_text(updated, encoding="utf-8")
+
+    def project_memory_file(self, cwd: Path | None = None) -> Path | None:
+        expected = str((cwd or self.cwd).resolve())
+        if not self.memory_root.is_dir():
+            return None
+        for candidate in self.memory_root.glob("*/MEMORY.md"):
+            try:
+                first = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+            except (OSError, IndexError):
+                continue
+            if first == f"# Project Memory — {expected}":
+                return candidate
+        return None
+
+    def _sync_memory_file(self, root: Path, harness: str, namespace: str, path: Path, label: str) -> tuple[int, int, int]:
+        ns_dir = get_namespace_dir(root, namespace)
+        lines = []
+        for door in sorted(ns_dir.glob("*.md")):
+            if door.name in {"MEMORY.md", f"grok-native-{label}.md"}:
+                continue
+            content = door.read_text(encoding="utf-8")
+            _, summary, target_h = extract_metadata_and_summary(content, door.name)
+            if matches_target_harness(target_h, harness):
+                lines.append(f"- {summary} — {door}")
+        bridge = memory_bridge("grok").replace(
+            MANAGED_BLOCK_END,
+            ("\n\n### Current fleet doors\n\n" + "\n".join(lines[:200]) if lines else "") + f"\n{MANAGED_BLOCK_END}",
+        )
+        return _sync_native_document(
+            root,
+            harness,
+            path,
+            namespace,
+            f"grok-native-{label}.md",
+            label,
+            target_harness="all",
+            managed_block=bridge,
+        )
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        self._enable()
+        global_file = self.memory_root / "MEMORY.md"
+        inc, outc, delc = self._sync_memory_file(root, harness, GLOBAL_NAMESPACE, global_file, "global-memory")
+        project = self.project_memory_file()
+        if project is not None:
+            i2, o2, d2 = self._sync_memory_file(root, harness, namespace, project, "project-memory")
+            inc, outc, delc = inc + i2, outc + o2, delc + d2
+        return inc, outc, delc
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        self._enable()
+        ingested = delivered = deleted = 0
+        i1, o1, d1 = self._sync_memory_file(
+            root, harness, GLOBAL_NAMESPACE, self.memory_root / "MEMORY.md", "global-memory"
+        )
+        ingested += i1
+        delivered += o1
+        deleted += d1
+        count = 1
+        if self.memory_root.is_dir():
+            for candidate in sorted(self.memory_root.glob("*/MEMORY.md")):
+                try:
+                    first = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+                except (OSError, IndexError):
+                    continue
+                prefix = "# Project Memory — "
+                if not first.startswith(prefix):
+                    continue
+                project = Path(first[len(prefix) :]).expanduser()
+                namespace = detect_namespace(project)
+                inc, outc, delc = self._sync_memory_file(
+                    root, harness, namespace, candidate, "project-memory"
+                )
+                ingested += inc
+                delivered += outc
+                deleted += delc
+                count += 1
+        return count, ingested, delivered, deleted
+
+
+class GeminiMemoryAdapter(ProjectMemoryAdapter):
+    """Google Gemini CLI private memory; distinct from Antigravity's brain."""
+
+    def __init__(self, home: Path, cwd: Path):
+        self.home = home
+        self.cwd = cwd.resolve()
+        self.instruction_path = home / ".gemini" / "GEMINI.md"
+        super().__init__("gemini", home / ".gemini" / "tmp")
+
+    def local_dir(self, namespace: str) -> Path:
+        registry = self.home / ".gemini" / "projects.json"
+        if registry.is_file():
+            try:
+                mapping = json.loads(registry.read_text(encoding="utf-8")).get("projects", {})
+                slug = mapping.get(str(self.cwd))
+                if slug:
+                    return self.project_root / slug / "memory"
+            except (OSError, ValueError, AttributeError):
+                pass
+        for marker in self.project_root.glob("*/.project_root"):
+            try:
+                if Path(marker.read_text(encoding="utf-8").strip()).resolve() == self.cwd:
+                    return marker.parent / "memory"
+            except OSError:
+                continue
+        # Gemini 0.49 migrates this legacy SHA-256 directory into its claimed
+        # slug during Storage.initialize(); preflight can safely seed it first.
+        return self.project_root / hashlib.sha256(str(self.cwd).encode()).hexdigest() / "memory"
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        inc, outc, delc = _sync_project_memory_namespace(root, harness, namespace, self.local_dir(namespace))
+        i2, o2, d2 = sync_instruction_document(root, self.name, self.instruction_path)
+        return inc + i2, outc + o2, delc + d2
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        pairs = {detect_namespace(self.cwd): self.local_dir(detect_namespace(self.cwd))}
+        registry = self.home / ".gemini" / "projects.json"
+        if registry.is_file():
+            try:
+                mapping = json.loads(registry.read_text(encoding="utf-8")).get("projects", {})
+                for project, slug in mapping.items():
+                    pairs[detect_namespace(Path(project))] = self.project_root / slug / "memory"
+            except (OSError, ValueError, AttributeError):
+                pass
+        for marker in self.project_root.glob("*/.project_root"):
+            try:
+                project = Path(marker.read_text(encoding="utf-8").strip())
+            except OSError:
+                continue
+            pairs[detect_namespace(project)] = marker.parent / "memory"
+        ingested = delivered = deleted = 0
+        for namespace, memory_dir in sorted(pairs.items()):
+            inc, outc, delc = _sync_project_memory_namespace(root, harness, namespace, memory_dir)
+            ingested += inc
+            delivered += outc
+            deleted += delc
+        i2, o2, d2 = sync_instruction_document(root, self.name, self.instruction_path)
+        return len(pairs), ingested + i2, delivered + o2, deleted + d2
+
+
+class CodexMemoryAdapter(HarnessMemoryAdapter):
+    """Deliver unified doors through Codex's supported ad-hoc update inbox.
+
+    Codex's ``memories/`` directory is generated runtime state, not a project
+    memory store.  Writing or rsyncing it bypasses the Codex memory ingestor and
+    can overwrite another host's generated state.  The inbox is append-only, so
+    changed and deleted fleet doors are represented as explicit update notes.
+    """
+
+    name = "codex"
+
+    def __init__(self, home: Path | None = None):
+        codex_home = Path(os.environ.get("CODEX_HOME", (home or Path.home()) / ".codex"))
+        self.memory_root = codex_home / "memories"
+        self.notes_dir = codex_home / "memories" / "extensions" / "ad_hoc" / "notes"
+        self.instruction_path = codex_home / "AGENTS.md"
+
+    def _export_generated_summary(self, root: Path) -> tuple[int, int, int]:
+        # The summary is Codex's compact durable semantic output. MEMORY.md is
+        # a machine-local registry of rollout paths and is intentionally not
+        # exported without its session artifacts.
+        origin = memory_origin(root).replace("-", "")[:12]
+        return ingest_read_only_native_document(
+            root,
+            self.name,
+            self.memory_root / "memory_summary.md",
+            f"native-codex-{origin}-memory-summary.md",
+            "generated memory summary",
+            target_harness="all",
+        )
+
+    @staticmethod
+    def _slug(value: str, limit: int = 72) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:limit] or "door"
+
+    def _write_note(self, namespace: str, filename: str, digest: str, action: str, content: str = "") -> None:
+        self.notes_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stem = self._slug(f"fleet-{namespace}-{Path(filename).stem}")
+        note = self.notes_dir / f"{stamp}-{stem}-{digest[:12]}.md"
+        suffix = 1
+        while note.exists():
+            note = self.notes_dir / f"{stamp}-{stem}-{digest[:12]}-{suffix}.md"
+            suffix += 1
+        operation = "Delete" if action == "delete" else "Add or update"
+        body = (
+            f"# {operation} fleet memory door\n\n"
+            f"- Source: yggterm unified fleet memory\n"
+            f"- Namespace: `{namespace}`\n"
+            f"- Door: `{filename}`\n"
+            f"- SHA-256: `{digest}`\n\n"
+        )
+        if action == "delete":
+            body += "Remove the previously imported door with this source identity.\n"
+        else:
+            body += "## Door content\n\n" + content
+        note.write_text(body, encoding="utf-8")
+
+    def _deliver_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        ns_dir = get_namespace_dir(root, namespace)
+        watermark = load_watermark(root, harness)
+        state = watermark.setdefault("native_delivery", {}).setdefault("codex", {}).setdefault(namespace, {})
+        delivered = deleted = 0
+        present = {}
+        for door in ns_dir.glob("*.md"):
+            if door.name == "MEMORY.md":
+                continue
+            content = door.read_text(encoding="utf-8")
+            _, _, target = extract_metadata_and_summary(content, door.name)
+            if not matches_target_harness(target, harness):
+                continue
+            digest = file_sha256(door)
+            present[door.name] = digest
+            if state.get(door.name) != digest:
+                self._write_note(namespace, door.name, digest, "upsert", content)
+                state[door.name] = digest
+                delivered += 1
+        for filename, digest in list(state.items()):
+            if filename not in present:
+                self._write_note(namespace, filename, digest, "delete")
+                del state[filename]
+                deleted += 1
+        watermark["last_seq"] = get_latest_seq(root)
+        watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        save_watermark(root, watermark)
+        return 0, delivered, deleted
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple[int, int, int]:
+        native_in, native_out, native_del = self._export_generated_summary(root)
+        inc, outc, delc = self._deliver_namespace(root, harness, namespace)
+        bridge_in, bridge_out, bridge_del = sync_instruction_document(root, self.name, self.instruction_path)
+        return (
+            native_in + inc + bridge_in,
+            native_out + outc + bridge_out,
+            native_del + delc + bridge_del,
+        )
+
+    def sync_all(self, root: Path, harness: str) -> tuple[int, int, int, int]:
+        native_in, native_out, native_del = self._export_generated_summary(root)
+        namespaces = sorted(directory.name for directory in (root / "namespaces").glob("*") if directory.is_dir())
+        ingested, delivered, deleted = native_in, native_out, native_del
+        for namespace in namespaces:
+            inc, outc, delc = self._deliver_namespace(root, harness, namespace)
+            ingested += inc
+            delivered += outc
+            deleted += delc
+        inc, outc, delc = sync_instruction_document(root, self.name, self.instruction_path)
+        return len(namespaces), ingested + inc, delivered + outc, deleted + delc
+
+
+def get_harness_adapter(harness: str, home: Path | None = None, cwd: Path | None = None) -> HarnessMemoryAdapter:
+    """Return an explicit native backend; never infer one from a path pattern."""
+    normalized = normalize_harness_name(harness)
+    home = (home or Path.home()).resolve()
+    cwd = (cwd or Path.cwd()).resolve()
+    if normalized == "codex":
+        return CodexMemoryAdapter(home)
+    if normalized == "claude":
+        return ClaudeMemoryAdapter(home)
+    if normalized == "muse":
+        return MuseMemoryAdapter(home)
+    if normalized == "antigravity":
+        return AntigravityMemoryAdapter(home)
+    if normalized == "opencode":
+        return InstructionBridgeAdapter("opencode", home / ".config" / "opencode" / "AGENTS.md")
+    if normalized == "pi":
+        return InstructionBridgeAdapter("pi", home / ".pi" / "agent" / "AGENTS.md")
+    if normalized == "kimi":
+        return KimiMemoryAdapter(home)
+    if normalized == "qwen":
+        return QwenMemoryAdapter(home, cwd)
+    if normalized == "grok":
+        return GrokMemoryAdapter(home, cwd)
+    if normalized == "gemini":
+        return GeminiMemoryAdapter(home, cwd)
+    raise ValueError(f"Unsupported harness memory backend: {normalized}")
+
+
+def _flock_open(lock_path: Path, timeout_seconds: float = 10):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     f = open(lock_path, "a+")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        # Wait up to 10 seconds for concurrent write
-        for _ in range(20):
+        # Native startup waits briefly; fleet import/migration can explicitly
+        # wait longer for a native all-pass without holding any network lock.
+        attempts = max(1, int(timeout_seconds / 0.5))
+        for _ in range(attempts):
             time.sleep(0.5)
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -116,10 +1144,26 @@ def normalize_harness_name(name: str) -> str:
     if not name:
         return "unknown"
     n = name.strip().lower()
-    if n in ("agy", "antigravity", "gemini"):
+    if n in ("agy", "antigravity", "antigravity-cli"):
+        return "antigravity"
+    if n in ("gemini", "gemini-cli", "gemini_cli"):
         return "gemini"
     if n in ("cc", "claude_code", "claude"):
         return "claude"
+    if n in ("codex-litellm", "codex_litellm"):
+        return "codex"
+    if n in ("grok-build", "grok_build", "grok"):
+        return "grok"
+    if n in ("muse-code", "muse_code", "muse"):
+        return "muse"
+    if n in ("qwen-code", "qwen_code", "qwen"):
+        return "qwen"
+    if n in ("open-code", "open_code", "opencode"):
+        return "opencode"
+    if n in ("kimi-code", "kimi_code", "kimi"):
+        return "kimi"
+    if n in ("pi-coding-agent", "pi_coding_agent", "pi"):
+        return "pi"
     return n
 
 
@@ -128,7 +1172,9 @@ def detect_harness(override: str = None) -> str:
         return normalize_harness_name(override)
     if os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("CLAUDE_SESSION_ID"):
         return "claude"
-    if os.environ.get("GEMINI_CLI") or os.environ.get("ANTIGRAVITY_SESSION"):
+    if os.environ.get("ANTIGRAVITY_SESSION"):
+        return "antigravity"
+    if os.environ.get("GEMINI_CLI"):
         return "gemini"
     if os.environ.get("CODEX_SESSION") or os.environ.get("CODEX_HOME"):
         return "codex"
@@ -199,6 +1245,56 @@ def get_journal_path(root: Path) -> Path:
     return root / "journal.jsonl"
 
 
+def memory_origin(root: Path) -> str:
+    """Stable per-store identity; hostnames are neither unique nor immutable."""
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / ".origin-id"
+    if path.is_file():
+        value = path.read_text(encoding="utf-8", errors="replace").strip()
+        if value:
+            return value
+    value = str(uuid.uuid4())
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(value + "\n")
+    except FileExistsError:
+        value = path.read_text(encoding="utf-8").strip()
+    return value
+
+
+def object_path(root: Path, digest: str) -> Path:
+    return root / "objects" / digest[:2] / digest
+
+
+def store_content_object(root: Path, source: Path) -> str:
+    digest = file_sha256(source)
+    target = object_path(root, digest)
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_suffix(".tmp")
+        shutil.copyfile(source, temp)
+        temp.replace(target)
+    return digest
+
+
+def record_event_id(record: dict) -> str:
+    existing = record.get("event_id")
+    if existing:
+        return str(existing)
+    # Stable migration identity for legacy records. Different hosts with truly
+    # identical legacy events collapse; different content/timestamps survive.
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    return "legacy-" + hashlib.sha256(payload).hexdigest()
+
+
+def latest_version_for(root: Path, ns: str, filename: str) -> str | None:
+    latest = None
+    for record in read_journal_entries(root, namespace=ns):
+        if record.get("file") == filename and record.get("version_id"):
+            latest = record["version_id"]
+    return latest
+
+
 def matches_target_harness(entry_target: str, query_harness: str) -> bool:
     """Check if entry target matches query harness."""
     if not query_harness or query_harness == "all":
@@ -253,14 +1349,77 @@ def get_latest_seq(root: Path) -> int:
     return latest
 
 
-def append_journal_entry(root: Path, ns: str, filename: str, kind: str, action: str, harness: str, summary: str, target_harness: str = "all") -> dict:
+def unseen_journal_entries(root: Path, watermark: dict, namespace: str, harness: str) -> list:
+    seen = set(watermark.get("seen_event_ids", []))
+    vector = watermark.get("seen_origin_seq", {}).get(namespace, {})
+    legacy_seq = watermark.get("last_seq", 0)
+    result = []
+    for record in read_journal_entries(root, after_seq=0, namespace=namespace, target_harness=harness):
+        event_id = record.get("event_id")
+        if event_id:
+            origin = record.get("origin")
+            if event_id not in seen and (not origin or record.get("seq", 0) > vector.get(origin, 0)):
+                result.append(record)
+        elif record.get("seq", 0) > legacy_seq:
+            result.append(record)
+    return result
+
+
+def mark_events_seen(root: Path, watermark: dict, namespace: str | None, harness: str) -> None:
+    vectors = watermark.setdefault("seen_origin_seq", {})
+    for record in read_journal_entries(root, after_seq=0, namespace=namespace, target_harness=harness):
+        origin = record.get("origin")
+        if record.get("event_id") and origin:
+            vector = vectors.setdefault(record.get("ns", ""), {})
+            vector[origin] = max(vector.get(origin, 0), record.get("seq", 0))
+    # Selective acknowledgements older than the full vector no longer need an
+    # unbounded UUID entry.
+    covered = {
+        record_event_id(record)
+        for record in read_journal_entries(root)
+        if record.get("origin")
+        and record.get("seq", 0)
+        <= vectors.get(record.get("ns", ""), {}).get(record.get("origin"), 0)
+    }
+    watermark["seen_event_ids"] = sorted(set(watermark.get("seen_event_ids", [])) - covered)
+    watermark["last_seq"] = get_latest_seq(root)
+
+
+_AUTOMATIC_BASE = object()
+
+
+def append_journal_entry(
+    root: Path,
+    ns: str,
+    filename: str,
+    kind: str,
+    action: str,
+    harness: str,
+    summary: str,
+    target_harness: str = "all",
+    origin: str | None = None,
+    base_version=_AUTOMATIC_BASE,
+    base_versions: list[str] | None = None,
+) -> dict:
     jpath = get_journal_path(root)
     latest = get_latest_seq(root)
     next_seq = latest + 1
     now_ts = int(time.time())
     iso_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    event_id = str(uuid.uuid4())
+    origin = origin or memory_origin(root)
+    previous = latest_version_for(root, ns, filename) if base_version is _AUTOMATIC_BASE else base_version
+    digest = None
+    source = root / "namespaces" / ns / filename
+    if action != "delete" and source.is_file():
+        digest = store_content_object(root, source)
+    # Content identity and causal version identity are deliberately different:
+    # A -> B -> A reuses an object digest but is a new causal revision.
+    version_id = f"event:{event_id}"
     record = {
         "seq": next_seq,
+        "event_id": event_id,
+        "origin": origin,
         "ts": now_ts,
         "iso": iso_ts,
         "ns": ns,
@@ -270,10 +1429,121 @@ def append_journal_entry(root: Path, ns: str, filename: str, kind: str, action: 
         "harness": normalize_harness_name(harness),
         "target_harness": normalize_harness_name(target_harness) if target_harness != "all" else "all",
         "summary": summary,
+        "digest": digest,
+        "version_id": version_id,
+        "base_version": previous,
+        "base_versions": base_versions or [],
     }
     with open(jpath, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
     return record
+
+
+def _event_semantic_key(record: dict) -> str:
+    digest = record.get("digest")
+    return f"object:{digest}" if digest else f"delete:{record_event_id(record)}"
+
+
+def causal_heads_for(
+    root: Path,
+    namespace: str,
+    filename: str,
+    records: list[dict] | None = None,
+    *,
+    coalesce: bool = True,
+) -> list[dict]:
+    records = records if records is not None else read_journal_entries(root, namespace=namespace)
+    records = [
+        record for record in records if record.get("file") == filename and record.get("version_id")
+    ]
+    superseded = set()
+    for record in records:
+        if record.get("base_version"):
+            superseded.add(record["base_version"])
+        superseded.update(record.get("base_versions", []))
+    heads = [record for record in records if record.get("version_id") not in superseded]
+    if not coalesce:
+        return heads
+    semantic = {}
+    for record in heads:
+        semantic.setdefault(_event_semantic_key(record), record)
+    return list(semantic.values())
+
+
+def materialize_store(root: Path) -> dict:
+    """Materialize content-addressed event heads without hiding divergence.
+
+    A causal successor names ``base_version`` and supersedes that version. Two
+    unconnected heads are concurrent. A deterministic live copy keeps readers
+    working, while every divergent head is copied under ``conflicts/`` and the
+    non-zero conflict count makes the condition observable to timers/onboarding.
+    """
+    groups = {}
+    for record in read_journal_entries(root):
+        if not record.get("version_id"):
+            continue
+        key = (record.get("ns", ""), record.get("file", ""))
+        if not all(key):
+            continue
+        groups.setdefault(key, []).append(record)
+
+    written = deleted = conflicts = missing_objects = 0
+    for (namespace, filename), records in groups.items():
+        heads = causal_heads_for(root, namespace, filename, records)
+        if not heads:
+            continue
+
+        live = get_namespace_dir(root, namespace) / filename
+        conflict_dir = root / "conflicts" / namespace / filename
+        if conflict_dir.exists():
+            shutil.rmtree(conflict_dir)
+
+        if len(heads) > 1:
+            conflicts += 1
+            conflict_dir.mkdir(parents=True, exist_ok=True)
+            for head in heads:
+                event_id = record_event_id(head)
+                digest = head.get("digest")
+                if digest and object_path(root, digest).is_file():
+                    shutil.copyfile(object_path(root, digest), conflict_dir / f"{event_id}.md")
+                else:
+                    (conflict_dir / f"{event_id}.delete.md").write_text(
+                        json.dumps(head, indent=2) + "\n", encoding="utf-8"
+                    )
+
+        current_digest = file_sha256(live) if live.is_file() else None
+        chosen = next((head for head in heads if head.get("digest") == current_digest), None)
+        if chosen is None:
+            chosen = max(
+                heads,
+                key=lambda record: (
+                    record.get("ts", 0),
+                    record.get("origin", ""),
+                    record_event_id(record),
+                ),
+            )
+        digest = chosen.get("digest")
+        if not digest:
+            if live.exists():
+                live.unlink()
+                deleted += 1
+            continue
+        source = object_path(root, digest)
+        if not source.is_file():
+            missing_objects += 1
+            continue
+        if current_digest != digest:
+            live.parent.mkdir(parents=True, exist_ok=True)
+            temp = live.with_suffix(live.suffix + ".tmp")
+            shutil.copyfile(source, temp)
+            temp.replace(live)
+            written += 1
+    return {
+        "written": written,
+        "deleted": deleted,
+        "conflicts": conflicts,
+        "missing_objects": missing_objects,
+    }
 
 
 def extract_metadata_and_summary(content: str, filename: str = "") -> tuple:
@@ -351,7 +1621,7 @@ def cmd_status(args):
     last_seq = watermark.get("last_seq", 0)
     latest_seq = get_latest_seq(root)
 
-    new_entries = read_journal_entries(root, after_seq=last_seq, namespace=ns, target_harness=harness)
+    new_entries = unseen_journal_entries(root, watermark, ns, harness)
     # Deduplicate changed door filenames
     changed_doors = list(dict.fromkeys([e["file"] for e in new_entries if e.get("file")]))
 
@@ -385,7 +1655,7 @@ def cmd_diff(args):
     watermark = load_watermark(root, harness)
     last_seq = watermark.get("last_seq", 0)
 
-    entries = read_journal_entries(root, after_seq=last_seq, namespace=ns, target_harness=harness)
+    entries = unseen_journal_entries(root, watermark, ns, harness)
     if args.filter:
         flt = args.filter.lower()
         entries = [e for e in entries if flt in e.get("kind", "").lower() or flt in e.get("file", "").lower() or flt in e.get("summary", "").lower()]
@@ -426,14 +1696,14 @@ def cmd_ack(args):
     root = Path(args.root)
     harness = detect_harness(args.harness)
     ns = detect_namespace(override=args.ns)
-    lock = _flock_open(LOCK_FILE)
+    lock = _flock_open(root / ".ygg-memory.lock")
     try:
         watermark = load_watermark(root, harness)
         latest_seq = get_latest_seq(root)
         ns_map = watermark.setdefault("namespaces", {}).setdefault(ns, {})
 
         if args.all:
-            watermark["last_seq"] = latest_seq
+            mark_events_seen(root, watermark, ns, harness)
             watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             # Record current hashes of all doors in ns matching this harness
             ns_dir = get_namespace_dir(root, ns)
@@ -456,6 +1726,12 @@ def cmd_ack(args):
                     ns_map[fname] = file_sha256(fpath)
                     acked_files.append(fname)
             watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            selected = set(acked_files)
+            seen = set(watermark.get("seen_event_ids", []))
+            for record in read_journal_entries(root, namespace=ns, target_harness=harness):
+                if record.get("file") in selected and record.get("event_id"):
+                    seen.add(record["event_id"])
+            watermark["seen_event_ids"] = sorted(seen)
             save_watermark(root, watermark)
             if args.json:
                 print(json.dumps({"status": "ok", "acked": acked_files, "last_seq": watermark.get("last_seq", 0)}))
@@ -477,7 +1753,7 @@ def cmd_publish(args):
         print(f"Error: Source file '{args.file}' does not exist.", file=sys.stderr)
         sys.exit(1)
 
-    lock = _flock_open(LOCK_FILE)
+    lock = _flock_open(root / ".ygg-memory.lock")
     try:
         ns_dir = get_namespace_dir(root, ns)
         dest_filename = source_path.name
@@ -507,6 +1783,15 @@ def cmd_publish(args):
         watermark = load_watermark(root, harness)
         watermark.setdefault("namespaces", {}).setdefault(ns, {})[dest_filename] = file_sha256(dest_path)
         watermark["last_seq"] = max(watermark.get("last_seq", 0), record["seq"])
+        if record.get("event_id"):
+            origin = record.get("origin")
+            if origin:
+                vector = watermark.setdefault("seen_origin_seq", {}).setdefault(ns, {})
+                vector[origin] = max(vector.get(origin, 0), record.get("seq", 0))
+            else:
+                seen = set(watermark.get("seen_event_ids", []))
+                seen.add(record["event_id"])
+                watermark["seen_event_ids"] = sorted(seen)
         watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         save_watermark(root, watermark)
 
@@ -529,97 +1814,168 @@ def cmd_publish(args):
         _flock_close(lock)
 
 
-def _sync_single_namespace(root: Path, harness: str, ns: str) -> tuple:
-    """Sync one namespace. Returns (in_count, out_count). Handles tombstone deletes."""
-    # Determine local harness memory dir
-    if harness == "claude":
-        local_dir = Path.home() / ".claude" / "projects" / ns / "memory"
-    elif harness == "gemini":
-        local_dir = Path.home() / ".gemini" / "projects" / ns / "memory"
-    else:
-        local_dir = Path.home() / f".{harness}" / "projects" / ns / "memory"
+def cmd_resolve(args):
+    """Resolve every current causal head with one reviewed Markdown result."""
+    root = Path(args.root)
+    harness = detect_harness(args.harness)
+    namespace = detect_namespace(override=args.ns)
+    source = Path(args.using).resolve()
+    if not source.is_file():
+        raise SystemExit(f"ygg-memory: resolution source does not exist: {source}")
+    lock = _flock_open(root / ".ygg-memory.lock")
+    try:
+        heads = causal_heads_for(root, namespace, args.file)
+        raw_heads = causal_heads_for(root, namespace, args.file, coalesce=False)
+        if len(heads) < 2:
+            raise SystemExit(f"ygg-memory: {namespace}/{args.file} has fewer than two divergent heads")
+        destination = get_namespace_dir(root, namespace) / args.file
+        if source != destination.resolve():
+            shutil.copyfile(source, destination)
+        content = destination.read_text(encoding="utf-8")
+        kind, summary, target = extract_metadata_and_summary(content, args.file)
+        record = append_journal_entry(
+            root,
+            namespace,
+            args.file,
+            kind,
+            "resolve",
+            harness,
+            summary,
+            target_harness=target,
+            base_version=None,
+            # Supersede every causal version, including identical duplicate
+            # events that semantic conflict display intentionally coalesces.
+            base_versions=[head["version_id"] for head in raw_heads],
+        )
+        report = materialize_store(root)
+        remaining = causal_heads_for(root, namespace, args.file)
+        if len(remaining) != 1:
+            raise RuntimeError(f"resolution did not converge {args.file}: {len(remaining)} heads remain")
+        if args.json:
+            print(json.dumps({"status": "ok", "record": record, "report": report}))
+        else:
+            print(f"Resolved {namespace}/{args.file}; superseded {len(heads)} divergent heads.")
+    finally:
+        _flock_close(lock)
 
+
+def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir: Path) -> tuple:
+    """Three-way sync one project-memory directory without mtime arbitration."""
     local_dir.mkdir(parents=True, exist_ok=True)
     ns_dir = get_namespace_dir(root, ns)
-
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_dir = BACKUP_ROOT / ns / stamp
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    for f in local_dir.glob("*.md"):
-        shutil.copy2(f, backup_dir)
-
     in_count = 0
     out_count = 0
     del_count = 0
+    watermark = load_watermark(root, harness)
+    backend_identity = str(local_dir.resolve())
+    backend_identities = watermark.setdefault("sync_backend_v2", {})
+    if backend_identities.get(ns) != backend_identity:
+        # v1 watermarks did not identify their native path. Reusing one after
+        # correcting a fake/guessed backend turns "new correct directory is
+        # empty" into hundreds of false user deletions. A new path starts with
+        # no three-way base and receives/imports by content instead.
+        watermark.setdefault("sync_state", {})[ns] = {}
+        watermark.setdefault("sync_versions", {})[ns] = {}
+        backend_identities[ns] = backend_identity
+    sync_state = watermark.setdefault("sync_state", {}).setdefault(ns, {})
+    version_state = watermark.setdefault("sync_versions", {}).setdefault(ns, {})
+    names = {
+        path.name for path in local_dir.glob("*.md")
+    } | {
+        path.name for path in ns_dir.glob("*.md")
+    } | set(sync_state)
 
-    # Collect journal tombstones for this ns since last sync
-    # We load watermark once and keep reference for mutation — caller will reload and save, so we must persist deletes directly
-    watermark_for_deletes = load_watermark(root, harness)
-    delete_entries = [e for e in read_journal_entries(root, after_seq=0, namespace=ns) if e.get("action") == "delete"]
-    deleted_files = {e.get("file") for e in delete_entries}
+    for fname in sorted(names):
+        local = local_dir / fname
+        hub = ns_dir / fname
+        local_exists = local.is_file()
+        hub_exists = hub.is_file()
+        local_digest = file_sha256(local) if local_exists else None
+        hub_digest = file_sha256(hub) if hub_exists else None
+        target = "all"
+        if hub_exists:
+            _, _, target = extract_metadata_and_summary(hub.read_text(encoding="utf-8"), fname)
+        if hub_exists and not matches_target_harness(target, harness):
+            # A private door for another harness is not ours to overwrite. If
+            # this adapter previously delivered an unchanged copy, withdraw it.
+            if fname in sync_state and local_digest == sync_state[fname]:
+                backup_native_file(root, harness, ns, local)
+                local.unlink()
+                out_count += 1
+            sync_state.pop(fname, None)
+            version_state.pop(fname, None)
+            continue
 
-    # Apply tombstone deletes locally (unified -> local delete propagation)
-    for del_file in deleted_files:
-        local_target = local_dir / del_file
-        if local_target.exists():
-            if not (ns_dir / del_file).exists():
-                local_target.unlink()
+        base_digest = sync_state.get(fname)
+        base_version = version_state.get(fname)
+
+        def publish_native(causal_base: str | None) -> None:
+            nonlocal in_count, del_count
+            if local_exists:
+                content = local.read_text(encoding="utf-8")
+                kind, summary, native_target = extract_metadata_and_summary(content, fname)
+                shutil.copyfile(local, hub)
+                action = "upsert"
+                in_count += 1
+            else:
+                previous = hub.read_text(encoding="utf-8") if hub_exists else ""
+                kind, summary, native_target = extract_metadata_and_summary(previous, fname)
+                if hub.exists():
+                    hub.unlink()
+                action = "delete"
+                summary = f"deleted {fname}"
                 del_count += 1
-        # Also ensure watermark no longer tracks this deleted file (clean stale watermark entry)
-        if del_file in watermark_for_deletes.get("namespaces", {}).get(ns, {}):
-            watermark_for_deletes["namespaces"][ns].pop(del_file, None)
-            save_watermark(root, watermark_for_deletes)
+            append_journal_entry(
+                root,
+                ns,
+                fname,
+                kind,
+                action,
+                harness,
+                summary,
+                target_harness=native_target,
+                base_version=causal_base,
+            )
+            materialize_store(root)
 
-    # Detect local deletes (file was in watermark but now missing locally -> intentional delete)
-    ns_watermark_files = watermark_for_deletes.get("namespaces", {}).get(ns, {})
-    for fname in list(ns_watermark_files.keys()):
-        if fname not in deleted_files and not (local_dir / fname).exists() and (ns_dir / fname).exists():
-            tombstone_src = ns_dir / fname
-            try:
-                tombstone_src.unlink()
-            except FileNotFoundError:
-                pass
-            content_backup = ""
-            try:
-                content_backup = backup_dir.joinpath(fname).read_text(encoding="utf-8") if (backup_dir / fname).exists() else ""
-            except Exception:
-                pass
-            kind, summary, target_h = extract_metadata_and_summary(content_backup, fname)
-            append_journal_entry(root, ns, fname, kind, "delete", harness, f"deleted {fname}", target_harness=target_h)
-            del_count += 1
-            watermark_for_deletes.get("namespaces", {}).get(ns, {}).pop(fname, None)
-            save_watermark(root, watermark_for_deletes)
+        if base_digest is None:
+            if local_exists and not hub_exists:
+                publish_native(None)
+            elif local_exists and hub_exists and local_digest != hub_digest:
+                publish_native(None)
+        else:
+            local_changed = local_digest != base_digest
+            hub_changed = hub_digest != base_digest
+            if local_changed and not hub_changed:
+                publish_native(base_version or version_for_digest(root, ns, fname, hub_digest))
+            elif local_changed and hub_changed and local_digest != hub_digest:
+                publish_native(base_version)
 
-    # Pass 1: Ingest from local harness -> unified root (if local newer or unified missing)
-    for loc_file in local_dir.glob("*.md"):
-        if loc_file.name in deleted_files:
-            continue
-        dest_file = ns_dir / loc_file.name
-        if not dest_file.exists() or loc_file.stat().st_mtime > dest_file.stat().st_mtime:
-            content = loc_file.read_text(encoding="utf-8")
-            kind, summary, target_h = extract_metadata_and_summary(content, loc_file.name)
-            shutil.copy2(loc_file, dest_file)
-            append_journal_entry(root, ns, loc_file.name, kind, "upsert", harness, summary, target_harness=target_h)
-            in_count += 1
+        hub_exists = hub.is_file()
+        hub_digest = file_sha256(hub) if hub_exists else None
+        if hub_exists:
+            content = hub.read_text(encoding="utf-8")
+            _, _, target = extract_metadata_and_summary(content, fname)
+        if hub_exists and matches_target_harness(target, harness):
+            if not local.is_file() or file_sha256(local) != hub_digest:
+                if local.is_file():
+                    backup_native_file(root, harness, ns, local)
+                temp = local.with_suffix(local.suffix + ".tmp")
+                shutil.copyfile(hub, temp)
+                temp.replace(local)
+                out_count += 1
+            if sync_state.get(fname) != hub_digest or not version_state.get(fname):
+                version_state[fname] = version_for_digest(root, ns, fname, hub_digest)
+            sync_state[fname] = hub_digest
+        elif not hub_exists and fname in sync_state:
+            if local.is_file():
+                backup_native_file(root, harness, ns, local)
+                local.unlink()
+                out_count += 1
+            sync_state.pop(fname, None)
+            version_state.pop(fname, None)
 
-    # Pass 2: Propagate from unified root -> local harness (matching target_harness only!)
-    for uni_file in ns_dir.glob("*.md"):
-        content = uni_file.read_text(encoding="utf-8")
-        _, _, target_h = extract_metadata_and_summary(content, uni_file.name)
-        if not matches_target_harness(target_h, harness):
-            continue
-        dest_file = local_dir / uni_file.name
-        if not dest_file.exists() or uni_file.stat().st_mtime > dest_file.stat().st_mtime:
-            shutil.copy2(uni_file, dest_file)
-            out_count += 1
-
-    # Ensure steering header in local MEMORY.md
-    loc_mem = local_dir / "MEMORY.md"
-    if loc_mem.exists():
-        txt = loc_mem.read_text(encoding="utf-8")
-        if "UNIFIED FLEET MEMORY" not in txt:
-            loc_mem.write_text(STEERING_HEADER + "\n" + txt, encoding="utf-8")
-
+    save_watermark(root, watermark)
     return in_count, out_count, del_count
 
 
@@ -627,46 +1983,35 @@ def cmd_sync_harness(args):
     """Bidirectional sync between harness-local directory and ~/.yggterm/memory."""
     root = Path(args.root)
     harness = detect_harness(args.harness)
-    lock = _flock_open(LOCK_FILE)
+    adapter = get_harness_adapter(harness)
+    lock = _flock_open(root / ".ygg-memory.lock")
 
     try:
+        migrate_legacy_store(root)
         if getattr(args, "all", False):
-            # Discover all namespaces from unified + all harness local dirs
-            all_ns = set()
-            for d in (root / "namespaces").glob("*"):
-                if d.is_dir():
-                    all_ns.add(d.name)
-            for h in ["claude", "muse", "gemini", "codex", "grok"]:
-                base = Path.home() / f".{h}" / "projects"
-                if h == "claude":
-                    base = Path.home() / ".claude" / "projects"
-                elif h == "gemini":
-                    base = Path.home() / ".gemini" / "projects"
-                if base.exists():
-                    for d in base.glob("*/memory"):
-                        ns = d.parent.name
-                        all_ns.add(ns)
-            # Also include any -home-pi* style from filesystem
-            total_in = total_out = total_del = 0
-            for ns in sorted(all_ns):
-                inc, outc, delc = _sync_single_namespace(root, harness, ns)
-                total_in += inc
-                total_out += outc
-                total_del += delc
+            namespace_count, total_in, total_out, total_del = adapter.sync_all(root, harness)
             watermark = load_watermark(root, harness)
-            watermark["last_seq"] = get_latest_seq(root)
+            mark_events_seen(root, watermark, None, harness)
             watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             save_watermark(root, watermark)
             if args.json:
-                print(json.dumps({"status": "ok", "harness": harness, "namespaces": len(all_ns), "pulled_in": total_in, "pushed_out": total_out, "deleted": total_del}))
+                print(json.dumps({"status": "ok", "harness": harness, "namespaces": namespace_count, "pulled_in": total_in, "pushed_out": total_out, "deleted": total_del}))
             else:
-                print(f"Harness sync completed ({harness} all {len(all_ns)} ns): {total_in} ingested, {total_out} propagated, {total_del} deleted.")
+                print(f"Harness sync completed ({harness} all {namespace_count} ns): {total_in} ingested, {total_out} propagated, {total_del} deleted.")
             return
 
         ns = detect_namespace(override=args.ns)
-        inc, outc, delc = _sync_single_namespace(root, harness, ns)
+        # ``--local-dir`` is an explicit test/operator override for project-style
+        # adapters.  Codex deliberately has no such escape hatch: its inbox is
+        # the only sanctioned native write surface.
+        if getattr(args, "local_dir", None):
+            if not isinstance(adapter, ProjectMemoryAdapter):
+                raise ValueError(f"{harness} does not support --local-dir; use its native adapter")
+            inc, outc, delc = _sync_project_memory_namespace(root, harness, ns, Path(args.local_dir))
+        else:
+            inc, outc, delc = adapter.sync_namespace(root, harness, ns)
         watermark = load_watermark(root, harness)
-        watermark["last_seq"] = get_latest_seq(root)
+        mark_events_seen(root, watermark, ns, harness)
         watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         save_watermark(root, watermark)
         if args.json:
@@ -686,7 +2031,7 @@ def _merge_journals(local_path: Path, peer_content: str):
             if line:
                 try:
                     d = json.loads(line)
-                    k = (d.get("seq", 0), d.get("ns", ""), d.get("file", ""))
+                    k = record_event_id(d)
                     records_by_key[k] = d
                 except Exception:
                     pass
@@ -695,100 +2040,367 @@ def _merge_journals(local_path: Path, peer_content: str):
         if line:
             try:
                 d = json.loads(line)
-                k = (d.get("seq", 0), d.get("ns", ""), d.get("file", ""))
+                k = record_event_id(d)
                 if k not in records_by_key:
                     records_by_key[k] = d
             except Exception:
                 pass
-    sorted_records = sorted(records_by_key.values(), key=lambda r: (r.get("seq", 0), r.get("ts", 0)))
+    sorted_records = sorted(
+        records_by_key.values(),
+        key=lambda r: (r.get("ts", 0), r.get("origin", ""), r.get("seq", 0), record_event_id(r)),
+    )
     local_path.parent.mkdir(parents=True, exist_ok=True)
     with open(local_path, "w", encoding="utf-8") as f:
         for r in sorted_records:
             f.write(json.dumps(r) + "\n")
 
 
+def migrate_legacy_store(root: Path) -> int:
+    """Snapshot pre-v2 namespace files, including old recursive rsync nests."""
+    marker = root / ".v2-migrated"
+    if marker.is_file():
+        return 0
+    records = read_journal_entries(root)
+    represented = {
+        (record.get("ns"), record.get("file"), record.get("digest"))
+        for record in records
+        if record.get("digest")
+    }
+    current_versions = {}
+    for record in records:
+        if record.get("version_id"):
+            current_versions[(record.get("ns"), record.get("file"))] = record["version_id"]
+    next_seq = max((record.get("seq", 0) for record in records), default=0)
+    origin = memory_origin(root)
+    migrated = 0
+    pending = []
+    namespace_root = root / "namespaces"
+    for source in sorted(namespace_root.rglob("*.md")):
+        relative = source.relative_to(namespace_root)
+        if len(relative.parts) < 2:
+            continue
+        namespace = source.parent.name
+        if namespace == "namespaces" or not (namespace.startswith("-") or namespace == GLOBAL_NAMESPACE):
+            continue
+        nested_legacy = len(relative.parts) > 2
+        digest = store_content_object(root, source)
+        if (namespace, source.name, digest) in represented:
+            continue
+        content = source.read_text(encoding="utf-8", errors="replace")
+        kind, summary, target = extract_metadata_and_summary(content, source.name)
+        next_seq += 1
+        event_id = str(uuid.uuid4())
+        version = f"event:{event_id}"
+        pending.append(
+            {
+                "seq": next_seq,
+                "event_id": event_id,
+                "origin": origin,
+                "ts": int(time.time()),
+                "iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "ns": namespace,
+                "file": source.name,
+                "kind": kind,
+                "action": "upsert",
+                "harness": "legacy-migration",
+                "target_harness": target,
+                "summary": summary,
+                "digest": digest,
+                "version_id": version,
+                # Canonical files form the pre-v2 live line. A stranded nested
+                # rsync copy has no proved ancestry, so retain it as a parallel
+                # head instead of silently placing it before or after live.
+                "base_version": None if nested_legacy else current_versions.get((namespace, source.name)),
+                "base_versions": [],
+            }
+        )
+        if not nested_legacy:
+            current_versions[(namespace, source.name)] = version
+        migrated += 1
+    if pending:
+        journal = get_journal_path(root)
+        with journal.open("a", encoding="utf-8") as handle:
+            for record in pending:
+                handle.write(json.dumps(record) + "\n")
+    marker.write_text("content-addressed-event-store-v2\n", encoding="utf-8")
+    return migrated
+
+
+def _fleet_ssh_command(connect_timeout: int) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={connect_timeout}",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "LogLevel=ERROR",
+    ]
+
+
+def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
+    """Exchange immutable objects + event IDs; namespace files never rsync."""
+    local_host = socket.gethostname()
+    peers = [host for host in mesh if host != local_host]
+    ssh_cmd = _fleet_ssh_command(1 if quick else 5)
+    live_peers = []
+    unreachable = []
+    for peer in peers:
+        try:
+            result = subprocess.run(
+                ssh_cmd + [peer, "true"], capture_output=True, timeout=2 if quick else 7
+            )
+        except subprocess.TimeoutExpired:
+            unreachable.append(peer)
+            continue
+        if result.returncode == 0:
+            live_peers.append(peer)
+        else:
+            unreachable.append(peer)
+
+    local_lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
+    try:
+        migrate_legacy_store(root)
+    finally:
+        _flock_close(local_lock)
+    (root / "objects").mkdir(parents=True, exist_ok=True)
+    journal_file = get_journal_path(root)
+    script_dir = Path(__file__).resolve().parent
+    failures = []
+
+    if not quick:
+        for peer in live_peers:
+            prepared = subprocess.run(
+                ssh_cmd
+                + [
+                    peer,
+                    "mkdir -p ~/.local/bin ~/.yggterm/bin ~/.yggterm/memory/objects; "
+                    "for d in ~/.local/bin ~/.yggterm/bin; do "
+                    "for f in ygg-memory ygg-memory.py; do "
+                    "test ! -L \"$d/$f\" || unlink \"$d/$f\"; done; done",
+                ],
+                capture_output=True,
+            )
+            if prepared.returncode != 0:
+                failures.append(f"{peer}:prepare")
+            for destination in (".local/bin", ".yggterm/bin"):
+                copied = subprocess.run(
+                    [
+                        "scp",
+                        "-q",
+                        "-o",
+                        "BatchMode=yes",
+                        str(script_dir / "ygg-memory.py"),
+                        str(script_dir / "ygg-memory"),
+                        f"{peer}:{destination}/",
+                    ],
+                    capture_output=True,
+                )
+                if copied.returncode != 0:
+                    failures.append(f"{peer}:deploy-{destination}")
+            made_executable = subprocess.run(
+                ssh_cmd
+                + [
+                    peer,
+                    "chmod +x ~/.local/bin/ygg-memory ~/.local/bin/ygg-memory.py ~/.yggterm/bin/ygg-memory ~/.yggterm/bin/ygg-memory.py",
+                ],
+                capture_output=True,
+            )
+            if made_executable.returncode != 0:
+                failures.append(f"{peer}:chmod")
+
+    # Every peer must objectify its own legacy live view before we pull its
+    # journal or import ours. This handshake is the upgrade safety boundary.
+    ready_peers = []
+    for peer in live_peers:
+        migrated = subprocess.run(
+            ssh_cmd + [peer, "~/.local/bin/ygg-memory migrate --json"],
+            capture_output=True,
+            text=True,
+        )
+        if migrated.returncode == 0:
+            ready_peers.append(peer)
+        else:
+            failures.append(f"{peer}:migrate")
+    live_peers = ready_peers
+
+    ssh_transport = " ".join(ssh_cmd)
+    pulled_objects = pushed_objects = 0
+    incoming_journals = []
+    for peer in live_peers:
+        pull = subprocess.run(
+            [
+                "rsync",
+                "-az",
+                "--ignore-existing",
+                "--exclude=*.tmp",
+                "--itemize-changes",
+                "-e",
+                ssh_transport,
+                f"{peer}:~/.yggterm/memory/objects/",
+                str(root / "objects") + "/",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if pull.returncode != 0:
+            failures.append(f"{peer}:pull-objects")
+        pulled_objects += sum(1 for line in pull.stdout.splitlines() if line.startswith(">f"))
+        journal = subprocess.run(
+            ssh_cmd + [peer, "cat ~/.yggterm/memory/journal.jsonl 2>/dev/null || true"],
+            capture_output=True,
+            text=True,
+        )
+        if journal.stdout:
+            incoming_journals.append(journal.stdout)
+
+    # Network calls never occur while this lock is held. Two hosts can sync at
+    # once without each waiting on the other's local lock.
+    local_lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
+    try:
+        for incoming in incoming_journals:
+            _merge_journals(journal_file, incoming)
+        materialized = materialize_store(root)
+        journal_content = journal_file.read_text(encoding="utf-8") if journal_file.is_file() else ""
+    finally:
+        _flock_close(local_lock)
+    for peer in live_peers:
+        push = subprocess.run(
+            [
+                "rsync",
+                "-az",
+                "--ignore-existing",
+                "--exclude=*.tmp",
+                "--itemize-changes",
+                "-e",
+                ssh_transport,
+                str(root / "objects") + "/",
+                f"{peer}:~/.yggterm/memory/objects/",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if push.returncode != 0:
+            failures.append(f"{peer}:push-objects")
+        pushed_objects += sum(1 for line in push.stdout.splitlines() if line.startswith(">f"))
+        command = "~/.local/bin/ygg-memory import-journal"
+        imported = subprocess.run(
+            ssh_cmd + [peer, command],
+            input=journal_content,
+            capture_output=True,
+            text=True,
+        )
+        if imported.returncode != 0:
+            failures.append(f"{peer}:import-journal")
+    if materialized.get("conflicts"):
+        failures.append(f"{materialized['conflicts']}-preserved-conflict(s)")
+    if materialized.get("missing_objects"):
+        failures.append(f"{materialized['missing_objects']}-missing-object(s)")
+    if unreachable or failures:
+        details = []
+        if unreachable:
+            details.append("unreachable=" + ",".join(unreachable))
+        if failures:
+            details.append("failed=" + ",".join(failures))
+        raise RuntimeError("fleet memory did not converge: " + "; ".join(details))
+    return {
+        "peers": live_peers,
+        "pulled_objects": pulled_objects,
+        "pushed_objects": pushed_objects,
+        **materialized,
+    }
+
+
 def cmd_sync_fleet(args):
-    """Mesh synchronize ~/.yggterm/memory across reachable fleet hosts over SSH."""
+    """Mesh synchronize semantic objects/events across reachable SSH peers."""
     root = Path(args.root)
     mesh = resolve_fleet_mesh(args.mesh)
-    lock = _flock_open(LOCK_FILE)
+    report = _run_fleet_sync(root, mesh, quick=getattr(args, "quick", False))
+    if getattr(args, "json", False):
+        print(json.dumps(report))
+    elif not getattr(args, "quiet", False):
+        peers = ", ".join(report["peers"]) or "none reachable"
+        print(
+            f"Fleet memory sync: {peers}; {report['pulled_objects']} objects pulled, "
+            f"{report['pushed_objects']} pushed, {report['conflicts']} conflicts."
+        )
 
+
+def cmd_import_journal(args):
+    root = Path(args.root)
+    incoming = sys.stdin.read()
+    lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
     try:
-        # Detect local host
-        local_host = os.uname().nodename
-        peers = [h for h in mesh if h != local_host]
-        live_peers = []
-
-        ssh_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR"]
-        for p in peers:
-            r = subprocess.run(ssh_cmd + [p, "true"], capture_output=True)
-            if r.returncode == 0:
-                live_peers.append(p)
-
-        if not live_peers:
-            print("No reachable peer hosts in fleet mesh.")
-            return
-
-        # Snapshot local
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup = BACKUP_ROOT / "fleet-mesh" / stamp
-        backup.mkdir(parents=True, exist_ok=True)
-        if root.exists():
-            for sub in (root / "namespaces").glob("*/*.md"):
-                sub_bak = backup / sub.parent.name
-                sub_bak.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(sub, sub_bak)
-
-        pulled = 0
-        pushed = 0
-        journal_file = root / "journal.jsonl"
-
-        # Deploy ygg-memory binary & scripts to peer hosts
-        script_dir = Path(__file__).resolve().parent
-        for peer in live_peers:
-            subprocess.run(ssh_cmd + [peer, "mkdir -p ~/.yggterm/memory/namespaces ~/.yggterm/bin ~/.local/bin"], capture_output=True)
-            # Copy tool scripts
-            subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(script_dir / "ygg-memory.py"), str(script_dir / "ygg-memory"), f"{peer}:.local/bin/"], capture_output=True)
-            subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(script_dir / "ygg-memory.py"), str(script_dir / "ygg-memory"), f"{peer}:.yggterm/bin/"], capture_output=True)
-            subprocess.run(ssh_cmd + [peer, "chmod +x ~/.local/bin/ygg-memory ~/.local/bin/ygg-memory.py ~/.yggterm/bin/ygg-memory ~/.yggterm/bin/ygg-memory.py"], capture_output=True)
-
-        ns_local_dir = str(root / "namespaces") + "/"
-
-        # Two-pass rsync with newest-wins per file
-        for peer in live_peers:
-            ns_peer_dir = f"{peer}:~/.yggterm/memory/namespaces/"
-            # Pass 1: Pull namespaces from peer
-            r_pull = subprocess.run([
-                "rsync", "-az", "-u", "--itemize-changes", "-e", " ".join(ssh_cmd),
-                ns_peer_dir, ns_local_dir
-            ], capture_output=True, text=True)
-            pulled += len([ln for ln in r_pull.stdout.splitlines() if ln.startswith(">") or ln.startswith("<")])
-
-            # Merge journals
-            r_jread = subprocess.run(ssh_cmd + [peer, "cat ~/.yggterm/memory/journal.jsonl 2>/dev/null || true"], capture_output=True, text=True)
-            if r_jread.stdout:
-                _merge_journals(journal_file, r_jread.stdout)
-
-            # Pass 2: Push unified namespaces back out
-            r_push = subprocess.run([
-                "rsync", "-az", "-u", "--itemize-changes", "-e", " ".join(ssh_cmd),
-                ns_local_dir, ns_peer_dir
-            ], capture_output=True, text=True)
-            pushed += len([ln for ln in r_push.stdout.splitlines() if ln.startswith(">") or ln.startswith("<")])
-
-            # Push merged journal back out
-            if journal_file.exists():
-                subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(journal_file), f"{peer}:.yggterm/memory/journal.jsonl"], capture_output=True)
-
-        print(f"Fleet memory sync complete across {len(live_peers)} peers ({', '.join(live_peers)}): {pulled} pulled, {pushed} pushed.")
+        _merge_journals(get_journal_path(root), incoming)
+        report = materialize_store(root)
+        if getattr(args, "json", False):
+            print(json.dumps(report))
     finally:
         _flock_close(lock)
+
+
+def cmd_migrate(args):
+    """Private upgrade endpoint: capture this host before accepting a peer."""
+    root = Path(args.root)
+    lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
+    try:
+        migrated = migrate_legacy_store(root)
+        report = materialize_store(root)
+        output = {"migrated": migrated, **report}
+        if getattr(args, "json", False):
+            print(json.dumps(output))
+    finally:
+        _flock_close(lock)
+
+
+def _sync_adapter_once(root: Path, harness: str) -> tuple[int, int, int, int]:
+    adapter = get_harness_adapter(harness, cwd=Path.cwd())
+    lock = _flock_open(root / ".ygg-memory.lock")
+    try:
+        migrate_legacy_store(root)
+        result = adapter.sync_all(root, harness)
+        watermark = load_watermark(root, harness)
+        mark_events_seen(root, watermark, None, harness)
+        watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        save_watermark(root, watermark)
+        return result
+    finally:
+        _flock_close(lock)
+
+
+def cmd_startup(args):
+    """Bounded pre-launch convergence. Failure is visible but never eats the PTY."""
+    root = Path(args.root)
+    harness = detect_harness(args.harness)
+    errors = []
+    totals = [0, 0, 0, 0]
+    for phase in ("local-before", "fleet", "local-after"):
+        try:
+            if phase == "fleet":
+                try:
+                    mesh = resolve_fleet_mesh(getattr(args, "mesh", None))
+                except SystemExit:
+                    # A one-machine installation is complete. sync-fleet still
+                    # fails loudly when invoked explicitly without a roster.
+                    continue
+                _run_fleet_sync(root, mesh, quick=True)
+            else:
+                result = _sync_adapter_once(root, harness)
+                totals = [left + right for left, right in zip(totals, result)]
+        except Exception as error:
+            errors.append(f"{phase}: {error}")
+    if errors:
+        print("ygg-memory startup warning: " + " | ".join(errors), file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps({"harness": harness, "namespaces": totals[0], "totals": totals[1:], "warnings": errors}))
 
 
 def main():
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("--root", default=str(DEFAULT_MEMORY_ROOT), help="Root path for ~/.yggterm/memory")
-    common_parser.add_argument("--harness", default=None, help="Agent CLI harness name (claude, gemini, grok, codex, muse)")
+    common_parser.add_argument("--harness", default=None, help="Agent CLI harness name")
     common_parser.add_argument("--ns", default=None, help="Project namespace (e.g. -home-pi-gh-yggterm)")
     common_parser.add_argument("--json", action="store_true", help="Format output as JSON for tool calls")
 
@@ -818,6 +2430,11 @@ def main():
     p_pub.add_argument("--summary", default=None, help="One-line summary description")
     p_pub.add_argument("--target-harness", "--scope", dest="target_harness", default=None, help="Target harness scope ('all' or specific: gemini, claude, grok, codex)")
 
+    # resolve
+    p_resolve = subparsers.add_parser("resolve", parents=[common_parser], help="Resolve all divergent heads of one door")
+    p_resolve.add_argument("--file", required=True, help="Conflicted door filename")
+    p_resolve.add_argument("--using", required=True, help="Reviewed Markdown file containing the merged result")
+
     # sync-harness
     p_sync_h = subparsers.add_parser("sync-harness", parents=[common_parser], help="Bi-directional sync with local harness store")
     p_sync_h.add_argument("--local-dir", default=None, help="Explicit local harness memory directory")
@@ -828,6 +2445,18 @@ def main():
     p_sync_f.add_argument("--mesh", default=None,
                           help="Space-separated peer SSH hosts; default reads $YGG_FLEET_MESH "
                                "then ~/.config/ygg-fleet/mesh")
+    p_sync_f.add_argument("--quick", action="store_true", help="Skip deployment and use one-second SSH probes")
+    p_sync_f.add_argument("--quiet", action="store_true", help="Suppress success output")
+
+    # import-journal: private fleet transport endpoint, stdin is JSONL.
+    subparsers.add_parser("import-journal", parents=[common_parser], help=argparse.SUPPRESS)
+
+    # migrate: private fleet upgrade handshake.
+    subparsers.add_parser("migrate", parents=[common_parser], help=argparse.SUPPRESS)
+
+    # startup: yggterm-managed, bounded pre-launch convergence.
+    p_startup = subparsers.add_parser("startup", parents=[common_parser], help="Converge fleet + native memory before CLI launch")
+    p_startup.add_argument("--mesh", default=None, help="Optional fleet roster override")
 
     args = parser.parse_args()
 
@@ -841,10 +2470,18 @@ def main():
         cmd_ack(args)
     elif args.subcommand == "publish":
         cmd_publish(args)
+    elif args.subcommand == "resolve":
+        cmd_resolve(args)
     elif args.subcommand == "sync-harness":
         cmd_sync_harness(args)
     elif args.subcommand == "sync-fleet":
         cmd_sync_fleet(args)
+    elif args.subcommand == "import-journal":
+        cmd_import_journal(args)
+    elif args.subcommand == "migrate":
+        cmd_migrate(args)
+    elif args.subcommand == "startup":
+        cmd_startup(args)
     else:
         parser.print_help()
 

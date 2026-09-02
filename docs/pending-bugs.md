@@ -5202,6 +5202,27 @@ moved to "[11.0→6.1] AN ADOPTION CHAIN LOSES THE PRESERVED-OWNER TABLE" (the e
 read); what remains HERE is the render residual (refuse loudly on an empty seed) and the
 glyph-soup switches, which are not yet tied to the same root.
 
+**SECOND READING, 2026-09-03 ~00:05–00:57 + 03:37 on the live GUI (3.2.40→3.2.42)
+— new mechanism, owner screenshotted twice.** Switch-in to a remote-opencode row
+with **ZERO `replay_reset`/`replay_reseed`** (no retained replay involved at
+all), mount opened at the correct 172×65 grid, then `retained_empty_surface_
+settle_wait` with 64/65 blank rows — and immediately the `resize_repaint_nudge`
+([11.39]) fired to wake the idle fullscreen TUI. The corruption the owner saw
+was the **mid-cure composite**: the TUI's position-addressed fragments
+(`53;6H`/`60;6H`/`64;4H` + full 24-bit SGR, inside an unterminated `\e[?2026h`
+synchronous-update envelope) arrived over a still-blank canvas — duplicated
+columns at two origins, unreplaced black bands. Byte-exact samples survive on
+the `xterm_attach/stream_sample` plane (`live_stream`, 35–131K chars, sgr38
+24–63). The nudge cured it: by 03:37 the row paints a flawless opencode
+model-picker (faithful screenshot verified same session). ⇒ **The residual
+remedy is the paint-hold the owner asked for: hold the reveal cover (or
+suppress live-stream paint) from the nudge until the first post-nudge full
+frame settles — the mid-cure window is the defect, not the cure.** File this
+as the pixel-paint-cache remedy: a snapshotted last-good frame held as the
+cover, released on repaint-ack. And the `[11.44]` mouse sibling is closed in
+the same window (buffer-kind seed, `c133cd699`, live on 3.2.42: `xterm_buffer_
+kind` now reports per host).
+
 **That instrument now exists, is armed by default, and here is how to read it.** On the trace
 plane: `layer:"xterm"`, probe `xterm_attach/stream_sample`, tagged `stage: "reseed"` vs
 `"live_stream"` vs `"restore"`. It arms on every screen wipe and every replay, and is bounded
