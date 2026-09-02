@@ -43867,6 +43867,71 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         )));
         assert!(!shell.server_busy);
     }
+
+    /// ⛔ [startpage-hijack-D] THE PUSH DECISION. The GUI pushes its held view
+    /// to the daemon exactly when the daemon says null, the GUI holds a
+    /// session, and that session is still live in the incoming snapshot —
+    /// never when the daemon already holds an active, and never for a row the
+    /// daemon no longer tracks (adopting nothing is correct there).
+    #[test]
+    fn daemon_active_desync_push_target_fires_only_for_daemon_null_with_held_live_view() {
+        let held = "local://held-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(held));
+        // Establish the GUI-held view: the user's restored session.
+        shell.apply_daemon_snapshot_result(Ok((
+            test_server_snapshot_for_active_session(held),
+            None,
+        )));
+        assert_eq!(shell.server.active_session_path(), Some(held));
+
+        // Daemon desynced to null, held row still live → the push fires.
+        let mut snapshot = test_server_snapshot_for_active_session(held);
+        snapshot.active_session_path = None;
+        assert_eq!(
+            shell.daemon_active_desync_push_target(&snapshot).as_deref(),
+            Some(held)
+        );
+
+        // Daemon already holds an active → nothing to push.
+        snapshot.active_session_path = Some("local://another".to_string());
+        assert_eq!(shell.daemon_active_desync_push_target(&snapshot), None);
+
+        // The held row is gone from the live set → adopting nothing is correct.
+        snapshot.active_session_path = None;
+        snapshot.live_sessions.clear();
+        assert_eq!(shell.daemon_active_desync_push_target(&snapshot), None);
+    }
+
+    /// ⛔ [startpage-hijack-D] SAFE DEGRADATION NOTE, recorded as a test that
+    /// CANNOT be: adopting the daemon's null is role-gated
+    /// (`viewport_is_client_owned_for_role`) and the test harness's client
+    /// role skips the adopt entirely — so the unreachable-daemon case cannot
+    /// be pinned end-to-end here. The production yank was measured in the
+    /// real GUI's adopt (falsifier run, `from local://89eec6c0 → null`,
+    /// origin `apply_snapshot_adopt_daemon_view`); the helper's Err arm keeps
+    /// the incoming snapshot verbatim, which is exactly the pre-fix behavior.
+    #[test]
+    fn daemon_active_desync_push_target_is_pure_over_the_fixture_snapshot() {
+        let held = "local://held-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(held));
+        let mut snapshot = test_server_snapshot_for_active_session(held);
+        snapshot.active_session_path = None;
+
+        // Daemon null + GUI-held live view → the push fires with the held row.
+        assert_eq!(
+            shell.daemon_active_desync_push_target(&snapshot).as_deref(),
+            Some(held)
+        );
+
+        // No held view on the client (start page) → nothing to push either.
+        let mut start_page_shell = ShellState::new(test_shell_bootstrap_with_start_page());
+        start_page_shell.needs_initial_server_sync = false;
+        assert_eq!(
+            start_page_shell
+                .daemon_active_desync_push_target(&snapshot),
+            None
+        );
+    }
     #[test]
     fn apply_snapshot_result_without_request_resyncs_stale_sidebar_selection_to_active_live_local_session()
      {
@@ -66260,6 +66325,7 @@ mod web_surface_immersion_locks {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            last_activity_epoch_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
