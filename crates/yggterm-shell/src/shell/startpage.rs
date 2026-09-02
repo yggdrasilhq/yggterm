@@ -93,7 +93,28 @@ fn start_page_recent_rows_from_browser_rows(
 /// already dedups on. So the epoch is looked up by id, and a live `remote-cc://`
 /// row inherits the mtime of the transcript it is a running instance of.
 fn start_page_scanned_last_used_epochs(snapshot: &RenderSnapshot) -> HashMap<String, i64> {
-    scanned_last_used_epochs_by_session_id(&snapshot.remote_machines)
+    let mut epochs = scanned_last_used_epochs_by_session_id(&snapshot.remote_machines);
+    // ⛔ LIVE ROWS CARRY THEIR OWN TRUTH (2026-09-02 fs-truth fix): the daemon
+    // stamps each live row with when its PTY was last ACTIVE
+    // (`last_activity_epoch_ms`, seconds here). A live row the scan has no
+    // store row for — a brand-new session, a probe row — used to answer 0 and
+    // depended on the old live-first tier to be seen at all; now its own
+    // activity clock ranks it, exactly like every durable row's mtime does.
+    // Newest sighting wins, matching the scan map above.
+    for session in &snapshot.live_sessions {
+        let Some(ms) = session.last_activity_epoch_ms else {
+            continue;
+        };
+        let epoch = i64::try_from(ms / 1000).unwrap_or(0);
+        if epoch <= 0 || session.id.trim().is_empty() {
+            continue;
+        }
+        epochs
+            .entry(session.id.trim().to_string())
+            .and_modify(|existing| *existing = (*existing).max(epoch))
+            .or_insert(epoch);
+    }
+    epochs
 }
 
 /// The ONE implementation of "when was this session last used", by session id.
@@ -208,9 +229,11 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
             }
             if fresh {
                 let ix = candidates.len();
-                // A running session is the most current thing on the page, and a
-                // stored transcript's mtime cannot express that — a live row often
-                // carries no epoch at all and would sort BELOW week-old files.
+                // Live-ness is NOT a ranking tier any more (2026-09-02 fs-truth
+                // law): it expresses itself through the row's truthful epoch
+                // (scanned last-used / daemon last-activity). Live rows are
+                // pushed FIRST only so the DEDUP keeps the live spelling of a
+                // session — presence and focus-routing, not rank.
                 let is_live =
                     live_paths_for_rank.contains(&normalize_live_session_path(&row.full_path));
                 candidates.push((row, is_live, in_scope, modified_epoch, started_at, ix));
@@ -289,20 +312,16 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
         push_candidate(row.clone(), modified_epoch, String::new(), in_scope);
     }
 
-    // Running sessions first, then recency. Ordering "by recency" was the
-    // 2026-05-25 spec and still governs everything below the live block; live
-    // rows sit above it because "running right now" outranks any file mtime,
-    // and because a live row's epoch is frequently 0.
-    //
-    // ⭐ THEN the scope, which is where a filter used to be. In-scope work leads
-    // the list, exactly as it did when everything else was thrown away — the
-    // difference is that "further down" replaced "gone", and a row the owner is
-    // looking for can now be FOUND rather than only remembered.
+    // ⛔ RANKING LAW (reversed 2026-09-02, owner falsifier — see the twin doc
+    // on `order_candidates_for_startpage` in yggterm-core): recency outranks
+    // live-ness. The old `is_live` tier made a row idle for days — but stamped
+    // "now" by every scan — permanently outrank week-fresh durable work.
+    // A running session keeps its card, dedups to the live spelling, and now
+    // ranks by the SAME truthful epoch everything else ranks by.
     candidates.sort_by(|left, right| {
         right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.2.cmp(&left.2))
+            .2
+            .cmp(&left.2)
             .then_with(|| right.3.cmp(&left.3))
             .then_with(|| right.4.cmp(&left.4))
             .then_with(|| left.5.cmp(&right.5))
@@ -751,8 +770,16 @@ fn start_page_recent_scope_allows_browser_row(
         }
     }
     if let Some(cwd) = scope.cwd.as_deref() {
+        // ⛔ UNKNOWN CWD IS NOT OUT OF SCOPE (2026-09-02 fs-truth law): a row
+        // whose cwd the row data does not carry — a live row whose browser
+        // entry predates its metadata copy — used to `return false` here, and
+        // while the live ranking tier hid that, recency-first ranking made
+        // "unknown" rank BELOW every out-of-scope row. The scope ranks, it
+        // does not drop: on the right machine, a row of unknown cwd stays
+        // in-scope rather than being ranked out; a row with a KNOWN cwd
+        // outside the scope still ranks out below.
         let Some(row_cwd) = row.session_cwd.as_deref() else {
-            return false;
+            return true;
         };
         if !recent_cwd_matches_scope(row_cwd, cwd) {
             return false;

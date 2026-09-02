@@ -1013,33 +1013,25 @@ impl StartpageDurableRow {
 
 /// Startpage ordering — MUST stay single-sourced with `yggterm-shell/src/shell/startpage.rs`.
 ///
-/// Shell ranking is `is_live` > `in_scope` > `modified_epoch` > `started_at` > `insertion_index`.
-/// The verb `in_scope` is always true and `started_at` is empty, so it collapses to
-/// live-first + recency — but the verb MUST go through this same fn so the lie detector
-/// cannot drift. The faithful verb therefore calls `order_for_startpage_with_live_scope`
-/// with the live/scope it learned from `app state` / `snapshot`; the simple recency
-/// fallback below is only for headless oracles that have no GUI state.
-pub fn order_for_startpage(mut rows: Vec<StartpageDurableRow>) -> Vec<StartpageDurableRow> {
-    rows.sort_by(|a, b| {
-        b.modified_epoch_ms
-            .cmp(&a.modified_epoch_ms)
-            .then_with(|| a.session_id.cmp(&b.session_id))
-    });
-    rows
-}
-
-/// Faithful ordering — the exact `candidates.sort_by` the shell uses.
-///
-/// `rows` are `(row, is_live, in_scope, modified_epoch, started_at, insertion_index)`.
-/// Kept here so `server startpage ls` and the shell cannot drift.
+/// ⛔ **RANKING LAW, REVERSED 2026-09-02 (owner falsifier: "the most recent
+/// sessions in dev should be some opencode sessions from ~/gh/yggterm"):**
+/// ranking was `is_live` > `in_scope` > `modified_epoch` > … — live-ness was a
+/// tier ABOVE recency. Combined with the verbs stamping every live row's epoch
+/// with the scan time, that made the top of RECENT WORK a wall of rows reading
+/// "used one second ago" forever, above week-fresh durable work. The page's own
+/// header says "most recently used first", so RECENCY is the law and live-ness
+/// expresses itself through a TRUTHFUL epoch (daemon last-activity / store
+/// mtime), never through rank supremacy: `in_scope` > `modified_epoch` >
+/// `started_at` > `insertion_index`. Presence + dedup-to-live-spelling (the
+/// 2026-08-06 spec) are unchanged — a running session keeps its card and opens
+/// as a focus; it just no longer buys the front row in perpetuity.
 pub fn order_candidates_for_startpage(
     mut candidates: Vec<(StartpageDurableRow, bool, bool, i64, String, usize)>,
 ) -> Vec<StartpageDurableRow> {
     candidates.sort_by(|left, right| {
         right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.2.cmp(&left.2))
+            .2
+            .cmp(&left.2)
             .then_with(|| right.3.cmp(&left.3))
             .then_with(|| right.4.cmp(&left.4))
             .then_with(|| left.5.cmp(&right.5))
@@ -1675,5 +1667,50 @@ mod scan_truth_tests {
         );
         drop(memo);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn rank_row(id: &str, epoch_ms: u128) -> StartpageDurableRow {
+        StartpageDurableRow {
+            session_id: id.to_string(),
+            cwd: "/home/user/gh/widgets".to_string(),
+            title: Some(id.to_string()),
+            generated_title: None,
+            effective_title: Some(id.to_string()),
+            detail: None,
+            kind: crate::SessionKind::Codex,
+            modified_epoch_ms: epoch_ms,
+            storage_path: format!("/home/user/gh/widgets/{id}.jsonl"),
+            display_path: format!("local://{id}"),
+        }
+    }
+
+    /// ⛔ THE FS-TRUTH RANKING LAW (owner falsifier 2026-09-02: "the most
+    /// recent sessions in dev should be some opencode sessions from
+    /// ~/gh/yggterm"). The old `is_live > recency` tier let a live row whose
+    /// epoch was stale rank above week-fresh durable work — and combined with
+    /// the scan-time stamps the verbs used to emit, the top of RECENT WORK was
+    /// a wall of permanently-"now" rows. Recency is the whole law: a STALE
+    /// live row sinks below a fresh durable row, a FRESH live row leads, and
+    /// scope still outranks both.
+    #[test]
+    fn startpage_ranking_is_recency_not_liveness() {
+        let stale_live = rank_row("stale-live", 100_000);
+        let fresh_durable = rank_row("fresh-durable", 900_000);
+        let fresh_live = rank_row("fresh-live", 950_000);
+        let out_of_scope = rank_row("out-of-scope", 990_000);
+
+        let candidates = vec![
+            (stale_live.clone(), true, true, 100, String::new(), 0),
+            (fresh_durable.clone(), false, true, 900, String::new(), 1),
+            (fresh_live.clone(), true, true, 950, String::new(), 2),
+            (out_of_scope.clone(), false, false, 990, String::new(), 3),
+        ];
+        let ordered = super::order_candidates_for_startpage(candidates);
+        let ids: Vec<&str> = ordered.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["fresh-live", "fresh-durable", "stale-live", "out-of-scope"],
+            "scope first, then TRUE recency; live-ness buys presence, not rank"
+        );
     }
 }

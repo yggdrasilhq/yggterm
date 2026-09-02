@@ -78,8 +78,8 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
             Some((faithful_rows, faithful_warnings, live_paths)) => {
                 let total = faithful_rows.len();
                 let mut ordered = faithful_rows;
-                // Faithful builder already applied is_live > in_scope > modified_epoch
-                // via order_candidates_for_startpage — keep it, do not re-rank recency-only.
+                // Faithful builder already applied the fs-truth ranking law
+                // (scope > recency; 2026-09-02) via order_candidates_for_startpage.
                 let truncated = if ordered.len() > limit {
                     ordered.truncate(limit);
                     true
@@ -131,6 +131,23 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
                         }
                     }
                 }
+                // Daemon-measured last activity per live row (2026-09-02 fs-truth
+                // law): the freshest honest epoch a live row can carry.
+                let live_activity_by_id: std::collections::HashMap<String, u128> = snapshot_opt
+                    .as_ref()
+                    .map(|snap| {
+                        snap.live_sessions
+                            .iter()
+                            .filter_map(|s| {
+                                let id = s.id.trim().to_string();
+                                if id.is_empty() {
+                                    return None;
+                                }
+                                s.last_activity_epoch_ms.map(|ms| (id, ms))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let mut all_rows_map: std::collections::HashMap<
                     String,
                     yggterm_core::startpage::StartpageDurableRow,
@@ -162,10 +179,20 @@ pub fn run_server_startpage_ls(store: &SessionStore, args: &[String]) -> anyhow:
                     let is_live = live_set.contains(&row.display_path)
                         || live_set.contains(&row.storage_path)
                         || remote_epoch_by_id.contains_key(&row.session_id);
-                    let epoch_ms = remote_epoch_by_id
+                    // Same truth fold as the faithful path (2026-09-02): daemon
+                    // last-activity outranks nothing — it IS the row's freshest
+                    // epoch when present; max() with the store epoch keeps a
+                    // stale-but-known mtime from being *lowered*.
+                    let epoch_ms = live_activity_by_id
                         .get(&row.session_id)
-                        .map(|e| (*e as u128) * 1000)
-                        .unwrap_or(row.modified_epoch_ms);
+                        .copied()
+                        .or_else(|| {
+                            remote_epoch_by_id
+                                .get(&row.session_id)
+                                .map(|e| (*e as u128) * 1000)
+                        })
+                        .unwrap_or(row.modified_epoch_ms)
+                        .max(row.modified_epoch_ms);
                     let epoch = i64::try_from(epoch_ms / 1000).unwrap_or(0);
                     candidates.push((row, is_live, true, epoch, String::new(), idx));
                 }
@@ -283,7 +310,8 @@ fn try_faithful_startpage_rows(
     // Faithful path — re-derive exactly as `yggterm-shell/src/shell/startpage.rs`
     // does from `server app rows` (browser rows) + `server app state` (scope/live).
     // Uses live daemon telemetry without killing it. Live/session ordering is
-    // is_live > in_scope > modified_epoch > started_at > insertion_index
+    // scope > recency > started_at > insertion_index (2026-09-02 fs-truth law;
+    // live-ness is NOT a rank tier — see order_candidates_for_startpage)
     // via order_candidates_for_startpage — same as the GUI.
     let observer_started = std::time::Instant::now();
     // Ask the already-running GUI directly. The old implementation spawned a
@@ -409,7 +437,7 @@ fn try_faithful_startpage_rows(
     let mut store_rows = yggterm_core::startpage::scan_all_durable_sessions(system_home);
     // Also compute remote_total and build remote durable rows from snapshot
     let (remote_rows, remote_total) = build_remote_durable_rows(&snapshot_json);
-    // Faithful ordering: is_live > in_scope > modified_epoch > started_at > idx
+    // Faithful ordering: scope > recency > started_at > idx (2026-09-02 law)
     // Parse selected scope like GUI does (machine_key + cwd)
     let (scope_machine, scope_cwd, scope_is_live_sessions) = {
         let selected_path = app_state
@@ -541,10 +569,34 @@ fn try_faithful_startpage_rows(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
+            // ⛔ THE SCAN-TIME STAMP WAS THE LIE (owner-caught 2026-09-02): this
+            // row used to carry `modified_epoch_ms: now_ms`, so every live-only
+            // session read as "used one second ago" at every scan tick and, under
+            // the old live-first ranking, permanently buried the durable rows
+            // whose store mtimes held the truth. The truthful epoch for a live
+            // row is when the DAEMON last saw it active
+            // (`last_activity_epoch_ms` on the snapshot's live rows); `0` when
+            // even that is unknown — honest unknown, ranked honestly last.
+            let live_activity_ms: Option<u128> = {
+                let snapshot_json = snapshot_json.as_ref();
+                snapshot_json.and_then(|v| {
+                    v.get("live_sessions")
+                        .and_then(|l| l.as_array())
+                        .and_then(|arr| {
+                            arr.iter()
+                                .find(|s| {
+                                    s.get("id").and_then(|v| v.as_str()) == Some(sid.as_str())
+                                        || s.get("session_path").and_then(|v| v.as_str())
+                                            == Some(display_path.as_str())
+                                })
+                                .and_then(|s| {
+                                    s.get("last_activity_epoch_ms")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|ms| ms as u128)
+                                })
+                        })
+                })
+            };
             let row = yggterm_core::startpage::StartpageDurableRow {
                 session_id: sid.clone(),
                 cwd: cwd.clone(),
@@ -553,7 +605,7 @@ fn try_faithful_startpage_rows(
                 effective_title: label.clone(),
                 detail: None,
                 kind,
-                modified_epoch_ms: now_ms,
+                modified_epoch_ms: live_activity_ms.unwrap_or(0),
                 storage_path: if storage_path.is_empty() {
                     display_path.clone()
                 } else {
@@ -596,6 +648,29 @@ fn try_faithful_startpage_rows(
             true
         })
         .count();
+    // ⛔ LIVE ACTIVITY IS THE FRESHEST TRUTH ABOUT A LIVE ROW (2026-09-02
+    // fs-truth law): fold the daemon's per-row last-activity into the epoch
+    // lookup, taking the MAX with the store/scan epoch — a live row's store
+    // mtime can lag the running CLI by exactly the time since its last write,
+    // and the daemon saw the PTY more recently than that.
+    let live_activity_by_id: std::collections::HashMap<String, u128> = snapshot_json
+        .as_ref()
+        .and_then(|v| v.get("live_sessions"))
+        .and_then(|l| l.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let id = s.get("id").and_then(|v| v.as_str())?.trim().to_string();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    s.get("last_activity_epoch_ms")
+                        .and_then(|v| v.as_u64())
+                        .map(|ms| (id, ms as u128))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut candidates: Vec<(
         yggterm_core::startpage::StartpageDurableRow,
         bool,
@@ -611,10 +686,16 @@ fn try_faithful_startpage_rows(
             || live_set.contains(&format!("remote-cc://{}", row.session_id))
             || live_set.contains(&format!("remote-session://{}", row.session_id))
             || live_set.contains(&format!("local://{}", row.session_id));
-        let epoch_ms = remote_epoch_by_id
+        let epoch_ms = live_activity_by_id
             .get(&row.session_id)
-            .map(|e| (*e as u128) * 1000)
-            .unwrap_or(row.modified_epoch_ms);
+            .copied()
+            .or_else(|| {
+                remote_epoch_by_id
+                    .get(&row.session_id)
+                    .map(|e| (*e as u128) * 1000)
+            })
+            .unwrap_or(row.modified_epoch_ms)
+            .max(row.modified_epoch_ms);
         let epoch = i64::try_from(epoch_ms / 1000).unwrap_or(0);
         let in_scope = if scope_is_live_sessions {
             is_live
