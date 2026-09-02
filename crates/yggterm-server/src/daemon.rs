@@ -1183,7 +1183,9 @@ fn hot_update_idle_threshold_ms() -> u64 {
 /// `true` when the operator has explicitly opted out of the idle gate (e.g. an
 /// agent/dev deploy that must land now). Cache preservation is the default
 /// priority, so this is an explicit override rather than something `--force`
-/// implies (`--force` only bypasses the same-version target check).
+/// implies (`--force` bypasses the same-version target check, routing a
+/// same-version rebuild onto the cold-with-persist swap at a quiet window —
+/// see [`same_version_cold_swap_armed`]).
 ///
 /// ⛔ It waives WAITING, not SAFETY. A session whose state does not outlive its
 /// PTY still blocks — see [`DaemonRuntime::hot_update_idle_gate_blockers`]. An
@@ -10127,7 +10129,64 @@ impl DaemonRuntime {
                     .iter()
                     .cloned()
                     .collect::<HashSet<_>>();
-                if hot_restart_should_defer_for_session_survival(&owned_terminal_session_keys) {
+                // ⛔ THE DOOMED-SPAWN GUARD FOR A SAME-VERSION TARGET (measured
+                // live 2026-09-02 11:42, `disk_binary_replaced_self_retire` on a
+                // lane deploy that did not bump the version): the preserving arm
+                // spawns the successor pointing at THIS daemon's own version
+                // socket. A same-version successor cannot bind it —
+                // `bind_lock_busy`, exit 0 — yet the handoff still answers
+                // "preserving N runtimes", and the caller then pins this process
+                // on the stale build for the LIFE OF THE PROCESS (the poll's
+                // `Lingering` arm). Same-version rebuilds are the COMMON deploy
+                // shape — every ygg-ci lane merge that is not a release roll.
+                // For a same-version target the honest swap is the
+                // COLD-WITH-PERSIST arm below: yield the socket, respawn,
+                // restore from persisted state. That destroys PTY state, so it
+                // is safe ONLY at a quiet window — the idle gate owns that
+                // answer. A gate block surfaces as an ERROR so the self-retire
+                // poll retries at its interval: same-version deploys then
+                // self-activate at the next quiet window instead of pinning the
+                // stale build until a human intervenes.
+                let same_version_target = hot_restart_target_is_same_version(expected_version.as_deref());
+                let same_version_gate_block_reason = if same_version_target
+                    && force
+                    && hot_restart_should_defer_for_session_survival(
+                        &owned_terminal_session_keys,
+                    ) {
+                    let blockers =
+                        self.hot_update_idle_gate_blockers(&owned_terminal_session_keys);
+                    if blockers.is_empty() {
+                        append_trace_event(
+                            self.store.home_dir(),
+                            "daemon",
+                            "lifecycle",
+                            "hot_restart_same_version_cold_swap_armed",
+                            serde_json::json!({
+                                "reason": reason,
+                                "owned_terminal_session_count": owned_terminal_session_keys.len(),
+                                "owned_terminal_session_keys": &owned_terminal_session_keys,
+                                "server_version": SERVER_PROTOCOL_VERSION,
+                                "server_build_id": current_build_id(),
+                                "pid": std::process::id(),
+                            }),
+                        );
+                        None
+                    } else {
+                        hot_restart_block_reason_summary(&blockers)
+                            .or_else(|| Some("idle gate blocked".to_string()))
+                    }
+                } else {
+                    None
+                };
+                let same_version_cold_swap = same_version_cold_swap_armed(
+                    expected_version.as_deref(),
+                    force,
+                    hot_restart_should_defer_for_session_survival(&owned_terminal_session_keys),
+                    same_version_gate_block_reason.is_none(),
+                );
+                if hot_restart_should_defer_for_session_survival(&owned_terminal_session_keys)
+                    && !same_version_cold_swap
+                {
                     if let Some(duplicate_owner) = hot_restart_duplicate_runtime_owner_status(
                         self.store.home_dir(),
                         expected_version.as_deref(),
@@ -10177,14 +10236,23 @@ impl DaemonRuntime {
                             )),
                         });
                     }
-                    if !force
-                        && expected_version
-                            .as_deref()
-                            .is_none_or(|version| version == SERVER_PROTOCOL_VERSION)
-                    {
-                        return Ok(ServerResponse::Error {
-                            message: "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string(),
-                        });
+                    if same_version_target {
+                        // ⛔ A SAME-VERSION SUCCESSOR CAN NEVER BIND THIS SOCKET
+                        // while we hold it (`bind_lock_busy`, measured). With
+                        // force this is the idle-gate deferral, not a refusal:
+                        // the self-retire poll retries, and the swap fires at
+                        // the next quiet window. Without force the long-standing
+                        // message stands.
+                        let message = if force {
+                            same_version_gate_block_reason
+                                .map(|reason| {
+                                    format!("same-version swap deferred at the idle gate: {reason}")
+                                })
+                                .unwrap_or_else(|| "same-version swap deferred".to_string())
+                        } else {
+                            "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string()
+                        };
+                        return Ok(ServerResponse::Error { message });
                     }
                     // NO idle gate here. This handoff PRESERVES every runtime —
                     // its own success message is "preserving N live terminal
@@ -20375,6 +20443,49 @@ fn self_retire_handoff_disabled() -> bool {
     )
 }
 
+/// Is this HotRestart target the SAME server version this process already is?
+/// `None` (a binary that reports no version) counts as same-version: nothing
+/// downstream can tell it apart from ourselves on the wire.
+fn hot_restart_target_is_same_version(expected_version: Option<&str>) -> bool {
+    expected_version.is_none_or(|version| version == SERVER_PROTOCOL_VERSION)
+}
+
+/// Whether a same-version HotRestart takes the COLD-WITH-PERSIST arm instead of
+/// the preserving handoff.
+///
+/// ⛔ THE DOOMED-SPAWN GUARD (measured live 2026-09-02 11:42): a same-version
+/// successor binds the SAME version socket this daemon holds, so the spawned
+/// child dies `bind_lock_busy` and the preserving arm answers
+/// "preserving N runtimes" into a void — the daemon then pins itself on the
+/// stale build for the life of the process. Same-version rebuilds are the
+/// COMMON deploy shape (every ygg-ci lane merge that is not a release roll).
+/// The honest same-version swap is: yield the socket, respawn, restore from
+/// persisted state — armed only when `force` (an agent-style deploy), when we
+/// own runtimes (the preserving arm's own precondition), and when the idle
+/// gate is CLEAR (the cold arm destroys PTY state; the gate is what makes that
+/// safe). A gate block keeps the request in the preserving arm, which now
+/// answers a deferral error the self-retire poll retries at its interval.
+fn same_version_cold_swap_armed(
+    expected_version: Option<&str>,
+    force: bool,
+    owns_terminal_runtimes: bool,
+    idle_gate_blockers_empty: bool,
+) -> bool {
+    hot_restart_target_is_same_version(expected_version)
+        && force
+        && owns_terminal_runtimes
+        && idle_gate_blockers_empty
+}
+
+/// Can a live daemon at `target` ever SATISFY a swap owed by one at `mine`?
+/// Only strict advancement counts: a same-version target is satisfied by the
+/// owing process ITSELF, so it can never be waited for.
+fn swap_target_is_ahead(target: &str, mine: &str) -> bool {
+    parse_daemon_version_triple(target)
+        .zip(parse_daemon_version_triple(mine))
+        .is_some_and(|(target, mine)| target > mine)
+}
+
 /// Pure parser for the kill-switch env value (set/unset/`0`/`false` = enabled).
 /// Split out so it is testable without mutating the shared process environment.
 #[cfg(target_os = "linux")]
@@ -20905,7 +21016,17 @@ fn hot_restart_swap_step(
     match attempt_self_retire_preserving_handoff(endpoint, home_dir, exe_link, owned) {
         Some(handoff) => {
             if let Some(target_version) = handoff.target_version.as_deref() {
-                remember_hot_restart_swap_target(target_version);
+                // ⛔ REMEMBER ONLY A TARGET THAT CAN EVER BE SATISFIED. A
+                // same-version target is "satisfied" by THIS process — so
+                // remembering it made every later poll answer `Lingering`
+                // (`local_target.is_some()`), and a daemon that handed off into
+                // a doomed same-version spawn stayed pinned on its stale build
+                // for the life of the process (measured 2026-09-02 11:42). An
+                // ahead target still earns the memory: it is the half that
+                // survives a peer clearing the queue file.
+                if swap_target_is_ahead(target_version, SERVER_PROTOCOL_VERSION) {
+                    remember_hot_restart_swap_target(target_version);
+                }
             }
             queue_self_retire_swap(home_dir, &handoff, retire_trigger, now_ms);
             SwapStep::HandedOff
@@ -34083,6 +34204,69 @@ mod tests {
         assert!(super::parse_self_retire_handoff_disabled(Some("1")));
         assert!(super::parse_self_retire_handoff_disabled(Some("true")));
         assert!(super::parse_self_retire_handoff_disabled(Some(" yes ")));
+    }
+
+    /// ⛔ THE SAME-VERSION SWAP LANE (owner-caught 2026-09-02: a ygg-ci lane
+    /// merge that does not bump the version left the daemon pinned on the stale
+    /// build — the spawned successor died `bind_lock_busy` on its own socket
+    /// and the handoff still answered "preserving N runtimes"). The cold
+    /// arm is armed ONLY for a same-version target, forced, owning runtimes,
+    /// with a CLEAR idle gate; every other shape keeps its existing lane.
+    #[test]
+    fn same_version_cold_swap_armed_only_for_forced_quiet_same_version_targets() {
+        let current = super::SERVER_PROTOCOL_VERSION;
+        // The lane this fix exists for: same version + force + owned + quiet.
+        assert!(super::same_version_cold_swap_armed(
+            Some(current),
+            true,
+            true,
+            true
+        ));
+        // A version-bump target keeps the PRESERVING handoff (proven path:
+        // `AllMoved`, successor binds its own version socket).
+        assert!(!super::same_version_cold_swap_armed(
+            Some("99.0.0"),
+            true,
+            true,
+            true
+        ));
+        // A busy gate must NOT arm the cold arm — it destroys PTY state.
+        assert!(!super::same_version_cold_swap_armed(
+            Some(current),
+            true,
+            true,
+            false
+        ));
+        // Without force (the GUI button's default shape), behaviour is
+        // unchanged: the preserving arm answers the long-standing error.
+        assert!(!super::same_version_cold_swap_armed(
+            Some(current),
+            false,
+            true,
+            true
+        ));
+        // Nothing owned → the plain cold restart already handled it before.
+        assert!(!super::same_version_cold_swap_armed(
+            Some(current),
+            true,
+            false,
+            true
+        ));
+        // An unreporting binary counts as same-version (nothing on the wire
+        // can tell it apart from ourselves).
+        assert!(super::same_version_cold_swap_armed(None, true, true, true));
+    }
+
+    /// A swap target a live daemon at OUR version already satisfies can never
+    /// be waited for — remembering it pinned the poll in `Lingering` forever.
+    #[test]
+    fn swap_target_is_ahead_requires_strict_advancement() {
+        let mine = super::SERVER_PROTOCOL_VERSION;
+        assert!(!super::swap_target_is_ahead(mine, mine));
+        assert!(super::swap_target_is_ahead("99.0.0", mine));
+        assert!(!super::swap_target_is_ahead("0.0.1", mine));
+        // Unparseable targets are never "ahead" — the safe direction.
+        assert!(!super::swap_target_is_ahead("not-a-version", mine));
     }
 
     #[cfg(unix)]
