@@ -3845,7 +3845,7 @@ pub struct SnapshotSessionView {
     /// honest unknown, never synthesized. serde(default) keeps older
     /// snapshots deserializable.
     #[serde(default)]
-    pub last_activity_epoch_ms: Option<u128>,
+    pub last_activity_epoch_ms: Option<u64>,
     pub ssh_target: Option<String>,
     pub ssh_prefix: Option<String>,
     // Observability (campaign grid-squish diagnosis): the PTY's current grid
@@ -4309,7 +4309,7 @@ pub struct ManagedSessionView {
     /// synthesizes a recency for a row the daemon could not measure
     /// (`None` = unknown, epoch 0, ranked honestly last). 2026-09-02 fs-truth
     /// law: recency outranks live-ness, so the epoch must be real.
-    pub last_activity_epoch_ms: Option<u128>,
+    pub last_activity_epoch_ms: Option<u64>,
     pub ssh_target: Option<String>,
     pub ssh_prefix: Option<String>,
     pub stored_preview_hydrated: bool,
