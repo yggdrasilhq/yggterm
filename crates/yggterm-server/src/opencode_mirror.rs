@@ -417,6 +417,56 @@ impl YggtermServer {
                         .retain(|m| m.label != VIEWING_SESSION_METADATA);
                 }
             }
+            // ⭐ THE MIRROR-TICK REBIND: the anchor's bound IDENTITY follows
+            // the session the TUI is actually rendering. The title follow and
+            // the Viewing stamp are witnesses; this makes the underlying state
+            // true — the row's id and its resume command become the viewed
+            // session's, so the owner's click-to-resume lands in the session
+            // he was LOOKING at (the handoff rule), a cold restart restores
+            // that session, and the Dynamic title chore reads the right store
+            // entry. Measured gap (dev, 2026-09-02): uuid-keyed anchors kept
+            // their birth uuid as `id` for days — the phantom-resume class,
+            // three live TUIs booting on ids no store ever held — while the
+            // TUI rendered entirely different sessions.
+            //
+            // Rails: the anchor must be LIVE (a dead row renders nothing —
+            // rebinding one would aim a resume at a ghost); the service's
+            // focus stream is the vouch (the same stream tab-row births
+            // already trust); and the rebind is a no-op on every tick where
+            // the bound id already agrees, so a quiet TUI costs one compare.
+            let anchor_live = self.sessions.get(&anchor_key).is_some_and(|a| {
+                a.terminal_process_id.is_some()
+                    || matches!(
+                        a.launch_phase,
+                        crate::TerminalLaunchPhase::Running
+                            | crate::TerminalLaunchPhase::RemoteBootstrap
+                    )
+            });
+            if anchor_live {
+                if let Some(ses_id) = viewing.clone() {
+                    let bound = self.sessions.get(&anchor_key).map(|a| a.id.clone());
+                    if bound.as_deref() != Some(ses_id.as_str())
+                        && self.apply_agent_runtime_session_id_to_live_session_service_vouched(
+                            &anchor_key,
+                            &ses_id,
+                        )
+                    {
+                        if let Ok(home_dir) = crate::resolve_yggterm_home() {
+                            yggterm_core::append_trace_event(
+                                &home_dir,
+                                "daemon",
+                                "opencode_mirror",
+                                "anchor_rebound_to_viewed_session",
+                                serde_json::json!({
+                                    "anchor": anchor_key,
+                                    "bound_id": bound,
+                                    "viewed_session": ses_id,
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
             if !explicit {
                 if let Some(newest) = active
                     .iter()
@@ -774,6 +824,78 @@ mod anchor_tests {
             Some(live),
             "a RUNNING TUI outranks a dead uuid row in anchor selection",
         );
+    }
+
+    #[test]
+    fn the_anchor_rebinds_its_identity_to_the_session_it_is_viewing() {
+        let (mut server, _dead, _live) = server_with_two_anchors();
+        // The real plane's rows carry Cwd; the rebind's birth-command rebuild
+        // reads it to recompose the resume.
+        for row in server.sessions.values_mut() {
+            crate::upsert_session_metadata(
+                &mut row.metadata,
+                "Cwd",
+                "/home/user/proj".to_string(),
+            );
+        }
+        let viewed = |id: &str, viewed: u128| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(format!("Tab {id}")),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: viewed,
+            running: true,
+        };
+        // Two open tabs; ses_b was looked at LAST, so it is what the TUI
+        // renders right now.
+        let active = vec![
+            viewed("ses_a0000000000000000000000001", 100),
+            viewed("ses_b0000000000000000000000002", 200),
+        ];
+        server.apply_opencode_tab_mirror(&active);
+        let anchor_key = server.opencode_anchor_key().expect("an anchor exists");
+        let anchor = server.sessions.get(&anchor_key).expect("anchor row");
+        // The anchor was born wearing its row uuid as its id — the
+        // phantom-resume class. After the tick its identity is the session
+        // the human is LOOKING at, and the resume command says so.
+        assert_eq!(
+            anchor.id, "ses_b0000000000000000000000002",
+            "identity follows the viewed session, not the birth uuid",
+        );
+        assert!(
+            anchor.launch_command.contains("ses_b0000000000000000000000002"),
+            "the resume command must name the rebound session, got: {}",
+            anchor.launch_command,
+        );
+    }
+
+    #[test]
+    fn a_dead_anchor_is_never_rebound_to_a_viewed_session() {
+        let (mut server, dead, live) = server_with_two_anchors();
+        // Nothing is rendering: strip the live marks from BOTH rows so the
+        // anchor pick falls back to first-qualified on a corpse. A rebind
+        // here would aim a resume at a ghost.
+        for row in server.sessions.values_mut() {
+            row.launch_phase = crate::TerminalLaunchPhase::Queued;
+            row.terminal_process_id = None;
+        }
+        let viewed = |id: &str, viewed: u128| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(format!("Tab {id}")),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: viewed,
+            running: true,
+        };
+        let active = vec![viewed("ses_b0000000000000000000000002", 200)];
+        server.apply_opencode_tab_mirror(&active);
+        for key in [dead, live] {
+            let row = server.sessions.get(&key).expect("fixture row survives");
+            assert_ne!(
+                row.id, "ses_b0000000000000000000000002",
+                "a dead anchor must not adopt the viewed session id",
+            );
+        }
     }
 
     #[test]
