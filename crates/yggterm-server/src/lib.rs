@@ -19065,6 +19065,23 @@ fn local_remote_bootstrap_executable_from_current(current: &Path) -> Option<Path
 
 fn preferred_install_headless_bootstrap_executable(current: &Path) -> Option<PathBuf> {
     let context = detect_install_context(current).ok()?;
+    // ⛔ THE INSTALL MUST BE ABOUT THIS BINARY (2026-09-03). `detect_install_context`
+    // falls back to ambient machine state — the yggterm home's record, a management
+    // override — when no install state names `current` itself, so a fixture, sandbox or
+    // development binary silently inherited THIS machine's deployed companion. Measured
+    // the day the deploy started writing `install-state.json`: six bootstrap/legacy
+    // tests went red on clean main, /tmp fixtures resolving to
+    // `~/.yggterm/bin/yggterm-headless`. An install preference is a claim that two
+    // binaries ship as a pair; it is honoured only when `current` lives under the
+    // install root it was read from. Every real install keeps it (the root is an
+    // ancestor of its binaries — the direct-install case by construction); a stranger
+    // falls through to adjacency, which names the pair it actually ships with (a dev
+    // `target/debug/yggterm` gets its own freshly built headless, not the deployed
+    // one — the old answer was a version-mismatch footgun wearing a preference).
+    let root = context.managed_root.as_ref()?;
+    if !current.starts_with(root) {
+        return None;
+    }
     let preferred = context.preferred_executable.as_ref()?;
     let parent = preferred.parent()?;
     for name in headless_bootstrap_file_names(preferred) {

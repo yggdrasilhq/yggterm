@@ -588,6 +588,34 @@ fn find_direct_install_state_scoped(
     Ok(None)
 }
 
+/// The WRITE-scoped install finder: ancestors of `target_executable` plus the
+/// management override, but NEVER the ambient home fallback.
+///
+/// ⛔ A PROMOTE IS A WRITE, AND A WRITE NEEDS AN OWNER (2026-09-03). The read
+/// finder falls back to the machine's ambient install state when no state
+/// names the binary itself — correct for reads (a `~/.local/bin` binary wants
+/// its install's record). `promote_direct_install_active_version` used the
+/// same finder, so an unrelated binary resolved to the machine's real install
+/// and REWROTE its record: measured live, the fleet's `install-state.json`
+/// carried `active_version 2.8.5` with a deleted /tmp fixture as its
+/// executable — written by the "unmanaged install" unit test, silently
+/// breaking the client-restart door the record exists for. A promote writes
+/// `target_executable` INTO the record; it runs only against the install that
+/// owns that path (an ancestor, or the override root containing it).
+fn find_direct_install_state_for_promote(
+    target_executable: &Path,
+) -> Result<Option<(PathBuf, DirectInstallState)>> {
+    if let Some(root) = std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT)
+        .map(PathBuf::from)
+        .filter(|root| root.join(INSTALL_STATE_FILENAME).is_file())
+        && target_executable.starts_with(&root)
+        && let Some(state) = load_direct_install_state(&root)?
+    {
+        return Ok(Some((root, state)));
+    }
+    find_direct_install_state_scoped(target_executable, None)
+}
+
 fn load_direct_install_state(root: &Path) -> Result<Option<DirectInstallState>> {
     let path = root.join(INSTALL_STATE_FILENAME);
     if !path.is_file() {
@@ -721,14 +749,11 @@ pub fn promote_direct_install_active_version(
     target_version: &str,
     target_executable: &Path,
 ) -> Result<bool> {
-    let found = if let Some(root) = std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT)
-        .map(PathBuf::from)
-        .filter(|root| root.join(INSTALL_STATE_FILENAME).is_file())
-    {
-        load_direct_install_state(&root)?.map(|state| (root, state))
-    } else {
-        find_direct_install_state(target_executable)?
-    };
+    // ⛔ One finder, write-scoped: the env override is honoured only when it
+    // owns `target_executable`, and the ambient home fallback never is (see
+    // `find_direct_install_state_for_promote`). An unconditional env arm here
+    // would re-open the same corruption through the management override.
+    let found = find_direct_install_state_for_promote(target_executable)?;
     let Some((root, state)) = found else {
         return Ok(false);
     };
