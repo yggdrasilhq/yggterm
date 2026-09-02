@@ -5602,6 +5602,26 @@ below a third.
 
 **Status:** OPEN
 
+**RE-MEASURED 2026-09-02 22:30–23:44 (guihost, the owner's freeze report —
+"UI freeze while browsing with ychrome, force-restarted"):** 160 `ui/block`
+spans in ~50 min, **p50 541 ms / p95 1,670 ms / max 3,340 ms, 105 s total
+blocked** — an order over this entry's bar (≤1/min, p95 ≤ 50 ms). Shape, from
+the per-minute census: a churn storm 22:57–23:01 (~110 blocks of 300–600 ms —
+the post-restart adoption window), an escalation 23:04–23:06 (blocks reaching
+2,069 / 3,365 ms), and the freeze tail 23:36–23:43 — `app_control/watchdog_
+spawned` 580 ms, `daemon_recovery/current_daemon_existing_before_cleanup`
+**3,365 ms**, `app_control/request_begin` 464 ms, `terminal_mount/js_ready`
+750 ms, **`web_surface/popup_adopted` 226 ms** (a ychrome popup adopted
+mid-browse), then the owner's force restart. Witness census across the window:
+`terminal_mount/*` (switching) and `app_control/*` (verbs/modals) are the
+top named predecessors — exactly this entry's two halves — with ~47 idle
+blocks naming nothing. Composed with tonight's deploy churn (four GUI
+restarts 19:44–20:5x, see the deploy-churn law in the campaign door) and
+`cli/refresh_managed_codex` blocking spans escalating 189 s → 229 s → **438 s**
+across three perf incidents. The freeze force-restart is the saturation
+presentation this entry already documented; the ychrome popup adoption as a
+UI-thread block witness is NEW evidence for the [11.24] web-surface lane.
+
 First measured 2026-08-20, with the `ui/block` watchdog live.
 
 The UI-block watchdog now names what the zero-incident freeze class was. In its first 30 minutes
