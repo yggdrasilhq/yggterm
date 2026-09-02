@@ -25552,6 +25552,25 @@ opencode the store is the service + `session_v2`/`session` by id; a uuid that an
 neither must refuse the restore or demote the row before the Connect line is offered. The
 restore-metadata half (wrong CLI's verb) is fixed on the fs-truth lane (bug B1).
 
+### ⛔ CORRECTION (2026-09-02 ~21:10, live proof session) — "ether" was the wrong word
+
+Live verification after the 3.2.40 handover falsified half of the appendix above. The
+`d4090efe` TUI is **not** an ether session: `server screen` showed it MID-TURN running real
+work (GLM-5.3-flash, a `grep` in a worktree, 478K context), and the service API
+(`/api/session`) shows the session it renders is `ses_f9e245d72…` — "Continue ymacs
+campaign", 981K input tokens. What actually happened when a restore ran
+`opencode2 --auto --session <row-uuid>` on an id no store held: **opencode2 minted a fresh
+`ses_` id and carried on** — so the defect here is not "a session that cannot be resumed"
+but **identity divergence: the row key, the `--session` argument, and the CLI's real session
+id are three different strings, and TWO rows now render ONE conversation** (the legacy uuid
+row's PTY + the `ses_` mirror row). The uuid ids remain absent from every store table
+(re-checked 21:00), so the store-probe story stands; the "cannot be resumed / blank session"
+inference does not — for opencode2 `--auto`, an unknown id starts a live session, it does not
+fail. The [11.28] refusal guidance still applies to CLIs that fail QUIETLY (antigravity's
+`warning:` + fresh prompt); opencode2 needs the OTHER half: the row must REBIND to the id the
+CLI actually minted (the identity poll should ask the service's active set), so one
+conversation stops owning two rows.
+
 ## ⛔ [99.1] A ROW WHOSE CLI HAS DIED IS STILL ADVERTISED AS LIVE, AND REPORTS `idle`
 
 **Status:** OPEN
