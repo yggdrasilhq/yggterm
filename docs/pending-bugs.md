@@ -104,20 +104,43 @@ order minus the deleted row); a second delete moves nothing else.
 
 ## ⛔ [11.43] THE VIEWPORT SWITCHES ITSELF TO THE STARTPAGE VIEW AFTER SOME TIME
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — lane `trace/startpage-hijack` (`7584907cf` + merge
+`f7bb90131`, 3.2.39, wire stamp re-cut). LIVE PROOF OWED on a 3.2.39 GUI.
 
-Owner report (2026-09-02): "after some time, from time to time, my viewport
-changes to startpage view" — recurring, timer-shaped, reproducible enough that
-he expects it to come back. Not yet root-caused. Suspect plane: the GUI's
-periodic chores (snapshot refresh / hot-update convergence / auto-titlebar
-dwell) racing `WorkspaceViewMode` — a chore landing while the active session
-is briefly absent from a snapshot could flip the view to startpage and never
-flip back.
+**Root cause, measured 2026-09-02 18:17–18:25** (event-trace.g1788352723860, guihost):
+the "chore racing a snapshot" suspicion was wrong. The sequence was:
 
-**What would falsify it being fixed:** an hour of idle use with zero
-uncommanded `WorkspaceViewMode` transitions (telemetry +
-`active_view_mode` in `server app state` sampled before/after each chore
-tick).
+1. `18:17:27` — a `terminal new --no-activate` create (usability-check level-4
+   probe `local://93f088d6`) was born **ACTIVE**: the flag died at the GUI local
+   arm, which called `start_local_session_seated` with no activate field — the
+   wire (`ServerRequest::StartLocalSession`) could not carry it, so the daemon
+   inserted `launch_now=true, activate=true` and moved the active session off
+   the owner's row (`insert_live_session_with_launch_options` activation).
+2. `18:17:33` — the probe's reap hit `remove_live_session`, found the probe
+   ACTIVE (it had never should have been), and cleared the pointer to `None`
+   → the GUI fell to the startpage (owner screenshot 18:18).
+3. `18:20–18:25` — every background attach while active stayed `None` wrote the
+   `request_terminal_launch_preserving_active` /
+   `launch_preserving_active_had_none` flip-flop pair (`user_gesture:false`) —
+   the double-write churn the 18:19 host-panic heartbeat reported as "UI
+   thread blocking 7 times a minute".
+
+Fix: `activate` travels on the wire to the daemon (the viewport decision is
+made where the viewport state lives); a non-activating create skips
+`ensure_terminal_for_active` (the row's PTY stays lazy by contract); the
+shape stamp re-cut with the version bump in the same commit. Sibling halves
+filed, NOT fixed: **[startpage-hijack-B]** (the preserve-active launch writes
+its restore as a second activation — churn while active is None) and
+**[startpage-hijack-C]** (a daemon-side remove of the ACTIVE row still drops
+to `None`/startpage instead of falling back to the next row — needs a
+behavior ruling, the current test pins clear-to-None).
+
+**What would falsify it being fixed:** on a 3.2.39 GUI, run
+`scripts/usability-check.sh` (level 4 creates and reaps a probe): the owner's
+active session does not move, the reaped probe never appears as active, and
+an hour of use shows zero uncommanded `WorkspaceViewMode` transitions. Until
+the GUI itself is 3.2.39, a `--no-activate` create still drops the flag
+client-side — the daemon alone cannot prove this fix.
 
 ## ⛔ [11.44] IN A FULLSCREEN TUI WITHOUT MOUSE TRACKING THE WHEEL IS DEAD — NO ALTERNATE-SCROLL TRANSLATION
 
@@ -160,6 +183,18 @@ arrive at the PTY); in a mouse-tracking TUI, wheel events arrive as mouse
 reports and nothing scrolls locally.
 
 ## ⛔ [11.38] THE GUI BURNS UP TO A CORE AND THE WEBVIEW RETENTION CLIMBS ~300 MB/h UNDER STREAMING — AND THE FLOOD REGIME'S ENGAGEMENT IS UNVERIFIABLE (the owner's heat + leak report)
+
+**FLOOD SUB-QUESTION ANSWERED 2026-09-02 (Lane A live data):** the flood gate
+ENGAGES and is row-type-agnostic. One GUI-generation census
+(event-trace.g1788352723860, guihost, 17:45–19:00): `flood_mode` edges with
+`active=1` on the SSH-shell row (17 on, ema 335–65,440 chars/s) AND on every
+streaming remote-opencode row — 01a043ae (4 on, peak 66,924), 06c6e80b (7 on,
+35,791), d4090efe (9 on, 54,327), e2470eef (13 on, 30,919), 7e7d6c5e (1 on,
+11,751) — framing at `frame_ms=66` per the budget. The gate CYCLES with burst
+shape (on/off edges interleave as the EMA crosses and decays), so the
+2026-09-01 "zero flood_mode edges" window was an EMA-below-threshold lull
+between bursts, not a disengaged gate. The 2026-09-01 heat + WebKit retention
+halves of this entry remain OPEN.
 
 **Status:** OPEN
 
@@ -25683,3 +25718,33 @@ live row exists. ⚠ This is a BEHAVIOR RULING, not a bugfix: the current test
 clear-to-None, and plain-shell close semantics may WANT the startpage (a closed shell
 has no store to fall back to). Needs the owner's word or a spec note before the code
 moves; not fixed alongside the activate half for exactly that reason.
+
+---
+
+## ⛔ [traffic-light] THE SIDEBAR MACHINE DOT STAYS AMBER ("cached") LONG AFTER THE DAEMON'S REMOTE-MACHINE HEALTH WENT HEALTHY
+
+**Status:** OPEN — measured 2026-09-02, guihost.
+
+Owner screenshots 18:05 and 18:18 show the `dev` machine row's dot amber in
+the tree while every session under it was green. The daemon's
+`remote_machine/refresh_end` for dev said `"health":"healthy"` from
+`17:45:51` — sixteen seconds after the 17:45 GUI restart — and on every one
+of 32 subsequent refreshes. The GUI's machine dot is fed by
+`machine_display_health` (state.rs), which promotes `Cached → Healthy` only
+when `remote_deploy_state == Ready` AND `scanned_sessions > 0` IN THE GUI'S
+COPY of the machine snapshot — one of those two fields evidently stayed
+stale for 20+ minutes while the daemon's truth was healthy. Two ambers, one
+color: the same screenshot also carried a session-row amber (that one was
+`input_unanswered` ATTENTION on `remote-opencode://dev/7e7d6c5e`,
+`unans_ms 105136` at 18:03, self-cleared by 18:20 — a different mechanism
+sharing the vocabulary slot).
+
+⇒ Recommended: the GUI should adopt `remote_machine.health` from the
+daemon's refresh result verbatim (the daemon owns reachability truth; the
+GUI re-deriving it from a cached deploy-state copy is a second source of
+truth), and the machine-dot legend needs to distinguish cached-amber from
+attention-amber at a glance (label suffix or tooltip is not enough when the
+owner reads color). Also repro-question: amber dots also appeared on FOLDER
+rows under the machine subtree (`/home/user`, `.ssh`) — the group-dot painter
+only knows machine-health and busy-blue, so confirm what paints those
+before touching the vocabulary.
