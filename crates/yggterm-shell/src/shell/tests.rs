@@ -66120,6 +66120,23 @@ mod web_surface_immersion_locks {
             "the tab mirror's session id outranks the row's uuid seat"
         );
 
+        // ⛔ THE UUID FALLBACK IS ONLY A SESSION ID WHEN THE CLI SAID SO AT
+        // BIRTH. A self-minting CLI's row uuid is the yggterm SEAT — a
+        // uuid-keyed TUI window row must not present its seat under the
+        // registry's session label.
+        let mut seat_only = minimal_opencode_row();
+        seat_only.metadata = vec![SessionMetadataEntry {
+            label: "UUID",
+            value: "11111111-2222-4333-8444-555555555555".to_string(),
+        }];
+        let (label, value) =
+            metadata_session_identity(&seat_only).expect("an identity line exists");
+        assert_eq!(
+            label, "Session id",
+            "a self-minting CLI's row uuid is a SEAT — the generic label only"
+        );
+        assert_eq!(value, "11111111-2222-4333-8444-555555555555");
+
         // And the dynamicity entries surface what the row is tied to RIGHT
         // NOW: the viewed session on an anchor, the mirrored session on a tab.
         let mut anchor = minimal_opencode_row();

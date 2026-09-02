@@ -34,6 +34,10 @@ pub const TAB_SESSION_ID_METADATA: &str = "Tab Session Id";
 /// uuid-keyed anchor row is not A session, it is A WINDOW onto whichever
 /// session is focused, and this entry names it.
 pub const VIEWING_SESSION_METADATA: &str = "Viewing Tab Session Id";
+/// The one-time verdict of asking whether a legacy row's `--session` arg
+/// names a session the CLI could actually resume. Stamped so the 1-second
+/// mirror loop never re-opens the store under the daemon lock.
+pub const LAUNCH_SESSION_PROBE_METADATA: &str = "Launch Session Probe";
 pub const SPAWN_BUDGET_PER_TICK: usize = 1;
 const VIEWED_METADATA: &str = "Tab Viewed Ms";
 
@@ -500,6 +504,22 @@ impl YggtermServer {
                 );
             }
         }
+        // LAST: reconcile legacy rows' launch identities (rebind a real
+        // `--session` arg; demote a phantom one). Runs every tick but is
+        // memoized per row by its verdict stamp, so the store probe under the
+        // lock happens once per row ever.
+        let reconciled = self.reconcile_opencode_row_identities(active);
+        if reconciled > 0 {
+            if let Ok(home_dir) = crate::resolve_yggterm_home() {
+                yggterm_core::append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "opencode_mirror",
+                    "identity_reconcile",
+                    serde_json::json!({ "reconciled": reconciled }),
+                );
+            }
+        }
     }
 
     /// The live opencode TUI row (the mirror's seating anchor) and the next
@@ -558,6 +578,219 @@ impl YggtermServer {
             })
             .count();
         Some(format!("{base}.{}", used + 1))
+    }
+
+    /// The `--session <arg>` a row's launch command names, if any.
+    ///
+    /// The wrapper quotes its tokens (`opencode2 '--auto' '--session' 'x'`), so
+    /// the scan is token-wise with the quotes stripped — a `contains("--session")`
+    /// substring test would find the flag and then mis-take the NEXT word.
+    fn launch_session_arg(launch_command: &str) -> Option<String> {
+        let mut tokens = launch_command.split_whitespace().map(|token| {
+            token
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_string()
+        });
+        while let Some(token) = tokens.next() {
+            if token == "--session" {
+                return tokens.next().filter(|value| !value.is_empty());
+            }
+        }
+        None
+    }
+
+    /// Reconcile a legacy row's launch identity with the sessions the CLI's
+    /// service actually knows — the opencode half of the identity-rebind
+    /// family (the codex and Claude Code twins read /proc fds and transcripts;
+    /// opencode's truth is the launch line validated against the service and
+    /// the store).
+    ///
+    /// ⛔ THE DEFECT THIS CLOSES (measured live 2026-09-02, pending-bugs
+    /// [11.28] correction): restore re-launches uuid-keyed rows with
+    /// `--session <row-uuid>` — an id NO store holds — and opencode2 mints a
+    /// fresh `ses_` id and carries on. Every restore of such a row points a
+    /// TUI at a conversation that does not exist, and the row's Restore line
+    /// offers the same phantom resume to the human. Two outcomes, by what the
+    /// launch arg provably names:
+    ///
+    /// - **Real session** (in the service's active set or the store): the row
+    ///   is REBOUND to it — `apply_agent_runtime_session_id_to_live_session`
+    ///   repoints id, launch and Launch metadata, and the kind's session-id
+    ///   metadata is stamped so the pane stops showing the row seat.
+    /// - **Phantom** (neither knows the id): the row is a WINDOW, not a
+    ///   session — yggterm cannot know which conversation it renders (the
+    ///   service exposes no window→session map, and the Observer Rule forbids
+    ///   guessing), so its resume-of-a-phantom is DEMOTED to the bare TUI
+    ///   start. The conversation is reachable from the TUI's own session
+    ///   list; what stops happening is minting a fresh empty session on every
+    ///   restore.
+    ///
+    /// The store probe runs ONCE per row: the verdict is stamped in metadata
+    /// (`Launch Session Probe`), so the 1-second loop never re-opens sqlite
+    /// under the daemon lock.
+    pub(crate) fn reconcile_opencode_row_identities(
+        &mut self,
+        active: &[OpencodeServiceSession],
+    ) -> usize {
+        let Some(home) = crate::resolve_yggterm_home().ok() else {
+            return 0;
+        };
+        let store_home = yggterm_core::startpage::agent_store_home(&home);
+        self.reconcile_opencode_row_identities_in(&store_home, active)
+    }
+
+    /// [`Self::reconcile_opencode_row_identities`] against an explicit store
+    /// home — the test seam, so a test never reads the machine's real CLI
+    /// store (a unit test that consults the user's own store passes or fails
+    /// on THEIR data).
+    pub(crate) fn reconcile_opencode_row_identities_in(
+        &mut self,
+        store_home: &std::path::Path,
+        active: &[OpencodeServiceSession],
+    ) -> usize {
+        let active_ids: std::collections::HashSet<&str> = active
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        // Collect first, mutate after: the rebind path rewrites row state and
+        // the anchor phases above already ran on a stable map.
+        let candidates: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .filter(|(key, session)| {
+                session.kind == crate::SessionKind::OpenCode
+                    && key.starts_with("opencode-runtime://")
+                    && !session
+                        .metadata
+                        .iter()
+                        .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
+                    && !session
+                        .metadata
+                        .iter()
+                        .any(|m| m.label == LAUNCH_SESSION_PROBE_METADATA)
+            })
+            .filter_map(|(key, session)| {
+                Self::launch_session_arg(&session.launch_command).map(|arg| (key.clone(), arg))
+            })
+            .collect();
+        let mut reconciled = 0usize;
+        for (key, arg) in candidates {
+            let key_id = key.trim_start_matches("opencode-runtime://").to_string();
+            let known = active_ids.contains(arg.as_str())
+                || yggterm_core::agent_cli::opencode_store_index_holds_session(
+                    store_home,
+                    &arg,
+                )
+                .unwrap_or(false);
+            let mut verdict = "probe failed".to_string();
+            if known {
+                if arg == key_id {
+                    verdict = "self".to_string();
+                } else {
+                    // REBIND: the launch names a session this row is not keyed
+                    // to — the CLI's id outranks the birth seat (the codex
+                    // rebind's law). Repoints id, launch and Launch metadata.
+                    if self.apply_agent_runtime_session_id_to_live_session(&key, &arg) {
+                        let resolved = self
+                            .resolve_session_storage_key(&key)
+                            .map(str::to_string);
+                        if let Some(resolved) = resolved {
+                            if let Some(session) = self.sessions.get_mut(&resolved) {
+                                crate::upsert_session_metadata(
+                                    &mut session.metadata,
+                                    "OpenCode Session",
+                                    arg.clone(),
+                                );
+                            }
+                        }
+                        verdict = format!("rebound to {arg}");
+                    } else {
+                        verdict = "rebind refused".to_string();
+                    }
+                }
+            } else {
+                // DEMOTE: the phantom resume must not survive into the next
+                // restore. Rebuild the launch as the bare TUI start (the same
+                // wrapper, no `--session`), and repoint the Restore line the
+                // pane offers to the bare-start form.
+                let mut demoted = false;
+                if let Some(key) = self.resolve_session_storage_key(&key).map(str::to_string) {
+                    if let Some(session) = self.sessions.get_mut(&key) {
+                        let cwd = session
+                            .metadata
+                            .iter()
+                            .find(|m| m.label == "Cwd")
+                            .map(|m| m.value.clone())
+                            .or_else(|| {
+                                session
+                                    .metadata
+                                    .iter()
+                                    .find(|m| m.label == "Target")
+                                    .map(|m| m.value.clone())
+                            })
+                            .filter(|value| !value.trim().is_empty());
+                        if let Ok(bare) = crate::managed_cli::managed_cli_shell_command_with_terminal_appearance(
+                            crate::SessionKind::OpenCode,
+                            cwd.as_deref(),
+                            crate::managed_cli::ManagedCliAction::Launch,
+                            None,
+                        ) {
+                            let key_id = key
+                                .trim_start_matches("opencode-runtime://")
+                                .to_string();
+                            session.launch_command = bare.clone();
+                            crate::upsert_session_metadata(
+                                &mut session.metadata,
+                                "Launch",
+                                crate::user_visible_launch_command(&bare),
+                            );
+                            if let Some(start_verb) =
+                                crate::remote_agent_start_subcommand(crate::SessionKind::OpenCode)
+                            {
+                                crate::upsert_session_metadata(
+                                    &mut session.metadata,
+                                    "Restore",
+                                    format!("yggterm server remote {start_verb} {key_id}"),
+                                );
+                            }
+                            verdict = format!("phantom demoted (arg {arg})");
+                            demoted = true;
+                        }
+                    }
+                }
+                if !demoted {
+                    // keep the "probe failed" default — the row is re-probed
+                    // next tick (no verdict stamp distinguishes a failed probe
+                    // from an unprobed row, deliberately: a failed probe must
+                    // be RETRIED, not remembered).
+                }
+            }
+            if let Some(key) = self.resolve_session_storage_key(&key).map(str::to_string) {
+                if let Some(session) = self.sessions.get_mut(&key) {
+                    crate::upsert_session_metadata(
+                        &mut session.metadata,
+                        LAUNCH_SESSION_PROBE_METADATA,
+                        verdict.clone(),
+                    );
+                }
+            }
+            if let Ok(home_dir) = crate::resolve_yggterm_home() {
+                yggterm_core::append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "opencode_mirror",
+                    "launch_session_reconciled",
+                    serde_json::json!({
+                        "session_path": key,
+                        "arg": arg,
+                        "verdict": verdict,
+                    }),
+                );
+            }
+            reconciled += 1;
+        }
+        reconciled
     }
 }
 
@@ -856,5 +1089,200 @@ mod anchor_tests {
                 .any(|m| m.label == VIEWING_SESSION_METADATA),
             "no viewed tab anywhere must not leave a frozen 'Viewing' claim",
         );
+    }
+
+    /// The launch line's `--session` argument, read token-wise with the
+    /// wrapper's quoting stripped. A substring test would find the flag and
+    /// mis-take the next word; this is the parser the reconcile trusts.
+    #[test]
+    fn the_launch_session_arg_parser_survives_the_wrapper_quotes() {
+        let wrapper = "opencode2 '--auto' '--session' 'd4090efe-4e12-42d9-938d-66f61801d2e7'";
+        assert_eq!(
+            super::YggtermServer::launch_session_arg(wrapper).as_deref(),
+            Some("d4090efe-4e12-42d9-938d-66f61801d2e7")
+        );
+        assert_eq!(
+            super::YggtermServer::launch_session_arg("opencode2 --auto").as_deref(),
+            None,
+            "a bare TUI start names no session — nothing to reconcile"
+        );
+    }
+
+    fn phantom_arg_row() -> crate::YggtermServer {
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let key = server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            None,
+        );
+        if let Some(row) = server.sessions.get_mut(&key) {
+            row.session_path = format!("opencode-runtime://{}", row.id);
+            row.launch_command = format!(
+                "opencode2 '--auto' '--session' '{}'",
+                row.id
+            );
+            row.metadata.push(crate::SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/user/proj".to_string(),
+            });
+        }
+        server
+    }
+
+    fn rekey_runtime(server: &mut crate::YggtermServer, old_key: &str) -> String {
+        let mut row = server.sessions.remove(old_key).expect("fixture row");
+        let new_key = format!("opencode-runtime://{}", row.id);
+        row.session_path = new_key.clone();
+        server.sessions.insert(new_key.clone(), row);
+        new_key
+    }
+
+    fn any_row_key(server: &crate::YggtermServer) -> String {
+        server
+            .sessions
+            .keys()
+            .next()
+            .cloned()
+            .expect("fixture row key")
+    }
+
+    /// ⛔ THE PHANTOM RESUME MUST NOT SURVIVE INTO THE NEXT RESTORE
+    /// (pending-bugs [11.28] correction, 2026-09-02). A uuid-keyed row whose
+    /// launch names `--session <uuid>` — an id the service AND the store both
+    /// deny — is a WINDOW, not a session: yggterm cannot know which
+    /// conversation it renders. The reconcile DEMOTES the resume-of-a-phantom
+    /// to the bare TUI start, so the next restore stops minting a fresh empty
+    /// session, and the pane's Restore line offers what would actually happen.
+    #[test]
+    fn a_phantom_session_arg_is_demoted_to_the_bare_start() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-oc-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = phantom_arg_row();
+        let first = any_row_key(&server);
+        let key = rekey_runtime(&mut server, &first);
+        let reconciled = server
+            .reconcile_opencode_row_identities_in(&home, &[]);
+        assert_eq!(reconciled, 1, "the phantom-arg row is reconciled");
+        let row = server.sessions.get(&key).expect("row stays at its key");
+        assert!(
+            !row.launch_command.contains("--session"),
+            "the demoted launch must not name a session: {:?}",
+            row.launch_command
+        );
+        assert!(
+            row.launch_command.contains("--auto"),
+            "the demoted launch is the bare TUI start: {:?}",
+            row.launch_command
+        );
+        let restore = row
+            .metadata
+            .iter()
+            .find(|m| m.label == "Restore")
+            .map(|m| m.value.clone())
+            .unwrap_or_default();
+        assert!(
+            restore.contains("start-opencode") && !restore.contains("resume"),
+            "the Restore line offers the bare start, not the phantom resume: {restore:?}"
+        );
+        let probe = row
+            .metadata
+            .iter()
+            .find(|m| m.label == LAUNCH_SESSION_PROBE_METADATA)
+            .map(|m| m.value.clone())
+            .unwrap_or_default();
+        assert!(
+            probe.contains("phantom"),
+            "the verdict is stamped so the store probe never re-runs: {probe:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A real `--session` arg (the service knows it) REBINDS the row: the
+    /// CLI's id outranks the birth seat, the kind's session-id metadata is
+    /// stamped, and the verdict says so — the one-conversation-two-rows
+    /// divergence closes at the identity plane.
+    #[test]
+    fn a_real_session_arg_rebinds_the_legacy_row() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-oc-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = phantom_arg_row();
+        let first = any_row_key(&server);
+        let key = rekey_runtime(&mut server, &first);
+        let real = "ses_real00000000000000000000001";
+        if let Some(row) = server.sessions.get_mut(&key) {
+            row.launch_command = format!("opencode2 '--auto' '--session' '{real}'");
+        }
+        let active = vec![OpencodeServiceSession {
+            id: real.to_string(),
+            title: Some("the real session".to_string()),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: 1,
+            running: true,
+        }];
+        let reconciled = server
+            .reconcile_opencode_row_identities_in(&home, &active);
+        assert_eq!(reconciled, 1, "the real-arg row is reconciled");
+        let row = server.sessions.get(&key).expect("row stays at its key");
+        assert_eq!(
+            row.id, real,
+            "the row's identity is the session the CLI actually runs"
+        );
+        let store_label = row
+            .metadata
+            .iter()
+            .find(|m| m.label == "OpenCode Session")
+            .map(|m| m.value.clone());
+        assert_eq!(
+            store_label.as_deref(),
+            Some(real),
+            "the kind's session-id metadata carries the REAL id — the pane \
+             stops showing the row seat"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The verdict stamp is the memoization: a reconciled row is never
+    /// re-probed (the store probe under the daemon lock happens once per row
+    /// ever), and a consistent row (`--session <its own real id>`) stamps
+    /// "self" and is left alone.
+    #[test]
+    fn a_reconciled_row_is_never_reprobed() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-oc-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = phantom_arg_row();
+        let first = any_row_key(&server);
+        let key = rekey_runtime(&mut server, &first);
+        assert_eq!(
+            server.reconcile_opencode_row_identities_in(&home, &[]),
+            1
+        );
+        let after_first = server
+            .sessions
+            .get(&key)
+            .expect("row")
+            .launch_command
+            .clone();
+        assert_eq!(
+            server.reconcile_opencode_row_identities_in(&home, &[]),
+            0,
+            "a stamped row is not a candidate — the probe is memoized"
+        );
+        assert_eq!(
+            server.sessions.get(&key).expect("row").launch_command,
+            after_first,
+            "the second tick changed nothing"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

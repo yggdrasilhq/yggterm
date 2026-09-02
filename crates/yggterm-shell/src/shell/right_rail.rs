@@ -5226,8 +5226,19 @@ pub(crate) fn metadata_session_identity(
     if !tab_id.trim().is_empty() {
         return Some((label, tab_id.trim().to_string()));
     }
+    // ⛔ THE UUID FALLBACK IS ONLY A SESSION ID WHEN THE CLI SAID SO AT
+    // BIRTH. For a self-minting CLI (opencode: `id_assigned_at_birth: false`)
+    // a row uuid is the yggterm SEAT — a uuid-keyed TUI window row rendered
+    // "OpenCode Session: <row-uuid>", a claim the seat cannot back (measured
+    // live 2026-09-02: four such rows). Those fall to the generic "Session
+    // id" label, which claims only what the row is.
     let uuid = metadata_value(session, "UUID");
-    (!uuid.trim().is_empty()).then(|| (label, uuid.trim().to_string()))
+    if !uuid.trim().is_empty() {
+        let birth_id = descriptor.is_some_and(|d| d.id_assigned_at_birth);
+        let id_label = if birth_id { label } else { "Session id" };
+        return Some((id_label, uuid.trim().to_string()));
+    }
+    None
 }
 
 /// The dynamicity lines the pane shows for one row: an OpenCode tab row names
