@@ -182,6 +182,45 @@ for h in $HOSTS; do
   fi
 done
 
+# ⛔ THE RECORD'S OWN EXPIRY (2026-09-02, the metadata campaign's third block of
+# the day): the repair module gives a forced-shutdown record a repair window —
+# hot_restart_repair::REPAIR_WINDOW_MS, 600 s — after which the record "is
+# dropped, loudly, rather than honoured". The DAEMON honours that expiry; this
+# file-existence test did not, so a record from a swap that was REFUSED (the
+# gate blocked it — nothing was ever shut down, nothing needs `continue`)
+# blocked every deploy for hours. Measured twice on 2026-09-02 alone. The guard
+# therefore asks the record's AGE with the same window: a record older than the
+# repair window is expired BY THE MODULE'S OWN LAW — named in the refusal that
+# no longer fires, moved nowhere, deleted by nobody here. A FRESH record (a
+# real, recent forced cold shutdown) still refuses exactly as before.
+REPAIR_WINDOW_SECS=600
+EXPIRED=""
+still_stranded=""
+for h in $STRANDED; do
+  R="${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json"
+  if [ "$h" = "$(hostname -s 2>/dev/null)" ] || [ "$h" = dev ]; then
+    AGE=$(( $(date +%s) - $(stat -c %Y "$R" 2>/dev/null || date +%s) ))
+  else
+    AGE=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$h" \
+      "echo \$(( \$(date +%s) - \$(stat -c %Y '$R' 2>/dev/null || date +%s) ))" 2>/dev/null)
+  fi
+  case "${AGE:-}" in
+    ''|*[!0-9]*)
+      echo "deploy-fleet: ⚠ cannot read the interrupted-record age on $h — treating it as FRESH (refusing)." >&2
+      still_stranded="$still_stranded $h"
+      ;;
+    *)
+      if [ "$AGE" -gt "$REPAIR_WINDOW_SECS" ]; then
+        EXPIRED="$EXPIRED $h (${AGE}s old)"
+      else
+        still_stranded="$still_stranded $h"
+      fi
+      ;;
+  esac
+done
+[ -n "$EXPIRED" ] && echo "deploy-fleet: expired interrupted-record(s) past the ${REPAIR_WINDOW_SECS}s repair window, not honoured:$EXPIRED" >&2
+STRANDED="$still_stranded"
+
 if [ -n "$STRANDED" ]; then
   echo "⛔ REFUSING: an interrupted-sessions record is still present on:$STRANDED" >&2
   echo "   That record is written on a FORCED cold shutdown and is the list of rows the" >&2
