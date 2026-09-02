@@ -3180,6 +3180,34 @@ mod tests {
             ManagedCliTool::ClaudeCode.package_name(),
             "@anthropic-ai/claude-code"
         );
+        // ⛔ THE SES_ GUARD: an un-rebounded opencode row carries yggterm's
+        // birth uuid; opencode2's service rejects anything not starting with
+        // `ses` (the owner's viewport error). The composer degrades to a
+        // FRESH LAUNCH instead of composing a doomed resume.
+        let phantom = managed_cli_shell_command(
+            SessionKind::OpenCode,
+            Some("/tmp"),
+            ManagedCliAction::Resume {
+                session_id: "d4090efe-4e12-42d9-938d-66f61801d2e7",
+                persistent: false,
+            },
+        )
+        .expect("opencode phantom resume command");
+        assert!(
+            !phantom.contains("--session"),
+            "a phantom id must not be composed as an opencode resume: {phantom}"
+        );
+        let real = managed_cli_shell_command(
+            SessionKind::OpenCode,
+            Some("/tmp"),
+            ManagedCliAction::Resume {
+                session_id: "ses_real",
+                persistent: false,
+            },
+        )
+        .expect("opencode real resume command");
+        assert!(real.contains("--session 'ses_real'"), "{real}");
+
         let resume = managed_cli_shell_command(
             SessionKind::ClaudeCode,
             Some("/tmp"),
@@ -5264,6 +5292,36 @@ pub(crate) fn managed_cli_shell_command_configured(
             session_id,
             persistent,
         } => {
+            // ⛔ THE SES_ GUARD (2026-09-02, owner screenshot): opencode2's
+            // service rejects any session id that does not start with `ses`
+            // — and an UN-REBOUND row carries yggterm's birth uuid, which the
+            // CLI then renders as a viewport error
+            // (`Expected a string starting with "ses" at ["sessionID"]`).
+            // A non-ses id on an opencode resume is a PHANTOM: compose a
+            // fresh launch instead (the owner's `/sessions` flow re-binds the
+            // real session), and say the phantom was dropped.
+            if descriptor.is_some_and(|d| d.kind == crate::SessionKind::OpenCode)
+                && !session_id.starts_with("ses_")
+            {
+                let prefix = if persistent { "exec " } else { "" };
+                (
+                    format!(
+                        "{prefix}{}{}",
+                        tool.binary_name(),
+                        extra_args
+                    ),
+                    CliInvocationShape {
+                        action: "launch",
+                        selector: "",
+                        carries_id: false,
+                        re_roots_with_cwd: descriptor
+                            .is_some_and(|descriptor| descriptor.resume_re_roots_with_cwd)
+                            && has_cwd,
+                        extra_arg_tokens: split_extra_args(&extra_args).len(),
+                        persistent,
+                    },
+                )
+            } else {
             let prefix = if persistent { "exec " } else { "" };
             let quoted = shell_single_quote(session_id);
             let tokens = descriptor
@@ -5289,6 +5347,7 @@ pub(crate) fn managed_cli_shell_command_configured(
                     persistent,
                 },
             )
+            }
         }
     };
     // ⭐ THE ONE COMPOSER, SO NO PER-CLI ARM CAN COMPOSE UNSEEN. This is where
