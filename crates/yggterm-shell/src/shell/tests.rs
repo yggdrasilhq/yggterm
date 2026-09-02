@@ -66330,6 +66330,58 @@ mod web_surface_immersion_locks {
         assert!(metadata_dynamicity_entries(&plain).is_empty());
     }
 
+    /// LINK: metadata pane → Live Diagnostic (Issue 31). The pane's identity
+    /// contract is composed from fields it already holds: the registry-bound
+    /// session id against the mirror's Viewing stamp. A row the TUI has moved
+    /// past reads DIVERGED with both ids; a row in agreement reads in sync;
+    /// a row with no viewing signal carries no diagnostic group at all.
+    #[test]
+    fn ssot_the_pane_states_the_identity_contract_against_the_viewing_stamp() {
+        let entry = |label: &'static str, value: &str| SessionMetadataEntry {
+            label,
+            value: value.to_string(),
+        };
+        // The 2026-09-03 incident shape: uuid-bound row, TUI on a ses_ id.
+        let mut diverged = minimal_opencode_row();
+        diverged.metadata = vec![
+            entry("UUID", "d4090efe-4e12-42d9-938d-66f61801d2e7"),
+            entry(
+                "Viewing Tab Session Id",
+                "ses_f9cdde2f5ffep2W0tBiWE7qb3a",
+            ),
+        ];
+        let diagnostic = metadata_live_diagnostic(&diverged);
+        assert_eq!(diagnostic.len(), 1);
+        assert_eq!(diagnostic[0].label, "Identity");
+        assert!(
+            diagnostic[0].value.starts_with("DIVERGED"),
+            "a row the TUI moved past must read DIVERGED, got: {}",
+            diagnostic[0].value
+        );
+        assert!(
+            diagnostic[0].value.contains("ses_f9cdde2f5ffep2W0tBiWE7qb3a"),
+            "the verdict must name the session the human is looking at"
+        );
+
+        // Agreement reads in sync; silence carries no group.
+        let mut synced = minimal_opencode_row();
+        synced.metadata = vec![
+            entry("OpenCode Session", "ses_probe0000000000000001"),
+            entry(
+                "Viewing Tab Session Id",
+                "ses_probe0000000000000001",
+            ),
+        ];
+        let diagnostic = metadata_live_diagnostic(&synced);
+        assert_eq!(diagnostic.len(), 1);
+        assert!(
+            diagnostic[0].value.starts_with("in sync"),
+            "an agreed row must read in sync, got: {}",
+            diagnostic[0].value
+        );
+        assert!(metadata_live_diagnostic(&minimal_opencode_row()).is_empty());
+    }
+
     /// A minimal OpenCode row for the pane-data assertions above — every
     /// field the type demands, none of the state under test.
     fn minimal_opencode_row() -> ManagedSessionView {

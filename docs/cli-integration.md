@@ -1308,3 +1308,88 @@ stamp name the same session, a cold restart's restore-spawn resumes the
 viewed session, and the `resume-opencode` composition carries the ses_ id the
 service accepts (the ses_ guard passes it through; the fresh-launch degrade
 only catches non-ses_ ids).
+## Issue Heading 31: live CLI probes — expected vs actual, on the trace plane and in the metadata pane (2026-09-03)
+
+Owner directive: *"why don't we add probe points called cli/common,
+cli/opencode, etc. in the pathways so you can dynamically 'see' in live
+yggterm GUI as you try to launch new session what is expected and what is
+actually happening?"* — for metadata integration, dynamic row updates, the
+working indicator, and daemon switching, CLI by CLI.
+
+### The gap that motivated it (measured 2026-09-03)
+
+Four live `opencode-runtime://<uuid>` rows on dev, all titled `New dev
+OpenCode`, all carrying their birth uuid as the OpenCode Session — while
+their TUIs rendered real `ses_…` sessions (one verified: the TUI showed the
+`sessions`-switched campaign session, the row still named the uuid). The
+mirror-tick rebind (`lane/dev/mirror-tick-rebind`, in the running build,
+ticks running, focus visible on the trace) emitted **zero** rebind events —
+and no instrument could say why: not which anchor was picked among five live
+TUIs, not what viewing each tick computed, not which rail of the rebind
+refused. The failure was unobservable from every surface. Probes are the fix
+for the unobservability; they are not the fix for the rebind.
+
+### The contract
+
+Four ytrace probes, all under the cli-plane laws (one category `cli` except
+the daemon one; skips are outcomes; edge-triggered or change-gated, never
+per-tick spam; shapes and counts, never user content — cwd, flags, prompts,
+screen text and argv strings stay out):
+
+* **`cli/mirror_tick`** — one event per INTERESTING mirror tick (spawned /
+  retired / focus present / identity diverged), not per 5 s tick. Payload:
+  `anchor` (row path or null), `candidates` (count of live-anchor-eligible
+  rows — with N live TUIs this is where the single-anchor model shows),
+  `viewing` (viewed session id or null), `bound` (anchor's bound id or null),
+  `decision`: `in_sync` | `diverged` | `rebound` | `rebind_failed` |
+  `no_anchor` | `anchor_not_live` | `no_viewing`, `active_tabs`. The
+  `diverged` outcome is the whole point: bound ≠ viewing and no rebind
+  happened, with the reason on the event instead of in a debugger.
+* **`cli/launch_contract`** — one event per composed launch/resume that
+  DEGRADES from the descriptor-declared shape (the ses_ guard's fresh-launch
+  degrade, the store-vouch absent-arm rebirth, the service-vouched override).
+  Payload: `slug`, `declared_selector`, `action`, `selector`, `carries_id`,
+  `reason`: `as_declared` is never emitted (the `cli/launch` shape event
+  already covers the faithful path) — `ses_guard_degrade` |
+  `store_absent_rebirth` | `service_vouched_resume`. Expected vs actual, per
+  launch, at the moment of composition.
+* **`cli/working_edge`** — the daemon's working verdict TRANSITIONS per row
+  (`working` | `idle` with the two sub-signals `screen_signal` and
+  `recency_signal` as bools), so the blinking dot's flicker is attributable:
+  a dot that blinks on recency alone reads differently from one the CLI's own
+  footer drives. Edge-triggered (enter/exit vs the last pass set); quiet rows
+  cost nothing.
+* **`daemon/idle_gate_eval`** — the swap-deferral DECISION mirrored from the
+  existing `daemon_cold_shutdown_deferred_idle_gate` trace event (same
+  change-or-heartbeat discipline) plus the same-version HotRestart-request
+  defer (per-request, bounded by restart requests). Payload: `blocker_count`,
+  blocker classes, head blocker — which session pins the swap, without
+  guessing.
+
+### GUI surface: the Live Diagnostic section (read-only)
+
+The metadata pane gains a `Live Diagnostic` group, rendered ONLY for agent
+rows that have something dynamic to say (a Viewing stamp present, or bound
+identity diverged from it) — quiet rows show nothing new. Entries are
+composed from snapshot fields the GUI already holds (no new wire fields —
+the JS forwarder drops those silently, measured):
+
+* `Identity`: `in sync` | `DIVERGED — row aims at <bound>, TUI shows
+  <viewing>` (labels from the registry, never hand matches).
+* `Working`: the existing Status wording; the sub-signal breakdown lives on
+  `cli/working_edge`, referenced by name, not duplicated.
+
+⛔ The pane is a witness, never a driver: nothing in it feeds back into
+daemon decisions.
+
+### What this issue does NOT cover
+
+* The rebind failure itself (Defect A: zero rebinds with live code+ticks+
+  focus) — these probes are the instrument that names it; the repair is a
+  separate unit, decided from probe evidence, not from this spec.
+* The single-anchor model vs N live TUIs (Defect B): `candidates` on
+  `cli/mirror_tick` measures it every tick, but per-TUI identity binding is
+  its own design unit with its own spec.
+* Sub-signal detail below bools (which footer needle matched) — follow-up if
+  the bools prove insufficient; the needle strings stay out of the trace
+  until a spec explicitly admits them.

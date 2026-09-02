@@ -88,15 +88,14 @@ struct Arm {
 const ARM_SESSION_ID: &str = "11111111-2222-3333-4444-555555555555";
 /// The ses_-shaped fixture id the OpenCode arm resumes with.
 ///
-/// ⛔ A uuid here is the RED matrix on every host, measured 2026-09-02: the
-/// ses_ guard (70329d66b — "never compose a resume with a non-ses_ id")
-/// deliberately degrades an OpenCode resume carrying a birth-style uuid to a
-/// fresh launch, because opencode2's service rejects anything not `ses_`-
-/// shaped. The arm's contract is what the CLI ACTUALLY accepts, so the
-/// OpenCode arm must exercise the id shape its service mints.
+/// ⛔ A uuid here is the RED matrix on every host: the ses_ guard ("never
+/// compose a resume with a non-ses_ id") deliberately degrades an OpenCode
+/// resume carrying a birth-style uuid to a fresh launch, because opencode2's
+/// service rejects anything not `ses_`-shaped. The arm's contract is what the
+/// CLI ACTUALLY accepts, so the OpenCode arm must exercise the id shape its
+/// service mints. (Same fix rides `lane/dev/mirror-tick-rebind`; whichever
+/// lane lands second drops its copy.)
 const OPENCODE_ARM_SESSION_ID: &str = "ses_arm0000000000000000000001";
-const ARM_CWD: &str = "/home/user/gh/yggterm";
-const ARM_MACHINE: &str = "dev";
 
 /// The session id each arm's RESUME composition must be exercised with: the
 /// id shape that arm's CLI actually accepts (see OPENCODE_ARM_SESSION_ID).
@@ -107,6 +106,8 @@ fn arm_resume_session_id(kind: SessionKind) -> &'static str {
         ARM_SESSION_ID
     }
 }
+const ARM_CWD: &str = "/home/user/gh/yggterm";
+const ARM_MACHINE: &str = "dev";
 
 const ARMS: &[Arm] = &[
     Arm {
@@ -642,6 +643,8 @@ fn contains_in_order(text: &str, tokens: &[&str]) -> bool {
 #[test]
 fn every_arm_builds_the_invocation_its_descriptor_declares() {
     for arm in ARMS {
+        let session_id = arm_resume_session_id(arm.kind);
+        let quoted_id = format!("'{session_id}'");
         let descriptor = agent_cli_descriptor(arm.kind).expect("registered CLI");
         assert_eq!(
             descriptor.binary_name,
