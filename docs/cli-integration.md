@@ -1306,14 +1306,18 @@ per-tick spam; shapes and counts, never user content — cwd, flags, prompts,
 screen text and argv strings stay out):
 
 * **`cli/mirror_tick`** — one event per INTERESTING mirror tick (spawned /
-  retired / focus present / identity diverged), not per 5 s tick. Payload:
+  retired / focus present / identity diverged), plus a five-minute heartbeat
+  on quiet ticks so a synced mirror is distinguishable from a dead one (the
+  plane's own law — ~288 small events a day, stated here, not discovered
+  later). Payload:
   `anchor` (row path or null), `candidates` (count of live-anchor-eligible
   rows — with N live TUIs this is where the single-anchor model shows),
   `viewing` (viewed session id or null), `bound` (anchor's bound id or null),
   `decision`: `in_sync` | `diverged` | `rebound` | `rebind_failed` |
   `no_anchor` | `anchor_not_live` | `no_viewing`, `active_tabs`. The
-  `diverged` outcome is the whole point: bound ≠ viewing and no rebind
-  happened, with the reason on the event instead of in a debugger.
+  `diverged` outcome is the event this probe exists for: bound ≠ viewing and
+  no rebind happened, with the anchor, the candidate count and both ids on
+  the event instead of in a debugger.
 * **`cli/launch_contract`** — one event per composed launch/resume that
   DEGRADES from the descriptor-declared shape (the ses_ guard's fresh-launch
   degrade, the store-vouch absent-arm rebirth, the service-vouched override).

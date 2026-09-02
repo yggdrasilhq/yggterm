@@ -455,10 +455,27 @@ impl YggtermServer {
             } else {
                 "diverged"
             };
+            // The plane's own law: a sweep that never reports when quiet is
+            // indistinguishable from a chore that stopped running. Interesting
+            // ticks always speak; quiet ones heartbeat every five minutes
+            // (~288 small events a day — the steady-state cost is stated in
+            // the Issue 31 spec, not discovered later).
+            static MIRROR_TICK_HEARTBEAT_LAST_MS: std::sync::OnceLock<std::sync::Mutex<u64>> =
+                std::sync::OnceLock::new();
+            let heartbeat_due = crate::current_millis_u64()
+                .saturating_sub(
+                    MIRROR_TICK_HEARTBEAT_LAST_MS
+                        .get_or_init(|| std::sync::Mutex::new(0))
+                        .lock()
+                        .map(|guard| *guard)
+                        .unwrap_or(0),
+                )
+                >= 300_000;
             if spawned > 0
                 || retired > 0
                 || plan.focus.is_some()
                 || decision == "diverged"
+                || heartbeat_due
             {
                 yggterm_core::cli_plane::emit_mirror_tick(
                     "daemon",
@@ -472,6 +489,12 @@ impl YggtermServer {
                         active_tabs: active.len(),
                     },
                 );
+                if let Ok(mut guard) = MIRROR_TICK_HEARTBEAT_LAST_MS
+                    .get_or_init(|| std::sync::Mutex::new(0))
+                    .lock()
+                {
+                    *guard = crate::current_millis_u64();
+                }
             }
         } else {
             // No row qualified as anchor at all — and a tick that cannot name
