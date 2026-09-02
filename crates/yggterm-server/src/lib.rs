@@ -5224,6 +5224,36 @@ impl YggtermServer {
         let preserved_active_view_mode = self.active_view_mode;
         let preserved_live_session_order = self.live_session_order.clone();
 
+        // ⭐ NOTHING WAS ACTIVE, AND THE ROW IS ALREADY LIVE — the launch is
+        // pure bookkeeping here, and its bookkeeping IS the defect: activate
+        // the row, then re-clear active to `None` (the
+        // `launch_preserving_active_had_none` arm below). Two activation
+        // writes per attach, every attach, while the user sits on the
+        // startpage — measured 30 pairs in one window on the GUI host
+        // (2026-09-02 20:22, remote-opencode rows, `user_gesture:false` on
+        // every one), each write snapshot-visible to every activation
+        // follower. The ensure funnel's own runtime half (terminal spec
+        // resolve, PTY ensure) runs AFTER this call and reads the session,
+        // not the active pointer, so a live row loses nothing by skipping.
+        // A stored path keeps the old flow: its ensure needs the
+        // stored→live open that the launch performs.
+        if preserved_active_path.is_none() && self.resolve_live_session_entry(path).is_some() {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "session",
+                    "request_terminal_launch",
+                    serde_json::json!({
+                        "path": path,
+                        "resolved_key": self.resolve_session_storage_key(path).map(str::to_string),
+                        "skipped": "preserving_active_had_none_live_row",
+                    }),
+                );
+            }
+            return;
+        }
+
         self.request_terminal_launch_for_path(
             path,
             ActivationOrigin::internal("request_terminal_launch_preserving_active"),
@@ -42270,6 +42300,44 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), Some(active.as_str()));
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
         assert_eq!(server.live_session_order, vec![active, inactive]);
+    }
+
+    /// ⛔ [startpage-hijack-B] THE PRESERVE-LAUNCH DOUBLE WRITE. With no active
+    /// session (the user is on the startpage, or a GUI restart has just
+    /// happened), every background attach of a LIVE row used to write the
+    /// activate-then-re-clear pair — 30 pairs in one measured window
+    /// (guihost 2026-09-02 20:22), each write snapshot-visible to every
+    /// activation follower. The skip keeps the state exactly as it was: the
+    /// attach is plumbing, the user's (empty) view is preserved, and the
+    /// ensure funnel's own runtime half still runs in the caller.
+    #[test]
+    fn preserving_active_launch_with_no_active_session_does_not_flip_through_the_row() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let target = crate::local_session_target(SessionKind::Shell, Some("/home/user"));
+        let live = "local://live-shell".to_string();
+        server.insert_live_session_with_launch(
+            &live,
+            "live-shell",
+            SessionKind::Shell,
+            &target,
+            Some("live".to_string()),
+            false,
+            false,
+        );
+        // Nothing is active — the post-restart / startpage window.
+        assert_eq!(server.active_session_path(), None);
+
+        server.request_terminal_launch_for_path_preserving_active(&live);
+
+        // The flip is gone: still no active session, view mode untouched.
+        assert_eq!(server.active_session_path(), None);
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+        // And the row itself was never promoted to active by the attach.
+        assert!(server.sessions.contains_key(&live));
     }
 
     /// ⛔ THE RANDOM-STARTPAGE-HIJACK REGRESSION (GUI host 2026-09-02 18:17).
