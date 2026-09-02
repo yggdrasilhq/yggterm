@@ -13134,7 +13134,21 @@ fn local_store_title_skip(
         || (yggterm_core::is_agent_plane_composed_title(&session.title)
             && session.title.contains(" unnamed "))
         || session.title.trim() == session.id.trim();
-    if !working_paths.contains(&session.session_path) && !title_is_placeholder {
+    // ⛔ A DYNAMIC CLI'S TITLE IS NEVER "SETTLED" (owner directive
+    // 2026-09-02: "our metadata system should understand their dynamicity
+    // language"). OpenCode retitles sessions for their whole life — an
+    // auto-title after the first prompt, a human rename in the TUI, a fork's
+    // own name — so an idle OpenCode row with a well-formed title can still
+    // be wearing LAST week's name. The registry answers which CLIs behave
+    // this way (`title_mutability`); for those the settle-skip does not fire
+    // and the poll proceeds to the store read, whose store-agrees check
+    // keeps a quiet tick write-free. Static CLIs keep the cheap skip.
+    let title_dynamic = yggterm_core::agent_cli::title_mutability(descriptor.kind)
+        == yggterm_core::agent_cli::TitleMutability::Dynamic;
+    if !working_paths.contains(&session.session_path)
+        && !title_is_placeholder
+        && !title_dynamic
+    {
         return Some((
             CliTitleOutcome::SkippedTitleSettled,
             serde_json::json!({ "reason": "idle_and_named" }),
@@ -13183,16 +13197,53 @@ fn collect_live_store_title_syncs_in(
             .expect("the skip classifier refuses a CLI with no reader");
         let stored = read_title(home, &session.id).map(|title| title.trim().to_string());
         let Some(title) = stored.filter(|title| !title.is_empty()) else {
-                sweep.record(
-                    &session.session_path,
-                    session.kind,
-                    &session.id,
-                    CliTitleOutcome::NoTitleInStore,
-                    // A self-minting row changing from its birth UUID to its
-                    // real CLI UUID is a new lookup edge even when both miss.
-                    // Without the id in the signature, ytrace suppresses the
-                    // one event that proves rebind happened.
-                    Some(&session.id),
+            // ⛔ THE STORE HAS NO TITLE — AND IF THE ROW IS WEARING A
+            // DETECTOR-CAUGHT FALLBACK, SILENCE HERE IS THE LIE'S BODYGUARD.
+            // Measured live 2026-09-02: opencode anchor rows answered
+            // `Remote OpenCode {shorthash}` for DAYS, every tick recording
+            // `no_title_in_store` and stopping — the detector knew the title
+            // was a lie, but nothing ever INSERTED a replacement, so the
+            // stale label rode the preserve path forever (the ACT VII
+            // lesson, daemon side). When the store cannot name the session
+            // and the current title is machine copy, the birth title IS the
+            // answer: insert it, report it, and let the next tick's
+            // store-agrees path keep it quiet.
+            let wearing_fallback = looks_like_generated_fallback_title(&session.title);
+            if wearing_fallback {
+                let birth = yggterm_core::agent_cli::new_row_birth_title(
+                    yggterm_core::local_machine_name_opt().as_deref(),
+                    descriptor.display_name,
+                );
+                if birth != session.title {
+                    sweep.record(
+                        &session.session_path,
+                        session.kind,
+                        &session.id,
+                        CliTitleOutcome::InsertedBirthTitle,
+                        Some(&birth),
+                        serde_json::json!({
+                            "replaced": session.title,
+                            "id_origin": CliIdOrigin::declared_for(session.kind).label(),
+                        }),
+                    );
+                    updates.push(BackgroundCopyUpdate {
+                        session_path: session.session_path.clone(),
+                        title: Some(birth),
+                        summary: None,
+                    });
+                    continue;
+                }
+            }
+            sweep.record(
+                &session.session_path,
+                session.kind,
+                &session.id,
+                CliTitleOutcome::NoTitleInStore,
+                // A self-minting row changing from its birth UUID to its
+                // real CLI UUID is a new lookup edge even when both miss.
+                // Without the id in the signature, ytrace suppresses the
+                // one event that proves rebind happened.
+                Some(&session.id),
                 // The id the store was asked about. A CLI that mints its own id
                 // is rebound by the identity poll, and a miss whose id is the
                 // row's birth uuid is a REBIND failure wearing a store
@@ -32053,6 +32104,182 @@ mod tests {
         assert!(
             updates.is_empty(),
             "an owner-titled row must not be polled: {updates:?}",
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ⛔ THE STORE-SILENT + LIE-TITLED ROW GETS THE BIRTH TITLE INSERTED, NOT
+    /// ANOTHER SILENT TICK (owner directive 2026-09-02, the metadata campaign).
+    ///
+    /// Measured live: four uuid-keyed opencode rows answered
+    /// `Remote OpenCode {shorthash}` for days while every chore tick recorded
+    /// `no_title_in_store` and stopped — the detector KNEW the title was
+    /// machine copy, the store had no session under the row's uuid (the TUIs
+    /// had been resumed with the row's own id, which no store ever held), and
+    /// nothing ever inserted a replacement. The ACT VII lesson, daemon side: a
+    /// detector that filters the lie is half a fix.
+    #[test]
+    fn a_store_silent_row_wearing_a_fallback_gets_its_birth_title_inserted() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-store-title-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            Some("Remote OpenCode d4090efe"),
+        );
+        let working: std::collections::HashSet<String> =
+            server.live_sessions().iter().map(|s| s.session_path.clone()).collect();
+
+        let updates = super::collect_live_store_title_syncs_in(
+            &home,
+            &server.live_sessions(),
+            &working,
+        );
+        let expected = yggterm_core::agent_cli::new_row_birth_title(
+            yggterm_core::local_machine_name_opt().as_deref(),
+            "OpenCode",
+        );
+        assert_eq!(
+            updates.first().and_then(|u| u.title.as_deref()),
+            Some(expected.as_str()),
+            "a row wearing a detector-caught fallback with a silent store must \
+             get the birth title INSERTED, not another silent tick",
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A row wearing a REAL (non-fallback) title with a silent store is left
+    /// alone — the birth-title insertion must never destroy a human-meaningful
+    /// handle just because the CLI's store cannot echo it (a v1-era title, a
+    /// store since migrated: the words still tell the owner which row is which).
+    #[test]
+    fn a_store_silent_row_with_a_real_title_is_left_alone() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-store-title-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            Some("agy cli integration: session bugs"),
+        );
+        let working: std::collections::HashSet<String> =
+            server.live_sessions().iter().map(|s| s.session_path.clone()).collect();
+
+        let updates = super::collect_live_store_title_syncs_in(
+            &home,
+            &server.live_sessions(),
+            &working,
+        );
+        assert!(
+            updates.is_empty(),
+            "a real-looking title survives a silent store: {updates:?}",
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ⛔ A DYNAMIC CLI'S RETITLE MUST LAND EVEN ON AN IDLE, NAMED ROW (owner
+    /// directive 2026-09-02: "our metadata system should understand their
+    /// dynamicity language"). OpenCode rewrote the session's title in its
+    /// store AFTER the row's title had settled — the old chore skipped
+    /// idle+named rows forever, so the row wore last week's name. The
+    /// registry's `title_mutability` is what lifts the settle-skip for
+    /// OpenCode and ONLY OpenCode.
+    #[test]
+    fn a_dynamic_cli_row_picks_up_a_later_store_retitle_while_idle() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-store-title-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let key = server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            Some("First prompt title"),
+        );
+        let session_id = server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == key)
+            .map(|session| session.id.clone())
+            .expect("the row exists");
+        // The store, as opencode writes it: the session retitled after the
+        // row's title settled. A v2 table with a fresh title for this id.
+        let db_dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).expect("opencode store dir");
+        let conn = rusqlite::Connection::open(db_dir.join("opencode.db"))
+            .expect("fixture store");
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT);",
+        )
+        .expect("fixture table");
+        conn.execute(
+            "INSERT INTO session_v2 (id, title) VALUES (?1, ?2)",
+            rusqlite::params![session_id, "Renamed in the TUI"],
+        )
+        .expect("fixture row");
+        drop(conn);
+
+        // NOT working — the exact shape the old settle-skip refused forever.
+        let working: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let updates = super::collect_live_store_title_syncs_in(
+            &home,
+            &server.live_sessions(),
+            &working,
+        );
+        assert_eq!(
+            updates.first().and_then(|u| u.title.as_deref()),
+            Some("Renamed in the TUI"),
+            "an idle Dynamic-CLI row must follow its store's retitle",
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The settle-skip is the CHEAP path and Static CLIs keep it: an idle
+    /// codex row with a well-formed title is not polled, store silent or not.
+    /// (The birth-title insertion is keyed on the row WEARING a fallback — a
+    /// settled real title is neither polled nor rewritten.)
+    #[test]
+    fn a_static_cli_row_still_settles_after_its_first_title() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-store-title-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        server.start_local_session(
+            crate::SessionKind::Codex,
+            Some("/home/user/proj"),
+            Some("Refactor the parser pipeline"),
+        );
+        let working: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let updates = super::collect_live_store_title_syncs_in(
+            &home,
+            &server.live_sessions(),
+            &working,
+        );
+        assert!(
+            updates.is_empty(),
+            "a Static-CLI idle row must settle: {updates:?}",
         );
         let _ = std::fs::remove_dir_all(&home);
     }

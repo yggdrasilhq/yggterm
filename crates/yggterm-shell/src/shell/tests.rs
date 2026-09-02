@@ -66176,6 +66176,96 @@ mod web_surface_immersion_locks {
         );
     }
 
+    /// LINK: metadata pane → CLI identity. The pane's session-id line must
+    /// name the CLI's OWN session id with the REGISTRY's label — not the row
+    /// uuid under a generic "Session id". A uuid-keyed anchor row's uuid is a
+    /// seat, not a session id; the tab mirror's id outranks it (measured
+    /// 2026-09-02: OpenCode rows showing their row uuid as "Session id").
+    #[test]
+    fn ssot_the_pane_prefers_the_cli_session_id_and_uses_the_registry_label() {
+        let entry = |label: &'static str, value: &str| SessionMetadataEntry {
+            label,
+            value: value.to_string(),
+        };
+        let mut session = minimal_opencode_row();
+        session.metadata = vec![
+            entry("UUID", "11111111-2222-4333-8444-555555555555"),
+            entry("Tab Session Id", "ses_probe0000000000000001"),
+        ];
+        let (label, value) =
+            metadata_session_identity(&session).expect("an identity line exists");
+        assert_eq!(
+            label, "OpenCode Session",
+            "the label is the REGISTRY's session_metadata_label, not a hand match"
+        );
+        assert_eq!(
+            value, "ses_probe0000000000000001",
+            "the tab mirror's session id outranks the row's uuid seat"
+        );
+
+        // And the dynamicity entries surface what the row is tied to RIGHT
+        // NOW: the viewed session on an anchor, the mirrored session on a tab.
+        let mut anchor = minimal_opencode_row();
+        anchor.metadata = vec![entry(
+            "Viewing Tab Session Id",
+            "ses_probe0000000000000001",
+        )];
+        assert_eq!(
+            metadata_dynamicity_entries(&anchor),
+            vec![("Viewing session", "ses_probe0000000000000001".to_string())],
+            "the anchor's currently-viewed session is the pane's dynamicity line"
+        );
+        // A row with nothing dynamic carries no dynamicity lines.
+        let plain = minimal_opencode_row();
+        assert!(metadata_dynamicity_entries(&plain).is_empty());
+    }
+
+    /// A minimal OpenCode row for the pane-data assertions above — every
+    /// field the type demands, none of the state under test.
+    fn minimal_opencode_row() -> ManagedSessionView {
+        ManagedSessionView {
+            id: "ses_probe0000000000000001".to_string(),
+            session_path: "opencode-runtime://ses_probe0000000000000001".to_string(),
+            title: String::new(),
+            kind: SessionKind::OpenCode,
+            host_label: "probehost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Queued,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                older_available: false,
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+            working: None,
+            limit_wait: false,
+            awaiting_user_choice: false,
+            input_unanswered_ms: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        }
+    }
+
     /// The worst-case sidebar row: `session_kind: None`, exactly the shape a
     /// builder that lost the kind emits.
     fn ssot_sidebar_row_of_unknown_kind(path: &str) -> BrowserRow {

@@ -28,6 +28,12 @@ use yggterm_core::opencode_service::OpencodeServiceSession;
 pub const TAB_SOURCE_METADATA: &str = "opencode-tab-mirror";
 pub const MIRROR_INTERVAL_MS: u64 = 5_000;
 pub const TAB_SESSION_ID_METADATA: &str = "Tab Session Id";
+/// The anchor's currently-rendered session — the tab the human is LOOKING at
+/// in the TUI, refreshed every tick from the service's viewed-focus stream.
+/// This is how the metadata pane speaks opencode's dynamicity language: a
+/// uuid-keyed anchor row is not A session, it is A WINDOW onto whichever
+/// session is focused, and this entry names it.
+pub const VIEWING_SESSION_METADATA: &str = "Viewing Tab Session Id";
 pub const SPAWN_BUDGET_PER_TICK: usize = 1;
 const VIEWED_METADATA: &str = "Tab Viewed Ms";
 
@@ -386,6 +392,31 @@ impl YggtermServer {
                 .get(&anchor_key)
                 .map(|a| a.title_is_explicit)
                 .unwrap_or(true);
+            // The anchor's DYNAMICITY, surfaced as metadata: which session the
+            // TUI is rendering RIGHT NOW. The title follow above answers "what
+            // am I looking at" in the sidebar; this answers it in the metadata
+            // pane, where a row uuid that is not a session id could never
+            // (owner directive 2026-09-02: the metadata system should
+            // understand the CLI's dynamicity language — opencode's is the
+            // viewed-tab focus stream).
+            let viewing = active
+                .iter()
+                .filter(|s| s.viewed_epoch_ms > 0)
+                .max_by_key(|s| s.viewed_epoch_ms)
+                .map(|s| s.id.clone());
+            if let Some(session) = self.sessions.get_mut(&anchor_key) {
+                if let Some(ses_id) = &viewing {
+                    crate::upsert_session_metadata(
+                        &mut session.metadata,
+                        VIEWING_SESSION_METADATA,
+                        ses_id.clone(),
+                    );
+                } else {
+                    session
+                        .metadata
+                        .retain(|m| m.label != VIEWING_SESSION_METADATA);
+                }
+            }
             if !explicit {
                 if let Some(newest) = active
                     .iter()
@@ -474,9 +505,19 @@ impl YggtermServer {
     /// The live opencode TUI row (the mirror's seating anchor) and the next
     /// free sub-seat under it: `<anchor outline>.<n+1>`.
     fn opencode_anchor_key(&self) -> Option<String> {
-        self.sessions
+        // ⛔ THE ANCHOR IS THE LIVE TUI, NOT THE FIRST ROW THAT QUALIFIES.
+        // The original predicate took the first OpenCode row without the
+        // mirror stamp — with several uuid-keyed rows in the set (anchors of
+        // TUIs that died, phantom resumes of ids no store ever held — both
+        // measured live 2026-09-02: four uuid rows, one real TUI) the
+        // anchor-as-header title landed on an arbitrary dead row while the
+        // real TUI kept its stale name. Prefer a row that is actually
+        // RUNNING; only a set with no live TUI at all falls back to the
+        // historical first-qualified order.
+        let candidates: Vec<&crate::ManagedSessionView> = self
+            .sessions
             .values()
-            .find(|s| {
+            .filter(|s| {
                 s.kind == crate::SessionKind::OpenCode
                     && s.session_path.starts_with("opencode-runtime://")
                     && !s
@@ -484,6 +525,19 @@ impl YggtermServer {
                         .iter()
                         .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
             })
+            .collect();
+        candidates
+            .iter()
+            .find(|s| {
+                s.terminal_process_id.is_some()
+                    || matches!(
+                        s.launch_phase,
+                        crate::TerminalLaunchPhase::Running
+                            | crate::TerminalLaunchPhase::RemoteBootstrap
+                    )
+            })
+            .copied()
+            .or_else(|| candidates.first().copied())
             .map(|a| a.session_path.clone())
     }
 
@@ -639,6 +693,168 @@ mod adoption_tests {
                 None,
             ),
             None
+        );
+    }
+}
+
+mod anchor_tests {
+    use super::*;
+
+    fn server_with_two_anchors() -> (crate::YggtermServer, String, String) {
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        // The historical order bug: the DEAD anchor sorts first in the row
+        // map, so the old first-qualified pick landed on it while the live
+        // TUI sat untitled. Measured live 2026-09-02: four uuid rows, one
+        // real TUI, and the anchor-as-header title on an arbitrary one.
+        let dead = server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            Some("Remote OpenCode d4090efe"),
+        );
+        let live = server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            Some("Remote OpenCode 7e7d6c5e"),
+        );
+        let live_row = server
+            .sessions
+            .get_mut(&live)
+            .expect("the live row exists");
+        live_row.launch_phase = crate::TerminalLaunchPhase::Running;
+        live_row.terminal_process_id = Some(4242);
+        // The dead row must be dead ON PURPOSE: `start_local_session` may
+        // birth rows in a running-looking phase depending on the host, and
+        // the selection under test keys on the running marks.
+        let dead_row = server
+            .sessions
+            .get_mut(&dead)
+            .expect("the dead row exists");
+        dead_row.launch_phase = crate::TerminalLaunchPhase::Queued;
+        dead_row.terminal_process_id = None;
+        // The rows this test mirrors are the runtime-spelled ones the real
+        // plane serves (`opencode-runtime://<uuid>`); `start_local_session`
+        // births rows under the `local://` seat key, so re-key both rows the
+        // way the daemon's alias layer does before the mirror runs. The rows
+        // are identified by their MARK (the live TUI carries a pid), never by
+        // their title — a fallback-shaped title hint is filtered at birth and
+        // proves nothing.
+        for key in [&dead, &live] {
+            if let Some(mut row) = server.sessions.remove(key) {
+                let new_key = format!("opencode-runtime://{}", row.id);
+                row.session_path = new_key.clone();
+                server.sessions.insert(new_key, row);
+            }
+        }
+        let dead_key = server
+            .sessions
+            .values()
+            .find(|r| {
+                r.kind == crate::SessionKind::OpenCode && r.terminal_process_id.is_none()
+            })
+            .map(|r| r.session_path.clone())
+            .expect("dead fixture row");
+        let live_key = server
+            .sessions
+            .values()
+            .find(|r| r.terminal_process_id == Some(4242))
+            .map(|r| r.session_path.clone())
+            .expect("live fixture row");
+        (server, dead_key, live_key)
+    }
+
+    #[test]
+    fn the_anchor_is_the_live_tui_not_the_first_qualified_row() {
+        let (server, _dead, live) = server_with_two_anchors();
+        assert_eq!(
+            server.opencode_anchor_key(),
+            Some(live),
+            "a RUNNING TUI outranks a dead uuid row in anchor selection",
+        );
+    }
+
+    #[test]
+    fn the_anchor_names_the_session_it_is_currently_viewing() {
+        let (mut server, _dead, _live) = server_with_two_anchors();
+        let viewed = |id: &str, viewed: u128| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(format!("Tab {id}")),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: viewed,
+            running: true,
+        };
+        // Two open tabs; ses_b was looked at LAST, so it is what the TUI
+        // renders right now.
+        let active = vec![
+            viewed("ses_a0000000000000000000000001", 100),
+            viewed("ses_b0000000000000000000000002", 200),
+        ];
+        server.apply_opencode_tab_mirror(&active);
+        let anchor_key = server
+            .opencode_anchor_key()
+            .expect("an anchor exists");
+        let anchor = server.sessions.get(&anchor_key).expect("anchor row");
+        let viewing = anchor
+            .metadata
+            .iter()
+            .find(|m| m.label == VIEWING_SESSION_METADATA)
+            .map(|m| m.value.clone());
+        assert_eq!(
+            viewing.as_deref(),
+            Some("ses_b0000000000000000000000002"),
+            "the anchor's metadata pane entry must name the session the human \
+             is LOOKING at — the CLI's dynamicity language, surfaced",
+        );
+        // And the header title follows the same focus (anchor-as-header).
+        assert!(
+            anchor.title.contains("ses_b")
+                || anchor.title == "Tab ses_b0000000000000000000000002",
+            "the anchor title follows the viewed tab, got {:?}",
+            anchor.title
+        );
+    }
+
+    #[test]
+    fn a_quiet_service_clears_the_viewing_entry_instead_of_freezing_it() {
+        let (mut server, _dead, _live) = server_with_two_anchors();
+        let viewed = |id: &str, viewed: u128| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(format!("Tab {id}")),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: viewed,
+            running: true,
+        };
+        server.apply_opencode_tab_mirror(&vec![viewed(
+            "ses_a0000000000000000000000001",
+            100,
+        )]);
+        let with_tabs = {
+            let anchor_key = server.opencode_anchor_key().expect("anchor");
+            server
+                .sessions
+                .get(&anchor_key)
+                .expect("anchor row")
+                .metadata
+                .iter()
+                .any(|m| m.label == VIEWING_SESSION_METADATA)
+        };
+        assert!(with_tabs, "a viewed tab stamps the viewing entry");
+        // The service's active set goes quiet (no tabs anywhere): a stale
+        // "Viewing …" would now be a lie about the present.
+        server.apply_opencode_tab_mirror(&[]);
+        let anchor_key = server.opencode_anchor_key().expect("anchor");
+        let anchor = server.sessions.get(&anchor_key).expect("anchor row");
+        assert!(
+            !anchor
+                .metadata
+                .iter()
+                .any(|m| m.label == VIEWING_SESSION_METADATA),
+            "no viewed tab anywhere must not leave a frozen 'Viewing' claim",
         );
     }
 }

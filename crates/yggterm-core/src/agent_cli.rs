@@ -5781,6 +5781,41 @@ pub fn new_row_birth_title(machine: Option<&str>, what: &str) -> String {
     }
 }
 
+/// Whether a CLI's own store can REtitle a session after yggterm first read
+/// one — the title half of each CLI's dynamicity language.
+///
+/// ⛔ **THIS IS A PER-CLI FACT, NOT A POLICY.** A chore that assumes titles
+/// settle once forever will silently drop every later rename; one that polls
+/// every row forever burns the tick budget. The registry answers which is
+/// which so callers never guess:
+///
+/// - **[`TitleMutability::Dynamic`]** — the store rewrites titles for the
+///   life of the session: an auto-title lands after the first prompt, the
+///   human renames in the TUI, a fork mints its own. Measured on OpenCode
+///   2026-09-02: a session whose store title moved AFTER the row's title was
+///   settled kept its stale name forever, because the title chore skips
+///   idle+named rows. A Dynamic CLI's non-owner-set title is therefore never
+///   "settled" — the chore polls it every tick and the store-agrees check
+///   keeps a quiet tick write-free.
+/// - **[`TitleMutability::Static`]** — the store writes a title at most once
+///   (a summary on first turns). The existing settle-skip is correct and the
+///   poll budget stays where it was. Extend this match the day a CLI is
+///   MEASURED retitling — with the measurement in the comment, not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleMutability {
+    /// The store can retitle the session at any time (OpenCode today).
+    Dynamic,
+    /// The store writes a title once and never revises it (the default).
+    Static,
+}
+
+pub fn title_mutability(kind: SessionKind) -> TitleMutability {
+    match kind {
+        SessionKind::OpenCode => TitleMutability::Dynamic,
+        _ => TitleMutability::Static,
+    }
+}
+
 /// Which CLI's store `path` lives under, if any. The store roots are mutually
 /// exclusive by construction (`/.codex/sessions/` is not a substring of
 /// `/.codex-litellm/sessions/`), and
@@ -6122,7 +6157,49 @@ pub fn assert_store_predicate_coverage(predicate_name: &str, probe: impl Fn(&str
 mod tests {
     use super::*;
 
-    /// ⛔ A LIMIT-WAIT IS NOT IDLE. A session waiting out a usage limit paints
+    /// ⛔ THE DYNAMICITY CONTRACT IS EXHAUSTIVE AND OPENCODE IS ITS FIRST
+    /// MEMBER (owner directive 2026-09-02: "our metadata system should
+    /// understand their dynamicity language"). A CLI the registry has not
+    /// MEASURED as retitling must answer Static — the cheap settle-skip is
+    /// correct for it — and OpenCode must answer Dynamic: its store rewrites
+    /// titles for a session's whole life (auto-title after the first prompt,
+    /// human rename in the TUI, fork names), which is the measured reason a
+    /// settled row wore last week's name (2026-09-02).
+    #[test]
+    fn title_mutability_is_dynamic_only_for_measured_retitlers() {
+        assert_eq!(
+            title_mutability(SessionKind::OpenCode),
+            TitleMutability::Dynamic,
+            "OpenCode retitles dynamically — the one measured member"
+        );
+        for kind in SessionKind::ALL {
+            if *kind == SessionKind::OpenCode {
+                continue;
+            }
+            assert_eq!(
+                title_mutability(*kind),
+                TitleMutability::Static,
+                "{kind:?}: a CLI not measured as a retiler must stay Static — \
+                 extend the match with the measurement, never a guess"
+            );
+        }
+    }
+
+    /// The pane's session-id label is the REGISTRY's `session_metadata_label`
+    /// — one table per CLI, so a row can never be shown a label that names a
+    /// different CLI's fact.
+    #[test]
+    fn every_agent_cli_has_a_session_metadata_label() {
+        for descriptor in AGENT_CLIS {
+            assert!(
+                descriptor.session_metadata_label.trim().split_whitespace().count() >= 2,
+                "{}: a session metadata label must name the CLI and the fact",
+                descriptor.display_name
+            );
+        }
+    }
+
+    /// A LIMIT-WAIT IS NOT IDLE. A session waiting out a usage limit paints
     /// a footer with no working phrase, so every daemon-owned surface called
     /// it "confirmed idle" at once and the working→done edge fired a false
     /// "done". The phrases are per-CLI descriptor data like the working set.
