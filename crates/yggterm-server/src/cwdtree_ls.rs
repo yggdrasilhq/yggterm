@@ -191,7 +191,25 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
                     };
                     let display_path = full_path.clone();
                     let storage_path = brow.get("session_cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    // ⛔ THE SCAN-TIME STAMP WAS THE LIE (owner-caught 2026-09-02,
+                    // twin of the startpage fix): this row used to carry
+                    // `modified_epoch_ms: now_ms` — a live-only session read as
+                    // "used one second ago" at every scan tick, forever, and the
+                    // live-first group ordering made that lie load-bearing. The
+                    // truthful epoch is the daemon's own last-activity measurement
+                    // for the row (`last_activity_epoch_ms` on the snapshot's live
+                    // rows); `0` when unknown — honest unknown, ranked honestly.
+                    let live_activity_ms: Option<u64> = snapshot_opt
+                        .as_ref()
+                        .and_then(|snap| {
+                            snap.live_sessions
+                                .iter()
+                                .find(|s| {
+                                    s.id.trim() == sid.as_str()
+                                        || s.session_path == display_path
+                                })
+                                .and_then(|s| s.last_activity_epoch_ms)
+                        });
                     let row = yggterm_core::startpage::StartpageDurableRow {
                         session_id: sid.clone(),
                         cwd: cwd.clone(),
@@ -200,7 +218,7 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
                         effective_title: label.clone(),
                         detail: None,
                         kind,
-                        modified_epoch_ms: now_ms,
+                        modified_epoch_ms: live_activity_ms.map(|ms| ms as u128).unwrap_or(0),
                         storage_path: if storage_path.is_empty() { display_path.clone() } else { storage_path },
                         display_path: display_path.clone(),
                     };
@@ -222,24 +240,20 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
         for (r, h) in &rows_with_host { uniq.insert((h.clone(), r.cwd.clone())); }
         uniq.len()
     };
-    // Cwdtree: groups by cwd, sessions within groups and groups themselves by recency.
-    // Recency is live > modified_epoch (so a running session's group leads even if mtime is 0).
-    // Helper: effective epoch with live promotion (live sessions use current time as epoch when mtime==0)
-    let effective_epoch = |row: &yggterm_core::startpage::StartpageDurableRow| -> (bool, u128) {
-        let is_live = live_set.contains(&row.display_path) || live_set.contains(&row.storage_path) || live_set.contains(&row.session_id);
-        let epoch = if is_live && row.modified_epoch_ms == 0 {
-            // Live but no mtime yet — treat as most recent
-            u128::MAX
-        } else {
-            row.modified_epoch_ms
-        };
-        (is_live, epoch)
+    // Cwdtree: groups by cwd, sessions within groups and groups themselves by
+    // recency. ⛔ RECENCY IS THE WHOLE LAW now (2026-09-02 fs-truth fix): the
+    // old `live > epoch` promotion plus the `u128::MAX` epoch for live rows
+    // with no mtime kept a folder full of stale-but-live rows ranked "now"
+    // forever, above folders whose durable rows held true recency. Every row
+    // carries a truthful epoch (store mtime; daemon last-activity for live
+    // rows); unknown is 0 and ranks last — honest, not promoted.
+    let effective_epoch = |row: &yggterm_core::startpage::StartpageDurableRow| -> u128 {
+        row.modified_epoch_ms
     };
     rows_with_host.sort_by(|(a_row, a_host), (b_row, b_host)| {
-        let (a_live, a_epoch) = effective_epoch(a_row);
-        let (b_live, b_epoch) = effective_epoch(b_row);
-        b_live.cmp(&a_live)
-            .then_with(|| b_epoch.cmp(&a_epoch))
+        let a_epoch = effective_epoch(a_row);
+        let b_epoch = effective_epoch(b_row);
+        b_epoch.cmp(&a_epoch)
             .then_with(|| a_host.cmp(b_host))
             .then_with(|| a_row.cwd.cmp(&b_row.cwd))
     });
@@ -249,12 +263,9 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
     }
     let mut groups: Vec<((String, String), Vec<yggterm_core::startpage::StartpageDurableRow>)> = groups_map.into_iter().collect();
     groups.sort_by(|a, b| {
-        let a_max_live = a.1.iter().any(|r| effective_epoch(r).0);
-        let b_max_live = b.1.iter().any(|r| effective_epoch(r).0);
-        let a_max = a.1.iter().map(|r| effective_epoch(r).1).max().unwrap_or(0);
-        let b_max = b.1.iter().map(|r| effective_epoch(r).1).max().unwrap_or(0);
-        b_max_live.cmp(&a_max_live)
-            .then_with(|| b_max.cmp(&a_max))
+        let a_max = a.1.iter().map(|r| effective_epoch(r)).max().unwrap_or(0);
+        let b_max = b.1.iter().map(|r| effective_epoch(r)).max().unwrap_or(0);
+        b_max.cmp(&a_max)
             .then_with(|| a.0.cmp(&b.0))
     });
 
@@ -270,9 +281,9 @@ pub fn run_server_cwdtree_ls(store: &yggterm_core::SessionStore, args: &[String]
     for ((host_key, cwd), mut sessions) in groups {
         if remaining == 0 { break; }
         sessions.sort_by(|a, b| {
-            let (a_live, a_epoch) = effective_epoch(a);
-            let (b_live, b_epoch) = effective_epoch(b);
-            b_live.cmp(&a_live).then_with(|| b_epoch.cmp(&a_epoch))
+            let a_epoch = effective_epoch(a);
+            let b_epoch = effective_epoch(b);
+            b_epoch.cmp(&a_epoch)
         });
         if sessions.len() > remaining { sessions.truncate(remaining); }
         remaining -= sessions.len();

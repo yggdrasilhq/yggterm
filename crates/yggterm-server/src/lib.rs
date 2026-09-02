@@ -2274,6 +2274,28 @@ fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) -> Ext
     wait_for_external_agent_resume_to_clear(SessionKind::Codex, home, session_id)
 }
 
+/// May this wait END THE HOLDERS instead of expiring into the ether?
+///
+/// True only when BOTH hold for every holder:
+/// 1. **provably ours** — `StrandedYggtermOwned`: the process's environ marker
+///    names this session, so it was yggterm-launched and is nobody else's work
+///    to protect; and
+/// 2. **orphaned** — reparented to init (ppid 1): its original terminal and
+///    owning daemon are gone, so no one can ever attach to it again and no
+///    reader is watching it work.
+///
+/// An EXTERNAL holder (a person's own terminal), or a stranded holder that
+/// still hangs under a live parent, returns `false` — the wait expires the way
+/// it always has and the choice stays with the reader.
+#[cfg(target_os = "linux")]
+fn stranded_orphan_holders_recoverable(processes: &[ExternalCodexResumeProcess]) -> bool {
+    !processes.is_empty()
+        && processes
+            .iter()
+            .all(|process| process.holder == AgentResumeHolderKind::StrandedYggtermOwned)
+        && processes.iter().all(|process| process.ppid == Some(1))
+}
+
 /// How long the banner may sit unchanged before it is re-rendered with the
 /// elapsed time. Long enough not to scroll a viewport, short enough that a
 /// person who looks away and back can tell the wait is still live.
@@ -2340,6 +2362,55 @@ fn wait_for_external_agent_resume_to_clear(
             return ExternalResumeWait::Released;
         }
         if started.elapsed() >= EXTERNAL_ACTIVE_WAIT_DEADLINE {
+            // ⛔ BUG B2 SELF-RECOVERY (owner-caught 2026-09-02, "sessions opened
+            // in the ether"): a holder that is PROVABLY OURS
+            // (`StrandedYggtermOwned` — its environ marker names this session)
+            // AND orphaned to init (ppid 1 — its terminal and owning daemon are
+            // both gone) can never be observed by anyone again. Before this
+            // branch the wait expired, the caller retried later, the retry
+            // collided with the same corpse, and a keep-alive row lived in the
+            // banner forever — measured live: 21 wait cycles and 2 deadlines in
+            // 8 minutes on one row, holders 15+ hours dead. The transcript
+            // persists in the session file (that is what resume re-derives
+            // from), so ending the corpse loses the conversation nothing; the
+            // 08-29 "reader's choice" rule is explicitly OVERRIDDEN here for
+            // the stranded-orphan case only — an EXTERNAL holder, or a holder
+            // still attached to any live parent, still expires without a kill.
+            if stranded_orphan_holders_recoverable(&processes) {
+                let pids = processes.iter().map(|process| process.pid).collect::<Vec<_>>();
+                append_trace_event(
+                    home,
+                    "remote",
+                    "resume_codex",
+                    "external_active_wait_recovered_stranded_orphan",
+                    json!({
+                        "session_id": session_id,
+                        "pids": pids,
+                        "waited_secs": started.elapsed().as_secs(),
+                        "policy": "stranded_orphan_holders_block_no_one",
+                    }),
+                );
+                if in_place {
+                    println!();
+                }
+                println!(
+                    "yggterm: the holding process ({}) is a stranded orphan of an earlier Yggterm \
+                     restart — ending it and attaching from the session transcript.",
+                    pids.iter()
+                        .map(|pid| pid.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let _ = std::io::stdout().flush();
+                for pid in &pids {
+                    terminate_linux_process_tree(*pid);
+                }
+                // Loop: the next scan finds no holders → Released → the resume
+                // proceeds. Give the reaper a beat first so the released notice
+                // does not race our own kill.
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             append_trace_event(
                 home,
                 "remote",
@@ -3761,6 +3832,20 @@ pub struct SnapshotSessionView {
     pub embedded_surface_detail: Option<String>,
     pub last_launch_error: Option<String>,
     pub last_window_error: Option<String>,
+    /// When this row was LAST ACTIVE, in epoch ms, as the DAEMON'S OWN PTY
+    /// clock measured it (now − `TerminalManager::session_idle_for_ms`).
+    ///
+    /// ⛔ This field exists because the fs-recency surfaces lied (owner-caught
+    /// 2026-09-02): the startpage/cwdtree projections stamped every live row
+    /// with the SCAN time, so a row idle for days read as "used one second
+    /// ago" at every scan tick and permanently outranked every durable row
+    /// whose store mtime held the truth. A live row's recency is a FACT the
+    /// daemon knows and was not telling; now it rides the snapshot.
+    /// `None` = this daemon does not own (or cannot see) the row's PTY —
+    /// honest unknown, never synthesized. serde(default) keeps older
+    /// snapshots deserializable.
+    #[serde(default)]
+    pub last_activity_epoch_ms: Option<u64>,
     pub ssh_target: Option<String>,
     pub ssh_prefix: Option<String>,
     // Observability (campaign grid-squish diagnosis): the PTY's current grid
@@ -4218,6 +4303,13 @@ pub struct ManagedSessionView {
     pub embedded_surface_detail: Option<String>,
     pub last_launch_error: Option<String>,
     pub last_window_error: Option<String>,
+    /// Daemon-measured last-activity for a LIVE row (epoch ms), carried from
+    /// the snapshot's `SnapshotSessionView` through the shell's session
+    /// conversion. The shell's startpage ranking reads THIS — it never
+    /// synthesizes a recency for a row the daemon could not measure
+    /// (`None` = unknown, epoch 0, ranked honestly last). 2026-09-02 fs-truth
+    /// law: recency outranks live-ness, so the epoch must be real.
+    pub last_activity_epoch_ms: Option<u64>,
     pub ssh_target: Option<String>,
     pub ssh_prefix: Option<String>,
     pub stored_preview_hydrated: bool,
@@ -5131,6 +5223,36 @@ impl YggtermServer {
         let preserved_active_path = self.active_session_path.clone();
         let preserved_active_view_mode = self.active_view_mode;
         let preserved_live_session_order = self.live_session_order.clone();
+
+        // ⭐ NOTHING WAS ACTIVE, AND THE ROW IS ALREADY LIVE — the launch is
+        // pure bookkeeping here, and its bookkeeping IS the defect: activate
+        // the row, then re-clear active to `None` (the
+        // `launch_preserving_active_had_none` arm below). Two activation
+        // writes per attach, every attach, while the user sits on the
+        // startpage — measured 30 pairs in one window on the GUI host
+        // (2026-09-02 20:22, remote-opencode rows, `user_gesture:false` on
+        // every one), each write snapshot-visible to every activation
+        // follower. The ensure funnel's own runtime half (terminal spec
+        // resolve, PTY ensure) runs AFTER this call and reads the session,
+        // not the active pointer, so a live row loses nothing by skipping.
+        // A stored path keeps the old flow: its ensure needs the
+        // stored→live open that the launch performs.
+        if preserved_active_path.is_none() && self.resolve_live_session_entry(path).is_some() {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "session",
+                    "request_terminal_launch",
+                    serde_json::json!({
+                        "path": path,
+                        "resolved_key": self.resolve_session_storage_key(path).map(str::to_string),
+                        "skipped": "preserving_active_had_none_live_row",
+                    }),
+                );
+            }
+            return;
+        }
 
         self.request_terminal_launch_for_path(
             path,
@@ -10432,6 +10554,29 @@ impl YggtermServer {
         title_hint: Option<&str>,
         launch: &AgentLaunchOptions,
     ) -> String {
+        self.start_local_session_with_launch_options_and_activation(
+            kind, cwd, title_hint, launch, true,
+        )
+    }
+
+    /// [`Self::start_local_session_with_launch_options`], with the viewport
+    /// decision made explicit.
+    ///
+    /// `activate == false` is the `--no-activate` contract: the row is born,
+    /// seated, and NOT made the active session — the user's view does not
+    /// move, and the row's PTY starts lazily on first open. This is the
+    /// daemon half of a decision that used to exist only client-side, which
+    /// is how a `--no-activate` usability probe took the active session
+    /// (GUI host 2026-09-02 18:17) and its reap dropped the user onto the
+    /// startpage.
+    pub fn start_local_session_with_launch_options_and_activation(
+        &mut self,
+        kind: SessionKind,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        launch: &AgentLaunchOptions,
+        activate: bool,
+    ) -> String {
         let uuid = Uuid::new_v4().to_string();
         let key = match kind {
             SessionKind::SshShell => format!("live::{uuid}"),
@@ -10451,7 +10596,7 @@ impl YggtermServer {
             &target,
             Some(title),
             true,
-            true,
+            activate,
             launch,
         );
         key
@@ -15558,10 +15703,21 @@ fn refresh_restored_remote_runtime_codex_launch_command(
         "Source",
         "daemon-owned-remote-runtime".to_string(),
     );
+    // ⛔ THE RESTORE LINE NAMES THE ROW'S OWN CLI (owner-caught 2026-09-02,
+    // daemon-drift bug B1): it hardcoded `resume-codex` + "Codex" for EVERY
+    // kind, so an OpenCode row restored into the ether announced a codex
+    // resume that was never its command — the metadata panel lied about the
+    // exact verb the fleet needed to debug. Derive both from the registry.
+    let restore_verb = remote_agent_resume_subcommand(session.kind)
+        .unwrap_or_else(|| "resume-codex".to_string());
+    let restore_cli = agent_cli_descriptor(session.kind)
+        .map(|d| d.display_name)
+        .unwrap_or("Codex")
+        .to_string();
     upsert_session_metadata(
         &mut session.metadata,
         "Restore",
-        format!("yggterm server remote resume-codex {session_id} --require-existing"),
+        format!("yggterm server remote {restore_verb} {session_id} --require-existing"),
     );
     upsert_session_metadata(
         &mut session.metadata,
@@ -15587,7 +15743,7 @@ fn refresh_restored_remote_runtime_codex_launch_command(
 
     let terminal_lines = vec![
         format!("$ {launch_command}"),
-        format!("Resume daemon-owned remote Codex session {session_id}"),
+        format!("Resume daemon-owned remote {restore_cli} session {session_id}"),
         format!(
             "Workspace: {}",
             cwd.clone().unwrap_or_else(local_default_cwd)
@@ -15655,6 +15811,7 @@ mod restored_runtime_repair_tests {
             embedded_surface_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
+            last_activity_epoch_ms: None,
             last_window_error: None,
             ssh_target: None,
             ssh_prefix: None,
@@ -15703,6 +15860,136 @@ mod restored_runtime_repair_tests {
         assert!(repaired, "the restored daemon-runtime case must keep working");
         assert_eq!(session.session_path, key);
         assert_eq!(session.source, SessionSource::LiveLocal);
+    }
+
+    /// ⛔ BUG B2 SELF-RECOVERY GATE (owner-caught 2026-09-02, "sessions opened
+    /// in the ether"): the wait may end the HOLDERS only when every holder is
+    /// provably yggterm's own AND orphaned to init. An external holder (a
+    /// person's own terminal) or a stranded holder still attached to a live
+    /// parent must never be killed by the deadline path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_stranded_orphaned_holders_are_self_recoverable() {
+        use super::{stranded_orphan_holders_recoverable, AgentResumeHolderKind};
+        let holder = |pid: u32, ppid: Option<u32>, holder: AgentResumeHolderKind| {
+            super::ExternalCodexResumeProcess {
+                pid,
+                argv0: "codex".to_string(),
+                holder,
+                ppid,
+            }
+        };
+        // The ether case: ours, reparented to init — recoverable.
+        assert!(stranded_orphan_holders_recoverable(&[holder(
+            122603,
+            Some(1),
+            AgentResumeHolderKind::StrandedYggtermOwned
+        )]));
+        assert!(stranded_orphan_holders_recoverable(&[
+            holder(122603, Some(1), AgentResumeHolderKind::StrandedYggtermOwned),
+            holder(122624, Some(1), AgentResumeHolderKind::StrandedYggtermOwned),
+        ]));
+        // A person's own terminal: never.
+        assert!(!stranded_orphan_holders_recoverable(&[holder(
+            500,
+            Some(900),
+            AgentResumeHolderKind::External
+        )]));
+        // Ours but still under a live parent: not provably unobserved — no.
+        assert!(!stranded_orphan_holders_recoverable(&[holder(
+            501,
+            Some(2710488),
+            AgentResumeHolderKind::StrandedYggtermOwned
+        )]));
+        // Mixed: one external holder in the set — the strictest reading wins.
+        assert!(!stranded_orphan_holders_recoverable(&[
+            holder(502, Some(1), AgentResumeHolderKind::StrandedYggtermOwned),
+            holder(503, Some(900), AgentResumeHolderKind::External),
+        ]));
+        // Nothing to recover from is not a recovery.
+        assert!(!stranded_orphan_holders_recoverable(&[]));
+    }
+
+    /// ⛔ BUG B1 (owner-caught 2026-09-02, "sessions opened in the ether"):
+    /// the Restore metadata + viewport preamble hardcoded `resume-codex` and
+    /// "Codex" for EVERY kind — an OpenCode row restored by the daemon then
+    /// announced a codex resume that was never its command, and the metadata
+    /// panel lied about the exact verb anyone debugging the ether needed. The
+    /// line must name the row's OWN CLI, from the registry.
+    #[test]
+    fn restored_opencode_row_names_opencode_in_its_restore_metadata() {
+        let sid = "ses_fa81cc6f5ffeW0DjEXb8idKoWo";
+        let key = format!("opencode-runtime://{sid}");
+        let mut session = ManagedSessionView {
+            id: sid.to_string(),
+            session_path: key.clone(),
+            title: "explore libyggterm structure".to_string(),
+            kind: SessionKind::OpenCode,
+            host_label: String::new(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::Queued,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            // Already a resume for this session (contains the CLI's own
+            // `--session` needle + the id) so the store-existence probe is
+            // skipped and the test stays hermetic.
+            launch_command: format!("opencode2 --session {sid}"),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![],
+            preview: SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/user/gh/widgets".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            last_activity_epoch_ms: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            limit_wait: false,
+            awaiting_user_choice: false,
+            input_unanswered_ms: None,
+            agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+        let repaired = refresh_restored_remote_runtime_codex_launch_command(&key, &mut session);
+        assert!(repaired, "a restored opencode runtime row is repaired");
+        let restore = session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Restore")
+            .map(|entry| entry.value.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            restore,
+            format!("yggterm server remote resume-opencode {sid} --require-existing"),
+            "the Restore line names the row's OWN CLI verb"
+        );
+        let preamble = session.terminal_lines.join("\n");
+        assert!(
+            preamble.contains(&format!("OpenCode session {sid}")),
+            "the preamble names OpenCode, not Codex; got: {preamble}"
+        );
+        assert!(
+            !preamble.contains("Codex session"),
+            "no codex wording may survive on an opencode row"
+        );
     }
 }
 
@@ -30782,6 +31069,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         embedded_surface_detail: session.embedded_surface_detail,
         last_launch_error: session.last_launch_error,
         last_window_error: session.last_window_error,
+        last_activity_epoch_ms: None,
         ssh_target: session.ssh_target,
         ssh_prefix: session.ssh_prefix,
         pty_cols: None,
@@ -30900,6 +31188,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         embedded_surface_detail: session.embedded_surface_detail.clone(),
         last_launch_error: session.last_launch_error.clone(),
         last_window_error: session.last_window_error.clone(),
+        last_activity_epoch_ms: None,
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
         pty_cols: None,
@@ -31101,6 +31390,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         embedded_surface_detail: session.embedded_surface_detail,
         last_launch_error: session.last_launch_error,
         last_window_error: session.last_window_error,
+        last_activity_epoch_ms: session.last_activity_epoch_ms,
         ssh_target: session.ssh_target,
         ssh_prefix: session.ssh_prefix,
         stored_preview_hydrated: true,
@@ -31474,6 +31764,7 @@ terminal_window_id: None,
         embedded_surface_detail: None,
         last_launch_error: None,
         last_window_error: None,
+        last_activity_epoch_ms: None,
         ssh_target: None,
         ssh_prefix: None,
         stored_preview_hydrated: should_hydrate_stored_preview,
@@ -31840,6 +32131,7 @@ fn build_live_session_with_launch_options(
         embedded_surface_detail: None,
         last_launch_error: None,
         last_window_error: None,
+        last_activity_epoch_ms: None,
         ssh_target: Some(target.ssh_target.clone()),
         ssh_prefix: target.prefix.clone(),
         stored_preview_hydrated: true,
@@ -33285,6 +33577,7 @@ mod recipe_tests {
             embedded_surface_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
+            last_activity_epoch_ms: None,
             last_window_error: None,
             ssh_target: None,
             ssh_prefix: None,
@@ -36003,6 +36296,7 @@ mod tests {
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             pty_cols: None,
@@ -39726,6 +40020,7 @@ mod tests {
                 embedded_surface_id: None,
                 embedded_surface_detail: None,
                 last_launch_error: None,
+            last_activity_epoch_ms: None,
                 last_window_error: None,
                 ssh_target: None,
                 ssh_prefix: None,
@@ -39823,6 +40118,7 @@ mod tests {
             embedded_surface_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
+            last_activity_epoch_ms: None,
             last_window_error: None,
             ssh_target: None,
             ssh_prefix: None,
@@ -39881,6 +40177,7 @@ mod tests {
             embedded_surface_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
+            last_activity_epoch_ms: None,
             last_window_error: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
@@ -40710,6 +41007,7 @@ terminal_window_id: None,
             embedded_surface_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
+            last_activity_epoch_ms: None,
             last_window_error: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
@@ -42002,6 +42300,136 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), Some(active.as_str()));
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
         assert_eq!(server.live_session_order, vec![active, inactive]);
+    }
+
+    /// ⛔ [startpage-hijack-B] THE PRESERVE-LAUNCH DOUBLE WRITE. With no active
+    /// session (the user is on the startpage, or a GUI restart has just
+    /// happened), every background attach of a LIVE row used to write the
+    /// activate-then-re-clear pair — 30 pairs in one measured window
+    /// (guihost 2026-09-02 20:22), each write snapshot-visible to every
+    /// activation follower. The skip keeps the state exactly as it was: the
+    /// attach is plumbing, the user's (empty) view is preserved, and the
+    /// ensure funnel's own runtime half still runs in the caller.
+    #[test]
+    fn preserving_active_launch_with_no_active_session_does_not_flip_through_the_row() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let target = crate::local_session_target(SessionKind::Shell, Some("/home/user"));
+        let live = "local://live-shell".to_string();
+        server.insert_live_session_with_launch(
+            &live,
+            "live-shell",
+            SessionKind::Shell,
+            &target,
+            Some("live".to_string()),
+            false,
+            false,
+        );
+        // Nothing is active — the post-restart / startpage window.
+        assert_eq!(server.active_session_path(), None);
+
+        server.request_terminal_launch_for_path_preserving_active(&live);
+
+        // The flip is gone: still no active session, view mode untouched.
+        assert_eq!(server.active_session_path(), None);
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+        // And the row itself was never promoted to active by the attach.
+        assert!(server.sessions.contains_key(&live));
+    }
+
+    /// ⛔ THE RANDOM-STARTPAGE-HIJACK REGRESSION (GUI host 2026-09-02 18:17).
+    /// A `--no-activate` usability probe was born ACTIVE because the daemon
+    /// half of the flag did not exist; when the probe was reaped six seconds
+    /// later, `remove_live_session` cleared an active session the user had
+    /// never left, and the GUI fell to the startpage mid-keystroke. The
+    /// daemon-side honor lives in
+    /// [`YggtermServer::start_local_session_with_launch_options_and_activation`];
+    /// this test pins BOTH halves of the contract: a no-activate birth moves
+    /// nothing, an activating birth still takes the viewport.
+    #[test]
+    fn start_local_session_no_activate_birth_leaves_active_session_untouched() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let target = crate::local_session_target(SessionKind::Shell, Some("/home/user"));
+        let active = "local://active-shell".to_string();
+        server.insert_live_session_with_launch(
+            &active,
+            "active-shell",
+            SessionKind::Shell,
+            &target,
+            Some("active".to_string()),
+            false,
+            false,
+        );
+        server.active_session_path = Some(active.clone());
+        server.active_view_mode = WorkspaceViewMode::Terminal;
+
+        // The probe's birth: `--no-activate` (activate = false).
+        let probe = server.start_local_session_with_launch_options_and_activation(
+            SessionKind::Shell,
+            Some("/home/user"),
+            Some("Agent unnamed shell: usability level-4 input probe"),
+            &AgentLaunchOptions::default(),
+            false,
+        );
+
+        // The row EXISTS (the create succeeded) …
+        assert!(server.sessions.contains_key(&probe));
+        // … and the user's view DID NOT MOVE — the whole point of the flag.
+        assert_eq!(server.active_session_path(), Some(active.as_str()));
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
+
+        // The activating birth (every human door) still takes the viewport.
+        let activated =
+            server.start_local_session_with_launch_options_and_activation(
+                SessionKind::Shell,
+                Some("/home/user"),
+                None,
+                &AgentLaunchOptions::default(),
+                true,
+            );
+        assert_eq!(server.active_session_path(), Some(activated.as_str()));
+    }
+
+    /// The wire cannot lose the flag silently in EITHER direction: an
+    /// OLD-shaped request (no `activate` field, pre-3.2.39 client) must still
+    /// parse and read as activate-on-create, and an explicit `false` must
+    /// survive the round trip. `serde(default)` + `Option` is the contract.
+    #[test]
+    fn start_local_session_request_activate_field_defaults_to_activate_on_create() {
+        use crate::ServerRequest;
+        let legacy = serde_json::json!({
+            "kind": "start_local_session",
+            "session_kind": "shell",
+        });
+        let parsed: ServerRequest = serde_json::from_value(legacy)
+            .expect("a pre-activate-field request must still parse");
+        match parsed {
+            ServerRequest::StartLocalSession { activate, .. } => {
+                assert_eq!(activate, None, "absent field reads as None (=> true)");
+            }
+            other => panic!("wrong request variant parsed: {other:?}"),
+        }
+
+        let explicit = serde_json::json!({
+            "kind": "start_local_session",
+            "session_kind": "shell",
+            "activate": false,
+        });
+        let parsed: ServerRequest = serde_json::from_value(explicit)
+            .expect("an explicit activate=false must parse");
+        match parsed {
+            ServerRequest::StartLocalSession { activate, .. } => {
+                assert_eq!(activate, Some(false), "--no-activate must survive the wire");
+            }
+            other => panic!("wrong request variant parsed: {other:?}"),
+        }
     }
 
     #[test]
@@ -43916,6 +44344,7 @@ terminal_window_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             pty_cols: None,
@@ -47683,6 +48112,7 @@ terminal_window_id: None,
                 embedded_surface_id: None,
                 embedded_surface_detail: None,
                 last_launch_error: None,
+            last_activity_epoch_ms: None,
                 last_window_error: None,
                 ssh_target: None,
                 ssh_prefix: None,
@@ -47775,6 +48205,7 @@ terminal_window_id: None,
             embedded_surface_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
+            last_activity_epoch_ms: None,
             last_window_error: None,
             ssh_target: None,
             ssh_prefix: None,
@@ -47897,6 +48328,7 @@ terminal_window_id: None,
             embedded_surface_id: None,
             embedded_surface_detail: None,
             last_launch_error: None,
+            last_activity_epoch_ms: None,
             last_window_error: None,
             ssh_target: None,
             ssh_prefix: None,

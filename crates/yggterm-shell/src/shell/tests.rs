@@ -25631,6 +25631,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: Some("dev".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -25705,6 +25706,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -25915,6 +25917,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: Some("oc".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -26026,6 +26029,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -26115,6 +26119,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -26244,6 +26249,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -26336,6 +26342,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -26450,6 +26457,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: Some("oc".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -26963,6 +26971,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: Some("oc".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -27064,6 +27073,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -27472,6 +27482,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -27525,6 +27536,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -27570,6 +27582,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -27621,6 +27634,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -27670,6 +27684,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -27759,6 +27774,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -27839,6 +27855,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -27925,6 +27942,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -28004,6 +28022,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -28055,6 +28074,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -28435,6 +28455,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -28507,6 +28528,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -28583,6 +28605,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -28656,6 +28679,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -28741,6 +28765,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -28787,6 +28812,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -28890,6 +28916,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -28974,6 +29001,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: Some("guihost".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -29041,6 +29069,7 @@ console.log('ok');
                 embedded_surface_detail: None,
                 last_launch_error: None,
                 last_window_error: None,
+                last_activity_epoch_ms: None,
                 ssh_target: Some("guihost".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
@@ -31662,6 +31691,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -31707,6 +31737,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -31799,6 +31830,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -31873,6 +31905,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("oc".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -31929,6 +31962,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -32293,6 +32327,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -32350,6 +32385,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -32418,6 +32454,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -32489,6 +32526,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -32558,6 +32596,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -32621,6 +32660,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -32678,6 +32718,7 @@ console.log('ok');
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -41226,6 +41267,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -41270,6 +41312,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -42137,6 +42180,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -42274,6 +42318,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: if source == SessionSource::LiveSsh {
                 Some("oc".to_string())
             } else {
@@ -42649,6 +42694,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -43608,6 +43654,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -43680,6 +43727,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -43733,6 +43781,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -43817,6 +43866,71 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             Some("snapshot applied".to_string()),
         )));
         assert!(!shell.server_busy);
+    }
+
+    /// ⛔ [startpage-hijack-D] THE PUSH DECISION. The GUI pushes its held view
+    /// to the daemon exactly when the daemon says null, the GUI holds a
+    /// session, and that session is still live in the incoming snapshot —
+    /// never when the daemon already holds an active, and never for a row the
+    /// daemon no longer tracks (adopting nothing is correct there).
+    #[test]
+    fn daemon_active_desync_push_target_fires_only_for_daemon_null_with_held_live_view() {
+        let held = "local://held-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(held));
+        // Establish the GUI-held view: the user's restored session.
+        shell.apply_daemon_snapshot_result(Ok((
+            test_server_snapshot_for_active_session(held),
+            None,
+        )));
+        assert_eq!(shell.server.active_session_path(), Some(held));
+
+        // Daemon desynced to null, held row still live → the push fires.
+        let mut snapshot = test_server_snapshot_for_active_session(held);
+        snapshot.active_session_path = None;
+        assert_eq!(
+            shell.daemon_active_desync_push_target(&snapshot).as_deref(),
+            Some(held)
+        );
+
+        // Daemon already holds an active → nothing to push.
+        snapshot.active_session_path = Some("local://another".to_string());
+        assert_eq!(shell.daemon_active_desync_push_target(&snapshot), None);
+
+        // The held row is gone from the live set → adopting nothing is correct.
+        snapshot.active_session_path = None;
+        snapshot.live_sessions.clear();
+        assert_eq!(shell.daemon_active_desync_push_target(&snapshot), None);
+    }
+
+    /// ⛔ [startpage-hijack-D] SAFE DEGRADATION NOTE, recorded as a test that
+    /// CANNOT be: adopting the daemon's null is role-gated
+    /// (`viewport_is_client_owned_for_role`) and the test harness's client
+    /// role skips the adopt entirely — so the unreachable-daemon case cannot
+    /// be pinned end-to-end here. The production yank was measured in the
+    /// real GUI's adopt (falsifier run, `from local://89eec6c0 → null`,
+    /// origin `apply_snapshot_adopt_daemon_view`); the helper's Err arm keeps
+    /// the incoming snapshot verbatim, which is exactly the pre-fix behavior.
+    #[test]
+    fn daemon_active_desync_push_target_is_pure_over_the_fixture_snapshot() {
+        let held = "local://held-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(held));
+        let mut snapshot = test_server_snapshot_for_active_session(held);
+        snapshot.active_session_path = None;
+
+        // Daemon null + GUI-held live view → the push fires with the held row.
+        assert_eq!(
+            shell.daemon_active_desync_push_target(&snapshot).as_deref(),
+            Some(held)
+        );
+
+        // No held view on the client (start page) → nothing to push either.
+        let mut start_page_shell = ShellState::new(test_shell_bootstrap_with_start_page());
+        start_page_shell.needs_initial_server_sync = false;
+        assert_eq!(
+            start_page_shell
+                .daemon_active_desync_push_target(&snapshot),
+            None
+        );
     }
     #[test]
     fn apply_snapshot_result_without_request_resyncs_stale_sidebar_selection_to_active_live_local_session()
@@ -43909,6 +44023,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -44543,6 +44658,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -44628,6 +44744,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -45753,6 +45870,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -45794,6 +45912,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -46004,6 +46123,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -46214,6 +46334,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -46427,6 +46548,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -46644,6 +46766,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -46853,6 +46976,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -47062,6 +47186,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -47271,6 +47396,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -47312,6 +47438,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -47524,6 +47651,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -47734,6 +47862,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -47775,6 +47904,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -48517,6 +48647,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -49512,21 +49643,22 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .map(|row| row.full_path)
             .collect::<Vec<_>>();
         // SPEC (user directive 2026-08-06, reversing the 2026-05-26 call): the
-        // retained live session in this folder KEEPS its card, and sorts above
-        // the durable ones because running-now outranks a file mtime.
+        // retained live session in this folder KEEPS its card — running sessions
+        // are never stripped, and this assertion pins that presence.
         //
-        // The folder selection still SCOPES the list — it just ranks now rather
-        // than dropping (2026-08-08). `newer-other` lives in /home/user/gh/other
-        // and therefore sorts LAST, where it can still be found; it used to be
-        // thrown away, and a thrown-away row reads to the owner as a row that
-        // never existed.
+        // ⛔ RANK, 2026-09-02 fs-truth law: recency outranks live-ness, and the
+        // scope law still ranks out-of-scope work last. The live row's row data
+        // carries cwd `/home/user` (not the selected `/home/user/gh/yggterm`)
+        // and no measured epoch, so it truthfully ranks LAST: the scanned rows
+        // whose mtimes and cwds put them in this folder lead. Under the old
+        // live-first tier this row led the list forever no matter what it was.
         assert_eq!(
             recent_paths,
             vec![
-                "remote-session://dev/live-active".to_string(),
                 "remote-session://dev/newest-yggterm".to_string(),
                 "remote-session://dev/older-yggterm".to_string(),
                 "remote-session://dev/newer-other".to_string(),
+                "remote-session://dev/live-active".to_string(),
             ]
         );
     }
@@ -50608,6 +50740,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("localhost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -50836,6 +50969,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("localhost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -51341,6 +51475,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -51385,6 +51520,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -51596,6 +51732,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -51661,6 +51798,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -51794,6 +51932,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -51892,6 +52031,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -51950,6 +52090,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -53533,6 +53674,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -53590,6 +53732,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
@@ -53641,6 +53784,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -53712,6 +53856,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -53775,6 +53920,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -54169,6 +54315,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -54262,6 +54409,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
@@ -66194,6 +66342,7 @@ mod web_surface_immersion_locks {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            last_activity_epoch_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -66336,6 +66485,7 @@ mod web_surface_immersion_locks {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            last_activity_epoch_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,

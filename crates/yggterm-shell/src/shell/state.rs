@@ -18776,6 +18776,9 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         embedded_surface_detail: session.embedded_surface_detail.clone(),
         last_launch_error: session.last_launch_error.clone(),
         last_window_error: session.last_window_error.clone(),
+        // The daemon measured this row\'s last PTY activity — carry it; the
+        // startpage recency law ranks live rows by it (2026-09-02 fs-truth fix).
+        last_activity_epoch_ms: session.last_activity_epoch_ms,
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
@@ -18839,6 +18842,9 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         embedded_surface_detail: session.embedded_surface_detail.clone(),
         last_launch_error: session.last_launch_error.clone(),
         last_window_error: session.last_window_error.clone(),
+        // The daemon measured this row\'s last PTY activity — carry it; the
+        // startpage recency law ranks live rows by it (2026-09-02 fs-truth fix).
+        last_activity_epoch_ms: session.last_activity_epoch_ms,
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
@@ -28887,6 +28893,70 @@ impl ShellState {
         }
         true
     }
+    /// The push target for [`Self::close_daemon_active_desync_for_restore`]:
+    /// the held session only when the daemon says null, the GUI holds a view,
+    /// and that view is still a live row in the incoming snapshot. Pure, so a
+    /// test can pin the decision without a daemon on the wire.
+    fn daemon_active_desync_push_target(
+        &self,
+        snapshot: &ServerUiSnapshot,
+    ) -> Option<String> {
+        if snapshot.active_session_path.is_some() {
+            return None;
+        }
+        let held = self.server.active_session_path()?.to_string();
+        // Only a row the daemon still tracks as live: focusing a departed key
+        // is a silent no-op there, and adopting nothing is then correct.
+        snapshot
+            .live_sessions
+            .iter()
+            .any(|session| session.session_path == held)
+            .then_some(held)
+    }
+
+    /// ⭐ [startpage-hijack-D] CLOSE THE DAEMON-ACTIVE DESYNC instead of
+    /// adopting its null. After a GUI restart the daemon's active pointer is
+    /// whatever ITS persisted state carried — null, when the last incident or
+    /// handover cleared it — while the GUI holds the user's restored view.
+    /// Adopting the daemon's null here (the default `adopt_daemon_view` flow)
+    /// is how the viewport landed on the startpage with nothing spawned:
+    /// measured live on the [11.43] falsifier run, `from local://89eec6c0 →
+    /// null`, origin `apply_snapshot_adopt_daemon_view`. The daemon's pointer
+    /// is the SSOT, so the fix is not to ignore the null — it is to CLOSE the
+    /// desync: focus the held session daemon-side (the same door a click uses,
+    /// `FocusLive` — reveals and resumes without creating anything) and adopt
+    /// the post-focus snapshot, which carries the pointer back. Self-limiting:
+    /// once the daemon holds a non-null active the condition cannot fire again
+    /// until the next real desync, which is the next restart.
+    fn close_daemon_active_desync_for_restore(&mut self, snapshot: &mut ServerUiSnapshot) {
+        let Some(held) = self.daemon_active_desync_push_target(snapshot) else {
+            return;
+        };
+        let endpoint = self.bootstrap.server_endpoint.clone();
+        match focus_live_with_view(&endpoint, &held, None) {
+            Ok((focused, message)) => {
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "client",
+                        "gui",
+                        "restored_active_pushed_to_daemon",
+                        json!({
+                            "session_path": held,
+                            "message": message,
+                        }),
+                    );
+                }
+                *snapshot = focused;
+            }
+            Err(_) => {
+                // Daemon unreachable or the row unresolvable server-side: keep
+                // the incoming snapshot and let the existing adopt semantics
+                // decide, exactly as before this fix.
+            }
+        }
+    }
+
     fn apply_snapshot_result_without_request(
         &mut self,
         result: Result<(ServerUiSnapshot, Option<String>)>,
@@ -28920,6 +28990,7 @@ impl ShellState {
                 if was_initial_sync {
                     sanitize_startup_view_mode(&mut snapshot);
                 }
+                self.close_daemon_active_desync_for_restore(&mut snapshot);
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -29017,6 +29088,7 @@ impl ShellState {
                 if was_initial_sync {
                     sanitize_startup_view_mode(&mut snapshot);
                 }
+                self.close_daemon_active_desync_for_restore(&mut snapshot);
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -29091,6 +29163,7 @@ impl ShellState {
                 if was_initial_sync {
                     sanitize_startup_view_mode(&mut snapshot);
                 }
+                self.close_daemon_active_desync_for_restore(&mut snapshot);
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -83406,6 +83479,16 @@ async fn process_pending_app_control_requests(
                     let terminal_appearance_for_task = terminal_appearance.clone();
                     let launch_for_task = launch_options.clone();
                     let seat_for_task = seat.clone();
+                    // ⛔ THE FLAG TRAVELS TO THE DAEMON — a viewport decision is
+                    // made where the viewport state lives. Passing `--no-activate`
+                    // through used to stop HERE: the daemon read no flag on the
+                    // wire, born the row ACTIVE, and the next reap of that row
+                    // cleared an active session the user had never left — the
+                    // "random startpage spawn" (GUI host 2026-09-02 18:17,
+                    // usability probe local://93f088d6). The client-side
+                    // preserved-view restore below still runs, but it is the
+                    // SECOND half of the contract, not the whole of it.
+                    let activate_requested = activate.unwrap_or(true);
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_local",
                         &home,
@@ -83419,6 +83502,7 @@ async fn process_pending_app_control_requests(
                                 Some(&terminal_appearance_for_task),
                                 &launch_for_task,
                                 &seat_for_task,
+                                activate_requested,
                             )
                         },
                     )
