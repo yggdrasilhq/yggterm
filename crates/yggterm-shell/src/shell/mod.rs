@@ -34,3 +34,6 @@ include!("overlays.rs");
 
 #[cfg(test)]
 include!("tests.rs");
+
+#[cfg(test)]
+include!("key_plane_tests.rs");

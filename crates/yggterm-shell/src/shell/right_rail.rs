@@ -3984,6 +3984,11 @@ fn AppPaneRailBody(
                                         let (pane_id, action) = (pane_id.clone(), action.clone());
                                         let on_app_pane_action = on_app_pane_action.clone();
                                         move |evt: KeyboardEvent| {
+                                            // Rail fields own their keys: a key-capture
+                                            // document pane must never see chords typed
+                                            // into a rail filter (the buffers search
+                                            // box stays native under capture).
+                                            evt.stop_propagation();
                                             if evt.key() == Key::Enter && !action.is_empty() {
                                                 on_app_pane_action.call((pane_id.clone(), action.clone(), None));
                                             }
@@ -4042,6 +4047,12 @@ fn AppPaneRailBody(
                                                     let on_app_pane_value = on_app_pane_value.clone();
                                                     move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
                                                 },
+                                                onkeydown: move |evt: KeyboardEvent| {
+                                                    // Rail fields own their keys (see the
+                                                    // search box above): no bubbling into a
+                                                    // key-capture document pane's channel.
+                                                    evt.stop_propagation();
+                                                },
                                             }
                                         } else {
                                             input {
@@ -4061,6 +4072,10 @@ fn AppPaneRailBody(
                                                     let (pane_id, action) = (pane_id.clone(), action.clone());
                                                     let on_app_pane_action = on_app_pane_action.clone();
                                                     move |evt: KeyboardEvent| {
+                                                        // Rail fields own their keys (see the
+                                                        // search box above): no bubbling into a
+                                                        // key-capture document pane's channel.
+                                                        evt.stop_propagation();
                                                         if evt.key() == Key::Enter && !action.is_empty() {
                                                             on_app_pane_action.call((pane_id.clone(), action.clone(), None));
                                                         }
@@ -4126,6 +4141,12 @@ fn AppPaneRailBody(
                                             let id = id.clone();
                                             let on_app_pane_value = on_app_pane_value.clone();
                                             move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                        },
+                                        onkeydown: move |evt: KeyboardEvent| {
+                                            // Rail fields own their keys (see the search
+                                            // box above): no bubbling into a key-capture
+                                            // document pane's channel.
+                                            evt.stop_propagation();
                                         },
                                     }
                                 }

@@ -1,4 +1,86 @@
 // ============================================================================
+// SECTION: the key plane — chord spelling (pure, contract-tested)
+// ----------------------------------------------------------------------------
+// One keydown in Emacs chord spelling for a key-capture document pane
+// (ymacs' docs/spec-key-plane.md is the contract). One EVENT per chord:
+// sequences are the app's business. `None` = do not forward — modifier
+// keys alone, and anything this mapping does not name. Shift on a
+// printable key is folded into the produced character ("A", "?"); Shift
+// on a special spells "S-" (S-TAB). Prefix order is C-, M-, S-.
+// ============================================================================
+pub(crate) fn emacs_chord(key: &Key, modifiers: Modifiers) -> Option<String> {
+    let ctrl = modifiers.contains(Modifiers::CONTROL);
+    let alt = modifiers.contains(Modifiers::ALT);
+    let shift = modifiers.contains(Modifiers::SHIFT);
+    let mut spell = |base: String, shift_meaningful: bool| -> Option<String> {
+        let mut chord = String::new();
+        if ctrl {
+            chord.push_str("C-");
+        }
+        if alt {
+            chord.push_str("M-");
+        }
+        if shift && shift_meaningful {
+            chord.push_str("S-");
+        }
+        chord.push_str(&base);
+        Some(chord)
+    };
+    match key {
+        // A printable character: the platform already applied Shift to the
+        // produced character, so "A" spells "A" (never "S-a"), and "C-f"
+        // spells from the lowercased character the way Emacs chords read.
+        // Space arrives as Character(" ") (keyboard_types has no Space
+        // variant) and spells SPC.
+        Key::Character(text) => {
+            let mut chars = text.chars();
+            let (ch, more) = (chars.next()?, chars.next().is_some());
+            if more {
+                return None; // composed multi-char strings: not a chord, v0
+            }
+            if ch == ' ' {
+                return spell("SPC".into(), shift);
+            }
+            let base = if ctrl {
+                ch.to_lowercase().to_string()
+            } else {
+                ch.to_string()
+            };
+            spell(base, false)
+        }
+        Key::Enter => spell("RET".into(), shift),
+        Key::Tab => spell("TAB".into(), shift),
+        Key::Escape => spell("ESC".into(), shift),
+        Key::Backspace => spell("DEL".into(), shift),
+        Key::Delete => spell("<delete>".into(), shift),
+        Key::Insert => spell("<insert>".into(), shift),
+        Key::ArrowUp => spell("<up>".into(), shift),
+        Key::ArrowDown => spell("<down>".into(), shift),
+        Key::ArrowLeft => spell("<left>".into(), shift),
+        Key::ArrowRight => spell("<right>".into(), shift),
+        Key::Home => spell("<home>".into(), shift),
+        Key::End => spell("<end>".into(), shift),
+        Key::PageUp => spell("<prior>".into(), shift),
+        Key::PageDown => spell("<next>".into(), shift),
+        Key::F1 => spell("<f1>".into(), shift),
+        Key::F2 => spell("<f2>".into(), shift),
+        Key::F3 => spell("<f3>".into(), shift),
+        Key::F4 => spell("<f4>".into(), shift),
+        Key::F5 => spell("<f5>".into(), shift),
+        Key::F6 => spell("<f6>".into(), shift),
+        Key::F7 => spell("<f7>".into(), shift),
+        Key::F8 => spell("<f8>".into(), shift),
+        Key::F9 => spell("<f9>".into(), shift),
+        Key::F10 => spell("<f10>".into(), shift),
+        Key::F11 => spell("<f11>".into(), shift),
+        Key::F12 => spell("<f12>".into(), shift),
+        // Modifier keys alone (a bare Ctrl/Alt/Shift press) and anything
+        // unnamed forward nothing.
+        _ => None,
+    }
+}
+
+// ============================================================================
 // SECTION: `pub fn launch_shell` — binary entry point
 // ----------------------------------------------------------------------------
 // Receives the bootstrap from apps/yggterm/src/main.rs (settings loaded,
@@ -3092,6 +3174,38 @@ fn app() -> Element {
                 // bridge (keytip_apply_bridge_message), so it works from a
                 // focused terminal too; this DOM handler only carries the
                 // direct accelerators below.
+                // ── The key plane (schema-declared `key_capture`; ymacs'
+                // docs/spec-key-plane.md is the contract) ── while the active
+                // session's document pane captures keys, every keydown this
+                // root sees is spelled as an Emacs chord and POSTed to the
+                // app as `action:"key"`, then consumed: the app owns the
+                // keyboard exactly the way it owns every widget action.
+                // Ordering law: AFTER the shell chords above (Ctrl+Shift+P
+                // stays shell), BEFORE the arms below — the browser-only
+                // Ctrl+F self-guards on non-browser surfaces, and preview
+                // PageUp/Home/End must never eat an editor's paging keys.
+                // Keys typed into RAIL fields stop propagation at their own
+                // handlers, so the buffers filter stays native under capture.
+                let capture_target = {
+                    let shell = state.read();
+                    shell
+                        .server
+                        .active_session_path()
+                        .map(|session| session.to_string())
+                        .and_then(|session| {
+                            shell
+                                .document_pane_key_capture(&session)
+                                .map(|pane_id| (session, pane_id))
+                        })
+                };
+                if let Some((session, pane_id)) = capture_target {
+                    if let Some(chord) = emacs_chord(&evt.key(), evt.modifiers()) {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        spawn(document_pane_forward_key(state, session, pane_id, chord));
+                        return;
+                    }
+                }
                 let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
                     || evt.modifiers().contains(Modifiers::META);
                 // Ctrl+Alt+PageUp/PageDown (session nav) is now a registered direct

@@ -2412,6 +2412,7 @@ mod tests {
             titlebar_switch: None,
             footer: Vec::new(),
             split_ratio: None,
+            key_capture: false,
         };
 
         let seq_a = shell.document_pane_next_request("local://a");
@@ -4338,6 +4339,7 @@ JSON.stringify({{
         AppPaneSchema {
             title: "Doc".to_string(),
             titlebar_switch: None,
+            key_capture: false,
             widgets: vec![AppPaneWidget::TextInput {
                 id: "editor".into(),
                 label: String::new(),

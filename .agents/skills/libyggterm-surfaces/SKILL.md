@@ -349,6 +349,22 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     - Absent/empty `value_key` = no identity declared, and the field behaves
       exactly as it did before this existed. Settings and password fields need
       nothing.
+  - **⭐ `key_capture` (2026-09-02, ymacs the forcing consumer):** a DOCUMENT
+    pane schema may declare `key_capture: true` — while that pane is the
+    session's live schema, the shell's root keydown forwards every chord to
+    the app as `{"action": "key", "values": {"key": "<chord>"}}` on the
+    ordinary action POST and consumes it: the app owns the keyboard the way
+    it owns every widget action. Chords are Emacs-spelled (`C-f`, `M-x`,
+    `S-TAB`, `RET` `TAB` `SPC` `DEL` `ESC` `<up>` `<prior>` `<f5>`), ONE
+    event per POST — sequences are the app's business. The reply may carry
+    `schema`, so one loopback round trip renders the keystroke; ordering is
+    guarded by the document channel's request-seq, so a fast typist never
+    sees a stale buffer. Shell chords keep precedence (GTK accelerators
+    never reach the DOM; `Ctrl+Shift+P` stays shell; rail fields stop
+    propagation at their own handlers, so a rail filter stays native under
+    capture). `serde(default)`: an app declaring it under an older GUI
+    degrades to the pre-key surface untouched. ONE reader of the flag
+    (`ShellState::document_pane_key_capture`) — do not grow a second door.
   - **Editor draft stability (2026-07-24):** the document channel keeps the
     user's LIVE draft as the source of truth while they type. A schema whose
     declared value merely ECHOES a draft the GUI already sent up (the ~2.5s

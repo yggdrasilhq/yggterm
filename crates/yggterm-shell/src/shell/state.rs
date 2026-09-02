@@ -3850,6 +3850,18 @@ struct AppPaneSchema {
     /// host and the app cannot disagree about how far a drag may go.
     #[serde(default)]
     split_ratio: Option<f32>,
+    /// Key capture — the key plane (Tier C contract; ymacs'
+    /// docs/spec-key-plane.md is the forcing consumer). While THIS document
+    /// pane is the session's live schema, the shell's root keydown forwards
+    /// every chord to the app as `{"action": "key", "values": {"key":
+    /// "<chord>"}}` on the ordinary action POST, and the app answers with a
+    /// fresh schema — one loopback round trip per keystroke, no drafts, no
+    /// native input. `serde(default)`: an app declaring it under an older
+    /// GUI degrades to the pre-key surface untouched. ONE reader
+    /// ([`ShellState::document_pane_key_capture`]) so the flag cannot grow
+    /// a second, drifting door (the 2026-07-22 two-arms lesson).
+    #[serde(default)]
+    key_capture: bool,
 }
 
 fn app_pane_text_input_word_wrap_default() -> bool {
@@ -25357,6 +25369,8 @@ impl ShellState {
             footer: spec.footer,
             titlebar_switch: None,
             split_ratio: None,
+            // A modal is a form, not an editor: its keys are its own.
+            key_capture: false,
         };
         let mounted = self
             .app_pane_modal
@@ -26096,6 +26110,15 @@ impl ShellState {
     fn document_pane_channel(&self, session_path: &str) -> Option<&DocumentPaneChannel> {
         self.document_panes
             .get(&Self::document_pane_key(session_path))
+    }
+    /// The pane id of `session_path`'s document pane when its live schema
+    /// declares key capture, else None. THE one reader of
+    /// `AppPaneSchema::key_capture` — the root keydown arm comes through
+    /// here, so the flag has exactly one door.
+    fn document_pane_key_capture(&self, session_path: &str) -> Option<String> {
+        let channel = self.document_pane_channel(session_path)?;
+        let state = channel.schema.as_ref()?;
+        state.schema.key_capture.then(|| state.pane_id.clone())
     }
     fn document_pane_next_request(&mut self, session_path: &str) -> u64 {
         let channel = self
@@ -68989,6 +69012,59 @@ async fn document_pane_run_action(
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| pane_id.clone());
             shell.push_notification(NotificationTone::Info, title, toast);
+        });
+    }
+}
+
+/// Forward ONE keydown to a key-capture document pane's app (the key
+/// plane; ymacs' docs/spec-key-plane.md is the contract). POSTs the
+/// ordinary action door with `action:"key"` and the Emacs chord, then
+/// applies the reply's schema through the channel's request-seq guard —
+/// a fast typist's out-of-order replies can never paint a stale buffer.
+/// Deliberately NOT `document_pane_run_action`: no draft values ride a
+/// key POST (the editor is display-only under capture), and no
+/// `mark_sent` echo baseline moves — the app owns the buffer text.
+async fn document_pane_forward_key(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    pane_id: String,
+    chord: String,
+) {
+    let (control_url, control_token) = {
+        let shell = state.read();
+        (
+            shell.sidebar_control_url(&session_path),
+            shell.sidebar_control_token(&session_path),
+        )
+    };
+    let Some(control_url) = control_url else {
+        return;
+    };
+    let seq = state.with_mut_counted(|shell| shell.document_pane_next_request(&session_path));
+    let url = app_pane_action_url(&control_url);
+    let body = json!({ "pane": pane_id, "action": "key", "values": { "key": chord } });
+    let replied =
+        task::spawn_blocking(move || control_request(&url, Some(&body), control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("document key forward panicked: {error}")));
+    let reply = match replied.and_then(|value| {
+        if value.is_null() {
+            return Ok(AppPaneActionReply::default());
+        }
+        serde_json::from_value::<AppPaneActionReply>(value)
+            .map_err(|error| format!("document key reply is malformed: {error}"))
+    }) {
+        Ok(reply) => reply,
+        Err(error) => {
+            state.with_mut_counted(|shell| {
+                shell.push_notification(NotificationTone::Error, "App key failed", error);
+            });
+            return;
+        }
+    };
+    if let Some(schema) = reply.schema {
+        state.with_mut_counted(|shell| {
+            shell.document_pane_apply_schema(seq, &session_path, &pane_id, schema)
         });
     }
 }
