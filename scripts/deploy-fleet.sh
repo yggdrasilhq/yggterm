@@ -598,7 +598,7 @@ $open_exe_paths
   # IS the installer here: it owns the record the same way it owns the six
   # copies. Written remotely so $HOME is the HOST's home; verified by
   # read-back like every other copy.
-  if run_on "$host" 'mkdir -p "$HOME/.yggterm" && V='"$VERSION"' && printf "{\n  \"channel\": \"direct\",\n  \"repo\": \"fleet-deploy\",\n  \"asset_label\": \"fleet\",\n  \"active_version\": \"%s\",\n  \"active_executable\": \"%s/versions/%s/yggterm\",\n  \"icon_revision\": \"%s\"\n}\n" "$V" "$HOME" "$V" "$V" > "$HOME/.yggterm/install-state.json.new" && mv -f "$HOME/.yggterm/install-state.json.new" "$HOME/.yggterm/install-state.json" && grep -q "\"active_version\": \"$V\"" "$HOME/.yggterm/install-state.json"'; then
+  if run_on "$host" 'mkdir -p "$HOME/.yggterm" && V='"$VERSION"' && printf "{\n  \"channel\": \"direct\",\n  \"repo\": \"fleet-deploy\",\n  \"asset_label\": \"fleet\",\n  \"active_version\": \"%s\",\n  \"active_executable\": \"%s/.yggterm/versions/%s/yggterm\",\n  \"icon_revision\": \"%s\"\n}\n" "$V" "$HOME" "$V" "$V" > "$HOME/.yggterm/install-state.json.new" && mv -f "$HOME/.yggterm/install-state.json.new" "$HOME/.yggterm/install-state.json" && grep -q "\"active_executable\": \"$HOME/.yggterm/versions/$V/yggterm\"" "$HOME/.yggterm/install-state.json"'; then
     echo "  · install-state.json → $VERSION"
   else
     echo "  ⛔ $host: install-state.json write/read-back FAILED — the client restart door stays broken on this host" >&2
