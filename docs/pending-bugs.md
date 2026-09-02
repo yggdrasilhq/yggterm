@@ -130,22 +130,29 @@ its own gutter/overlay (`scrollControllerReason = 'alternate_screen'`), and
 `shouldHandleWheel` handed every alternate-buffer wheel straight to
 xterm.js — which has no scrollback to move, so the wheel was dead.
 
-Fix: alternate-scroll translation in the wheel handler — when the active
-buffer is the alternate buffer AND the TUI's observed mouse tracking mode is
-`none` (read live from `term.modes.mouseTrackingMode`, the same truth the
-ACT V mouse-mode probe witnesses), wheel up/down is translated into cursor
-up/down (`\u001b[A/B`, or the application-cursor forms under DECCKM), one
-line per wheel notch, gated by the same input gate as typing. A TUI that
-armed mouse tracking never lands here — it receives real mouse reports
-through its own mode. A per-CLI surface model (opencode = window-GUI TUI;
-codex = inline; agy = dual) remains welcome for OTHER decisions, but the
-wheel law keys off the OBSERVED buffer + mouse mode, not the registry.
+Fix, two halves. (1) Alternate-scroll translation in the wheel handler —
+when the active buffer is the alternate buffer AND the TUI's observed mouse
+tracking mode is `none` (read live from `term.modes.mouseTrackingMode`, the
+same truth the ACT V mouse-mode probe witnesses), wheel up/down is
+translated into cursor up/down (`\u001b[A/B`, or the application-cursor
+forms under DECCKM), gated by the same input gate as typing. (2) ⛔ THE
+SECOND HALF THE FIRST REVEALED: opencode ARMS 1003+1006 (probe-witnessed on
+every row) and then does nothing with the reports — so for opencode the
+`none` gate never opened. `suppresses_mouse_tracking(OpenCode)` now has the
+mount script CONSUME pure mouse DECSETs at the parse boundary (the
+observer law stays literal for every other CLI and every other DECSET:
+alt-screen and bracketed-paste modes pass untouched), xterm never arms
+tracking, and the alternate-scroll path owns the pointer. A per-CLI surface
+model (opencode = window-GUI TUI; codex = inline; agy = dual) remains
+welcome for OTHER decisions, but the wheel law keys off the OBSERVED buffer
++ mouse mode, with the registry only deciding whether mouse DECSETs mean
+anything at all.
 
-**What would falsify it being fixed:** in an idle opencode TUI with the mouse
-probe reporting tracking off, wheel-up/down scrolls the conversation (the
-translated keys arrive at the PTY; the host's `altScrollWheelEvents` counter
-climbs); in a mouse-tracking TUI, wheel events arrive as mouse reports and
-nothing scrolls locally.
+**What would falsify it being fixed:** in an idle opencode TUI the probe
+reports the mouse DECSETs as `suppressed:true`, wheel-up/down scrolls the
+conversation (the translated cursor keys arrive at the PTY; the host's
+`altScrollWheelEvents` counter climbs); a CLI NOT in the suppression set
+keeps receiving real mouse reports.
 
 **What would falsify it being fixed:** in an idle opencode TUI with the mouse
 probe reporting tracking off, wheel-up/down scrolls the conversation (keys
