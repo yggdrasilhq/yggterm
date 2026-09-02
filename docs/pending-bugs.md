@@ -182,6 +182,26 @@ probe reporting tracking off, wheel-up/down scrolls the conversation (keys
 arrive at the PTY); in a mouse-tracking TUI, wheel events arrive as mouse
 reports and nothing scrolls locally.
 
+**THIRD READING, 2026-09-03 ~00:05–03:45 (guihost, owner screenshots ×3,
+frame_hash pairings, byte samples) — the family splits into three
+discriminated mechanisms sharing one root shape.** (1) S1 GRID-TRANSIENT:
+canvas measures 173 vs PTY 172 at switch-in (four mismatches in one second,
+client hash churning), addressed writes wrap — the duplicated columns. The
+fit addon owns post-birth grids; fix = clamp fit to the PTY grid until
+first full paint. (2) S2 EMPTY-APPLIED: identical client hash across two
+switch-ins against a moved-on daemon — the 11.14 ladder fires correctly
+(empty→retry→end ×2) but the mount meanwhile JOINS THE LIVE STREAM MID-
+SEQUENCE with a fresh parser, painting split-sequence tails as literal text
+(the D-ST/@/DIS fragments). (3) S3 MID-CURE COMPOSITE: nudge fragments over
+the still-blank canvas (remedy: hold the reveal cover to repaint-ack — the
+pixel-paint cache). EXONERATED: xterm's 2026 has a 1 s timeout flush (cannot
+freeze paint); the daemon grid is pixel-clean; no writeSync ran (zero replay
+events); the active renderer is canvas2d (no atlas-UV class). LATENT (not
+tonight): writeSync bypasses the write queue with a shared parser — a replay
+landing between a queued split sequence's halves corrupts both. Root shape:
+four writers (fit-resize, seed/replay, nudge-repaint, live stream) with no
+order contract at switch-in. Board ACK-9e4210c5fc.
+
 ## ⛔ [11.38] THE GUI BURNS UP TO A CORE AND THE WEBVIEW RETENTION CLIMBS ~300 MB/h UNDER STREAMING — AND THE FLOOD REGIME'S ENGAGEMENT IS UNVERIFIABLE (the owner's heat + leak report)
 
 **FLOOD SUB-QUESTION ANSWERED 2026-09-02 (Lane A live data):** the flood gate
