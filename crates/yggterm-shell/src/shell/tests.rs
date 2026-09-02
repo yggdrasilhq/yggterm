@@ -2478,7 +2478,7 @@ mod tests {
             "test",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        );
+        None);
         assert!(
             host.contains("data-document-surface"),
             "the host input guard must honour the same focus owners"
@@ -9620,7 +9620,7 @@ JSON.stringify({{
             "test",
             true,
             ("\x1b[5~", "\x1b[6~", 120),
-        );
+        None);
         assert!(
             suppressed.contains("const suppressMouse = true;"),
             "suppressed script must carry the flag for the probe handler"
@@ -10090,6 +10090,34 @@ console.log('ok');
                 false,
                 ("\x1b[A", "\x1b[B", 0),
             );
+        // ⭐ [startpage-hijack-D sibling] The buffer-kind seed travels the same
+        // way the birth grid does: a page global assigned before the script
+        // body, read by the alternate-scroll wheel gate ONLY until the mount
+        // observes a real buffer state. Without the seed the gate stayed
+        // closed after every switch-in (fullscreen TUIs never re-say their
+        // buffer DECSETs for a client they cannot see).
+        let buffer_seeded = terminal_eval_script_with_pinned_grid_seeded(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            None,
+            None,
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            Some("alternate"),
+        );
+        assert!(
+            buffer_seeded.contains("lastKnownBufferKindSeed = \"alternate\";"),
+            "the seed must be assigned before the mount script body"
+        );
+        assert!(
+            buffer_seeded.contains("lastKnownBufferKindSeed || kind"),
+            "the wheel gate must consume the seed"
+        );
+        assert!(
+            !plain.contains("lastKnownBufferKindSeed = \"alternate\";"),
+            "the un-seeded form must not invent a belief"
+        );
         assert!(
             !plain.contains("window.__yggtermInitialGrid ="),
             "no birth grid, no assignment — the pre-existing default path is unchanged"
@@ -20051,7 +20079,7 @@ console.log('ok');
         ));
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false, ("\x1b[A", "\x1b[B", 0));
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
         assert!(script.contains("const canvasRendererEnabled = false;"));
         assert!(script.contains("let webglAddonAvailable = Boolean(window.WebglAddon"));
         assert!(script.contains("if (canvasRendererEnabled && webglAddonAvailable"));
@@ -20137,9 +20165,9 @@ console.log('ok');
     fn terminal_eval_script_runtime_gates_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let disabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false, ("\x1b[A", "\x1b[B", 0));
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
         let enabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0));
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
         assert!(disabled.contains("const canvasRendererEnabled = false;"));
         assert!(enabled.contains("const canvasRendererEnabled = true;"));
         assert!(enabled.contains(
@@ -20155,7 +20183,7 @@ console.log('ok');
         // call sites still exist but early-return; full code removal is a follow-up.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0));
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
         assert!(script.contains("const softwareCanvasLayerOptimizationAllowed = () => false;"));
         assert!(script.contains("applySoftwareCanvasLayerOptimization('initial_mount');"));
     }
@@ -20164,7 +20192,7 @@ console.log('ok');
     fn terminal_eval_script_keeps_codex_prompt_and_cursor_xterm_owned() {
         let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0));
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
         assert!(!script.contains(".yggterm-canvas-input-line-overlay"));
         assert!(!script.contains(".yggterm-canvas-cursor-overlay"));
         assert!(!script.contains("overlay.className = 'yggterm-canvas-input-line-overlay'"));
@@ -20203,7 +20231,7 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        );
+        None);
         assert!(script.contains("pattern: 'glyph_gap_rows'"));
         assert!(
             script.contains("detectAndHealGlyphGapRows(reason)"),
@@ -20247,7 +20275,7 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        );
+        None);
         assert!(
             script.contains("term.unicode.activeVersion = '11';"),
             "the terminal must activate the corrected width table"
@@ -20296,7 +20324,7 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        );
+        None);
         assert!(script.contains("window.__yggtermRafGapMonitor"));
         assert!(script.contains("pattern: 'stale_atlas_paint'"));
         assert!(
@@ -20425,7 +20453,7 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        );
+        None);
         assert!(script.contains("&& hostIsActive"));
         assert!(script.contains("'canvas_blank_with_buffer_text_background'"));
         assert!(script.contains(
@@ -20437,7 +20465,7 @@ console.log('ok');
     fn terminal_eval_script_can_opt_into_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0));
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
         assert!(script.contains("const canvasRendererEnabled = true;"));
     }
 

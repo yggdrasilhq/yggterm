@@ -5981,7 +5981,9 @@ fn TerminalCanvas(
                 state.with(|shell| shadow_pinned_terminal_grid(shell, &session_path));
             let initial_grid =
                 state.with(|shell| initial_terminal_grid_for_mount(shell, &session_path));
-            let mut eval = terminal_document.eval(terminal_eval_script_with_pinned_grid(
+            let initial_buffer_kind =
+                state.with(|shell| shell.last_known_terminal_buffer_kind(&session_path));
+            let mut eval = terminal_document.eval(terminal_eval_script_with_pinned_grid_seeded(
                 &host_id,
                 &theme,
                 terminal_initial_programmatic_focus(
@@ -6004,6 +6006,7 @@ fn TerminalCanvas(
                 initial_grid,
                 yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
                 yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
+                initial_buffer_kind.as_deref(),
             ));
             append_trace_event(
                 &trace_home,
@@ -7698,8 +7701,26 @@ fn TerminalCanvas(
                                 render_health_recovery_pending,
                                 visible_nonblank_rows,
                                 render_anomaly,
+                                buffer_kind,
                             }) => {
                                 last_host_health_visible_nonblank_rows = visible_nonblank_rows;
+                                // ⭐ [startpage-hijack-D sibling] Persist the
+                                // observed buffer kind per session — the seed
+                                // the NEXT mount reads so the alternate-scroll
+                                // wheel gate re-opens after a switch-in.
+                                {
+                                    let mut state = state.clone();
+                                    let session_path = session_path.clone();
+                                    let kind = buffer_kind.clone();
+                                    spawn(async move {
+                                        state.with_mut_counted(|shell| {
+                                            shell.record_terminal_buffer_kind(
+                                                &session_path,
+                                                &kind,
+                                            );
+                                        });
+                                    });
+                                }
                                 // Client-detected render fail pattern (e.g. a redraw
                                 // burst with no session change) — record it for later
                                 // inspection so the user need not report every minor
