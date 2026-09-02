@@ -508,18 +508,7 @@ impl YggtermServer {
         // `--session` arg; demote a phantom one). Runs every tick but is
         // memoized per row by its verdict stamp, so the store probe under the
         // lock happens once per row ever.
-        let reconciled = self.reconcile_opencode_row_identities(active);
-        if reconciled > 0 {
-            if let Ok(home_dir) = crate::resolve_yggterm_home() {
-                yggterm_core::append_trace_event(
-                    &home_dir,
-                    "daemon",
-                    "opencode_mirror",
-                    "identity_reconcile",
-                    serde_json::json!({ "reconciled": reconciled }),
-                );
-            }
-        }
+        self.reconcile_opencode_row_identities(active);
     }
 
     /// The live opencode TUI row (the mirror's seating anchor) and the next
@@ -637,7 +626,25 @@ impl YggtermServer {
             return 0;
         };
         let store_home = yggterm_core::startpage::agent_store_home(&home);
-        self.reconcile_opencode_row_identities_in(&store_home, active)
+        let verdicts = self.reconcile_opencode_row_identities_in(&store_home, active);
+        // The per-row verdicts are the observable; the emission lives in the
+        // PRODUCTION wrapper only — the `*_in` test seam must never write the
+        // fleet's trace files (measured 2026-09-02: test-fixture verdicts
+        // polluted production ytrace).
+        for (session_path, arg, verdict) in &verdicts {
+            yggterm_core::append_trace_event(
+                &home,
+                "daemon",
+                "opencode_mirror",
+                "launch_session_reconciled",
+                serde_json::json!({
+                    "session_path": session_path,
+                    "arg": arg,
+                    "verdict": verdict,
+                }),
+            );
+        }
+        verdicts.len()
     }
 
     /// [`Self::reconcile_opencode_row_identities`] against an explicit store
@@ -648,7 +655,7 @@ impl YggtermServer {
         &mut self,
         store_home: &std::path::Path,
         active: &[OpencodeServiceSession],
-    ) -> usize {
+    ) -> Vec<(String, String, String)> {
         let active_ids: std::collections::HashSet<&str> = active
             .iter()
             .map(|session| session.id.as_str())
@@ -674,7 +681,7 @@ impl YggtermServer {
                 Self::launch_session_arg(&session.launch_command).map(|arg| (key.clone(), arg))
             })
             .collect();
-        let mut reconciled = 0usize;
+        let mut verdicts: Vec<(String, String, String)> = Vec::new();
         for (key, arg) in candidates {
             let key_id = key.trim_start_matches("opencode-runtime://").to_string();
             let known = active_ids.contains(arg.as_str())
@@ -775,22 +782,9 @@ impl YggtermServer {
                     );
                 }
             }
-            if let Ok(home_dir) = crate::resolve_yggterm_home() {
-                yggterm_core::append_trace_event(
-                    &home_dir,
-                    "daemon",
-                    "opencode_mirror",
-                    "launch_session_reconciled",
-                    serde_json::json!({
-                        "session_path": key,
-                        "arg": arg,
-                        "verdict": verdict,
-                    }),
-                );
-            }
-            reconciled += 1;
+            verdicts.push((key, arg, verdict));
         }
-        reconciled
+        verdicts
     }
 }
 
@@ -1168,7 +1162,7 @@ mod anchor_tests {
         let key = rekey_runtime(&mut server, &first);
         let reconciled = server
             .reconcile_opencode_row_identities_in(&home, &[]);
-        assert_eq!(reconciled, 1, "the phantom-arg row is reconciled");
+        assert_eq!(reconciled.len(), 1, "the phantom-arg row is reconciled");
         let row = server.sessions.get(&key).expect("row stays at its key");
         assert!(
             !row.launch_command.contains("--session"),
@@ -1230,7 +1224,7 @@ mod anchor_tests {
         }];
         let reconciled = server
             .reconcile_opencode_row_identities_in(&home, &active);
-        assert_eq!(reconciled, 1, "the real-arg row is reconciled");
+        assert_eq!(reconciled.len(), 1, "the real-arg row is reconciled");
         let row = server.sessions.get(&key).expect("row stays at its key");
         assert_eq!(
             row.id, real,
@@ -1264,7 +1258,9 @@ mod anchor_tests {
         let first = any_row_key(&server);
         let key = rekey_runtime(&mut server, &first);
         assert_eq!(
-            server.reconcile_opencode_row_identities_in(&home, &[]),
+            server
+                .reconcile_opencode_row_identities_in(&home, &[])
+                .len(),
             1
         );
         let after_first = server
@@ -1274,7 +1270,9 @@ mod anchor_tests {
             .launch_command
             .clone();
         assert_eq!(
-            server.reconcile_opencode_row_identities_in(&home, &[]),
+            server
+                .reconcile_opencode_row_identities_in(&home, &[])
+                .len(),
             0,
             "a stamped row is not a candidate — the probe is memoized"
         );
