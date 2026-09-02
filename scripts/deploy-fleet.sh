@@ -586,6 +586,25 @@ $open_exe_paths
       rm -rf "$HOME/.yggterm/versions/$d" && echo "  · pruned versions/$d (older, not executed)"
     done' 2>/dev/null | sed 's/^/  /'
 
+  # ⛔ THE CLIENT-RESTART DOOR READS THIS RECORD — WRITE IT (2026-09-02, "the
+  # daemon did not restart the client"). `server app update restart` finds
+  # WHERE to restart into from `~/.yggterm/install-state.json`; that file was
+  # written only by the manual installer, never by this deploy, so on a fleet
+  # host it was MISSING entirely and `restart_into_pending_update` silently
+  # returned — measured live with a 20-hour-old GUI client (a 3.2.38 build)
+  # that survived five deploys while its daemon crossed them all. Every
+  # client-side fix in those deploys (wheel translation, mouse suppression,
+  # title law, pane identity) was code the owner's eyes never ran. The deploy
+  # IS the installer here: it owns the record the same way it owns the six
+  # copies. Written remotely so $HOME is the HOST's home; verified by
+  # read-back like every other copy.
+  if run_on "$host" 'mkdir -p "$HOME/.yggterm" && V='"$VERSION"' && printf "{\n  \"channel\": \"direct\",\n  \"repo\": \"fleet-deploy\",\n  \"asset_label\": \"fleet\",\n  \"active_version\": \"%s\",\n  \"active_executable\": \"%s/versions/%s/yggterm\",\n  \"icon_revision\": \"%s\"\n}\n" "$V" "$HOME" "$V" "$V" > "$HOME/.yggterm/install-state.json.new" && mv -f "$HOME/.yggterm/install-state.json.new" "$HOME/.yggterm/install-state.json" && grep -q "\"active_version\": \"$V\"" "$HOME/.yggterm/install-state.json"'; then
+    echo "  · install-state.json → $VERSION"
+  else
+    echo "  ⛔ $host: install-state.json write/read-back FAILED — the client restart door stays broken on this host" >&2
+    FAILED=1
+  fi
+
   unset DEST_KIND
 done
 

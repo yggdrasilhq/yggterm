@@ -4164,7 +4164,9 @@ fn app() -> Element {
                             state.with_mut_counted(|shell| shell.toggle_web_tabs_panel());
                             sync_active_terminal_input_policy(state);
                             },
-                            on_restart_update: move || restart_into_pending_update(state),
+                            on_restart_update: move || {
+                                restart_into_pending_update(state);
+                            },
                             on_request_window_drag: move || {
                             state.with_mut_counted(|shell| shell.note_titlebar_drag_request());
                             },

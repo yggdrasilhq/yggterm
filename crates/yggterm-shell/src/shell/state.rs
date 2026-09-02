@@ -37987,19 +37987,39 @@ fn spawn_manual_daemon_hot_restart(mut state: Signal<ShellState>) {
         }
     });
 }
-fn restart_into_pending_update(mut state: Signal<ShellState>) {
+fn restart_into_pending_update(mut state: Signal<ShellState>) -> Result<String, String> {
     let pending = state
         .read()
         .pending_update_restart
         .clone()
         .or_else(pending_restart_from_active_install_state_for_current_exe);
+    // ⛔ THE SILENT NO-OP IS THE BUG THE OWNER NAMED (2026-09-02: "the daemon
+    // did not restart the client"). This door used to `return` with nothing
+    // said when no pending update could be resolved — which on a fleet host
+    // was ALWAYS, because `install-state.json` is written by the manual
+    // installer and never by deploy-fleet: no record, no restart, no answer,
+    // and a 20-hour-old client kept running five-deploy-old UI code while
+    // every verb reply read as success. The verb's caller now gets the REASON,
+    // and the record's maintenance belongs to the writer (deploy-fleet writes
+    // it every deploy).
     let Some(update) = pending else {
-        return;
+        let current = std::env::current_exe()
+            .map(|exe| exe.display().to_string())
+            .unwrap_or_else(|_| "<unknown exe>".to_string());
+        let why = format!(
+            "nothing to restart into: no pending update and no usable install \
+             record (~/.yggterm/install-state.json) beside or for {current}"
+        );
+        state.with_mut_counted(|shell| {
+            shell.last_action = why.clone();
+        });
+        return Err(why);
     };
     state.with_mut_counted(|shell| {
         shell.pending_update_restart = Some(update.clone());
         shell.last_action = format!("restarting into {}", update.version);
     });
+    let update_version = update.version.clone();
     spawn(async move {
         let next_exe = update.executable.clone();
         let next_version = update.version.clone();
@@ -38057,6 +38077,10 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
             });
         }
     });
+    Ok(format!(
+        "restart into {} initiated (successor launched; this process closes on its own terms)",
+        update_version
+    ))
 }
 fn close_window_after_update_restart(state: Signal<ShellState>) {
     close_window_preserving_live_sessions(state, Some("update-restart".to_string()));
@@ -81953,19 +81977,29 @@ async fn process_pending_app_control_requests(
                     data: Some(refusal),
                 }
             } else {
-                restart_into_pending_update(state);
+                // ⛔ THE OUTCOME IS THE ANSWER (2026-09-02: "the daemon did not
+                // restart the client"). A silent no-op here read as success at
+                // every verb call site while the client kept running its old
+                // build — the reply now names what happened, including the
+                // nothing-to-restart-into case with its reason.
+                let outcome = restart_into_pending_update(state);
+                let (restart_error, restart_note) = match &outcome {
+                    Ok(note) => (None, note.clone()),
+                    Err(reason) => (Some(reason.clone()), format!("refused: {reason}")),
+                };
                 sleep(Duration::from_millis(40)).await;
                 AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
                     completed_at_ms: current_millis() as u128,
                     output_path: None,
+                    error: restart_error,
                     data: Some(json!({
                         "command": "restart_pending_update",
+                        "restart": restart_note,
                         "window": describe_window(&desktop),
                         "state": describe_app_state_snapshot(&state, &desktop),
                     })),
-                    error: None,
                 }
             }
         }
