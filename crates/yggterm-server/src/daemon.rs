@@ -6659,10 +6659,23 @@ impl DaemonRuntime {
             self.overlay_agent_runtime_snapshot_session(active_session);
             self.overlay_codex_runtime_snapshot_session(active_session, yggterm_home.as_deref());
         }
+        // ⛔ LIVE-ROW RECENCY IS A DAEMON FACT, NOT A SCAN ARTIFACT (owner-caught
+        // fs-truth lie, 2026-09-02): stamp each live row with when its PTY was
+        // last active, measured by THIS daemon. The startpage/cwdtree ordering
+        // consumes this instead of stamping scan-time "now" on every live row —
+        // which is how a row idle for days outranked week-fresh durable work.
+        // A row this daemon cannot see (proxied/preserved) stays `None`:
+        // unknown, never synthesized.
+        let now_ms = current_millis_u64();
         for session in &mut snapshot.live_sessions {
             self.overlay_terminal_runtime_snapshot_session(session);
             self.overlay_agent_runtime_snapshot_session(session);
             self.overlay_codex_runtime_snapshot_session(session, yggterm_home.as_deref());
+            let runtime_path = self.terminal_runtime_key_for_path(&session.session_path);
+            session.last_activity_epoch_ms = self
+                .terminals
+                .session_idle_for_ms(&runtime_path)
+                .map(|idle_ms| (now_ms.saturating_sub(idle_ms)) as u128);
             // ⛔ ONLY where this daemon has no answer of its own. A scrape of a
             // screen we own is the freshest truth there is; a proxied flag may
             // be up to one refresh old, so it fills a hole and never overwrites.
@@ -30789,6 +30802,7 @@ mod tests {
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             pty_cols: None,

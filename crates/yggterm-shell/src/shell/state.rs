@@ -18775,6 +18775,9 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         embedded_surface_detail: session.embedded_surface_detail.clone(),
         last_launch_error: session.last_launch_error.clone(),
         last_window_error: session.last_window_error.clone(),
+        // The daemon measured this row\'s last PTY activity — carry it; the
+        // startpage recency law ranks live rows by it (2026-09-02 fs-truth fix).
+        last_activity_epoch_ms: session.last_activity_epoch_ms,
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
@@ -18838,6 +18841,9 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         embedded_surface_detail: session.embedded_surface_detail.clone(),
         last_launch_error: session.last_launch_error.clone(),
         last_window_error: session.last_window_error.clone(),
+        // The daemon measured this row\'s last PTY activity — carry it; the
+        // startpage recency law ranks live rows by it (2026-09-02 fs-truth fix).
+        last_activity_epoch_ms: session.last_activity_epoch_ms,
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
