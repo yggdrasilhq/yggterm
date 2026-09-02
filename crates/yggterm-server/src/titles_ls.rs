@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use yggterm_core::startpage::{order_for_startpage, scan_all_durable_sessions, StartpageDurableRow};
+use yggterm_core::startpage::{scan_all_durable_sessions, StartpageDurableRow};
 
 use crate::snapshot;
 
@@ -71,8 +71,8 @@ pub fn run_server_titles_ls(store: &yggterm_core::SessionStore, args: &[String])
         b_has.cmp(&a_has).then_with(|| b.modified_epoch_ms.cmp(&a.modified_epoch_ms))
     });
     // Stabilize to startpage order within same title-presence bucket
-    // by keeping the original order_for_startpage for ties.
-    let _ = order_for_startpage; // keep import used for future rank moves
+    // (the recency order itself is the order_for_startpage law, single-sourced
+    // in yggterm-core::startpage::order_candidates_for_startpage)
     if rows.len() > limit {
         rows.truncate(limit);
     }

@@ -528,6 +528,7 @@ impl ShellArm {
             embedded_surface_detail: None,
             last_launch_error: None,
             last_window_error: None,
+            last_activity_epoch_ms: None,
             ssh_target: match self.locality {
                 Locality::Local => None,
                 Locality::Remote => Some(ARM_MACHINE.to_string()),
