@@ -5304,22 +5304,38 @@ pub(crate) fn managed_cli_shell_command_configured(
                 && !session_id.starts_with("ses_")
             {
                 let prefix = if persistent { "exec " } else { "" };
+                let shape = CliInvocationShape {
+                    action: "launch",
+                    selector: "",
+                    carries_id: false,
+                    re_roots_with_cwd: descriptor
+                        .is_some_and(|descriptor| descriptor.resume_re_roots_with_cwd)
+                        && has_cwd,
+                    extra_arg_tokens: split_extra_args(&extra_args).len(),
+                    persistent,
+                };
+                // Issue 31 probe: the composition refused what the descriptor
+                // declares (a `--session <id>` resume) and degraded to a
+                // fresh launch. Expected vs actual, at the moment of
+                // composition — the launch event below would otherwise show
+                // only the degraded shape with no word that a degrade
+                // happened.
+                yggterm_core::cli_plane::emit_launch_contract(
+                    "daemon",
+                    kind,
+                    descriptor
+                        .map(|descriptor| descriptor.resume_selector_token())
+                        .unwrap_or_default(),
+                    shape,
+                    yggterm_core::cli_plane::CliLaunchContractBreach::SesGuardDegrade,
+                );
                 (
                     format!(
                         "{prefix}{}{}",
                         tool.binary_name(),
                         extra_args
                     ),
-                    CliInvocationShape {
-                        action: "launch",
-                        selector: "",
-                        carries_id: false,
-                        re_roots_with_cwd: descriptor
-                            .is_some_and(|descriptor| descriptor.resume_re_roots_with_cwd)
-                            && has_cwd,
-                        extra_arg_tokens: split_extra_args(&extra_args).len(),
-                        persistent,
-                    },
+                    shape,
                 )
             } else {
             let prefix = if persistent { "exec " } else { "" };

@@ -856,6 +856,127 @@ fn identity_poll_payload(kind: SessionKind, stats: CliIdentityPollStats) -> Valu
     })
 }
 
+/// One mirror tick's identity decision, for a CLI whose TUI renders sessions
+/// the row was not born with.
+///
+/// Emitted on INTERESTING ticks only (a spawn, a retire, a focus, or a bound
+/// identity that disagrees with what the service is viewing) — never on the
+/// 5 s tick, which would cost ~17k events a day to say "still in sync". The
+/// `diverged` outcome is the event this probe exists for: bound ≠ viewing and
+/// no rebind happened, with the anchor, the candidate count and both ids on
+/// the event instead of in a debugger. `anchor` is `None` when no row
+/// qualified; `viewing`/`bound` are `None` when the service was quiet or the
+/// anchor carries no id yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliMirrorTickDecision<'a> {
+    pub anchor: Option<&'a str>,
+    pub candidates: usize,
+    pub viewing: Option<&'a str>,
+    pub bound: Option<&'a str>,
+    /// `in_sync` | `diverged` | `rebound` | `rebind_failed` | `no_anchor` |
+    /// `anchor_not_live` | `no_viewing`.
+    pub decision: &'static str,
+    pub active_tabs: usize,
+}
+
+pub fn emit_mirror_tick(component: &str, kind: SessionKind, tick: CliMirrorTickDecision<'_>) {
+    if agent_cli_descriptor(kind).is_none() {
+        return;
+    }
+    let payload = mirror_tick_payload(kind, tick);
+    crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "mirror_tick", payload);
+}
+
+fn mirror_tick_payload(kind: SessionKind, tick: CliMirrorTickDecision<'_>) -> Value {
+    json!({
+        "slug": slug_of(kind),
+        "kind": format!("{kind:?}"),
+        "anchor": tick.anchor,
+        "candidates": tick.candidates,
+        "viewing": tick.viewing,
+        "bound": tick.bound,
+        "decision": tick.decision,
+        "active_tabs": tick.active_tabs,
+    })
+}
+
+/// Why a composed launch/resume does NOT say what the descriptor declares.
+///
+/// Emitted ONLY on degrade — the faithful path is already covered by the
+/// `cli/launch` shape event, and a second event per launch would double that
+/// stream's bytes to restate agreement. Each reason names the rail that
+/// refused: the ses_ guard (a phantom id the service would reject), the
+/// store-vouch absent arm (an id the store never held), or the service-vouched
+/// override (the live focus stream outranks a lagging store index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliLaunchContractBreach {
+    SesGuardDegrade,
+    StoreAbsentRebirth,
+    ServiceVouchedResume,
+}
+
+impl CliLaunchContractBreach {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SesGuardDegrade => "ses_guard_degrade",
+            Self::StoreAbsentRebirth => "store_absent_rebirth",
+            Self::ServiceVouchedResume => "service_vouched_resume",
+        }
+    }
+}
+
+pub fn emit_launch_contract(
+    component: &str,
+    kind: SessionKind,
+    declared_selector: &str,
+    shape: CliInvocationShape<'_>,
+    breach: CliLaunchContractBreach,
+) {
+    if agent_cli_descriptor(kind).is_none() {
+        return;
+    }
+    let mut payload = launch_payload(kind, shape);
+    merge(
+        &mut payload,
+        json!({
+            "declared_selector": declared_selector,
+            "breach": breach.label(),
+        }),
+    );
+    crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "launch_contract", payload);
+}
+
+/// One row's working-verdict transition, as the daemon's snapshot chore saw
+/// it — the attributable form of the blinking dot.
+///
+/// `screen_signal` = the CLI's own in-flight chrome is on the live screen;
+/// `recency_signal` = the PTY went active inside the recent window. A dot
+/// blinking on recency alone reads differently from one the CLI's footer
+/// drives, and until now the two were one bit. Edge-triggered by the caller:
+/// this fn emits unconditionally, and the chore that owns the last-state set
+/// decides when a transition happened.
+pub fn emit_working_edge(
+    component: &str,
+    kind: SessionKind,
+    session_path: &str,
+    working: bool,
+    screen_signal: bool,
+    recency_signal: bool,
+) {
+    if agent_cli_descriptor(kind).is_none() {
+        return;
+    }
+    let payload = json!({
+        "session_path": session_path,
+        "slug": slug_of(kind),
+        "kind": format!("{kind:?}"),
+        "edge": if working { "working" } else { "idle" },
+        "screen_signal": screen_signal,
+        "recency_signal": recency_signal,
+    });
+    crate::perf::ytrace_emit_event(component, CLI_PLANE_CATEGORY, "working_edge", payload);
+}
+
 fn launch_payload(kind: SessionKind, shape: CliInvocationShape<'_>) -> Value {
     json!({
             "slug": slug_of(kind),
@@ -1115,6 +1236,77 @@ mod tests {
         assert_eq!(payload["newly_exhausted"], serde_json::json!(2));
     }
 
+    #[test]
+    fn a_diverged_mirror_tick_names_anchor_viewing_bound_and_verdict() {
+        let payload = mirror_tick_payload(
+            SessionKind::OpenCode,
+            CliMirrorTickDecision {
+                anchor: Some("opencode-runtime://d4090efe-4e12-42d9-938d-66f61801d2e7"),
+                candidates: 5,
+                viewing: Some("ses_f9cdde2f5ffep2W0tBiWE7qb3a"),
+                bound: Some("d4090efe-4e12-42d9-938d-66f61801d2e7"),
+                decision: "diverged",
+                active_tabs: 2,
+            },
+        );
+        assert_eq!(payload["slug"], serde_json::json!("opencode"));
+        assert_eq!(payload["decision"], serde_json::json!("diverged"));
+        assert_eq!(payload["candidates"], serde_json::json!(5));
+        assert_eq!(
+            payload["viewing"],
+            serde_json::json!("ses_f9cdde2f5ffep2W0tBiWE7qb3a")
+        );
+        assert_eq!(
+            payload["bound"],
+            serde_json::json!("d4090efe-4e12-42d9-938d-66f61801d2e7")
+        );
+    }
+
+    #[test]
+    fn a_quiet_mirror_tick_is_representable_without_ids() {
+        let payload = mirror_tick_payload(
+            SessionKind::OpenCode,
+            CliMirrorTickDecision {
+                anchor: None,
+                candidates: 0,
+                viewing: None,
+                bound: None,
+                decision: "no_anchor",
+                active_tabs: 0,
+            },
+        );
+        assert_eq!(payload["decision"], serde_json::json!("no_anchor"));
+        assert!(payload["viewing"].is_null());
+    }
+
+    #[test]
+    fn a_contract_breach_names_the_declared_selector_and_the_refusing_rail() {
+        let payload = {
+            let mut base = launch_payload(
+                SessionKind::OpenCode,
+                CliInvocationShape {
+                    action: "launch",
+                    selector: "",
+                    carries_id: false,
+                    re_roots_with_cwd: false,
+                    extra_arg_tokens: 0,
+                    persistent: true,
+                },
+            );
+            merge(
+                &mut base,
+                serde_json::json!({
+                    "declared_selector": "--session",
+                    "breach": CliLaunchContractBreach::SesGuardDegrade.label(),
+                }),
+            );
+            base
+        };
+        assert_eq!(payload["action"], serde_json::json!("launch"));
+        assert_eq!(payload["declared_selector"], serde_json::json!("--session"));
+        assert_eq!(payload["breach"], serde_json::json!("ses_guard_degrade"));
+    }
+
     /// The registry decides `id_origin`, so a CLI added tomorrow reports the
     /// truth without touching this module.
     #[test]
@@ -1308,11 +1500,25 @@ mod tests {
                 newly_exhausted: 1,
             },
         );
+        // Issue 31 probes ride the same per-event budget: a diverged tick
+        // carries two full-length ids, so it is measured at full length.
+        let mirror_tick = mirror_tick_payload(
+            SessionKind::OpenCode,
+            CliMirrorTickDecision {
+                anchor: Some("opencode-runtime://d4090efe-4e12-42d9-938d-66f61801d2e7"),
+                candidates: 5,
+                viewing: Some("ses_f9cdde2f5ffep2W0tBiWE7qb3a"),
+                bound: Some("d4090efe-4e12-42d9-938d-66f61801d2e7"),
+                decision: "diverged",
+                active_tabs: 2,
+            },
+        );
         for (name, payload) in [
             ("birth", &birth),
             ("launch", &launch),
             ("restore", &restore),
             ("identity_poll", &identity_poll),
+            ("mirror_tick", &mirror_tick),
         ] {
             let bytes =
                 serde_json::to_string(payload).expect("payload serialises").len() + LINE_ENVELOPE_BYTES;
