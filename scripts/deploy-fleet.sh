@@ -174,22 +174,70 @@ fi
 STRANDED=""
 for h in $HOSTS; do
   if [ "$h" = "$(hostname -s 2>/dev/null)" ] || [ "$h" = dev ]; then
-    [ -e "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json" ] && STRANDED="$STRANDED $h"
+    [ -e "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json" ] && STRANDED="$STRANDED $h:local"
   else
     ssh -o BatchMode=yes -o ConnectTimeout=5 "$h" \
       'test -e "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json"' 2>/dev/null \
-      && STRANDED="$STRANDED $h"
+      && STRANDED="$STRANDED $h:remote"
   fi
 done
 
-if [ -n "$STRANDED" ]; then
-  echo "⛔ REFUSING: an interrupted-sessions record is still present on:$STRANDED" >&2
+# The gate's hazard is a `continue` that will be TYPED. But the record's own
+# law already bounds that hazard to a 10-minute window
+# (crates/yggterm-server/src/hot_restart_repair.rs REPAIR_WINDOW_MS): past it,
+# take_repairable drops the record "loudly, rather than honoured" and dispatch
+# can never act on it. Refusing on an EXPIRED record blocks every deploy on a
+# repair that is already a dead letter — and the deadlock is self-reinforcing,
+# because the drop only runs when a daemon looks, and the gate stands in front
+# of every daemon that could look. Measured live on dev 2026-09-02, twice the
+# same day: a stranded record (writer was the daemon that SURVIVED its own
+# aborted swap) blocked deploys from 21:31 to past 23:00 until resolved by
+# hand, the second hand resolution of the day. So: FRESH record ⇒ refuse.
+# EXPIRED record ⇒ proceed over a loud warning (the successor's sweeper drops
+# it on arrival). UNREADABLE record ⇒ refuse — an unreadable list is not an
+# empty one.
+REPAIR_WINDOW_MS=600000
+record_age_ms() {
+  # $1 = "host:local|remote"; prints age in ms, or returns 2 if unreadable.
+  local host="${1%%:*}" kind="${1##*:}" path recorded now
+  if [ "$kind" = local ]; then
+    path="${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json"
+    recorded=$(grep -o '"recorded_at_ms":[0-9]*' "$path" 2>/dev/null | head -1 | cut -d: -f2)
+  else
+    recorded=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+      'grep -o "\"recorded_at_ms\":[0-9]*" "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json" 2>/dev/null | head -1' 2>/dev/null \
+      | cut -d: -f2)
+  fi
+  case "$recorded" in ''|*[!0-9]*) return 2 ;; esac
+  now=$(date +%s%3N)
+  echo $((now - recorded))
+}
+
+for entry in $STRANDED; do
+  age=$(record_age_ms "$entry")
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "⛔ REFUSING: interrupted-sessions record on ${entry%%:*} is UNREADABLE —" >&2
+    echo "   an unreadable list is not an empty one; resolve it by hand first." >&2
+    [ -n "${YGG_DRAFT_CLEARED:-}" ] || exit 1
+    echo "   ⚠ overridden by YGG_DRAFT_CLEARED=$YGG_DRAFT_CLEARED" >&2
+    continue
+  fi
+  if [ "$age" -gt "$REPAIR_WINDOW_MS" ]; then
+    echo "deploy-fleet: ⚠ EXPIRED interrupted-sessions record on ${entry%%:*} " >&2
+    echo "   (age ${age}ms > window ${REPAIR_WINDOW_MS}ms). Its \`continue\`s are dropped by" >&2
+    echo "   the daemon's own expiry law and will never be typed; proceeding. The successor" >&2
+    echo "   drops the record on arrival. If this repeats, the swapping daemon's poll thread" >&2
+    echo "   is dying mid-linger — that is the defect to fix, not this gate." >&2
+    continue
+  fi
+  echo "⛔ REFUSING: a LIVE interrupted-sessions record (${age}ms old) is present on ${entry%%:*}." >&2
   echo "   That record is written on a FORCED cold shutdown and is the list of rows the" >&2
   echo "   repair will TYPE \`continue\` into. Deploying now types into every one of them." >&2
   echo "   Resolve the stranded handover first; do not delete the record to get past this." >&2
   [ -n "${YGG_DRAFT_CLEARED:-}" ] || exit 1
   echo "   ⚠ overridden by YGG_DRAFT_CLEARED=$YGG_DRAFT_CLEARED" >&2
-fi
+done
 
 if [ "$ATTENDED_N" != 0 ]; then
   echo "deploy-fleet: ⚠ $ATTENDED_N human-attended row(s) on the never-arm list." >&2

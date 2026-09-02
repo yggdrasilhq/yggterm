@@ -25826,3 +25826,59 @@ ignores `null` when the GUI holds a session view and the daemon has never
 held a non-null active since this GUI attached. (a) is the SSOT-honest one:
 the pointer should live where the state lives, and after a restart it lives
 nowhere until the GUI gives it back.
+
+---
+
+## ⛔ [interrupted-orphan] THE EXPIRED-SWAP RECORD OUTLIVES EVERY THREAD THAT COULD AGE IT OUT, AND THE GATE REFUSES ON A DEAD LETTER
+
+**Status:** PARTIALLY FIXED 2026-09-02 — the expiry sweeper (own thread) and
+the gate's expiry-awareness landed on `lane/dev/interrupted-expiry`; the
+LINGER itself (root cause) is OPEN.
+
+Measured live on dev, 2026-09-02, TWICE the same day:
+
+1. ~20:31 — pid 3509741 (3.2.37) wrote `hot-restart-interrupted.json` naming
+   5 sessions, then its forced cold shutdown "took the preserving path and
+   lingered; poll thread exited before the expiry sweeper could run" (the
+   fs-truth campaign's trace words, `hot_restart_repair_expired_resolved_manually`,
+   resolved by hand 20:55 after verifying all 5 rows alive on live PTYs).
+2. 21:31 — pid 3196949 (3.2.40) wrote the record naming 2 opencode rows
+   (active 160s before), began the same forced shutdown, and LINGERED: the
+   daemon is still serving at 23:30 while its poll thread never ran again
+   (no expiry sweep at 21:41, no forced-deadline verdict at 22:01/22:31/23:01,
+   no `binary_replaced` retire despite two deploys installing newer binaries
+   at 22:41 and 23:08). The record blocked every deploy at the
+   `deploy-fleet.sh` gate from 22:49 (first refusal in ci.log) until removed
+   by hand before the 23:08 deploy passed; named rows verified `working` on
+   live PTYs of the surviving writer first.
+
+**The three strata:**
+
+- *The linger (OPEN, root cause).* A forced swap that writes the record must
+  either complete or die; "took the preserving path and lingered" leaves a
+  zombie that serves requests but can never retire (`binary_replaced` is a
+  poll-loop trigger), never force-swap, never age the record. Deploys then
+  install binaries that nothing ever loads. The request-path hot restart
+  (`server monitor --scenario hot-restart`) answered `deferred:
+  session_survival_required` and has no retry of its own — a deferred
+  same-version swap needs a re-request, and only the dead poll loop would
+  ever re-arm one.
+- *The expiry drop depended on the dying thread (FIXED).* The expired arm of
+  `take_repairable` was reachable only from `dispatch_interrupted_session_
+  repairs`, whose only caller was the poll loop. New:
+  `spawn_interrupted_record_expiry_sweeper` — a standalone 60s thread running
+  `hot_restart_repair::sweep_expired`, same loud
+  `hot_restart_repair_expired` verdict, collision-free by construction (an
+  expired record is never dispatched, so no batch can be in flight on one).
+- *The gate refused on a dead letter (FIXED).* `deploy-fleet.sh` refused
+  whenever the file existed, whatever its age. Now: fresh (≤10 min) ⇒ refuse
+  as before; expired ⇒ proceed over a loud warning (the successor drops the
+  record on arrival); unreadable ⇒ refuse (an unreadable list is not an empty
+  one).
+
+⇒ What remains: root-cause the preserving-path linger (why the shutdown
+neither completed nor exited) and give a deferred same-version swap a
+re-arming retry that does not depend on the poll thread. Until then every
+forced-swap linger needs the hand-resolution protocol: verify the named rows
+on live PTYs, archive the record to scratchpad, trace
+`hot_restart_repair_expired_resolved_manually`, remove.

@@ -296,6 +296,33 @@ pub fn format_pending_repair(record: &InterruptedSessions, now_ms: u64) -> Strin
     )
 }
 
+/// The expiry law on its own feet: clear a record already past
+/// [`REPAIR_WINDOW_MS`], whoever asks. Returns `Some((age_ms, sessions))` when
+/// it cleared, `None` when there was nothing past the window.
+///
+/// Why a standalone entry point beside [`take_repairable`]'s expired arm: that
+/// arm's only caller was the disk-binary poll thread, and the poll thread
+/// provably dies mid-linger — measured live on dev, 2026-09-02, TWICE the
+/// same day: a forced swap wrote the record, the shutdown took the preserving
+/// path and lingered, the poll thread exited, and the daemon went on serving
+/// every request while no code path could age the record out. Each stranded
+/// record then refused every deploy at the gate for hours, on a repair that by
+/// this module's own law was already a dead letter ("dropped, loudly, rather
+/// than honoured" — the dropping just had no survivor left to do it).
+///
+/// ⛔ Safe to run beside a dispatch: an expired record is never dispatched, so
+/// no repair batch can be in flight against one — the two paths cannot both
+/// act on the same record.
+pub fn sweep_expired(home_dir: &Path, now_ms: u64) -> Option<(u64, Vec<String>)> {
+    let record = load(home_dir)?;
+    let age_ms = now_ms.saturating_sub(record.recorded_at_ms);
+    if age_ms <= REPAIR_WINDOW_MS {
+        return None;
+    }
+    clear(home_dir);
+    Some((age_ms, record.sessions))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +346,37 @@ mod tests {
             reason: "unit test".to_string(),
             sessions: sessions.iter().map(|key| key.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn the_sweeper_ages_out_what_dispatch_never_reached() {
+        // The measured class: the record outlives every thread that could have
+        // run take_repairable's expired arm. sweep_expired is the same law with
+        // no caller alive to depend on — past the window it clears, and says so.
+        let home = scratch_home("sweeper-expired");
+        assert!(record(&home, &interrupted(1_000, 111, &["local://a"])));
+        let cleared = sweep_expired(&home, 1_000 + REPAIR_WINDOW_MS + 1);
+        assert_eq!(
+            cleared,
+            Some((REPAIR_WINDOW_MS + 1, vec!["local://a".to_string()]))
+        );
+        assert!(load(&home).is_none(), "expired record must be gone");
+    }
+
+    #[test]
+    fn the_sweeper_leaves_a_live_repair_alone() {
+        // Inside the window the record is dispatch's to spend, not the
+        // sweeper's — clearing it would un-owe a `continue` still owed.
+        let home = scratch_home("sweeper-fresh");
+        assert!(record(&home, &interrupted(1_000, 111, &["local://a"])));
+        assert!(sweep_expired(&home, 1_000 + REPAIR_WINDOW_MS - 1).is_none());
+        assert!(load(&home).is_some(), "live record must survive the sweep");
+    }
+
+    #[test]
+    fn the_sweeper_and_an_absent_record_agree_to_do_nothing() {
+        let home = scratch_home("sweeper-absent");
+        assert!(sweep_expired(&home, 9_000).is_none());
     }
 
     #[test]
