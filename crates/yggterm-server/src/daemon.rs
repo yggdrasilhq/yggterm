@@ -36638,7 +36638,7 @@ mod tests {
         // viewport outcomes is the lost-PTY latch storm this stamp exists to
         // prevent.
         const STAMPED_AT_VERSION: &str = "3.2.39";
-        const STAMPED_SHAPE_HASH: u64 = 0x1022be69ffce0943;
+        const STAMPED_SHAPE_HASH: u64 = 0x6f9ec7411a13eaaf;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

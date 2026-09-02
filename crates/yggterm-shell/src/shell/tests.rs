@@ -66312,6 +66312,7 @@ mod web_surface_immersion_locks {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            last_activity_epoch_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
