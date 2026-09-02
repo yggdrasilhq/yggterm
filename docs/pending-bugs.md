@@ -25491,3 +25491,54 @@ false` — while a row with one real character typed into it still answers `true
 ⭐ **It is now rehearsable without a desktop.** A sandbox `YGGTERM_HOME` + GUI reproduces
 it in about four minutes (recipe: field guide; aiming the verbs: fleet skill §11.9),
 which is how it was root-caused.
+
+---
+
+## ⛔ [startpage-hijack-B] The preserve-active launch writes its restore as a SECOND activation — churn every attach answers twice
+
+**Measured GUI host 2026-09-02 18:17–18:25** (same incident as the fixed half in
+`start_local_session_seated`'s activate flag — lane trace/startpage-hijack): with the
+daemon's active pointer at `None` (startpage), EVERY background attach of any row —
+warm-ensure, screen reconcile, attach seed — runs
+`request_terminal_launch_for_path_preserving_active`, which
+(1) sets active to the attached row (`request_terminal_launch_preserving_active`) and then
+(2) re-clears it to `None` (`launch_preserving_active_had_none`).
+Two activation trace writes + two snapshot-visible state writes per attach, forever, while
+the user sits on the startpage. The host-panic heartbeat flagged the GUI as "UI thread
+blocking 7 times a minute — the interface is thrashing" at 18:19, inside exactly this
+window. Trace census in that window: the pair fired against `remote-opencode://dev/`
+rows e2470eef, d4090efe (×3), 06c6e80b (×2) with `user_gesture:false` on every one.
+
+The net state is correct (nothing was active, nothing is active) — the DAMAGE is the
+per-attach double write, which every activation-follower (GUI adopt path, working-dot
+polls, row-order ledger) re-derives twice. The proper fix is a launch that never
+activates when preserved-active is `None`: `request_terminal_launch_for_active`'s body
+is deeply active-coupled (its remote-stored opens set active themselves), so the shape
+is "extract a path-parameterized launch, or early-return before the activation write and
+let the ensure funnel's own runtime half do the work" — the funnel
+(`ensure_terminal_for_path_with_initial_size_and_seed`) already continues independently
+after the bookkeeping call, so the early-return arm is safe for every live-row attach;
+only stored-remote opens would need the funnel's own path. ⛔ Do not "fix" it by dropping
+the trace writes — the writes are the witness, the STATE writes are the defect.
+
+## ⛔ [startpage-hijack-C] Removing the ACTIVE row drops the user to the startpage instead of the next row
+
+`remove_live_session` (lib.rs) clears the active pointer to `None` when the removed row
+WAS active — `ActivationOrigin::recovery("remove_live_session")` → the GUI's viewport
+falls to the startpage. The GUI-INITIATED close has redirect logic
+(`close_redirect_target_for_pending` walks viewport history); the daemon-side remove —
+which is what app-control `session remove` uses (probe reaps, agent cleanup,
+ephemeral TTL reaps) — has none. Measured 2026-09-02 18:17:33: the usability probe's
+reap cleared the owner's active pointer and the startpage took the viewport (the owner's
+"random startpage spawn" screenshot). The activate-half of this incident is fixed in
+lane trace/startpage-hijack (the probe can no longer BECOME active); this half remains
+open for any future case where an agent or TTL reaper removes a row the human is
+looking at.
+
+⇒ Recommended: the daemon remove should fall back the way the GUI close redirect does —
+nearest surviving live-session row in `live_session_order`, `None` only when no other
+live row exists. ⚠ This is a BEHAVIOR RULING, not a bugfix: the current test
+`remove_live_session_clears_active_path_for_normalized_active_alias` pins today's
+clear-to-None, and plain-shell close semantics may WANT the startpage (a closed shell
+has no store to fall back to). Needs the owner's word or a spec note before the code
+moves; not fixed alongside the activate half for exactly that reason.
