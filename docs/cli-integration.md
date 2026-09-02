@@ -1182,3 +1182,29 @@ The funnel now runs the descriptor-driven holder scan
 (`external_agent_resume_processes_for_session`) and refuses BY PID
 (`external_active_refused_local_spawn` trace event,
 policy session_survival_before_yggterm_attach).
+
+### ⛔ The blank-reveal repaint law: an identical-geometry resize signals nobody (2026-09-02)
+
+A fullscreen TUI repaints on input, a REAL winsize change, or its own timers —
+never on a client merely attaching. After a GUI restart the mount's startup
+resize asked for the grid the PTY already held, the kernel (correctly) did not
+signal the child, and the idle TUI slept while the fresh client showed its
+empty surface for the whole reveal (measured: 39.5 s, pending-bugs [11.39]).
+The resize wire request now carries `repaint` (serde-default false): at
+identical geometry the daemon bounces the PTY one row and restores it — two
+real SIGWINCHes — and the TUI's CURRENT frame arrives as ordinary bytes. The
+startup repair and the post-attach redraw nudge send it; shadows never do.
+Witness: `resize_repaint_nudge` + mock-tui `--scenario winch-repaint`.
+
+### ⛔ The SSOT session-title law: one name per row, rail and store (2026-09-02)
+
+Owner law: an agent row's title is the session's real title or, before that
+exists, the birth title `New {machine} {CLI}` — the SAME string the metadata
+rail shows. The cwd is not an agent's name (`humanized_terminal_title` no
+longer composes `{directory} {CLI}` for agent kinds; shells keep it), the
+daemon's remote-resume fallback stamps the birth title instead of
+`Remote {CLI} {shorthash}` (lib.rs, both sites), the low-signal title
+detector derives the `yggterm {CLI}` placeholder family from the registry
+(both hyphenated and spaced spellings — the hand list is how "yggterm
+opencode" leaked), and the rail resolves a low-signal stored title through
+the same humanized fallback the row label ends at (pending-bugs [11.41]).

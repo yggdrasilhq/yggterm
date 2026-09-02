@@ -205,6 +205,14 @@ are profiling).
     (wire envelope label; the GUI sends none today) + `hash_before`/`hash_after`
     at the seam. `null` origin = a daemon-internal repair; a `shadow` role here
     is a finding in itself (the role gate refuses shadow resizes upstream).
+  - `resize_repaint_nudge` (server/terminal_runtime): an identical-geometry
+    resize that BOUNCED the PTY winsize one row and restored it — two real
+    SIGWINCHes — so an idle fullscreen TUI repaints into a freshly attached
+    client (the 39.5 s blank-reveal root, pending-bugs [11.39]). Pair it with
+    the mock-tui `--scenario winch-repaint` witness (a TUI that repaints ONLY
+    on SIGWINCH): a plain identical resize must produce zero bytes; the nudge
+    must produce a new `WINCH_FRAME_<n>`. If a blank-reveal report returns,
+    check this event exists on the mount where `resize_noop` used to be.
 - `server app rows` — browser/sidebar rows. For every agent row, read
   `session_kind` + `session_kind_source`, `title_quality`, `icon_kind` +
   `expected_icon_kind`, and `icon_matches_session_kind`. These are the FINAL

@@ -1692,6 +1692,21 @@ mod tests {
         assert!(looks_like_generated_fallback_title(
             "Yggterm Orch Muse Code"
         ));
+        // ⛔ THE LEAK THAT COST THE OWNER HIS ROW NAMES (2026-09-02): the hand
+        // list knew `yggterm codex` but not `yggterm opencode`, so an OpenCode
+        // row in ~/gh/yggterm rendered "Yggterm OpenCode" for days. The
+        // detection is now DERIVED from the registry — every CLI, both
+        // spellings, forever.
+        assert!(looks_like_generated_fallback_title("Yggterm OpenCode"));
+        assert!(looks_like_generated_fallback_title("Yggterm Claude Code"));
+        assert!(looks_like_generated_fallback_title("Yggterm Claude-Code"));
+        for descriptor in crate::agent_cli::AGENT_CLIS {
+            let display = descriptor.display_name;
+            assert!(
+                looks_like_generated_fallback_title(&format!("Yggterm {display}")),
+                "dir+CLI placeholder must read low signal: Yggterm {display}"
+            );
+        }
         assert!(looks_like_generated_fallback_title("User Home Codex"));
         assert!(looks_like_generated_fallback_title("Operator Home Shell"));
         assert!(looks_like_generated_fallback_title("Codex Session"));
@@ -3529,6 +3544,18 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
                 .iter()
                 .any(|descriptor| descriptor.display_name.eq_ignore_ascii_case(tail))
         });
+    // `{directory} {CLI name}` — the shape `humanized_terminal_title` used to
+    // compose for agent rows and stopped composing on 2026-09-02 (owner law:
+    // the cwd is not an agent's name). Titles ALREADY STORED in that shape
+    // must still read as low signal so every resolver regenerates past them.
+    // Derived from the registry — hand-listing the old CLIs is exactly how
+    // "yggterm codex" was caught while "yggterm opencode" leaked to the screen
+    // for days. Both the hyphenated and the spaced spelling are recognised.
+    let yggterm_dir_cli_placeholder = crate::agent_cli::AGENT_CLIS.iter().any(|descriptor| {
+        let display = descriptor.display_name.to_ascii_lowercase();
+        lower == format!("yggterm {display}")
+            || lower == format!("yggterm {}", display.replace('-', " "))
+    });
     let new_muse_placeholder = lower.starts_with("new muse code session")
         || lower.starts_with("new antigravity session")
         || lower == "new session";
@@ -3549,6 +3576,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         || generic_runtime_title
         || yggterm_generic_placeholder
         || yggterm_orch_cli_placeholder
+        || yggterm_dir_cli_placeholder
         || new_muse_placeholder
         || opencode_new_session_placeholder
         || looks_like_low_signal_generated_title(compact)

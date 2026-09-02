@@ -5182,6 +5182,22 @@ fn session_connect_command(session: &ManagedSessionView, cwd: &str) -> String {
     }
     String::new()
 }
+/// ⛔ THE SSOT TITLE (owner law, 2026-09-02): the rail's Title entry and the
+/// sidebar row must answer with the same string. The rail used to print
+/// `session.title` raw — which for rows born before the birth-title law is the
+/// forbidden `Remote {CLI} {shorthash}` shape — while the row showed its own
+/// derived name. Now: a real title passes through untouched; a low-signal one
+/// falls through the SAME humanized fallback (`humanized_terminal_title`) the
+/// row's label ends at, so a row and its rail cannot disagree again.
+fn session_metadata_title(session: &ManagedSessionView, cwd: &str) -> Option<String> {
+    let raw = session.title.trim();
+    if !raw.is_empty() && !yggterm_core::looks_like_generated_fallback_title(raw) {
+        return Some(raw.to_string());
+    }
+    humanized_terminal_title(session.kind, cwd, Some(session.host_label.trim()))
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| (!raw.is_empty()).then(|| raw.to_string()))
+}
 /// Build the view-aware "useful" metadata panel from the rich snapshot fields
 /// (kind, host/source, pty grid, pid, working state) plus the genuinely useful
 /// daemon metadata entries (cwd, restore command, resume id, transcript stats),
@@ -5225,10 +5241,10 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
             value: cwd.trim().to_string(),
         });
     }
-    if !session.title.trim().is_empty() {
+    if let Some(title) = session_metadata_title(session, &cwd) {
         identity.push(SessionMetadataEntry {
             label: "Title",
-            value: session.title.trim().to_string(),
+            value: title,
         });
     }
 

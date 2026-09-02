@@ -85,6 +85,21 @@ pub(crate) fn humanized_terminal_title(
     host_label: Option<&str>,
 ) -> Option<String> {
     let suffix = terminal_kind_title_suffix(kind);
+    // ⛔ THE cwd IS NOT AN AGENT'S NAME (owner law, 2026-09-02): an agent row's
+    // human fallback is the BIRTH title the metadata rail already shows —
+    // `New {machine} {CLI}` — never `{directory} {CLI}`. The dir-composed shape
+    // leaked to the screen as "Yggterm OpenCode" (cwd `~/gh/yggterm` +
+    // OpenCode) while the same row's rail said "New dev OpenCode": two title
+    // sources answering one question. The one source is the birth rule in
+    // `yggterm_core::agent_cli`, the same function that stamped the rail's
+    // string, so a row and its rail cannot disagree again. Plain shells keep
+    // the directory composition below — a shell genuinely is its directory.
+    if kind.is_agent() {
+        return Some(yggterm_core::agent_cli::new_row_birth_title(
+            host_label,
+            suffix,
+        ));
+    }
     let cwd = cwd.trim().trim_end_matches('/');
     if !cwd.is_empty() {
         if let Some(home_user) = cwd.strip_prefix("/home/")
@@ -104,13 +119,11 @@ pub(crate) fn humanized_terminal_title(
         let title = format!("{} {suffix}", shell_title_case_words(host_label));
         return (!looks_like_generated_fallback_title(&title)).then_some(title);
     }
-    if kind.is_agent() {
-        return Some(format!("{suffix} Session"));
-    }
     Some(match kind {
         SessionKind::Shell => "Local Terminal".to_string(),
         SessionKind::SshShell => "SSH Terminal".to_string(),
         SessionKind::Document => "Document".to_string(),
+        // Unreachable for agents: the birth-title arm above returned already.
         _ => "Local Terminal".to_string(),
     })
 }
@@ -247,9 +260,63 @@ mod tests {
             humanized_terminal_title(SessionKind::Shell, "/home/user/git/samplenotes", Some("dev")),
             Some("Samplenotes Shell".to_string())
         );
+        // ⛔ Under the SSOT law an agent row's fallback is its birth title —
+        // never the cwd-composed shape (which for "/home/user" used to be
+        // caught low-signal and degraded to `None`, leaving the caller to
+        // improvise).
         assert_eq!(
             humanized_terminal_title(SessionKind::Codex, "/home/user", Some("dev")),
-            None
+            Some("New dev Codex".to_string())
+        );
+    }
+
+    /// ⛔ THE OWNER'S SSOT LAW (2026-09-02): an agent row's fallback title is
+    /// the birth title the metadata rail shows — never `{directory} {CLI}`.
+    /// The leak was live: an OpenCode row in `~/gh/yggterm` rendered
+    /// "Yggterm OpenCode" while its own rail said "New dev OpenCode".
+    #[test]
+    fn agent_rows_fall_back_to_the_birth_title_the_rail_shows() {
+        assert_eq!(
+            humanized_terminal_title(
+                SessionKind::OpenCode,
+                "/home/user/proj/yggterm",
+                Some("dev")
+            ),
+            Some("New dev OpenCode".to_string())
+        );
+        // A blank machine degrades to `New {CLI}`, never a double space —
+        // the same answer `new_row_birth_title` gives, by construction.
+        assert_eq!(
+            humanized_terminal_title(SessionKind::OpenCode, "/home/user/proj/yggterm", None),
+            Some("New OpenCode".to_string())
+        );
+        // Every registered agent CLI is covered by the same arm — adding a CLI
+        // to the registry covers its rows; nobody extends this test by hand.
+        // The expected spelling goes through the same suffix table the
+        // function reads (Codex-LiteLLM's prose spelling is decided there).
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let expected_suffix = terminal_kind_title_suffix(descriptor.kind);
+            let title =
+                humanized_terminal_title(descriptor.kind, "/home/user/proj/yggterm", Some("dev"));
+            assert_eq!(
+                title.as_deref(),
+                Some(
+                    yggterm_core::agent_cli::new_row_birth_title(Some("dev"), expected_suffix)
+                        .as_str()
+                ),
+                "kind {:?} must fall back to its birth title",
+                descriptor.kind
+            );
+        }
+    }
+
+    /// Plain shells KEEP the directory composition — a shell is genuinely its
+    /// directory, and the owner's sidebar reads those rows that way.
+    #[test]
+    fn shell_rows_keep_their_directory_composition() {
+        assert_eq!(
+            humanized_terminal_title(SessionKind::Shell, "/home/user/proj/my-app", Some("dev")),
+            Some("My App Shell".to_string())
         );
     }
 }

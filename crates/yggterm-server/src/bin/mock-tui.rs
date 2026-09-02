@@ -53,6 +53,39 @@ fn main() {
             thread::sleep(Duration::from_millis(80));
             let _ = write!(w, "\x1b[?1049l");
         }
+        // ⛔ THE BLANK-REVEAL WITNESS (owner, 2026-09-02): a fullscreen TUI
+        // that draws ONCE and then repaints ONLY on SIGWINCH — exactly the
+        // idle-opencode shape that left a restarted GUI staring at a blank
+        // viewport for 39.5s. Every SIGWINCH emits a new WINCH_FRAME_<n>, so
+        // a test can prove a resize actually reached the child (and that an
+        // identical-geometry resize does NOT).
+        "winch-repaint" => {
+            static WINCH_COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            extern "C" fn count_winch(_signal: libc::c_int) {
+                use std::sync::atomic::Ordering;
+                WINCH_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+            unsafe {
+                libc::signal(libc::SIGWINCH, count_winch as libc::sighandler_t);
+            }
+            let _ = write!(
+                w,
+                "\x1b[?1049h\x1b[2J\x1b[HALT_SCREEN_MARKER\r\nWINCH_FRAME_0\r\n> winch prompt"
+            );
+            let _ = w.flush();
+            let mut seen = 0u64;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                let count = WINCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+                if count != seen {
+                    seen = count;
+                    let _ = write!(w, "\r\nWINCH_FRAME_{seen}");
+                    let _ = w.flush();
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         // Normal buffer that accumulates scrollback (base_y grows).
         //
         // `--paced-ms N` flushes each line separately (with an N ms gap), so the
