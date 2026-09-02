@@ -25748,3 +25748,32 @@ owner reads color). Also repro-question: amber dots also appeared on FOLDER
 rows under the machine subtree (`/home/user`, `.ssh`) — the group-dot painter
 only knows machine-health and busy-blue, so confirm what paints those
 before touching the vocabulary.
+
+---
+
+## ⛔ [startpage-hijack-D] POST-RESTART NULL-ACTIVE WINDOW — the first snapshot adopt yanks the restored view to the startpage
+
+**Status:** OPEN — measured 2026-09-02 19:40–19:44, guihost, on the 3.2.39 GUI
+(running the [11.43] falsifier).
+
+After a GUI restart the DAEMON's active pointer is `null` until the first user
+click (the GUI restores its own view client-side; nothing has re-armed the
+daemon's pointer). In exactly that window, the next snapshot that reaches the
+GUI's `apply_snapshot_adopt_daemon_view` carries `active_session_path: null`,
+and the adopt moved the GUI's view FROM the user's restored session TO `null`
+— the startpage. Measured live: the falsifier probe was born `activate:false`
+(THE FIX HELD — the daemon's active never moved onto it), the probe's removal
+was unremarkable, and the snapshot after it still flipped the view
+`local://89eec6c0 → null` (`apply_snapshot_adopt_daemon_view`, pid 3739048).
+The owner feels this as "random startpage after every restart, even when
+nothing spawned".
+
+⇒ Recommended shape (needs a ruling before code moves): the daemon's `null`
+must not adopt over a GUI-held session view — adoption follows the daemon
+BETWEEN sessions, not INTO nothingness; either (a) the GUI pushes its
+restored active to the daemon on first attach (the daemon's pointer becomes
+the user's row, restoring the SSOT), or (b) `apply_snapshot_adopt_daemon_view`
+ignores `null` when the GUI holds a session view and the daemon has never
+held a non-null active since this GUI attached. (a) is the SSOT-honest one:
+the pointer should live where the state lives, and after a restart it lives
+nowhere until the GUI gives it back.
