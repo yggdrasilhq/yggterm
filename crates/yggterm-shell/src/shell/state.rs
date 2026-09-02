@@ -55214,18 +55214,25 @@ fn enrich_sidebar_rows_with_live_titles(
             continue;
         }
         if let Some(cwd) = session_cwd
-            && let Some(title) = humanized_title_for_copy_target(&CopyGenerationTarget {
-                session_path: session.session_path.clone(),
-                session_id: session.id.clone(),
-                cwd,
-                title: session.title.clone(),
-                source_updated_at: None,
-                remote_context: None,
-                remote_machine: None,
-                cached_summary: None,
-                storage_path: None,
-            })
+            && let Some(title) = humanized_terminal_title(
+                session.kind,
+                &cwd,
+                Some(&session.host_label),
+            )
+            .or_else(|| (!cwd.trim().is_empty()).then(|| cwd.clone()))
         {
+            // ⛔ THE KIND-AWARE FALLBACK (owner SSOT law, 2026-09-02): when the
+            // direct title is low-signal, the fallback is composed for the
+            // row's KIND — a birth title for agents (`New {machine} {CLI}`),
+            // the directory composition for shells. This slot used to call the
+            // shell-only humanizer, which for an agent row in ~/gh/yggterm
+            // composed "Yggterm Shell", read it as the placeholder it is, and
+            // inserted NOTHING — so the stale lie the row already carried
+            // survived every frame (measured live: "Yggterm OpenCode" on the
+            // owner's sidebar through three restarts). ⚠ The birth title reads
+            // as a generated fallback to the detector — deliberately: it must
+            // never BLOCK title generation — but in this slot it IS the
+            // answer, so no filter here.
             title_by_path.insert(session.session_path.clone(), title);
         }
     }
