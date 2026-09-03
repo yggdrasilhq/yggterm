@@ -3,6 +3,7 @@
 This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
+- **A crashed window can no longer leave a graveyard of ghost system scopes behind, and the launch path can no longer be killed by its own error messages.** Every launch puts the GUI in its own `yggterm-gui-<pid>.scope`, and a scope whose processes are all gone can stay registered as active for weeks (measured: 14 empty scopes, one from months ago) — every launch now sweeps the dead ones. And the notes the launch path leaves when it falls back to starting unbounded went through `eprintln!`, which panics on a dead stderr pipe — the same broken-pipe class that killed windows overnight (2026-09-04) — so those notes now go through a writer that cannot panic.
 ## Unreleased
 
 - **A slow or struggling daemon no longer freezes the keys you are typing into a recovering terminal.** When a remote terminal surface looks blank or disconnected, the GUI runs a short recovery dance - it asks the daemon for the terminal snapshot and, if needed, rebuilds the session. Those questions used to be asked from the middle of the terminal event loop, so every keystroke queued behind a full daemon round trip: measured holds of 1.4 s on remote agent rows, exactly when the daemon was least able to answer fast. All five recovery round trips now run as background work with their results applied on their own loop branch - same checks, same order, same traces, nothing waiting on the typing path.

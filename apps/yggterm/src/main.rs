@@ -3422,8 +3422,123 @@ fn memory_scope_preflight_args(policy: MemoryScopePolicy, unit: &str) -> Vec<Str
 /// ⇒ Returns the outcome instead of swallowing it, because an unbounded GUI that
 /// never says so is the failure that actually happened.
 #[cfg(target_os = "linux")]
+/// A pipe-safe birth-path note. std's `eprintln!` PANICS on a broken pipe,
+/// and the birth process's stderr is whatever the spawner handed it — often a
+/// pipe whose reader is already gone (measured 2026-09-04: GUI deaths from
+/// exactly this class, one in a gtk callback, one on the title-generation
+/// tracing path). A fallback note must cost bytes, never the launch.
+fn scope_note(message: &str) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(message.as_bytes());
+    let _ = stderr.write_all(b"\n");
+}
+
+/// One `yggterm-gui-<pid>.scope` per launch, and a scope whose processes are
+/// all gone can stay registered as ACTIVE for weeks (measured 2026-09-04: 14
+/// empty scopes on the gui host, one from the 3.2.43 era — none holding a
+/// process, pure unit-registry litter). Sweep them at birth: a scope systemd
+/// still calls active whose cgroup holds no live process is stopped. Cheap,
+/// self-healing — every launch cleans the graveyard the last crash left.
+/// Every failure is ignored: the sweep must never delay or block a launch.
+fn gc_stale_gui_scopes() {
+    let Ok(listing) = Command::new("systemctl")
+        .args(["--user", "list-units", "yggterm-gui-*.scope", "--no-legend", "--all"])
+        .output()
+    else {
+        return;
+    };
+    if !listing.status.success() {
+        return;
+    }
+    let own_unit = format!("yggterm-gui-{}.scope", std::process::id());
+    for unit in parse_gui_scope_units(&String::from_utf8_lossy(&listing.stdout)) {
+        if unit == own_unit {
+            continue;
+        }
+        let (Ok(state_out), Ok(cg_out)) = (
+            Command::new("systemctl")
+                .args(["--user", "show", &unit, "--value", "-p", "ActiveState"])
+                .output(),
+            Command::new("systemctl")
+                .args(["--user", "show", &unit, "--value", "-p", "ControlGroup"])
+                .output(),
+        ) else {
+            continue;
+        };
+        let state = String::from_utf8_lossy(&state_out.stdout).trim().to_string();
+        let cgroup = String::from_utf8_lossy(&cg_out.stdout).trim().to_string();
+        if !scope_is_stale(&state, &cgroup) {
+            continue;
+        }
+        let stopped = Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if stopped {
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "gui",
+                    "memory_scope",
+                    "gc_stale_scope",
+                    serde_json::json!({ "unit": unit }),
+                );
+            }
+        }
+    }
+}
+
+/// Parse `systemctl list-units --no-legend` rows into this app's scope unit
+/// names. State filtering is `scope_is_stale`'s job, not the parser's.
+fn parse_gui_scope_units(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|row| row.split_whitespace().next())
+        .filter(|unit| unit.starts_with("yggterm-gui-") && unit.ends_with(".scope"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Stale = systemd still calls the unit active AND its cgroup holds no live
+/// process. The pid in the unit NAME cannot be trusted (an exec can outlive
+/// the pid that named it); the cgroup cannot lie.
+fn scope_is_stale(active_state: &str, cgroup_path: &str) -> bool {
+    if active_state != "active" || cgroup_path.is_empty() {
+        return false;
+    }
+    let root = std::path::Path::new("/sys/fs/cgroup").join(cgroup_path.trim_start_matches('/'));
+    !cgroup_has_live_procs(&root, 0)
+}
+
+/// Any pid in this cgroup or — because the family arms child cgroups
+/// (`gui`/`web`/`helpers`) — any bounded-depth child of it?
+fn cgroup_has_live_procs(dir: &std::path::Path, depth: u8) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+        if !procs.trim().is_empty() {
+            return true;
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && cgroup_has_live_procs(&entry.path(), depth + 1)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
     use std::os::unix::process::CommandExt;
+
+    gc_stale_gui_scopes();
 
     // ⛔ DEFAULT ON. This shipped opt-in and therefore bounded nothing.
     //
@@ -3481,10 +3596,10 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
         if bounded {
             return MemoryScopeOutcome::Inherited { unit };
         }
-        eprintln!(
+        scope_note(&format!(
             "yggterm: the memory-scope marker is set but this process is in an unbounded \
              cgroup ({unit}); re-arming a private scope"
-        );
+        ));
         rearm_from = Some(unit);
         // Falls through to the re-exec below. If THAT fails, the Fallback
         // reasons below name the unit the GUI is being rescued from, so the
@@ -3511,14 +3626,14 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
                 exe.display()
             ),
         );
-        eprintln!("yggterm: {reason}; starting unbounded instead");
+        scope_note(&format!("yggterm: {reason}; starting unbounded instead"));
         return MemoryScopeOutcome::Fallback(reason);
     }
     let policy = memory_scope_policy(read_mem_total_kb());
     let pid = std::process::id();
     if let Err(reason) = memory_scope_preflight(policy, &format!("yggterm-gui-preflight-{pid}")) {
         let reason = with_rearm_context(rearm_from.as_deref(), reason);
-        eprintln!("yggterm: {reason}; starting unbounded instead");
+        scope_note(&format!("yggterm: {reason}; starting unbounded instead"));
         return MemoryScopeOutcome::Fallback(reason);
     }
     let forwarded: Vec<String> = std::env::args().skip(1).collect();
@@ -3530,9 +3645,9 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
         .exec();
     let reason = format!("exec of systemd-run failed after its probe succeeded ({error})");
     let reason = with_rearm_context(rearm_from.as_deref(), reason);
-    eprintln!(
+    scope_note(&format!(
         "yggterm: could not enter a private memory scope ({error}); starting unbounded instead"
-    );
+    ));
     MemoryScopeOutcome::Fallback(reason)
 }
 
@@ -4808,6 +4923,45 @@ mod tests {
     /// stale heading on a passing test is a signpost pointing the wrong way at
     /// exactly the moment someone is trusting it.
     #[test]
+    fn gui_scope_gc_parses_units_and_judges_staleness() {
+        use crate::{cgroup_has_live_procs, parse_gui_scope_units, scope_is_stale};
+        let rows = "yggterm-gui-1021017.scope loaded active running /home/user/.local/bin/yggterm\n\
+                    other.service loaded active running /bin/true\n\
+                    yggterm-gui-9.scope loaded failed failed\n";
+        assert_eq!(
+            parse_gui_scope_units(rows),
+            vec![
+                "yggterm-gui-1021017.scope".to_string(),
+                "yggterm-gui-9.scope".to_string(),
+            ],
+            "state filtering belongs to scope_is_stale, not the parser"
+        );
+        // Only ACTIVE scopes are candidates: failed/dead ones systemd reaps itself.
+        assert!(scope_is_stale("active", "/user.slice/app.slice/yggterm-gui-1.scope"));
+        assert!(!scope_is_stale("failed", "/user.slice/app.slice/yggterm-gui-1.scope"));
+        assert!(!scope_is_stale("active", ""), "no cgroup path, no verdict");
+        // A cgroup path that does not exist holds no process: stale.
+        assert!(scope_is_stale("active", "/no/such/cgroup-here"));
+    }
+
+    #[test]
+    fn cgroup_proc_scan_reads_the_tree_not_just_the_root() {
+        use crate::cgroup_has_live_procs;
+        let base = std::env::temp_dir().join(format!("ygg-scope-gc-test-{}", std::process::id()));
+        let nested = base.join("gui");
+        std::fs::create_dir_all(&nested).expect("temp cgroup tree");
+        std::fs::write(base.join("cgroup.procs"), "").expect("empty root");
+        std::fs::write(nested.join("cgroup.procs"), "4242\n").expect("live child");
+        assert!(
+            cgroup_has_live_procs(&base, 0),
+            "a pid in a CHILD cgroup (gui/web/helpers) keeps the scope alive"
+        );
+        std::fs::write(nested.join("cgroup.procs"), "").expect("drained child");
+        assert!(!cgroup_has_live_procs(&base, 0), "an empty tree is the stale scope");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn the_memory_scope_is_default_on_and_a_failure_to_enter_it_still_starts_the_gui() {
         // ⛔ SCAN THE PRODUCT HALF ONLY. `include_str!` pulls in this test too,
         // and the anchor string below appears in both. While the real signature
@@ -4858,10 +5012,12 @@ mod tests {
             "the re-executed child must be stamped, or it re-enters forever"
         );
         assert!(
-            body.contains(".exec()") && body.contains("eprintln!"),
+            body.contains(".exec()") && body.contains("scope_note("),
             "`exec` returns ONLY on failure, so there must be code AFTER it: \
              every way entering the scope can fail has to fall through and start \
-             the GUI unbounded rather than not at all"
+             the GUI unbounded rather than not at all — and the notes it leaves on \
+             those paths must be pipe-safe (a raw `eprintln!` panics on a dead \
+             stderr pipe, which inside a launch path is a crash on birth)"
         );
         assert!(
             !body.contains("expect(") && !body.contains("unwrap()"),
