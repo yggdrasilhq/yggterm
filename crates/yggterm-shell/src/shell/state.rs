@@ -36234,8 +36234,13 @@ fn spawn_title_generation_for_target(
                 }
                 Ok((title, None))
             } else {
-                let title = store.generate_title_for_session_path(
+                // Transcript RESCUE (Issue Heading 29): not codex-only any
+                // more — the registry gate decides, the target carries the
+                // identity the store key needs.
+                let title = store.generate_title_for_transcript(
                     &settings_for_task,
+                    &target_for_task.session_id,
+                    &target_for_task.cwd,
                     &target_for_task.session_path,
                     force,
                 )?;
@@ -36776,8 +36781,10 @@ fn spawn_summary_generation_for_target(
                 }
                 return Ok(summary);
             }
-            store.generate_summary_for_session_path(
+            store.generate_summary_for_transcript(
                 &settings_for_task,
+                &target_for_task.session_id,
+                &target_for_task.cwd,
                 &target_for_task.session_path,
                 effective_force,
             )

@@ -859,6 +859,64 @@ impl SessionStore {
         resolver.generate_for_session(settings, &identity.session_id, &identity.cwd, &path, force)
     }
 
+    /// The transcript RESCUE arm for every CLI (Issue Heading 29): the
+    /// codex-only *_for_session_path wrappers refused any transcript their
+    /// identity parse could not read, so muse/pi/grok/opencode/kimi rows
+    /// whose own store carries no usable title were never rescued (measured:
+    /// muse zero-content sessions hold "New session"/"hi", correctly filtered,
+    /// and then nothing rescues them). The caller -- the copy chore candidate
+    /// or the shell on-demand trigger -- already holds the session id and cwd;
+    /// the path only has to be a file some registered CLI store declares a
+    /// session transcript (see transcript_rescue_path). The transcript reader
+    /// under generate_for_session is already CLI-generic (CC read alongside
+    /// codex, locked by its own test).
+    pub fn generate_title_for_transcript(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        transcript_path: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        let Some(path) = Self::transcript_rescue_path(transcript_path) else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.generate_for_session(settings, session_id, cwd, &path, force)
+    }
+
+    /// The summary twin of generate_title_for_transcript: the background copy
+    /// chore generates both from the same source path, and the codex gate
+    /// silenced both for every non-codex CLI.
+    pub fn generate_summary_for_transcript(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        transcript_path: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        let Some(path) = Self::transcript_rescue_path(transcript_path) else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.generate_summary_for_session(settings, session_id, cwd, &path, force)
+    }
+
+    /// The gate both transcript-rescue arms share: the file must exist and a
+    /// REGISTERED CLI store must declare it a session transcript
+    /// (agent_cli_for_store_session_file) -- an arbitrary readable file is
+    /// never a rescue source, and a local:// row key (no transcript stamp)
+    /// fails exists the same quiet way the codex wrapper always has.
+    fn transcript_rescue_path(transcript_path: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(transcript_path);
+        if !path.exists() || agent_cli::agent_cli_for_store_session_file(transcript_path).is_none()
+        {
+            return None;
+        }
+        Some(path)
+    }
+
     pub fn generate_title_for_context(
         &self,
         settings: &AppSettings,
@@ -3600,6 +3658,83 @@ mod tests {
     }
 
     use super::*;
+
+    // The transcript RESCUE gate (Issue Heading 29): the codex-only wrappers
+    // refused every non-codex transcript, so the rescue (the designed last
+    // resort for TitleAuthority::Generated kinds) never fired for muse/pi/
+    // grok/opencode/kimi. The gate must accept exactly what the registry
+    // declares a session transcript -- every registered CLI -- and never an
+    // arbitrary readable file.
+    fn fixture_matching_glob(glob: &str) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        for seg in glob.split('/') {
+            if seg == "**" {
+                parts.push("a".to_string());
+                parts.push("b".to_string());
+            } else if seg.contains('{') || seg.contains(',') {
+                return None;
+            } else if seg.contains('*') {
+                let cleaned: String =
+                    seg.chars().filter(|c| *c != '*' && *c != '{').collect();
+                parts.push(if cleaned.is_empty() { "a".to_string() } else { cleaned });
+            } else {
+                parts.push(seg.to_string());
+            }
+        }
+        Some(format!("/home/u/{}", parts.join("/")))
+    }
+
+    #[test]
+    fn transcript_rescue_gate_accepts_a_declared_session_file_from_every_cli() {
+        // The gate demands a REAL file (the codex wrapper always has), so the
+        // registry-derived fixtures are materialized under a temp home.
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-rescue-gate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("temp home");
+        let mut covered = 0usize;
+        for descriptor in agent_cli::AGENT_CLIS {
+            let Some(glob) = descriptor.session_store_globs.first() else {
+                continue;
+            };
+            let Some(rel) = fixture_matching_glob(glob) else {
+                continue;
+            };
+            let path = home.join(rel.trim_start_matches('/'));
+            // Honesty guard: the fixture only counts if the registry itself
+            // declares it a session file (a wrong expansion proves nothing).
+            if !descriptor.store_path_is_session_file(path.to_str().unwrap()) {
+                continue;
+            }
+            std::fs::create_dir_all(path.parent().unwrap()).expect("fixture dirs");
+            std::fs::write(&path, b"session transcript bytes").expect("fixture file");
+            assert!(
+                super::SessionStore::transcript_rescue_path(path.to_str().unwrap()).is_some(),
+                "the rescue gate must accept the path ({})",
+                descriptor.slug,
+            );
+            covered += 1;
+        }
+        assert!(
+            covered >= 6,
+            "the gate must cover the CLIs of the fleet"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn transcript_rescue_gate_refuses_a_file_no_store_declares() {
+        let stranger = std::env::temp_dir().join("yggterm-rescue-gate-stranger.jsonl");
+        std::fs::write(&stranger, b"session transcript bytes").expect("write fixture");
+        assert!(
+            super::SessionStore::transcript_rescue_path(stranger.to_str().unwrap()).is_none(),
+            "an existing file under no CLI store is never a rescue source"
+        );
+        let _ = std::fs::remove_file(&stranger);
+        // And the historic quiet case: a row key (local://...) is not a file.
+        assert!(super::SessionStore::transcript_rescue_path("local://bb8c8317").is_none());
+    }
 
     #[test]
     fn antigravity_title_reading_and_rename_round_trip() {
