@@ -1004,6 +1004,16 @@ profile → the surface's `WebContext` is rebuilt, per host-owned profiles). Thi
 also fixes the old no-arg case: ychrome no longer emits `about:blank`, which
 `web_surface_url_scheme_allowed` rejects (only http/https pass).
 
+The daemon RETAINS the `pick` record (under the `web-surface` verb, like an
+`open`), and the GUI's retained-declare rebuild mounts the same native picker
+for it. This is the swap-survival half of the contract: a daemon takeover
+relaunches the row's app, the app sits AT the chooser, and its one live `pick`
+can fly past during the client's reconnect window — with nothing retained, the
+row stayed a bare terminal hiding a running picker (measured 2026-09-04: the
+ychrome row's web surface went stale at the swap and no recovery arm ever
+fired). The post-choice `open` replaces the retained record and a `close`
+still clears it, so a stale pick can never outlive the app's own progression.
+
 ### Profile metadata: `web-profiles/<name>/profile.json`
 
 A profile's jar carries an optional sidecar, `profile.json`. Its ONE owner is

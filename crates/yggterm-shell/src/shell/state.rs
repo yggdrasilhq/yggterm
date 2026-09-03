@@ -16522,10 +16522,58 @@ mod web_ensure_policy_gate_locks {
              and signer bridge:\n{preamble}"
         );
     }
+
+    /// The picker survives the swap: the rebuild fn must route a retained
+    /// `pick` record through the NATIVE picker upsert (the same surface the
+    /// live OSC arm mounts), never through the full browsing-surface
+    /// materializer, and never by falling through to the open path.
+    /// Measured 2026-09-04 (GUI host): with retention ignoring pick, a daemon
+    /// swap left a no-arg ychrome row a bare terminal with a hidden picker
+    /// for 20+ minutes — the restore poll could not see the row's true state.
+    #[test]
+    fn the_rebuild_arm_mounts_a_retained_pick_as_the_native_picker() {
+        let source = SHELL_SOURCE;
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        let start = product
+            .iter()
+            .position(|line| line.trim() == "async fn rebuild_web_surface_from_daemon_declare(")
+            .expect("the rebuild fn moved — move this lock with it");
+        let end = product[start..]
+            .iter()
+            .position(|line| line.trim() == "async fn materialize_declared_web_surface(")
+            .map(|offset| start + offset)
+            .expect("the rebuild fn's end marker moved");
+        let body = product[start..end].join("\n");
+        let pick = body
+            .find("if record.action == \"pick\" {")
+            .expect("the rebuild fn no longer arms a picker rebuild for a retained pick");
+        let picker = body[pick..]
+            .find("upsert_web_surface_picker(")
+            .map(|offset| pick + offset)
+            .expect("the picker rebuild arm moved — it must upsert the native picker");
+        assert!(
+            body[pick..picker].contains("resolve_control_endpoint_url("),
+            "the picker rebuild must resolve the control endpoint through the \
+             same egress the live OSC arm uses"
+        );
+        let open_path = body[pick..]
+            .find("materialize_declared_web_surface(")
+            .map(|offset| pick + offset)
+            .expect("the rebuild fn lost its open path");
+        assert!(
+            open_path > picker,
+            "the picker arm must return before the open path — falling through \
+             would mount a browsing surface for a row whose app is still asking \
+             for a profile choice"
+        );
+    }
 }
 
 async fn rebuild_web_surface_from_daemon_declare(
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
     trace_home: PathBuf,
     session_path: &str,
 ) -> DeclareRebuild {
@@ -16600,6 +16648,45 @@ async fn rebuild_web_surface_from_daemon_declare(
         claimed_session,
     } = open;
     let ssh_target = state.with(|shell| shell.web_surface_session_ssh_target(session_path));
+    if record.action == "pick" {
+        // THE PICKER REBUILD: a retained pick is the row's launch intent —
+        // the app is sitting at its chooser waiting for a human choice.
+        // Measured 2026-09-04 (GUI host): a daemon swap relaunched a no-arg
+        // ychrome row, its live pick flew past during the reconnect window,
+        // and while retention ignored pick the restore poll could never see
+        // it — the row stayed a bare terminal with a hidden picker for 20+
+        // minutes (web-surface liveness stale from 01:25:45, no recovery
+        // arm fired). Mount the SAME native picker the live OSC arm mounts
+        // — no page, no tabs — so the user's own choice lands in the app's
+        // real flow. The post-choice open replaces the retained record, so
+        // this arm cannot resurrect a picker the app already moved past.
+        let resolve_url = url.clone();
+        let resolve_target = ssh_target.clone();
+        let (effective_control, forward_child) = task::spawn_blocking(move || {
+            resolve_control_endpoint_url(&resolve_url, resolve_target.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| (url.clone(), None));
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "web_surface",
+            "daemon_declare_picker_rebuild",
+            json!({
+                "session_path": session_path,
+                "control_url": url,
+                "effective_control": effective_control,
+                "forwarded": forward_child.is_some(),
+                "declared_at_ms": record.at_ms,
+                "declare_seq": record.seq,
+            }),
+        );
+        state.with_mut_counted(|shell| {
+            shell
+                .upsert_web_surface_picker(session_path, effective_control, forward_child, now_ms);
+        });
+        return DeclareRebuild::Rebuilt;
+    }
     append_trace_event(
         &trace_home,
         "ui",
