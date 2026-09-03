@@ -6473,6 +6473,15 @@ fn TerminalCanvas(
             let mut last_window_focused_for_read =
                 state.with(|shell| shell.effective_window_focused());
             let mut terminal_write_bridge = TerminalWriteBridge::new(terminal_write_frame_ms());
+            // THE REVEAL COVER (the ghost-frame family's paint-hold): armed at
+            // every repaint-nudge emit, it holds the live PTY bytes for one
+            // reveal window so a fullscreen TUI's position-addressed repaint
+            // lands on the canvas WHOLE — never as fragments over the curing
+            // canvas (the mid-cure composite, [11.5]'s second reading).
+            // Released by the TUI's full frame (screen-area of bytes), by the
+            // deadline through `off_loop_rpc_rx`, or superseded by a newer
+            // arm. Disarmed everywhere else: the keystroke path is untouched.
+            let mut reveal_cover = crate::reveal_cover::RevealCoverGate::new();
             let mut unfocused_tui_drop_active = false;
             let mut eval_result = Box::pin(eval.clone().join::<Value>());
             loop {
@@ -10415,6 +10424,39 @@ fn TerminalCanvas(
                                 }
                                 if is_remote_resume_session && !startup_resize_repair_scheduled {
                                     startup_resize_repair_scheduled = true;
+                                    // THE REVEAL COVER arms with the startup
+                                    // repair's repaint: same mid-cure hazard,
+                                    // same hold-until-full-frame remedy.
+                                    let cover_generation = reveal_cover.arm(
+                                        current_millis(),
+                                        cols,
+                                        rows,
+                                    );
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "reveal_cover_held",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "source": "startup_resize_repair",
+                                            "generation": cover_generation,
+                                            "cols": cols,
+                                            "rows": rows,
+                                        }),
+                                    );
+                                    let cover_tx = off_loop_rpc_tx.clone();
+                                    task::spawn(async move {
+                                        sleep(Duration::from_millis(
+                                            crate::reveal_cover::REVEAL_COVER_DEADLINE_MS,
+                                        ))
+                                        .await;
+                                        let _ = cover_tx.send(
+                                            OffLoopTerminalRpcResult::RevealCoverRelease {
+                                                generation: cover_generation,
+                                            },
+                                        );
+                                    });
                                     spawn_terminal_startup_resize_repair(
                                         endpoint.clone(),
                                         runtime_session_path.clone(),
@@ -10498,6 +10540,36 @@ fn TerminalCanvas(
                                         "error": error,
                                     }),
                                 );
+                            }
+                            OffLoopTerminalRpcResult::RevealCoverRelease { generation } => {
+                                let _loop_branch = TerminalLoopBranchGuard::new(
+                                    "reveal_cover_deadline",
+                                    &session_path,
+                                );
+                                // The TUI never painted its full frame within
+                                // the deadline (slow remote, non-repainting
+                                // app): flush whatever the hold buffered so
+                                // the reveal is late, never lost. A stale
+                                // generation is ignored — a newer hold owns
+                                // the canvas now.
+                                if reveal_cover.release_if_gen(generation, current_millis()) {
+                                    let flushed = reveal_cover.take_flush();
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "reveal_cover_released",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "reason": "deadline",
+                                            "generation": generation,
+                                            "bytes": flushed.len(),
+                                        }),
+                                    );
+                                    if !flushed.is_empty() {
+                                        let _ = eval.send(TerminalJsCommand::Write { data: flushed });
+                                    }
+                                }
                             }
                         }
                     }
@@ -10874,6 +10946,40 @@ fn TerminalCanvas(
                                         current_terminal_cols,
                                         current_terminal_rows,
                                     ) {
+                                        // THE REVEAL COVER arms with the squish
+                                        // resync: the TUI's post-bounce repaint
+                                        // must land whole over the resynced
+                                        // canvas ([11.34] family).
+                                        let cover_generation = reveal_cover.arm(
+                                            current_millis(),
+                                            current_terminal_cols,
+                                            current_terminal_rows,
+                                        );
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "reveal_cover_held",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "source": "cursor_rewound_geometry_resync",
+                                                "generation": cover_generation,
+                                                "cols": current_terminal_cols,
+                                                "rows": current_terminal_rows,
+                                            }),
+                                        );
+                                        let cover_tx = off_loop_rpc_tx.clone();
+                                        task::spawn(async move {
+                                            sleep(Duration::from_millis(
+                                                crate::reveal_cover::REVEAL_COVER_DEADLINE_MS,
+                                            ))
+                                            .await;
+                                            let _ = cover_tx.send(
+                                                OffLoopTerminalRpcResult::RevealCoverRelease {
+                                                    generation: cover_generation,
+                                                },
+                                            );
+                                        });
                                         spawn_terminal_startup_resize_repair(
                                             endpoint.clone(),
                                             runtime_session_path.clone(),
@@ -11804,6 +11910,44 @@ fn TerminalCanvas(
                                                 let _ = eval.send(terminal_reset_command(&title, &theme));
                                                 placeholder_rendered = false;
                                             }
+                                            // THE REVEAL COVER, write gate: while
+                                            // a nudge-armed hold is up, live bytes
+                                            // buffer instead of painting — the
+                                            // TUI's post-SIGWINCH repaint reaches
+                                            // the canvas WHOLE, never as
+                                            // addressed fragments over the curing
+                                            // canvas. Bookkeeping below (replay
+                                            // buffers, samples) is untouched: the
+                                            // hold changes only WHAT PAINTS.
+                                            if reveal_cover.is_holding() {
+                                                let released =
+                                                    reveal_cover.hold(&data, current_millis());
+                                                if released {
+                                                    let reason = if reveal_cover.full_frame_ready()
+                                                    {
+                                                        "full_frame"
+                                                    } else {
+                                                        "deadline"
+                                                    };
+                                                    let flushed = reveal_cover.take_flush();
+                                                    append_trace_event(
+                                                        &trace_home,
+                                                        "ui",
+                                                        "terminal_mount",
+                                                        "reveal_cover_released",
+                                                        json!({
+                                                            "session_path": session_path.clone(),
+                                                            "reason": reason,
+                                                            "bytes": flushed.len(),
+                                                        }),
+                                                    );
+                                                    if !flushed.is_empty() {
+                                                        let _ = eval.send(TerminalJsCommand::Write {
+                                                            data: flushed,
+                                                        });
+                                                    }
+                                                }
+                                            } else {
                                             for write in terminal_write_bridge.stage_or_immediate(
                                                 data.clone(),
                                                 current_millis(),
@@ -11837,6 +11981,7 @@ fn TerminalCanvas(
                                                         &mut last_write_send_failure_trace_ms,
                                                     );
                                                 }
+                                            }
                                             }
                                             set_signal_if_changed(
                                                 terminal_resume_surface_staged,
@@ -11939,12 +12084,53 @@ fn TerminalCanvas(
                                                         }),
                                                     );
                                                 }
+                                                // THE REVEAL COVER, frame-budgeted
+                                                // write gate: while a nudge-armed
+                                                // hold is up, the repaint bytes
+                                                // buffer into the cover instead of
+                                                // painting; the release flush rides
+                                                // this same write loop.
+                                                let mut bridge_writes: Vec<String> =
+                                                    if reveal_cover.is_holding() {
+                                                        let mut staged: Vec<String> = Vec::new();
+                                                        let released = reveal_cover.hold(
+                                                            &data_to_write,
+                                                            current_millis(),
+                                                        );
+                                                        if released {
+                                                            let reason =
+                                                                if reveal_cover.full_frame_ready() {
+                                                                    "full_frame"
+                                                                } else {
+                                                                    "deadline"
+                                                                };
+                                                            let flushed =
+                                                                reveal_cover.take_flush();
+                                                            append_trace_event(
+                                                                &trace_home,
+                                                                "ui",
+                                                                "terminal_mount",
+                                                                "reveal_cover_released",
+                                                                json!({
+                                                                    "session_path": session_path.clone(),
+                                                                    "reason": reason,
+                                                                    "bytes": flushed.len(),
+                                                                }),
+                                                            );
+                                                            if !flushed.is_empty() {
+                                                                staged.push(flushed);
+                                                            }
+                                                        }
+                                                        staged
+                                                    } else {
+                                                        terminal_write_bridge.stage_or_immediate(
+                                                            data_to_write,
+                                                            current_millis(),
+                                                            throttle_bridge_output,
+                                                        )
+                                                    };
                                                 for write in
-                                                    terminal_write_bridge.stage_or_immediate(
-                                                        data_to_write,
-                                                        current_millis(),
-                                                        throttle_bridge_output,
-                                                    )
+                                                    bridge_writes.drain(..)
                                                 {
                                                     record_terminal_forward_sample(
                                                         &trace_home,
@@ -12353,6 +12539,45 @@ fn TerminalCanvas(
                                     // attach (the latch above); shadows never
                                     // ask (D8: no SIGWINCH from a viewer).
                                     if !client_is_shadow_viewer() {
+                                        // THE REVEAL COVER arms here: from this
+                                        // nudge until the TUI's first full
+                                        // post-nudge frame (or the deadline),
+                                        // live bytes buffer instead of painting
+                                        // — the addressed repaint lands WHOLE,
+                                        // never as fragments over the curing
+                                        // canvas (the mid-cure composite,
+                                        // [11.5] second reading / [11.39]'s
+                                        // own path).
+                                        let cover_generation = reveal_cover.arm(
+                                            current_millis(),
+                                            current_terminal_cols,
+                                            current_terminal_rows,
+                                        );
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "reveal_cover_held",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "source": "post_attach_redraw_nudge",
+                                                "generation": cover_generation,
+                                                "cols": current_terminal_cols,
+                                                "rows": current_terminal_rows,
+                                            }),
+                                        );
+                                        let cover_tx = off_loop_rpc_tx.clone();
+                                        task::spawn(async move {
+                                            sleep(Duration::from_millis(
+                                                crate::reveal_cover::REVEAL_COVER_DEADLINE_MS,
+                                            ))
+                                            .await;
+                                            let _ = cover_tx.send(
+                                                OffLoopTerminalRpcResult::RevealCoverRelease {
+                                                    generation: cover_generation,
+                                                },
+                                            );
+                                        });
                                         let repaint_endpoint = endpoint.clone();
                                         let repaint_path = session_path.clone();
                                         let repaint_cols = current_terminal_cols;
@@ -16396,6 +16621,11 @@ enum OffLoopTerminalRpcResult {
     FrameHashFailed {
         error: String,
     },
+    /// The reveal cover's deadline fired: flush whatever the hold still
+    /// buffers, unless a newer arm superseded this generation. The full-frame
+    /// release path runs inline at the write gate; only the deadline needs
+    /// the channel (a silent TUI produces no writes to evaluate it on).
+    RevealCoverRelease { generation: u64 },
 }
 
 /// Records how long ONE `tokio::select!` branch body held the terminal event

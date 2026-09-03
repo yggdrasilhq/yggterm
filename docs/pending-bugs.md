@@ -5533,15 +5533,21 @@ frame settles — the mid-cure window is the defect, not the cure.** File this
 as the pixel-paint-cache remedy: a snapshotted last-good frame held as the
 cover, released on repaint-ack.
 **AUDIT 2026-09-04 (lane/trace/determinism-audit):** verified the
-paint-hold/pixel-paint-cache remedy is still NOT implemented — no cover
-state exists on the reveal or nudge path (grep across `yggterm-shell`:
-the only "cover" hits are unrelated). Implementation site when someone
-takes it: the `resize_repaint_nudge` emit and the paint-boundary
-hardening (`strip_leading_partial_escape_sequence`) in
-`crates/yggterm-shell/src/shell/viewport.rs` — hold at nudge emit,
-release on the first full post-nudge frame (or paint ack). Until then
-the mid-cure composite window stays open on every idle fullscreen TUI
-reveal. And the `[11.44]` mouse sibling is closed in
+paint-hold/pixel-paint-cache remedy was still NOT implemented — no cover
+state existed on the reveal or nudge path.
+**LANDED SAME DAY (lane/trace/ghost-frame-cover):** the remedy is built as
+the reveal cover — `crates/yggterm-shell/src/reveal_cover.rs` holds live
+bytes from each repaint-nudge emit (post-attach nudge, startup resize
+repair, cursor-rewound squish resync) and releases on the TUI's first
+full frame (screen-area of held bytes) or a 1 s deadline (flush, never
+drop); deadline releases ride the existing off-loop channel, so the
+keystroke path is never held behind an await. Traces:
+`reveal_cover_held` / `reveal_cover_released {reason, bytes}`. Locked by
+the `reveal_cover` gate tests (fragments held, full frame releases,
+deadline releases, stale generation ignored, rearm clears). Falsifier
+still owed live: switch into an idle fullscreen TUI and confirm the
+first post-nudge paint is the TUI's full frame with no
+`reveal_cover_released reason=deadline` dominating. And the `[11.44]` mouse sibling is closed in
 the same window (buffer-kind seed, `c133cd699`, live on 3.2.42: `xterm_buffer_
 kind` now reports per host).
 
@@ -26388,6 +26394,15 @@ dropped them (check the row's `terminal_io/dispatch` forward path and
 let the brave url through for a picker surface — read that clause's actual
 runtime values on a repro). The replay-rebuild proves the guarded rebuild
 path itself works.
+
+**ADJACENT FIX LANDED while this entry was open:** `lane/trace/picker-survives-swap`
+(in 3.2.52) fixed the DAEMON-SWAP half of the picker-stuck family — the one-time
+OSC `pick` was treated as not-worth-keeping, so a takeover relaunch could fly it
+past the reconnect window and the row fell back to a bare terminal view. That
+fix retains the pick in daemon web-surface state. THIS entry remains open on
+its own halves: the dead-loopback-URL staleness (no liveness coupling) and the
+~12-minute OSC/declare divergence — neither is touched by the pick-retention
+fix.
 
 **Related ychrome-side findings (routed to the ychrome owner via board):** the
 ychrome host daemon self-reports `"stale": true` (its own self-staleness stamp

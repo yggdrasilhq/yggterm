@@ -39,6 +39,7 @@ mod terminal_observe;
 mod terminal_protocol;
 mod terminal_retained_replay_policy;
 mod terminal_themes;
+mod reveal_cover;
 mod terminal_write_bridge;
 mod terminal_write_policy;
 mod theme_contract;
