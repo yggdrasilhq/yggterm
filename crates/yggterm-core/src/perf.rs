@@ -98,12 +98,26 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
         // mount wheel handler's own decision with the gate's inputs —
         // transition-only per mount, so a wheel that scrolls scrollback on a
         // fullscreen TUI arrives with the closed rail visible).
+        //
+        // Issue 31 (live CLI probes): `mirror_tick` (the opencode mirror's
+        // per-interesting-tick identity decision — anchor, viewing, bound,
+        // verdict), `launch_contract` (a composed launch that degrades from
+        // the descriptor-declared shape, with the refusing rail named),
+        // `working_edge` (the daemon working-verdict transitions per row with
+        // both sub-signals, so the blinking dot is attributable),
+        // `daemon/idle_gate_eval` (a swap deferral with the pinning blocker
+        // classes — the end of "why hasn't the new build taken over" as a
+        // guessing game).
         for probe in [
             "cli/codex_geometry",
             "cli/resume_decision",
             "cli/scan",
             "cli/scan_total",
             "cli/wheel_gate",
+            "cli/mirror_tick",
+            "cli/launch_contract",
+            "cli/working_edge",
+            "daemon/idle_gate_eval",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }
