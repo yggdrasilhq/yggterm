@@ -3083,11 +3083,27 @@ fn DocumentSurfaceBody(
         }
     };
 
-    let layer_style = format!(
-        "position:absolute; inset:0; z-index:20; display:flex; flex-direction:column; \
-         min-width:0; min-height:0; overflow:hidden; background:{}; color:{}; border-radius:11px;",
+    // Outer column: transparent, so the ribbon sits on the shell's own
+    // background (seamless with startpage) and the card starts below it.
+    // The card keeps the old layer look; only its positioning changed
+    // from absolute-fill to flex-fill inside this column.
+    let layer_style = "position:absolute; inset:0; z-index:20; display:flex; \
+         flex-direction:column; min-width:0; min-height:0; overflow:hidden; \
+         background:transparent;";
+    let card_style = format!(
+        "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; \
+         min-width:0; overflow:hidden; background:{}; color:{}; border-radius:11px;",
         doc.bg, doc.fg
     );
+    let ribbon_style = "display:flex; align-items:center; gap:10px; flex-wrap:wrap; \
+         padding:2px 14px 8px; flex:0 0 auto;";
+    // The ribbon: toolbar strip above the card. Subset vocabulary
+    // (AppPaneSchema::ribbon) — label/toolbar/button; the body keeps
+    // everything else.
+    let ribbon_widgets: Vec<AppPaneWidget> = schema
+        .as_ref()
+        .map(|schema| schema.ribbon.iter().cloned().collect())
+        .unwrap_or_default();
     let bar_style = format!(
         "display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:7px 14px; \
          border-bottom:1px solid {}; background:{}; flex:0 0 auto;",
@@ -3196,122 +3212,28 @@ fn DocumentSurfaceBody(
                     }
                 }
             },
-            if has_bar {
+            // The ribbon lives OUTSIDE the card: app toolbar strip on
+            // shell background, viewport below. Buttons POST on the same
+            // document channel as the bar's.
+            if !ribbon_widgets.is_empty() {
                 div {
-                    style: "{bar_style}",
-                    for (index, widget) in bar_widgets.iter().enumerate() {
+                    "data-document-ribbon": "{pane_id}",
+                    style: "{ribbon_style}",
+                    for (index, widget) in ribbon_widgets.iter().enumerate() {
                         {
                             let widget_key = widget.key(index, &value_epochs);
                             match widget {
-                                AppPaneWidget::Section { text, .. } | AppPaneWidget::Label { text, muted: _ } => rsx! {
+                                AppPaneWidget::Section { text, .. } | AppPaneWidget::Label { text, .. } => rsx! {
                                     span {
                                         key: "{widget_key}",
-                                        style: if matches!(widget, AppPaneWidget::Section { .. }) { bar_title_style.clone() } else { bar_label_style.clone() },
+                                        style: "{bar_title_style}",
                                         "{text}"
                                     }
                                 },
-                                AppPaneWidget::Tabs { id, action, tabs, active } => rsx! {
-                                    div {
-                                        key: "{widget_key}",
-                                        style: "display:flex; gap:4px; flex-wrap:wrap; min-width:0;",
-                                        for tab in tabs.iter().cloned() {
-                                            button {
-                                                key: "{id}-{tab.id}",
-                                                style: if tab.id == *active { bar_button_primary_style.clone() } else { bar_button_style.clone() },
-                                                title: "{tab.label}",
-                                                onclick: {
-                                                    let run_action = run_action.clone();
-                                                    let action = action.clone();
-                                                    let tab_id = tab.id.clone();
-                                                    move |_| run_action(action.clone(), Some(tab_id.clone()))
-                                                },
-                                                "{tab.label}"
-                                            }
-                                        }
-                                    }
-                                },
-                                AppPaneWidget::Toggle { id: _, label, action, value } => rsx! {
-                                    button {
-                                        key: "{widget_key}",
-                                        style: if *value { bar_button_primary_style.clone() } else { bar_button_style.clone() },
-                                        onclick: {
-                                            let run_action = run_action.clone();
-                                            let action = action.clone();
-                                            let next = (!*value).to_string();
-                                            move |_| run_action(action.clone(), Some(next.clone()))
-                                        },
-                                        "{label}"
-                                    }
-                                },
-                                AppPaneWidget::Button { id, label, action, primary, title, .. } => rsx! {
-                                    button {
-                                        key: "{widget_key}",
-                                        "data-document-button": "{id}",
-                                        title: "{title}",
-                                        style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
-                                        onclick: {
-                                            let run_action = run_action.clone();
-                                            let action = action.clone();
-                                            move |_| run_action(action.clone(), None)
-                                        },
-                                        {shell_glyph(label, 13)}
-                                    }
-                                },
-                                // A SEARCH BOX IS A TEXT INPUT HERE, and it has to
-                                // be, because a widget this placement does not
-                                // match is dropped in SILENCE — no error, no
-                                // fallback, nothing in the app's transcript. The
-                                // rail rendered `search-box` and the document
-                                // surface did not, so yRDP's chooser had a filter
-                                // in the rail and none in the viewport; the moment
-                                // the rail went away the filter went with it, and
-                                // the app had no way to find that out.
-                                AppPaneWidget::TextInput { id, placeholder, value, action, .. }
-                                | AppPaneWidget::SearchBox { id, placeholder, value, action } => rsx! {
-                                    input {
-                                        key: "{widget_key}",
-                                        "data-document-input": "{id}",
-                                        style: format!(
-                                            "padding:4px 10px; border:1px solid {}; border-radius:7px; \
-                                             background:{}; color:{}; font-size:11px; outline:none; \
-                                             min-width:200px; flex:0 1 340px;",
-                                            doc.border, doc.bg, doc.fg
-                                        ),
-                                        placeholder: "{placeholder}",
-                                        initial_value: "{value}",
-                                        oninput: {
-                                            let mut state = state;
-                                            let id = id.clone();
-                                            let session_path = session_path.clone();
-                                            move |evt: FormEvent| {
-                                                state.with_mut_counted(|shell| {
-                                                    shell.set_document_pane_value(
-                                                        &session_path,
-                                                        &id,
-                                                        evt.value(),
-                                                    );
-                                                });
-                                            }
-                                        },
-                                        onkeydown: {
-                                            let run_action = run_action.clone();
-                                            let action = action.clone();
-                                            move |evt: KeyboardEvent| {
-                                                if evt.key() == Key::Enter && !action.is_empty() {
-                                                    run_action(action.clone(), None);
-                                                }
-                                            }
-                                        },
-                                    }
-                                },
-                                // Several buttons the app groups together. The bar
-                                // is already a row, so a toolbar is its buttons
-                                // wearing the bar's own skin rather than a second
-                                // container inside it.
                                 AppPaneWidget::Toolbar { id, buttons } => rsx! {
                                     div {
                                         key: "{widget_key}",
-                                        "data-document-toolbar": "{id}",
+                                        "data-document-ribbon-toolbar": "{id}",
                                         style: "display:flex; align-items:center; gap:6px; flex-wrap:wrap;",
                                         for toolbar_button in buttons.iter().cloned() {
                                             button {
@@ -3328,255 +3250,119 @@ fn DocumentSurfaceBody(
                                                     let action = toolbar_button.action.clone();
                                                     move |_| run_action(action.clone(), None)
                                                 },
-                                                "{toolbar_button.label}"
+                                                {shell_glyph(&toolbar_button.label, 13)}
                                             }
                                         }
                                     }
                                 },
-                                AppPaneWidget::NumberInput { id, label, value, min, max } => rsx! {
-                                    div {
+                                AppPaneWidget::Button { id, label, action, primary, title, .. } => rsx! {
+                                    button {
                                         key: "{widget_key}",
-                                        style: "display:flex; align-items:center; gap:6px;",
-                                        if !label.is_empty() {
-                                            span { style: "{bar_label_style}", "{label}" }
-                                        }
-                                        input {
-                                            "data-document-input": "{id}",
-                                            style: format!(
-                                                "padding:4px 8px; border:1px solid {}; border-radius:7px; \
-                                                 background:{}; color:{}; font-size:11px; outline:none; \
-                                                 max-width:88px;",
-                                                doc.border, doc.bg, doc.fg
-                                            ),
-                                            r#type: "number",
-                                            min: "{min}",
-                                            max: "{max}",
-                                            initial_value: "{value}",
-                                            oninput: {
-                                                let mut state = state;
-                                                let id = id.clone();
-                                                let session_path = session_path.clone();
-                                                move |evt: FormEvent| {
-                                                    state.with_mut_counted(|shell| {
-                                                        shell.set_document_pane_value(
-                                                            &session_path,
-                                                            &id,
-                                                            evt.value(),
-                                                        );
-                                                    });
-                                                }
-                                            },
-                                        }
+                                        "data-document-button": "{id}",
+                                        title: "{title}",
+                                        style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                        onclick: {
+                                            let run_action = run_action.clone();
+                                            let action = action.clone();
+                                            move |_| run_action(action.clone(), None)
+                                        },
+                                        {shell_glyph(label, 13)}
                                     }
                                 },
-                                // ⛔ The silent drop. Everything a document surface
-                                // can be handed is matched ABOVE — locked by
-                                // `every_app_pane_widget_reaches_the_document_surface`
-                                // — so this arm exists for the variant somebody
-                                // adds next, and it is the reason that lock has to
-                                // be structural: an unmatched widget renders as an
-                                // empty span, which looks exactly like an app that
-                                // never declared it.
+                                // Ribbon subset is label/toolbar/button; anything
+                                // else is the same empty span an unmatched bar
+                                // widget renders — never a hole in the strip.
                                 _ => rsx! { span { key: "{widget_key}" } },
                             }
                         }
                     }
-                    div { style: "flex:1 1 auto;" }
-                    // ⛔ The Document|Terminal switch does NOT live here. It is
-                    // the titlebar's surface-switch slot
-                    // (`TitlebarSurfaceSwitch`), which is where every other
-                    // "what is this viewport showing" switch already lived.
-                    // A copy here floated over the editor on a pure-body
-                    // document — the surface reserves no space for chrome, so
-                    // the pill drew straight over the first line of the text.
-                }
-            }
-            if let Some(error) = error {
-                div {
-                    style: format!("padding:10px 16px; color:{}; font-size:12px;", doc.muted),
-                    "Document unavailable: {error}"
                 }
             }
             div {
-                style: if split_view {
-                    "flex:1 1 auto; min-height:0; display:flex; flex-direction:row; overflow:hidden;"
-                } else {
-                    "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:auto;"
-                },
-                if body_widgets.is_empty() && schema.is_some() {
+                style: "{card_style}",
+                if has_bar {
                     div {
-                        style: format!("padding:26px; color:{}; font-size:13px;", doc.muted),
-                        "The app declared no document body."
-                    }
-                } else if schema.is_none() {
-                    div {
-                        style: format!("padding:26px; color:{}; font-size:13px;", doc.muted),
-                        "Loading document…"
-                    }
-                }
-                for (index, widget) in body_widgets.iter().enumerate() {
-                    div {
-                        key: "half-{widget.key(index, &value_epochs)}",
-                        // ⛔ SPELLED OUT, NOT INTERPOLATED, AND THAT IS LOAD-BEARING.
-                        // An RSX attribute NAME is a literal: `"{EXPR}"` interpolates
-                        // a VALUE, never a name, so this written as
-                        // `"{yggui_contract::document_split_stamps::HALF}"` emitted an
-                        // attribute called `{yggui_contract::…::HALF}` — braces, colons
-                        // and all — which `setAttribute` refuses outright
-                        // (`InvalidCharacterError: Invalid qualified name`). The throw
-                        // killed the whole edit batch, so EVERY mutation after it was
-                        // dropped and never re-sent: the halves, the gutter, the editor
-                        // and the reader all failed to mount while the container's own
-                        // `style` (emitted before the throw) kept tracking the data.
-                        // That is why the viewport painted nothing while the rail, the
-                        // footer counts and `document_surfaces.has_schema` all reported
-                        // success — they come from a different pane and a different
-                        // batch. Locked by `document_split_stamp_attribute_names_are_literal`.
-                        "data-yggui-doc-split-half": if split_view {
-                            if index == 0 { "first" } else { "second" }
-                        } else { "" },
-                        style: if split_view {
-                            // flex-basis carries the ratio; grow is 0 so the
-                            // gutter's position is the ratio and nothing else.
-                            // The border is gone — the gutter IS the divider now.
-                            format!(
-                                "order:{}; flex:0 1 calc({}% - 3px); min-width:0; min-height:0; overflow:auto;",
-                                index * 2,
-                                if index == 0 { split_first_pct } else { 100.0 - split_first_pct },
-                            )
-                        } else {
-                            "display:contents;".to_string()
-                        },
-                    {
-                        let widget_key = widget.key(index, &value_epochs);
-                        match widget {
-                            AppPaneWidget::Markdown { id, source, live_from } => rsx! {
-                                div {
-                                    key: "{widget_key}",
-                                    "data-document-markdown": "{id}",
-                                    style: "padding:16px 28px 40px 28px; max-width:980px; width:100%; margin:0 auto; box-sizing:border-box;",
-                                    if live_from.is_empty() {
-                                        // The pure READER: no sibling editor, so
-                                        // blocks are click-to-edit in place
-                                        // (Phase 4 — Typora-lite, not WYSIWYG).
-                                        EditableMarkdownBody {
-                                            source: source.clone(),
-                                            doc: doc.clone(),
-                                            state,
-                                            session_path: session_path.clone(),
-                                            pane_id: pane_id.clone(),
+                        style: "{bar_style}",
+                        for (index, widget) in bar_widgets.iter().enumerate() {
+                            {
+                                let widget_key = widget.key(index, &value_epochs);
+                                match widget {
+                                    AppPaneWidget::Section { text, .. } | AppPaneWidget::Label { text, muted: _ } => rsx! {
+                                        span {
+                                            key: "{widget_key}",
+                                            style: if matches!(widget, AppPaneWidget::Section { .. }) { bar_title_style.clone() } else { bar_label_style.clone() },
+                                            "{text}"
                                         }
-                                    } else {
-                                        // Live preview beside an editor: the
-                                        // sibling's draft renders per keystroke,
-                                        // no app round trip — and edits belong
-                                        // in the editor, not here.
-                                        {
-                                            let live = document_values.get(live_from).cloned();
-                                            markdown_widget_body(
-                                                live.as_deref().unwrap_or(source),
-                                                &doc,
-                                                ProseTokens::document(),
-                                            )
-                                        }
-                                    }
-                                }
-                            },
-                            AppPaneWidget::TextInput { id, value, line_numbers, word_wrap, .. } => {
-                                // The gutter tracks the LIVE draft, not the last
-                                // declared value, so typing a newline never
-                                // desyncs the numbers.
-                                let live = document_values
-                                    .get(id)
-                                    .cloned()
-                                    .unwrap_or_else(|| value.clone());
-                                let line_count = live.split('\n').count().max(1);
-                                // Text-mode editor is one point larger than the
-                                // 12.5px chrome baseline (user call 2026-07-24):
-                                // source editing wants a touch more air than a
-                                // dense sidebar row. The gutter shares it so the
-                                // numbers sit on the same baseline as the text.
-                                let editor_font = "font-family:ui-monospace, monospace; font-size:13.5px; line-height:1.55;";
-                                // Wrap mode keeps its line numbers now: a hidden
-                                // mirror measures each logical line's visual-row
-                                // count, and the gutter draws the number on a
-                                // line's first row + a continuation arrow (↪) on
-                                // each wrapped row, KDE-Kate style (see
-                                // DOCUMENT_WRAP_GUTTER_SCRIPT). The textarea owns
-                                // its own scroll; the gutter's inner block tracks
-                                // its scrollTop.
-                                let wrapped = *word_wrap;
-                                let show_gutter = *line_numbers;
-                                // The wrap gutter's JS pairs textarea↔gutter by this
-                                // marker; absent (None) in non-wrap mode.
-                                let wrap_editor_marker = wrapped.then(|| id.clone());
-                                rsx! {
-                                    div {
-                                        key: "{widget_key}",
-                                        style: if wrapped {
-                                            "display:flex; align-items:stretch; min-height:100%; height:100%;"
-                                        } else {
-                                            "display:flex; align-items:flex-start; min-height:100%;"
-                                        },
-                                        if show_gutter && !wrapped {
-                                            div {
-                                                "data-document-gutter": "{id}",
-                                                style: format!(
-                                                    "flex:0 0 auto; text-align:right; padding:14px 10px 40px 16px; \
-                                                     color:{}; border-right:1px solid {}; user-select:none; \
-                                                     -webkit-user-select:none; white-space:pre; {editor_font}",
-                                                    doc.muted, doc.border
-                                                ),
-                                                {(1..=line_count).map(|n| n.to_string()).collect::<Vec<_>>().join("\n")}
-                                            }
-                                        }
-                                        if show_gutter && wrapped {
-                                            // JS-maintained gutter: overflow-hidden
-                                            // frame, inner block translated by the
-                                            // textarea's scrollTop. Padding-top
-                                            // matches the textarea so line 1 aligns.
-                                            div {
-                                                "data-document-wrap-gutter": "{id}",
-                                                style: format!(
-                                                    "flex:0 0 auto; overflow:hidden; text-align:right; \
-                                                     padding:14px 10px 40px 16px; color:{}; border-right:1px solid {}; \
-                                                     user-select:none; -webkit-user-select:none; white-space:pre; {editor_font}",
-                                                    doc.muted, doc.border
-                                                ),
-                                                div {}
-                                            }
-                                        }
-                                        textarea {
-                                            "data-document-editor": "{id}",
-                                            "data-document-wrap-editor": wrap_editor_marker,
-                                            style: if wrapped {
-                                                format!(
-                                                    "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
-                                                     background:transparent; color:{}; caret-color:{}; \
-                                                     padding:14px 20px 40px 20px; white-space:pre-wrap; overflow-wrap:anywhere; \
-                                                     overflow-x:hidden; overflow-y:auto; tab-size:4; {editor_font}",
-                                                    doc.fg, doc.accent
-                                                )
-                                            } else {
-                                                format!(
-                                                    "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
-                                                     background:transparent; color:{}; caret-color:{}; \
-                                                     padding:14px 20px 40px 14px; white-space:pre; overflow-x:auto; \
-                                                     overflow-y:hidden; tab-size:4; {editor_font}",
-                                                    doc.fg, doc.accent
-                                                )
-                                            },
-                                            spellcheck: "false",
-                                            wrap: if wrapped { "soft" } else { "off" },
-                                            rows: if wrapped { "2".to_string() } else { format!("{}", line_count + 1) },
-                                            initial_value: "{value}",
-                                            onmounted: move |_evt| async move {
-                                                // Install/refresh the wrap gutter maintainer
-                                                // once the textarea is in the DOM. Idempotent.
-                                                if wrapped {
-                                                    let _ = document::eval(DOCUMENT_WRAP_GUTTER_SCRIPT);
+                                    },
+                                    AppPaneWidget::Tabs { id, action, tabs, active } => rsx! {
+                                        div {
+                                            key: "{widget_key}",
+                                            style: "display:flex; gap:4px; flex-wrap:wrap; min-width:0;",
+                                            for tab in tabs.iter().cloned() {
+                                                button {
+                                                    key: "{id}-{tab.id}",
+                                                    style: if tab.id == *active { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                                    title: "{tab.label}",
+                                                    onclick: {
+                                                        let run_action = run_action.clone();
+                                                        let action = action.clone();
+                                                        let tab_id = tab.id.clone();
+                                                        move |_| run_action(action.clone(), Some(tab_id.clone()))
+                                                    },
+                                                    "{tab.label}"
                                                 }
+                                            }
+                                        }
+                                    },
+                                    AppPaneWidget::Toggle { id: _, label, action, value } => rsx! {
+                                        button {
+                                            key: "{widget_key}",
+                                            style: if *value { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                            onclick: {
+                                                let run_action = run_action.clone();
+                                                let action = action.clone();
+                                                let next = (!*value).to_string();
+                                                move |_| run_action(action.clone(), Some(next.clone()))
                                             },
+                                            "{label}"
+                                        }
+                                    },
+                                    AppPaneWidget::Button { id, label, action, primary, title, .. } => rsx! {
+                                        button {
+                                            key: "{widget_key}",
+                                            "data-document-button": "{id}",
+                                            title: "{title}",
+                                            style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                            onclick: {
+                                                let run_action = run_action.clone();
+                                                let action = action.clone();
+                                                move |_| run_action(action.clone(), None)
+                                            },
+                                            {shell_glyph(label, 13)}
+                                        }
+                                    },
+                                    // A SEARCH BOX IS A TEXT INPUT HERE, and it has to
+                                    // be, because a widget this placement does not
+                                    // match is dropped in SILENCE — no error, no
+                                    // fallback, nothing in the app's transcript. The
+                                    // rail rendered `search-box` and the document
+                                    // surface did not, so yRDP's chooser had a filter
+                                    // in the rail and none in the viewport; the moment
+                                    // the rail went away the filter went with it, and
+                                    // the app had no way to find that out.
+                                    AppPaneWidget::TextInput { id, placeholder, value, action, .. }
+                                    | AppPaneWidget::SearchBox { id, placeholder, value, action } => rsx! {
+                                        input {
+                                            key: "{widget_key}",
+                                            "data-document-input": "{id}",
+                                            style: format!(
+                                                "padding:4px 10px; border:1px solid {}; border-radius:7px; \
+                                                 background:{}; color:{}; font-size:11px; outline:none; \
+                                                 min-width:200px; flex:0 1 340px;",
+                                                doc.border, doc.bg, doc.fg
+                                            ),
+                                            placeholder: "{placeholder}",
+                                            initial_value: "{value}",
                                             oninput: {
                                                 let mut state = state;
                                                 let id = id.clone();
@@ -3591,79 +3377,378 @@ fn DocumentSurfaceBody(
                                                     });
                                                 }
                                             },
+                                            onkeydown: {
+                                                let run_action = run_action.clone();
+                                                let action = action.clone();
+                                                move |evt: KeyboardEvent| {
+                                                    if evt.key() == Key::Enter && !action.is_empty() {
+                                                        run_action(action.clone(), None);
+                                                    }
+                                                }
+                                            },
                                         }
-                                    }
-                                }
-                            },
-                            AppPaneWidget::ListRow { id, title, subtitle, actions, .. } => rsx! {
-                                div {
-                                    key: "{widget_key}",
-                                    "data-document-row": "{id}",
-                                    style: format!(
-                                        "display:flex; align-items:center; gap:10px; margin:3px 26px; padding:9px 14px; \
-                                         border-radius:9px; background:{}; color:{}; max-width:720px;",
-                                        doc.chrome, doc.fg
-                                    ),
-                                    div {
-                                        style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                    },
+                                    // Several buttons the app groups together. The bar
+                                    // is already a row, so a toolbar is its buttons
+                                    // wearing the bar's own skin rather than a second
+                                    // container inside it.
+                                    AppPaneWidget::Toolbar { id, buttons } => rsx! {
                                         div {
-                                            style: "font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                                            "{title}"
+                                            key: "{widget_key}",
+                                            "data-document-toolbar": "{id}",
+                                            style: "display:flex; align-items:center; gap:6px; flex-wrap:wrap;",
+                                            for toolbar_button in buttons.iter().cloned() {
+                                                button {
+                                                    key: "{toolbar_button.action}",
+                                                    "data-document-button": "{toolbar_button.action}",
+                                                    style: if toolbar_button.primary {
+                                                        bar_button_primary_style.clone()
+                                                    } else {
+                                                        bar_button_style.clone()
+                                                    },
+                                                    title: "{toolbar_button.title}",
+                                                    onclick: {
+                                                        let run_action = run_action.clone();
+                                                        let action = toolbar_button.action.clone();
+                                                        move |_| run_action(action.clone(), None)
+                                                    },
+                                                    "{toolbar_button.label}"
+                                                }
+                                            }
                                         }
-                                        if !subtitle.is_empty() {
-                                            div {
-                                                style: format!("font-size:11px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", doc.muted),
-                                                "{subtitle}"
+                                    },
+                                    AppPaneWidget::NumberInput { id, label, value, min, max } => rsx! {
+                                        div {
+                                            key: "{widget_key}",
+                                            style: "display:flex; align-items:center; gap:6px;",
+                                            if !label.is_empty() {
+                                                span { style: "{bar_label_style}", "{label}" }
+                                            }
+                                            input {
+                                                "data-document-input": "{id}",
+                                                style: format!(
+                                                    "padding:4px 8px; border:1px solid {}; border-radius:7px; \
+                                                     background:{}; color:{}; font-size:11px; outline:none; \
+                                                     max-width:88px;",
+                                                    doc.border, doc.bg, doc.fg
+                                                ),
+                                                r#type: "number",
+                                                min: "{min}",
+                                                max: "{max}",
+                                                initial_value: "{value}",
+                                                oninput: {
+                                                    let mut state = state;
+                                                    let id = id.clone();
+                                                    let session_path = session_path.clone();
+                                                    move |evt: FormEvent| {
+                                                        state.with_mut_counted(|shell| {
+                                                            shell.set_document_pane_value(
+                                                                &session_path,
+                                                                &id,
+                                                                evt.value(),
+                                                            );
+                                                        });
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    },
+                                    // ⛔ The silent drop. Everything a document surface
+                                    // can be handed is matched ABOVE — locked by
+                                    // `every_app_pane_widget_reaches_the_document_surface`
+                                    // — so this arm exists for the variant somebody
+                                    // adds next, and it is the reason that lock has to
+                                    // be structural: an unmatched widget renders as an
+                                    // empty span, which looks exactly like an app that
+                                    // never declared it.
+                                    _ => rsx! { span { key: "{widget_key}" } },
+                                }
+                            }
+                        }
+                        div { style: "flex:1 1 auto;" }
+                        // ⛔ The Document|Terminal switch does NOT live here. It is
+                        // the titlebar's surface-switch slot
+                        // (`TitlebarSurfaceSwitch`), which is where every other
+                        // "what is this viewport showing" switch already lived.
+                        // A copy here floated over the editor on a pure-body
+                        // document — the surface reserves no space for chrome, so
+                        // the pill drew straight over the first line of the text.
+                    }
+                }
+                if let Some(error) = error {
+                    div {
+                        style: format!("padding:10px 16px; color:{}; font-size:12px;", doc.muted),
+                        "Document unavailable: {error}"
+                    }
+                }
+                div {
+                    style: if split_view {
+                        "flex:1 1 auto; min-height:0; display:flex; flex-direction:row; overflow:hidden;"
+                    } else {
+                        "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:auto;"
+                    },
+                    if body_widgets.is_empty() && schema.is_some() {
+                        div {
+                            style: format!("padding:26px; color:{}; font-size:13px;", doc.muted),
+                            "The app declared no document body."
+                        }
+                    } else if schema.is_none() {
+                        div {
+                            style: format!("padding:26px; color:{}; font-size:13px;", doc.muted),
+                            "Loading document…"
+                        }
+                    }
+                    for (index, widget) in body_widgets.iter().enumerate() {
+                        div {
+                            key: "half-{widget.key(index, &value_epochs)}",
+                            // ⛔ SPELLED OUT, NOT INTERPOLATED, AND THAT IS LOAD-BEARING.
+                            // An RSX attribute NAME is a literal: `"{EXPR}"` interpolates
+                            // a VALUE, never a name, so this written as
+                            // `"{yggui_contract::document_split_stamps::HALF}"` emitted an
+                            // attribute called `{yggui_contract::…::HALF}` — braces, colons
+                            // and all — which `setAttribute` refuses outright
+                            // (`InvalidCharacterError: Invalid qualified name`). The throw
+                            // killed the whole edit batch, so EVERY mutation after it was
+                            // dropped and never re-sent: the halves, the gutter, the editor
+                            // and the reader all failed to mount while the container's own
+                            // `style` (emitted before the throw) kept tracking the data.
+                            // That is why the viewport painted nothing while the rail, the
+                            // footer counts and `document_surfaces.has_schema` all reported
+                            // success — they come from a different pane and a different
+                            // batch. Locked by `document_split_stamp_attribute_names_are_literal`.
+                            "data-yggui-doc-split-half": if split_view {
+                                if index == 0 { "first" } else { "second" }
+                            } else { "" },
+                            style: if split_view {
+                                // flex-basis carries the ratio; grow is 0 so the
+                                // gutter's position is the ratio and nothing else.
+                                // The border is gone — the gutter IS the divider now.
+                                format!(
+                                    "order:{}; flex:0 1 calc({}% - 3px); min-width:0; min-height:0; overflow:auto;",
+                                    index * 2,
+                                    if index == 0 { split_first_pct } else { 100.0 - split_first_pct },
+                                )
+                            } else {
+                                "display:contents;".to_string()
+                            },
+                        {
+                            let widget_key = widget.key(index, &value_epochs);
+                            match widget {
+                                AppPaneWidget::Markdown { id, source, live_from } => rsx! {
+                                    div {
+                                        key: "{widget_key}",
+                                        "data-document-markdown": "{id}",
+                                        style: "padding:16px 28px 40px 28px; max-width:980px; width:100%; margin:0 auto; box-sizing:border-box;",
+                                        if live_from.is_empty() {
+                                            // The pure READER: no sibling editor, so
+                                            // blocks are click-to-edit in place
+                                            // (Phase 4 — Typora-lite, not WYSIWYG).
+                                            EditableMarkdownBody {
+                                                source: source.clone(),
+                                                doc: doc.clone(),
+                                                state,
+                                                session_path: session_path.clone(),
+                                                pane_id: pane_id.clone(),
+                                            }
+                                        } else {
+                                            // Live preview beside an editor: the
+                                            // sibling's draft renders per keystroke,
+                                            // no app round trip — and edits belong
+                                            // in the editor, not here.
+                                            {
+                                                let live = document_values.get(live_from).cloned();
+                                                markdown_widget_body(
+                                                    live.as_deref().unwrap_or(source),
+                                                    &doc,
+                                                    ProseTokens::document(),
+                                                )
                                             }
                                         }
                                     }
-                                    for row_action in actions.iter().cloned() {
-                                        button {
-                                            key: "{row_action.action}",
-                                            style: format!(
-                                                "border:0; border-radius:7px; background:transparent; color:{}; \
-                                                 font-size:13px; cursor:pointer; padding:3px 8px;",
-                                                doc.muted
-                                            ),
-                                            title: "{row_action.title}",
-                                            onclick: {
-                                                let run_action = run_action.clone();
-                                                let (action, row_id) = (row_action.action.clone(), id.clone());
-                                                move |_| run_action(action.clone(), Some(row_id.clone()))
+                                },
+                                AppPaneWidget::TextInput { id, value, line_numbers, word_wrap, .. } => {
+                                    // The gutter tracks the LIVE draft, not the last
+                                    // declared value, so typing a newline never
+                                    // desyncs the numbers.
+                                    let live = document_values
+                                        .get(id)
+                                        .cloned()
+                                        .unwrap_or_else(|| value.clone());
+                                    let line_count = live.split('\n').count().max(1);
+                                    // Text-mode editor is one point larger than the
+                                    // 12.5px chrome baseline (user call 2026-07-24):
+                                    // source editing wants a touch more air than a
+                                    // dense sidebar row. The gutter shares it so the
+                                    // numbers sit on the same baseline as the text.
+                                    let editor_font = "font-family:ui-monospace, monospace; font-size:13.5px; line-height:1.55;";
+                                    // Wrap mode keeps its line numbers now: a hidden
+                                    // mirror measures each logical line's visual-row
+                                    // count, and the gutter draws the number on a
+                                    // line's first row + a continuation arrow (↪) on
+                                    // each wrapped row, KDE-Kate style (see
+                                    // DOCUMENT_WRAP_GUTTER_SCRIPT). The textarea owns
+                                    // its own scroll; the gutter's inner block tracks
+                                    // its scrollTop.
+                                    let wrapped = *word_wrap;
+                                    let show_gutter = *line_numbers;
+                                    // The wrap gutter's JS pairs textarea↔gutter by this
+                                    // marker; absent (None) in non-wrap mode.
+                                    let wrap_editor_marker = wrapped.then(|| id.clone());
+                                    rsx! {
+                                        div {
+                                            key: "{widget_key}",
+                                            style: if wrapped {
+                                                "display:flex; align-items:stretch; min-height:100%; height:100%;"
+                                            } else {
+                                                "display:flex; align-items:flex-start; min-height:100%;"
                                             },
-                                            "{row_action.label}"
+                                            if show_gutter && !wrapped {
+                                                div {
+                                                    "data-document-gutter": "{id}",
+                                                    style: format!(
+                                                        "flex:0 0 auto; text-align:right; padding:14px 10px 40px 16px; \
+                                                         color:{}; border-right:1px solid {}; user-select:none; \
+                                                         -webkit-user-select:none; white-space:pre; {editor_font}",
+                                                        doc.muted, doc.border
+                                                    ),
+                                                    {(1..=line_count).map(|n| n.to_string()).collect::<Vec<_>>().join("\n")}
+                                                }
+                                            }
+                                            if show_gutter && wrapped {
+                                                // JS-maintained gutter: overflow-hidden
+                                                // frame, inner block translated by the
+                                                // textarea's scrollTop. Padding-top
+                                                // matches the textarea so line 1 aligns.
+                                                div {
+                                                    "data-document-wrap-gutter": "{id}",
+                                                    style: format!(
+                                                        "flex:0 0 auto; overflow:hidden; text-align:right; \
+                                                         padding:14px 10px 40px 16px; color:{}; border-right:1px solid {}; \
+                                                         user-select:none; -webkit-user-select:none; white-space:pre; {editor_font}",
+                                                        doc.muted, doc.border
+                                                    ),
+                                                    div {}
+                                                }
+                                            }
+                                            textarea {
+                                                "data-document-editor": "{id}",
+                                                "data-document-wrap-editor": wrap_editor_marker,
+                                                style: if wrapped {
+                                                    format!(
+                                                        "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
+                                                         background:transparent; color:{}; caret-color:{}; \
+                                                         padding:14px 20px 40px 20px; white-space:pre-wrap; overflow-wrap:anywhere; \
+                                                         overflow-x:hidden; overflow-y:auto; tab-size:4; {editor_font}",
+                                                        doc.fg, doc.accent
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
+                                                         background:transparent; color:{}; caret-color:{}; \
+                                                         padding:14px 20px 40px 14px; white-space:pre; overflow-x:auto; \
+                                                         overflow-y:hidden; tab-size:4; {editor_font}",
+                                                        doc.fg, doc.accent
+                                                    )
+                                                },
+                                                spellcheck: "false",
+                                                wrap: if wrapped { "soft" } else { "off" },
+                                                rows: if wrapped { "2".to_string() } else { format!("{}", line_count + 1) },
+                                                initial_value: "{value}",
+                                                onmounted: move |_evt| async move {
+                                                    // Install/refresh the wrap gutter maintainer
+                                                    // once the textarea is in the DOM. Idempotent.
+                                                    if wrapped {
+                                                        let _ = document::eval(DOCUMENT_WRAP_GUTTER_SCRIPT);
+                                                    }
+                                                },
+                                                oninput: {
+                                                    let mut state = state;
+                                                    let id = id.clone();
+                                                    let session_path = session_path.clone();
+                                                    move |evt: FormEvent| {
+                                                        state.with_mut_counted(|shell| {
+                                                            shell.set_document_pane_value(
+                                                                &session_path,
+                                                                &id,
+                                                                evt.value(),
+                                                            );
+                                                        });
+                                                    }
+                                                },
+                                            }
                                         }
                                     }
-                                }
-                            },
-                            _ => rsx! { span { key: "{widget_key}" } },
+                                },
+                                AppPaneWidget::ListRow { id, title, subtitle, actions, .. } => rsx! {
+                                    div {
+                                        key: "{widget_key}",
+                                        "data-document-row": "{id}",
+                                        style: format!(
+                                            "display:flex; align-items:center; gap:10px; margin:3px 26px; padding:9px 14px; \
+                                             border-radius:9px; background:{}; color:{}; max-width:720px;",
+                                            doc.chrome, doc.fg
+                                        ),
+                                        div {
+                                            style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                            div {
+                                                style: "font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                                "{title}"
+                                            }
+                                            if !subtitle.is_empty() {
+                                                div {
+                                                    style: format!("font-size:11px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", doc.muted),
+                                                    "{subtitle}"
+                                                }
+                                            }
+                                        }
+                                        for row_action in actions.iter().cloned() {
+                                            button {
+                                                key: "{row_action.action}",
+                                                style: format!(
+                                                    "border:0; border-radius:7px; background:transparent; color:{}; \
+                                                     font-size:13px; cursor:pointer; padding:3px 8px;",
+                                                    doc.muted
+                                                ),
+                                                title: "{row_action.title}",
+                                                onclick: {
+                                                    let run_action = run_action.clone();
+                                                    let (action, row_id) = (row_action.action.clone(), id.clone());
+                                                    move |_| run_action(action.clone(), Some(row_id.clone()))
+                                                },
+                                                "{row_action.label}"
+                                            }
+                                        }
+                                    }
+                                },
+                                _ => rsx! { span { key: "{widget_key}" } },
+                            }
+                        }
                         }
                     }
-                    }
-                }
-                // THE SPLIT GUTTER. Rendered after the halves and pulled
-                // back over the seam, so it is one element regardless of how
-                // many widgets the app declared. Dragging it sets a CSS var the
-                // halves are sized from, and releases POST the ratio to the app
-                // — the app owns the value, the host only reports the gesture.
-                //
-                // It carries the contract stamps so an agent can find and drive
-                // it through yggui exactly as a pointer does; that is the point
-                // of naming them in yggui-contract rather than inline here.
-                if split_view {
-                    div {
-                        // Literal names — see the half stamp above for why an
-                        // interpolated attribute NAME silently destroys this subtree.
-                        "data-yggui-doc-split-gutter": "1",
-                        "data-yggui-doc-split-ratio": "{split_ratio}",
-                        role: "separator",
-                        "aria-orientation": "vertical",
-                        "aria-valuenow": "{(split_ratio * 100.0) as i64}",
-                        title: "Drag to resize · double-click to centre",
-                        style: format!(
-                            "order:1; flex:0 0 6px; z-index:2; cursor:col-resize;                              background:{}; opacity:0.55; transition:opacity 120ms;                              touch-action:none; user-select:none;",
-                            doc.border,
-                        ),
+                    // THE SPLIT GUTTER. Rendered after the halves and pulled
+                    // back over the seam, so it is one element regardless of how
+                    // many widgets the app declared. Dragging it sets a CSS var the
+                    // halves are sized from, and releases POST the ratio to the app
+                    // — the app owns the value, the host only reports the gesture.
+                    //
+                    // It carries the contract stamps so an agent can find and drive
+                    // it through yggui exactly as a pointer does; that is the point
+                    // of naming them in yggui-contract rather than inline here.
+                    if split_view {
+                        div {
+                            // Literal names — see the half stamp above for why an
+                            // interpolated attribute NAME silently destroys this subtree.
+                            "data-yggui-doc-split-gutter": "1",
+                            "data-yggui-doc-split-ratio": "{split_ratio}",
+                            role: "separator",
+                            "aria-orientation": "vertical",
+                            "aria-valuenow": "{(split_ratio * 100.0) as i64}",
+                            title: "Drag to resize · double-click to centre",
+                            style: format!(
+                                "order:1; flex:0 0 6px; z-index:2; cursor:col-resize;                              background:{}; opacity:0.55; transition:opacity 120ms;                              touch-action:none; user-select:none;",
+                                doc.border,
+                            ),
+                        }
                     }
                 }
             }

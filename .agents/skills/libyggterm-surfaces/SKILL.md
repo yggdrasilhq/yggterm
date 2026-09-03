@@ -233,6 +233,17 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     it at the rail BOTTOM, under the scroll area, behind a separator. Subset
     vocabulary only: `label`, `toggle`, `button` (grow it when a consumer
     needs more). Use it for status-bar data (counts, modes) — not for content.
+  - **Ribbon strip (2026-09-03, ymacs tool-bar-mode was the forcing
+    consumer):** a DOCUMENT schema may also carry a top-level
+    `ribbon: [widgets…]` list — yggterm renders it ABOVE the viewport card,
+    on the shell's own background (seamless with startpage), and the card —
+    the viewport — starts below it. Subset vocabulary only: `label`,
+    `toolbar`, `button` (grow it when a consumer needs more). Use it for
+    the app's toolbar (Office-ribbon shape); never for content, which stays
+    in `widgets`. Absent/empty = no strip and the card keeps the full rect.
+    Buttons POST on the ordinary document action channel. Multi-viewport
+    seam, not a promise: the column (ribbon rows, then viewport panes) is
+    where a future timeline/CAD app stacks more; one viewport today.
   - **`text-input` editor fields (document surface):** `line_numbers: true`
     draws the gutter; `word_wrap` (DEFAULT TRUE — user spec) soft-wraps the
     editor. While wrap is on the gutter is SUPPRESSED (logical line numbers

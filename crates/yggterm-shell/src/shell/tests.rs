@@ -2411,6 +2411,7 @@ mod tests {
             widgets: Vec::new(),
             titlebar_switch: None,
             footer: Vec::new(),
+            ribbon: Vec::new(),
             split_ratio: None,
             key_capture: false,
         };
@@ -4359,6 +4360,7 @@ JSON.stringify({{
             }],
             split_ratio: None,
             footer: Vec::new(),
+            ribbon: Vec::new(),
         }
     }
 
@@ -4454,6 +4456,70 @@ JSON.stringify({{
         assert!(
             !shell.document_pane_fetch_is_noop(seq2, "local://a", "doc", &switched),
             "a buffer switch under a live draft is real work"
+        );
+    }
+
+    /// The ribbon region: absent by default (old apps paint exactly as
+    /// before), parsed when declared, and part of the noop identity — a
+    /// ribbon change is real work, an identical ribbon is silence.
+    #[test]
+    fn document_ribbon_defaults_absent_parses_declared_counts_as_change() {
+        // Absent ⇒ empty: apps that never heard of the ribbon are unchanged.
+        let plain: AppPaneSchema =
+            serde_json::from_value(json!({"title": "t", "widgets": []}))
+                .expect("schema parses");
+        assert!(plain.ribbon.is_empty(), "ribbon must default absent");
+        // Declared toolbar + label parse into the region.
+        let ribboned: AppPaneSchema = serde_json::from_value(json!({
+            "title": "t",
+            "widgets": [],
+            "ribbon": [
+                {"kind": "label", "text": "Buf"},
+                {"kind": "toolbar", "id": "tb", "buttons": [
+                    {"action": "save", "label": "Save", "primary": true},
+                ]},
+            ],
+        }))
+        .expect("ribbon parses");
+        assert_eq!(ribboned.ribbon.len(), 2, "label + toolbar land in the region");
+        // The noop mirror compares whole schemas: ribbon movement is work.
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://a"));
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", plain.clone());
+        let seq2 = shell.document_pane_next_request("local://a");
+        assert!(
+            shell.document_pane_fetch_is_noop(seq2, "local://a", "doc", &plain),
+            "identical ribbon-less schemas stay silent"
+        );
+        assert!(
+            !shell.document_pane_fetch_is_noop(seq2, "local://a", "doc", &ribboned),
+            "a newly declared ribbon is real work, not a noop"
+        );
+    }
+
+    /// Structural lock: the ribbon renders OUTSIDE the card, above it —
+    /// `data-document-ribbon` before the card div, on shell background.
+    /// A future editor who moves the strip back inside the viewport must
+    /// answer this test instead of silently re-shrinking the viewport.
+    #[test]
+    fn document_ribbon_renders_above_the_card_not_inside_it() {
+        let source = include_str!("right_rail.rs");
+        let (_, after_surface) = source
+            .split_once("fn DocumentSurfaceBody(")
+            .expect("DocumentSurfaceBody is gone from this file");
+        let ribbon_at = after_surface
+            .find("\"data-document-ribbon\"")
+            .expect("no ribbon region in the document surface");
+        let card_at = after_surface
+            .find("style: \"{card_style}\"")
+            .expect("no card div in the document surface");
+        assert!(
+            ribbon_at < card_at,
+            "the ribbon must open before the card div"
+        );
+        assert!(
+            after_surface.contains("background:transparent"),
+            "the ribbon column must not paint the viewport background"
         );
     }
 

@@ -37,6 +37,7 @@ mod key_plane_locks {
             widgets: Vec::new(),
             titlebar_switch: None,
             footer: Vec::new(),
+            ribbon: Vec::new(),
             split_ratio: None,
             key_capture: true,
         };
