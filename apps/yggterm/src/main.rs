@@ -1189,7 +1189,7 @@ fn main() -> Result<()> {
         .with_env_filter("info")
         .with_target(false)
         .without_time()
-        .with_writer(std::io::stderr)
+        .with_writer(LossyStderr)
         .init();
 
     if args.is_empty() {
@@ -4405,6 +4405,42 @@ fn signal_client_scope_matches(candidate: &SignalClientScope, current: &SignalCl
     }
     candidate.xdg_session_id == current.xdg_session_id
         && candidate.xdg_runtime_dir == current.xdg_runtime_dir
+}
+
+/// A tracing writer that never panics. std's stderr `write_fmt` aborts the
+/// process on a broken pipe ("failed printing to stderr"), and a GUI whose
+/// stderr pipe reader exits dies mid-render — measured 2026-09-04 on guihost:
+/// 63 broken-pipe panics in panic.log, two of them the 02:30/02:33 GUI deaths,
+/// one on the UI thread inside `spawn_title_generation_for_target`'s tracing
+/// event. Tracing output is a diagnostic; losing one line to a dead pipe must
+/// never kill the app. TWIN: the same writer is defined in
+/// `src/bin/yggterm-headless.rs` (no shared lib between the two binaries).
+#[derive(Clone, Copy)]
+struct LossyStderr;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LossyStderr {
+    type Writer = LossyStderrHandle;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LossyStderrHandle
+    }
+}
+
+struct LossyStderrHandle;
+
+impl std::io::Write for LossyStderrHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let _ = std::io::stderr().flush();
+        Ok(())
+    }
 }
 
 fn install_panic_logging(home_dir: &std::path::Path) {

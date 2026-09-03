@@ -316,6 +316,32 @@ fn ui_block_density(home: &Path, window_ms: u128) -> Option<f64> {
     Some(blocks.count as f64 / (window_ms as f64 / 60_000.0))
 }
 
+/// GUI restart/crash churn, read straight from the trace: `restart_taken`
+/// (convergence self-restarts) and `window_spawned` (GUI windows appearing —
+/// deliberately NOT `main_enter`, which every CLI invocation also fires). Both
+/// signals are GUI-only, so N of either inside the window is a loop regardless
+/// of cause: panic-respawn, convergence, watchdog — a crash loop where every
+/// individual death looks clean to every other instrument.
+const GUI_LOOP_WINDOW_MS: u128 = 3 * 60_000;
+const GUI_LOOP_RESTARTS_LIMIT: u64 = 5;
+const GUI_LOOP_SPAWNS_LIMIT: u64 = 6;
+const GUI_LOOP_COOLDOWN_MS: u128 = 15 * 60_000;
+
+fn gui_loop_density(home: &Path, window_ms: u128) -> (u64, u64) {
+    let since = now_ms().saturating_sub(window_ms);
+    let restarts = ytrace::query::summarize(home, Some("version_convergence"), Some(since))
+        .iter()
+        .find(|s| s.name == "restart_taken")
+        .map(|s| s.count)
+        .unwrap_or(0);
+    let spawns = ytrace::query::summarize(home, Some("startup"), Some(since))
+        .iter()
+        .find(|s| s.name == "window_spawned")
+        .map(|s| s.count)
+        .unwrap_or(0);
+    (restarts, spawns)
+}
+
 // ── the watcher ─────────────────────────────────────────────────────────────
 
 pub struct HostPanicWatcher {
@@ -327,6 +353,8 @@ pub struct HostPanicWatcher {
     /// When the current above-threshold condition started.
     elevated_since: Option<Instant>,
     last_notify_ms: u128,
+    /// Last time the GUI crash-loop detector filed an incident (cooldown).
+    last_loop_incident_ms: u128,
 }
 
 impl HostPanicWatcher {
@@ -346,6 +374,7 @@ impl HostPanicWatcher {
             provider,
             elevated_since: None,
             last_notify_ms: 0,
+            last_loop_incident_ms: 0,
         }
     }
 
@@ -353,6 +382,58 @@ impl HostPanicWatcher {
     pub fn tick(&mut self) -> Option<ytrace::diagnosis::Incident> {
         if !is_enabled() {
             return None;
+        }
+        // ── GUI crash-loop detector ──
+        // Independent of host health and of the host-panic sustain machinery:
+        // a restart/crash loop is a loop even on a cool idle machine, and it
+        // must be DETECTABLE the minute it happens (measured 2026-09-04: a
+        // 10 s convergence restart loop ran five minutes with no instrument
+        // saying so). The verdict is emitted directly on the heartbeat/panic
+        // channel — the same surface owners and agents already watch — with a
+        // cooldown so one burst files one incident.
+        let (restarts, spawns) = gui_loop_density(&self.ytrace_home, GUI_LOOP_WINDOW_MS);
+        if (restarts >= GUI_LOOP_RESTARTS_LIMIT || spawns >= GUI_LOOP_SPAWNS_LIMIT)
+            && now_ms().saturating_sub(self.last_loop_incident_ms) > GUI_LOOP_COOLDOWN_MS
+        {
+            self.last_loop_incident_ms = now_ms();
+            let diagnosis = format!(
+                "GUI is restart/crash looping: {restarts} convergence restarts / {spawns} window spawns in the last 3 minutes"
+            );
+            let payload = json!({
+                "incident": true,
+                "incident_id": "gui_crash_loop_detected",
+                "kind": "health",
+                "severity": "error",
+                "host": self.host,
+                "diagnosis": diagnosis,
+                "remedy": "group version_convergence and startup/window_spawned events by pid; the respawn trigger that survives its own restart is the bug",
+                "observed": {
+                    "restarts_taken_3m": restarts,
+                    "window_spawns_3m": spawns,
+                },
+                "suggested_queries": [
+                    "ytrace tail --category version_convergence --lines 50",
+                    "ytrace query --category startup --name window_spawned --since 10m --json",
+                ],
+            });
+            self.provider
+                .incident("daemon", "heartbeat", "panic", payload);
+            yggterm_core::append_trace_event(
+                &self.home,
+                "daemon",
+                "heartbeat",
+                "panic",
+                json!({
+                    "host": self.host,
+                    "incident_id": "gui_crash_loop_detected",
+                    "severity": "error",
+                    "diagnosis": diagnosis,
+                    "observed": {
+                        "restarts_taken_3m": restarts,
+                        "window_spawns_3m": spawns,
+                    },
+                }),
+            );
         }
         let (mem_used_fraction, swap_used_gib) = memory_pressure();
         let (socket_watts, fan_rpm) = power_and_fan();

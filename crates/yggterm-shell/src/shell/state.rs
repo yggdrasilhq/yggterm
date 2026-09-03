@@ -17618,6 +17618,10 @@ struct ShellState {
     version_convergence_last_seen_daemon_version: Option<String>,
     version_convergence_last_notified_missing: Option<String>,
     version_convergence_last_deferred_version: Option<String>,
+    /// Same-version + daemon-pending, seen once per daemon version — the
+    /// `daemon_pending_noop` trace must not fire on every poll. See the
+    /// equal-versions law in `version_convergence_pending_restart`.
+    version_convergence_last_pending_noop: Option<String>,
     /// ⛔ THE owner of "a daemon handover is in progress, stop painting"
     /// (user-settled call #7). Driven from `latest_runtime_status` and nothing
     /// else; read through `handover_paint_suspended()`.
@@ -20016,6 +20020,7 @@ impl ShellState {
             version_convergence_last_seen_daemon_version: None,
             version_convergence_last_notified_missing: None,
             version_convergence_last_deferred_version: None,
+            version_convergence_last_pending_noop: None,
             handover_gate: HandoverPaintGate::default(),
             working_flags_poll_started: false,
             drag_paths: Vec::new(),
@@ -20215,12 +20220,39 @@ impl ShellState {
         if daemon_version.is_empty() {
             return None;
         }
-        // Same version but daemon has a newer build on disk (hot_restart_pending) — treat as skew too.
-        let is_same_version_newer_build = daemon_version == own_version && status.hot_restart_pending;
-        if daemon_version == own_version && !is_same_version_newer_build {
+        // ⛔ EQUAL VERSIONS NEVER RESTART THE GUI — including "the daemon has a
+        // newer same-version build on disk" (hot_restart_pending). A GUI restart
+        // execs the same version, consumes nothing, and the daemon's pending flag
+        // stays set until ITS OWN gated handoff rotates it — so every fresh GUI
+        // re-armed the identical restart ~10 s later. Measured live 2026-09-04
+        // 02:33–02:38 on guihost: ~30 respawns in 5 minutes with own_version ==
+        // newest_seen == 3.2.51 the whole time; the loop stopped only because the
+        // owner typed into a terminal (the pending_input_draft defer). A genuinely
+        // newer daemon is handled below; a pending same-version build is the
+        // daemon handoff's job and only traced here.
+        if daemon_version == own_version {
+            if status.hot_restart_pending
+                && self.version_convergence_last_pending_noop.as_deref() != Some(&daemon_version)
+            {
+                self.version_convergence_last_pending_noop = Some(daemon_version.clone());
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "gui",
+                        "version_convergence",
+                        "daemon_pending_noop",
+                        json!({
+                            "own_version": own_version,
+                            "newest_seen": daemon_version,
+                            "server_pid": status.server_pid,
+                            "note": "same version + daemon hot_restart_pending: no GUI restart — the daemon's own gated handoff owns this rotation",
+                        }),
+                    );
+                }
+            }
             return None;
         }
-        if !is_same_version_newer_build && !Self::is_version_newer(&daemon_version, &own_version) {
+        if !Self::is_version_newer(&daemon_version, &own_version) {
             if self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version) {
                 self.version_convergence_last_seen_daemon_version = Some(daemon_version.clone());
                 if let Ok(home) = resolve_yggterm_home() {
@@ -20251,7 +20283,7 @@ impl ShellState {
                     json!({
                         "own_version": own_version,
                         "newest_seen": daemon_version,
-                        "source": if is_same_version_newer_build { "daemon_pending" } else { "daemon" },
+                        "source": "daemon",
                         "server_pid": status.server_pid,
                     }),
                 );
@@ -38366,6 +38398,99 @@ fn close_window_after_update_restart(state: Signal<ShellState>) {
 
 /// Version convergence trigger — called when daemon status shows a newer version.
 /// Respects drafts guard and binary availability (spec-bidirectional-version-convergence.md).
+/// Durable restart-cadence guard — the GUI crash-loop breaker.
+///
+/// A restart that doesn't fix its own trigger re-arms forever: every respawn is
+/// a fresh process with fresh in-memory dedup state, so the loop counter must
+/// outlive the process. The ledger is one `kind ts_ms` pair per line in
+/// `~/.yggterm/gui-restart-cadence.jsonl`; LIMIT restarts inside WINDOW trip it,
+/// a trip blocks convergence restarts for COOLDOWN, and the trip itself files a
+/// loud incident so the loop is visible the minute it starts.
+const GUI_RESTART_CADENCE_WINDOW_MS: u128 = 10 * 60 * 1000;
+const GUI_RESTART_CADENCE_LIMIT: usize = 4;
+const GUI_RESTART_CADENCE_TRIP_COOLDOWN_MS: u128 = 30 * 60 * 1000;
+
+/// Pure verdict over cadence-ledger lines (`"restart <ms>"` / `"trip <ms>"`).
+/// Returns (restarts inside the window, a trip is younger than the cooldown).
+fn gui_restart_cadence_verdict(lines: &[&str], now_ms: u128) -> (usize, bool) {
+    let mut in_window = 0usize;
+    let mut tripped = false;
+    for line in lines {
+        let mut parts = line.split_whitespace();
+        let (kind, ts) = match (parts.next(), parts.next()) {
+            (Some(kind), Some(ts)) => (kind, ts),
+            _ => continue,
+        };
+        let Ok(ts) = ts.parse::<u128>() else { continue };
+        match kind {
+            "trip" => {
+                if now_ms.saturating_sub(ts) < GUI_RESTART_CADENCE_TRIP_COOLDOWN_MS {
+                    tripped = true;
+                }
+            }
+            _ => {
+                if now_ms.saturating_sub(ts) <= GUI_RESTART_CADENCE_WINDOW_MS {
+                    in_window += 1;
+                }
+            }
+        }
+    }
+    (in_window, tripped)
+}
+
+/// What the cadence guard decided for a would-be restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartCadenceVerdict {
+    /// Under the limit — take the restart.
+    Allowed,
+    /// This restart crossed the limit: take NO restart and say why, loudly.
+    NewlyTripped,
+    /// A trip is still inside its cooldown: take NO restart, silently.
+    Tripped,
+}
+
+/// Append one restart to the durable ledger and return the guard's verdict.
+/// File errors fail open — a missing or unwritable ledger must never block a
+/// legitimate upgrade; the guard only blocks while it can read its own trips.
+fn record_gui_restart_and_check_loop(now_ms: u128) -> RestartCadenceVerdict {
+    let Ok(home) = resolve_yggterm_home() else {
+        return RestartCadenceVerdict::Allowed;
+    };
+    let path = home.join("gui-restart-cadence.jsonl");
+    let prior = std::fs::read_to_string(&path).unwrap_or_default();
+    let (in_window, tripped_before) =
+        gui_restart_cadence_verdict(&prior.lines().collect::<Vec<_>>(), now_ms);
+    if tripped_before {
+        return RestartCadenceVerdict::Tripped;
+    }
+    if in_window + 1 <= GUI_RESTART_CADENCE_LIMIT {
+        // Keep the ledger bounded: restarts only matter inside the window.
+        let mut kept: Vec<String> = prior
+            .lines()
+            .filter(|l| {
+                let ts = l.split_whitespace().nth(1).and_then(|t| t.parse::<u128>().ok());
+                match (l.starts_with("trip "), ts) {
+                    (true, Some(ts)) => {
+                        now_ms.saturating_sub(ts) < 2 * GUI_RESTART_CADENCE_TRIP_COOLDOWN_MS
+                    }
+                    (true, None) => false,
+                    (false, Some(ts)) => now_ms.saturating_sub(ts) <= GUI_RESTART_CADENCE_WINDOW_MS,
+                    (false, None) => false,
+                }
+            })
+            .map(str::to_string)
+            .collect();
+        kept.push(format!("restart {now_ms}"));
+        let _ = std::fs::write(&path, kept.join("\n") + "\n");
+        return RestartCadenceVerdict::Allowed;
+    }
+    let _ = std::fs::write(
+        &path,
+        format!("{}trip {now_ms}\n", prior),
+    );
+    RestartCadenceVerdict::NewlyTripped
+}
+
 fn maybe_trigger_version_convergence(mut state: Signal<ShellState>) {
     // WHOEVER is newer updates the other — but the daemon→client direction is the
     // missing half. Client→daemon already exists (newer client spawns its own
@@ -38386,6 +38511,50 @@ fn maybe_trigger_version_convergence(mut state: Signal<ShellState>) {
     });
     if already_pending {
         // Already queued — the existing restart will handle it.
+        return;
+    }
+    // The crash-loop breaker, BEFORE the restart is taken: a convergence
+    // restart that does not clear its own trigger would re-arm forever (each
+    // respawn is a fresh process), so the counter lives in a durable ledger.
+    let cadence = record_gui_restart_and_check_loop(u128::from(current_millis()));
+    if cadence == RestartCadenceVerdict::Tripped {
+        return;
+    }
+    if cadence == RestartCadenceVerdict::NewlyTripped {
+        state.with_mut_counted(|shell| {
+            shell.last_action =
+                "version convergence BLOCKED by the restart-cadence guard — a restart loop was tripping"
+                    .to_string();
+            shell.push_notification(
+                NotificationTone::Warning,
+                "Restart Loop Guard",
+                format!(
+                    "{} GUI restarts in {} minutes — further auto-restarts are blocked for {} minutes while the trigger is investigated.",
+                    GUI_RESTART_CADENCE_LIMIT + 1,
+                    GUI_RESTART_CADENCE_WINDOW_MS / 60_000,
+                    GUI_RESTART_CADENCE_TRIP_COOLDOWN_MS / 60_000,
+                ),
+            );
+        });
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "gui",
+                "version_convergence",
+                "restart_storm_blocked",
+                json!({
+                    "incident": true,
+                    "incident_id": "gui_restart_storm",
+                    "severity": "error",
+                    "own_version": current_version(),
+                    "newest_seen": update.version,
+                    "restarts_in_window": GUI_RESTART_CADENCE_LIMIT + 1,
+                    "window_ms": GUI_RESTART_CADENCE_WINDOW_MS,
+                    "diagnosis": "GUI convergence restarts are looping — the same trigger survives its own restart and re-arms it",
+                    "remedy": "read version_convergence events grouped by pid; the trigger that outlives the respawn is the bug (measured 2026-09-04: same-version daemon_pending)",
+                }),
+            );
+        }
         return;
     }
     state.with_mut_counted(|shell| {
