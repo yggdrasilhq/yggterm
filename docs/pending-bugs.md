@@ -18,6 +18,61 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.47] A SAME-VERSION NEWER BUILD NEVER BECAME THE RUNNING DAEMON — THE IDLE GATE IT DEFERRED BEHIND NEVER OPENED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Owner directive (2026-09-03): "dev deploy should treat newer builds with the
+same respect as updated versions — they ARE updated versions." Measured live
+the same hour on the GUI host: daemon `running_build_id 1788437667` vs
+`on_disk_build_id 1788438101` (the 17:51 deploy), `hot_restart_pending: true`,
+blocked by "`remote-opencode://dev/1271bd1a…` was active 0s ago (idle window
+300s) **(+7 more session(s))**". The GUI half had converged; the DAEMON — the
+process that owns the PTYs — sat on the stale build.
+
+The mechanism was an asymmetry between the two handoff shapes. A
+VERSION-BUMP handoff proceeds immediately with no idle gate: the successor
+binds a DIFFERENT socket name, the old daemon lingers as the preserved owner,
+progressive migration drains it. A SAME-VERSION successor wants the SAME
+socket name the old daemon holds — the spawn died `bind_lock_busy`, exit 0 —
+so the code answered a forced request with a deferral: "the self-retire poll
+retries at the next quiet window". On a fleet host the quiet window never
+comes (eight owned agent rows reset the 300 s gate all day), so every
+ygg-ci lane merge that was not a release roll stayed a dead file on disk
+until a human ran `server app update restart` by hand. This is also the
+engine of the old [11.0] livelock (the `bind_lock_busy` +
+`swap_queue_skipped "not ahead"` cycle measured 2026-08-20).
+
+Fix: the **socket bequest**. A forced same-version handoff now takes the
+preserving arm exactly like a version bump. Before spawning the successor the
+retiree RENAMES (never unlinks) its version socket and lock to
+`*.retired-<pid>` — the listener and the flock survive on the same inodes, so
+existing clients never notice; the successor acquires a fresh lock and binds
+the canonical path; the preserved-owner registry carries the RETIRED path so
+adopters still dial the lingerer while it drains. Guards: a live successor at
+the target (probe moved above the bequest) skips the rename — renaming then
+would move the SUCCESSOR's socket; a failed spawn rolls the bequest back so
+the host is never left dark at its version's address; the unforced refusal
+and the quiet-window cold arm keep their existing lanes.
+
+Locked by `same_version_bequest_locks` (real filesystem + real flock: a
+bequest frees the canonical name AND keeps the retiree reachable at the
+retired one; the rollback restores both; the source lock
+`a_forced_same_version_handoff_is_never_deferred` pins the fall-through).
+
+**Still owed, named:** retired socket/lock files of a drained lingerer are
+inert litter (two small files per same-version swap) until the socket sweep
+learns the `.retired-<pid>` shape; retired names were deliberately kept
+parseable for exactly that sweep.
+
+**Falsifier:** deploy a newer build at the same version to a host with active
+sessions and touch nothing. Within the self-retire poll's own interval the
+daemon trace shows `same_version_socket_bequeathed` +
+`hot_update_handoff_prepared {same_version_bequest: true}` + the successor
+bound at the canonical path, and `server status` then reports
+`running_build_id == on_disk_build_id` with no `server app update restart`
+having been run by anyone.
+
 ## ⛔ [11.45] THE TITLE-RETRY ARMING LOOP — A NO-OP INSERT RENDERED 21 TIMES A SECOND UNTIL THE UI THREAD SATURATED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
