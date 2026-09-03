@@ -4762,6 +4762,20 @@ fn app() -> Element {
                                 // UNCONTROLLED — the write-back race was the
                                 // palette's does-not-let-me-type defect.
                                 revision: overlay.address_draft_revision,
+                                // THE OMNIBOX FLOURISH, handed to the
+                                // component: while a completion is active the
+                                // model's draft IS the completed text and
+                                // `address_typed_len` marks where the typing
+                                // ends, so the field adopts the draft with the
+                                // tail selected — the next keystroke types over
+                                // it, Enter accepts it. `web_surface_type_address`
+                                // (in `on_query` below) already computes and
+                                // stores the pair; this only SHOWS it.
+                                completion: overlay.address_typed_len.and_then(|len| {
+                                    let text = overlay.address_text.clone();
+                                    (len <= text.len() && text.is_char_boundary(len)).then_some(text)
+                                }),
+                                completion_typed_len: overlay.address_typed_len.unwrap_or(0),
                                 // Row 0 is what plain Enter does, so "nothing
                                 // chosen yet" and "the go row" are the same
                                 // state and the palette always has a target.
