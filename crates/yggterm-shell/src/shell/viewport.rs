@@ -7724,17 +7724,33 @@ fn TerminalCanvas(
                                 // the NEXT mount reads so the alternate-scroll
                                 // wheel gate re-opens after a switch-in.
                                 {
-                                    let mut state = state.clone();
                                     let session_path = session_path.clone();
                                     let kind = buffer_kind.clone();
-                                    spawn(async move {
-                                        state.with_mut_counted(|shell| {
-                                            shell.record_terminal_buffer_kind(
-                                                &session_path,
-                                                &kind,
-                                            );
+                                    // ⛔ NOOP-PROOF BEFORE THE SIGNAL. HostHealth
+                                    // ticks arrive continuously; recording an
+                                    // UNCHANGED kind through `with_mut_counted`
+                                    // marks the whole app dirty and costs a full
+                                    // root render per tick — this exact site was
+                                    // the top render cause (97 preceded renders in
+                                    // a 10-minute window, 2026-09-03). Read first;
+                                    // only a real change pays the render.
+                                    let unchanged = state
+                                        .read()
+                                        .terminal_last_buffer_kinds
+                                        .get(&session_path)
+                                        .map(|existing| existing == &kind)
+                                        .unwrap_or(false);
+                                    if !unchanged {
+                                        let mut state = state.clone();
+                                        spawn(async move {
+                                            state.with_mut_counted(|shell| {
+                                                shell.record_terminal_buffer_kind(
+                                                    &session_path,
+                                                    &kind,
+                                                );
+                                            });
                                         });
-                                    });
+                                    }
                                 }
                                 // Client-detected render fail pattern (e.g. a redraw
                                 // burst with no session change) — record it for later

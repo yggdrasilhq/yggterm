@@ -446,6 +446,21 @@ run_on() {  # host, command…  (stdin is NOT forwarded)
 
 push_one() {  # host, local_file, remote_path, expected_md5
   local host="$1" src="$2" dest="$3" want="$4" got
+  # ⛔ SAME BYTES, SAME INODE. Renaming a fresh copy over a byte-identical
+  # file is not a deploy — it is a re-arm of every running binary's "my exe
+  # was deleted" signal. Measured 2026-09-03 on the GUI host: sixteen
+  # same-version daemon takeovers in one hour, because every deploy rewrote
+  # four identical copies, every running daemon saw its exe deleted, spawned
+  # a successor (from the same mutable path), and every attached client
+  # dropped. The md5 is already in hand; when the host already holds these
+  # exact bytes, keep the inode and report the copy as done. A genuine new
+  # build has a different md5 and writes exactly as before.
+  got=$(run_on "$host" "md5sum \$(eval echo $dest) 2>/dev/null")
+  got=${got%% *}
+  if [ "$got" = "$want" ]; then
+    printf "  ✅ %-14s %s (same bytes, inode kept)\n" "$host" "$dest"
+    return 0
+  fi
   local write="d=\$(eval echo $dest); mkdir -p \$(dirname \$d); cat > \$d.new && chmod 755 \$d.new && mv -f \$d.new \$d"
   if is_self "$host"; then bash -c "$write" < "$src"
   else ssh "$host" "$write" < "$src"; fi

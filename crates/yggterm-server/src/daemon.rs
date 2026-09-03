@@ -5096,6 +5096,11 @@ pub(crate) struct DaemonRuntime {
     /// 30.7s, deafening the daemon while the user stared at the shadow.
     /// endpoint label → epoch-ms until which it is treated unreachable.
     preserved_owner_unreachable_until_ms: HashMap<String, u64>,
+    /// Consecutive revalidation misses per owner-endpoint label — the two-miss
+    /// grace behind `preserved_owner_revalidation_verdict`. Cleared whenever an
+    /// endpoint answers; process-local by design (a fresh daemon grants a
+    /// fresh first miss).
+    preserved_owner_consecutive_misses: HashMap<String, u32>,
     // Last relaunch-recovery attempt per runtime key (terminal-write path);
     // bounds ensure_terminal_for_path to one attempt per cooldown window.
     terminal_write_relaunch_attempted_at_ms: HashMap<String, u64>,
@@ -5322,6 +5327,7 @@ impl DaemonRuntime {
             restored_live_sessions,
             restored_remote_machines,
             preserved_owner_unreachable_until_ms: HashMap::new(),
+            preserved_owner_consecutive_misses: HashMap::new(),
             terminal_write_relaunch_attempted_at_ms: HashMap::new(),
             update_restart_state_written: false,
             update_restart_state_written_at_ms: None,
@@ -9492,6 +9498,19 @@ impl DaemonRuntime {
     /// Record the current live order into the shared row-order ledger scope
     /// and, when a request carried a client scope, into that scope too. Saves
     /// the ledger only when something changed.
+    ///
+    /// ⛔ THE REMEMBERED ORDER IS REFRESHED HERE, ON EVERY RECORD. The restore
+    /// half ([`Self::restore_row_order_from_boot_ledger`]) reconciles every
+    /// rebuild pass against `booted_with_row_order`; if that snapshot stayed
+    /// frozen at daemon boot (its old behaviour), the first rebuild pass
+    /// silently reverted every arrangement the user made since boot — and
+    /// this chokepoint then RE-RECORDED the reverted order, clobbering the
+    /// ledger too. Measured on the GUI host 2026-09-03 22:30: the user closed
+    /// the last row; the next `startup_post_bind` rebuild restore resurrected
+    /// it at a position remembered from BEFORE the user had moved it to the
+    /// end, and eighteen adjacent rows shifted down by one. With this refresh,
+    /// the snapshot and the shared scope can never disagree: "remembered"
+    /// means what the ledger remembers NOW.
     fn record_row_order_ledger(&mut self, client_scope: Option<&str>) {
         let live_order = self.server.live_session_order_keys().to_vec();
         let mut changed = self
@@ -9505,6 +9524,7 @@ impl DaemonRuntime {
         if changed && let Err(error) = self.row_order_ledger.save(self.store.home_dir()) {
             tracing::warn!(%error, "failed to save row-order ledger");
         }
+        self.booted_with_row_order = live_order;
     }
 
     /// THE restore half of the row-order ledger: after a handover rebuild has
@@ -9517,6 +9537,13 @@ impl DaemonRuntime {
     /// applied through `replace_live_session_order`, so this adds no second
     /// ordering primitive. Rows the ledger never saw keep exactly the placement
     /// the anchored import walk chose for them.
+    ///
+    /// `booted_with_row_order` is NOT a boot-time fossil: it is refreshed by
+    /// every [`Self::record_row_order_ledger`] call, so it always mirrors the
+    /// ledger's shared scope as of the last mutation. Restoring a frozen
+    /// boot-time copy was the 2026-09-03 row-jump incident (18 adjacent rows
+    /// shifted when a rebuild resurrected a closed row at a pre-arrangement
+    /// position).
     ///
     /// It cannot resurrect anything: the reconcile is a permutation of the rows
     /// this daemon already holds, so a tombstoned row sitting in the ledger
@@ -15898,8 +15925,87 @@ fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
     );
 }
 
+/// When THIS process last handed off to a SAME-VERSION successor. Zero = never.
+///
+/// ⛔ SAME-VERSION HANDOFF HYSTERESIS. A same-version content change re-arms
+/// this daemon's `disk_binary_replaced` trigger on every deploy — and on a
+/// night when main lands several merges per hour, every deploy spawned a
+/// takeover, every takeover dropped every attached client, and the host spent
+/// the evening re-attaching (measured 2026-09-03: ten takeovers in 45 minutes,
+/// one per deploy, all version-equal). The bytes still converge: the FIRST
+/// deploy after this process booted hands off immediately, later deploys are
+/// deferred for the cooldown, and the next poll after expiry retires ONCE onto
+/// whatever the newest bytes are. A real version-string bump bypasses the
+/// cooldown entirely (`newer_daemon_live` never consults it).
+#[cfg(target_os = "linux")]
+static SAME_VERSION_HANDOFF_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// One `cooldown deferred` trace per hysteresis window, not one per 20 s poll.
+#[cfg(target_os = "linux")]
+static SAME_VERSION_HANDOFF_DEFER_ANNOUNCED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How long this daemon keeps serving after a same-version handoff before it
+/// will hand off to the next one. Thirty minutes bounds the content-staleness
+/// cost while collapsing a deploy storm to at most one client-drop window per
+/// half hour.
+#[cfg(target_os = "linux")]
+const SAME_VERSION_HANDOFF_COOLDOWN_MS: u64 = 1_800_000;
+
 const PRESERVED_OWNER_REVALIDATE_INTERVAL_MS: u64 = 5 * 60_000;
 static PRESERVED_OWNER_LAST_REVALIDATE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// What one revalidation pass concludes about one preserved-owner entry.
+///
+/// Pure so the two-miss law is testable without a runtime: the chore maps a
+/// live probe to [`PreservedOwnerRevalidateVerdict`] through this and never
+/// decides on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreservedOwnerRevalidateVerdict {
+    /// The owner answered and serves the runtime — keep, and clear any misses.
+    Keep,
+    /// The owner did not answer, but this is its FIRST consecutive miss.
+    FirstMiss,
+    /// The owner missed twice in a row — dead or gone for at least one full
+    /// interval plus one probe.
+    DropUnreachable,
+    /// The owner answered but no longer owns the runtime — a positive answer,
+    /// authoritative immediately.
+    DropNotOwner,
+}
+
+/// The two-miss law for preserved-owner removal.
+///
+/// ONE unreachable status probe is a STALL, not a DEATH. A daemon that holds
+/// its runtime lock for a long chore (measured 2026-09-03: shutdown held the
+/// lock 31–125 s; `terminal_app_declares` queued 31 s behind it) misses a
+/// single 5-minute revalidation probe while perfectly alive — and the old
+/// one-miss drop destroyed the live row's registry entry on that miss, which
+/// surfaced as rows vanishing (`preserved_owner_removed` with
+/// `revalidate_owner_unreachable`, same day, same host). Two consecutive
+/// misses means the endpoint did not answer across 10+ minutes spanning a full
+/// interval; a lock holder recovers inside that. A POSITIVE answer that says
+/// "I no longer own this runtime" drops immediately — it is authoritative.
+fn preserved_owner_revalidation_verdict(
+    previous_consecutive_misses: u32,
+    probe: Option<bool>,
+) -> PreservedOwnerRevalidateVerdict {
+    match probe {
+        None => {
+            if previous_consecutive_misses >= 1 {
+                PreservedOwnerRevalidateVerdict::DropUnreachable
+            } else {
+                PreservedOwnerRevalidateVerdict::FirstMiss
+            }
+        }
+        Some(serves) => {
+            if serves {
+                PreservedOwnerRevalidateVerdict::Keep
+            } else {
+                PreservedOwnerRevalidateVerdict::DropNotOwner
+            }
+        }
+    }
+}
 
 /// Periodic preserved-owner registry revalidation (background chore thread).
 ///
@@ -15922,12 +16028,13 @@ fn run_preserved_owner_revalidation_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
     {
         return;
     }
-    let (home_dir, entries, pending_removals) = {
+    let (home_dir, entries, pending_removals, mut miss_counts) = {
         let runtime = lock_daemon_runtime(runtime, "preserved_owner_revalidation");
         (
             runtime.store.home_dir().to_path_buf(),
             runtime.preserved_terminal_owners.entries.clone(),
             Arc::clone(&runtime.pending_preserved_owner_removals),
+            runtime.preserved_owner_consecutive_misses.clone(),
         )
     };
     if entries.is_empty() {
@@ -15935,26 +16042,62 @@ fn run_preserved_owner_revalidation_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
     }
     let mut owner_statuses: HashMap<String, Option<ServerRuntimeStatus>> = HashMap::new();
     let mut dropped: Vec<(String, &'static str)> = Vec::new();
+    let mut first_misses: Vec<String> = Vec::new();
     for entry in &entries {
         let endpoint = entry.endpoint.to_endpoint();
         let label = owner_endpoint_label(&endpoint);
         let owner_status = owner_statuses
-            .entry(label)
+            .entry(label.clone())
             .or_insert_with(|| status(&endpoint).ok());
-        match owner_status {
-            None => dropped.push((entry.runtime_key.clone(), "revalidate_owner_unreachable")),
-            Some(owner_status)
-                if !preserved_owner_status_serves_runtime_key(owner_status, &entry.runtime_key) =>
-            {
+        let previous_misses = miss_counts.get(&label).copied().unwrap_or(0);
+        let serves = owner_status
+            .as_ref()
+            .map(|status| preserved_owner_status_serves_runtime_key(status, &entry.runtime_key));
+        match preserved_owner_revalidation_verdict(previous_misses, serves) {
+            PreservedOwnerRevalidateVerdict::Keep => {
+                miss_counts.remove(&label);
+            }
+            PreservedOwnerRevalidateVerdict::FirstMiss => {
+                // ⛔ Loud, never silent: the FIRST miss is the exact moment a
+                // future row-drop can still be prevented (a lock holder
+                // recovering, a socket mid-handover). One probe miss is a
+                // stall, not a death — measured 2026-09-03: shutdown held the
+                // runtime lock 31–125 s while perfectly alive.
+                first_misses.push(entry.runtime_key.clone());
+                miss_counts.insert(label, previous_misses + 1);
+            }
+            PreservedOwnerRevalidateVerdict::DropUnreachable => {
+                miss_counts.remove(&label);
+                dropped.push((entry.runtime_key.clone(), "revalidate_owner_unreachable"));
+            }
+            PreservedOwnerRevalidateVerdict::DropNotOwner => {
+                miss_counts.remove(&label);
                 dropped.push((
                     entry.runtime_key.clone(),
                     "revalidate_owner_does_not_own_runtime",
                 ));
             }
-            Some(_) => {}
         }
     }
+    if !first_misses.is_empty() {
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "hot_update",
+            "preserved_owner_revalidation_first_miss",
+            serde_json::json!({
+                "checked_entries": entries.len(),
+                "runtime_keys": first_misses,
+                "grace": "kept; drops on the NEXT consecutive miss",
+            }),
+        );
+    }
     if dropped.is_empty() {
+        // Still store the miss counts so the next pass can count consecutive
+        // misses even when this pass dropped nothing.
+        if let Ok(mut runtime) = runtime.try_lock() {
+            runtime.preserved_owner_consecutive_misses = miss_counts;
+        }
         return;
     }
     append_trace_event(
@@ -15973,6 +16116,9 @@ fn run_preserved_owner_revalidation_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
                 .collect::<Vec<_>>(),
         }),
     );
+    if let Ok(mut runtime) = runtime.try_lock() {
+        runtime.preserved_owner_consecutive_misses = miss_counts;
+    }
     let mut pending = pending_removals
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -19999,11 +20145,48 @@ fn spawn_disk_binary_version_poll(
             // which is precisely the one most likely to have adopted the
             // sessions a forced swap interrupted.
             dispatch_interrupted_session_repairs(&home_dir, &runtime);
-            // Retire trigger 1: our on-disk binary was replaced by an update.
+            // Retire trigger 1: our on-disk binary was replaced by an UPDATE.
+            // A deleted exe link alone is a WRITE signal, not an update signal:
+            // the deploy verb `mv -f`s a fresh inode over every copy on every
+            // run, including the byte-identical same-version copies the fleet
+            // CI ships every few minutes. Only DIFFERENT bytes on disk retire
+            // this daemon — see the helper for the measured incident.
             let exe_link = fs::read_link("/proc/self/exe")
                 .map(|link| link.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let binary_replaced = exe_link.ends_with(" (deleted)");
+            let mut binary_replaced = exe_link.ends_with(" (deleted)")
+                && disk_replacement_differs_from_running_bytes(&exe_link, &home_dir);
+            // Same-version handoff hysteresis: within the cooldown window after
+            // this process handed off to a version-equal successor, further
+            // same-version content deploys are served where they are — the
+            // bytes converge at the next poll after expiry. See the static's
+            // doc for the measured deploy-storm this ends.
+            if binary_replaced {
+                let now_ms = current_millis_u64();
+                let last = SAME_VERSION_HANDOFF_LAST_MS.load(Ordering::Relaxed);
+                if last != 0 && now_ms.saturating_sub(last) < SAME_VERSION_HANDOFF_COOLDOWN_MS {
+                    let announced = SAME_VERSION_HANDOFF_DEFER_ANNOUNCED_MS.load(Ordering::Relaxed);
+                    if announced == 0
+                        || now_ms.saturating_sub(announced) >= SAME_VERSION_HANDOFF_COOLDOWN_MS
+                    {
+                        SAME_VERSION_HANDOFF_DEFER_ANNOUNCED_MS.store(now_ms, Ordering::Relaxed);
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "disk_binary_handoff_cooldown_deferred",
+                            serde_json::json!({
+                                "cooldown_ms": SAME_VERSION_HANDOFF_COOLDOWN_MS,
+                                "ms_since_last_same_version_handoff":
+                                    now_ms.saturating_sub(last),
+                                "current_version": SERVER_PROTOCOL_VERSION,
+                                "current_pid": std::process::id(),
+                            }),
+                        );
+                    }
+                    binary_replaced = false;
+                }
+            }
             // Retire trigger 2: a strictly NEWER-version daemon is already live.
             // An update spawns a new-version successor, but THIS daemon's versioned
             // binary still exists on disk (different versioned path), so trigger 1
@@ -20846,6 +21029,146 @@ fn disk_replace_handoff_candidates(exe_link: &str) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .collect()
+}
+
+/// Does the file now sitting where our deleted exe lived hold DIFFERENT bytes
+/// from the binary this process is running?
+///
+/// The `disk_binary_replaced` trigger used to mean "the `/proc/self/exe` link
+/// says `(deleted)`" — which is not an update signal, it is a WRITE signal. The
+/// deploy verb replaces each copy with `cat > $d.new && mv -f` — a fresh inode —
+/// on every run, including the byte-identical same-version copies the fleet CI
+/// redeploys every few minutes. Measured on the GUI host 2026-09-03: **sixteen
+/// same-version socket bequests in one hour, six live daemons at once, 347
+/// client disconnects an hour and a UI blocking 6–11 times a minute** — every
+/// one of them a same-bytes rewrite re-arming this trigger in every running
+/// daemon, each spawning a same-version successor launched from the same
+/// mutable path, doom inherited. An update is "different bytes on disk", and
+/// only that.
+///
+/// Our own bytes stay reachable through the `/proc/self/exe` magic link even
+/// after the directory entry is gone — the kernel holds the inode open — so the
+/// honest comparison costs one read, no spawn, no hash: read both files and
+/// compare. The read is real work (~25 MB per daemon per rewrite), so it is
+/// latched on the replacement's `(len, mtime)`: a stat per poll, a full compare
+/// only when the file on disk actually changed. A `mv -f` always produces a
+/// fresh mtime, so a second same-bytes rewrite re-compares honestly — the latch
+/// remembers the last COMPARISON, never a verdict.
+///
+/// "No replacement on disk right now" (the mid-deploy window, or the backup-
+/// grave shape) answers NOT-replaced: there is nothing to hand off to, which is
+/// exactly what the old code discovered ten lines later as
+/// `replacement_binary_missing` — after it had already muted persists and
+/// entered the retire lane. The answer belongs before the lane, not inside it.
+#[cfg(target_os = "linux")]
+fn disk_replacement_differs_from_running_bytes(exe_link: &str, home_dir: &Path) -> bool {
+    // The candidate the handoff itself would pick — same helper, same order —
+    // so "differs" here and "what we spawn" can never disagree.
+    let replacement = disk_replace_handoff_candidates(exe_link)
+        .into_iter()
+        .find(|candidate| candidate.is_file());
+    let key: Option<(u64, u64)> = replacement.as_ref().map(|path| {
+        path.metadata()
+            .map(|meta| {
+                (
+                    meta.len(),
+                    meta.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0))
+    });
+    if let Some(current_key) = key
+        && let Ok(latch) = DISK_REPLACEMENT_COMPARE_LATCH.lock()
+        && latch.as_ref().is_some_and(|(latched_key, _)| *latched_key == current_key)
+    {
+        return latch.as_ref().is_some_and(|(_, differs)| *differs);
+    }
+    let differs = match replacement.as_deref() {
+        Some(path) => {
+            let verdict = files_differ_byte_for_byte(Path::new("/proc/self/exe"), path);
+            if !verdict {
+                // Trace only the SKIP: a `true` verdict flows into the existing
+                // `daemon_self_retire` event, so tracing both doubles the
+                // deploy-day noise for zero information.
+                append_trace_event(
+                    home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "disk_binary_same_bytes_redeploy_ignored",
+                    serde_json::json!({
+                        "exe_link": exe_link,
+                        "replacement": path.display().to_string(),
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": std::process::id(),
+                    }),
+                );
+            }
+            verdict
+        }
+        // Nothing on disk where our exe lived: not replaced, nothing to spawn.
+        None => false,
+    };
+    if let (Some(latch_key), Ok(mut latch)) =
+        (key, DISK_REPLACEMENT_COMPARE_LATCH.lock())
+    {
+        *latch = Some((latch_key, differs));
+    }
+    differs
+}
+
+/// Latch for [`disk_replacement_differs_from_running_bytes`]: the last
+/// comparison, keyed by the replacement's `(len, mtime)`.
+#[cfg(target_os = "linux")]
+static DISK_REPLACEMENT_COMPARE_LATCH: Mutex<Option<((u64, u64), bool)>> = Mutex::new(None);
+
+/// Byte-for-byte comparison through both paths. `/proc/<pid>/exe` is a magic
+/// link: opening it re-opens the live inode even when the directory entry says
+/// `(deleted)`. A length mismatch short-circuits before either read; a read
+/// error answers DIFFERS — the pre-fix behaviour — because failing to notice a
+/// real update strands a stale daemon, while a spurious retire merely costs one
+/// handoff, the exact trade the old code made unconditionally.
+#[cfg(target_os = "linux")]
+fn files_differ_byte_for_byte(ours: &Path, theirs: &Path) -> bool {
+    use std::io::Read;
+    let (mut ours_file, mut theirs_file) = match (
+        std::fs::File::open(ours),
+        std::fs::File::open(theirs),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return true,
+    };
+    let ours_len = ours_file
+        .metadata()
+        .map(|meta| meta.len())
+        .unwrap_or(u64::MAX);
+    let theirs_len = theirs_file
+        .metadata()
+        .map(|meta| meta.len())
+        .unwrap_or(u64::MAX);
+    if ours_len != theirs_len {
+        return true;
+    }
+    let mut ours_buf = [0u8; 64 * 1024];
+    let mut theirs_buf = [0u8; 64 * 1024];
+    loop {
+        let (n_ours, n_theirs) = match (
+            ours_file.read(&mut ours_buf),
+            theirs_file.read(&mut theirs_buf),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return true,
+        };
+        if n_ours != n_theirs || ours_buf[..n_ours] != theirs_buf[..n_theirs] {
+            return true;
+        }
+        if n_ours == 0 {
+            return false;
+        }
+    }
 }
 
 /// How long a QUEUED swap waits before a drainer tries again.
@@ -21701,6 +22024,14 @@ fn attempt_self_retire_preserving_handoff(
                 HotRestartResult::Handoff { .. } => "preserved_owner_handoff",
                 HotRestartResult::Restarting { .. } => "restart_no_owned_runtime",
             };
+            // Same-version handoff hysteresis: a version-equal successor starts
+            // THIS process's cooldown window — the next same-version content
+            // deploy is deferred until it expires. A version bump never sets
+            // it (its handoff is not deferred either).
+            if target_version.as_deref() == Some(SERVER_PROTOCOL_VERSION) {
+                SAME_VERSION_HANDOFF_LAST_MS.store(current_millis_u64(), Ordering::Relaxed);
+                SAME_VERSION_HANDOFF_DEFER_ANNOUNCED_MS.store(0, Ordering::Relaxed);
+            }
             append_trace_event(
                 home_dir,
                 "daemon",
@@ -26467,6 +26798,124 @@ mod tests {
             "the guard before SwapStep::Failed still rests on the shared file \
              alone; a peer clearing it drops this daemon into the path that \
              kills the PTYs its handoff preserved. Guard was: {failed_guard}"
+        );
+    }
+
+    /// `disk_binary_replaced` must mean "different bytes on disk", not "my
+    /// directory entry is gone".
+    ///
+    /// The deploy verb `mv -f`s a fresh inode over every copy on every run,
+    /// including byte-identical same-version copies the fleet CI redeploys
+    /// every few minutes. Measured on the GUI host 2026-09-03: sixteen
+    /// same-version socket bequests in one hour, six daemons live at once,
+    /// 347 client disconnects an hour, UI blocking 6–11 times a minute —
+    /// every one a same-bytes rewrite re-arming this trigger in every running
+    /// daemon, each spawning a successor from the same mutable path, doom
+    /// inherited. If this test fails because names changed, re-point it — do
+    /// not delete it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_byte_identical_rewrite_is_not_a_binary_replacement() {
+        let source = daemon_product_source();
+        let poll = daemon_fn_body(source.as_str(), "fn spawn_disk_binary_version_poll(");
+        let poll_code = poll
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            poll_code.contains("disk_replacement_differs_from_running_bytes"),
+            "the deleted-exe signal must be confirmed against the bytes now on \
+             disk before it retires this daemon; a deleted link alone fires on \
+             every same-version deploy"
+        );
+        let helper = daemon_fn_body(
+            source.as_str(),
+            "fn disk_replacement_differs_from_running_bytes(",
+        );
+        let helper_code = helper
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            helper_code.contains("/proc/self/exe"),
+            "the comparison must read this process's own bytes through the exe \
+             magic link — the deleted inode stays readable there"
+        );
+        assert!(
+            helper_code.contains("disk_replace_handoff_candidates"),
+            "the comparison must examine the same candidate the handoff would \
+             spawn, or 'differs' and 'what we launch' can disagree"
+        );
+        assert!(
+            helper_code.contains("DISK_REPLACEMENT_COMPARE_LATCH"),
+            "the comparison is real work on every poll while deleted; without \
+             the (len, mtime) latch it re-reads ~25 MB per daemon per 20 s"
+        );
+    }
+
+    /// ONE unreachable probe is a stall, not a death. Measured on the GUI host
+    /// 2026-09-03: a daemon holding its runtime lock 31–125 s missed a single
+    /// 5-minute revalidation probe while perfectly alive, and the one-miss drop
+    /// destroyed live rows' registry entries — the felt "row droppings".
+    /// If this test fails because names changed, re-point it — do not delete it.
+    #[test]
+    fn preserved_owner_needs_two_consecutive_misses_to_be_called_dead() {
+        use super::{PreservedOwnerRevalidateVerdict, preserved_owner_revalidation_verdict};
+        let first = preserved_owner_revalidation_verdict(0, None);
+        assert_eq!(
+            first,
+            PreservedOwnerRevalidateVerdict::FirstMiss,
+            "the first miss must be a kept-with-grace verdict, not a removal"
+        );
+        let second = preserved_owner_revalidation_verdict(1, None);
+        assert_eq!(
+            second,
+            PreservedOwnerRevalidateVerdict::DropUnreachable,
+            "the SECOND consecutive miss may drop: 10+ minutes unreachable"
+        );
+        let recovered = preserved_owner_revalidation_verdict(1, Some(true));
+        assert_eq!(
+            recovered,
+            PreservedOwnerRevalidateVerdict::Keep,
+            "an owner that answers again must clear its miss count, so an \
+             alternating alive/stalled owner is never dropped"
+        );
+        let not_owner = preserved_owner_revalidation_verdict(0, Some(false));
+        assert_eq!(
+            not_owner,
+            PreservedOwnerRevalidateVerdict::DropNotOwner,
+            "a positive 'I no longer own this runtime' answer is authoritative \
+             immediately — no grace for it"
+        );
+    }
+
+    /// The remembered row order must track the ledger's latest recorded order,
+    /// never a boot-time fossil. A frozen snapshot made every rebuild pass
+    /// revert the user's post-boot arrangement (and the chokepoint then
+    /// re-recorded the revert, clobbering the ledger) — measured 2026-09-03
+    /// 22:30: a closed row resurrected at its PRE-arrangement position and
+    /// eighteen adjacent rows shifted down by one.
+    #[test]
+    fn the_remembered_row_order_refreshes_on_every_record() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(source.as_str(), "fn record_row_order_ledger(");
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("booted_with_row_order = live_order"),
+            "record_row_order_ledger must refresh booted_with_row_order from \
+             the order it just recorded; a boot-frozen snapshot reverts every \
+             post-boot arrangement at the first rebuild pass"
+        );
+        let restore = daemon_fn_body(source.as_str(), "fn restore_row_order_from_boot_ledger(");
+        assert!(
+            restore.contains("booted_with_row_order"),
+            "the restore must keep reading the (now live) remembered order"
         );
     }
 

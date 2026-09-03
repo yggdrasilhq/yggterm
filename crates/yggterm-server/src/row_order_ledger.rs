@@ -275,10 +275,12 @@ pub fn reconcile_order_with_remembered(current: &[String], remembered: &[String]
 /// order — so the restore adds no ordering primitive of its own. A no-op
 /// reconcile does not touch the server at all.
 ///
-/// `remembered` must be the ledger as it stood BEFORE this daemon started
-/// recording (see `DaemonRuntime::booted_with_row_order`); reconciling against a
-/// ledger this daemon has already overwritten with the scramble is a no-op by
-/// construction.
+/// `remembered` must be a mirror of the ledger's shared scope as of the last
+/// recorded order — `DaemonRuntime::record_row_order_ledger` refreshes
+/// `booted_with_row_order` on every record, so the two can never disagree.
+/// (Reconciling against a ledger this daemon has already overwritten with a
+/// scramble is a no-op by construction; the defence against scrambles is that
+/// each rebuild pass reconciles BEFORE its record, not a stale snapshot.)
 pub(crate) fn restore_live_row_order(
     server: &mut crate::YggtermServer,
     remembered: &[String],
