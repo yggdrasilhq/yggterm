@@ -50,6 +50,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import uuid
 import time
 from pathlib import Path
 
