@@ -15939,6 +15939,16 @@ fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
 /// deferred for the cooldown, and the next poll after expiry retires ONCE onto
 /// whatever the newest bytes are. A real version-string bump bypasses the
 /// cooldown entirely (`newer_daemon_live` never consults it).
+///
+/// ⛔ AND THE COOLDOWN IS SEEDED AT BOOT (2026-09-04): a successor is BORN from
+/// a handoff, so its first same-version deploy used to find a zero timer and
+/// hand off immediately — with deploys landing every five minutes the chain
+/// simply continued one takeover per deploy, uptime 1m40s per daemon, and
+/// nine preserved owners piled up behind it. Seeding the clock at birth means
+/// every daemon serves at least one full cooldown window no matter how the
+/// deploy storm runs. The defer is VERSION-AWARE: it only defers a
+/// replacement that reports THIS process's own version string, so a real
+/// version bump still takes over on the first poll.
 #[cfg(target_os = "linux")]
 static SAME_VERSION_HANDOFF_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -20158,15 +20168,27 @@ fn spawn_disk_binary_version_poll(
                 .unwrap_or_default();
             let mut binary_replaced = exe_link.ends_with(" (deleted)")
                 && disk_replacement_differs_from_running_bytes(&exe_link, &home_dir);
-            // Same-version handoff hysteresis: within the cooldown window after
-            // this process handed off to a version-equal successor, further
-            // same-version content deploys are served where they are — the
-            // bytes converge at the next poll after expiry. See the static's
-            // doc for the measured deploy-storm this ends.
+            // Same-version handoff hysteresis: within the cooldown window —
+            // seeded at this process's BIRTH and re-armed by each of its own
+            // handoffs — a replacement that reports OUR OWN version string is
+            // deferred; the bytes converge at the next poll after expiry. A
+            // different version string bypasses the defer entirely: real
+            // updates take over on the first poll. See the static's doc for
+            // the measured deploy-storm this ends.
             if binary_replaced {
                 let now_ms = current_millis_u64();
+                let _ = SAME_VERSION_HANDOFF_LAST_MS.compare_exchange(
+                    0,
+                    now_ms,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 let last = SAME_VERSION_HANDOFF_LAST_MS.load(Ordering::Relaxed);
-                if last != 0 && now_ms.saturating_sub(last) < SAME_VERSION_HANDOFF_COOLDOWN_MS {
+                let in_cooldown = now_ms.saturating_sub(last) < SAME_VERSION_HANDOFF_COOLDOWN_MS;
+                let same_version = disk_replacement_version(&exe_link)
+                    .map(|version| version == SERVER_PROTOCOL_VERSION)
+                    .unwrap_or(false);
+                if in_cooldown && same_version {
                     let announced = SAME_VERSION_HANDOFF_DEFER_ANNOUNCED_MS.load(Ordering::Relaxed);
                     if announced == 0
                         || now_ms.saturating_sub(announced) >= SAME_VERSION_HANDOFF_COOLDOWN_MS
@@ -21127,6 +21149,47 @@ fn disk_replacement_differs_from_running_bytes(exe_link: &str, home_dir: &Path) 
 /// comparison, keyed by the replacement's `(len, mtime)`.
 #[cfg(target_os = "linux")]
 static DISK_REPLACEMENT_COMPARE_LATCH: Mutex<Option<((u64, u64), bool)>> = Mutex::new(None);
+
+/// The on-disk replacement's `--version`, latched on `(len, mtime)`.
+///
+/// Feeds the same-version hysteresis: the defer must know whether the bytes
+/// that replaced ours report THIS process's version string. One spawn per
+/// rewrite per daemon — the same cost class as the byte comparison — never a
+/// spawn per 20 s poll.
+#[cfg(target_os = "linux")]
+static DISK_REPLACEMENT_VERSION_LATCH: Mutex<Option<((u64, u64), String)>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+fn disk_replacement_version(exe_link: &str) -> Option<String> {
+    let replacement = disk_replace_handoff_candidates(exe_link)
+        .into_iter()
+        .find(|candidate| candidate.is_file())?;
+    let key: (u64, u64) = replacement
+        .metadata()
+        .map(|meta| {
+            (
+                meta.len(),
+                meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    if let Ok(latch) = DISK_REPLACEMENT_VERSION_LATCH.lock()
+        && latch.as_ref().is_some_and(|(latched, _)| *latched == key)
+    {
+        return latch.as_ref().map(|(_, version)| version.clone());
+    }
+    let version = crate::yggterm_executable_reported_version(&replacement);
+    if let Ok(mut latch) = DISK_REPLACEMENT_VERSION_LATCH.lock() {
+        if let Some(v) = version.clone() {
+            *latch = Some((key, v));
+        }
+    }
+    version
+}
 
 /// Byte-for-byte comparison through both paths. `/proc/<pid>/exe` is a magic
 /// link: opening it re-opens the live inode even when the directory entry says
