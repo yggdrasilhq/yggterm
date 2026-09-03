@@ -17355,7 +17355,7 @@ async fn terminal_snapshot_async(
     endpoint: ServerEndpoint,
     session_path: String,
     trace_home: &Path,
-) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>)> {
+) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>, Option<bool>)> {
     run_dedicated_terminal_io("terminal_snapshot", trace_home, move || {
         terminal_snapshot(&endpoint, &session_path)
     })
