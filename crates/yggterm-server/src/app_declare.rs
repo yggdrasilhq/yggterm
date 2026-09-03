@@ -406,6 +406,119 @@ fn is_split_opener_suffix(suffix: &str) -> bool {
     true
 }
 
+/// The per-PTY terminal-title plane (Issue Heading 34, Defect B): opencode2's
+/// TUI titles its window `OC | <session title>` per session route (measured
+/// in its own app.tsx, dev 2026-09-04), so the title STRING is per-TUI
+/// identity truth the mirror can bind non-anchor rows with. Like the witness
+/// below, this is per-reader (a restart is a new observation epoch) and
+/// split-safe: an OSC 0/2 sequence may straddle chunk boundaries, so the
+/// tracker keeps a small pending tail. The TRACE never carries the parameter
+/// (the witness law — titles carry cwds); this slot is row STATE, like the
+/// Viewing stamp, published into the session runtime on completion.
+#[derive(Debug, Default)]
+pub struct OscTitleTracker {
+    pending: String,
+}
+
+/// A real terminal title never approaches this; a runt or hostile stream
+/// that never terminates the sequence is drained rather than buffered.
+const OSC_TITLE_PENDING_MAX: usize = 1024;
+
+impl OscTitleTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one decoded PTY chunk; returns the NEWEST completed OSC 0/2
+    /// title if any sequence finished in or spanning this chunk. Split
+    /// handling: bytes after the last consumed position are retained for the
+    /// next chunk. A payload is terminated by BEL or ST; a second ESC inside
+    /// a payload aborts that capture (the bytes stay queued for rescanning
+    /// as the possible opener of the next sequence).
+    pub fn observe(&mut self, data: &str) -> Option<String> {
+        if self.pending.len() > OSC_TITLE_PENDING_MAX {
+            self.pending.clear();
+        }
+        self.pending.push_str(data);
+        let bytes = self.pending.as_bytes();
+        let mut result = None;
+        let mut consumed = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            if i + 1 >= bytes.len() || bytes[i + 1] != b']' {
+                // Not an OSC opener — could be the ESC of a split opener
+                // across chunks; keep it queued and stop scanning here.
+                break;
+            }
+            let mut j = i + 2;
+            let mut digits = 0usize;
+            let mut id: u32 = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                id = id.saturating_mul(10).saturating_add((bytes[j] - b'0') as u32);
+                digits += 1;
+                j += 1;
+            }
+            if digits == 0 || (id != 0 && id != 2) {
+                i = j.max(i + 2);
+                continue;
+            }
+            if j >= bytes.len() {
+                break; // id itself may be split; wait for more
+            }
+            if bytes[j] != b';' {
+                i = j;
+                continue;
+            }
+            // Payload: start..k until BEL or ST; a bare ESC aborts.
+            let start = j + 1;
+            let mut k = start;
+            let mut terminated = false;
+            let mut aborted = false;
+            while k < bytes.len() {
+                if bytes[k] == 0x07 {
+                    terminated = true;
+                    break;
+                }
+                if bytes[k] == 0x1b {
+                    if k + 1 < bytes.len() && bytes[k + 1] == b'\\' {
+                        terminated = true;
+                        break;
+                    }
+                    aborted = true;
+                    break;
+                }
+                k += 1;
+            }
+            if aborted {
+                i = k; // rescan from this ESC
+                continue;
+            }
+            if !terminated {
+                break; // incomplete; wait for more bytes
+            }
+            if let Some(title) = self.pending.get(start..k) {
+                let title = title.trim_end_matches(0x07 as char).trim();
+                if !title.is_empty() {
+                    result = Some(title.to_string());
+                }
+            }
+            consumed = if bytes[k] == 0x07 { k + 1 } else { k + 2 };
+            i = consumed;
+        }
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+        }
+        if self.pending.len() > OSC_TITLE_PENDING_MAX {
+            self.pending.clear();
+        }
+        result
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OscWitness {
     seen: std::collections::HashSet<&'static str>,
@@ -508,6 +621,41 @@ impl OscWitness {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_title_tracker_reassembles_a_sequence_split_across_chunks() {
+        let mut t = crate::app_declare::OscTitleTracker::new();
+        assert_eq!(t.observe("screen noise \u{1b}]2;OC | He"), None);
+        assert_eq!(
+            t.observe("llo\u{1b}\\ tail"),
+            Some("OC | Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn the_title_tracker_reads_bel_and_st_terminators_and_ignores_other_osc() {
+        let mut t = crate::app_declare::OscTitleTracker::new();
+        assert_eq!(t.observe("\u{1b}]0;OpenCode\u{7}"), Some("OpenCode".to_string()));
+        assert_eq!(t.observe("plain bytes"), None);
+        assert_eq!(
+            t.observe("\u{1b}]7717;app_declare_payload\u{7} not a title"),
+            None,
+            "non-0/2 OSC ids are the witness's business, not the title plane"
+        );
+    }
+
+    #[test]
+    fn the_title_tracker_drains_an_unterminated_payload() {
+        let mut t = crate::app_declare::OscTitleTracker::new();
+        let junk: String = std::iter::repeat("x").take(4096).collect();
+        assert_eq!(t.observe(&format!("\u{1b}]2;{junk}")), None);
+        // After the drain the tracker still works.
+        assert_eq!(
+            t.observe("\u{1b}]2;OC | Recovery\u{7}"),
+            Some("OC | Recovery".to_string())
+        );
+    }
+
     use super::*;
 
     fn osc(verb: &str, action: &str, payload: serde_json::Value) -> String {

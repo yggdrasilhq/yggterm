@@ -177,6 +177,40 @@ fn mirror_display_title(ses: &OpencodeServiceSession) -> Option<String> {
     Some(raw.to_string())
 }
 
+/// opencode2's own window-title prefix for a session route (its app.tsx:
+/// `renderer.setTerminalTitle(`OC | ${title}`)`).
+const OPENCODE_WINDOW_TITLE_PREFIX: &str = "OC | ";
+
+/// opencode2 truncates the title it puts in the window: over 40 chars
+/// becomes the first 37 + "..." (same file). Compare in the SAME window.
+fn opencode_title_window(title: &str) -> String {
+    if title.chars().count() > 40 {
+        let head: String = title.chars().take(37).collect();
+        format!("{head}...")
+    } else {
+        title.to_string()
+    }
+}
+
+/// The ONE active service session whose window-title form equals `name`;
+/// `None` when none matches or when two match (ambiguous is not identity —
+/// a fork view is fine to share, a shared NAME is not).
+fn unique_session_by_title<'a>(
+    active: &'a [OpencodeServiceSession],
+    name: &str,
+) -> Option<&'a OpencodeServiceSession> {
+    let mut found: Option<&OpencodeServiceSession> = None;
+    for session in active {
+        if opencode_title_window(session.title.as_deref().unwrap_or("")) == name {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(session);
+        }
+    }
+    found
+}
+
 fn directory_display_name(directory: Option<&String>) -> Option<String> {
     let dir = directory?;
     let name = dir.rsplit('/').find(|seg| !seg.is_empty())?;
@@ -190,6 +224,7 @@ impl YggtermServer {
         &mut self,
         active: &[OpencodeServiceSession],
         screen_live: &std::collections::HashSet<String>,
+        terminal_titles: &std::collections::HashMap<String, String>,
     ) {
         let owned = owned_tabs_from(&self.sessions);
         let plan = plan_tab_sync(active, &owned);
@@ -487,6 +522,66 @@ impl YggtermServer {
                     }
                 }
             }
+            // ⭐ PER-ROW TITLE IDENTITY (Issue Heading 34, Defect B): the
+            // focus stream stamps THE anchor; every OTHER live TUI carries
+            // its own truth on the window-title plane — opencode2 titles its
+            // window `OC | <session title>` per session route (measured in
+            // its app.tsx; `OpenCode` on home/default = no signal). Bind a
+            // live non-anchor row to the ONE service session its title
+            // names, through the same service-vouched arm the anchor rebind
+            // uses. Rails: the anchor is never overridden here (the focus
+            // stream outranks a possibly-lagged title); dead rows never
+            // bind; zero or multiple title matches bind nothing; a row
+            // already bound in agreement costs one map lookup.
+            let rows: Vec<(String, Option<String>)> = self
+                .opencode_anchor_candidates()
+                .into_iter()
+                .filter(|row| Some(row.session_path.as_str()) != Some(anchor_key.as_str()))
+                .map(|row| (row.session_path.clone(), Some(row.id.clone())))
+                .collect();
+            for (row_path, bound_id) in rows {
+                let Some(pty_title) = terminal_titles.get(&row_path) else {
+                    continue;
+                };
+                let Some(name) = pty_title.strip_prefix(OPENCODE_WINDOW_TITLE_PREFIX)
+                else {
+                    continue;
+                };
+                let Some(session) = unique_session_by_title(active, name) else {
+                    continue;
+                };
+                let Some(bound) = bound_id else { continue };
+                if bound == session.id {
+                    continue;
+                }
+                let live = self
+                    .sessions
+                    .get(&row_path)
+                    .is_some_and(|a| Self::anchor_row_is_live(a, screen_live));
+                if !live {
+                    continue;
+                }
+                if self.apply_agent_runtime_session_id_to_live_session_service_vouched(
+                    &row_path,
+                    &session.id,
+                ) {
+                    // BUS LAW: gated — tests run the apply path for state.
+                    #[cfg(not(test))]
+                    if let Ok(home_dir) = crate::resolve_yggterm_home() {
+                        yggterm_core::append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "opencode_mirror",
+                            "row_rebound_to_title_session",
+                            serde_json::json!({
+                                "row": row_path,
+                                "bound_id": bound,
+                                "title_session": session.id,
+                            }),
+                        );
+                    }
+                }
+            }
             // Issue 31 probe: the tick's identity decision, on the plane. The
             // anchor the picker chose, how many rows qualified, what the
             // service is viewing, what the anchor is bound to — and the
@@ -745,6 +840,10 @@ impl YggtermServer {
 mod tests {
     use super::*;
 
+    fn empty_titles() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
+
     fn empty_screen_live() -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
     }
@@ -885,6 +984,10 @@ mod adoption_tests {
 mod anchor_tests {
     use super::*;
 
+    fn empty_titles() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
+
     fn empty_screen_live() -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
     }
@@ -1019,7 +1122,7 @@ mod anchor_tests {
             viewed("ses_a0000000000000000000000001", 100),
             viewed("ses_b0000000000000000000000002", 200),
         ];
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live());
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &empty_titles());
         let anchor_key = server
             .opencode_anchor_key(&empty_screen_live())
             .expect("an anchor exists");
@@ -1057,7 +1160,7 @@ mod anchor_tests {
             running: true,
         };
         let active = vec![viewed("ses_b0000000000000000000000002", 200)];
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live());
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &empty_titles());
         for key in [dead, live] {
             let row = server.sessions.get(&key).expect("fixture row survives");
             assert_ne!(
@@ -1065,6 +1168,117 @@ mod anchor_tests {
                 "a dead anchor must not adopt the viewed session id",
             );
         }
+    }
+
+    #[test]
+    fn a_live_non_anchor_row_rebinds_to_the_session_its_window_title_names() {
+        let (mut server, dead, live) = server_with_two_anchors();
+        // Both rows LIVE: one wins the anchor pick (the focus stream's row),
+        // the other is exactly Defect B's stampless anchor.
+        for key in [&dead, &live] {
+            let row = server.sessions.get_mut(key).expect("fixture row");
+            row.launch_phase = crate::TerminalLaunchPhase::Running;
+            row.terminal_process_id = Some(4242);
+        }
+        for key in [&dead, &live] {
+            let new_key = key.clone();
+            let row = server.sessions.get_mut(&new_key).expect("row");
+            crate::upsert_session_metadata(
+                &mut row.metadata,
+                "Cwd",
+                "/home/user/proj".to_string(),
+            );
+        }
+        let anchor_key = server
+            .opencode_anchor_key(&empty_screen_live())
+            .expect("an anchor exists");
+        let other = if anchor_key == dead { live.clone() } else { dead.clone() };
+        let viewed = |id: &str, viewed: u128| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(format!("Tab {id}")),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: viewed,
+            running: true,
+        };
+        let active = vec![
+            viewed("ses_a0000000000000000000000001", 100),
+            viewed("ses_b0000000000000000000000002", 200),
+        ];
+        // The non-anchor TUI's window names ITS session — ses_a — while the
+        // service's focus (most-recently-viewed) is ses_b. Only the anchor
+        // follows focus; the other row follows its own title.
+        let mut titles = empty_titles();
+        titles.insert(
+            other.clone(),
+            "OC | Tab ses_a0000000000000000000000001".to_string(),
+        );
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &titles);
+        let row = server.sessions.get(&other).expect("row survives");
+        assert_eq!(
+            row.id, "ses_a0000000000000000000000001",
+            "the non-anchor row binds the session its own window title names"
+        );
+        assert!(
+            row.launch_command.contains("ses_a0000000000000000000000001"),
+            "the resume command must name the title-bound session"
+        );
+        let anchor_row = server.sessions.get(&anchor_key).expect("anchor row");
+        assert_ne!(
+            anchor_row.id, "ses_a0000000000000000000000001",
+            "the title plane must never override the anchor"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_or_prefixless_window_title_binds_nothing() {
+        let (mut server, dead, live) = server_with_two_anchors();
+        let viewed = |id: &str, viewed: u128| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some("Same".to_string()),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: viewed,
+            running: true,
+        };
+        let active = vec![viewed("ses_a0000000000000000000000001", 100), viewed("ses_b0000000000000000000000002", 200)];
+        let mut titles = empty_titles();
+        titles.insert(live.clone(), "OC | Same".to_string());
+        titles.insert(dead.clone(), "OpenCode".to_string());
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &titles);
+        for key in [&dead, &live] {
+            let row = server.sessions.get(key).expect("row survives");
+            assert_ne!(
+                row.id,
+                "ses_a0000000000000000000000001",
+                "ambiguous or prefixless titles are not identity"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_row_never_binds_from_its_window_title() {
+        let (mut server, dead, live) = server_with_two_anchors();
+        let viewed = |id: &str, viewed: u128| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(format!("Tab {id}")),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 0,
+            viewed_epoch_ms: viewed,
+            running: true,
+        };
+        let active = vec![viewed("ses_a0000000000000000000000001", 100)];
+        let mut titles = empty_titles();
+        titles.insert(
+            dead.clone(),
+            "OC | Tab ses_a0000000000000000000000001".to_string(),
+        );
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &titles);
+        let row = server.sessions.get(&dead).expect("row survives");
+        assert_ne!(
+            row.id, "ses_a0000000000000000000000001",
+            "a dead row renders nothing; its title is a ghost's word"
+        );
     }
 
     #[test]
@@ -1084,7 +1298,7 @@ mod anchor_tests {
             viewed("ses_a0000000000000000000000001", 100),
             viewed("ses_b0000000000000000000000002", 200),
         ];
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live());
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &empty_titles());
         let anchor_key = server
             .opencode_anchor_key(&empty_screen_live())
             .expect("an anchor exists");
@@ -1123,6 +1337,7 @@ mod anchor_tests {
         server.apply_opencode_tab_mirror(
             &vec![viewed("ses_a0000000000000000000000001", 100)],
             &empty_screen_live(),
+            &empty_titles(),
         );
         let with_tabs = {
             let anchor_key = server.opencode_anchor_key(&empty_screen_live()).expect("anchor");
@@ -1137,7 +1352,7 @@ mod anchor_tests {
         assert!(with_tabs, "a viewed tab stamps the viewing entry");
         // The service's active set goes quiet (no tabs anywhere): a stale
         // "Viewing …" would now be a lie about the present.
-        server.apply_opencode_tab_mirror(&[], &empty_screen_live());
+        server.apply_opencode_tab_mirror(&[], &empty_screen_live(), &empty_titles());
         let anchor_key = server.opencode_anchor_key(&empty_screen_live()).expect("anchor");
         let anchor = server.sessions.get(&anchor_key).expect("anchor row");
         assert!(
