@@ -26216,6 +26216,17 @@ and traced `startup_hot_swap_request_failed`; and the successor itself was
 born into the graveyard scope `yggterm-gui-2381266.scope` ([11.40]'s family,
 still open).
 
+**THE WEDGE IS NOW FIXED (same night, lane
+`lane/trace/resume-never-blocks-on-provision`, FIXED IN CODE — LIVE PROOF
+OWED).** The superseded sweep treats a pre-commit seat-conflict refusal
+(`SeatVerdict::Conflict` — the successor runs a DIFFERENT live child for the
+key) as a DRAINED seat: the parked reader wakes and the predecessor's
+duplicate runtime is torn down (`pty_handoff_duplicate_dropped` trace), so
+`classify_handoff_sweep` counts it toward an emptied hands (`AllMoved`) and
+the retire converges instead of refusing forever. A real failure beside drops
+still classifies `Partial`. Source-lock: classifier test
+`a_sweep_that_dropped_seat_conflict_duplicates_counts_as_drained`.
+
 Measured live on dev, 2026-09-02, TWICE the same day:
 
 1. ~20:31 — pid 3509741 (3.2.37) wrote `hot-restart-interrupted.json` naming

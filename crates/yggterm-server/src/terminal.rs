@@ -715,7 +715,19 @@ pub enum SeatVerdict {
 /// post-commit one cannot describe the same fact in two ways.
 #[cfg(target_os = "linux")]
 pub fn seat_conflict_reason(key: &str) -> String {
-    format!("refusing to adopt {key}: this daemon already runs a live PTY for it")
+    format!("refusing to adopt {key}: {SEAT_CONFLICT_MARKER}")
+}
+
+/// The stable suffix of [`seat_conflict_reason`], matched by the PREDECESSOR
+/// when it decides a refusal is permanent. A separate name so the two sides
+/// cannot drift: the successor words the refusal, the predecessor reads it.
+pub const SEAT_CONFLICT_MARKER: &str = "this daemon already runs a live PTY for it";
+
+/// True when a handoff refusal is the successor's permanent seat verdict: the
+/// successor holds a DIFFERENT live child for this key, so the caller's copy
+/// is a duplicate nobody serves and may be dropped.
+pub fn message_is_seat_conflict(message: &str) -> bool {
+    message.contains(SEAT_CONFLICT_MARKER)
 }
 
 #[derive(Debug, Clone)]

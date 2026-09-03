@@ -3,7 +3,8 @@
 This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
-## Unreleased
+
+- **A retiring daemon no longer lingers forever holding duplicate terminals the successor already owns.** The handover sweep treated one specific refusal as a retriable failure: when the successor answered "I already run a live PTY for this session" (its own re-spawned copy, a different live child), the retiring daemon kept its redundant duplicate and asked again every minute — measured: eleven refusals across ten minutes, the retire never converging, a predecessor alive 19+ minutes past its own retirement holding five remote rows and the successor itself. The sweep now recognizes that refusal as permanent: the duplicate is torn down, the seat counts as drained, and the daemon's hands empty so it can retire and its sockets die with it.
 
 - **Clicking an agent row can no longer stall for minutes on a silent CLI download.** The remote resume/start paths ran the full blocking managed-CLI ensure before attaching: if a background refresh held the machine-wide install lock, the row waited for it (measured: 89 seconds); if npm had published a newer version, the row waited for a full download and install (measured: two and a half minutes, three tarballs) — all behind a banner that showed no progress — and could leave the new client talking to an older session service. The six interactive resume/start arms now use the cheap existence probe and leave downloading to the background refresh, where it already runs on a schedule.
 

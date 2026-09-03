@@ -5523,6 +5523,8 @@ impl DaemonRuntime {
         let mut precommit = crate::pty_handoff::PrecommitSupport::default();
         let mut refused_before_commit = 0usize;
         let mut refused_after_commit = 0usize;
+        let mut dropped_duplicates = 0usize;
+        let mut dropped_keys: Vec<String> = Vec::new();
         // ⛔⛔ ATTEMPT EVERY SESSION. This loop used to `break` on the first
         // failure, so ONE stuck key abandoned every remaining runtime — measured
         // live 2026-08-14 as `readers_stood_down: 11, moved: 0`, eleven healthy
@@ -5583,6 +5585,48 @@ impl DaemonRuntime {
                             refused_before_commit += 1;
                         }
                     }
+                    // ⛔⛔ A SEAT-CONFLICT REFUSAL IS PERMANENT — drop the
+                    // duplicate instead of retrying it. The successor answered
+                    // and holds a DIFFERENT live child for this key
+                    // (`SeatVerdict::Conflict`), so our copy is a duplicate
+                    // nobody serves and the refusal will repeat every sweep.
+                    // Retrying is the wedge that kept a predecessor alive 19+
+                    // minutes holding PTY twins it could never drain (measured
+                    // on the GUI host 2026-09-04: `pty_handoff_refused` x11,
+                    // one per minute, retire never converged). The parked
+                    // reader wakes first — a parked reader must not be joined —
+                    // then the duplicate is torn down; the successor's child is
+                    // the one the user is being served by.
+                    if error.refused
+                        && !error.committed
+                        && crate::terminal::message_is_seat_conflict(&error.message)
+                    {
+                        if let Some((_, park)) = parked.iter().find(|(k, _)| k == &key) {
+                            park.unpark();
+                        }
+                        match self.terminals.remove_session(&key, None) {
+                            Ok(true) => {
+                                dropped_duplicates += 1;
+                                dropped_keys.push(key.clone());
+                                append_trace_event(
+                                    &self.store.home_dir(),
+                                    "daemon",
+                                    "lifecycle",
+                                    "pty_handoff_duplicate_dropped",
+                                    serde_json::json!({
+                                        "runtime_key": key,
+                                        "successor_version": successor_version,
+                                        "reason": error.message,
+                                    }),
+                                );
+                            }
+                            other => {
+                                first_failure = first_failure
+                                    .or(Some(format!("{key}: duplicate drop failed: {other:?}")));
+                            }
+                        }
+                        continue;
+                    }
                     first_failure = first_failure.or(Some(format!("{key}: {error}")));
                     continue;
                 }
@@ -5593,12 +5637,15 @@ impl DaemonRuntime {
         // successor now holds stay parked.
         let (held, released): (Vec<_>, Vec<_>) = parked
             .into_iter()
+            // Dropped duplicates were unparked and torn down above; their
+            // parks belong to neither half of this partition.
+            .filter(|(key, _)| !dropped_keys.contains(key))
             .partition(|(key, _)| moved_keys.contains(key));
         for (_, park) in &released {
             park.unpark();
         }
         HandoffSweepOutcome {
-            sweep: classify_handoff_sweep(total, moved, first_failure),
+            sweep: classify_handoff_sweep(total, moved, dropped_duplicates, first_failure),
             parked: held.into_iter().map(|(_, park)| park).collect(),
             successor_identity,
             stood_down,
@@ -5606,6 +5653,7 @@ impl DaemonRuntime {
             precommit: precommit.as_str(),
             refused_before_commit,
             refused_after_commit,
+            dropped_duplicates,
         }
     }
 
@@ -16569,6 +16617,7 @@ fn spawn_superseded_self_retire_sweep(
                         "precommit": outcome.precommit,
                         "refused_before_commit": outcome.refused_before_commit,
                         "refused_after_commit": outcome.refused_after_commit,
+                        "dropped_duplicates": outcome.dropped_duplicates,
                         "server_version": SERVER_PROTOCOL_VERSION,
                         "pid": std::process::id(),
                     }),
@@ -16640,6 +16689,11 @@ pub(crate) struct HandoffSweepOutcome {
     /// contested between the verdict and the seat — and the two are told apart
     /// by `precommit`.
     pub refused_after_commit: usize,
+    /// Seats the successor permanently refused because it already runs a
+    /// DIFFERENT live child for the key. Those runtimes are DROPPED (see the
+    /// sweep), not retried: retrying a permanent refusal is the wedge that
+    /// kept a predecessor alive holding PTY twins it could never drain.
+    pub dropped_duplicates: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -16656,6 +16710,7 @@ impl HandoffSweepOutcome {
             precommit: crate::pty_handoff::PrecommitSupport::Unknown.as_str(),
             refused_before_commit: 0,
             refused_after_commit: 0,
+            dropped_duplicates: 0,
         }
     }
 
@@ -16885,15 +16940,22 @@ pub(crate) enum HandoffSweep {
 pub(crate) fn classify_handoff_sweep(
     total: usize,
     moved: usize,
+    dropped: usize,
     first_failure: Option<String>,
 ) -> HandoffSweep {
+    // A dropped duplicate is a seat the successor PERMANENTLY holds with its
+    // own live child: the predecessor's hands have emptied for that key just
+    // as surely as if the descriptor had moved. Retrying it forever is the
+    // linger wedge; counting it a failure would be the same wedge with a
+    // different name.
+    let drained = moved + dropped;
     match first_failure {
-        None if moved == total => HandoffSweep::AllMoved { moved },
+        None if drained == total => HandoffSweep::AllMoved { moved },
         None => HandoffSweep::Partial {
             moved,
             reason: format!("{moved} of {total} moved with no error reported"),
         },
-        Some(reason) if moved == 0 => HandoffSweep::NoneMoved { reason },
+        Some(reason) if moved == 0 && dropped == 0 => HandoffSweep::NoneMoved { reason },
         Some(reason) => HandoffSweep::Partial { moved, reason },
     }
 }
@@ -28814,7 +28876,7 @@ mod tests {
     #[test]
     fn a_sweep_that_moved_everything_lets_the_predecessor_exit() {
         assert_eq!(
-            super::classify_handoff_sweep(3, 3, None),
+            super::classify_handoff_sweep(3, 3, 0, None),
             super::HandoffSweep::AllMoved { moved: 3 }
         );
     }
@@ -28826,7 +28888,7 @@ mod tests {
     #[test]
     fn a_sweep_that_moved_nothing_is_the_safe_failure() {
         assert_eq!(
-            super::classify_handoff_sweep(3, 0, Some("connect refused".to_string())),
+            super::classify_handoff_sweep(3, 0, 0, Some("connect refused".to_string())),
             super::HandoffSweep::NoneMoved {
                 reason: "connect refused".to_string()
             }
@@ -28841,7 +28903,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_partial_sweep_must_never_be_mistaken_for_success() {
-        let sweep = super::classify_handoff_sweep(3, 2, Some("peer died".to_string()));
+        let sweep = super::classify_handoff_sweep(3, 2, 0, Some("peer died".to_string()));
         assert_eq!(
             sweep,
             super::HandoffSweep::Partial {
@@ -28861,7 +28923,7 @@ mod tests {
     #[test]
     fn a_short_count_with_no_error_is_still_not_success() {
         assert!(matches!(
-            super::classify_handoff_sweep(3, 2, None),
+            super::classify_handoff_sweep(3, 2, 0, None),
             super::HandoffSweep::Partial { moved: 2, .. }
         ));
     }
@@ -28872,6 +28934,26 @@ mod tests {
     /// the bug this whole mechanism exists to close. A pid whose start time has
     /// moved is a different process wearing a reused number.
     #[cfg(target_os = "linux")]
+    /// A dropped duplicate is a DRAINED seat, not a failure: the successor
+    /// permanently holds the key with its own live child, so a sweep that
+    /// moved some and dropped the rest emptied this daemon's hands and may
+    /// report AllMoved. Retrying the refusal was the linger wedge (measured
+    /// 2026-09-04: 11 refusals, one per minute, retire never converged).
+    #[test]
+    fn a_sweep_that_dropped_seat_conflict_duplicates_counts_as_drained() {
+        // 1 moved + 2 dropped = all 3 seats off our hands, no failure.
+        let sweep = super::classify_handoff_sweep(3, 1, 2, None);
+        assert!(
+            matches!(sweep, super::HandoffSweep::AllMoved { moved: 1 }),
+            "a fully drained sweep must classify AllMoved, got {sweep:?}"
+        );
+        // Drops do not mask a real failure either.
+        let sweep = super::classify_handoff_sweep(3, 1, 1, Some("peer died".to_string()));
+        assert!(
+            matches!(sweep, super::HandoffSweep::Partial { moved: 1, .. }),
+            "a real failure alongside drops stays Partial, got {sweep:?}"
+        );
+    }
     #[test]
     fn a_successor_is_identified_by_pid_and_start_time_together() {
         let me = std::process::id();
