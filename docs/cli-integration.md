@@ -1615,7 +1615,14 @@ it lands on the bus from CI within the hour.
 
 1. Defect B — per-TUI identity for N anchors (design unit, spec first).
 2. The no-persisted-row cold-restore candidate (measured unit).
-3. Muse live-row Storage stamp on the rescue candidate (measure first).
+3. CLOSED 2026-09-04 (code-verified, daemon.rs live-agent arm): the
+   Storage stamp always rides the candidate for generated-copy kinds —
+   a stampless live muse row is never a rescue candidate at all, so the
+   rescue never sees a row key. Residual watch: muse rows whose rebind
+   poll never records a Storage stamp rescue only via their own store
+   (as designed for store-authoritative CLIs; muse is Generated, so a
+   long-lived stampless muse row would stay birth-titled — if observed,
+   teach the muse reader's find_muse_session_jsonl_in to feed the stamp).
 4. Wheel-gate first-wheel falsifier (needs owner's hands).
 5. [interrupted-orphan] linger root cause (deploy plane).
 6. opencode2 descriptor `Generated` label drift (cosmetic).
@@ -1691,4 +1698,11 @@ stamp.
   measurement per CLI.
 * The no-persisted-row cold-restore candidate (Issue 33 queue item 2) —
   unchanged.
-* Muse live-row rescue stamps — measured separately.
+* Muse live-row rescue stamps — MEASURED 2026-09-04, closed: the chore's
+  live-agent arm never emits a stampless candidate for generated-copy
+  kinds — it requires the `Storage` metadata entry (`.jsonl` and exists,
+  recorded by the rebind poll) and `continue`s otherwise, so the rescue's
+  `transcript_rescue_path` only ever sees a real transcript path. The
+  Issue 33 hedge below ("falls back to the row key") described a path the
+  candidate builder never takes; live muse rows on dev carry birth titles
+  ("New dev Muse Code") exactly as this predicts until they work.
