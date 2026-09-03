@@ -5,6 +5,8 @@ This file tracks user-visible changes in `yggterm`.
 ## Unreleased
 ## Unreleased
 
+- **A slow or struggling daemon no longer freezes the keys you are typing into a recovering terminal.** When a remote terminal surface looks blank or disconnected, the GUI runs a short recovery dance - it asks the daemon for the terminal snapshot and, if needed, rebuilds the session. Those questions used to be asked from the middle of the terminal event loop, so every keystroke queued behind a full daemon round trip: measured holds of 1.4 s on remote agent rows, exactly when the daemon was least able to answer fast. All five recovery round trips now run as background work with their results applied on their own loop branch - same checks, same order, same traces, nothing waiting on the typing path.
+
 - **Clicking an agent row can no longer stall for minutes on a silent CLI download.** The remote resume/start paths ran the full blocking managed-CLI ensure before attaching: if a background refresh held the machine-wide install lock, the row waited for it (measured: 89 seconds); if npm had published a newer version, the row waited for a full download and install (measured: two and a half minutes, three tarballs) — all behind a banner that showed no progress — and could leave the new client talking to an older session service. The six interactive resume/start arms now use the cheap existence probe and leave downloading to the background refresh, where it already runs on a schedule.
 
 

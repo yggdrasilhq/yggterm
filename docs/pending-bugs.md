@@ -436,10 +436,16 @@ by `the_js_event_daemon_rpcs_leave_the_select_loop`,
 (2064); the 8 red server tests fail identically on pristine HEAD
 (environmental, the npm-symlink class).
 
-**Still open, deliberately:** the HostHealth arm's recovery RPCs (snapshot
-replays, ensure-recoveries) remain inline - attempt-counters gate them and
-moving them wants the same channel treatment as one sweep, not a rush; the
-web-surface/sidebar-declare arms' loopback awaits are rare (OSC events only).
+**SWEEP LANDED 2026-09-04 (lane/trace/recovery-rpc-sweep):** the "still
+open" half is closed - the whole HostHealth recovery cascade (non-prompt
+snapshot replay, retained recovery, blank-host snapshot replay,
+blank-retry-poison recovery, transport-error recovery) moved off-loop
+through the existing channel: gates and attempt-counters stay at event
+time, each RPC spawns, results apply on their own select branch with the
+event-time guard inputs (cursor/text tails, session-kind flags) carried in
+the message so decisions read the values the event saw. The
+web-surface/sidebar-declare loopback awaits stay as they were (rare, OSC
+events only).
 The memory-pressure half of the hang (4-5 GB swap, GUI pages swapped) is
 host state, not this fix's - a swap cycle or the [11.40] scope work is the
 structural remedy.
