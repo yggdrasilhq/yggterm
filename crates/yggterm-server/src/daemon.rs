@@ -19999,11 +19999,17 @@ fn spawn_disk_binary_version_poll(
             // which is precisely the one most likely to have adopted the
             // sessions a forced swap interrupted.
             dispatch_interrupted_session_repairs(&home_dir, &runtime);
-            // Retire trigger 1: our on-disk binary was replaced by an update.
+            // Retire trigger 1: our on-disk binary was replaced by an UPDATE.
+            // A deleted exe link alone is a WRITE signal, not an update signal:
+            // the deploy verb `mv -f`s a fresh inode over every copy on every
+            // run, including the byte-identical same-version copies the fleet
+            // CI ships every few minutes. Only DIFFERENT bytes on disk retire
+            // this daemon — see the helper for the measured incident.
             let exe_link = fs::read_link("/proc/self/exe")
                 .map(|link| link.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let binary_replaced = exe_link.ends_with(" (deleted)");
+            let binary_replaced = exe_link.ends_with(" (deleted)")
+                && disk_replacement_differs_from_running_bytes(&exe_link, &home_dir);
             // Retire trigger 2: a strictly NEWER-version daemon is already live.
             // An update spawns a new-version successor, but THIS daemon's versioned
             // binary still exists on disk (different versioned path), so trigger 1
@@ -20846,6 +20852,146 @@ fn disk_replace_handoff_candidates(exe_link: &str) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .collect()
+}
+
+/// Does the file now sitting where our deleted exe lived hold DIFFERENT bytes
+/// from the binary this process is running?
+///
+/// The `disk_binary_replaced` trigger used to mean "the `/proc/self/exe` link
+/// says `(deleted)`" — which is not an update signal, it is a WRITE signal. The
+/// deploy verb replaces each copy with `cat > $d.new && mv -f` — a fresh inode —
+/// on every run, including the byte-identical same-version copies the fleet CI
+/// redeploys every few minutes. Measured on the GUI host 2026-09-03: **sixteen
+/// same-version socket bequests in one hour, six live daemons at once, 347
+/// client disconnects an hour and a UI blocking 6–11 times a minute** — every
+/// one of them a same-bytes rewrite re-arming this trigger in every running
+/// daemon, each spawning a same-version successor launched from the same
+/// mutable path, doom inherited. An update is "different bytes on disk", and
+/// only that.
+///
+/// Our own bytes stay reachable through the `/proc/self/exe` magic link even
+/// after the directory entry is gone — the kernel holds the inode open — so the
+/// honest comparison costs one read, no spawn, no hash: read both files and
+/// compare. The read is real work (~25 MB per daemon per rewrite), so it is
+/// latched on the replacement's `(len, mtime)`: a stat per poll, a full compare
+/// only when the file on disk actually changed. A `mv -f` always produces a
+/// fresh mtime, so a second same-bytes rewrite re-compares honestly — the latch
+/// remembers the last COMPARISON, never a verdict.
+///
+/// "No replacement on disk right now" (the mid-deploy window, or the backup-
+/// grave shape) answers NOT-replaced: there is nothing to hand off to, which is
+/// exactly what the old code discovered ten lines later as
+/// `replacement_binary_missing` — after it had already muted persists and
+/// entered the retire lane. The answer belongs before the lane, not inside it.
+#[cfg(target_os = "linux")]
+fn disk_replacement_differs_from_running_bytes(exe_link: &str, home_dir: &Path) -> bool {
+    // The candidate the handoff itself would pick — same helper, same order —
+    // so "differs" here and "what we spawn" can never disagree.
+    let replacement = disk_replace_handoff_candidates(exe_link)
+        .into_iter()
+        .find(|candidate| candidate.is_file());
+    let key: Option<(u64, u64)> = replacement.as_ref().map(|path| {
+        path.metadata()
+            .map(|meta| {
+                (
+                    meta.len(),
+                    meta.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0))
+    });
+    if let Some(current_key) = key
+        && let Ok(latch) = DISK_REPLACEMENT_COMPARE_LATCH.lock()
+        && latch.as_ref().is_some_and(|(latched_key, _)| *latched_key == current_key)
+    {
+        return latch.as_ref().is_some_and(|(_, differs)| *differs);
+    }
+    let differs = match replacement.as_deref() {
+        Some(path) => {
+            let verdict = files_differ_byte_for_byte(Path::new("/proc/self/exe"), path);
+            if !verdict {
+                // Trace only the SKIP: a `true` verdict flows into the existing
+                // `daemon_self_retire` event, so tracing both doubles the
+                // deploy-day noise for zero information.
+                append_trace_event(
+                    home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "disk_binary_same_bytes_redeploy_ignored",
+                    serde_json::json!({
+                        "exe_link": exe_link,
+                        "replacement": path.display().to_string(),
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": std::process::id(),
+                    }),
+                );
+            }
+            verdict
+        }
+        // Nothing on disk where our exe lived: not replaced, nothing to spawn.
+        None => false,
+    };
+    if let (Some(latch_key), Ok(mut latch)) =
+        (key, DISK_REPLACEMENT_COMPARE_LATCH.lock())
+    {
+        *latch = Some((latch_key, differs));
+    }
+    differs
+}
+
+/// Latch for [`disk_replacement_differs_from_running_bytes`]: the last
+/// comparison, keyed by the replacement's `(len, mtime)`.
+#[cfg(target_os = "linux")]
+static DISK_REPLACEMENT_COMPARE_LATCH: Mutex<Option<((u64, u64), bool)>> = Mutex::new(None);
+
+/// Byte-for-byte comparison through both paths. `/proc/<pid>/exe` is a magic
+/// link: opening it re-opens the live inode even when the directory entry says
+/// `(deleted)`. A length mismatch short-circuits before either read; a read
+/// error answers DIFFERS — the pre-fix behaviour — because failing to notice a
+/// real update strands a stale daemon, while a spurious retire merely costs one
+/// handoff, the exact trade the old code made unconditionally.
+#[cfg(target_os = "linux")]
+fn files_differ_byte_for_byte(ours: &Path, theirs: &Path) -> bool {
+    use std::io::Read;
+    let (mut ours_file, mut theirs_file) = match (
+        std::fs::File::open(ours),
+        std::fs::File::open(theirs),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return true,
+    };
+    let ours_len = ours_file
+        .metadata()
+        .map(|meta| meta.len())
+        .unwrap_or(u64::MAX);
+    let theirs_len = theirs_file
+        .metadata()
+        .map(|meta| meta.len())
+        .unwrap_or(u64::MAX);
+    if ours_len != theirs_len {
+        return true;
+    }
+    let mut ours_buf = [0u8; 64 * 1024];
+    let mut theirs_buf = [0u8; 64 * 1024];
+    loop {
+        let (n_ours, n_theirs) = match (
+            ours_file.read(&mut ours_buf),
+            theirs_file.read(&mut theirs_buf),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return true,
+        };
+        if n_ours != n_theirs || ours_buf[..n_ours] != theirs_buf[..n_theirs] {
+            return true;
+        }
+        if n_ours == 0 {
+            return false;
+        }
+    }
 }
 
 /// How long a QUEUED swap waits before a drainer tries again.
@@ -26467,6 +26613,60 @@ mod tests {
             "the guard before SwapStep::Failed still rests on the shared file \
              alone; a peer clearing it drops this daemon into the path that \
              kills the PTYs its handoff preserved. Guard was: {failed_guard}"
+        );
+    }
+
+    /// `disk_binary_replaced` must mean "different bytes on disk", not "my
+    /// directory entry is gone".
+    ///
+    /// The deploy verb `mv -f`s a fresh inode over every copy on every run,
+    /// including byte-identical same-version copies the fleet CI redeploys
+    /// every few minutes. Measured on the GUI host 2026-09-03: sixteen
+    /// same-version socket bequests in one hour, six daemons live at once,
+    /// 347 client disconnects an hour, UI blocking 6–11 times a minute —
+    /// every one a same-bytes rewrite re-arming this trigger in every running
+    /// daemon, each spawning a successor from the same mutable path, doom
+    /// inherited. If this test fails because names changed, re-point it — do
+    /// not delete it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_byte_identical_rewrite_is_not_a_binary_replacement() {
+        let source = daemon_product_source();
+        let poll = daemon_fn_body(source.as_str(), "fn spawn_disk_binary_version_poll(");
+        let poll_code = poll
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            poll_code.contains("disk_replacement_differs_from_running_bytes"),
+            "the deleted-exe signal must be confirmed against the bytes now on \
+             disk before it retires this daemon; a deleted link alone fires on \
+             every same-version deploy"
+        );
+        let helper = daemon_fn_body(
+            source.as_str(),
+            "fn disk_replacement_differs_from_running_bytes(",
+        );
+        let helper_code = helper
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            helper_code.contains("/proc/self/exe"),
+            "the comparison must read this process's own bytes through the exe \
+             magic link — the deleted inode stays readable there"
+        );
+        assert!(
+            helper_code.contains("disk_replace_handoff_candidates"),
+            "the comparison must examine the same candidate the handoff would \
+             spawn, or 'differs' and 'what we launch' can disagree"
+        );
+        assert!(
+            helper_code.contains("DISK_REPLACEMENT_COMPARE_LATCH"),
+            "the comparison is real work on every poll while deleted; without \
+             the (len, mtime) latch it re-reads ~25 MB per daemon per 20 s"
         );
     }
 
