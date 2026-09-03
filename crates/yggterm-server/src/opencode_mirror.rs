@@ -435,14 +435,14 @@ impl YggtermServer {
             // focus stream is the vouch (the same stream tab-row births
             // already trust); and the rebind is a no-op on every tick where
             // the bound id already agrees, so a quiet TUI costs one compare.
-            let anchor_live = self.sessions.get(&anchor_key).is_some_and(|a| {
-                a.terminal_process_id.is_some()
-                    || matches!(
-                        a.launch_phase,
-                        crate::TerminalLaunchPhase::Running
-                            | crate::TerminalLaunchPhase::RemoteBootstrap
-                    )
-            });
+            // One liveness predicate for the picker and the tick ([11.47]):
+            // a screen-verdict `working` row is live even when pid/phase
+            // bookkeeping was lost, and the rebind must hear about its
+            // session switches just as the probe below does.
+            let anchor_live = self
+                .sessions
+                .get(&anchor_key)
+                .is_some_and(|a| Self::anchor_row_is_live(a, screen_live));
             if anchor_live {
                 if let Some(ses_id) = viewing.clone() {
                     let bound = self.sessions.get(&anchor_key).map(|a| a.id.clone());
@@ -1013,8 +1013,10 @@ mod anchor_tests {
             viewed("ses_a0000000000000000000000001", 100),
             viewed("ses_b0000000000000000000000002", 200),
         ];
-        server.apply_opencode_tab_mirror(&active);
-        let anchor_key = server.opencode_anchor_key().expect("an anchor exists");
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live());
+        let anchor_key = server
+            .opencode_anchor_key(&empty_screen_live())
+            .expect("an anchor exists");
         let anchor = server.sessions.get(&anchor_key).expect("anchor row");
         // The anchor was born wearing its row uuid as its id — the
         // phantom-resume class. After the tick its identity is the session
@@ -1049,7 +1051,7 @@ mod anchor_tests {
             running: true,
         };
         let active = vec![viewed("ses_b0000000000000000000000002", 200)];
-        server.apply_opencode_tab_mirror(&active);
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live());
         for key in [dead, live] {
             let row = server.sessions.get(&key).expect("fixture row survives");
             assert_ne!(
