@@ -39,7 +39,7 @@
 //!
 //! | record | when | why it earns its bytes |
 //! |---|---|---|
-//! | `media/playback_window` | every 5 s while playing | the always-on aggregate; keeps fps and clock-ratio honest without a record per frame |
+//! | `media/playback_window` | every 5 s while playing | the always-on aggregate; keeps fps and clock-ratio honest without a record per frame — and carries the `raf_*` compositor-cadence fields, because a healthy media clock with a hole-riddled compositor cadence is exactly the "stats say nothing, but it stutters" report and no presented-frame counter can see it |
 //! | `media/quality_change` | the `resize` event | ⭐ a BOUNDARY, and the direct answer to "the quality dropped" — a resolution transition is the ladder moving |
 //! | `media/stall` | `waiting`/`stalled` | an OUTLIER; the thing that did not happen in the steady state |
 //! | `media/attach` / `media/ended` / `media/error` | lifecycle edges | boundaries; a window is uninterpretable without knowing what it belongs to |
@@ -178,7 +178,11 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
       // Did the callback REGISTER, and did it ever actually FIRE? Two
       // different facts, and conflating them is what made this probe report a
       // healthy playback as zero frames. See `closeWindow`.
-      rvfc: true, everFired: false
+      rvfc: true, everFired: false,
+      // The COMPOSITOR cadence half — see the rAF loop below for why rVFC
+      // alone cannot answer "is it choppy". Exact per-window gaps, one array
+      // of ≤ a few hundred small numbers, reset every window.
+      rafArmed: false, rafFrames: 0, rafLast: null, rafGaps: []
     };
     // rVFC: one counter increment per presented frame. The engine's own
     // `presentedFrames` in the metadata is cumulative and trustworthy — unlike
@@ -197,6 +201,33 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
     } else {
       st.rvfc = false;
     }
+    // ⭐ THE CADENCE HALF OF THE PROBE. rVFC counts the frames the MEDIA
+    // pipeline presented, and a healthy pipeline presents every frame on its
+    // own clock — measured on the live host through a visibly choppy
+    // playback: rVFC said 60 fps and clock_ratio 1.0 while the page's
+    // requestAnimationFrame cadence carried 250 ms holes. That is exactly the
+    // "stats for nerds shows nothing dropped but it stutters" complaint, and
+    // no media-pipeline counter can ever see it: the shortfall is in the
+    // frames the COMPOSITOR walked in, not the frames the decoder made.
+    //
+    // So while the element is armed we also walk rAF — the page's own view of
+    // the compositor — and keep each inter-frame gap. The loop re-registers
+    // only while `live` holds this element, exactly like the rVFC loop above:
+    // disarm stops it with no separate timer.
+    if (typeof requestAnimationFrame === "function") {
+      st.rafArmed = true;
+      var raf = function (t) {
+        if (!live.has(mid)) { return; }   // disarmed: stop re-registering
+        if (st.rafLast !== null) {
+          var gap = t - st.rafLast;
+          if (gap >= 0) { st.rafGaps.push(gap); }
+        }
+        st.rafLast = t;
+        st.rafFrames++;
+        requestAnimationFrame(raf);
+      };
+      requestAnimationFrame(raf);
+    }
     st.timer = setInterval(function () { closeWindow(mid, false); }, WINDOW_MS);
     live.set(mid, st);
   }
@@ -210,6 +241,7 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
     var media = el.currentTime - st.m0;
     if (wall <= 0) { return; }
     var s = shape(el);
+    var cad = rafStats(st, wall);
     emit("playback_window", {
       mid: s.mid, vw: s.vw, vh: s.vh, dw: s.dw, dh: s.dh, dpr: s.dpr,
       // ⛔ MEASURED, never the nominal 5000 — the interval can overrun when the
@@ -234,6 +266,14 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
       fps: st.everFired ? Math.round((st.presented / wall) * 10) / 10 : null,
       // The engine's cumulative frame count, if it gave us one.
       presented_total: st.lastPresented,
+      // ⭐ The compositor cadence the eye actually watches: the page's own
+      // requestAnimationFrame gaps over this window. `fps` above can read
+      // perfect while these holes are huge — that combination IS "the stats
+      // say nothing is wrong but it stutters".
+      raf_frames: cad.raf_frames, raf_fps: cad.raf_fps,
+      raf_p50_ms: cad.raf_p50_ms, raf_p95_ms: cad.raf_p95_ms,
+      raf_max_ms: cad.raf_max_ms, raf_over_25: cad.raf_over_25,
+      raf_blind: cad.raf_blind,
       // ⭐ The headline number: media seconds per wall second. 1.0 is healthy;
       // below 1.0 with no stall is the pipeline failing to keep real time.
       clock_ratio: Math.round((media / wall) * 1000) / 1000,
@@ -250,10 +290,40 @@ pub const MEDIA_TRACE_SHIM_JS: &str = r#"(function(){
       live.delete(mid);
     } else {
       st.t0 = t1; st.m0 = el.currentTime; st.presented = 0; st.waits = 0;
+      st.rafFrames = 0; st.rafLast = null; st.rafGaps = [];
     }
   }
 
   function disarm(el) { closeWindow(midOf(el), true); }
+
+  // The cadence aggregate for one closed window: exact percentiles from the
+  // window's own gap list (≤ a few hundred entries — one sort per 5 s, no
+  // reservoir math), or the blind shape. Same law as `frames_blind`: an
+  // instrument that never saw a frame must not report a number that reads as
+  // "perfectly smooth".
+  function rafStats(st, wall) {
+    if (!st.rafArmed || st.rafFrames === 0) {
+      return { raf_frames: null, raf_fps: null, raf_p50_ms: null,
+               raf_p95_ms: null, raf_max_ms: null, raf_over_25: null,
+               raf_blind: st.rafArmed };
+    }
+    var gaps = st.rafGaps.slice().sort(function (a, b) { return a - b; });
+    var pick = function (p) {
+      if (!gaps.length) { return null; }
+      return Math.round(gaps[Math.min(gaps.length - 1, Math.floor(p * gaps.length))] * 10) / 10;
+    };
+    var over25 = 0;
+    for (var i = 0; i < gaps.length; i++) { if (gaps[i] > 25) { over25++; } }
+    return {
+      raf_frames: st.rafFrames,
+      raf_fps: Math.round((st.rafFrames / wall) * 10) / 10,
+      raf_p50_ms: pick(0.5),
+      raf_p95_ms: pick(0.95),
+      raf_max_ms: gaps.length ? Math.round(gaps[gaps.length - 1] * 10) / 10 : null,
+      raf_over_25: over25,
+      raf_blind: false
+    };
+  }
 
   // ── the hooks ──
   // Capture-phase listeners on the document. Media events do NOT bubble, but
@@ -614,6 +684,44 @@ mod tests {
         assert!(
             !MEDIA_TRACE_SHIM_JS.contains("window_ms: WINDOW_MS"),
             "window_ms must never be the nominal interval"
+        );
+    }
+
+    /// ⭐ The cadence half, and the complaint it exists for.
+    ///
+    /// Measured on the live host (2026-09-04) through a playback the user
+    /// called choppy: rVFC presented 60 fps with `clock_ratio` 1.00 and zero
+    /// media stalls, while the page's rAF cadence ran p95 32 ms with a
+    /// 248 ms hole — and pausing the video cleaned the cadence (p95 17 ms)
+    /// without touching the page. The media pipeline was innocent; the
+    /// shortfall was in compositor frames. A probe that only counted
+    /// presented frames would have called that playback perfect forever,
+    /// which is precisely the "stats for nerds shows nothing dropped but it
+    /// stutters" report this field group answers.
+    #[test]
+    fn the_window_carries_the_compositor_cadence_and_never_a_silent_zero() {
+        let code = shim_code();
+        assert!(
+            code.contains("st.rafArmed = true;"),
+            "arming playback must also arm the rAF cadence walker"
+        );
+        assert!(
+            code.matches("if (!live.has(mid)) { return; }").count() >= 2,
+            "the rAF loop must be disarmed by the same `live` gate as rVFC, or it \
+             outlives the window and reports gaps from a paused element"
+        );
+        assert!(
+            code.contains("raf_blind: st.rafArmed"),
+            "a cadence that never fired must report blind, not smooth"
+        );
+        assert!(
+            code.contains("raf_frames: null"),
+            "blind cadence fields must be null, never 0 — null and zero are \
+             opposite findings, as with `frames_blind`"
+        );
+        assert!(
+            code.contains("raf_max_ms: gaps.length ?"),
+            "max gap is exact, taken from the window's own gap list"
         );
     }
 }
