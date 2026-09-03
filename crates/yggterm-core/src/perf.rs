@@ -94,12 +94,16 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
         // start and lies about coverage. `codex_geometry` (viewport squish
         // repair), `resume_decision` (the resume-or-rebirth fork every non-CC
         // resume passes through), `scan`/`scan_total` (the per-CLI store-scan
-        // counts that verdict startpage/cwdtree truth).
+        // counts that verdict startpage/cwdtree truth), `wheel_gate` (the
+        // mount wheel handler's own decision with the gate's inputs —
+        // transition-only per mount, so a wheel that scrolls scrollback on a
+        // fullscreen TUI arrives with the closed rail visible).
         for probe in [
             "cli/codex_geometry",
             "cli/resume_decision",
             "cli/scan",
             "cli/scan_total",
+            "cli/wheel_gate",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }

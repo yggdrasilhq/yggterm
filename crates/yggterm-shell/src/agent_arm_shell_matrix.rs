@@ -539,6 +539,7 @@ impl ShellArm {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            pty_in_alternate_screen: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,

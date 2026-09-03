@@ -5982,7 +5982,7 @@ fn TerminalCanvas(
             let initial_grid =
                 state.with(|shell| initial_terminal_grid_for_mount(shell, &session_path));
             let initial_buffer_kind =
-                state.with(|shell| shell.last_known_terminal_buffer_kind(&session_path));
+                state.with(|shell| shell.mount_buffer_kind_seed(&session_path));
             let mut eval = terminal_document.eval(terminal_eval_script_with_pinned_grid_seeded(
                 &host_id,
                 &theme,
@@ -9337,6 +9337,43 @@ fn TerminalCanvas(
                                         "enabled": enabled,
                                         "suppressed": suppressed,
                                     }),
+                                );
+                            }
+                            Ok(TerminalJsEvent::WheelGate {
+                                decision,
+                                buffer_kind,
+                                tracking,
+                                input_enabled,
+                                owns_input,
+                            }) => {
+                                // The wheel-gate probe (Issue 31 follow-up):
+                                // the mount's wheel handler witnessed its own
+                                // decision with the gate's inputs. Content-free
+                                // — classifications only, nothing from the
+                                // screen. Mirrored to the ytrace bus as
+                                // `cli/wheel_gate` so a wheel that scrolls
+                                // scrollback on a fullscreen TUI is one filter
+                                // away, not one jsonl grep.
+                                let wheel_gate_payload = json!({
+                                    "session_path": session_path.clone(),
+                                    "decision": decision,
+                                    "buffer_kind": buffer_kind,
+                                    "tracking": tracking,
+                                    "input_enabled": input_enabled,
+                                    "owns_input": owns_input,
+                                });
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "wheel_gate_probe",
+                                    wheel_gate_payload.clone(),
+                                );
+                                yggterm_core::perf::ytrace_emit_event(
+                                    "ui",
+                                    "cli",
+                                    "wheel_gate",
+                                    wheel_gate_payload,
                                 );
                             }
                             Ok(TerminalJsEvent::FrameHash {

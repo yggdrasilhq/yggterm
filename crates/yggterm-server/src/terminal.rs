@@ -1412,6 +1412,29 @@ impl TerminalManager {
             .map(|session| session.screen_snapshot())
     }
 
+    /// Whether the daemon's own vt100 parser currently holds this session in
+    /// the alternate screen — the AUTHORITATIVE answer to "is a fullscreen
+    /// TUI live on this PTY", independent of any client mount.
+    ///
+    /// A fresh client xterm starts on the normal buffer knowing nothing, and
+    /// a TUI that went fullscreen before the mount never re-says its buffer
+    /// DECSETs for a client it cannot see — so client-observed buffer kind
+    /// reads `normal` on exactly the rows that need `alternate` (measured
+    /// 2026-09-03: the wheel gate stayed closed on every fresh opencode
+    /// mount, and "normal" re-seeded itself across remounts). The daemon's
+    /// parser watched the PTY since birth; its answer outranks the mount's.
+    /// `None` = no live screen here (unowned key, runtime gone) — honest
+    /// unknown, never synthesized.
+    pub fn session_in_alternate_screen(&self, key: &str) -> Option<bool> {
+        self.sessions.get(key).and_then(|session| {
+            session
+                .screen_state
+                .lock()
+                .ok()
+                .map(|state| state.parser.screen().alternate_screen())
+        })
+    }
+
     /// The session's clean scrolled-off history rows (vt100 scrollback ring).
     /// See `PtySessionRuntime::history_rows` — near-empty for cursor-addressed
     /// in-place repaint TUIs (codex), populated for genuinely-scrolling output.
@@ -5533,6 +5556,31 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    /// The load-bearing fact behind the mount buffer-kind seed: feeding the
+    /// daemon's vt100 the alternate-screen enter MUST flip
+    /// `alternate_screen()`, and leaving it MUST flip back. If a vt100
+    /// upgrade ever changes that reporting, the seed silently degrades to
+    /// client-observed kind and the wheel gate closes on every fresh mount
+    /// of a fullscreen TUI — this test fails first, loudly, instead.
+    #[test]
+    fn the_daemon_vt100_reports_the_alternate_screen_it_was_fed() {
+        let mut state = TerminalScreenState::new(24, 80);
+        assert!(
+            !state.parser.screen().alternate_screen(),
+            "a fresh parser is on the normal buffer"
+        );
+        state.process(b"\x1b[?1049h");
+        assert!(
+            state.parser.screen().alternate_screen(),
+            "DECSET 1049h must read as alternate — the mount seed depends on it"
+        );
+        state.process(b"\x1b[?1049l");
+        assert!(
+            !state.parser.screen().alternate_screen(),
+            "DECSET 1049l must read as normal again"
+        );
+    }
 
     /// ⛔ THE PROBE MAY NOT TYPE OVER A HUMAN.
     ///
