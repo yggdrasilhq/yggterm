@@ -3918,6 +3918,7 @@ impl AppPaneWidget {
                 None => format!("row-{id}"),
             },
             AppPaneWidget::Toolbar { id, .. } => format!("toolbar-{id}"),
+            AppPaneWidget::RibbonBar { id, .. } => format!("ribbonbar-{id}"),
             AppPaneWidget::Markdown { id, .. } => format!("markdown-{id}"),
         }
     }
@@ -3946,6 +3947,7 @@ impl AppPaneWidget {
             | AppPaneWidget::Button { .. }
             | AppPaneWidget::ListRow { .. }
             | AppPaneWidget::Toolbar { .. }
+            | AppPaneWidget::RibbonBar { .. }
             | AppPaneWidget::Markdown { .. } => None,
         }
     }
@@ -4395,6 +4397,22 @@ enum AppPaneWidget {
         #[serde(default)]
         buttons: Vec<AppPaneToolbarButton>,
     },
+    /// The full Office ribbon: a TAB STRIP over GROUPED command buttons.
+    /// Tabs fire `action` with the tab id as its value (the app switches
+    /// its own command groups and re-declares); group buttons fire the
+    /// same document actions the toolbar's do. `right` groups float to
+    /// the far edge (Excel's Comments/Share slot).
+    RibbonBar {
+        id: String,
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        active: String,
+        #[serde(default)]
+        tabs: Vec<AppPaneTab>,
+        #[serde(default)]
+        groups: Vec<AppPaneRibbonGroup>,
+    },
     /// A block of markdown the GUI renders to native DOM — the document
     /// surface's body widget (yedit's reader). Rendered to VNodes, NEVER via
     /// innerHTML: note-derived content must not reach the shell's JS context,
@@ -4419,6 +4437,17 @@ struct AppPaneToolbarButton {
     title: String,
     #[serde(default)]
     primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPaneRibbonGroup {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    buttons: Vec<AppPaneToolbarButton>,
+    /// Float this group to the far edge of the ribbon row.
+    #[serde(default)]
+    right: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
