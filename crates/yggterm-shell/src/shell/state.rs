@@ -13994,17 +13994,7 @@ async fn web_surface_native_reconcile_loop(
                         // async answer on a URI change (inside the engine) and
                         // the model is written through only when the bytes
                         // actually changed, so a page sitting still costs no
-                        // render. A stashed surface skips this whole block and
-                        // its row keeps the last icon it earned — the database
-                        // answers again within a tick or two of the reveal.
-                        let page_favicon = desktop.web_surface_page_favicon(entry.native_id);
-                        if entry.page_favicon != page_favicon {
-                            entry.page_favicon = page_favicon.clone();
-                            let mut writable = state;
-                            writable.with_mut(|shell| {
-                                shell.set_web_tab_favicon(&key.0, key.1, page_favicon);
-                            });
-                        }
+                        // render.
                         if url_changed || title_changed {
                             entry.page_url = page_url.clone();
                             entry.page_title = page_title.clone();
@@ -14080,6 +14070,24 @@ async fn web_surface_native_reconcile_loop(
                     // else the global "Ychrome Global Zoom". Also re-applies when
                     // the app's zoom map or the global setting moves. Only touches
                     // the FFI on a real change.
+                    // The PAGE'S ICON, for EVERY surface with a webview —
+                    // visible or stashed. "Load all favicons": a background
+                    // tab earns its icon while it is in the background, so a
+                    // row never shows a blank mark just because nobody had the
+                    // tab on screen yet. The engine's store answers instantly
+                    // for a URI any tab has already earned; the write-through
+                    // requires SOME bytes so a reclaimed (webview-less)
+                    // surface's `None` cannot wipe the icon its row already
+                    // earned — that is also why this poll lives OUTSIDE the
+                    // stash guard above rather than inside it.
+                    let page_favicon = desktop.web_surface_page_favicon(entry.native_id);
+                    if page_favicon.is_some() && entry.page_favicon != page_favicon {
+                        entry.page_favicon = page_favicon.clone();
+                        let mut writable = state;
+                        writable.with_mut(|shell| {
+                            shell.set_web_tab_favicon(&key.0, key.1, page_favicon);
+                        });
+                    }
                     let want_zoom = surface_zoom_factor(&key.0, &entry.page_url);
                     if (entry.zoom_factor - want_zoom).abs() > f64::EPSILON {
                         desktop.set_web_surface_zoom(entry.native_id, want_zoom);
