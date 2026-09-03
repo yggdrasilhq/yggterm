@@ -26145,6 +26145,32 @@ transition-only per mount, trace + ytrace bus) through one witnessed
 **Falsifier:** fresh opencode mount → first wheel emits `translate` with
 kind=alternate; wheel scrolls the conversation; scrollback_intent goes quiet.
 
+**FIFTH READING, 2026-09-03 late — the falsifier RAN and FAILED; the truth
+seed starves on proxied runtimes.** The one live `cli/wheel_gate` firing on
+the fleet (guihost 20:50:38, row `remote-opencode://dev/4f0f1ab8…`) read
+`decision: scrollback, buffer_kind: normal, tracking: none` — the
+plain-shell branch again, on the fixed build. Measured on both GUI hosts
+the same night: the daemon snapshot carries `pty_in_alternate_screen: null`
+for EVERY row (dev 12/12 opencode rows, guihost 33/33 rows), because the
+overlay (`overlay_terminal_runtime_snapshot_session`) reads only the LOCAL
+`TerminalManager`, and after every daemon takeover the successor holds
+addresses, not runtimes — every row is proxied until its PTY re-spawns
+under the new daemon. The seed's "daemon-true wins" arm never receives
+daemon truth; `None` falls through to the client record (`normal`), which
+is exactly the self-perpetuation the truth seed was built to kill. The
+repair is wire-correct; the DELIVERY is rotation-fragile. Fix shape, next
+unit, options weighed: (a) overlay answers from the predecessor via the
+proxy channel for the ACTIVE row only, bounded (the PEER_TRIAGE budget
+precedent) + short TTL cache (alt-screen is stable for TUIs); (b) carry
+per-runtime truth (pid/alt/cols-rows) in the handoff bequest blob so a
+successor is born knowing; (c) at mount, when seed is None, GUI asks
+`terminal_snapshot` (proxy-aware) and reads the alt bit — needs a sync
+daemon call out of the mount path, ui/block risk, least preferred. Also
+observed while measuring: `daemon_self_retire` for one guihost pid repeats
+every 20 s for minutes (21:56–21:59+) — the same-version cooldown's
+defer-and-re-request loop, loud on the trace; the tracefix lane owns that
+plane, notified via the campaign door.
+
 ## ⛔ [11.47] THE ANCHOR PICKER AND THE MIRROR TICK DISAGREE ABOUT "LIVE" — SCREEN-VERDICT ROWS WERE UNANCHORABLE, AND EVERY GHOST NOW CARRIES ITS CAUSE
 
 **Status:** FIX ON `lane/dev/anchor-liveness-truth`; ghost context SHIPPED in
