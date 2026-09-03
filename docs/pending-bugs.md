@@ -18,6 +18,37 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.49] AN INTERACTIVE RESUME BLOCKED ON PROVISIONING — 89s ON THE INSTALL LOCK, THEN A FULL CLI GENERATION DOWNLOAD, ALL SILENT
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Measured on dev 2026-09-04 02:51–02:54 from the resume wrapper's own ytrace
+(pid 2192417, `server remote resume-opencode … --require-existing`): the
+owner clicked an opencode row and got the banner and nothing else. The
+wrapper's `ensure_local_managed_cli` sat **89 seconds** on
+`managed-cli-install.lock` (`install lock_busy` → `lock_acquired_after_wait`)
+behind a background refresh, then downloaded a full CLI generation from the
+npm registry (three tarballs, `npm_cli_published generation 304, replaced
+303`) — two and a half minutes of a stuck row with no progress, no error, and
+no timeout. Worse, the mid-resume install rotated the CLI generation while
+the opencode SERVICE kept running the older one: the attach then painted 4
+bytes into a cleared alternate screen and went silent
+(`remote_stdio_bridge initial_raw_stream_first_paint {cursor: 4}`), a
+client/service skew every npm publish could renew. The blocking ensure sat in
+ALL SIX interactive remote arms (resume/start × codex, cc, agent-generic) —
+the fast `ensure_local_managed_cli_for_focus` (existence probe + background
+refresh) existed exactly for attach paths and was never wired into them.
+
+**Fix (lane `lane/trace/resume-never-blocks-on-provision`):** all six arms
+now use the focus ensure; provisioning stays with the background refresh and
+the explicit `refresh`/`install` verbs, which SHOULD block. Source-lock test
+`the_remote_resume_arms_never_call_the_blocking_managed_cli_ensure` pins all
+six arms over the product half of the file.
+
+**Falsifier:** click an opencode row while a background CLI refresh holds the
+install lock — the row attaches immediately (banner → TUI) with no
+`install lock_busy`/`lock_acquired_after_wait` spans in the wrapper's trace.
+
 ## ⛔ [11.48] A DAEMON SWAP LEFT A NO-ARG YCHROME ROW A BARE TERMINAL HIDING A RUNNING PICKER — THE `pick` WAS INVISIBLE TO EVERY RECOVERY ARM
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

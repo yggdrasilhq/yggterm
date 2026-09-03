@@ -3,6 +3,10 @@
 This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
+## Unreleased
+
+- **Clicking an agent row can no longer stall for minutes on a silent CLI download.** The remote resume/start paths ran the full blocking managed-CLI ensure before attaching: if a background refresh held the machine-wide install lock, the row waited for it (measured: 89 seconds); if npm had published a newer version, the row waited for a full download and install (measured: two and a half minutes, three tarballs) — all behind a banner that showed no progress — and could leave the new client talking to an older session service. The six interactive resume/start arms now use the cheap existence probe and leave downloading to the background refresh, where it already runs on a schedule.
+
 
 - **A ychrome row (or any app with a profile chooser) no longer falls back to a bare terminal view after a daemon swap.** A no-arg `ychrome` launches into its profile picker and announces it with a one-time OSC `pick` — but the daemon treated that announcement as not-worth-keeping, so when a daemon takeover relaunched the row's app, the fresh `pick` could fly past during the client's reconnect window and nothing anywhere remembered the row was sitting at a chooser: the restore poll answered "no declare" every few seconds while the viewport showed the shell the picker was hiding behind (measured: a row stuck for 20+ minutes, its liveness probe re-detecting the loss every 30 seconds with no recovery arm). The daemon now retains the pick like any other web-surface state, and the client's rebuild path mounts the same native picker it would mount live — never a page, and never after the app has moved past the choice, because the post-choice `open` replaces the record and a `close` still clears it.
 

@@ -20961,7 +20961,7 @@ pub fn run_remote_resume_codex(
             ));
         }
     }
-    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
+    let _ = ensure_local_managed_cli_for_focus(ManagedCliTool::Codex)?;
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
@@ -21096,7 +21096,7 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
             span.finish(meta);
         }
     };
-    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
+    let _ = ensure_local_managed_cli_for_focus(ManagedCliTool::Codex)?;
     let home = resolve_yggterm_home()?;
     let runtime_key = remote_runtime_codex_session_key(session_id);
     let initial_size = current_tty_size();
@@ -21211,7 +21211,7 @@ pub fn run_remote_resume_cc(
             ));
         }
     }
-    let _ = ensure_local_managed_cli(ManagedCliTool::ClaudeCode)?;
+    let _ = ensure_local_managed_cli_for_focus(ManagedCliTool::ClaudeCode)?;
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
@@ -21303,7 +21303,14 @@ pub fn run_remote_resume_agent(
         }
     }
     if let Some(tool) = ManagedCliTool::from_session_kind(kind) {
-        let _ = ensure_local_managed_cli(tool)?;
+        // ⛔ THE RESUME PATH NEVER BLOCKS ON PROVISIONING. Measured 2026-09-04
+        // (dev, opencode row): the blocking ensure sat 89s on the machine-wide
+        // install lock behind a background refresh, then downloaded a full CLI
+        // generation from npm — two and a half minutes with the row showing
+        // only its banner, and a client/service generation skew left behind.
+        // The focus-path ensure probes existence cheaply and moves any install
+        // to the background; the launch's login shell resolves the binary.
+        let _ = ensure_local_managed_cli_for_focus(tool)?;
     }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
@@ -21331,7 +21338,8 @@ pub fn run_remote_start_agent(
     cwd: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(tool) = ManagedCliTool::from_session_kind(kind) {
-        let _ = ensure_local_managed_cli(tool)?;
+        // Non-blocking ensure — see the resume twin's provision-block note.
+        let _ = ensure_local_managed_cli_for_focus(tool)?;
     }
     // The launch's model / permission mode, if the caller asked for one. THIS
     // machine owns the CLI, so this is where the options meet the descriptor
@@ -21427,7 +21435,7 @@ pub fn run_remote_start_cc(session_id: &str, cwd: Option<&str>) -> anyhow::Resul
             span.finish(meta);
         }
     };
-    let _ = ensure_local_managed_cli(ManagedCliTool::ClaudeCode)?;
+    let _ = ensure_local_managed_cli_for_focus(ManagedCliTool::ClaudeCode)?;
     let home = resolve_yggterm_home()?;
     let runtime_key = remote_runtime_cc_session_key(session_id);
     let initial_size = current_tty_size();
@@ -35130,6 +35138,52 @@ mod tests {
     /// that string. The option lives on the session and every rebuild must
     /// consult it. Scanned over the product half of the file so this test's own
     /// text cannot satisfy it (field guide §7.1).
+
+    /// THE INTERACTIVE RESUME PATH NEVER BLOCKS ON PROVISIONING. Every
+    /// `run_remote_resume_*` / `run_remote_start_*` arm must use the focus
+    /// ensure (cheap existence probe + background refresh), never the blocking
+    /// `ensure_local_managed_cli` — measured 2026-09-04 (dev, opencode row):
+    /// the blocking call sat 89s on the machine-wide install lock behind a
+    /// background refresh, then downloaded a full CLI generation from npm,
+    /// leaving the row on its banner for minutes with a client/service
+    /// generation skew left behind. Scanned over the product half of the file
+    /// so this test's own text cannot satisfy it (field guide §7.1).
+    #[test]
+    fn the_remote_resume_arms_never_call_the_blocking_managed_cli_ensure() {
+        let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for arm in [
+            "pub fn run_remote_resume_codex(",
+            "pub fn run_remote_start_codex(",
+            "pub fn run_remote_resume_cc(",
+            "pub fn run_remote_start_cc(",
+            "pub fn run_remote_resume_agent(",
+            "pub fn run_remote_start_agent(",
+        ] {
+            let body = source
+                .split(arm)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{arm} moved — move this lock with it"))
+                .split("\npub fn ")
+                .next()
+                .expect("the end of the arm");
+            assert!(
+                body.contains("ensure_local_managed_cli_for_focus("),
+                "{arm} no longer uses the non-blocking focus ensure — an \
+                 interactive connect must never wait on the install lock or a \
+                 registry download"
+            );
+            assert!(
+                !body.contains("let _ = ensure_local_managed_cli("),
+                "{arm} regressed to the blocking ensure — that is the \
+                 provision-block the 2026-09-04 measurement fixed"
+            );
+        }
+    }
+
     #[test]
     fn a_local_cc_relaunch_rebuild_carries_the_rows_launch_options() {
         let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
