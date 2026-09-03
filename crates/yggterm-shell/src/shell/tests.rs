@@ -1484,6 +1484,7 @@ mod tests {
         shell.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
+                address_draft_revision: 0,
                 tabs: vec![WebSurfaceTab {
                     media_playing: false,
                     media_seen_ms: 0,
@@ -4788,6 +4789,73 @@ JSON.stringify({{
     // instance — two parallel tests driving the same tags interleave and
     // flake. Sequential phases here cannot. Gut either precheck and this goes
     // red (that phase's tag count moves on the re-arm).
+
+    // THE TEXT-KILL WIRING LOCK (owner directive: emacs kills — Ctrl+K /
+    // Ctrl+D / Alt+D — belong to EVERY input box, and the typing fix to the
+    // command palette's jank lives in the component layer). Four facts must
+    // hold at once:
+    // (1) the key-plane listener carries the kill branch, gated on an
+    //     editable field, the overlay being CLOSED, and xterm being refused;
+    // (2) the bridge installs the shared helper ahead of the listener, so
+    //     the keys work from first paint, not only while a palette stands;
+    // (3) the omnibox palette mount passes the draft revision, so the host
+    //     can move the uncontrolled field;
+    // (4) web_surface_type_address does NOT bump the revision — that IS
+    //     typing, and remounting per keystroke is the defect being fixed.
+    #[test]
+    fn the_text_kill_keys_are_wired_app_wide() {
+        let src = SHELL_SOURCE;
+        // (1) the listener branch.
+        let branch_at = src
+            .find("THE TEXT-KILL KEYS COME FIRST WHEN AN EDITABLE FIELD HOLDS FOCUS")
+            .expect("the key-plane kill branch exists");
+        let branch = &src[branch_at..(branch_at + 2_400).min(src.len())];
+        for needle in [
+            "overlayOpen()",
+            "closest('.xterm')",
+            "kill-end",
+            "del-forward",
+            "kill-word-forward",
+            "preventDefault",
+        ] {
+            assert!(branch.contains(needle), "the kill branch lost {needle}");
+        }
+        // (2) the helper installs ahead of the listener.
+        assert!(
+            src.contains("yggui::YGGUI_TEXT_KILL_JS"),
+            "the shared text-kill helper is not installed by the bridge"
+        );
+        // (3) the mount passes the revision.
+        assert!(
+            src.contains("revision: overlay.address_draft_revision"),
+            "the palette mount stopped passing the draft revision — the field \
+             cannot be moved by the host any more"
+        );
+        // (4) typing must not bump the revision.
+        let type_at = src
+            .find("fn web_surface_type_address(")
+            .expect("the typing handler exists");
+        let type_fn = &src[type_at..src[type_at..].find("\n    fn ").map(|end| type_at + end).unwrap_or(type_at + 4_000)];
+        assert!(
+            !type_fn.contains("address_draft_revision"),
+            "web_surface_type_address bumps the draft revision — the palette \
+             field remounts per keystroke, which is the defect being fixed"
+        );
+        // ...and the two PROGRAMMATIC setters do.
+        for fn_name in [
+            "fn web_surface_set_address_draft(",
+            "fn web_surface_begin_address_edit(",
+        ] {
+            let at = src.find(fn_name).expect(fn_name);
+            let body = &src[at..(at + 1_600).min(src.len())];
+            assert!(
+                body.contains("address_draft_revision"),
+                "{fn_name} stopped bumping the draft revision — the uncontrolled \
+                 field would keep the user's stale text after an accept or edit reset"
+            );
+        }
+    }
+
     #[test]
     fn title_retry_arming_writes_only_on_real_change() {
         fn write_count(tag: &str) -> u64 {

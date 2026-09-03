@@ -1828,6 +1828,14 @@ struct WebSurfaceUiState {
     /// completion, shown selected so it is typed-over or accepted with Enter.
     /// `None` = no active completion (the whole draft is user input).
     address_typed_len: Option<usize>,
+    /// Bumped ONLY when the HOST replaces the address draft outside typing
+    /// (`set_address_draft` / `begin_address_edit`). It is the palette field's
+    /// remount `revision`: the field is UNCONTROLLED — a controlled `value:`
+    /// re-set the DOM text on every render and a fast typist's keystrokes lost
+    /// that race (the ychrome command palette's "does not let me type").
+    /// Deliberately NOT bumped by `web_surface_type_address`: that IS typing,
+    /// and remounting per keystroke is the defect.
+    address_draft_revision: u64,
     /// Keyboard-selected omnibox suggestion (index into the rendered
     /// suggestion rows); None = plain Enter-on-draft behavior.
     address_suggestion_index: Option<usize>,
@@ -6126,6 +6134,9 @@ struct WebSurfaceOverlayView {
     /// Keyboard-selected dropdown row: 0 = the synthesized go/search row,
     /// 1.. = address_suggestions[i-1]. None = plain Enter-on-draft.
     address_suggestion_index: Option<usize>,
+    /// The palette field's remount revision — see
+    /// `WebSurfaceState::address_draft_revision`.
+    address_draft_revision: u64,
     /// Active tab's profile (drives which history file feeds suggestions).
     profile: String,
     /// Vertical-tabs browsing mode: the tabs leave the viewport for the tab-tree
@@ -21669,6 +21680,7 @@ impl ShellState {
                 last_seen_ms: now_ms,
                 address_draft: None,
                 address_typed_len: None,
+                address_draft_revision: 0,
                 address_suggestion_index: None,
                 osc_url: url,
                 picker: None,
@@ -21781,6 +21793,7 @@ impl ShellState {
                 last_seen_ms: now_ms,
                 address_draft: None,
                 address_typed_len: None,
+                address_draft_revision: 0,
                 address_suggestion_index: None,
                 osc_url: control_url.clone(),
                 picker: Some(WebSurfacePickerState {
@@ -23683,6 +23696,7 @@ impl ShellState {
             surface.address_draft = draft;
             surface.address_typed_len = None;
             surface.address_suggestion_index = None;
+            surface.address_draft_revision = surface.address_draft_revision.wrapping_add(1);
         }
     }
     /// Put the address bar into EDIT MODE holding what it already shows.
@@ -23712,6 +23726,7 @@ impl ShellState {
         surface.address_draft = Some(text);
         surface.address_typed_len = None;
         surface.address_suggestion_index = None;
+        surface.address_draft_revision = surface.address_draft_revision.wrapping_add(1);
     }
     /// Handle a keystroke in the omnibox with Chrome-style inline autocomplete.
     /// `value` is the input's current text (the selected completion tail, if any,
@@ -24046,6 +24061,7 @@ impl ShellState {
                 .map(|picker| picker.control_url.clone()),
             address_suggestions,
             address_suggestion_index: surface.address_suggestion_index,
+            address_draft_revision: surface.address_draft_revision,
             profile: active.profile.clone(),
             vertical_tabs: self.settings.web_surface_vertical_tabs,
             // Follows the ACTIVE tab's host, so navigating between a light and a
@@ -50743,6 +50759,37 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     return null;
   }
   window.addEventListener('keydown', function(e){
+    // ⛔ THE TEXT-KILL KEYS COME FIRST WHEN AN EDITABLE FIELD HOLDS FOCUS.
+    // Owner ruling: emacs editing (Ctrl+K kill-to-end, Ctrl+D delete-forward,
+    // Alt+D kill-word-forward) belongs to EVERY input box, and inside a field
+    // the field wins over the ALT accelerators — Alt+D in the omnibox kills a
+    // word instead of opening a keytip. `__ygguiTextKill` refuses xterm's
+    // textarea (the terminal owns Ctrl+D and Ctrl+K absolutely) and dispatches
+    // a real input event, so controlled hosts resync. Overlay open means
+    // chord-capture mode: the walker keeps the keys.
+    if (!overlayOpen()) {
+      var __ael = document.activeElement;
+      if (__ael) {
+        var __tag = (__ael.tagName || '').toLowerCase();
+        if ((__tag === 'input' || __tag === 'textarea')
+            && !(__ael.closest && __ael.closest('.xterm'))) {
+          var __op = null;
+          if (e.ctrlKey && !e.altKey && !e.metaKey) {
+            var __k = (e.key || '').toLowerCase();
+            if (__k === 'k') { __op = 'kill-end'; }
+            else if (__k === 'd') { __op = 'del-forward'; }
+          } else if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
+                     && (e.key || '').toLowerCase() === 'd') {
+            __op = 'kill-word-forward';
+          }
+          if (__op && window.__ygguiTextKill
+              && window.__ygguiTextKill(__op) !== null) {
+            e.preventDefault(); e.stopPropagation();
+            return;
+          }
+        }
+      }
+    }
     // Accelerators win first, at any focus. PTY-safe by construction, so a bare
     // Ctrl+<letter> the terminal wants is never in this set (§11.2).
     var acc = matchAccel(e);
@@ -51018,8 +51065,12 @@ fn keytip_accel_js_array(config: &KeymapConfig) -> String {
 /// rides the same install loop so the audit verb and the derive edge always see
 /// the one `window.__yggtermKeytipWalk`, reinstalled after a webview reload.
 fn keytip_bridge_js(config: &KeymapConfig) -> String {
+    // The text-kill helper rides this bridge so it exists from first paint —
+    // every input box in the app gets the emacs kills (Ctrl+K / Ctrl+D /
+    // Alt+D), not only the palette that could otherwise have defined it.
     format!(
-        "{KEYTIP_INTERACTABLE_WALK_JS}\n{}",
+        "{}\n{KEYTIP_INTERACTABLE_WALK_JS}\n{}",
+        yggui::YGGUI_TEXT_KILL_JS,
         ALT_TAP_LISTENER_JS_TEMPLATE.replace("__ACCELS__", &keytip_accel_js_array(config))
     )
 }
