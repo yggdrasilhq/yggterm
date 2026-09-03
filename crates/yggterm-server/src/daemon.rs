@@ -10154,14 +10154,22 @@ impl DaemonRuntime {
                 // on the stale build for the LIFE OF THE PROCESS (the poll's
                 // `Lingering` arm). Same-version rebuilds are the COMMON deploy
                 // shape — every ygg-ci lane merge that is not a release roll.
-                // For a same-version target the honest swap is the
-                // COLD-WITH-PERSIST arm below: yield the socket, respawn,
-                // restore from persisted state. That destroys PTY state, so it
-                // is safe ONLY at a quiet window — the idle gate owns that
-                // answer. A gate block surfaces as an ERROR so the self-retire
-                // poll retries at its interval: same-version deploys then
-                // self-activate at the next quiet window instead of pinning the
-                // stale build until a human intervenes.
+                //
+                // ⭐ OWNER DIRECTIVE 2026-09-03: A SAME-VERSION NEWER BUILD IS
+                // AN UPDATE. The quiet-window answer below was retired the same
+                // day: it deferred at the idle gate, and on a fleet host the
+                // gate never opens (eight owned agent sessions reset the 300 s
+                // window all day — measured live), so same-version builds were
+                // pinned until a human ran `server app update restart` by hand.
+                // A forced same-version handoff now takes the PRESERVING arm:
+                // `bequeath_version_socket_to_same_version_successor` renames
+                // our socket + lock aside so the successor binds the canonical
+                // name, and this process lingers as the preserved owner exactly
+                // as it does for a version bump. The COLD-WITH-PERSIST arm
+                // below remains for the shape it was built for — a QUIET
+                // window, where the gate is clear and the cold swap is cheap.
+                // An UNFORCED same-version request still refuses (no agent
+                // deploy asked for it).
                 let same_version_target = hot_restart_target_is_same_version(expected_version.as_deref());
                 let same_version_gate_block_reason = if same_version_target
                     && force
@@ -10251,50 +10259,54 @@ impl DaemonRuntime {
                             )),
                         });
                     }
+                    if same_version_target && !force {
+                        // The long-standing rule for an UNFORCED request stands:
+                        // a handoff requires a different target version when
+                        // live terminal runtimes are present.
+                        return Ok(ServerResponse::Error {
+                            message: "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string(),
+                        });
+                    }
                     if same_version_target {
-                        // ⛔ A SAME-VERSION SUCCESSOR CAN NEVER BIND THIS SOCKET
-                        // while we hold it (`bind_lock_busy`, measured). With
-                        // force this is the idle-gate deferral, not a refusal:
-                        // the self-retire poll retries, and the swap fires at
-                        // the next quiet window. Without force the long-standing
-                        // message stands.
-                        let message = if force {
-                            same_version_gate_block_reason
-                                .map(|reason| {
-                                    format!("same-version swap deferred at the idle gate: {reason}")
-                                })
-                                .unwrap_or_else(|| "same-version swap deferred".to_string())
-                        } else {
-                            "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string()
-                        };
-                        // Issue 31 probe: a requested restart that did NOT
-                        // happen, on the ytrace bus. Bounded by restart
-                        // requests (rare), never by ticks — always emitted.
-                        if force {
-                            let gate_blockers = self.hot_update_idle_gate_blockers(
-                                &owned_terminal_session_keys,
-                            );
-                            let mut blocker_kinds: Vec<&str> = gate_blockers
-                                .iter()
-                                .map(|blocker| blocker.kind.as_str())
-                                .collect();
-                            blocker_kinds.sort_unstable();
-                            blocker_kinds.dedup();
-                            yggterm_core::perf::ytrace_emit_event(
-                                "daemon",
-                                "daemon",
-                                "idle_gate_eval",
-                                serde_json::json!({
-                                    "site": "hot_restart_request",
-                                    "blocker_count": gate_blockers.len(),
-                                    "blocker_kinds": blocker_kinds,
-                                    "settled": false,
-                                    "deferred_polls": 0,
-                                    "head_blocker": gate_blockers.first().map(|blocker| blocker.session_key.clone()),
-                                }),
-                            );
-                        }
-                        return Ok(ServerResponse::Error { message });
+                        // ⛔ OWNER DIRECTIVE 2026-09-03: A SAME-VERSION NEWER
+                        // BUILD IS AN UPDATE. It used to defer here — "the
+                        // self-retire poll retries at the next quiet window" —
+                        // and the quiet window never came: eight owned agent
+                        // sessions reset the 300 s idle gate all day (measured
+                        // live, `+7 more session(s)` against the 17:51 deploy),
+                        // so every same-version deploy pinned the stale build
+                        // until a human ran `server app update restart` by
+                        // hand.
+                        //
+                        // The preserving arm below can now serve a same-version
+                        // target: the SOCKET BEQUEST yields the canonical name
+                        // (rename, not unlink — our listener and flock survive
+                        // on the same inodes), the successor binds fresh, and
+                        // this process lingers as the preserved owner exactly
+                        // as it does for a version bump. No idle gate is
+                        // needed: this handoff destroys nothing.
+                        let gate_blockers =
+                            self.hot_update_idle_gate_blockers(&owned_terminal_session_keys);
+                        let mut blocker_kinds: Vec<&str> = gate_blockers
+                            .iter()
+                            .map(|blocker| blocker.kind.as_str())
+                            .collect();
+                        blocker_kinds.sort_unstable();
+                        blocker_kinds.dedup();
+                        yggterm_core::perf::ytrace_emit_event(
+                            "daemon",
+                            "daemon",
+                            "idle_gate_eval",
+                            serde_json::json!({
+                                "site": "hot_restart_request",
+                                "blocker_count": gate_blockers.len(),
+                                "blocker_kinds": blocker_kinds,
+                                "settled": false,
+                                "deferred_polls": 0,
+                                "head_blocker": gate_blockers.first().map(|blocker| blocker.session_key.clone()),
+                                "outcome": "same_version_bequest_preserving_handoff",
+                            }),
+                        );
                     }
                     // NO idle gate here. This handoff PRESERVES every runtime —
                     // its own success message is "preserving N live terminal
@@ -10354,7 +10366,66 @@ impl DaemonRuntime {
                         );
                     write_persisted_state(&self.state_path, &state)?;
                     self.mark_update_restart_state_written();
-                    let owner_endpoint = default_endpoint(self.store.home_dir());
+                    // THE SUCCESSOR-ALREADY-LIVE CHECK MOVED ABOVE THE BEQUEST:
+                    // the bequest decision needs it (a live successor at the
+                    // target makes the bequest both unnecessary and harmful —
+                    // it would rename THE SUCCESSOR's socket), and the probe
+                    // must exclude OUR canonical endpoint, which is only honest
+                    // before the rename.
+                    let live_successor_version = expected_version.as_deref().and_then(|target| {
+                        let want = parse_daemon_version_triple(target)?;
+                        // ⛔ Budgeted triage probe — same lock, same measured
+                        // 10 s deafness as the duplicate-owner check above.
+                        reachable_versioned_daemon_statuses_filtered(
+                            self.store.home_dir(),
+                            Some(&default_endpoint(self.store.home_dir())),
+                            Some(std::time::Duration::from_millis(
+                                PEER_TRIAGE_PROBE_BUDGET_MS,
+                            )),
+                        )
+                        .into_iter()
+                        .find_map(|(_peer_endpoint, status)| {
+                            let peer = parse_daemon_version_triple(status.server_version.trim())?;
+                            (peer >= want).then(|| status.server_version.clone())
+                        })
+                    });
+                    // THE SAME-VERSION BEQUEST: yield the canonical socket so
+                    // the successor can bind. Only when no successor is already
+                    // live — renaming then would move the SUCCESSOR's socket.
+                    let bequeathed = if same_version_target && live_successor_version.is_none() {
+                        match bequeath_version_socket_to_same_version_successor(
+                            self.store.home_dir(),
+                        ) {
+                            Ok(endpoint) => Some(endpoint),
+                            Err(error) => {
+                                // Without the path there is no same-version
+                                // swap; say so and let the poll retry rather
+                                // than spawn a successor that can only die
+                                // `bind_lock_busy`.
+                                append_trace_event(
+                                    self.store.home_dir(),
+                                    "daemon",
+                                    "lifecycle",
+                                    "same_version_socket_bequest_failed",
+                                    serde_json::json!({
+                                        "error": error,
+                                        "server_version": SERVER_PROTOCOL_VERSION,
+                                        "server_build_id": current_build_id(),
+                                        "pid": std::process::id(),
+                                    }),
+                                );
+                                return Ok(ServerResponse::Error {
+                                    message: format!(
+                                        "same-version swap deferred: the socket bequest failed: {error}"
+                                    ),
+                                });
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let owner_endpoint =
+                        bequeathed.clone().unwrap_or_else(|| default_endpoint(self.store.home_dir()));
                     let represented_preserved_owner_keys = runtime_status
                         .preserved_terminal_owner_keys
                         .iter()
@@ -10403,24 +10474,8 @@ impl DaemonRuntime {
                     //
                     // A live daemon at or above the target version IS the
                     // successor. Register the handoff against it and skip the
-                    // doomed spawn.
-                    let live_successor_version = expected_version.as_deref().and_then(|target| {
-                        let want = parse_daemon_version_triple(target)?;
-                        // ⛔ Budgeted triage probe — same lock, same measured
-                        // 10 s deafness as the duplicate-owner check above.
-                        reachable_versioned_daemon_statuses_filtered(
-                            self.store.home_dir(),
-                            Some(&owner_endpoint),
-                            Some(std::time::Duration::from_millis(
-                                PEER_TRIAGE_PROBE_BUDGET_MS,
-                            )),
-                        )
-                        .into_iter()
-                        .find_map(|(_peer_endpoint, status)| {
-                            let peer = parse_daemon_version_triple(status.server_version.trim())?;
-                            (peer >= want).then(|| status.server_version.clone())
-                        })
-                    });
+                    // doomed spawn. (The probe itself now runs ABOVE the
+                    // bequest — see the note there.)
                     let spawn_result = match live_successor_version.as_deref() {
                         Some(_) => Ok(()),
                         None => {
@@ -10456,9 +10511,27 @@ impl DaemonRuntime {
                             // the failure this distinguishes it from.
                             "successor_already_live": live_successor_version.is_some(),
                             "successor_live_version": live_successor_version,
+                            // True when this handoff YIELDED the canonical
+                            // socket so a same-version successor could bind —
+                            // the mechanism that makes a same-version deploy
+                            // converge like a version bump (owner directive
+                            // 2026-09-03). `owner_endpoint` above is then the
+                            // retired path, and that is where adopters dial the
+                            // lingerer.
+                            "same_version_bequest": bequeathed.is_some(),
                             "update_priority": "handoff_preserve_sessions",
                         }),
                     );
+                    // ⛔ THE BEQUEST IS ROLLBACK-ABLE UNTIL THE SPAWN LANDS. If
+                    // the spawn itself fails, the canonical path now has NO
+                    // daemon behind it and would not until something else
+                    // binds — give the name back rather than leave the host
+                    // dark. Best-effort: a failed rename-back leaves the
+                    // retired names in place, which the registry still points
+                    // at, and the self-retire poll retries the swap.
+                    if spawn_result.is_err() && bequeathed.is_some() {
+                        bequeath_rollback(self.store.home_dir(), std::process::id());
+                    }
                     spawn_result?;
                     // ★ LEVEL (b): try the LOSSLESS route before lingering.
                     //
@@ -10492,13 +10565,13 @@ impl DaemonRuntime {
                             // thread, so this request's response still reaches
                             // the caller.
                             //
-                            // `default_endpoint` IS this daemon's version-named
-                            // socket — the one owner of "which socket am I", so
-                            // the bequest it eventually makes cannot name a
-                            // different file from the one we release.
+                            // The watch must name the endpoint THIS daemon
+                            // actually answers at — after a same-version
+                            // bequest that is the RETIRED path (`owner_endpoint`
+                            // above), not the canonical name we just yielded.
                             spawn_handoff_settle_watch(
                                 self.store.home_dir().to_path_buf(),
-                                default_endpoint(self.store.home_dir()),
+                                owner_endpoint.clone(),
                                 successor.to_string(),
                                 outcome,
                             );
@@ -20667,8 +20740,14 @@ fn hot_restart_target_is_same_version(expected_version: Option<&str>) -> bool {
 /// persisted state — armed only when `force` (an agent-style deploy), when we
 /// own runtimes (the preserving arm's own precondition), and when the idle
 /// gate is CLEAR (the cold arm destroys PTY state; the gate is what makes that
-/// safe). A gate block keeps the request in the preserving arm, which now
-/// answers a deferral error the self-retire poll retries at its interval.
+/// safe).
+///
+/// ⛔ The arm below this is now the QUIET-WINDOW lane only (2026-09-03): a
+/// gate BLOCK on a forced same-version target used to defer forever — the
+/// gate never opens on a busy fleet host — and the preserving arm took the
+/// request over with the socket bequest instead. Cold still wins when the
+/// host genuinely is quiet, because a cold swap with nothing to preserve is
+/// the simplest honest move.
 fn same_version_cold_swap_armed(
     expected_version: Option<&str>,
     force: bool,
@@ -20821,6 +20900,129 @@ static HOT_RESTART_SWAP_LANE_SETTLED: AtomicBool = AtomicBool::new(false);
 /// an allowance that resets is not an allowance.
 #[cfg(target_os = "linux")]
 static HOT_RESTART_SWAP_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// THE SAME-VERSION BEQUEST — yield the version socket so a same-version
+/// successor can bind.
+///
+/// A version-bump successor never had a bind problem: it binds a DIFFERENT
+/// name (`server-3-2-46.sock` vs our `server-3-2-45.sock`). A same-version
+/// successor wants OUR name, which we hold — the spawn died `bind_lock_busy`
+/// and the old answer was to defer the swap until every owned session had sat
+/// idle for the gate window. On a fleet host that window never comes (eight
+/// agent rows reset it all day, measured 2026-09-03), so same-version builds
+/// never activated without a human running `server app update restart` by
+/// hand. Owner directive the same day: **a same-version newer build IS an
+/// update — treat it with the same respect as a version bump.**
+///
+/// Renaming (never unlinking) the socket file and its lock file moves the
+/// PATHS aside while our listening socket and our `flock` survive on the SAME
+/// inodes: existing clients never notice, the successor acquires a fresh lock
+/// at the canonical path and binds it, and the preserved-owner registry hands
+/// adopters the retired path so proxied reads keep reaching us while we drain.
+///
+/// Returns the endpoint the LINGERER is reachable at after the rename — the
+/// value the handoff registry must carry. `Ok(canonical)` unchanged for a
+/// non-unix (TCP) endpoint, where the bind clash does not exist.
+#[cfg(unix)]
+fn bequeath_version_socket_to_same_version_successor(
+    home_dir: &Path,
+) -> Result<ServerEndpoint, String> {
+    let canonical = match default_endpoint(home_dir) {
+        ServerEndpoint::UnixSocket(path) => path,
+        other => return Ok(other),
+    };
+    let pid = std::process::id();
+    let retire_name = |path: &Path| -> Option<PathBuf> {
+        let name = path.file_name()?.to_str()?;
+        Some(path.with_file_name(format!("{name}.retired-{pid}")))
+    };
+    let retired_socket =
+        retire_name(&canonical).ok_or_else(|| "socket path has no file name".to_string())?;
+    let lock_path = daemon_socket_lock_path(&canonical);
+    let retired_lock =
+        retire_name(&lock_path).ok_or_else(|| "lock path has no file name".to_string())?;
+    // The lock first: a successor that started between the two renames would
+    // find the socket path free but the lock still held at the canonical name.
+    // Renaming the lock inode moves our flock with it, so the successor's
+    // fresh open+flock succeeds either way; the order only keeps the free
+    // window as short as possible.
+    fs::rename(&lock_path, &retired_lock)
+        .map_err(|error| format!("renaming lock {}: {error}", lock_path.display()))?;
+    fs::rename(&canonical, &retired_socket)
+        .map_err(|error| format!("renaming socket {}: {error}", canonical.display()))?;
+    append_trace_event(
+        home_dir,
+        "daemon",
+        "lifecycle",
+        "same_version_socket_bequeathed",
+        serde_json::json!({
+            "canonical_socket": canonical.display().to_string(),
+            "retired_socket": retired_socket.display().to_string(),
+            "retired_lock": retired_lock.display().to_string(),
+            "pid": pid,
+        }),
+    );
+    Ok(ServerEndpoint::UnixSocket(retired_socket))
+}
+
+/// Pure half of [`bequeath_version_socket_to_same_version_successor`]: the
+/// retired names a bequest produces. Split out so the registry-cleanup law and
+/// the sweep can agree with the bequest about what its litter is called without
+/// re-deriving the format at a second site.
+#[cfg(unix)]
+fn retired_daemon_socket_names(socket_path: &Path, pid: u32) -> (PathBuf, PathBuf) {
+    let socket_name = socket_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("server.sock")
+        .to_string();
+    let lock_path = daemon_socket_lock_path(socket_path);
+    let lock_name = lock_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("server.sock.lock")
+        .to_string();
+    (
+        socket_path.with_file_name(format!("{socket_name}.retired-{pid}")),
+        lock_path.with_file_name(format!("{lock_name}.retired-{pid}")),
+    )
+}
+
+/// Roll a failed bequest back: move the socket and lock back to their
+/// canonical names so the host is not left with no daemon at its version's
+/// address. Best-effort — the retired names are re-derived from the same pure
+/// helper the bequest used, and a failed rename is traced, not fatal.
+#[cfg(unix)]
+fn bequeath_rollback(home_dir: &Path, pid: u32) {
+    let canonical = match default_endpoint(home_dir) {
+        ServerEndpoint::UnixSocket(path) => path,
+        other => {
+            let _ = other;
+            return;
+        }
+    };
+    let (retired_socket, retired_lock) = retired_daemon_socket_names(&canonical, pid);
+    let outcomes = [
+        fs::rename(&retired_lock, daemon_socket_lock_path(&canonical)),
+        fs::rename(&retired_socket, &canonical),
+    ];
+    append_trace_event(
+        home_dir,
+        "daemon",
+        "lifecycle",
+        "same_version_socket_bequest_rolled_back",
+        serde_json::json!({
+            "canonical_socket": canonical.display().to_string(),
+            "retired_socket": retired_socket.display().to_string(),
+            "ok": outcomes.iter().all(|o| o.is_ok()),
+            "errors": outcomes
+                .iter()
+                .filter_map(|o| o.as_ref().err().map(|e| e.to_string()))
+                .collect::<Vec<_>>(),
+            "pid": pid,
+        }),
+    );
+}
 
 /// The version THIS process handed off to, remembered locally. `None` = we have
 /// never handed off.
@@ -25337,6 +25539,155 @@ pub(crate) fn terminal_write_strategy_for_path(
         TerminalWriteStrategy::RemoteDirectFallback
     } else {
         TerminalWriteStrategy::LocalRuntimeFallback
+    }
+}
+
+/// THE SAME-VERSION BEQUEST, locked (owner directive 2026-09-03: a
+/// same-version newer build IS an update). The bequest's whole mechanism is
+/// rename-not-unlink: the canonical path becomes free for the successor while
+/// the retiree's listener and flock survive on the SAME inodes at the retired
+/// names. These tests run the REAL filesystem + REAL flock in a temp home —
+/// mocking rename would prove nothing the kernel could not contradict.
+#[cfg(unix)]
+#[cfg(test)]
+mod same_version_bequest_locks {
+    use super::{
+        bequeath_version_socket_to_same_version_successor, daemon_socket_lock_path,
+        default_endpoint, retired_daemon_socket_names, try_acquire_daemon_socket_lock,
+    };
+    use crate::ServerEndpoint;
+    use std::fs;
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd as _;
+
+    fn temp_home() -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-bequest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&home).expect("temp home");
+        home
+    }
+
+    /// A live socket file and its held lock, exactly what a running daemon
+    /// has before a bequest.
+    fn hold_daemon_address(home: &std::path::Path) -> (std::path::PathBuf, fs::File) {
+        let socket_path = match default_endpoint(home) {
+            ServerEndpoint::UnixSocket(path) => path,
+            other => panic!("unix-only test, got {other:?}"),
+        };
+        fs::write(&socket_path, b"socket inode").expect("socket file");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(daemon_socket_lock_path(&socket_path))
+            .expect("lock file");
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the fixture must hold the lock the way a live daemon does"
+        );
+        (socket_path, lock)
+    }
+
+    #[test]
+    fn a_bequest_frees_the_canonical_name_and_keeps_the_retiree_reachable() {
+        let home = temp_home();
+        let (canonical, _held_lock) = hold_daemon_address(&home);
+
+        let retired =
+            bequeath_version_socket_to_same_version_successor(&home).expect("bequest ok");
+        let retired_path = match &retired {
+            ServerEndpoint::UnixSocket(path) => path.clone(),
+            other => panic!("unix-only test, got {other:?}"),
+        };
+        // The canonical name is GONE — a same-version successor's fresh
+        // open+flock+bind now succeeds.
+        assert!(
+            !canonical.exists(),
+            "the canonical socket path must be free after the bequest"
+        );
+        let successor_lock = try_acquire_daemon_socket_lock(&canonical, &home)
+            .expect("lock probe ok")
+            .expect("a successor must be able to acquire the lock the retiree yielded");
+        drop(successor_lock);
+        // The retiree stays REACHABLE at the retired path — the whole point of
+        // rename over unlink: the preserved-owner registry hands adopters this
+        // endpoint so proxied reads reach the lingerer while it drains.
+        assert!(
+            retired_path.exists(),
+            "the retired socket must survive at the retired name"
+        );
+        assert_ne!(retired_path, canonical);
+        drop(_held_lock);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_failed_spawn_can_roll_the_bequest_back() {
+        let home = temp_home();
+        let (canonical, _held_lock) = hold_daemon_address(&home);
+        let pid = std::process::id();
+        let retired =
+            bequeath_version_socket_to_same_version_successor(&home).expect("bequest ok");
+        let (retired_socket, retired_lock) = retired_daemon_socket_names(&canonical, pid);
+        assert_eq!(
+            match &retired {
+                ServerEndpoint::UnixSocket(path) => path.clone(),
+                other => panic!("unix-only test, got {other:?}"),
+            },
+            retired_socket,
+            "the rollback must derive the SAME retired names the bequest made"
+        );
+        // The rollback is the exact rename pair `bequeath_rollback` runs.
+        fs::rename(&retired_lock, daemon_socket_lock_path(&canonical)).expect("lock back");
+        fs::rename(&retired_socket, &canonical).expect("socket back");
+        assert!(canonical.exists(), "the canonical name must be restored");
+        let retired_path = match &retired {
+            ServerEndpoint::UnixSocket(path) => path.clone(),
+            other => panic!("unix-only test, got {other:?}"),
+        };
+        assert!(!retired_path.exists());
+        drop(_held_lock);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// THE DEFINITION-OF-UPDATE LOCK. `HotRestart`'s same-version branch must
+    /// NOT answer a FORCED request with a deferral — that answer is what pinned
+    /// every same-version build behind a busy host's never-open idle gate
+    /// (eight owned agent sessions, measured all day on the GUI host). The
+    /// branch must fall through to the preserving arm via the bequest; only the
+    /// UNFORCED request keeps the refusal. Restoring either old return trips
+    /// this.
+    #[test]
+    fn a_forced_same_version_handoff_is_never_deferred() {
+        let source = include_str!("daemon.rs");
+        let block_at = source
+            .find("if same_version_target && !force {")
+            .expect("the !force refusal branch exists");
+        let block = &source[block_at..block_at + 12_000];
+        assert!(
+            block.contains("same_version_bequest_preserving_handoff"),
+            "the forced same-version branch lost its fall-through to the \
+             preserving arm — same-version builds will pin behind the idle \
+             gate again (the GUI-host hang of 2026-09-03)"
+        );
+        assert!(
+            !block.contains("same-version swap deferred at the idle gate"),
+            "the forced same-version deferral error is back"
+        );
+        // The fall-through must be able to yield the socket: no bequest, no
+        // same-version swap.
+        assert!(
+            block.contains("bequeath_version_socket_to_same_version_successor"),
+            "the same-version handoff no longer bequeaths the version socket — \
+             the successor will die bind_lock_busy again"
+        );
     }
 }
 
