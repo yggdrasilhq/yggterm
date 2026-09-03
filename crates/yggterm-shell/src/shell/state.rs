@@ -35960,6 +35960,20 @@ fn spawn_title_generation_for_target(
     else {
         return;
     };
+    // Peek before the write (same storm shape as the title-retry arming fix,
+    // 2026-09-03): the negative answer — already in flight, or not
+    // retry-ready — used to dirty the signal on the way out, one full render
+    // per refused start.
+    let already_in_flight = safe_shell_read(state, "title_generation_start_precheck", |shell| {
+        shell.title_requests_in_flight.contains(&session_path)
+            || (!force
+                && allow_passive_suspend
+                && !background_copy_retry_ready(shell, "title", &session_path))
+    })
+    .unwrap_or(false);
+    if already_in_flight {
+        return;
+    }
     let should_start = safe_shell_mut(state, "title_generation_start", |shell| {
         if shell.title_requests_in_flight.contains(&session_path)
             || (!force
@@ -52681,20 +52695,39 @@ fn remote_machine_for_session_path<'a>(
 fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: ManagedSessionView) {
     let session_path = session.session_path.clone();
     let session_id = session.id.clone();
-    let already_in_flight = state.with_mut_counted(|shell| {
-        if shell
-            .active_copy_hydration_in_flight
-            .contains(&session_path)
-            || shell.store_copy_hydrated_session_ids.contains(&session_id)
-        {
-            true
-        } else {
+    // Peek before the write (same storm shape as the title-retry arming fix,
+    // 2026-09-03): this guard runs on paths a whole-state-subscribed effect
+    // reaches per render, and `with_mut` dirties the signal even when the
+    // answer is "already in flight" — one render per call to change nothing.
+    let already_in_flight = safe_shell_read(
+        state,
+        "copy_hydration_in_flight_precheck",
+        |shell| {
             shell
                 .active_copy_hydration_in_flight
-                .insert(session_path.clone());
-            false
-        }
-    });
+                .contains(&session_path)
+                || shell.store_copy_hydrated_session_ids.contains(&session_id)
+        },
+    )
+    .unwrap_or(false);
+    let already_in_flight = if already_in_flight {
+        true
+    } else {
+        state.with_mut_counted(|shell| {
+            if shell
+                .active_copy_hydration_in_flight
+                .contains(&session_path)
+                || shell.store_copy_hydrated_session_ids.contains(&session_id)
+            {
+                true
+            } else {
+                shell
+                    .active_copy_hydration_in_flight
+                    .insert(session_path.clone());
+                false
+            }
+        })
+    };
     if already_in_flight {
         return;
     }
@@ -61646,6 +61679,51 @@ fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
     rows
 }
 
+/// One memoized `describe_app_rows_snapshot` build per write epoch.
+///
+/// The rows serve is the fleet's most expensive read: a second full sidebar
+/// merge with every set open, a tombstone-file load, and a ~1 MB JSON build
+/// with per-row O(live) scans — and agents probe it ~9/min against a state
+/// that is usually unchanged. On the GUI host (2026-09-03 hang window) seven
+/// serves in fifty seconds each stalled the UI thread ~2 s under memory
+/// pressure: the serve rebuilds the world every time even when the only thing
+/// that moved is the clock. Keyed on `SHELLSTATE_MUT_TOTAL` (the same epoch
+/// that keys the shared snapshot) with the snapshot cache's own 500 ms TTL —
+/// a write invalidates immediately; a quiet shell serves the SAME value.
+static APP_ROWS_RESPONSE_CACHE_TTL_MS: u64 = 500;
+thread_local! {
+    static APP_ROWS_RESPONSE_CACHE: std::cell::RefCell<Option<(u64, u64, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// How many full builds ran — the counter the memoization lock reads, and a
+/// probe-rate diagnostic in its own right (builds should track state churn,
+/// not probe count).
+static APP_ROWS_RESPONSE_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn describe_app_rows_snapshot_cached(state: &Signal<ShellState>) -> Value {
+    use std::sync::atomic::Ordering;
+    let epoch = SHELLSTATE_MUT_TOTAL.load(Ordering::Relaxed);
+    let now = current_millis();
+    let cached = APP_ROWS_RESPONSE_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache
+            .as_ref()
+            .filter(|(cached_epoch, cached_at, _)| {
+                *cached_epoch == epoch && now.saturating_sub(*cached_at) < APP_ROWS_RESPONSE_CACHE_TTL_MS
+            })
+            .map(|(_, _, value)| value.clone())
+    });
+    if let Some(value) = cached {
+        return value;
+    }
+    let fresh = describe_app_rows_snapshot(state);
+    APP_ROWS_RESPONSE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    APP_ROWS_RESPONSE_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((epoch, now, fresh.clone()));
+    });
+    fresh
+}
+
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     let shell = state.read();
     // Clone of the shared snapshot, not a rebuild: this verb annotates its
@@ -67475,6 +67553,45 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
     json!({
         "error": "dom_debug_snapshot_timeout",
     })
+}
+
+/// How long one successful DOM debug snapshot may be re-served. The walk runs
+/// `getAnimations({subtree:true})` + `getComputedStyle` over the WHOLE page —
+/// a layout-forcing pass in the WEB PROCESS, on the same thread xterm input
+/// runs on — so every describe_state probe froze the terminal's own JS for the
+/// walk's duration (p50 867 ms whole-serve measured on the GUI host,
+/// 2026-09-03). Probes are observability, not interaction: one second of
+/// staleness costs an agent nothing and buys the user's typing back.
+const DOM_DEBUG_CACHE_TTL_MS: u64 = 1_000;
+thread_local! {
+    static DOM_DEBUG_CACHE: std::cell::RefCell<Option<(u64, String, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+async fn capture_dom_debug_snapshot_cached_for(active_session_path: Option<&str>) -> Value {
+    let key = active_session_path.unwrap_or_default().to_string();
+    let now = current_millis();
+    let cached = DOM_DEBUG_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache
+            .as_ref()
+            .filter(|(cached_at, cached_key, _)| {
+                *cached_key == key && now.saturating_sub(*cached_at) < DOM_DEBUG_CACHE_TTL_MS
+            })
+            .map(|(_, _, value)| value.clone())
+    });
+    if let Some(value) = cached {
+        return value;
+    }
+    let fresh = capture_dom_debug_snapshot_for_or_empty(active_session_path).await;
+    // Cache successes only: a timed-out walk must not pin its failure for a
+    // second — the fallback ladder below it exists to be retried promptly.
+    if fresh.get("error").is_none() {
+        DOM_DEBUG_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some((now, key, fresh.clone()));
+        });
+    }
+    fresh
 }
 
 async fn capture_dom_debug_snapshot_for_or_empty(active_session_path: Option<&str>) -> Value {
@@ -86128,7 +86245,10 @@ async fn process_pending_app_control_requests(
             handled_by_pid: std::process::id(),
             completed_at_ms: current_millis() as u128,
             output_path: None,
-            data: Some(describe_app_rows_snapshot(&state)),
+            // Memoized per write epoch — the serve rebuilds the world (second
+            // full merge + ~1 MB JSON), and the fleet probes it ~9/min against
+            // a mostly-unchanged shell. See the cache note on the helper.
+            data: Some(describe_app_rows_snapshot_cached(&state)),
             error: None,
         },
         // A well-formed request whose `kind` this GUI build does not know.
@@ -86252,7 +86372,7 @@ async fn process_pending_app_control_requests(
                 trace_stage("describe_state_snapshot_end", json!({}));
                 trace_stage("describe_state_dom_begin", json!({}));
                 let mut dom =
-                    capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
+                    capture_dom_debug_snapshot_cached_for(active_session_path.as_deref()).await;
                 trace_stage(
                     "describe_state_dom_end",
                     json!({
