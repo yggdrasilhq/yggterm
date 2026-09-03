@@ -4756,6 +4756,12 @@ fn app() -> Element {
                                 ),
                                 query: draft,
                                 items,
+                                // The field's remount key: bumped ONLY when the
+                                // host replaced the draft outside typing (accept
+                                // clears, focus begins an edit). The field is
+                                // UNCONTROLLED — the write-back race was the
+                                // palette's does-not-let-me-type defect.
+                                revision: overlay.address_draft_revision,
                                 // Row 0 is what plain Enter does, so "nothing
                                 // chosen yet" and "the go row" are the same
                                 // state and the palette always has a target.

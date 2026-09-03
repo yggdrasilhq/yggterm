@@ -61,6 +61,61 @@ row, the row's viewport shows the native profile picker — trace
 `web_surface/daemon_declare_picker_rebuild` fires once per rebuild, and
 `liveness stale_detected` for that row does not recur.
 
+## ⛔ [11.49] THE COMMAND PALETTE FIGHTS THE TYPOIST — AND NO INPUT BOX HAD THE EMACS KILLS
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Owner report (2026-09-03): the omnibox was fixed to behave like the reference
+browser, but "command palette input is still janky and aggressive — it just
+does not let me type"; selections of long URLs cut off instead of scrolling;
+and the emacs kills (Ctrl+K / Ctrl+D / Alt+D) should exist in **every** input
+box. Layer ruling with the report: text editing belongs to the libyggterm
+components; omnibox-specific flourishes are the app's extras.
+
+**Why the palette ate keystrokes.** The palette field was CONTROLLED — a
+`value:` attribute re-set the DOM text on every render. Every keystroke races
+the host's re-render (this app re-renders a 693-row tree per state write):
+a fast typist's next key lands in the DOM *before* the frame that re-writes
+the value, and the frame clobbers it. The omnibox pill had fixed the same
+race at its own layer for the completion case only; the palette's re-set
+happened on EVERY key. Second insult: Home and End moved the LIST instead of
+the caret, so the two reflexes every editor owns did nothing to the text —
+the "aggressive".
+
+Fix, in the component (`yggui` v0.14.2, libyggterm 58bb8d7):
+1. The field is UNCONTROLLED: `initial_value` seeds it once, a `revision`
+   prop is its remount key, edits report upward, and the host's query stays
+   the ranking truth without ever re-writing the caret. The omnibox host
+   bumps `address_draft_revision` only on PROGRAMMATIC draft changes
+   (accept, dismiss, begin-edit) — `web_surface_type_address` deliberately
+   does not touch it, because typing remounting per keystroke IS the defect.
+2. Home/End freed for the caret; the list's first/last moved to
+   PageUp/PageDown.
+3. `YGGUI_TEXT_KILL_JS` — `__ygguiTextKill(op)`, applied to the FOCUSED
+   element, dispatched as a real `input` event so controlled hosts resync.
+   The shell's key-plane bridge installs it from first paint and binds the
+   three chords gated on: an editable field holds focus, the keytip overlay
+   is closed, and xterm's textarea is refused (the terminal owns Ctrl+D and
+   Ctrl+K absolutely). Every input box in the app — rail schema widgets,
+   find bar, pill, palette — has the same emacs fingers.
+4. A selected result row stops amputating long URLs: at rest it ellipsizes
+   as before; selected it scrolls horizontally, and every row carries its
+   full text as a hover title.
+
+Locked in the component (`same_version_bequest_locks`'s siblings:
+`the_field_is_uncontrolled_and_the_host_moves_it_by_revision`,
+`home_and_end_move_the_caret_not_the_list`, `the_emacs_kills_are_field_keys`,
+`a_selected_row_scrolls_instead_of_cutting_off`) and in the shell
+(`the_text_kill_keys_are_wired_app_wide` — the branch, the install, the
+mount, the bump-no-while-typing negative).
+
+**Falsifier:** on a deployed GUI, typing fast into the raised palette loses
+no characters (the field's text stays the user's, verified by the DOM value
+after a burst), Home/End move the caret, Ctrl+K/Ctrl+D/Alt+D edit the field
+while Alt+D outside a field still opens whatever the keytips map, Ctrl+D in a
+focused terminal still sends EOF, and a long-URL result row can be scrolled
+to its end while selected.
+
 ## ⛔ [11.47] A SAME-VERSION NEWER BUILD NEVER BECAME THE RUNNING DAEMON — THE IDLE GATE IT DEFERRED BEHIND NEVER OPENED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
