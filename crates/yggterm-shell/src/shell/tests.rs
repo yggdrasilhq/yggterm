@@ -4775,6 +4775,83 @@ JSON.stringify({{
         );
     }
 
+    // The GUI-host render-storm lock (2026-09-03): the storm autopsy caught
+    // `active_title_autogen_retry_schedule` writing 310 times in 15 s — 21
+    // renders/sec with forced_wakes 0 — while a session's title stayed
+    // ungeneratable. Driver: a whole-state-subscribed effect re-runs
+    // `maybe_request_copy_generation_for_session` on EVERY state write, and the
+    // arming insert dirtied the signal even when the tick was already armed —
+    // a render scheduling its own re-render at CPU speed.
+    //
+    // ONE test for both arming paths, deliberately: the lock reads the
+    // process-global write registry, whose tags do not name the shell
+    // instance — two parallel tests driving the same tags interleave and
+    // flake. Sequential phases here cannot. Gut either precheck and this goes
+    // red (that phase's tag count moves on the re-arm).
+    #[test]
+    fn title_retry_arming_writes_only_on_real_change() {
+        fn write_count(tag: &str) -> u64 {
+            crate::render_attribution::state_write_totals(None)
+                .into_iter()
+                .find(|(site, _)| site == tag)
+                .map(|(_, count)| count)
+                .unwrap_or(0)
+        }
+        // Phase 1: re-arming an armed tick must be a pure read.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let shell = ShellState::new(bootstrap);
+        menu_dismissal_locks::with_live_shell(shell, |state| {
+            schedule_active_title_autogen_retry_tick(state, "local://a".to_string(), 15_000);
+            assert!(
+                state
+                    .read()
+                    .title_autogen_retry_pending
+                    .contains("local://a"),
+                "the first call must arm the tick"
+            );
+            let before = write_count("active_title_autogen_retry_schedule");
+            schedule_active_title_autogen_retry_tick(state, "local://a".to_string(), 15_000);
+            assert_eq!(
+                write_count("active_title_autogen_retry_schedule"),
+                before,
+                "re-arming an already-armed title retry tick wrote ShellState — \
+                 the write re-renders, the render re-runs the copy-generation \
+                 effect, and the effect re-arms: 21 renders/sec (GUI host 2026-09-03)"
+            );
+        });
+        // Phase 2: a repeat failure against a live deadline must be a pure
+        // read — with the Interface LLM quota gone every attempt fails, so a
+        // re-stamping failure path re-renders once per untitled session per
+        // background sweep to change nothing.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let shell = ShellState::new(bootstrap);
+        menu_dismissal_locks::with_live_shell(shell, |state| {
+            schedule_active_title_retry_after_failure(state, "local://a");
+            let deadline = state
+                .read()
+                .title_autogen_retry_after_ms
+                .get("local://a")
+                .copied()
+                .expect("the first failure arms the retry deadline");
+            let before = write_count("active_title_autogen_retry_after_failure");
+            schedule_active_title_retry_after_failure(state, "local://a");
+            assert_eq!(
+                write_count("active_title_autogen_retry_after_failure"),
+                before,
+                "a repeat title failure re-stamped a live retry deadline"
+            );
+            assert_eq!(
+                state
+                    .read()
+                    .title_autogen_retry_after_ms
+                    .get("local://a")
+                    .copied(),
+                Some(deadline),
+                "the live deadline moved under a repeat failure"
+            );
+        });
+    }
+
     #[test]
     fn every_shellstate_write_goes_through_a_counted_wrapper() {
         let source = SHELL_SOURCE;
