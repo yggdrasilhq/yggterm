@@ -6303,6 +6303,21 @@ fn TerminalCanvas(
                 tokio::sync::mpsc::unbounded_channel::<(&'static str, bool, Option<String>)>();
             let mut screen_reconcile_fetch_in_flight = false;
             let mut startup_resize_repair_scheduled = false;
+            // THE DAEMON RPCs INSIDE THE js_event BRANCH LEAVE THE LOOP THE SAME
+            // WAY the reconcile fetch does. Measured on the GUI host 2026-09-03
+            // (the "UI blocks are hang equivalents" window):
+            // `input/loop_block` caught the `js_event` branch holding 1378 ms
+            // and 1411 ms on remote agent rows — every branch body runs to
+            // completion before the keystroke branch is polled again, and these
+            // arms awaited daemon round trips INLINE (resize on every geometry
+            // change, the frame-hash read, the prompt-gap nudge), each of which
+            // proxies to the OWNING daemon — over ssh for a remote row. The
+            // request side now spawns the call and `continue`s; the apply side
+            // runs on this channel's own branch, so ordering and the loop
+            // locals it mutates are preserved.
+            let (off_loop_rpc_tx, mut off_loop_rpc_rx) =
+                tokio::sync::mpsc::unbounded_channel::<OffLoopTerminalRpcResult>();
+            let mut frame_hash_fetch_in_flight = false;
             // RE-RESUME / REFLOW-BG FIX: when the COLUMN count changes, xterm.js
             // reflows and drops the background attribute of existing cells; a
             // delta-rendering TUI (codex) never repaints the unchanged text, so its
@@ -7904,37 +7919,44 @@ fn TerminalCanvas(
                                         }),
                                     );
                                     let _ = eval.send(TerminalJsCommand::Refit);
-                                    if let Err(error) = terminal_resize_nudge_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        current_terminal_cols.max(1),
-                                        current_terminal_rows.max(rows),
-                                    ).await {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "prompt_gap_resize_nudge_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": error.to_string(),
-                                                "attempt": prompt_gap_resize_nudges,
-                                            }),
-                                        );
-                                    } else {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "prompt_gap_resize_nudge_end",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "cursor_y": cursor_y,
-                                                "rows": rows,
-                                                "blank_rows_below_cursor": blank_rows_below_cursor,
-                                                "attempt": prompt_gap_resize_nudges,
-                                            }),
-                                        );
+                                    // ⛔ OFF-LOOP: the nudge proxies to the
+                                    // owning daemon (ssh for a remote row) and
+                                    // used to be awaited right here — inside
+                                    // the HostHealth arm, the highest-frequency
+                                    // variant in the `js_event` branch. The
+                                    // flow control below (read_poll_ms reset,
+                                    // continue) stays on the loop; only the
+                                    // round trip and its tracing moved.
+                                    {
+                                        let nudge_endpoint = endpoint.clone();
+                                        let nudge_session = runtime_session_path.clone();
+                                        let nudge_cols = current_terminal_cols.max(1);
+                                        let nudge_rows = current_terminal_rows.max(rows);
+                                        let nudge_attempt = prompt_gap_resize_nudges;
+                                        let nudge_cursor_y = cursor_y as u32;
+                                        let nudge_rows_view = rows;
+                                        let nudge_blank = blank_rows_below_cursor;
+                                        let nudge_tx = off_loop_rpc_tx.clone();
+                                        tokio::spawn(async move {
+                                            let error = terminal_resize_nudge_async(
+                                                nudge_endpoint,
+                                                nudge_session,
+                                                nudge_cols,
+                                                nudge_rows,
+                                            )
+                                            .await
+                                            .err()
+                                            .map(|error| error.to_string());
+                                            let _ = nudge_tx.send(
+                                                OffLoopTerminalRpcResult::PromptGapNudgeSettled {
+                                                    attempt: nudge_attempt,
+                                                    cursor_y: nudge_cursor_y,
+                                                    rows: nudge_rows_view,
+                                                    blank_rows_below_cursor: nudge_blank,
+                                                    error,
+                                                },
+                                            );
+                                        });
                                     }
                                     read_poll_ms = 45;
                                     next_read_deadline = tokio::time::Instant::now()
@@ -9246,76 +9268,41 @@ fn TerminalCanvas(
                                 ) {
                                     continue;
                                 }
-                                match terminal_resize_async(
-                                    endpoint.clone(),
-                                    runtime_session_path.clone(),
-                                    cols,
-                                    rows,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        // A COLUMN change (not the first resize) is what
-                                        // makes xterm reflow + drop cell backgrounds. Schedule
-                                        // a post-settle repaint from the daemon's authoritative
-                                        // screen to restore them. Gate on previously-known cols
-                                        // (!=0) so the initial mount resize doesn't trigger it.
-                                        let column_changed = last_sent_terminal_resize_cols != 0
-                                            && last_sent_terminal_resize_cols != cols;
-                                        last_sent_terminal_resize_cols = cols;
-                                        last_sent_terminal_resize_rows = rows;
-                                        // The daemon's PTY grid reaches this process ONLY as the
-                                        // "PTY size" metadata string on the live-session snapshot,
-                                        // and that snapshot refreshes every 60s while nothing is
-                                        // foreground-busy. So the one actor that just CHANGED the
-                                        // grid would go on comparing the live viewport against its
-                                        // own minute-old copy — and the SSOT divergence check would
-                                        // keep reporting a broken bottom that the resize had already
-                                        // repaired. Measured: the divergence was real for ~4.5s and
-                                        // reported for 46s, which is how `server app open` came to
-                                        // fail on a healthy row at its 15s deadline. Pull the refresh
-                                        // forward instead of widening the check's tolerance: the
-                                        // check is right, its input was stale.
-                                        state.with_mut_counted(|shell| {
-                                            schedule_live_session_snapshot_refresh(
-                                                shell,
-                                                LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS,
-                                            );
-                                        });
-                                        if column_changed {
-                                            screen_reconcile_due_at_ms = current_millis()
-                                                .saturating_add(POST_RESIZE_SCREEN_RECONCILE_SETTLE_MS);
-                                        }
-                                        if is_remote_resume_session
-                                            && !startup_resize_repair_scheduled
-                                        {
-                                            startup_resize_repair_scheduled = true;
-                                            spawn_terminal_startup_resize_repair(
-                                                endpoint.clone(),
-                                                runtime_session_path.clone(),
-                                                session_path.clone(),
-                                                cols,
-                                                rows,
-                                                trace_home.clone(),
-                                                "resize",
-                                            );
-                                        }
-                                    }
-                                    Err(error) => {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "terminal_resize_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "cols": cols,
-                                                "rows": rows,
-                                                "error": error.to_string(),
-                                            }),
-                                        );
-                                    }
-                                }
+                                // ⛔ OFF-LOOP (the `js_event` branch must not
+                                // await a daemon round trip — see the channel
+                                // setup): the resize proxies to the owning
+                                // daemon, over ssh for a remote row. The apply
+                                // half (last_sent bookkeeping, post-resize
+                                // refresh, reconcile scheduling) runs on the
+                                // `off_loop_rpc_apply` branch; until it lands
+                                // the geometry gate still compares the LAST
+                                // SENT grid, so a burst of refits coalesces
+                                // into one in-flight call plus at most one
+                                // queued duplicate.
+                                let (resize_cols, resize_rows) = (cols, rows);
+                                let resize_endpoint = endpoint.clone();
+                                let resize_session = runtime_session_path.clone();
+                                let resize_tx = off_loop_rpc_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = terminal_resize_async(
+                                        resize_endpoint,
+                                        resize_session,
+                                        resize_cols,
+                                        resize_rows,
+                                    )
+                                    .await;
+                                    let _ = resize_tx.send(match result {
+                                        Ok(()) => OffLoopTerminalRpcResult::ResizeApplied {
+                                            cols: resize_cols,
+                                            rows: resize_rows,
+                                        },
+                                        Err(error) => OffLoopTerminalRpcResult::ResizeFailed {
+                                            cols: resize_cols,
+                                            rows: resize_rows,
+                                            error: error.to_string(),
+                                        },
+                                    });
+                                });
                             }
                             Ok(TerminalJsEvent::MouseMode { mode, enabled, suppressed }) => {
                                 // The mouse-mode probe (mouse_mode_probe.rs): the
@@ -9412,32 +9399,55 @@ fn TerminalCanvas(
                                 // it just drained). One round trip, honest by
                                 // construction: the daemon hashes its model
                                 // NOW, the client pairs its stable buffer now.
-                                match terminal_read_async(
-                                    endpoint.clone(),
-                                    runtime_session_path.clone(),
-                                    cursor,
-                                    &trace_home,
-                                )
-                                .await
-                                {
-                                    Ok((_, _, _, _, _, _, _, _, Some(fresh))) => {
-                                        let _ = eval.send(TerminalJsCommand::FrameHash {
-                                            hash: fresh,
-                                        });
-                                    }
-                                    Ok((..)) => {}
-                                    Err(error) => {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "frame_hash_request_failed",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": error.to_string(),
-                                            }),
-                                        );
-                                    }
+                                //
+                                // ⛔ OFF-LOOP: the read proxies to the owning
+                                // daemon (over ssh for a remote row) and this
+                                // branch used to await it — a 1.4 s hold with
+                                // the keystroke branch queued behind it
+                                // (input/loop_block, GUI host 2026-09-03).
+                                // Latched to one in-flight fetch: the client
+                                // half is throttled, and the fetch that IS in
+                                // flight will answer with a fresher hash than
+                                // any duplicate would.
+                                if !frame_hash_fetch_in_flight {
+                                    frame_hash_fetch_in_flight = true;
+                                    let hash_endpoint = endpoint.clone();
+                                    let hash_session = runtime_session_path.clone();
+                                    let hash_cursor = cursor;
+                                    let hash_trace_home = trace_home.clone();
+                                    let hash_tx = off_loop_rpc_tx.clone();
+                                    tokio::spawn(async move {
+                                        match terminal_read_async(
+                                            hash_endpoint,
+                                            hash_session,
+                                            hash_cursor,
+                                            &hash_trace_home,
+                                        )
+                                        .await
+                                        {
+                                            Ok((_, _, _, _, _, _, _, _, Some(fresh))) => {
+                                                let _ = hash_tx.send(
+                                                    OffLoopTerminalRpcResult::FrameHashFresh {
+                                                        hash: Some(fresh),
+                                                    },
+                                                );
+                                            }
+                                            Ok((..)) => {
+                                                let _ = hash_tx.send(
+                                                    OffLoopTerminalRpcResult::FrameHashFresh {
+                                                        hash: None,
+                                                    },
+                                                );
+                                            }
+                                            Err(error) => {
+                                                let _ = hash_tx.send(
+                                                    OffLoopTerminalRpcResult::FrameHashFailed {
+                                                        error: error.to_string(),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    });
                                 }
                             }
                             Ok(TerminalJsEvent::ContextMenu { client_x, client_y }) => {
@@ -10328,6 +10338,135 @@ fn TerminalCanvas(
                                     "{write_error}. Typing is re-enabled — the surface may need a switch away and back."
                                 ),
                             );
+                        }
+                    }
+                    Some(result) = off_loop_rpc_rx.recv() => {
+                        // The apply half of the daemon calls the `js_event`
+                        // branch used to await inline (resize, frame-hash
+                        // fetch, prompt-gap nudge). Same shape as
+                        // `screen_reconcile_apply`: the RPC ran on its own
+                        // task, only this cheap half runs on the loop.
+                        let _loop_branch =
+                            TerminalLoopBranchGuard::new("off_loop_rpc_apply", &session_path);
+                        match result {
+                            OffLoopTerminalRpcResult::ResizeApplied { cols, rows } => {
+                                // A COLUMN change (not the first resize) is what
+                                // makes xterm reflow + drop cell backgrounds. Schedule
+                                // a post-settle repaint from the daemon's authoritative
+                                // screen to restore them. Gate on previously-known cols
+                                // (!=0) so the initial mount resize doesn't trigger it.
+                                let column_changed = last_sent_terminal_resize_cols != 0
+                                    && last_sent_terminal_resize_cols != cols;
+                                last_sent_terminal_resize_cols = cols;
+                                last_sent_terminal_resize_rows = rows;
+                                // The daemon's PTY grid reaches this process ONLY as the
+                                // "PTY size" metadata string on the live-session snapshot,
+                                // and that snapshot refreshes every 60s while nothing is
+                                // foreground-busy. So the one actor that just CHANGED the
+                                // grid would go on comparing the live viewport against its
+                                // own minute-old copy — and the SSOT divergence check would
+                                // keep reporting a broken bottom that the resize had already
+                                // repaired. Measured: the divergence was real for ~4.5s and
+                                // reported for 46s, which is how `server app open` came to
+                                // fail on a healthy row at its 15s deadline. Pull the refresh
+                                // forward instead of widening the check's tolerance: the
+                                // check is right, its input was stale.
+                                state.with_mut_counted(|shell| {
+                                    schedule_live_session_snapshot_refresh(
+                                        shell,
+                                        LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS,
+                                    );
+                                });
+                                if column_changed {
+                                    screen_reconcile_due_at_ms = current_millis()
+                                        .saturating_add(POST_RESIZE_SCREEN_RECONCILE_SETTLE_MS);
+                                }
+                                if is_remote_resume_session && !startup_resize_repair_scheduled {
+                                    startup_resize_repair_scheduled = true;
+                                    spawn_terminal_startup_resize_repair(
+                                        endpoint.clone(),
+                                        runtime_session_path.clone(),
+                                        session_path.clone(),
+                                        cols,
+                                        rows,
+                                        trace_home.clone(),
+                                        "resize",
+                                    );
+                                }
+                            }
+                            OffLoopTerminalRpcResult::ResizeFailed {
+                                cols,
+                                rows,
+                                error,
+                            } => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "terminal_resize_error",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "cols": cols,
+                                        "rows": rows,
+                                        "error": error,
+                                    }),
+                                );
+                            }
+                            OffLoopTerminalRpcResult::PromptGapNudgeSettled {
+                                attempt,
+                                cursor_y,
+                                rows,
+                                blank_rows_below_cursor,
+                                error,
+                            } => match error {
+                                Some(error) => {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "prompt_gap_resize_nudge_error",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "error": error,
+                                            "attempt": attempt,
+                                        }),
+                                    );
+                                }
+                                None => {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "prompt_gap_resize_nudge_end",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor_y": cursor_y,
+                                            "rows": rows,
+                                            "blank_rows_below_cursor": blank_rows_below_cursor,
+                                            "attempt": attempt,
+                                        }),
+                                    );
+                                }
+                            },
+                            OffLoopTerminalRpcResult::FrameHashFresh { hash } => {
+                                frame_hash_fetch_in_flight = false;
+                                if let Some(hash) = hash {
+                                    let _ = eval.send(TerminalJsCommand::FrameHash { hash });
+                                }
+                            }
+                            OffLoopTerminalRpcResult::FrameHashFailed { error } => {
+                                frame_hash_fetch_in_flight = false;
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "frame_hash_request_failed",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "error": error,
+                                    }),
+                                );
+                            }
                         }
                     }
                     _ = tokio::time::sleep_until(next_read_deadline),
@@ -16197,6 +16336,35 @@ async fn terminal_force_remote_restart_async(
 /// worth recording. A keystroke echo above roughly a tenth of a second is
 /// perceptible, so the threshold sits just under it.
 const TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS: u64 = 120;
+
+/// One completed daemon call that USED to be awaited inside the `js_event`
+/// select branch, delivered back for on-loop application. The payload carries
+/// exactly what the old inline apply half read, so the branch bodies below are
+/// the old code minus the `.await`.
+enum OffLoopTerminalRpcResult {
+    ResizeApplied {
+        cols: u16,
+        rows: u16,
+    },
+    ResizeFailed {
+        cols: u16,
+        rows: u16,
+        error: String,
+    },
+    PromptGapNudgeSettled {
+        attempt: u8,
+        cursor_y: u32,
+        rows: u16,
+        blank_rows_below_cursor: u16,
+        error: Option<String>,
+    },
+    FrameHashFresh {
+        hash: Option<String>,
+    },
+    FrameHashFailed {
+        error: String,
+    },
+}
 
 /// Records how long ONE `tokio::select!` branch body held the terminal event
 /// loop, and reports it when that becomes user-visible.

@@ -4868,6 +4868,127 @@ JSON.stringify({{
         );
     }
 
+    // The rows-serve memoization lock (GUI host 2026-09-03): `server app rows`
+    // rebuilds the world (second full merge + ~1 MB JSON) on every probe, and
+    // the fleet probes ~9/min — seven serves in fifty seconds each stalled the
+    // UI thread ~2 s in the hang window. The cache is keyed on the write
+    // epoch: a quiet shell must NOT rebuild (the build counter holds), and one
+    // counted write must invalidate it (the counter moves). Gut the epoch key
+    // and the first half of this goes red.
+    #[test]
+    fn a_quiet_shell_serves_the_memoized_rows_snapshot() {
+        use std::sync::atomic::Ordering;
+        let builds = || APP_ROWS_RESPONSE_BUILDS.load(Ordering::Relaxed);
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let shell = ShellState::new(bootstrap);
+        menu_dismissal_locks::with_live_shell(shell, |state| {
+            describe_app_rows_snapshot_cached(&state);
+            let after_first = builds();
+            describe_app_rows_snapshot_cached(&state);
+            assert_eq!(
+                builds(),
+                after_first,
+                "a second rows probe against an unchanged shell rebuilt the world — \
+                 the serve is the UI thread's most expensive read and the fleet \
+                 probes it nine times a minute"
+            );
+            // One counted write invalidates: the NEXT probe must rebuild, or a
+            // probe would answer about a shell that has moved on.
+            SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            describe_app_rows_snapshot_cached(&state);
+            assert!(
+                builds() > after_first,
+                "a state write did not invalidate the rows cache — the next probe \
+                 would answer from before the write"
+            );
+        });
+    }
+
+    // The hang lock (GUI host 2026-09-03, "UI blocks are hang equivalents"):
+    // the `js_event` select branch awaited daemon round trips INLINE — resize
+    // on every geometry change, the frame-hash read, the prompt-gap nudge —
+    // and `input/loop_block` caught the branch holding 1378/1411 ms on remote
+    // rows, with the keystroke branch queued behind it. Every one of those
+    // calls must now leave the loop through the off-loop channel (request side
+    // spawns + sends; the `off_loop_rpc_apply` branch applies), and the
+    // FrameHashRequest arm must no longer await its read.
+    #[test]
+    fn the_js_event_daemon_rpcs_leave_the_select_loop() {
+        let viewport = include_str!("viewport.rs");
+        let frame_hash_at = viewport
+            .find("Ok(TerminalJsEvent::FrameHashRequest) => {")
+            .expect("the FrameHashRequest arm exists");
+        let frame_hash_body = &viewport[frame_hash_at..frame_hash_at + 3_000];
+        assert!(
+            frame_hash_body.contains("off_loop_rpc_tx.clone()"),
+            "the FrameHashRequest arm stopped sending its read off-loop — the \
+             branch holds the keystroke path for as long as the (possibly \
+             ssh-proxied) round trip takes"
+        );
+        assert!(
+            !frame_hash_body
+                .split("tokio::spawn")
+                .next()
+                .unwrap_or_default()
+                .contains(".await"),
+            "the FrameHashRequest arm awaits its read INLINE again"
+        );
+        let resize_at = viewport
+            .find("Ok(TerminalJsEvent::Resize { cols, rows }) => {")
+            .expect("the Resize arm exists");
+        let resize_body = &viewport[resize_at..resize_at + 3_000];
+        assert!(
+            resize_body.contains("off_loop_rpc_tx.clone()")
+                && !resize_body
+                    .split("tokio::spawn")
+                    .next()
+                    .unwrap_or_default()
+                    .contains(".await"),
+            "the Resize arm awaits the daemon resize INLINE again — it fires on \
+             every geometry change, so one slow remote holds every keystroke"
+        );
+        let nudge_body_at = viewport
+            .find("\"prompt_gap_resize_nudge_begin\"")
+            .expect("the prompt-gap nudge's begin trace exists");
+        let nudge_body = &viewport[nudge_body_at..nudge_body_at + 2_500];
+        assert!(
+            nudge_body.contains("off_loop_rpc_tx.clone()"),
+            "the prompt-gap nudge awaits its daemon round trip inline again"
+        );
+        assert!(
+            viewport.contains("OffLoopTerminalRpcResult::ResizeApplied"),
+            "the off-loop apply branch is gone — the results would be sent and \
+             never applied"
+        );
+    }
+
+    // The DOM-walk cache lock (GUI host 2026-09-03): describe_state's DOM
+    // debug snapshot runs a layout-forcing walk (getAnimations +
+    // getComputedStyle over the whole page) in the WEB process — the same
+    // thread xterm input runs on — so each probe froze the terminal's own JS
+    // for the walk's duration. The serve must go through the TTL cache, not
+    // the raw walk.
+    #[test]
+    fn describe_state_serves_a_cached_dom_snapshot() {
+        let source = SHELL_SOURCE;
+        assert!(
+            source.contains("capture_dom_debug_snapshot_cached_for(active_session_path.as_deref())"),
+            "describe_state went back to the raw DOM walk — every probe \
+             re-freezes the web process's main thread (the terminal's typing) \
+             for the walk's duration"
+        );
+        let wrapper_at = source
+            .find("async fn capture_dom_debug_snapshot_cached_for(")
+            .expect("the DOM cache wrapper exists");
+        let wrapper = &source[wrapper_at..wrapper_at + 2_000];
+        assert!(
+            wrapper.contains("DOM_DEBUG_CACHE_TTL_MS")
+                && wrapper.contains("fresh.get(\"error\").is_none()"),
+            "the DOM cache lost its TTL or its success-only gate — a failed walk \
+             must not pin its failure"
+        );
+    }
+
     // The memo prerequisite for the whole component tree: two back-to-back
     // snapshots of an UNCHANGED shell must compare equal. `MainSurface` and
     // `Sidebar` receive the snapshot as a prop, and Dioxus skips their
@@ -37692,11 +37813,16 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     #[test]
     fn a_successful_resize_pulls_the_session_snapshot_forward() {
         let source = SHELL_SOURCE;
+        // The resize RPC left the `js_event` branch (off-loop channel, hang fix
+        // 2026-09-03), so the success half is applied on the
+        // `ResizeApplied` arm of the apply branch — the property is the same.
         let resize_ok_arm = source
-            .split("match terminal_resize_async(")
+            .split("OffLoopTerminalRpcResult::ResizeApplied { cols, rows } => {")
             .nth(1)
-            .and_then(|suffix| suffix.split("Err(error) => {").next())
-            .expect("resize success arm present");
+            .and_then(|suffix| {
+                suffix.split("OffLoopTerminalRpcResult::ResizeFailed").next()
+            })
+            .expect("resize success apply arm present");
         assert!(
             resize_ok_arm.contains("LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS"),
             "a successful resize must reschedule the live-session snapshot, or the \
