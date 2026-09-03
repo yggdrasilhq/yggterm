@@ -233,17 +233,30 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     it at the rail BOTTOM, under the scroll area, behind a separator. Subset
     vocabulary only: `label`, `toggle`, `button` (grow it when a consumer
     needs more). Use it for status-bar data (counts, modes) — not for content.
-  - **Ribbon strip (2026-09-03, ymacs tool-bar-mode was the forcing
-    consumer):** a DOCUMENT schema may also carry a top-level
-    `ribbon: [widgets…]` list — yggterm renders it ABOVE the viewport card,
-    on the shell's own background (seamless with startpage), and the card —
-    the viewport — starts below it. Subset vocabulary only: `label`,
-    `toolbar`, `button` (grow it when a consumer needs more). Use it for
-    the app's toolbar (Office-ribbon shape); never for content, which stays
-    in `widgets`. Absent/empty = no strip and the card keeps the full rect.
-    Buttons POST on the ordinary document action channel. Multi-viewport
-    seam, not a promise: the column (ribbon rows, then viewport panes) is
-    where a future timeline/CAD app stacks more; one viewport today.
+  - **Ribbon (v2, 2026-09-04; ymacs tab-bar-mode is the forcing consumer,
+    spec: ymacs `docs/spec-ribbon.md`):** a DOCUMENT schema may carry a
+    top-level `ribbon: [widgets…]` list, rendered as TWO layers. The TAB
+    STRIP — the `ribbon-bar` widget's `tabs` — is PINNED above the
+    viewport card on the shell's own background (chrome): never floating,
+    never overlaying content. The COMMAND PANEL — the widget's `groups`,
+    declared for the `active` tab — FLOATS: an opaque, bordered, shadowed
+    panel anchored under the strip, overlaying the card. Open/closed is
+    GUI-owned view state (a menu, not a layout region): a tab click opens
+    and POSTs `action` with the tab id, the active tab while open
+    dismisses with NO POST, outside click (a fixed backdrop below strip
+    and panel, above the card) and Escape-on-strip dismiss too. Opening
+    the panel never resizes the viewport; a remount starts closed. Schema
+    UNCHANGED from v1 — an old GUI renders the same widget as the old
+    attached strip, and the plain `label`/`toolbar`/`button` strip
+    widgets keep their v1 in-strip rendering. Never content, which stays
+    in `widgets`; absent/empty `ribbon` = no strip and the card keeps the
+    full rect. Buttons POST on the ordinary document action channel.
+    Styling law: DocTheme tokens only, carried as `--rb-*` custom
+    properties into ONE scoped stylesheet (`RIBBON_CSS` in
+    `right_rail.rs`) — hover/focus/elevation live there, never inline.
+    Multi-viewport seam, not a promise: the column (ribbon rows, then
+    viewport panes) is where a future timeline/CAD app stacks more; one
+    viewport today.
   - **`text-input` editor fields (document surface):** `line_numbers: true`
     draws the gutter; `word_wrap` (DEFAULT TRUE — user spec) soft-wraps the
     editor. While wrap is on the gutter is SUPPRESSED (logical line numbers

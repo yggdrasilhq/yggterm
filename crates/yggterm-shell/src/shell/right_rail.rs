@@ -3040,6 +3040,94 @@ impl DocTheme {
     }
 }
 
+/// The ribbon's hover, focus and elevation states. Inline styles cannot
+/// hover, so ONE stylesheet rides the strip (spec-ribbon styling law):
+/// every rule is scoped to `[data-document-ribbon]` and painted only from
+/// the `--rb-*` custom properties the container sets from DocTheme tokens —
+/// no hardcoded colour anywhere, so both shell palettes and terminal
+/// palettes theme it without a second copy of anything.
+const RIBBON_CSS: &str = r##"
+[data-document-ribbon] .ygg-ribbon-tab {
+  appearance: none; border: 0; background: transparent; cursor: pointer;
+  color: var(--rb-muted); font-size: 12px; font-weight: 500;
+  padding: 8px 12px 9px; border-radius: 7px 7px 0 0;
+  border-bottom: 2px solid transparent;
+  transition: color .12s ease, background .12s ease, border-color .12s ease;
+}
+[data-document-ribbon] .ygg-ribbon-tab:hover {
+  color: var(--rb-fg);
+  background: color-mix(in srgb, var(--rb-fg) 6%, transparent);
+}
+[data-document-ribbon] .ygg-ribbon-tab.is-active {
+  color: var(--rb-fg); font-weight: 600;
+  border-bottom-color: var(--rb-accent);
+}
+[data-document-ribbon] .ygg-ribbon-tab.is-active:hover {
+  background: color-mix(in srgb, var(--rb-accent) 8%, transparent);
+}
+[data-document-ribbon] .ygg-ribbon-tab:focus-visible {
+  outline: 2px solid var(--rb-accent); outline-offset: -2px;
+}
+[data-document-ribbon] .ygg-ribbon-btn {
+  appearance: none; cursor: pointer;
+  color: var(--rb-fg); background: transparent;
+  border: 1px solid var(--rb-border); border-radius: 8px;
+  font-size: 12px; font-weight: 500; padding: 6px 12px;
+  transition: background .12s ease, border-color .12s ease, filter .12s ease;
+}
+[data-document-ribbon] .ygg-ribbon-btn:hover {
+  background: color-mix(in srgb, var(--rb-accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--rb-accent) 45%, var(--rb-border));
+}
+[data-document-ribbon] .ygg-ribbon-btn:active {
+  background: color-mix(in srgb, var(--rb-accent) 18%, transparent);
+}
+[data-document-ribbon] .ygg-ribbon-btn:focus-visible {
+  outline: 2px solid var(--rb-accent); outline-offset: 1px;
+}
+[data-document-ribbon] .ygg-ribbon-btn.is-primary {
+  background: var(--rb-accent); border-color: var(--rb-accent);
+  color: var(--rb-bg); font-weight: 600;
+}
+[data-document-ribbon] .ygg-ribbon-btn.is-primary:hover { filter: brightness(1.08); }
+[data-document-ribbon] .ygg-ribbon-keys {
+  margin-left: auto; font-size: 11px; font-weight: 600;
+  color: var(--rb-muted); letter-spacing: .03em; white-space: nowrap;
+}
+[data-document-ribbon] .ygg-ribbon-backdrop {
+  position: fixed; inset: 0; z-index: 1;
+  background: transparent; border: 0; padding: 0; cursor: default;
+}
+[data-document-ribbon] .ygg-ribbon-panel {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 2;
+  background: var(--rb-bg);
+  border: 1px solid var(--rb-border); border-radius: 12px;
+  box-shadow: 0 14px 40px rgba(0,0,0,.22), 0 2px 8px rgba(0,0,0,.10);
+  padding: 10px 6px 8px; margin: 0 8px;
+  display: flex; align-items: stretch; flex-wrap: wrap; row-gap: 6px;
+  max-height: min(60vh, 420px); overflow-y: auto;
+  animation: ygg-ribbon-in .13s ease;
+}
+@keyframes ygg-ribbon-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+[data-document-ribbon] .ygg-ribbon-group {
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 2px 12px; justify-content: center; min-width: 0;
+}
+[data-document-ribbon] .ygg-ribbon-group + .ygg-ribbon-group {
+  border-left: 1px solid var(--rb-border);
+}
+[data-document-ribbon] .ygg-ribbon-group-buttons {
+  display: flex; gap: 6px; flex-wrap: wrap; justify-content: center;
+}
+[data-document-ribbon] .ygg-ribbon-group-caption {
+  font-size: 9.5px; font-weight: 600; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--rb-muted); text-align: center;
+}
+"##;
+
 #[component]
 fn DocumentSurfaceBody(
     snapshot: SharedSnapshot,
@@ -3050,6 +3138,10 @@ fn DocumentSurfaceBody(
     let Some(surface) = snapshot.document_surfaces.get(&session_path).cloned() else {
         return rsx! {};
     };
+    // The floating ribbon panel's open state is GUI-owned VIEW state
+    // (spec-ribbon: "a menu, not a layout region") — never a POST, never
+    // schema. A remount (surface expiry, session close) starts closed.
+    let mut ribbon_open = use_signal(|| false);
     let document_pane = surface.pane.clone();
     let document_values = surface.values.clone();
     let pane_id = document_pane.pane_id.clone();
@@ -3099,11 +3191,15 @@ fn DocumentSurfaceBody(
     // this column, and a transparent strip shows the dark terminal
     // bleeding through (the black-bar abomination, 2026-09-03). panel_alt
     // is the same chrome the in-card bar always wore — seamless with the
-    // gaps around the card, never the viewport's background.
+    // gaps around the card, never the viewport's background. v2: the strip
+    // is the ribbon's PINNED layer (spec-ribbon) — the command panel floats
+    // OVER the card from here, so the container is the positioning context
+    // and carries the DocTheme tokens as CSS custom properties for the one
+    // stylesheet below (inline styles cannot hover).
     let ribbon_style = format!(
-        "display:flex; align-items:center; gap:10px; flex-wrap:wrap; \
-         padding:4px 14px 8px; flex:0 0 auto; background:{};",
-        doc.chrome
+        "position:relative; z-index:30; flex:0 0 auto; background:{}; \
+         --rb-accent:{}; --rb-fg:{}; --rb-muted:{}; --rb-border:{}; --rb-bg:{};",
+        doc.chrome, doc.accent, doc.fg, doc.muted, doc.border, doc.bg
     );
     // The ribbon: toolbar strip above the card. Subset vocabulary
     // (AppPaneSchema::ribbon) — label/toolbar/button; the body keeps
@@ -3225,137 +3321,176 @@ fn DocumentSurfaceBody(
                     }
                 }
             },
-            // The ribbon lives OUTSIDE the card: app toolbar strip on
-            // shell background, viewport below. Buttons POST on the same
-            // document channel as the bar's.
+            // The ribbon v2 (ymacs docs/spec-ribbon.md): the tab strip is
+            // PINNED on this chrome; the active tab's command panel FLOATS
+            // over the viewport card as GUI-owned view state. Buttons POST
+            // on the same document channel as the bar's. Opening the panel
+            // never moves the card; dismissing it is never a POST.
             if !ribbon_widgets.is_empty() {
                 div {
                     "data-document-ribbon": "{pane_id}",
                     style: "{ribbon_style}",
-                    for (index, widget) in ribbon_widgets.iter().enumerate() {
-                        {
-                            let widget_key = widget.key(index, &value_epochs);
-                            match widget {
-                                AppPaneWidget::Section { text, .. } | AppPaneWidget::Label { text, .. } => rsx! {
-                                    span {
-                                        key: "{widget_key}",
-                                        style: "{bar_title_style}",
-                                        "{text}"
-                                    }
-                                },
-                                AppPaneWidget::Toolbar { id, buttons } => rsx! {
-                                    div {
-                                        key: "{widget_key}",
-                                        "data-document-ribbon-toolbar": "{id}",
-                                        style: "display:flex; align-items:center; gap:6px; flex-wrap:wrap;",
-                                        for toolbar_button in buttons.iter().cloned() {
-                                            button {
-                                                key: "{toolbar_button.action}",
-                                                "data-document-button": "{toolbar_button.action}",
-                                                style: if toolbar_button.primary {
-                                                    bar_button_primary_style.clone()
-                                                } else {
-                                                    bar_button_style.clone()
-                                                },
-                                                title: "{toolbar_button.title}",
-                                                onclick: {
-                                                    let run_action = run_action.clone();
-                                                    let action = toolbar_button.action.clone();
-                                                    move |_| run_action(action.clone(), None)
-                                                },
-                                                {shell_glyph(&toolbar_button.label, 13)}
-                                            }
+                    style { {RIBBON_CSS} },
+                    // Click-to-dismiss backdrop: BELOW the strip and panel
+                    // (they carry z-index 3/2 inside this container), ABOVE
+                    // the card — so a click on the card dismisses, a click
+                    // on a tab still reaches the tab.
+                    if ribbon_open() {
+                        div {
+                            key: "ribbon-backdrop-{pane_id}",
+                            class: "ygg-ribbon-backdrop",
+                            onclick: move |_| ribbon_open.set(false),
+                        }
+                    }
+                    div {
+                        class: "ygg-ribbon-strip",
+                        style: "position:relative; z-index:3; display:flex; align-items:center; gap:8px; flex-wrap:wrap; width:100%; padding:0 10px;",
+                        onkeydown: move |evt: KeyboardEvent| {
+                            // Escape dismisses while the strip holds focus —
+                            // a view gesture; every other chord flows on.
+                            if evt.key() == Key::Escape && ribbon_open() {
+                                evt.stop_propagation();
+                                ribbon_open.set(false);
+                            }
+                        },
+                        for (index, widget) in ribbon_widgets.iter().enumerate() {
+                            {
+                                let widget_key = widget.key(index, &value_epochs);
+                                match widget {
+                                    AppPaneWidget::Section { text, .. } => rsx! {
+                                        span {
+                                            key: "{widget_key}",
+                                            style: "{bar_title_style}",
+                                            "{text}"
                                         }
-                                    }
-                                },
-                                AppPaneWidget::Button { id, label, action, primary, title, .. } => rsx! {
-                                    button {
-                                        key: "{widget_key}",
-                                        "data-document-button": "{id}",
-                                        title: "{title}",
-                                        style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
-                                        onclick: {
-                                            let run_action = run_action.clone();
-                                            let action = action.clone();
-                                            move |_| run_action(action.clone(), None)
-                                        },
-                                        {shell_glyph(label, 13)}
-                                    }
-                                },
-                                AppPaneWidget::RibbonBar { id, action, active, tabs, groups } => rsx! {
-                                    div {
-                                        key: "{widget_key}",
-                                        "data-document-ribbon-bar": "{id}",
-                                        style: "flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:0;",
-                                        // tab strip: text tabs, active tab carries the accent underline
+                                    },
+                                    AppPaneWidget::Label { text, .. } => rsx! {
+                                        span {
+                                            key: "{widget_key}",
+                                            class: "ygg-ribbon-keys",
+                                            "{text}"
+                                        }
+                                    },
+                                    AppPaneWidget::Toolbar { id, buttons } => rsx! {
                                         div {
-                                            style: "display:flex; align-items:flex-end; gap:1px; padding:1px 6px 0; border-bottom:1px solid {doc.border};",
-                                            for tab in tabs.iter().cloned() {
+                                            key: "{widget_key}",
+                                            "data-document-ribbon-toolbar": "{id}",
+                                            style: "display:flex; align-items:center; gap:6px; flex-wrap:wrap;",
+                                            for toolbar_button in buttons.iter().cloned() {
                                                 button {
-                                                    key: "{id}-{tab.id}",
-                                                    style: if tab.id == *active {
-                                                        format!("padding:4px 13px 5px; background:transparent; color:{}; font-size:11.5px; border:0; border-bottom:2px solid {}; font-weight:600; cursor:pointer;", doc.fg, doc.accent)
-                                                    } else {
-                                                        format!("padding:4px 13px 5px; background:transparent; color:{}; font-size:11.5px; border:0; border-bottom:2px solid transparent; cursor:pointer;", doc.muted)
-                                                    },
-                                                    title: "{tab.label}",
+                                                    key: "{toolbar_button.action}",
+                                                    class: if toolbar_button.primary { "ygg-ribbon-btn is-primary" } else { "ygg-ribbon-btn" },
+                                                    "data-document-button": "{toolbar_button.action}",
+                                                    title: "{toolbar_button.title}",
                                                     onclick: {
                                                         let run_action = run_action.clone();
-                                                        let action = action.clone();
-                                                        let tab_id = tab.id.clone();
-                                                        move |_| run_action(action.clone(), Some(tab_id.clone()))
+                                                        let action = toolbar_button.action.clone();
+                                                        move |_| run_action(action.clone(), None)
                                                     },
-                                                    "{tab.label}"
-                                                }
-                                            }
-                                        },
-                                        // command row: groups with caption captions, divider-separated
-                                        div {
-                                            style: "display:flex; align-items:stretch; flex-wrap:wrap; padding:3px 8px 4px; row-gap:4px;",
-                                            for (gi, group) in groups.iter().enumerate() {
-                                                div {
-                                                    key: "{id}-group{gi}",
-                                                    style: if group.right {
-                                                        "margin-left:auto; display:flex; flex-direction:column; gap:2px; padding:1px 10px; justify-content:center;".to_string()
-                                                    } else if gi > 0 {
-                                                        format!("display:flex; flex-direction:column; gap:2px; padding:1px 10px; border-left:1px solid {}; justify-content:center;", doc.border)
-                                                    } else {
-                                                        "display:flex; flex-direction:column; gap:2px; padding:1px 10px; justify-content:center;".to_string()
-                                                    },
-                                                    div {
-                                                        style: "display:flex; gap:4px; flex-wrap:wrap;",
-                                                        for ribbon_group_button in group.buttons.iter().cloned() {
-                                                            button {
-                                                                key: "{ribbon_group_button.action}",
-                                                                "data-document-button": "{ribbon_group_button.action}",
-                                                                title: "{ribbon_group_button.title}",
-                                                                style: if ribbon_group_button.primary {
-                                                                    bar_button_primary_style.clone()
-                                                                } else {
-                                                                    format!("padding:3px 10px; border:1px solid transparent; border-radius:6px; background:transparent; color:{}; font-size:11px; cursor:pointer;", doc.fg)
-                                                                },
-                                                                onclick: {
-                                                                    let run_action = run_action.clone();
-                                                                    let action = ribbon_group_button.action.clone();
-                                                                    move |_| run_action(action.clone(), None)
-                                                                },
-                                                                {shell_glyph(&ribbon_group_button.label, 13)}
-                                                            }
-                                                        }
-                                                    },
-                                                    {(!group.label.is_empty()).then(|| {
-                                                        let label_style = format!("font-size:9px; color:{}; text-align:center;", doc.muted);
-                                                        rsx! { span { style: "{label_style}", "{group.label}" } }
-                                                    })}
+                                                    {shell_glyph(&toolbar_button.label, 13)}
                                                 }
                                             }
                                         }
-                                    }
-                                },
-                                // Ribbon subset is label/toolbar/button; anything
-                                // else is the same empty span an unmatched bar
-                                // widget renders — never a hole in the strip.
-                                _ => rsx! { span { key: "{widget_key}" } },
+                                    },
+                                    AppPaneWidget::Button { id, label, action, primary, title, .. } => rsx! {
+                                        button {
+                                            key: "{widget_key}",
+                                            class: if *primary { "ygg-ribbon-btn is-primary" } else { "ygg-ribbon-btn" },
+                                            "data-document-button": "{id}",
+                                            title: "{title}",
+                                            onclick: {
+                                                let run_action = run_action.clone();
+                                                let action = action.clone();
+                                                move |_| run_action(action.clone(), None)
+                                            },
+                                            {shell_glyph(label, 13)}
+                                        }
+                                    },
+                                    AppPaneWidget::RibbonBar { id, action, active, tabs, groups } => rsx! {
+                                        div {
+                                            key: "{widget_key}",
+                                            "data-document-ribbon-bar": "{id}",
+                                            style: "position:relative; flex:1 1 auto; min-width:0; display:flex; align-items:center;",
+                                            // TAB STRIP — pinned chrome (spec-ribbon
+                                            // layer 1). Click opens the floating panel
+                                            // on that tab; the active tab while open
+                                            // dismisses it.
+                                            div {
+                                                style: "display:flex; align-items:center; gap:1px; min-width:0;",
+                                                for tab in tabs.iter().cloned() {
+                                                    button {
+                                                        key: "{id}-{tab.id}",
+                                                        class: if tab.id == *active { "ygg-ribbon-tab is-active" } else { "ygg-ribbon-tab" },
+                                                        title: "{tab.label}",
+                                                        onclick: {
+                                                            let run_action = run_action.clone();
+                                                            let action = action.clone();
+                                                            let tab_id = tab.id.clone();
+                                                            let active_id = active.clone();
+                                                            move |_| {
+                                                                if ribbon_open() && tab_id == *active_id {
+                                                                    ribbon_open.set(false);
+                                                                } else {
+                                                                    if tab_id != *active_id {
+                                                                        run_action(action.clone(), Some(tab_id.clone()));
+                                                                    }
+                                                                    ribbon_open.set(true);
+                                                                }
+                                                            }
+                                                        },
+                                                        "{tab.label}"
+                                                    }
+                                                }
+                                            },
+                                            // FLOATING COMMAND PANEL — spec-ribbon
+                                            // layer 2: the active tab's groups,
+                                            // overlaying the card. Positioning
+                                            // context is this bar wrapper; the
+                                            // stylesheet owns the elevation. An
+                                            // active tab with no groups renders
+                                            // nothing — an empty floating card
+                                            // would be a lie.
+                                            if ribbon_open() && !groups.is_empty() {
+                                                div {
+                                                    key: "{id}-panel",
+                                                    class: "ygg-ribbon-panel",
+                                                    "data-ribbon-panel": "{id}",
+                                                    for (gi, group) in groups.iter().enumerate() {
+                                                        div {
+                                                            key: "{id}-group{gi}",
+                                                            class: "ygg-ribbon-group",
+                                                            style: if group.right { "margin-left:auto;" } else { "" },
+                                                            div {
+                                                                class: "ygg-ribbon-group-buttons",
+                                                                for ribbon_group_button in group.buttons.iter().cloned() {
+                                                                    button {
+                                                                        key: "{ribbon_group_button.action}",
+                                                                        class: if ribbon_group_button.primary { "ygg-ribbon-btn is-primary" } else { "ygg-ribbon-btn" },
+                                                                        "data-document-button": "{ribbon_group_button.action}",
+                                                                        title: "{ribbon_group_button.title}",
+                                                                        onclick: {
+                                                                            let run_action = run_action.clone();
+                                                                            let action = ribbon_group_button.action.clone();
+                                                                            move |_| run_action(action.clone(), None)
+                                                                        },
+                                                                        {shell_glyph(&ribbon_group_button.label, 13)}
+                                                                    }
+                                                                }
+                                                            },
+                                                            {(!group.label.is_empty()).then(|| {
+                                                                rsx! { span { class: "ygg-ribbon-group-caption", "{group.label}" } }
+                                                            })}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    // Ribbon subset is label/toolbar/button; anything
+                                    // else is the same empty span an unmatched bar
+                                    // widget renders — never a hole in the strip.
+                                    _ => rsx! { span { key: "{widget_key}" } },
+                                }
                             }
                         }
                     }
