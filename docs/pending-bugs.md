@@ -26577,3 +26577,59 @@ working) while running a 5-day-old `(deleted)` binary through many deploys —
 it lacks yggterm's wave-1 disk-replacement retire law; and the picker's
 orphaned-listener design means a mid-pick app death always strands the
 webview on a dead interstitial by construction.
+
+## ⛔ [arm-matrix-red] THE ARM MATRIX RAN RED ON EVERY HOST SINCE THE ses_ GUARD — OPENCODE'S ARM EXERCISED AN ID SHAPE ITS SERVICE REFUSES
+
+**Status:** FIXED 2026-09-02 on `lane/dev/mirror-tick-rebind`.
+
+`every_arm_builds_the_invocation_its_descriptor_declares` asserted OpenCode's
+resume composes `opencode2 --session '<id>'` — with
+`ARM_SESSION_ID = 11111111-…` (a uuid). The ses_ guard (70329d66b, "never
+compose a resume with a non-ses_ id — degrade to a fresh launch") deliberately
+degrades exactly that shape, so the assertion has been red on every host since
+that commit landed (`opencode2 '--auto'` — measured on dev main f6b1c5f88
+before this lane). The arm's contract is what the CLI ACTUALLY accepts:
+`arm_resume_session_id(kind)` now gives the OpenCode arm a ses_-shaped fixture
+id, every other arm keeps the uuid. `locality_does_not_fork_the_invocation`
+uses the same helper, so the local/remote twin comparison stays symmetric.
+
+## ⛔ [managed-remove-ambient] THE MANAGED-CLI REMOVAL TESTS READ THE HOST'S PATH — RED WHEREVER QWEN IS INSTALLED
+
+**Status:** OPEN — measured on dev 2026-09-02, main f6b1c5f88.
+
+`removing_an_absent_cli_is_a_reported_no_op` (and the generations twin) build
+isolated `provision_test_paths`, but the removal's resolver consults the REAL
+environment: on a host where `~/.yggterm/npm/bin/qwen` exists on PATH,
+`remove_local_managed_cli_with_paths` refuses with "resolves to … which is a
+system install — yggterm only removes binaries under its own managed dir"
+before the no-op assertion can run. The test's isolation is incomplete — the
+resolution seam must be injectable (paths for the lookup too), or the test
+must neuter PATH. Same class as [[finding-a-test-that-reads-ambient-host-state-is-not-flaky]].
+
+## ⛔ [arm-matrix-red] THE ARM MATRIX RAN RED ON EVERY HOST SINCE THE ses_ GUARD — OPENCODE'S ARM EXERCISED AN ID SHAPE ITS SERVICE REFUSES
+
+**Status:** FIXED 2026-09-02 on `lane/dev/mirror-tick-rebind`.
+
+`every_arm_builds_the_invocation_its_descriptor_declares` asserted OpenCode's
+resume composes `opencode2 --session '<id>'` — with
+`ARM_SESSION_ID = 11111111-…` (a uuid). The ses_ guard (70329d66b, "never
+compose a resume with a non-ses_ id — degrade to a fresh launch") deliberately
+degrades exactly that shape, so the assertion has been red on every host since
+that commit landed (`opencode2 '--auto'` — measured on dev main f6b1c5f88
+before this lane). The arm's contract is what the CLI ACTUALLY accepts:
+`arm_resume_session_id(kind)` now gives the OpenCode arm a ses_-shaped fixture
+id, every other arm keeps the uuid. `locality_does_not_fork_the_invocation`
+uses the same helper, so the local/remote twin comparison stays symmetric.
+
+## ⛔ [managed-remove-ambient] THE MANAGED-CLI REMOVAL TESTS READ THE HOST'S PATH — RED WHEREVER QWEN IS INSTALLED
+
+**Status:** OPEN — measured on dev 2026-09-02, main f6b1c5f88.
+
+`removing_an_absent_cli_is_a_reported_no_op` (and the generations twin) build
+isolated `provision_test_paths`, but the removal's resolver consults the REAL
+environment: on a host where `~/.yggterm/npm/bin/qwen` exists on PATH,
+`remove_local_managed_cli_with_paths` refuses with "resolves to … which is a
+system install — yggterm only removes binaries under its own managed dir"
+before the no-op assertion can run. The test's isolation is incomplete — the
+resolution seam must be injectable (paths for the lookup too), or the test
+must neuter PATH. Same class as [[finding-a-test-that-reads-ambient-host-state-is-not-flaky]].

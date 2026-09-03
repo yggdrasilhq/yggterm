@@ -1277,6 +1277,38 @@ opencode is very dynamic."*
 * Restore metadata naming the wrong CLI's verb (`resume-codex` on an OpenCode
   row) is fixed on the fs-truth lane (bug B1) and merges separately.
 
+### Issue 30 amendment (2026-09-02 late): the mirror-tick rebind — identity follows the viewing stream
+
+Issue 30 above SURFACED the dynamic state and declared identity out of scope
+("does not add a new switch detector"). The detector already existed — the
+mirror's focus stream. What was missing was the consumer: the anchor's bound
+identity never followed it, so a uuid-keyed anchor kept its birth uuid as
+`session.id` (the phantom-resume class, three live TUIs measured booting on
+ids no store ever held) while the TUI rendered entirely different sessions,
+and click-to-resume aimed at the row's birth id, not what the human was
+looking at.
+
+**Landed (lane `lane/dev/mirror-tick-rebind`):** on every mirror tick, when
+the anchor is LIVE (pid or running phase — a dead row renders nothing and is
+never rebound) and the most-recently-viewed service session differs from the
+anchor's bound id, the anchor rebinds through
+`apply_agent_runtime_session_id_to_live_session_service_vouched`. The
+service-vouched arm exists because the store-vouching builder's absent-arm
+re-births — and the on-disk membership index can lag the very session the
+service is rendering right now (brand-new session, relocated store). The
+service's focus stream is the stronger vouch: the TUI is showing the session,
+so it exists. The rebind is a no-op on every tick where the bound id already
+agrees (a quiet TUI costs one compare) and traces
+`opencode_mirror/anchor_rebound_to_viewed_session` with the from/to ids.
+
+After the rebind, the already-landed pieces compose without further work: the
+Dynamic title chore polls the rebound id's store entry (title follows the
+switch on the next tick), the metadata pane's session-id line and Viewing
+stamp name the same session, a cold restart's restore-spawn resumes the
+viewed session, and the `resume-opencode` composition carries the ses_ id the
+service accepts (the ses_ guard passes it through; the fresh-launch degrade
+only catches non-ses_ ids).
+
 ## Issue Heading 31: live CLI probes — expected vs actual, on the trace plane and in the metadata pane (2026-09-03)
 
 Owner directive: *"why don't we add probe points called cli/common,

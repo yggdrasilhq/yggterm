@@ -7459,6 +7459,36 @@ impl YggtermServer {
         key_or_path: &str,
         session_id: &str,
     ) -> bool {
+        self.apply_agent_runtime_session_id_to_live_session_with_vouch(
+            key_or_path,
+            session_id,
+            true,
+        )
+    }
+
+    /// The mirror-tick rebind's arm: the new id is vouched by the CLI's OWN
+    /// SERVICE (the live focus stream that named it), so the store's
+    /// absent-arm must not re-birth the row — the on-disk index can lag the
+    /// very session the TUI is rendering right now, and re-birthing it would
+    /// discard what the human is looking at.
+    pub(crate) fn apply_agent_runtime_session_id_to_live_session_service_vouched(
+        &mut self,
+        key_or_path: &str,
+        session_id: &str,
+    ) -> bool {
+        self.apply_agent_runtime_session_id_to_live_session_with_vouch(
+            key_or_path,
+            session_id,
+            false,
+        )
+    }
+
+    fn apply_agent_runtime_session_id_to_live_session_with_vouch(
+        &mut self,
+        key_or_path: &str,
+        session_id: &str,
+        vouch_from_store: bool,
+    ) -> bool {
         if session_id.trim().is_empty() {
             return false;
         }
@@ -7495,12 +7525,20 @@ impl YggtermServer {
             && agent_cli_descriptor(session.kind).is_some()
         {
             if let Some(cwd) = session_metadata_value(session, "Cwd") {
-                session.launch_command = stored_session_launch_command_for_locality(
-                    session.kind,
-                    &cwd,
-                    session_id,
-                    true,
-                );
+                session.launch_command = if vouch_from_store {
+                    stored_session_launch_command_for_locality(
+                        session.kind,
+                        &cwd,
+                        session_id,
+                        true,
+                    )
+                } else {
+                    stored_session_launch_command_service_vouched(
+                        session.kind,
+                        &cwd,
+                        session_id,
+                    )
+                };
             }
         }
         session.id = session_id.to_string();
@@ -33361,6 +33399,44 @@ fn stored_session_launch_command_for_locality_with_options(
     is_local: bool,
     launch: &AgentLaunchOptions,
 ) -> String {
+    let vouch = is_local
+        .then(|| local_agent_store_vouches_for_session(kind, session_id))
+        .flatten();
+    stored_session_launch_command_from_vouch(kind, cwd, session_id, is_local, launch, vouch)
+}
+
+/// A resume for an id the CLI's OWN SERVICE has vouched for — the live TUI is
+/// rendering that session right now (the opencode mirror's focus stream). The
+/// on-disk membership index can lag a brand-new session or miss a relocated
+/// store, and its absent-arm re-births the row, discarding the exact session
+/// the human is looking at. The service's word outranks the index, so this
+/// composes as unanswerable — which resumes.
+fn stored_session_launch_command_service_vouched(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+) -> String {
+    stored_session_launch_command_from_vouch(
+        kind,
+        cwd,
+        session_id,
+        true,
+        &AgentLaunchOptions::default(),
+        None,
+    )
+}
+
+/// The composition given an already-decided vouch: `Some(false)` = the store
+/// was consulted and the id is not there (re-birth), `Some(true)`/`None` =
+/// vouched or unanswerable, both of which resume.
+fn stored_session_launch_command_from_vouch(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    is_local: bool,
+    launch: &AgentLaunchOptions,
+    vouch: Option<bool>,
+) -> String {
     match kind {
         SessionKind::ClaudeCode if is_local => match local_cc_resume_cwd(session_id) {
             // Resume in the cwd the TRANSCRIPT records, never the row's cwd: CC keys its
@@ -33402,9 +33478,6 @@ fn stored_session_launch_command_for_locality_with_options(
         // The second is silent data loss; the first merely looks like one. Both
         // are prevented by not asking for a session that is not there.
         _ => {
-            let vouch = is_local
-                .then(|| local_agent_store_vouches_for_session(kind, session_id))
-                .flatten();
             // ⭐ The decision is a probe, not a silent branch: which store said
             // what, and whether the row resumes or re-births, becomes a count
             // on `cli/resume_decision` (see `cli_plane::emit_resume_decision`).
