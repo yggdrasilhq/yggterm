@@ -78,6 +78,63 @@ either reintroduces this exact storm; the autopsy tag names them in one grep.
 top mut sites, and `ui/block` back under 1/min with no severe ≥1 s — read by
 `app_version`, never pooled across the roll.
 
+**FIRST READ, 2026-09-03 ~15:55 (fixed GUI pid, 1 h post-restart): HALF MET,
+and the half that failed is a different mechanism.** No autopsy with the retry
+tag has fired since the fix went live (the two in the file are pre-restart);
+GUI CPU 31%→18%, WebKit 26%→19%; overall rate 3.7/min→2.1/min. But steady
+state (post-adoption, last 30 min) still reads **85 blocks = 2.8/min, p50
+733 ms, max 1430 ms** — the ≤1/min + no-severe clause FAILS. Base-rate-checked
+attribution of the steady window (7.8 trace events/sec): `dispatch` and
+`js_debug` sit at their base rates (stampers, not causes);
+`app_control/request_begin` is **7× enriched in severe** (measured serve:
+`describe_rows` p50 27 ms/max 308 ms at ~9 probes/min,
+`describe_state` p50 867 ms — each full state is a severe block by itself);
+`dioxus_render/component_window` 3.5×; `app_declare/daemon_declare_absent`
+3.8× at 28 polls/min. And the loop's own guard names the giant directly:
+`input/loop_block` caught the **`js_event` branch holding 1378 ms and
+1411 ms on remote agent rows**. The storm is closed; the remainder is filed
+as [11.46] with its own instrument owed (per-variant timing inside the
+`js_event` branch — the guard names the branch, not the variant).
+
+## ⛔ [11.46] THE `js_event` BRANCH HOLDS THE TERMINAL LOOP 1.4 s ON REMOTE ROWS — AND EACH FULL `describe_state` IS A SEVERE BLOCK BY ITSELF
+
+**Status:** OPEN
+
+*Split off [11.45]'s first read, 2026-09-03 ~15:55: the title-retry storm is
+dead (no autopsy since the fix, CPU down) and the steady-state blocks are a
+different mechanism with its own witnesses.*
+
+Measured on the GUI host, fixed GUI pid, post-adoption steady 30 min (85
+blocks, 2.8/min, p50 733 ms, max 1430 ms; base rate 7.8 trace events/sec):
+
+1. `input/loop_block` (the terminal loop's own branch guard) caught the
+   **`js_event` branch at 1378 ms and 1411 ms, both on remote agent rows**.
+   The guard names the branch, not the `TerminalJsEvent` variant — the Ready /
+   Debug / FrameHash / clipboard arms all share one timer. Prime suspect by
+   shape is an inline daemon round trip for a remote row (the
+   `FrameHashRequest` arm awaits `terminal_read_async`, which proxies over
+   SSH), but no `frame_hash_request*` event fired in the hour, so that arm is
+   unproven — the branch needs per-variant guards before anyone touches it.
+2. `app_control/request_begin` is **7× enriched in severe blocks** against its
+   base rate. Measured serve (begin→end pairs): `describe_rows` p50 27 ms /
+   max 308 ms at ~9 probes/min; **`describe_state` p50 867 ms over 3 calls**
+   — each full state serve is a severe block by itself, on the UI thread.
+   The shared-snapshot dedup (state.rs) removed the re-merge; the remaining
+   cost is the ~450 KB JSON build + serialize per probe.
+3. `app_declare/daemon_declare_absent` 3.8× enriched in severe at 28
+   polls/min (the per-row-per-minute negative the [11.4] entry already
+   prices); `dioxus_render/component_window` 3.5× (the render itself, 693
+   rows at 1.4 renders/sec).
+
+**What would close it:** per-variant `loop_block` timing inside the
+`js_event` match (viewport.rs `TerminalLoopBranchGuard::new("js_event", …)`
+arm), then move the slowest variant's await off the branch — the proven shape
+is the reconcile-fetch latch (`spawn_screen_reconcile_fetch`), not a symptom
+patch. For app-control: serve `DescribeState`/`DescribeRows` from a snapshot
+cloned off-thread, or refuse the full state at probe cadence. **Falsifier:**
+steady-state `ui/block` under 1/min with no severe ≥1 s, and no `loop_block`
+over ~200 ms in the same window.
+
 ## ⛔ [11.39] A GUI RESTART LEAVES AN IDLE FULLSCREEN TUI'S VIEWPORT BLANK FOR ~40s — THE "SLOW TERMINAL REVEAL"
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
