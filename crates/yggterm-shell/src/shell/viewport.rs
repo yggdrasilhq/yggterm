@@ -9370,12 +9370,23 @@ fn TerminalCanvas(
                                 rows,
                                 at_bottom,
                                 mismatch,
+                                buffer_kind,
+                                buffer_transitions,
+                                visual_reason,
+                                host_age_ms,
+                                wheel_events,
                             }) => {                                // The frame-hash probe's client half
                                 // (frame_hash_probe.js): the applied viewport hash
                                 // paired against the daemon's authoritative-grid
                                 // hash. Emission is already throttled client-side;
                                 // a mismatch while at-bottom is the ghost family's
-                                // objective signature — record it verbatim.
+                                // objective signature — record it verbatim, WITH
+                                // the mount's ghost context (buffer kind, real
+                                // transitions, last visual reason, host age,
+                                // wheel events): the mismatch says THAT it
+                                // artifacted, the counters say FROM WHERE, so
+                                // the S1/S2/S3 family splits by payload instead
+                                // of by a human reading screenshots.
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -9389,6 +9400,11 @@ fn TerminalCanvas(
                                         "rows": rows,
                                         "at_bottom": at_bottom,
                                         "mismatch": mismatch,
+                                        "buffer_kind": buffer_kind,
+                                        "buffer_transitions": buffer_transitions,
+                                        "visual_reason": visual_reason,
+                                        "host_age_ms": host_age_ms,
+                                        "wheel_events": wheel_events,
                                     }),
                                 );
                             }

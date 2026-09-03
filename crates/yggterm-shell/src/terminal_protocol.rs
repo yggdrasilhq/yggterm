@@ -161,6 +161,17 @@ pub(crate) enum TerminalJsEvent {
         rows: u16,
         at_bottom: bool,
         mismatch: bool,
+        /// ⭐ THE GHOST CONTEXT (Issue 31 follow-up, 2026-09-03): the mount's
+        /// own counters ride every pairing, so a mismatch splits the S1/S2/S3
+        /// family by payload — buffer kind + genuine-transition count + the
+        /// last visual transition's reason + host age + wheel events. All
+        /// classification, no content. Constructed, never deserialized (the
+        /// wire twin carries serde(default) for older in-page scripts).
+        buffer_kind: String,
+        buffer_transitions: u32,
+        visual_reason: String,
+        host_age_ms: u64,
+        wheel_events: u64,
     },
     Clipboard {
         action: String,
@@ -493,6 +504,18 @@ enum TerminalJsEventWire {
         at_bottom: bool,
         #[serde(default)]
         mismatch: bool,
+        /// Ghost context — see the constructed twin. serde(default) so older
+        /// in-page scripts predate every field.
+        #[serde(default)]
+        buffer_kind: String,
+        #[serde(default)]
+        buffer_transitions: u32,
+        #[serde(default)]
+        visual_reason: String,
+        #[serde(default)]
+        host_age_ms: u64,
+        #[serde(default)]
+        wheel_events: u64,
     },
     Clipboard {
         action: String,
@@ -719,6 +742,11 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 rows,
                 at_bottom,
                 mismatch,
+                buffer_kind,
+                buffer_transitions,
+                visual_reason,
+                host_age_ms,
+                wheel_events,
             } => TerminalJsEvent::FrameHash {
                 daemon_hash,
                 client_hash,
@@ -726,6 +754,11 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 rows,
                 at_bottom,
                 mismatch,
+                buffer_kind,
+                buffer_transitions,
+                visual_reason,
+                host_age_ms,
+                wheel_events,
             },
             TerminalJsEventWire::Clipboard {
                 action,

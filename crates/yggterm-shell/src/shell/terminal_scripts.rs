@@ -2089,6 +2089,18 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 frameHashLastStateKey = stateKey;
                 frameHashLastEmitMs = nowMs;
+                // ⭐ THE GHOST CONTEXT (owner 2026-09-03: "ghost outputs
+                // should be traced out of existence"): a mismatch alone says
+                // THAT it artifacted; the mount's own counters say FROM
+                // WHERE. Buffer kind + transition count + the last visual
+                // transition's reason + host age + wheel events ride in every
+                // event, so the S1 (grid transient at switch-in) / S2
+                // (mid-stream join) / S3 (mid-cure composite) family splits
+                // by the payload instead of by a human reading screenshots.
+                // All classification, no content — same law as the rest of
+                // the probe.
+                const gateEntry = window.__yggtermXtermHosts
+                    && window.__yggtermXtermHosts[hostId];
                 sendTerminalEvent({{
                     kind: "frame_hash",
                     daemon_hash: frameHashDaemonHash,
@@ -2096,7 +2108,12 @@ fn terminal_eval_script_with_canvas_renderer(
                     cols: term.cols,
                     rows: term.rows,
                     at_bottom: reading.atBottom,
-                    mismatch: mismatch
+                    mismatch: mismatch,
+                    buffer_kind: currentBufferKind(),
+                    buffer_transitions: Number((gateEntry && gateEntry.bufferTransitionCount) || 0),
+                    visual_reason: String((gateEntry && gateEntry.lastVisualTransitionReason) || ''),
+                    host_age_ms: Number((gateEntry && gateEntry.mountedAtMs) ? (Date.now() - gateEntry.mountedAtMs) : 0),
+                    wheel_events: Number((gateEntry && gateEntry.wheelEventCount) || 0)
                 }});
             }} catch (_probeError) {{
                 // A probe failure must never disturb the flush path.

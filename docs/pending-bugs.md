@@ -26098,3 +26098,32 @@ transition-only per mount, trace + ytrace bus) through one witnessed
 
 **Falsifier:** fresh opencode mount → first wheel emits `translate` with
 kind=alternate; wheel scrolls the conversation; scrollback_intent goes quiet.
+
+## ⛔ [11.47] THE ANCHOR PICKER AND THE MIRROR TICK DISAGREE ABOUT "LIVE" — SCREEN-VERDICT ROWS WERE UNANCHORABLE, AND EVERY GHOST NOW CARRIES ITS CAUSE
+
+**Status:** FIX ON `lane/dev/anchor-liveness-truth`; ghost context SHIPPED in
+the same lane. Live proof owed after rotation.
+
+**Fifth reading, 2026-09-03 (probe first-readings, ACT XVI).** `mirror_tick`
+named what no instrument could: `anchor_not_live, candidates=27, viewing=
+ses_…, bound=<row uuid>` — among 27 opencode rows the picker chose a row
+whose pid/phase marks were absent, so `anchor_not_live` short-circuited the
+rebind on every row while real session switches streamed past in `viewing`.
+The five owned rows ALL answered screen-verdict `working` — the daemon held
+readable screens for every one. The picker's pid/phase predicate and the
+screen classifier are the same daemon looking at the same PTY; they
+disagreed about what "live" means, and the tick inherited the disagreement.
+
+**Fix:** one predicate, `anchor_row_is_live` (pid | running phase | the
+daemon's screen verdict `working.is_some()` — the verdict exists ONLY when
+the daemon holds a readable screen, so it is a liveness mark restored rows
+keep), used by BOTH the picker and the tick. A ghost-side companion: the
+frame-hash pairing event now carries the mount's ghost context — buffer
+kind, genuine-transition count, last visual reason, host age, wheel events —
+so the S1/S2/S3 family splits by payload at emission, per the owner's
+"ghost outputs should be traced out of existence".
+
+**Falsifier:** after rotation, `ytrace tail --category cli | grep mirror_tick`
+on a fresh opencode switch-in reads a decision that is NOT
+`anchor_not_live` for a screen-verdict row; a ghost mismatch arrives with
+`buffer_kind`/`buffer_transitions`/`visual_reason` populated.
