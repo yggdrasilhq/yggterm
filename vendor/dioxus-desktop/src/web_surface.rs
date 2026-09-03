@@ -1990,6 +1990,20 @@ pub struct WebSurfaceHost {
     /// key when its context dies so a future context for the same jar wires a
     /// fresh bell instead of trusting a dead handler.
     favicon_wired: RefCell<std::collections::HashSet<String>>,
+    /// THE FAVICON STORE: page URI → PNG bytes + when they were fetched, the
+    /// host's life-of-process answer to "what does this site's icon look
+    /// like". The per-surface `favicon_pngs` map above is a POLL model — it
+    /// belongs to one surface id, it parks at `None` while a database request
+    /// is in flight, and it dies with the surface — so a tab reopened, a site
+    /// opened in a second tab, or a background tab nobody has polled yet all
+    /// wait on the database's async answer for an icon the host ALREADY KNOWS.
+    /// The store is keyed by URI instead of surface and is consulted FIRST, so
+    /// an icon, once earned, serves instantly everywhere and forever after —
+    /// until the user hard-reloads (drop cache), the `favicon-changed` bell
+    /// says the site's icon moved, or the TTL expires. Written by the same
+    /// `get_favicon` callback that fills `favicon_pngs`; never by a fetch this
+    /// layer invented.
+    favicon_store: Rc<RefCell<HashMap<String, FaviconStoreEntry>>>,
     /// Native surface ids. The HOST allocates them, because it is no longer the
     /// only thing that creates surfaces: a popup is born inside a WebKit signal
     /// handler, and two allocators would eventually hand out the same id.
@@ -3356,15 +3370,43 @@ fn page_menu_insert_position_after_reload(
 fn rearm_favicons_after_database_clear(
     pngs: &RefCell<HashMap<u64, Option<Vec<u8>>>>,
     requests: &RefCell<HashMap<u64, String>>,
+    store: &RefCell<HashMap<String, FaviconStoreEntry>>,
 ) {
     requests.borrow_mut().clear();
     pngs.borrow_mut().clear();
+    store.borrow_mut().clear();
+}
+
+/// How long a STORED icon answers without re-asking the database. "For life"
+/// is the owner's phrase: the store's normal exits are the hard reload (drop
+/// cache) and the `favicon-changed` bell, and the TTL is the quiet third exit
+/// that keeps a site's renamed icon from outliving its own truth. Long, on
+/// purpose — a session is hours, this is a week.
+const FAVICON_STORE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// One stored icon: the PNG the database served, and when it was served.
+#[derive(Clone, Debug)]
+struct FaviconStoreEntry {
+    png: Vec<u8>,
+    fetched_at: std::time::Instant,
+}
+
+/// The store's answer for `page_uri`, if a LIVE (non-expired) entry exists.
+/// Expired entries are left in place for the next database answer to
+/// overwrite — removing them here would make every read pay a write.
+fn favicon_store_live_lookup(
+    store: &HashMap<String, FaviconStoreEntry>,
+    page_uri: &str,
+) -> Option<Vec<u8>> {
+    let entry = store.get(page_uri)?;
+    (entry.fetched_at.elapsed() < FAVICON_STORE_TTL).then(|| entry.png.clone())
 }
 
 #[cfg(test)]
 mod page_menu_position_tests {
     use super::{
-        page_menu_insert_position_after_reload, rearm_favicons_after_database_clear,
+        favicon_store_live_lookup, page_menu_insert_position_after_reload,
+        rearm_favicons_after_database_clear, FAVICON_STORE_TTL, FaviconStoreEntry,
     };
     use std::{cell::RefCell, collections::HashMap};
     use webkit2gtk::ContextMenuAction;
@@ -3397,13 +3439,46 @@ mod page_menu_position_tests {
             (7, "https://example.test/old".to_string()),
             (8, "https://other.test/".to_string()),
         ]));
+        let store = RefCell::new(HashMap::from([(
+            "https://example.test/old".to_string(),
+            FaviconStoreEntry { png: vec![1, 2, 3], fetched_at: std::time::Instant::now() },
+        )]));
 
-        rearm_favicons_after_database_clear(&pngs, &requests);
+        rearm_favicons_after_database_clear(&pngs, &requests, &store);
 
         assert!(!pngs.borrow().contains_key(&7));
         assert!(!requests.borrow().contains_key(&7));
         assert!(!pngs.borrow().contains_key(&8));
         assert!(!requests.borrow().contains_key(&8));
+        // The hard reload IS the owner's "drop cache": the store — the answer
+        // that would otherwise live for the TTL — empties with the rest, so
+        // every icon re-earns itself from the cleared database.
+        assert!(store.borrow().is_empty());
+    }
+
+    /// The store's contract: a live entry answers, an expired one does not,
+    /// and the TTL is measured from the FETCH, lazily — no timer, no sweep.
+    #[test]
+    fn a_stored_icon_answers_until_its_ttl_expires() {
+        let fresh = HashMap::from([(
+            "https://example.test/".to_string(),
+            FaviconStoreEntry { png: vec![9, 9], fetched_at: std::time::Instant::now() },
+        )]);
+        assert_eq!(
+            favicon_store_live_lookup(&fresh, "https://example.test/"),
+            Some(vec![9, 9])
+        );
+        // An unknown URI has never been earned; the database still gets to
+        // answer first.
+        assert_eq!(favicon_store_live_lookup(&fresh, "https://other.test/"), None);
+        let stale = HashMap::from([(
+            "https://example.test/".to_string(),
+            FaviconStoreEntry {
+                png: vec![9, 9],
+                fetched_at: std::time::Instant::now() - FAVICON_STORE_TTL,
+            },
+        )]);
+        assert_eq!(favicon_store_live_lookup(&stale, "https://example.test/"), None);
     }
 }
 
@@ -4607,6 +4682,7 @@ impl WebSurfaceHost {
             favicon_pngs: Rc::new(RefCell::new(HashMap::new())),
             favicon_requests: Rc::new(RefCell::new(HashMap::new())),
             favicon_wired: RefCell::new(std::collections::HashSet::new()),
+            favicon_store: Rc::new(RefCell::new(HashMap::new())),
             next_id: Rc::new(Cell::new(1)),
             popups: Rc::new(RefCell::new(Vec::new())),
             trace_batches: Rc::new(RefCell::new(Vec::new())),
@@ -4670,6 +4746,18 @@ impl WebSurfaceHost {
         if page_uri.is_empty() {
             return None;
         }
+        // THE STORE ANSWERS FIRST. An icon the host has already earned for
+        // this URI — under this surface or another, this tab or a reopened
+        // one — serves instantly, with no async gap for the poll to paper
+        // over. The per-surface model is still written so the next poll reads
+        // the same answer without re-entering this path.
+        if let Some(png) = favicon_store_live_lookup(&self.favicon_store.borrow(), &page_uri) {
+            self.favicon_requests
+                .borrow_mut()
+                .insert(id, page_uri.clone());
+            self.favicon_pngs.borrow_mut().insert(id, Some(png.clone()));
+            return Some(png);
+        }
         let needs_request = {
             let mut requests = self.favicon_requests.borrow_mut();
             match requests.get(&id) {
@@ -4712,6 +4800,7 @@ impl WebSurfaceHost {
 
         let pngs = self.favicon_pngs.clone();
         let requests = self.favicon_requests.clone();
+        let store = self.favicon_store.clone();
         let uri = page_uri.to_string();
         // The call takes a borrow, the closure takes the string by move —
         // two claims on one binding cannot share a call expression, so the
@@ -4730,8 +4819,17 @@ impl WebSurfaceHost {
                 if icon.write_to_png(&mut png).is_err() {
                     return;
                 }
-                // The surface moved on since the request: the answer is for a
-                // page nobody is asking about any more.
+                // The STORE takes the answer for the URI ITSELF: the bytes are
+                // the database's word about that page, true wherever the
+                // surface has since gone, and every future tab that shows the
+                // page starts from them. (The bell and the TTL unlearn it.)
+                store.borrow_mut().insert(
+                    uri.clone(),
+                    FaviconStoreEntry { png: png.clone(), fetched_at: std::time::Instant::now() },
+                );
+                // The per-surface model, though, is only written while the
+                // surface still asks for this URI — an answer for a page the
+                // surface has left must not paint that page's icon.
                 if requests.borrow().get(&id).map(String::as_str) != Some(uri.as_str()) {
                     return;
                 }
@@ -5592,8 +5690,13 @@ impl WebSurfaceHost {
                     let database = database.unwrap();
                     let pngs = self.favicon_pngs.clone();
                     let requests = self.favicon_requests.clone();
+                    let store = self.favicon_store.clone();
                     database.connect_favicon_changed(move |_db, page_uri, _origin| {
                         let page_uri = page_uri.to_string();
+                        // The STORE unlearns the page too: the database just
+                        // said this URI's icon changed, so the stored copy is
+                        // the past. The next poll re-asks and re-stores.
+                        store.borrow_mut().remove(&page_uri);
                         let mut requests = requests.borrow_mut();
                         for (surface_id, requested) in requests.iter_mut() {
                             if requested == &page_uri {
@@ -5855,6 +5958,7 @@ impl WebSurfaceHost {
         rearm_favicons_after_database_clear(
             self.favicon_pngs.as_ref(),
             self.favicon_requests.as_ref(),
+            self.favicon_store.as_ref(),
         );
 
         webview.reload_bypass_cache();
