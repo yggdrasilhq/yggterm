@@ -23046,6 +23046,10 @@ fn bridge_remote_runtime_session_stdio(
     // This bridge only reports genuine tty CHANGES (drag-resize propagation).
     let mut marked_interactive = false;
     let mut initial_snapshot_pending = true;
+    // Raw-stream mode is a WAIT for new visible bytes, not a paint strategy
+    // that can succeed on its own: once it gives up, the snapshot probe must
+    // take over (see the give-up branch below).
+    let mut raw_stream_exhausted = false;
     let mut initial_snapshot_probe_count = 0_u32;
     let mut next_initial_snapshot_probe_at = Instant::now();
     let mut wrote_initial_visible_chunks = false;
@@ -23091,6 +23095,7 @@ fn bridge_remote_runtime_session_stdio(
             .iter()
             .any(|chunk| terminal_bridge_snapshot_has_visible_text(&chunk.data));
         let delay_initial_raw_stream = initial_snapshot_pending
+            && !raw_stream_exhausted
             && bridge_initial_snapshot_should_use_raw_stream(path)
             && !chunks_have_visible_text;
         if (runtime_output_seen || snapshot_proof_of_life) && !marked_interactive {
@@ -23111,9 +23116,8 @@ fn bridge_remote_runtime_session_stdio(
             initial_read,
             runtime_output_seen,
             !chunks.is_empty(),
-        ) && !bridge_initial_snapshot_should_use_raw_stream(
-            path,
-        ) && Instant::now() >= next_initial_snapshot_probe_at;
+        ) && !(bridge_initial_snapshot_should_use_raw_stream(path) && !raw_stream_exhausted)
+            && Instant::now() >= next_initial_snapshot_probe_at;
         let initial_snapshot = if should_probe_initial_snapshot {
             initial_snapshot_probe_count = initial_snapshot_probe_count.saturating_add(1);
             next_initial_snapshot_probe_at = Instant::now() + Duration::from_millis(120);
@@ -23207,7 +23211,16 @@ fn bridge_remote_runtime_session_stdio(
         } else if delay_initial_raw_stream {
             if initial_read && start.elapsed() >= Duration::from_secs(15) {
                 cursor = next_cursor;
-                initial_snapshot_pending = false;
+                // ⛔ THE GIVE-UP MUST FALL BACK TO THE SNAPSHOT, NOT ABANDON
+                // BOTH. Raw-stream mode waits for NEW visible bytes; an idle
+                // TUI never emits any, so this branch used to clear
+                // `initial_snapshot_pending` and paint nothing — the row sat
+                // on its seed placeholder forever (GUI host 2026-09-03 23:28:
+                // "New dev OpenCode" showed the placeholder for 35 minutes at
+                // Status running · idle). Flipping to snapshot-probe mode
+                // paints the daemon's saved screen; the stream continues for
+                // whatever bytes come next.
+                raw_stream_exhausted = true;
                 trace_remote_bridge_event(
                     "initial_raw_stream_give_up",
                     json!({

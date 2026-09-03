@@ -28993,6 +28993,17 @@ impl ShellState {
         if kind.is_empty() || kind == "unknown" {
             return;
         }
+        // Noop-mirror law: an unchanged kind must not write. (Defence in
+        // depth — the caller at the HostHealth site also reads before writing,
+        // because the Signal marks dirty regardless of what the closure does.)
+        if self
+            .terminal_last_buffer_kinds
+            .get(session_path)
+            .map(String::as_str)
+            == Some(kind)
+        {
+            return;
+        }
         self.terminal_last_buffer_kinds
             .insert(session_path.to_string(), kind.to_string());
     }
