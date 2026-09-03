@@ -1,6 +1,6 @@
 use crate::app_declare::{
-    AppDeclareLog, AppDeclareRecord, AppDeclareScanner, attach_replay_neutralizes_web_surface_open,
-    rewrite_consumed_web_surface_opens,
+    AppDeclareLog, AppDeclareRecord, AppDeclareScanner, OscWitness,
+    attach_replay_neutralizes_web_surface_open, rewrite_consumed_web_surface_opens,
 };
 use crate::codex_cli::{
     TerminalIdentityColorProfile, normalize_terminal_identity_color,
@@ -2943,6 +2943,10 @@ impl PtySessionRuntime {
                 let mut protocol_filter = TerminalProtocolFilter::default();
                 let mut agent_error_scanner = AgentSessionErrorScanner::default();
                 let mut app_declare_scanner = AppDeclareScanner::new();
+                // Issue-31 follow-up: generic OSC class witness. Per-reader
+                // like the declare scanner (a restart is a new observation
+                // epoch), first-sight-per-reader emission, classes only.
+                let mut osc_witness = OscWitness::new();
                 let mut saw_any_output = false;
                 loop {
                     // Stand down here rather than inside the read: a parked
@@ -3087,6 +3091,7 @@ impl PtySessionRuntime {
                                 &key_label,
                                 &data,
                             );
+                            osc_witness.observe(&key_label, &data);
                             for hit in agent_error_scanner
                                 .scan(&strip_terminal_control_sequences(&data), now_millis())
                             {
