@@ -5320,6 +5320,7 @@ pub(crate) fn managed_cli_shell_command_configured(
                 // composition — the launch event below would otherwise show
                 // only the degraded shape with no word that a degrade
                 // happened.
+                #[cfg(not(test))]
                 yggterm_core::cli_plane::emit_launch_contract(
                     "daemon",
                     kind,
