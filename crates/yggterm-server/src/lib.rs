@@ -23049,6 +23049,16 @@ fn bridge_remote_runtime_session_stdio(
     let mut initial_snapshot_probe_count = 0_u32;
     let mut next_initial_snapshot_probe_at = Instant::now();
     let mut wrote_initial_visible_chunks = false;
+    // ⛔ A DELIVERED SNAPSHOT IS PROOF OF LIFE. The daemon's
+    // `runtime_output_seen` can read false while its saved screen state holds a
+    // fully painted frame (a churn-era runtime swap splits the two eras), and
+    // the raw-stream path paints that frame — after which the old wedge gate
+    // killed the attach at 120 s with "presumed wedged" printed into a row
+    // that was visibly up (GUI host, 2026-09-03 22:42 and 22:53: two rows, an
+    // opencode and a codex, both idle-but-healthy). The 2026-07-20 wedge this
+    // deadline exists for had NO output and NO snapshot — an honestly blank
+    // viewport. Snapshot with visible text is the difference.
+    let mut snapshot_proof_of_life = false;
     let registry_home = resolve_yggterm_home().ok();
     loop {
         if let Some((cols, rows)) = current_tty_size()
@@ -23083,7 +23093,7 @@ fn bridge_remote_runtime_session_stdio(
         let delay_initial_raw_stream = initial_snapshot_pending
             && bridge_initial_snapshot_should_use_raw_stream(path)
             && !chunks_have_visible_text;
-        if runtime_output_seen && !marked_interactive {
+        if (runtime_output_seen || snapshot_proof_of_life) && !marked_interactive {
             if let Some(home) = registry_home.as_deref() {
                 let _ = RemoteRuntimeRegistry::open(home).and_then(|registry| {
                     registry.transition_session(
@@ -23154,6 +23164,35 @@ fn bridge_remote_runtime_session_stdio(
         if let Some(snapshot) = initial_snapshot {
             cursor = next_cursor;
             initial_snapshot_pending = false;
+            let (snapshot, stripped_fragment) =
+                strip_leading_partial_escape_sequence(&snapshot);
+            if stripped_fragment {
+                trace_remote_bridge_event(
+                    "initial_screen_snapshot_leading_fragment_stripped",
+                    json!({
+                        "path": path,
+                        "session_id": session_id,
+                        "bytes": snapshot.len(),
+                    }),
+                );
+            }
+            snapshot_proof_of_life = true;
+            // Proof of life marks the session interactive too: the rail's
+            // "bootstrapping" state never latched for snapshot-painted rows
+            // because it keyed on stream output only.
+            if !marked_interactive {
+                if let Some(home) = registry_home.as_deref() {
+                    let _ = RemoteRuntimeRegistry::open(home).and_then(|registry| {
+                        registry.transition_session(
+                            &session_id,
+                            RemoteRuntimeSessionState::Interactive,
+                            Some("initial screen snapshot delivered"),
+                            &json!({ "path": path }),
+                        )
+                    });
+                }
+                marked_interactive = true;
+            }
             trace_remote_bridge_event(
                 "initial_screen_snapshot",
                 json!({
@@ -23256,9 +23295,14 @@ fn bridge_remote_runtime_session_stdio(
         // open spawn a fresh wrapper (the recovery that was previously a
         // manual `pkill`). Idle-but-healthy sessions are unaffected:
         // `runtime_output_seen` is the daemon's has-ever-produced-output
-        // flag, not a this-read flag.
-        if running
-            && !runtime_output_seen
+        // flag, not a this-read flag — AND a delivered screen snapshot with
+        // visible text is proof of life in its own right (a daemon that can
+        // serve the runtime's screen is not bridging a wedged void; the
+        // snapshot-painted rows that died here on 2026-09-03 were idle and
+        // healthy, re-attached after churn-era runtime swaps that reset the
+        // daemon-side output flag).
+        let proof_of_life = runtime_output_seen || snapshot_proof_of_life;
+        if running && !proof_of_life
             && start.elapsed() >= Duration::from_millis(BRIDGE_RUNNING_NO_OUTPUT_DEADLINE_MS)
         {
             trace_remote_bridge_event(
@@ -23284,6 +23328,66 @@ fn bridge_initial_snapshot_text(snapshot: Option<&str>) -> Option<&str> {
     snapshot
         .map(|text| text.trim_matches('\0'))
         .filter(|text| terminal_bridge_snapshot_has_visible_text(text))
+}
+
+/// Strip a leading PARTIAL escape sequence from a snapshot about to be painted.
+///
+/// A snapshot can begin with the CONTINUATION of an escape sequence — `[48;2;
+/// 10;10;10m` with no ESC — when the chunk ring trimmed at a sequence boundary
+/// (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream; the full re-attach
+/// resync stays owed there). Painted raw, the fragment prints literally and
+/// the whole frame reads as corruption (measured on the GUI host 2026-09-03
+/// 22:42: a snapshot-painted opencode row opened with a literal SGR fragment).
+/// Stripping one leading fragment is paint hardening at the boundary; it never
+/// touches anything after the first terminator, and it leaves text alone
+/// unless it genuinely parses as a CSI/OSC continuation.
+///
+/// Returns the cleaned text and whether anything was stripped.
+fn strip_leading_partial_escape_sequence(text: &str) -> (String, bool) {
+    let bytes = text.as_bytes();
+    match bytes.first() {
+        // Whole sequence: nothing amputated.
+        Some(0x1b) | None => (text.to_string(), false),
+        // CSI continuation: `[` + params (0x30–0x3F) + final (0x40–0x7E).
+        // ⛔ At least one PARAM byte must precede the final, or visible text
+        // like "[bookmark] choose an option" (whose 'b' is in the final-byte
+        // range with an empty param string) would be mutilated. A ring-boundary
+        // fragment of a real attribute sequence carries params.
+        Some(b'[') => {
+            let mut saw_param = false;
+            for (index, byte) in bytes[1..].iter().enumerate() {
+                match byte {
+                    0x30..=0x3f => saw_param = true,
+                    0x20..=0x2f => {}
+                    0x40..=0x7e => {
+                        // index+1 is the final byte's absolute position; the
+                        // cleaned text starts after it.
+                        let end = index + 2;
+                        return if saw_param && end <= 64 {
+                            (text[end..].to_string(), true)
+                        } else {
+                            (text.to_string(), false)
+                        };
+                    }
+                    _ => return (text.to_string(), false),
+                }
+            }
+            (text.to_string(), false)
+        }
+        // OSC continuation: `]...` terminated by BEL or ST (ESC \).
+        Some(b']') => {
+            let bel = bytes[1..].iter().position(|b| *b == 0x07).map(|i| i + 2);
+            let st = bytes[1..]
+                .windows(2)
+                .position(|w| w == [0x1b, b'\\'])
+                .map(|i| i + 3);
+            match bel.or(st) {
+                Some(end) if end <= 256 => (text[end..].to_string(), true),
+                _ => (text.to_string(), false),
+            }
+        }
+        _ => (text.to_string(), false),
+    }
 }
 
 /// Whether a bridge's first snapshot is delivered as a raw stream.
@@ -23320,6 +23424,63 @@ fn bridge_initial_snapshot_text_for_path<'a>(
     }
     Some(text)
 }
+
+#[cfg(test)]
+mod strip_leading_partial_escape_sequence_tests {
+    use super::strip_leading_partial_escape_sequence;
+
+    #[test]
+    fn intact_escapes_pass_through_untouched() {
+        let (out, stripped) =
+            strip_leading_partial_escape_sequence("\u{1b}[48;2;10;10;10mhello");
+        assert!(!stripped);
+        assert_eq!(out, "\u{1b}[48;2;10;10;10mhello");
+        let (out, stripped) = strip_leading_partial_escape_sequence("plain text");
+        assert!(!stripped);
+        assert_eq!(out, "plain text");
+        let (out, stripped) = strip_leading_partial_escape_sequence("");
+        assert!(!stripped);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn a_leading_csi_continuation_is_stripped_up_to_its_final_byte() {
+        // The measured corruption: ring trim amputated the ESC, the frame
+        // opened with the literal remainder of a truecolor background set.
+        let (out, stripped) =
+            strip_leading_partial_escape_sequence("[48;2;10;10;10m\u{1b}[0mrest");
+        assert!(stripped);
+        assert_eq!(out, "\u{1b}[0mrest");
+    }
+
+    #[test]
+    fn a_leading_osc_continuation_is_stripped_through_its_terminator() {
+        let (out, stripped) =
+            strip_leading_partial_escape_sequence("]8;;http://example.test\u{07}body");
+        assert!(stripped);
+        assert_eq!(out, "body");
+        let (out, stripped) =
+            strip_leading_partial_escape_sequence("]8;;http://example.test\u{1b}\\body");
+        assert!(stripped);
+        assert_eq!(out, "body");
+    }
+
+    #[test]
+    fn bracketed_text_that_is_not_a_sequence_is_left_alone() {
+        // A visible-text line that merely starts with '[' must survive: the
+        // strip only fires when a real CSI final byte arrives within bounds.
+        let (out, stripped) =
+            strip_leading_partial_escape_sequence("[bookmark] choose an option");
+        assert!(!stripped);
+        assert_eq!(out, "[bookmark] choose an option");
+        // Over-long: not a plausible CSI.
+        let long = format!("[{}m tail", "1;".repeat(40));
+        let (out, stripped) = strip_leading_partial_escape_sequence(&long);
+        assert!(!stripped);
+        assert_eq!(out, long);
+    }
+}
+
 
 fn remote_snapshot_looks_like_codex_prompt_only(bytes: &[u8]) -> bool {
     let text = strip_snapshot_terminal_controls(&String::from_utf8_lossy(bytes));
