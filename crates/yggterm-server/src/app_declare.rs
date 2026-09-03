@@ -476,6 +476,10 @@ impl OscWitness {
         for class in found {
             if self.seen.insert(class) {
                 fresh.push(class);
+                // ⛔ BUS LAW: unit tests run observe() for its RETURN value;
+                // the fleet bus must not receive test verdicts (same law as
+                // the mirror tick's gate).
+                #[cfg(not(test))]
                 yggterm_core::perf::ytrace_emit_event(
                     "daemon",
                     "cli",

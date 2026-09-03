@@ -471,18 +471,21 @@ impl YggtermServer {
                 || decision == "diverged"
                 || heartbeat_due
             {
-                yggterm_core::cli_plane::emit_mirror_tick(
-                    "daemon",
-                    crate::SessionKind::OpenCode,
-                    yggterm_core::cli_plane::CliMirrorTickDecision {
-                        anchor: Some(anchor_key.as_str()),
-                        candidates: self.opencode_anchor_candidates().len(),
-                        viewing: viewing.as_deref(),
-                        bound: bound.as_deref(),
-                        decision,
-                        active_tabs: active.len(),
-                    },
-                );
+                #[cfg(not(test))]
+                {
+    yggterm_core::cli_plane::emit_mirror_tick(
+                        "daemon",
+                        crate::SessionKind::OpenCode,
+                        yggterm_core::cli_plane::CliMirrorTickDecision {
+                            anchor: Some(anchor_key.as_str()),
+                            candidates: self.opencode_anchor_candidates().len(),
+                            viewing: viewing.as_deref(),
+                            bound: bound.as_deref(),
+                            decision,
+                            active_tabs: active.len(),
+                        },
+                    );
+                }
                 if let Ok(mut guard) = MIRROR_TICK_HEARTBEAT_LAST_MS
                     .get_or_init(|| std::sync::Mutex::new(0))
                     .lock()
@@ -495,22 +498,25 @@ impl YggtermServer {
             // its anchor is exactly as interesting as a diverged one: the
             // mirror is running with nothing to steer.
             if spawned > 0 || retired > 0 || plan.focus.is_some() {
-                yggterm_core::cli_plane::emit_mirror_tick(
-                    "daemon",
-                    crate::SessionKind::OpenCode,
-                    yggterm_core::cli_plane::CliMirrorTickDecision {
-                        anchor: None,
-                        candidates: 0,
-                        viewing: active
-                            .iter()
-                            .filter(|s| s.viewed_epoch_ms > 0)
-                            .max_by_key(|s| s.viewed_epoch_ms)
-                            .map(|s| s.id.as_str()),
-                        bound: None,
-                        decision: "no_anchor",
-                        active_tabs: active.len(),
-                    },
-                );
+                #[cfg(not(test))]
+                {
+    yggterm_core::cli_plane::emit_mirror_tick(
+                        "daemon",
+                        crate::SessionKind::OpenCode,
+                        yggterm_core::cli_plane::CliMirrorTickDecision {
+                            anchor: None,
+                            candidates: 0,
+                            viewing: active
+                                .iter()
+                                .filter(|s| s.viewed_epoch_ms > 0)
+                                .max_by_key(|s| s.viewed_epoch_ms)
+                                .map(|s| s.id.as_str()),
+                            bound: None,
+                            decision: "no_anchor",
+                            active_tabs: active.len(),
+                        },
+                    );
+                }
             }
         }
         let mut focused = None;

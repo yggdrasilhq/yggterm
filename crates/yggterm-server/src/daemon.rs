@@ -10320,6 +10320,7 @@ impl DaemonRuntime {
                             .collect();
                         blocker_kinds.sort_unstable();
                         blocker_kinds.dedup();
+                        #[cfg(not(test))]
                         yggterm_core::perf::ytrace_emit_event(
                             "daemon",
                             "daemon",
@@ -14417,6 +14418,7 @@ fn run_background_copy_chore(
         for (path, (kind, working, screen_signal, recency_signal)) in &working_edge_signals {
             let previous = last.get(path).copied();
             if previous != Some(*working) && (*working || previous.is_some()) {
+                #[cfg(not(test))]
                 yggterm_core::cli_plane::emit_working_edge(
                     "daemon",
                     *kind,
@@ -20529,6 +20531,7 @@ fn spawn_disk_binary_version_poll(
                         .collect();
                     blocker_kinds.sort_unstable();
                     blocker_kinds.dedup();
+                    #[cfg(not(test))]
                     yggterm_core::perf::ytrace_emit_event(
                         "daemon",
                         "daemon",

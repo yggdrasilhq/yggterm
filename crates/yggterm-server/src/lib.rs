@@ -33360,6 +33360,7 @@ fn stored_session_launch_command_for_locality_with_options(
                     // refused by the store and a rebirth is composed instead.
                     // Expected (resume on the declared selector) vs actual (a
                     // launch; an id rides along only for a CLI born WITH one).
+                    #[cfg(not(test))]
                     if let Some(descriptor) = agent_cli_descriptor(kind) {
                         yggterm_core::cli_plane::emit_launch_contract(
                             "daemon",
