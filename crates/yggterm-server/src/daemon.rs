@@ -14246,8 +14246,18 @@ fn build_background_copy_updates(
                 .as_deref()
                 .filter(|_| candidate.remote_machine.is_none())
                 .unwrap_or(&candidate.session_path);
+            // The transcript RESCUE (Issue Heading 29): the candidate already
+            // holds the session id and cwd, and the registry gate inside
+            // decides whether source_path is a declared session transcript —
+            // every CLI rescues now, not only codex.
             let title = if title_missing {
-                match store.generate_title_for_session_path(settings, source_path, false) {
+                match store.generate_title_for_transcript(
+                    settings,
+                    &candidate.session_id,
+                    &candidate.cwd,
+                    source_path,
+                    false,
+                ) {
                     Ok(title) => title,
                     Err(error) => {
                         rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
@@ -14258,8 +14268,10 @@ fn build_background_copy_updates(
                 None
             };
             let summary = if summary_missing && !rate_limited_this_tick {
-                match store.generate_summary_for_session_path(
+                match store.generate_summary_for_transcript(
                     settings,
+                    &candidate.session_id,
+                    &candidate.cwd,
                     source_path,
                     summary_force_refresh,
                 ) {

@@ -1140,21 +1140,25 @@ Coverage locks extended the contract the same commit: a new local reader with
 a remote arm demands a remote probe (codex/pi/grok/opencode probes added);
 codex-litellm correctly carries NO probe — it has no remote arm.
 
-### ⚠ FILED (next unit): the LLM title rescue is codex-gated
+### LANDED (lane `lane/dev/title-rescue-all-clis`): the LLM title rescue is every CLI's now
 
-`YggtermCore::generate_title_for_session_path` (server/src/lib.rs caller at
-daemon.rs:13754) refuses any transcript that fails `is_codex_session_file`,
-and resolves identity via `read_codex_session_identity` — so the rescue (the
-designed last resort for `TitleAuthority::Generated` kinds) never fires for
-Muse/Pi/Grok/OpenCode/Kimi rows whose own store carries no usable title
-(measured: muse zero-content sessions hold `New session`/`hi`, correctly
-filtered, and then nothing rescues them). Fix shape: a
-`generate_title_for_transcript(session_id, cwd, path, force)` that skips the
-codex identity parse (the caller — the chore candidate — already holds both),
-gates on ANY descriptor's `store_path_is_session_file`, and requires the
-candidate to carry a real transcript path (muse live rows may need the
-`Storage` stamp their reader can already locate via
-`find_muse_session_jsonl_in`).
+The codex gate is bypassed, not removed: `generate_title_for_transcript` /
+`generate_summary_for_transcript` (SessionStore) take the identity from the
+CALLER — the copy-chore candidate and the shell on-demand trigger already hold
+session id + cwd — and gate the path through the registry
+(`agent_cli_for_store_session_file`): the file must exist and some registered
+CLI's store must declare it a session transcript. The transcript reader under
+`generate_for_session` was already CLI-generic (CC read alongside codex), so
+the gate was the only blocker. Both chore arms (background copy + the shell
+Generate-title/summary pair) call the transcript arms; the codex-only
+wrappers stay for the codex-only refresh-copy tool. Registry-derived tests
+lock the gate across every registered CLI (real files under a temp home) and
+the refusals: an arbitrary readable file, and a `local://` row key with no
+transcript stamp. NOT covered here (filed for a follow-up measurement): muse
+live rows whose candidate carries no Storage stamp — the chore falls back to
+the row key, fails `exists`, and waits a tick, exactly as before; if muse
+rows still rescue late, the stamp their reader locates via
+`find_muse_session_jsonl_in` rides the candidate next.
 
 ### Kimi re-homed: the installed CLI writes `~/.kimi-code`, not `~/.kimi` (2026-08-30)
 
