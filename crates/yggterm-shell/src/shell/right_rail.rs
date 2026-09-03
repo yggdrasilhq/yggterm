@@ -219,6 +219,21 @@ fn web_chrome_icon_button_style(foreground: &str, enabled: bool) -> String {
 const WEB_CHROME_INPUT_FLEX_FILL: &str = "1 1 auto";
 const WEB_CHROME_INPUT_FLEX_FILL_COMPACT: &str = "1 1 100%";
 const WEB_CHROME_INPUT_FLEX_FIND: &str = "0 1 240px";
+/// The floating glass bar's stylesheet half. The address pill's fill belongs
+/// to `text_field_css`, and inline styles may not out-specify it — so the
+/// glass panel stamps `data-web-nav-glass` and THIS rule (mounted with the
+/// bar, so it exists exactly while the bar does) gives the pill its
+/// translucent, on-the-glass fill: mounted in the panel, not pasted on top.
+/// The focus fill steps up so typing reads as the panel answering, and both
+/// rules out-specify the global pill style by one attribute.
+const WEB_NAV_GLASS_CSS: &str = r#"
+[data-web-nav-glass] [data-yggui-field="pill"] {
+  background: rgba(255, 255, 255, 0.55);
+}
+[data-web-nav-glass] [data-yggui-field="pill"]:focus {
+  background: rgba(255, 255, 255, 0.82);
+}
+"#;
 /// The web chrome's input pill. `compact` is the ~300px rail variant (the
 /// omnibox's Zen home, where the field drops onto its own line); `border` and
 /// `flex` are the only things a caller may vary.
@@ -357,15 +372,40 @@ fn WebOmniboxBar(
     } else {
         0
     };
-    let nav_button_style = |enabled: bool| web_chrome_icon_button_style(&foreground, enabled);
+    // On glass the buttons breathe: the D-pad key's padding and radius, a
+    // touch larger than the shared icon chip, so the bar's four verbs read as
+    // keys on a panel rather than glyphs in a row.
+    let nav_button_style = |enabled: bool| {
+        if compact {
+            format!(
+                "border:none; background:rgba(255,255,255,0.16); color:{foreground}; font-size:15px; line-height:1; \
+                 padding:5px 9px; border-radius:7px; cursor:{}; opacity:{}; \
+                 box-shadow:inset 0 0 0 1px rgba(255,255,255,0.20);",
+                if enabled { "pointer" } else { "default" },
+                if enabled { "0.9" } else { "0.35" },
+            )
+        } else {
+            web_chrome_icon_button_style(&foreground, enabled)
+        }
+    };
     let back_style = nav_button_style(back_target.is_some());
     let forward_style = nav_button_style(forward_target.is_some());
     let reload_style = nav_button_style(true);
-    // In the rail (compact) the cluster wraps and the input drops onto its own
-    // line below the buttons (a 300px rail is too narrow for one row); over the
-    // page it is the classic single-row nav bar.
+    // In the rail (compact) the four nav buttons sit on a FLOATING GLASS BAR —
+    // the terminal D-pad's frosted recipe (blur + saturate over a faint dark
+    // fill, a white inset ring, one soft drop shadow), floated off the rail's
+    // edges by its own margin so it reads as an object ON the sidebar rather
+    // than the sidebar's first row. The address pill wraps onto its own line
+    // INSIDE the panel (order:9 + full basis; a ~300px rail cannot fit one
+    // row), where the stylesheet gives it a translucent fill so it reads as
+    // mounted in the glass, not pasted on top; over the page this is the
+    // classic single-row nav bar, unchanged.
     let bar_style = if compact {
-        "display:flex; flex-wrap:wrap; align-items:center; gap:3px; padding:0 0 2px; user-select:none;".to_string()
+        "display:flex; flex-wrap:wrap; align-items:center; column-gap:2px; row-gap:1px; \
+         margin:2px 2px 0; padding:5px 8px 6px; border-radius:12px; user-select:none; \
+         background:rgba(22,27,34,0.10); backdrop-filter:blur(14px) saturate(130%); \
+         box-shadow:inset 0 0 0 1px rgba(255,255,255,0.10), 0 12px 28px rgba(0,0,0,0.14);"
+            .to_string()
     } else {
         format!(
             "display:flex; align-items:center; gap:4px; padding:6px 10px; background:{background}; user-select:none; \
@@ -385,6 +425,9 @@ fn WebOmniboxBar(
     rsx! {
         div {
             style: "{bar_style}",
+            "data-web-nav-glass": if compact { "1" } else { "" },
+            // The glass panel's stylesheet half (see WEB_NAV_GLASS_CSS).
+            style { "{WEB_NAV_GLASS_CSS}" }
             button {
                 style: "{back_style}",
                 title: "Back",
