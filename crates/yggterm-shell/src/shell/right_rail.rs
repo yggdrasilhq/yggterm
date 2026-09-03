@@ -3183,6 +3183,11 @@ fn DocumentSurfaceBody(
             .unwrap_or(yggui_contract::DOCUMENT_SPLIT_DEFAULT_RATIO),
     );
     let split_first_pct = split_ratio * 100.0;
+    // yfiles Dolphin grid: a bar `tabs` with id=view_mode active=icons flips
+    // the document body's list into a grid of cards (their polish lane).
+    let is_grid = bar_widgets
+        .iter()
+        .any(|w| matches!(w, AppPaneWidget::Tabs { id, active, .. } if id == "view_mode" && active == "icons"));
 
     rsx! {
         div {
@@ -3492,6 +3497,8 @@ fn DocumentSurfaceBody(
                 div {
                     style: if split_view {
                         "flex:1 1 auto; min-height:0; display:flex; flex-direction:row; overflow:hidden;"
+                    } else if is_grid {
+                        "flex:1 1 auto; min-height:0; display:grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap:16px; padding:20px; overflow:auto; align-content:start;"
                     } else {
                         "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:auto;"
                     },
@@ -3687,43 +3694,163 @@ fn DocumentSurfaceBody(
                                         }
                                     }
                                 },
-                                AppPaneWidget::ListRow { id, title, subtitle, actions, .. } => rsx! {
-                                    div {
-                                        key: "{widget_key}",
-                                        "data-document-row": "{id}",
-                                        style: format!(
-                                            "display:flex; align-items:center; gap:10px; margin:3px 26px; padding:9px 14px; \
-                                             border-radius:9px; background:{}; color:{}; max-width:720px;",
-                                            doc.chrome, doc.fg
-                                        ),
-                                        div {
-                                            style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions, .. } => {
+                                    if is_grid {
+                                        rsx! {
                                             div {
-                                                style: "font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                                                "{title}"
-                                            }
-                                            if !subtitle.is_empty() {
+                                                key: "{widget_key}",
+                                                "data-document-row": "{id}",
+                                                "data-selected": if *selected { "true" } else { "false" },
+                                                style: format!(
+                                                    "display:flex; flex-direction:column; align-items:center; gap:8px; padding:14px 8px;                                                  border-radius:12px; background:{}; color:{}; cursor:pointer; text-align:center;                                                  border:1px solid {}; transition: background 120ms; min-width:0; overflow:hidden;",
+                                                    if *selected { format!("color-mix(in srgb, {} 14%, transparent)", doc.accent) } else { "transparent".to_string() },
+                                                    doc.fg,
+                                                    if *selected { format!("color-mix(in srgb, {} 22%, transparent)", doc.accent) } else { "transparent".to_string() },
+                                                ),
+                                                onclick: {
+                                                    let run_action = run_action.clone();
+                                                    let ra = row_action.clone();
+                                                    let row_id = id.clone();
+                                                    move |_| {
+                                                        if !ra.is_empty() {
+                                                            run_action(ra.clone(), Some(row_id.clone()));
+                                                        }
+                                                    }
+                                                },
+                                                {
+                                                    let icon_str = icon.clone();
+                                                    if icon_str.starts_with("file:") {
+                                                        let ext = icon_str.strip_prefix("file:").unwrap_or("").to_string();
+                                                        let label = if ext.is_empty() || ext == "·" { "·".to_string() } else { ext.chars().take(4).collect::<String>().to_lowercase() };
+                                                        rsx! {
+                                                            span {
+                                                                style: "display:inline-flex; align-items:center; justify-content:center; width:48px; height:48px; flex:0 0 48px; border-radius:9px; background:rgba(127,127,127,0.13); border:1px solid rgba(127,127,127,0.18);",
+                                                                span {
+                                                                    style: "font-size:11px; font-weight:700; letter-spacing:0.02em; color:rgba(90,90,90,0.85); text-transform:uppercase;",
+                                                                    "{label}"
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if let Some(si) = ShellIcon::from_token(&icon_str) {
+                                                        rsx! {
+                                                            span {
+                                                                style: format!("display:inline-flex; align-items:center; justify-content:center; width:48px; height:48px; flex:0 0 48px; border-radius:12px; background:color-mix(in srgb, {} 9%, transparent);", doc.accent),
+                                                                ShellIconMark { icon: si, size: 22 }
+                                                            }
+                                                        }
+                                                    } else if !icon_str.is_empty() {
+                                                        rsx! {
+                                                            span {
+                                                                style: "display:inline-flex; align-items:center; justify-content:center; width:48px; height:48px; flex:0 0 48px; border-radius:12px; background:rgba(127,127,127,0.14); font-size:20px;",
+                                                                "{icon_str}"
+                                                            }
+                                                        }
+                                                    } else {
+                                                        rsx! { span { style: "width:48px; height:48px; flex:0 0 48px;" } }
+                                                    }
+                                                }
                                                 div {
-                                                    style: format!("font-size:11px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", doc.muted),
-                                                    "{subtitle}"
+                                                    style: "font-size:12px; font-weight:500; max-width:100%; text-align:center; line-height:1.3; word-break:break-word; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;",
+                                                    "{title}"
+                                                }
+                                                if !subtitle.is_empty() {
+                                                    div {
+                                                        style: format!("font-size:10px; color:{}; max-width:100%; text-align:center; line-height:1.2; word-break:break-word; display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden;", doc.muted),
+                                                        "{subtitle}"
+                                                    }
                                                 }
                                             }
                                         }
-                                        for row_action in actions.iter().cloned() {
-                                            button {
-                                                key: "{row_action.action}",
+                                    } else {
+                                        rsx! {
+                                            div {
+                                                key: "{widget_key}",
+                                                "data-document-row": "{id}",
+                                                "data-selected": if *selected { "true" } else { "false" },
                                                 style: format!(
-                                                    "border:0; border-radius:7px; background:transparent; color:{}; \
-                                                     font-size:13px; cursor:pointer; padding:3px 8px;",
-                                                    doc.muted
+                                                    "display:flex; align-items:center; gap:12px; margin:2px 20px; padding:8px 12px;                                                  border-radius:8px; background:{}; color:{}; max-width:860px; cursor:pointer;                                                  border:1px solid {}; transition: background 120ms, border-color 120ms;",
+                                                    if *selected { format!("color-mix(in srgb, {} 14%, transparent)", doc.accent) } else { "transparent".to_string() },
+                                                    doc.fg,
+                                                    if *selected { format!("color-mix(in srgb, {} 22%, transparent)", doc.accent) } else { "transparent".to_string() },
                                                 ),
-                                                title: "{row_action.title}",
                                                 onclick: {
                                                     let run_action = run_action.clone();
-                                                    let (action, row_id) = (row_action.action.clone(), id.clone());
-                                                    move |_| run_action(action.clone(), Some(row_id.clone()))
+                                                    let ra = row_action.clone();
+                                                    let row_id = id.clone();
+                                                    move |_| {
+                                                        if !ra.is_empty() {
+                                                            run_action(ra.clone(), Some(row_id.clone()));
+                                                        }
+                                                    }
                                                 },
-                                                "{row_action.label}"
+                                                {
+                                                    let icon_str = icon.clone();
+                                                    if icon_str.starts_with("file:") {
+                                                        let ext = icon_str.strip_prefix("file:").unwrap_or("").to_string();
+                                                        let label = if ext.is_empty() || ext == "·" { "·".to_string() } else { ext.chars().take(4).collect::<String>().to_lowercase() };
+                                                        rsx! {
+                                                            span {
+                                                                style: "display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; flex:0 0 32px; border-radius:7px; background:rgba(127,127,127,0.13); border:1px solid rgba(127,127,127,0.18);",
+                                                                span {
+                                                                    style: "font-size:9px; font-weight:700; letter-spacing:0.02em; color:rgba(90,90,90,0.85); text-transform:uppercase;",
+                                                                    "{label}"
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if let Some(si) = ShellIcon::from_token(&icon_str) {
+                                                        rsx! {
+                                                            span {
+                                                                style: "display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; flex:0 0 32px; border-radius:50%; background:rgba(127,127,127,0.14);",
+                                                                ShellIconMark { icon: si, size: 14 }
+                                                            }
+                                                        }
+                                                    } else if !icon_str.is_empty() {
+                                                        rsx! {
+                                                            span {
+                                                                style: "display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; flex:0 0 32px; border-radius:50%; background:rgba(127,127,127,0.14); font-size:14px;",
+                                                                "{icon_str}"
+                                                            }
+                                                        }
+                                                    } else {
+                                                        rsx! { span { style: "width:32px; height:32px; flex:0 0 32px;" } }
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                                    div {
+                                                        style: "font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.2;",
+                                                        "{title}"
+                                                    }
+                                                    if !subtitle.is_empty() {
+                                                        div {
+                                                            style: format!("font-size:11.5px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", doc.muted),
+                                                            "{subtitle}"
+                                                        }
+                                                    }
+                                                }
+                                                for row_action in actions.iter().cloned() {
+                                                    button {
+                                                        key: "{row_action.action}",
+                                                        style: format!(
+                                                            "border:0; border-radius:7px; background:transparent; color:{};                                                          font-size:13px; cursor:pointer; padding:4px 8px; display:inline-flex; align-items:center; justify-content:center; min-width:28px; height:28px;",
+                                                            doc.muted
+                                                        ),
+                                                        title: "{row_action.title}",
+                                                        onclick: {
+                                                            let run_action = run_action.clone();
+                                                            let (action, row_id) = (row_action.action.clone(), id.clone());
+                                                            move |evt: MouseEvent| {
+                                                                evt.stop_propagation();
+                                                                run_action(action.clone(), Some(row_id.clone()))
+                                                            }
+                                                        },
+                                                        if let Some(si) = ShellIcon::from_token(&row_action.label) {
+                                                            ShellIconMark { icon: si, size: 13 }
+                                                        } else {
+                                                            "{row_action.label}"
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
