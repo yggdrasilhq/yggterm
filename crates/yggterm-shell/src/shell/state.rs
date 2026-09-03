@@ -3841,6 +3841,21 @@ struct AppPaneSchema {
     /// pane exactly like `widgets`.
     #[serde(default)]
     footer: Vec<AppPaneWidget>,
+    /// Ribbon region (Office-ribbon shape) rendered ABOVE the viewport card,
+    /// on the shell's own background — never inside the card, never on the
+    /// viewport's background. ymacs' tool-bar-mode is the forcing consumer
+    /// (2026-09-03): its quick-access toolbar moved out of the document
+    /// body so the viewport starts below the toolbar. Deliberately a SUBSET
+    /// vocabulary today: `label`, `toolbar`, `button` (grow it when a second
+    /// consumer needs more — the extraction-not-construction corollary).
+    /// This is a REGION over existing widgets, not a new widget kind, so no
+    /// Tier C admission applies (same standing as `footer`). Absent/empty ⇒
+    /// no ribbon and the card keeps the full rect, exactly as before.
+    /// Multi-viewport seam (NOT built): the column this region opens —
+    /// ribbon rows, then viewport panes — is where a future timeline/CAD
+    /// app's extra toolbars and viewports stack. One viewport today.
+    #[serde(default)]
+    ribbon: Vec<AppPaneWidget>,
     /// Where the SPLIT view's gutter sits — the fraction of the surface given
     /// to the first half. Absent means centred, which is what an app that has
     /// never been dragged should get; a split that opens off-centre makes the
@@ -25385,6 +25400,8 @@ impl ShellState {
             title: spec.title,
             widgets: spec.widgets,
             footer: spec.footer,
+            // Modals are forms: no ribbon above a dialog.
+            ribbon: Vec::new(),
             titlebar_switch: None,
             split_ratio: None,
             // A modal is a form, not an editor: its keys are its own.
