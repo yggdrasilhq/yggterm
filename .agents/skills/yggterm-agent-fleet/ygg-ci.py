@@ -843,6 +843,19 @@ def _do_tick_project(project, dry=False):
             push_err = (r.stderr or "")[-1200:]
             if not pushed:
                 log(f"  ⛔ push FAILED: {push_err}")
+                # ⛔ A FAILED PUSH MEANS UPSTREAM MOVED DURING OUR BUILD. The
+                # local merge commit can never fast-forward (it is not an
+                # ancestor of the new upstream tip), so leaving it in place
+                # wedges every future tick behind `refused-diverged` —
+                # measured 2026-09-04 00:50. Reset to the pre-tick state: the
+                # lanes stay subscribed and re-merge onto the NEWER upstream
+                # on the next tick. This arm must never fire for a
+                # privacy-guard refusal (those fail closed and repeat, which
+                # is correct — the guard's message rides the event).
+                reset = _run(["git", "reset", "--hard", pre_tick], cwd=str(repo), timeout=120)
+                _emit_event(project, "push_failed", sha=integ_sha, upstream=upstream,
+                            reset_to=pre_tick if reset.returncode == 0 else None,
+                            stderr=push_err[-500:])
         else:
             pushed = None  # push disabled for this repo
     else:
