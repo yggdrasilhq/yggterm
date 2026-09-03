@@ -3856,6 +3856,17 @@ pub struct SnapshotSessionView {
     pub pty_cols: Option<u16>,
     #[serde(default)]
     pub pty_rows: Option<u16>,
+    // Whether the daemon's own vt100 parser holds this PTY in the alternate
+    // screen — the AUTHORITATIVE fullscreen verdict, read off the parser that
+    // watched the PTY since birth. A fresh client xterm starts on the normal
+    // buffer and a pre-mount fullscreen TUI never re-says its buffer DECSETs,
+    // so client-observed kind reads `normal` on exactly the rows that need
+    // `alternate` (the wheel gate stayed closed on every fresh opencode mount
+    // 2026-09-03). The mount seed prefers this over the client's record.
+    // `None` = no live screen here — honest unknown, never synthesized.
+    // serde(default) keeps back-compat with older snapshots.
+    #[serde(default)]
+    pub pty_in_alternate_screen: Option<bool>,
     // Daemon-authoritative working state, the SSOT for the sidebar working dot
     // and the working→done notification. Computed from the session's LIVE vt100
     // screen at snapshot time (esc-to-interrupt SSOT): `Some(true)` = the agent
@@ -4326,6 +4337,10 @@ pub struct ManagedSessionView {
     /// [`SnapshotSessionView::input_unanswered_ms`]. `None` = answering, or not
     /// reported. ⚠ A trigger, never a verdict.
     pub input_unanswered_ms: Option<u64>,
+    /// Whether the daemon's vt100 holds this PTY in the alternate screen —
+    /// see [`SnapshotSessionView::pty_in_alternate_screen`]. The mount seed
+    /// prefers this over the client's last record; `None` = unknown.
+    pub pty_in_alternate_screen: Option<bool>,
     /// What this row's launch asked of its agent CLI: `--model`,
     /// `--permission-mode`.
     ///
@@ -15820,6 +15835,7 @@ mod restored_runtime_repair_tests {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -15964,6 +15980,8 @@ mod restored_runtime_repair_tests {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -31074,6 +31092,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         ssh_prefix: session.ssh_prefix,
         pty_cols: None,
         pty_rows: None,
+        pty_in_alternate_screen: session.pty_in_alternate_screen,
         working: session.working,
         limit_wait: session.limit_wait,
         awaiting_user_choice: session.awaiting_user_choice,
@@ -31193,6 +31212,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         ssh_prefix: session.ssh_prefix.clone(),
         pty_cols: None,
         pty_rows: None,
+        pty_in_alternate_screen: session.pty_in_alternate_screen,
         working: session.working,
         limit_wait: session.limit_wait,
         awaiting_user_choice: session.awaiting_user_choice,
@@ -31398,6 +31418,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         limit_wait: session.limit_wait,
         awaiting_user_choice: session.awaiting_user_choice,
         input_unanswered_ms: session.input_unanswered_ms,
+        pty_in_alternate_screen: session.pty_in_alternate_screen,
         agent_launch_options: session.agent_launch_options,
     }
 }
@@ -31774,6 +31795,8 @@ terminal_window_id: None,
         // A row being built has no runtime yet; the daemon's snapshot overlay is
         // the only thing that can answer this, and it does so every snapshot.
         input_unanswered_ms: None,
+        // No live PTY either: only the snapshot overlay answers this.
+        pty_in_alternate_screen: None,
         agent_launch_options: AgentLaunchOptions::default(),
     }
 }
@@ -32141,6 +32164,8 @@ fn build_live_session_with_launch_options(
         // A row being built has no runtime yet; the daemon's snapshot overlay is
         // the only thing that can answer this, and it does so every snapshot.
         input_unanswered_ms: None,
+        // No live PTY either: only the snapshot overlay answers this.
+        pty_in_alternate_screen: None,
         agent_launch_options: AgentLaunchOptions::default(),
     }
 }
@@ -33586,6 +33611,8 @@ mod recipe_tests {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -36305,6 +36332,8 @@ mod tests {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -40029,6 +40058,8 @@ mod tests {
                 limit_wait: false,
                 awaiting_user_choice: false,
                 input_unanswered_ms: None,
+                // Test fixture: no live PTY.
+                pty_in_alternate_screen: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -40127,6 +40158,8 @@ mod tests {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -40186,6 +40219,8 @@ mod tests {
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -41016,6 +41051,8 @@ terminal_window_id: None,
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -44353,6 +44390,8 @@ terminal_window_id: None,
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -48121,6 +48160,8 @@ terminal_window_id: None,
                 limit_wait: false,
                 awaiting_user_choice: false,
                 input_unanswered_ms: None,
+                // Test fixture: no live PTY.
+                pty_in_alternate_screen: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -48214,6 +48255,8 @@ terminal_window_id: None,
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -48337,6 +48380,8 @@ terminal_window_id: None,
             limit_wait: false,
             awaiting_user_choice: false,
             input_unanswered_ms: None,
+            // Test fixture: no live PTY.
+            pty_in_alternate_screen: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
             outline_prefix: None,

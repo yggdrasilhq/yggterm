@@ -115,6 +115,16 @@ pub(crate) enum TerminalJsEvent {
     ReadNudge {
         reason: String,
     },
+    /// The wheel-gate probe fired — see the wire twin for the contract.
+    /// Constructed, never deserialized (the wire twin carries it
+    /// serde-defaulted for older in-page scripts).
+    WheelGate {
+        decision: String,
+        buffer_kind: String,
+        tracking: String,
+        input_enabled: bool,
+        owns_input: bool,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -437,6 +447,25 @@ enum TerminalJsEventWire {
         #[serde(default)]
         reason: String,
     },
+    /// The wheel-gate probe fired: the mount's wheel handler witnessed its
+    /// own decision with the gate's inputs. Content-free — buffer kind,
+    /// tracking mode, two booleans, the verdict (`translate` | `scrollback` |
+    /// `ignored`). Transition-only per mount (the script dedups), so a wheel
+    /// that scrolls scrollback on a fullscreen TUI arrives as `scrollback`
+    /// with the closed rail visible. serde(default) throughout: older
+    /// in-page scripts predate the event.
+    WheelGate {
+        #[serde(default)]
+        decision: String,
+        #[serde(default)]
+        buffer_kind: String,
+        #[serde(default)]
+        tracking: String,
+        #[serde(default)]
+        input_enabled: bool,
+        #[serde(default)]
+        owns_input: bool,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -665,6 +694,19 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             },
             TerminalJsEventWire::Input { data } => TerminalJsEvent::Input { data },
             TerminalJsEventWire::ReadNudge { reason } => TerminalJsEvent::ReadNudge { reason },
+            TerminalJsEventWire::WheelGate {
+                decision,
+                buffer_kind,
+                tracking,
+                input_enabled,
+                owns_input,
+            } => TerminalJsEvent::WheelGate {
+                decision,
+                buffer_kind,
+                tracking,
+                input_enabled,
+                owns_input,
+            },
             TerminalJsEventWire::Resize { cols, rows } => TerminalJsEvent::Resize { cols, rows },
             TerminalJsEventWire::MouseMode { mode, enabled, suppressed } => {
                 TerminalJsEvent::MouseMode { mode, enabled, suppressed }
