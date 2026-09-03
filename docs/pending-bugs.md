@@ -96,44 +96,71 @@ attribution of the steady window (7.8 trace events/sec): `dispatch` and
 as [11.46] with its own instrument owed (per-variant timing inside the
 `js_event` branch — the guard names the branch, not the variant).
 
-## ⛔ [11.46] THE `js_event` BRANCH HOLDS THE TERMINAL LOOP 1.4 s ON REMOTE ROWS — AND EACH FULL `describe_state` IS A SEVERE BLOCK BY ITSELF
+## ⛔ [11.46] THE TERMINAL LOOP AWAITED DAEMON RPCs INLINE, EVERY ROWS PROBE REBUILT THE WORLD, AND EACH DOM PROBE FROZE THE WEBVIEW — THE HANG CLASS
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*Split off [11.45]'s first read, 2026-09-03 ~15:55: the title-retry storm is
+*Split off [11.45]'s first read, 2026-09-03: the title-retry storm is
 dead (no autopsy since the fix, CPU down) and the steady-state blocks are a
 different mechanism with its own witnesses.*
 
-Measured on the GUI host, fixed GUI pid, post-adoption steady 30 min (85
-blocks, 2.8/min, p50 733 ms, max 1430 ms; base rate 7.8 trace events/sec):
+**Owner report 2026-09-03 ~16:00: "the UI blocks are hang equivalents — I
+have to kill and open yggterm again."** The dead GUI's last minutes in the
+trace: **six ~2.05 s blocks in thirty seconds (15:49:59-15:50:30), every one
+with `app_control/request_begin` as last activity, 42-94 major faults per
+stall** - the UI thread serving probe requests under memory pressure (4-5 GB
+swap in use) until the owner killed it. Three stacked mechanisms, all fixed in
+code (`7e009f0b6`, the hang lane):
 
-1. `input/loop_block` (the terminal loop's own branch guard) caught the
-   **`js_event` branch at 1378 ms and 1411 ms, both on remote agent rows**.
-   The guard names the branch, not the `TerminalJsEvent` variant — the Ready /
-   Debug / FrameHash / clipboard arms all share one timer. Prime suspect by
-   shape is an inline daemon round trip for a remote row (the
-   `FrameHashRequest` arm awaits `terminal_read_async`, which proxies over
-   SSH), but no `frame_hash_request*` event fired in the hour, so that arm is
-   unproven — the branch needs per-variant guards before anyone touches it.
-2. `app_control/request_begin` is **7× enriched in severe blocks** against its
-   base rate. Measured serve (begin→end pairs): `describe_rows` p50 27 ms /
-   max 308 ms at ~9 probes/min; **`describe_state` p50 867 ms over 3 calls**
-   — each full state serve is a severe block by itself, on the UI thread.
-   The shared-snapshot dedup (state.rs) removed the re-merge; the remaining
-   cost is the ~450 KB JSON build + serialize per probe.
-3. `app_declare/daemon_declare_absent` 3.8× enriched in severe at 28
-   polls/min (the per-row-per-minute negative the [11.4] entry already
-   prices); `dioxus_render/component_window` 3.5× (the render itself, 693
-   rows at 1.4 renders/sec).
+1. **The `js_event` branch awaited daemon round trips inline.** The resize
+   arm (fires on every geometry change), the FrameHashRequest read, and the
+   prompt-gap nudge (inside the HostHealth arm, the highest-frequency
+   variant) each awaited a daemon RPC that proxies to the OWNING daemon -
+   over ssh for a remote row. `input/loop_block` caught the branch holding
+   **1378 ms and 1411 ms on remote agent rows**, the keystroke branch queued
+   behind them. Fix: the proven reconcile-fetch shape - request side spawns
+   and continues; a new `off_loop_rpc_apply` select branch applies results
+   through an `OffLoopTerminalRpcResult` channel; the frame-hash fetch is
+   latched to one in-flight read. The resize snapshot-refresh lock
+   (`a_successful_resize_pulls_the_session_snapshot_forward`) re-anchored to
+   the apply arm where the property now lives.
+2. **The rows serve rebuilt the world per probe.** `describe_rows` ran a
+   SECOND full sidebar merge with every set open + a tombstone-file load +
+   ~1 MB JSON with per-row O(live) scans - at ~9 probes/min against a
+   mostly-unchanged shell; in the hang window seven serves in fifty seconds
+   each stalled ~2 s. Fix: memoized per `SHELLSTATE_MUT_TOTAL` epoch with the
+   snapshot cache's 500 ms TTL (`APP_ROWS_RESPONSE_BUILDS` counts real
+   builds; a counted write invalidates immediately).
+3. **`describe_state`'s DOM debug snapshot froze the WEBVIEW.** The walk runs
+   `getAnimations({subtree:true})` + `getComputedStyle` over the whole page -
+   layout-forcing, in the web process, on the same thread xterm input runs
+   on. Whole-serve p50 was 867 ms; a probe froze the terminal's own typing
+   for the walk's duration. Fix: 1 s TTL cache, successes only (a timed-out
+   walk must not pin its failure).
 
-**What would close it:** per-variant `loop_block` timing inside the
-`js_event` match (viewport.rs `TerminalLoopBranchGuard::new("js_event", …)`
-arm), then move the slowest variant's await off the branch — the proven shape
-is the reconcile-fetch latch (`spawn_screen_reconcile_fetch`), not a symptom
-patch. For app-control: serve `DescribeState`/`DescribeRows` from a snapshot
-cloned off-thread, or refuse the full state at probe cadence. **Falsifier:**
-steady-state `ui/block` under 1/min with no severe ≥1 s, and no `loop_block`
-over ~200 ms in the same window.
+Also peeked before the copy-hydration and title-generation-start guards (the
+[11.45] dirty-on-no-op shape, taken before a caller reintroduces it). Locked
+by `the_js_event_daemon_rpcs_leave_the_select_loop`,
+`a_quiet_shell_serves_the_memoized_rows_snapshot`,
+`describe_state_serves_a_cached_dom_snapshot`. Full shell suite green
+(2064); the 8 red server tests fail identically on pristine HEAD
+(environmental, the npm-symlink class).
+
+**Still open, deliberately:** the HostHealth arm's recovery RPCs (snapshot
+replays, ensure-recoveries) remain inline - attempt-counters gate them and
+moving them wants the same channel treatment as one sweep, not a rush; the
+web-surface/sidebar-declare arms' loopback awaits are rare (OSC events only).
+The memory-pressure half of the hang (4-5 GB swap, GUI pages swapped) is
+host state, not this fix's - a swap cycle or the [11.40] scope work is the
+structural remedy.
+
+**Falsifier:** after the fix deploys and the GUI restarts onto it, one hour
+of normal use + fleet probing shows (a) no `loop_block` over ~200 ms in the
+`js_event`/`off_loop_rpc_apply` branches, (b) `describe_rows` serve p50 well
+under 100 ms with `APP_ROWS_RESPONSE_BUILDS` tracking state churn rather
+than probe count, and (c) no repeat of the kill-and-relaunch class - no
+cluster of >=2 s `app_control`-adjacent blocks. Read by pid, not by version:
+pre/post share the same build number.
 
 ## ⛔ [11.39] A GUI RESTART LEAVES AN IDLE FULLSCREEN TUI'S VIEWPORT BLANK FOR ~40s — THE "SLOW TERMINAL REVEAL"
 
