@@ -437,14 +437,7 @@ impl YggtermServer {
             // forces emission: it is the event the 2026-09-03 four-stale-rows
             // incident needed and no instrument could give.
             let anchor_row = self.sessions.get(&anchor_key);
-            let anchor_live = anchor_row.is_some_and(|a| {
-                a.terminal_process_id.is_some()
-                    || matches!(
-                        a.launch_phase,
-                        crate::TerminalLaunchPhase::Running
-                            | crate::TerminalLaunchPhase::RemoteBootstrap
-                    )
-            });
+            let anchor_live = anchor_row.is_some_and(Self::anchor_row_is_live);
             let bound = anchor_row.map(|a| a.id.clone());
             let decision = if !anchor_live {
                 "anchor_not_live"
@@ -590,6 +583,24 @@ impl YggtermServer {
         }
     }
 
+    /// Whether one row's liveness marks say a TUI is actually running on it.
+    ///
+    /// Three marks, one truth: the pid, a running launch phase, or — the mark
+    /// restored rows keep losing — the daemon's own screen verdict, which exists
+    /// only while the daemon holds a readable screen for the PTY. Split out so
+    /// the anchor picker and the mirror tick's `anchor_not_live` verdict answer
+    /// from ONE function: two encodings of "live" is how the picker chose a row
+    /// the tick called dead (measured 2026-09-03, five rows, all screen-`working`,
+    /// none pid-marked).
+    fn anchor_row_is_live(row: &crate::ManagedSessionView) -> bool {
+        row.terminal_process_id.is_some()
+            || matches!(
+                row.launch_phase,
+                crate::TerminalLaunchPhase::Running | crate::TerminalLaunchPhase::RemoteBootstrap
+            )
+            || row.working.is_some()
+    }
+
     /// The live opencode TUI row (the mirror's seating anchor) and the next
     /// free sub-seat under it: `<anchor outline>.<n+1>`.
     fn opencode_anchor_candidates(&self) -> Vec<&crate::ManagedSessionView> {
@@ -616,17 +627,21 @@ impl YggtermServer {
         // real TUI kept its stale name. Prefer a row that is actually
         // RUNNING; only a set with no live TUI at all falls back to the
         // historical first-qualified order.
+        //
+        // ⭐ 2026-09-03: `working` is a LIVE mark too. The daemon's working
+        // verdict exists ONLY when it holds a readable screen for the PTY
+        // (`None` = no live screen), so `working.is_some()` is the daemon
+        // saying "this PTY is alive and I am reading it" — independent of
+        // pid bookkeeping, which restored rows lose. Measured: five owned
+        // opencode rows all screen-verdict `working`, every one without
+        // usable pid/phase marks — `anchor_not_live` short-circuited the
+        // rebind on all five while real session switches streamed past.
+        // The predicate and the screen classifier must agree about what
+        // "live" means; they are the same daemon looking at the same PTY.
         let candidates = self.opencode_anchor_candidates();
         candidates
             .iter()
-            .find(|s| {
-                s.terminal_process_id.is_some()
-                    || matches!(
-                        s.launch_phase,
-                        crate::TerminalLaunchPhase::Running
-                            | crate::TerminalLaunchPhase::RemoteBootstrap
-                    )
-            })
+            .find(|s| Self::anchor_row_is_live(s))
             .copied()
             .or_else(|| candidates.first().copied())
             .map(|a| a.session_path.clone())

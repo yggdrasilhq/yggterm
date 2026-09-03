@@ -9854,6 +9854,37 @@ JSON.stringify({{
         assert_eq!(clamped.font_size, 5.0);
     }
     #[test]
+    /// LINK: frame-hash probe → ghost context (owner 2026-09-03: "ghost
+    /// outputs should be traced out of existence"). A mismatch alone says
+    /// THAT it artifacted; the mount's counters must ride the event so the
+    /// S1/S2/S3 family splits by payload — buffer kind, genuine-transition
+    /// count, last visual reason, host age, wheel events.
+    #[test]
+    fn the_frame_hash_event_carries_the_ghost_context() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("buffer_kind: currentBufferKind()"),
+            "the pairing must witness the buffer kind the ghost painted in"
+        );
+        assert!(
+            script.contains("buffer_transitions: Number((gateEntry && gateEntry.bufferTransitionCount) || 0)"),
+            "genuine-transition count rides the event"
+        );
+        assert!(
+            script.contains("visual_reason: String((gateEntry && gateEntry.lastVisualTransitionReason) || '')"),
+            "the last visual transition's reason rides the event"
+        );
+        assert!(
+            script.contains("host_age_ms:"),
+            "host age separates switch-in transients from old-mount drift"
+        );
+        assert!(
+            script.contains("wheel_events:"),
+            "wheel events separate scroll-induced repaints from streaming ghosts"
+        );
+    }
+
     fn the_composed_terminal_script_is_valid_javascript() {
         // ⛔⛔ THE ONE FAILURE THAT TAKES EVERY TERMINAL AT ONCE. The script is
         // assembled from a `format!` template plus an `include_str!`'d emitter,
