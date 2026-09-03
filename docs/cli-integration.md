@@ -1615,7 +1615,94 @@ it lands on the bus from CI within the hour.
 
 1. Defect B — per-TUI identity for N anchors (design unit, spec first).
 2. The no-persisted-row cold-restore candidate (measured unit).
-3. Muse live-row Storage stamp on the rescue candidate (measure first).
+3. CLOSED 2026-09-04 (code-verified, daemon.rs live-agent arm): the
+   Storage stamp always rides the candidate for generated-copy kinds —
+   a stampless live muse row is never a rescue candidate at all, so the
+   rescue never sees a row key. Residual watch: muse rows whose rebind
+   poll never records a Storage stamp rescue only via their own store
+   (as designed for store-authoritative CLIs; muse is Generated, so a
+   long-lived stampless muse row would stay birth-titled — if observed,
+   teach the muse reader's find_muse_session_jsonl_in to feed the stamp).
 4. Wheel-gate first-wheel falsifier (needs owner's hands).
 5. [interrupted-orphan] linger root cause (deploy plane).
 6. opencode2 descriptor `Generated` label drift (cosmetic).
+
+## Issue Heading 34: Defect B — per-TUI identity from the CLI's own title plane (2026-09-04)
+
+The last open identity plane (Issue 33 queue item 1). The mirror is
+single-anchor: the focus stream stamps `Viewing Tab Session Id` on THE one
+row the human is looking at, and the rebind + vouch make that one row's
+identity, resume and title true. The OTHER live TUIs — N windows, one
+daemon — carry their birth uuid as session id forever: stampless anchors,
+whose cold resumes cannot vouch and degrade to fresh empty windows
+(Issue 32's residual class), and whose pane session-id line names a seat,
+not a session. `cli/mirror_tick`'s `candidates` field has measured this
+every tick (4–5 live rows, one anchor).
+
+### The measured seam: every TUI already carries its own truth
+
+opencode2's TUI sets its terminal window title per PTY, from the session
+route, in its own app (`packages/tui/src/app.tsx`, read on dev 2026-09-04):
+
+* `OC | <session title>` — session route, title truncated to 40 chars
+  (`>40 → first 37 + "..."`), only when the session title is not the
+  default shape;
+* `OpenCode` — home route, default title, or the feature disabled
+  (`terminal_title_enabled`, default ON);
+* `OC | <plugin id>` — plugin route (rare; see rails).
+
+Live corroboration: `cli/osc_witness` sees the `title` OSC class on live
+opencode rows (12 events, dev). The witness records classes only, never
+parameters — the TRACE stays parameter-free by law; the row STATE (the
+metadata layer) is where per-PTY truth belongs, exactly like the Viewing
+stamp.
+
+### The contract, as landed
+
+* **Per-PTY title capture** (`OscTitleTracker`, beside the witness in the
+  reader loop): a bounded, split-safe tracker for OSC 0/2 (`ESC ] 0 ;` /
+  `ESC ] 2 ;` … BEL | ST) — title sequences straddle chunk boundaries, so
+  the tracker keeps a small pending buffer (capped, drained on overrun)
+  and publishes each completed title into the session's shared state.
+  `TerminalManager::terminal_title_for(runtime_key)` reads it; the mirror
+  chore builds the per-row map in the SAME pass and under the SAME lock
+  that builds `screen_live` — one daemon, one truth.
+* **Per-row binding, never anchor override**: for each LIVE opencode row
+  that is NOT the chosen anchor, a PTY title in the `OC | <name>` family
+  that matches EXACTLY ONE active service session's title (opencode's own
+  truncation applied to both sides) rebinds that row through the existing
+  service-vouched arm — the same arm the anchor's mirror-tick rebind uses,
+  so the store's absent-arm never re-births a rendered session. The
+  anchor itself is untouched: the focus stream outranks the title plane
+  (the human is LOOKING at it; the title could lag a just-switched tab).
+* **Rails**: dead rows never bind (`anchor_row_is_live`, the shared
+  predicate); a quiet tick costs one string compare per row; a `OpenCode`
+  default title is NO signal and never unbinds anything; zero or multiple
+  title matches bind nothing (ambiguous is not identity); two TUIs
+  rendering the same session MAY both bind it — that is honest, and the
+  phantom-resume vouch heals their resumes; every rebind traces
+  `opencode_mirror/row_rebound_to_title_session`, edge-triggered,
+  `cfg(not(test))` gated (the bus law).
+* **Cold restore composes for free**: a rebound row persists a
+  `ses_…`-shaped id, so its own resume already passes the ses_ guard —
+  no vouch needed. The vouch remains the anchor's arm for the
+  not-yet-rebound case.
+* **The pane needs nothing new**: the session-id line resolves in
+  registry order and now names the true per-row session; no wire change.
+
+### What this issue does NOT cover
+
+* Other CLIs' title planes — claude/codex TUIs set titles too (the
+  witness sees `title` class on codex rows); each CLI needs its own
+  measured title grammar before the registry grows. Same pattern, one
+  measurement per CLI.
+* The no-persisted-row cold-restore candidate (Issue 33 queue item 2) —
+  unchanged.
+* Muse live-row rescue stamps — MEASURED 2026-09-04, closed: the chore's
+  live-agent arm never emits a stampless candidate for generated-copy
+  kinds — it requires the `Storage` metadata entry (`.jsonl` and exists,
+  recorded by the rebind poll) and `continue`s otherwise, so the rescue's
+  `transcript_rescue_path` only ever sees a real transcript path. The
+  Issue 33 hedge below ("falls back to the row key") described a path the
+  candidate builder never takes; live muse rows on dev carry birth titles
+  ("New dev Muse Code") exactly as this predicts until they work.

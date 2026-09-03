@@ -22519,9 +22519,23 @@ fn run_opencode_tab_mirror_if_due(
         })
         .map(|session| session.session_path.clone())
         .collect();
+    // Issue Heading 34: the per-PTY title plane, gathered in the SAME pass
+    // and under the SAME lock as screen_live — one daemon, one truth.
+    let terminal_titles: std::collections::HashMap<String, String> = guard
+        .server
+        .live_sessions()
+        .iter()
+        .filter_map(|session| {
+            let runtime_key = guard.terminal_runtime_key_for_path(&session.session_path);
+            guard
+                .terminals
+                .session_terminal_title(&runtime_key)
+                .map(|title| (session.session_path.clone(), title))
+        })
+        .collect();
     guard
         .server
-        .apply_opencode_tab_mirror(&active, &screen_live);
+        .apply_opencode_tab_mirror(&active, &screen_live, &terminal_titles);
 }
 
 /// GATE #8 startup hook: run the superseded-daemon takeover once, off the
@@ -22762,9 +22776,25 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                         })
                         .map(|session| session.session_path.clone())
                         .collect();
+                    // Issue Heading 34: the per-PTY title plane, same pass,
+                    // same lock — the mirror binds non-anchor rows with it.
+                    let terminal_titles: std::collections::HashMap<String, String> =
+                        guard
+                            .server
+                            .live_sessions()
+                            .iter()
+                            .filter_map(|session| {
+                                let runtime_key = guard
+                                    .terminal_runtime_key_for_path(&session.session_path);
+                                guard
+                                    .terminals
+                                    .session_terminal_title(&runtime_key)
+                                    .map(|title| (session.session_path.clone(), title))
+                            })
+                            .collect();
                     guard
                         .server
-                        .apply_opencode_tab_mirror(&active, &screen_live);
+                        .apply_opencode_tab_mirror(&active, &screen_live, &terminal_titles);
                 }
             })
             .expect("spawn opencode mirror loop");

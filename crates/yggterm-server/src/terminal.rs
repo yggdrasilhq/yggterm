@@ -1412,6 +1412,17 @@ impl TerminalManager {
             .map(|session| session.screen_snapshot())
     }
 
+    /// The latest complete OSC 0/2 window title this session's PTY emitted —
+    /// the per-TUI identity plane (Issue Heading 34). `None` = nothing
+    /// captured (no title sequence yet, or an empty one).
+    pub fn session_terminal_title(&self, key: &str) -> Option<String> {
+        self.sessions.get(key).and_then(|session| {
+            session.osc_title.lock().ok().and_then(|slot| {
+                (!slot.is_empty()).then(|| slot.clone())
+            })
+        })
+    }
+
     /// Whether the daemon's own vt100 parser currently holds this session in
     /// the alternate screen — the AUTHORITATIVE answer to "is a fullscreen
     /// TUI live on this PTY", independent of any client mount.
@@ -2144,6 +2155,10 @@ struct PtySessionRuntime {
     current_cols: Arc<AtomicU16>,
     current_rows: Arc<AtomicU16>,
     screen_state: Arc<Mutex<TerminalScreenState>>,
+    /// The latest complete OSC 0/2 window title this PTY emitted, lifted by
+    /// the reader's [`crate::app_declare::OscTitleTracker`] (Issue Heading
+    /// 34). Per-TUI identity truth — empty string = nothing captured.
+    osc_title: Arc<Mutex<String>>,
     /// Memo for [`PtySessionRuntime::screen_snapshot`], keyed by
     /// [`ScreenSnapshotKey`] — every input the snapshot is a function of.
     screen_snapshot_memo: Arc<Mutex<Option<(ScreenSnapshotKey, Arc<str>)>>>,
@@ -2921,7 +2936,9 @@ impl PtySessionRuntime {
         let reader_attach_ready_seen = Arc::clone(&attach_ready_seen);
         let reader_screen_state = Arc::clone(&screen_state);
         let app_declares = Arc::new(Mutex::new(AppDeclareLog::new()));
+        let osc_title = Arc::new(Mutex::new(String::new()));
         let reader_app_declares = Arc::clone(&app_declares);
+        let reader_osc_title = Arc::clone(&osc_title);
         let key_label = key.to_string();
         let launch_command_label = launch_command.to_string();
         let terminal_protocol_profile =
@@ -2947,6 +2964,9 @@ impl PtySessionRuntime {
                 // like the declare scanner (a restart is a new observation
                 // epoch), first-sight-per-reader emission, classes only.
                 let mut osc_witness = OscWitness::new();
+                // Issue Heading 34: the title plane's capture half — same
+                // per-reader epoch law as the witness it sits beside.
+                let mut osc_title_tracker = crate::app_declare::OscTitleTracker::new();
                 let mut saw_any_output = false;
                 loop {
                     // Stand down here rather than inside the read: a parked
@@ -3092,6 +3112,11 @@ impl PtySessionRuntime {
                                 &data,
                             );
                             osc_witness.observe(&key_label, &data);
+                            if let Some(new_title) = osc_title_tracker.observe(&data)
+                                && let Ok(mut slot) = reader_osc_title.lock()
+                            {
+                                *slot = new_title;
+                            }
                             for hit in agent_error_scanner
                                 .scan(&strip_terminal_control_sequences(&data), now_millis())
                             {
@@ -3208,6 +3233,7 @@ impl PtySessionRuntime {
             screen_snapshot_memo: Arc::new(Mutex::new(None)),
             screen_hash_memo: Arc::new(Mutex::new(None)),
             app_declares,
+            osc_title,
             reader_park: park,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
