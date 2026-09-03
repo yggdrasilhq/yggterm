@@ -588,6 +588,27 @@ pub(crate) fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u6
     Some((major, minor, patch))
 }
 
+/// The retired names a same-version bequest leaves behind
+/// ([`retired_daemon_socket_names`]): `server-X-Y-Z.sock.retired-<pid>` and
+/// `server-X-Y-Z.sock.lock.retired-<pid>`. The socket sweep borrows this so
+/// its verdicts can never disagree with the bequest about which files are
+/// bequest litter, and the pid in the name is the liveness witness the sweep
+/// classifies them by: alive ⇒ load-bearing (the preserved-owner registry
+/// hands adopters this exact path), gone ⇒ garbage on the usual
+/// re-proved-sighting terms.
+#[cfg(unix)]
+pub(crate) fn parse_retired_server_socket_artifact(path: &Path) -> Option<((u64, u64, u64), u32)> {
+    let file_name = path.file_name()?.to_str()?;
+    let (stem, pid_text) = file_name.rsplit_once(".retired-")?;
+    let pid = pid_text.parse::<u32>().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    let stem = stem.strip_suffix(".lock").unwrap_or(stem);
+    let version = parse_versioned_server_socket_name(Path::new(stem))?;
+    Some((version, pid))
+}
+
 #[cfg(unix)]
 fn versioned_server_socket_alias_candidates(current: &Path) -> Vec<PathBuf> {
     let Some(parent) = current.parent() else {
@@ -30230,7 +30251,8 @@ mod tests {
     #[cfg(unix)]
     use super::{
         cleanup_legacy_unix_daemons, configure_unix_daemon_client_read_timeout,
-        daemon_binary_is_legacy, default_endpoint, parse_versioned_server_socket_name,
+        daemon_binary_is_legacy, default_endpoint, parse_retired_server_socket_artifact,
+        parse_versioned_server_socket_name,
         read_request, read_unix_request_with_timeout, server_version_is_strictly_newer,
         unix_socket_path_fits_platform, versioned_server_socket_alias_candidates,
         versioned_socket_alias_is_legacy, versioned_socket_alias_points_to_current,
@@ -35663,6 +35685,44 @@ mod tests {
         assert_eq!(parsed, Some((2, 1, 5)));
         assert_eq!(
             parse_versioned_server_socket_name(Path::new("/tmp/server.sock")),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_retired_server_socket_artifact_accepts_the_bequest_shapes() {
+        let socket = parse_retired_server_socket_artifact(Path::new(
+            "/home/x/.yggterm/server-3-2-50.sock.retired-2437596",
+        ));
+        assert_eq!(socket, Some(((3, 2, 50), 2437596)));
+        let lock = parse_retired_server_socket_artifact(Path::new(
+            "/home/x/.yggterm/server-3-2-50.sock.lock.retired-2024418",
+        ));
+        assert_eq!(lock, Some(((3, 2, 50), 2024418)));
+        // The canonical shapes are NOT retired artifacts: the sweep's step 1
+        // must keep classifying them by census, not by pid.
+        assert_eq!(
+            parse_retired_server_socket_artifact(Path::new("/tmp/server-3-2-50.sock")),
+            None
+        );
+        assert_eq!(
+            parse_retired_server_socket_artifact(Path::new(
+                "/tmp/server-3-2-50.sock.lock"
+            )),
+            None
+        );
+        // A garbage pid is not a witness.
+        assert_eq!(
+            parse_retired_server_socket_artifact(Path::new(
+                "/tmp/server-3-2-50.sock.retired-abc"
+            )),
+            None
+        );
+        assert_eq!(
+            parse_retired_server_socket_artifact(Path::new(
+                "/tmp/server-3-2-50.sock.retired-0"
+            )),
             None
         );
     }

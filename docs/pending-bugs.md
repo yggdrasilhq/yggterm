@@ -64,6 +64,19 @@ retired one; the rollback restores both; the source lock
 inert litter (two small files per same-version swap) until the socket sweep
 learns the `.retired-<pid>` shape; retired names were deliberately kept
 parseable for exactly that sweep.
+**OWED CLOSED 2026-09-04 (lane/trace/determinism-audit):** the sweep now
+classifies `.retired-<pid>` socket and lock artifacts by the pid their name
+carries — alive ⇒ keep (the preserved-owner registry hands adopters that
+exact path while the lingerer drains; no census needed), gone ⇒ the usual
+re-proved-sighting removal (24 h). Measured before the fix: 76 litter files
+on the GUI host within two days of the bequest landing, the dead-sighting
+ledger empty — the "kept parseable" claim above was drift: the canonical
+parser's `strip_suffix(".sock")` rejected the shape, so every retired file
+classified NotOurs. `parse_retired_server_socket_artifact` now shares the
+format owner with the bequest's rename; locked by
+`parse_retired_server_socket_artifact_accepts_the_bequest_shapes` +
+`a_retired_artifact_of_a_live_pid_is_kept_even_when_its_version_looks_dead`
++ the dead-pid confirmation tests in `socket_sweep`.
 
 **Falsifier:** deploy a newer build at the same version to a host with active
 sessions and touch nothing. Within the self-retire poll's own interval the
@@ -220,6 +233,22 @@ web-surface/sidebar-declare arms' loopback awaits are rare (OSC events only).
 The memory-pressure half of the hang (4-5 GB swap, GUI pages swapped) is
 host state, not this fix's - a swap cycle or the [11.40] scope work is the
 structural remedy.
+
+**AUDIT 2026-09-04 (lane/trace/determinism-audit):** swept the whole
+select-loop arm body for inline daemon round trips. The three recovery arms
+are confirmed the only remaining inline DAEMON RPCs, at
+`viewport.rs:8644` (`terminal_snapshot_async`, non-prompt replay),
+`:8906` (`terminal_snapshot_async`, blank-host replay) and
+`:9208` (`terminal_attempt_resume_recovery_async`, transport-error) — all
+attempt-counter-gated, all firing exactly when the daemon is struggling,
+each holding the keystroke branch behind a full round trip. The resize /
+frame-hash / prompt-gap arms are properly off-loop (spawn + channel). Also
+inline but a different class: `ClipboardPasteRequest` /
+`ClipboardImageRequest` await `paste_terminal_native_clipboard` /
+`stage_and_paste_terminal_clipboard_image` in the arm body
+(`viewport.rs:9649`, `:9753`) — user-triggered and local-clipboard-bound,
+so flagged for the same channel treatment only if a slow clipboard source
+ever shows up.
 
 **Falsifier:** after the fix deploys and the GUI restarts onto it, one hour
 of normal use + fleet probing shows (a) no `loop_block` over ~200 ms in the
@@ -5457,7 +5486,17 @@ remedy is the paint-hold the owner asked for: hold the reveal cover (or
 suppress live-stream paint) from the nudge until the first post-nudge full
 frame settles — the mid-cure window is the defect, not the cure.** File this
 as the pixel-paint-cache remedy: a snapshotted last-good frame held as the
-cover, released on repaint-ack. And the `[11.44]` mouse sibling is closed in
+cover, released on repaint-ack.
+**AUDIT 2026-09-04 (lane/trace/determinism-audit):** verified the
+paint-hold/pixel-paint-cache remedy is still NOT implemented — no cover
+state exists on the reveal or nudge path (grep across `yggterm-shell`:
+the only "cover" hits are unrelated). Implementation site when someone
+takes it: the `resize_repaint_nudge` emit and the paint-boundary
+hardening (`strip_leading_partial_escape_sequence`) in
+`crates/yggterm-shell/src/shell/viewport.rs` — hold at nudge emit,
+release on the first full post-nudge frame (or paint ack). Until then
+the mid-cure composite window stays open on every idle fullscreen TUI
+reveal. And the `[11.44]` mouse sibling is closed in
 the same window (buffer-kind seed, `c133cd699`, live on 3.2.42: `xterm_buffer_
 kind` now reports per host).
 

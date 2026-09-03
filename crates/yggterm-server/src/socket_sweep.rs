@@ -46,6 +46,18 @@
 //! ledger that will not read is treated as empty, which means "first sighting"
 //! for everything and therefore no deletions this round.
 //!
+//! ## Bequest litter (2026-09-04)
+//!
+//! A same-version handoff renames its socket and lock to `*.retired-<pid>`
+//! (`daemon::bequeath_version_socket_to_same_version_successor`). Those names
+//! parse as neither canonical sockets nor aliases, so the sweep skipped them
+//! as NotOurs — measured on the GUI host: 76 such files within two days of
+//! the bequest landing, while its dead-sighting ledger stayed empty. They are
+//! now classified by the pid their name carries: alive ⇒ load-bearing (the
+//! preserved-owner registry hands adopters this exact path), gone ⇒ the usual
+//! re-proved-sighting removal. The pid witness needs no census, so this one
+//! branch stays decidable even when the kernel socket table cannot be read.
+//!
 //! ## Platform
 //!
 //! Unix only (the socket names are), and the liveness proof is Linux's
@@ -74,7 +86,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::daemon::parse_versioned_server_socket_name;
+use crate::daemon::{parse_retired_server_socket_artifact, parse_versioned_server_socket_name};
 
 /// How long a socket must have been continuously observed dead before it is
 /// unlinked. A daemon mid-restart is dark for milliseconds; this is a day, and
@@ -107,6 +119,11 @@ pub(crate) enum KeepReason {
     LiveDaemonVersion,
     /// The entry could not be stat'd; absence of proof keeps the file.
     Unreadable,
+    /// A bequest's retired artifact whose retiree pid is still alive — the
+    /// preserved-owner registry hands adopters this exact path while the
+    /// lingerer drains, so the file is load-bearing however dead its name
+    /// looks to the census.
+    RetiredOwnerAlive,
 }
 
 /// One entry's verdict. `Remove` is the only branch that unlinks anything.
@@ -273,6 +290,18 @@ fn parse_listening_unix_socket_paths(text: &str) -> HashSet<PathBuf> {
 /// read here so the rule can be tested without a filesystem. `own_identity`
 /// is the sweeping daemon's own socket path, already canonicalized once by the
 /// caller (a syscall per entry across ~700 entries is not free).
+/// Positively prove a pid alive from procfs, the same direction the census
+/// reads liveness from. `None` ⇒ this kernel gives no answer (no procfs, e.g.
+/// a non-Linux unix) ⇒ the caller must keep the file: absence of proof is
+/// never a deletion.
+fn proc_pid_alive(pid: u32) -> Option<bool> {
+    let proc_fs = Path::new("/proc");
+    if !proc_fs.is_dir() {
+        return None;
+    }
+    Some(proc_fs.join(pid.to_string()).exists())
+}
+
 pub(crate) fn classify_socket_entry(
     path: &Path,
     canonical: Option<&Path>,
@@ -284,6 +313,30 @@ pub(crate) fn classify_socket_entry(
 ) -> SocketVerdict {
     // 1. Only files this module can prove the socket layer named.
     let Some(version) = parse_versioned_server_socket_name(path) else {
+        // 1b. The other shape this layer mints: a same-version bequest's
+        //     retired socket/lock. Its name carries the retiree's pid, which
+        //     is a DIRECT liveness witness — stronger than the census, which
+        //     only knows who is listening right now. While the pid lives, the
+        //     file is load-bearing (the preserved-owner registry points
+        //     adopters at this exact path), so it is kept whatever the census
+        //     says; once the pid is gone it is garbage and dies by the same
+        //     re-proved-sighting rule as every other removal. This branch
+        //     needs no census: /proc present ⇒ the pid check is complete
+        //     proof; /proc absent ⇒ Unreadable keeps the file. Version is
+        //     deliberately ignored here — a live daemon of the same version
+        //     elsewhere says nothing about THIS retired path's owner.
+        if let Some((_version, pid)) = parse_retired_server_socket_artifact(path) {
+            return match proc_pid_alive(pid) {
+                Some(true) => SocketVerdict::Keep(KeepReason::RetiredOwnerAlive),
+                Some(false) => match first_seen_dead_ms {
+                    Some(first) if now_ms.saturating_sub(first) >= SOCKET_DEAD_CONFIRM_MS => {
+                        SocketVerdict::Remove
+                    }
+                    _ => SocketVerdict::ConfirmLater,
+                },
+                None => SocketVerdict::Keep(KeepReason::Unreadable),
+            };
+        }
         return SocketVerdict::NotOurs;
     };
     // 2. No proof of what is alive ⇒ no deletions at all.
@@ -682,6 +735,139 @@ mod tests {
             ),
             SocketVerdict::Keep(KeepReason::LiveDaemonVersion)
         );
+    }
+
+    // ---- a same-version bequest's retired artifacts ----
+
+    /// A retired pid that is provably alive under test: this very process.
+    fn a_live_pid() -> u32 {
+        std::process::id()
+    }
+
+    /// A pid that is almost certainly gone: wait(2) has reaped it. Pid reuse
+    /// would need wraparound inside the test's microsecond window.
+    fn a_dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        pid
+    }
+
+    #[test]
+    fn a_retired_artifact_of_a_live_pid_is_kept_even_when_its_version_looks_dead() {
+        let tmp = Scratch::new("retired-live");
+        let retired = tmp
+            .path()
+            .join(format!("server-3-2-50.sock.retired-{}", a_live_pid()));
+        let census = census_with(&[]);
+        assert_eq!(
+            classify_socket_entry(
+                &retired,
+                None,
+                true,
+                &census,
+                None,
+                Some(0),
+                100 * DAY_MS
+            ),
+            SocketVerdict::Keep(KeepReason::RetiredOwnerAlive),
+            "a draining lingerer's retired path is load-bearing — the registry \
+             hands adopters this exact name — whatever the census says"
+        );
+    }
+
+    #[test]
+    fn a_retired_lock_file_is_judged_like_the_retired_socket() {
+        let tmp = Scratch::new("retired-lock");
+        let retired_lock = tmp
+            .path()
+            .join(format!("server-3-2-50.sock.lock.retired-{}", a_live_pid()));
+        let census = census_with(&[]);
+        assert_eq!(
+            classify_socket_entry(
+                &retired_lock,
+                None,
+                true,
+                &census,
+                None,
+                Some(0),
+                100 * DAY_MS
+            ),
+            SocketVerdict::Keep(KeepReason::RetiredOwnerAlive),
+            "the bequest renames the lock first; a live retiree holds its flock"
+        );
+    }
+
+    #[test]
+    fn a_retired_artifact_of_a_dead_pid_dies_by_the_same_confirmation() {
+        let tmp = Scratch::new("retired-dead");
+        let retired = tmp
+            .path()
+            .join(format!("server-3-2-50.sock.retired-{}", a_dead_pid()));
+        let census = census_with(&[]);
+        let now = 100 * DAY_MS;
+        assert_eq!(
+            classify_socket_entry(&retired, None, true, &census, None, None, now),
+            SocketVerdict::ConfirmLater,
+            "first sighting of a drained lingerer's litter records, never deletes"
+        );
+        assert_eq!(
+            classify_socket_entry(
+                &retired,
+                None,
+                true,
+                &census,
+                None,
+                Some(now - SOCKET_DEAD_CONFIRM_MS),
+                now
+            ),
+            SocketVerdict::Remove,
+            "a re-proved dead pid is the same garbage rule as everywhere else"
+        );
+    }
+
+    #[test]
+    fn a_retired_artifact_is_judged_by_its_pid_even_when_the_census_is_degraded() {
+        let tmp = Scratch::new("retired-degraded");
+        let retired = tmp
+            .path()
+            .join(format!("server-3-2-50.sock.retired-{}", a_dead_pid()));
+        let degraded = LiveDaemonCensus::from_parts(HashSet::new(), false);
+        assert_eq!(
+            classify_socket_entry(
+                &retired,
+                None,
+                true,
+                &degraded,
+                None,
+                None,
+                100 * DAY_MS
+            ),
+            SocketVerdict::ConfirmLater,
+            "the pid witness does not need the kernel socket table; an unreadable \
+             census must not read as 'keep forever' for names that prove themselves"
+        );
+    }
+
+    #[test]
+    fn a_retired_name_with_a_garbage_pid_is_not_ours() {
+        let tmp = Scratch::new("retired-garbage");
+        let census = census_with(&[]);
+        for name in [
+            "server-3-2-50.sock.retired-abc",
+            "server-3-2-50.sock.retired-0",
+            "server-3-2-50.sock.lock.retired-",
+            "server-abc.sock.retired-42",
+        ] {
+            let path = tmp.path().join(name);
+            assert_eq!(
+                classify_socket_entry(&path, None, true, &census, None, Some(0), 100 * DAY_MS),
+                SocketVerdict::NotOurs,
+                "{name} does not carry a usable pid witness and must be untouched"
+            );
+        }
     }
 
     // ---- the kernel table parser ----
