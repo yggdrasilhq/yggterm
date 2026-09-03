@@ -1030,10 +1030,11 @@ build on one host**.
 | fact | law |
 |---|---|
 | **Auto host is `dev`** | all ci builds run on `dev`, by tune default. Other hosts subscribe over `ssh dev`. |
-| **One build, many testers** | the watcher merges `origin/main` + every subscribed `lane/*` into an ephemeral worktree under `~/.yggterm/scratchpad/ci`, `cargo build --release` once, then `scripts/deploy-fleet.sh` (the same script a human uses, which proves identity via `md5sum /proc/<pid>/exe` and converges the fleet) — so one artefact is tested by every agent that enrolled. |
+| **One build, many testers** | **v2 (2026-09-03, owner-directed): the CI integrates IN the main branch of the local main repo — no worktrees of any project.** The tick merges `origin/main` + every subscribed `lane/*` into the main checkout, `cargo build --release` once **there**, then pushes `main` to the upstream **only when the build is green**, then deploys — hosts never run commits upstream does not have. The old scratch-worktree model is gone: a worktree integration built bytes that lived on no branch, which is the split the 3.2.4x daemon churn grew from. A red build/gate resets main to the pre-tick state and QUARANTINES the failing lanes at that tip (the next tick builds the rest; a new lane tip re-arms its lane). |
 | **Fleet-aware** | `deploy-fleet.sh` already sweeps `dev + $(ygg-live-host.sh) + oc`, verifies read-back checksums, and holds the deploy lease. `ygg-ci` just calls it; no second deploy path. |
 | **Timer, not a burn** | `watch` sleeps `interval` (default `300s`, tunable per project) and each `tick` does `fetch + stat` only; a clean tick costs no build. `subscribe` auto-spawns the watcher if none is alive — same arm shape as booter `ygg-booter.py:80`. |
-| **Any gitcoding project** | project recipe lives in `~/.yggterm/relay/ci/ci.json` (`repo`, `build`, `deploy`, `interval`, `host`). An agent tunes it in place; the watcher picks it up next tick. `yggterm` is the default recipe; `make`, `npm run build`, or any shell command works for other repos. |
+| **Talking events** | every transition lands in `~/.yggterm/relay/ci/events.jsonl` (read: `ygg-ci.py events --since 30m --json`) and failures ALSO post to msgGraph `infra/ci` (throttled per signature): merge_refused, build_failed, gate_failed, lane_quarantined, blocked-dirty-main, diverged, push_failed, deploy_failed. `ygg-ci.py why` is the plain-language state + the next action. |
+| **Any gitcoding project** | project recipe lives in `~/.yggterm/relay/ci/ci.json` (`repo`, `build`, `deploy`, `interval`, `host`, `gates`, `push`, `push_remote`). An agent tunes it in place; the watcher picks it up next tick. `yggterm` is the default recipe; `make`, `npm run build`, or any shell command works for other repos. |
 | **Subscribe = next build** | when the service is present, other agents can subscribe to it. An agent asks it to take their commits on the next run; the watcher aggregates on the next `tick`. |
 
 ```sh
@@ -1043,13 +1044,15 @@ ygg-ci.py subscribe --lane lane/foo/bar --project yggterm
 
 ygg-ci.py list --project yggterm          # who is enrolled
 ygg-ci.py status --json                   # watcher alive? held? last build?
+ygg-ci.py events --since 30m              # the talking plane: refusals, builds, pushes
+ygg-ci.py why                             # plain-language state + the next action
 ygg-ci.py tick --project yggterm --dry-run  # what WOULD merge (no build)
-ygg-ci.py tick --project yggterm          # one integration pass now
+ygg-ci.py tick --project yggterm          # one integration pass now: merge → build in main → push → deploy
 ygg-ci.py unsubscribe --lane lane/foo/bar --project yggterm  # when done
 
 # tune how a project builds — any agent can do this, it lands for everyone
-ygg-ci.py tune --project yggterm --interval 300 --build "cargo build --release" --deploy "scripts/deploy-fleet.sh" --repo ~/gh/yggterm
-ygg-ci.py tune --project myapp --repo ~/gh/myapp --build "npm run build" --deploy "" --interval 600
+ygg-ci.py tune --project yggterm --interval 300 --build "cargo build --release" --deploy "scripts/deploy-fleet.sh" --gates "scripts/check-privacy.sh" --repo ~/gh/yggterm
+ygg-ci.py tune --project myapp --repo ~/gh/myapp --build "npm test" --deploy "" --interval 600
 ygg-ci.py config --project yggterm --json
 
 # the OFF switches — same shape as booter
@@ -1069,10 +1072,9 @@ local. Anything that would replace `~/.local/bin/yggterm*`, the daemon, or be
 tested by more than one agent goes through `ygg-ci`.
 
 **Contracts (yggterm):**
-- The checkout must be a descendant of `origin/main` (`deploy-fleet.sh` refuses otherwise).
-- `integration` is *ephemeral* — never pushed, never landed. Lanes land via
-  `ship`/merge queue on `main`; ci auto-unsubscribes lanes already in `main`.
-- Build artefacts stay under the scratch worktree's `target/`; no `/tmp` (RAM tmpfs) per `AGENTS.md`.
+- The main checkout must be CLEAN and ON `main` before a tick — the hygiene gate blocks otherwise (that is the point: the CI builds the branch every agent pulls).
+- The push to upstream is the LAST gate: build green → gates green → push → deploy. The deploy never runs commits upstream lacks.
+- Lanes land via the CI's own push of main (the build publishes); ci auto-unsubscribes lanes already in `main`.
 
 **Conflicts — deterministic, no guessing, no extra turns:**
 
