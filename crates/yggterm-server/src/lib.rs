@@ -18721,6 +18721,17 @@ fn should_fallback_to_python(error: &anyhow::Error) -> bool {
     if message.contains("remote scan already in progress") {
         return false;
     }
+    // ⛔ A DAEMON ANSWER IS NOT A MISSING BINARY. "terminal session not
+    // found" is the far daemon's application-level refusal for a session it
+    // does not own: the remote binary executed FINE, so resetting the binary
+    // cache and re-running can only reproduce the same answer while paying a
+    // second ssh round trip per failure (measured 2026-09-04, guihost:
+    // 21 `remote_pty_resize_failed` events in the convergence window, every
+    // one double-billing this way). Match the session-level answer before the
+    // generic "not found" probe below, which exists for binary resolution.
+    if message.contains("terminal session not found") {
+        return false;
+    }
     message.contains("command not found")
         || message.contains("not found")
         || message.contains("No such file")
@@ -35182,6 +35193,31 @@ mod tests {
                  provision-block the 2026-09-04 measurement fixed"
             );
         }
+    }
+
+    /// The remote-command fallback resets the binary cache only for
+    /// BINARY-RESOLUTION failures. A daemon's session-level answer ("terminal
+    /// session not found") must fall through as a plain error — resetting the
+    /// cache on it double-bills every remote resize/mount failure with a
+    /// wasted ssh round trip and can never change the answer. Measured
+    /// 2026-09-04 (guihost, convergence window): 21 resize failures each paid
+    /// the extra round trip against a session the far daemon never owned.
+    #[test]
+    fn a_daemon_session_answer_never_trips_the_binary_cache_fallback() {
+        let session_answer = anyhow::anyhow!(
+            "remote yggterm command failed for dev: Error: terminal session not found: local://d4090efe"
+        );
+        assert!(
+            !should_fallback_to_python(&session_answer),
+            "a session-level daemon answer must not reset the remote binary cache"
+        );
+        // The genuine binary-resolution cases keep working.
+        assert!(should_fallback_to_python(&anyhow::anyhow!("bash: yggterm: command not found")));
+        assert!(should_fallback_to_python(&anyhow::anyhow!(
+            "failed to upload yggterm binary: permission denied"
+        )));
+        // The known non-fallback guard stays.
+        assert!(!should_fallback_to_python(&anyhow::anyhow!("remote scan already in progress")));
     }
 
     #[test]
