@@ -97,7 +97,10 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
         // counts that verdict startpage/cwdtree truth), `wheel_gate` (the
         // mount wheel handler's own decision with the gate's inputs —
         // transition-only per mount, so a wheel that scrolls scrollback on a
-        // fullscreen TUI arrives with the closed rail visible).
+        // fullscreen TUI arrives with the closed rail visible),
+        // `osc_witness` (generic OSC classes per PTY reader,
+        // first-sight-per-reader — classes only, never parameters: titles
+        // carry cwds, hyperlinks carry URLs).
         //
         // Issue 31 (live CLI probes): `mirror_tick` (the opencode mirror's
         // per-interesting-tick identity decision — anchor, viewing, bound,
@@ -118,6 +121,7 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
             "cli/launch_contract",
             "cli/working_edge",
             "daemon/idle_gate_eval",
+            "cli/osc_witness",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }

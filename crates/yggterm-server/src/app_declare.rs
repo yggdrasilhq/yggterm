@@ -340,6 +340,158 @@ impl AppDeclareLog {
     }
 }
 
+// ─── Generic OSC class witness (NOT 7717-specific) ──────────────────────────
+//
+// The owner's 2026-09-03 question — "do we have probes that let us see what
+// the CLI emits for OSC?" — had no witness anywhere: DECSETs are observed at
+// the mount-script boundary, but OSC sequences passed through unwitnessed on
+// every path. This is the daemon-side answer, beside the declare scanner
+// whose per-chunk discipline it shares: one pass over chunks that contain
+// ESC, classes only (a title carries the cwd, a hyperlink carries the URL —
+// both stay in the chunk, only the id travels), first-sight-per-reader
+// emission onto the ytrace bus as `cli/osc_witness`.
+//
+// ⛔ Honest limitations, stated not buried: a numeric opener whose digits run
+// to the chunk's end is HELD, not classified (the id may be split); a
+// non-numeric opener is skipped, not witnessed (exotic, and a stray `ESC ]`
+// in binary output must not become a false `other`). A reader restart
+// (park/handover) resets the seen-set — a restart is a new observation
+// epoch, and a re-emitted class after one says the CLI re-emitted it.
+
+/// Map a numeric OSC id to its witness class. Content-free by construction.
+fn osc_witness_class(id: u32) -> &'static str {
+    match id {
+        0 | 1 | 2 => "title",
+        4 | 10 | 11 | 12 => "color",
+        8 => "hyperlink",
+        52 => "clipboard",
+        9 | 99 | 777 => "notify",
+        133 => "shell_integration",
+        7717 => "app_declare",
+        _ => "other",
+    }
+}
+
+/// What a trailing chunk-suffix must look like to be retained as a possibly
+/// split OSC opener (`ESC`, `ESC ]`, or `ESC ]` + digits, nothing else).
+fn is_split_opener_suffix(suffix: &str) -> bool {
+    let bytes = suffix.as_bytes();
+    let (mut i, n) = (0, bytes.len());
+    if n == 0 || bytes[0] != 0x1b {
+        return false;
+    }
+    i += 1;
+    if i < n {
+        if bytes[i] != b']' {
+            return false;
+        }
+        i += 1;
+    }
+    while i < n {
+        if !bytes[i].is_ascii_digit() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[derive(Debug, Default)]
+pub struct OscWitness {
+    seen: std::collections::HashSet<&'static str>,
+    pending: String,
+}
+
+impl OscWitness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe one decoded PTY chunk; emit `cli/osc_witness` for every OSC
+    /// class this reader sees for the first time, and return those classes
+    /// so tests assert state rather than bus traffic. Both maps stay tiny:
+    /// at most eight classes ever enter `seen`, and `pending` holds only an
+    /// incomplete trailing opener (a few bytes).
+    pub fn observe(&mut self, path: &str, data: &str) -> Vec<&'static str> {
+        if data.is_empty() && self.pending.is_empty() {
+            return Vec::new();
+        }
+        if !data.contains('\x1b') && self.pending.is_empty() {
+            return Vec::new();
+        }
+        self.pending.push_str(data);
+        let bytes = self.pending.as_bytes();
+        let mut found: Vec<&'static str> = Vec::new();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1] == b']' {
+                let mut j = i + 2;
+                let mut id: u32 = 0;
+                let mut digits = 0;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    id = id
+                        .saturating_mul(10)
+                        .saturating_add((bytes[j] - b'0') as u32);
+                    digits += 1;
+                    j += 1;
+                }
+                if digits == 0 {
+                    i += 2;
+                    continue;
+                }
+                if j >= bytes.len() {
+                    // Digits run to the buffer's end: the id may be split
+                    // across the chunk boundary. Stop: the tail policy
+                    // below retains the opener for the next chunk.
+                    break;
+                }
+                let class = osc_witness_class(id);
+                if !found.contains(&class) {
+                    found.push(class);
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        // Retain only what is still classifiable: a trailing suffix that
+        // could still become an OSC opener. Bound by construction (≤16
+        // bytes); anything else is drained so `pending` can never grow with
+        // the stream. Slicing at the `rfind` hit is char-boundary safe
+        // (ESC is single-byte ASCII), and `is_split_opener_suffix` only
+        // byte-compares, so no multibyte split can panic here.
+        let tail_start = self.pending.rfind('\x1b').unwrap_or(self.pending.len());
+        let tail = &self.pending[tail_start..];
+        self.pending = if tail.len() <= 16 && is_split_opener_suffix(tail) {
+            tail.to_string()
+        } else {
+            String::new()
+        };
+        if found.is_empty() {
+            return Vec::new();
+        }
+        let kind = yggterm_core::agent_scheme::session_kind_for_path(path)
+            .map(yggterm_core::agent_cli::session_kind_label);
+        let mut fresh = Vec::new();
+        for class in found {
+            if self.seen.insert(class) {
+                fresh.push(class);
+                yggterm_core::perf::ytrace_emit_event(
+                    "daemon",
+                    "cli",
+                    "osc_witness",
+                    serde_json::json!({
+                        "session_path": path,
+                        "kind": kind,
+                        "osc_class": class,
+                    }),
+                );
+            }
+        }
+        fresh
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +500,42 @@ mod tests {
         let encoded =
             base64::engine::general_purpose::STANDARD.encode(payload.to_string().as_bytes());
         format!("\x1b]7717;{verb};{action};{encoded}\x07")
+    }
+
+    /// The OSC gap, closed: classes travel, parameters never do — and a
+    /// split opener across the chunk boundary is held, not misclassified.
+    #[test]
+    fn osc_witness_reports_classes_once_and_never_parameters() {
+        let mut witness = OscWitness::new();
+        // Ordinary output: nothing.
+        assert!(witness.observe("opencode-runtime://s", "hello\r\nworld\r\n").is_empty());
+        // Title + hyperlink in one chunk: both classes, no cwd, no URL.
+        let fresh = witness.observe(
+            "opencode-runtime://s",
+            "hi\x1b]0;/home/user/secret-proj\x07mid\x1b]8;;https://internal.example/x\x1b\\done",
+        );
+        assert_eq!(fresh, vec!["title", "hyperlink"]);
+        // Second sight is silent (edge-triggered per reader).
+        assert!(witness
+            .observe("opencode-runtime://s", "\x1b]0;another\x07")
+            .is_empty());
+        // A new class still speaks.
+        assert_eq!(
+            witness.observe("opencode-runtime://s", "\x1b]52;c;QUJD\x07"),
+            vec!["clipboard"]
+        );
+    }
+
+    #[test]
+    fn osc_witness_holds_a_split_opener_instead_of_misclassifying_it() {
+        let mut witness = OscWitness::new();
+        // `771` alone must not read as `other`: the id may continue.
+        assert!(witness.observe("opencode-runtime://s", "out\x1b]77").is_empty());
+        // Continuation completes 7717 → app_declare, exactly once.
+        assert_eq!(
+            witness.observe("opencode-runtime://s", "17;web-surface;open;e30=\x07"),
+            vec!["app_declare"]
+        );
     }
 
     #[test]
