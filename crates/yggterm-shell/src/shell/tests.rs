@@ -8569,6 +8569,59 @@ JSON.stringify({{
         }
     }
 
+    /// ⛔ THE 2026-09-04 CRASH LOOP REGRESSION. Same version + the daemon's
+    /// hot_restart_pending flag used to be "treat as skew too" — but a GUI
+    /// restart execs the same version, consumes nothing, and the flag stays set
+    /// until the daemon's own gated handoff, so every fresh GUI re-armed the
+    /// identical restart ~10 s later: ~30 respawns in 5 minutes on guihost,
+    /// 02:33–02:38, stopped only by the owner typing into a terminal.
+    #[test]
+    fn same_version_daemon_pending_never_restarts_the_gui() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        let mut status = runtime_status_for_test(&current_version(), 0, 4242);
+        status.hot_restart_pending = true;
+        shell.latest_runtime_status = Some(status);
+        assert!(
+            shell.version_convergence_pending_restart().is_none(),
+            "same version + daemon_pending must never produce a restart — the restart cannot clear the flag"
+        );
+        assert_eq!(
+            shell.version_convergence_last_pending_noop.as_deref(),
+            Some(current_version().as_str()),
+            "the no-op must be recorded once per daemon version"
+        );
+        // The pending flag alone is not a trigger: with nothing newer on either
+        // side, a fresh convergence check must still be a no-op.
+        assert!(shell.version_convergence_pending_restart().is_none());
+    }
+
+    #[test]
+    fn gui_restart_cadence_counts_window_and_respects_trips() {
+        let now: u128 = 10_000_000_000;
+        let in_window = format!("restart {}", now - 1_000);
+        let fresh = vec!["restart 1", in_window.as_str()];
+        assert_eq!(
+            gui_restart_cadence_verdict(&fresh, now),
+            (1, false),
+            "only restarts inside the window count"
+        );
+        let expired_trip = format!("trip {}", now - GUI_RESTART_CADENCE_TRIP_COOLDOWN_MS - 1);
+        let cooled = vec![expired_trip.as_str()];
+        assert_eq!(
+            gui_restart_cadence_verdict(&cooled, now),
+            (0, false),
+            "an expired trip must not block"
+        );
+        let live_trip = format!("trip {}", now - 1_000);
+        let tripped = vec!["restart 1", live_trip.as_str()];
+        assert_eq!(
+            gui_restart_cadence_verdict(&tripped, now),
+            (0, true),
+            "a live trip blocks and does not count restarts"
+        );
+    }
+
     fn runtime_status_for_test(
         server_version: &str,
         terminal_session_count: usize,

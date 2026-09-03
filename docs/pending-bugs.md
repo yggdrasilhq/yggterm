@@ -18,6 +18,64 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.50] THE GUI RESTART-LOOPED ON A SAME-VERSION DAEMON_PENDING FOR FIVE MINUTES — EVERY RESPAWN RE-ARMED THE TRIGGER, AND A DEAD STDERR PIPE PANICKED THE REST
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Owner report, 2026-09-04 ~02:40: "yggterm GUI is crash looping on the GUI
+host." Measured from the ytrace generations before touching code:
+
+- 02:33:36→02:38:22, `version_convergence/restart_taken` fired on a
+  dead-regular ~10 s cadence, ~30 GUI processes, every one with
+  `own_version == newest_seen == 3.2.51` and `source: "daemon_pending"` —
+  each respawn lived ~9–14 s, logged
+  `main_superseded_retirement_deferred_to_shell_handoff` at birth, and
+  restarted again. The loop stopped at 02:38:22 ONLY because the owner typed
+  into a terminal: `restart_deferred {reason: "pending_input_draft"}`. Active
+  use masked it; idle use looped forever.
+- The trigger that survived its own restart: the GUI's convergence check
+  treated "same version + daemon has a newer build on disk
+  (`hot_restart_pending`)" as skew and restarted itself — but the restart
+  consumed nothing (same-version exec) and the flag stayed set until the
+  DAEMON's own gated handoff rotated (idle window + same-version cooldown).
+  The branch violated the function's own doc law: "never backwards, never on
+  equal."
+- A second killer in the same window: `panic.log` has 63 broken-pipe panics
+  ("failed printing to stdout/stderr: Broken pipe"), two of them 02:30:29 and
+  02:33:30 GUI deaths. The tracing subscriber wrote via
+  `.with_writer(std::io::stderr)`, and std's stderr `write_fmt` PANICS on a
+  broken pipe — one backtrace died on the UI thread inside
+  `spawn_title_generation_for_target`'s tracing event. A GUI whose stderr
+  pipe reader exits (any spawner wrapper) was one log line from death.
+- Nothing detected any of it: the host health watcher stayed quiet (cool idle
+  machine), and the only loud signals were `host_panic_ui_thrash` — a
+  downstream symptom, 7–8 ui-blocks/min, mem 0.92, swap 7.3+ GiB.
+
+**Fix (lane `lane/trace/gui-crash-loop`), three independent layers:**
+1. The loop engine: equal versions NEVER restart the GUI — the
+   same-version+pending case traces `version_convergence/daemon_pending_noop`
+   (deduped per daemon version) and leaves the rotation to the daemon's gated
+   handoff, which already owns it.
+2. The breaker: `maybe_trigger_version_convergence` records every restart in a
+   durable ledger (`~/.yggterm/gui-restart-cadence.jsonl` — the counter must
+   outlive the process, because every respawn has fresh in-memory dedup
+   state); >4 restarts in 10 min trip it: restarts are blocked for 30 min, a
+   Warning toast fires once, and `version_convergence/restart_storm_blocked`
+   (incident-shaped) lands in the trace.
+3. The detector: the daemon's host-panic watcher now counts
+   `version_convergence/restart_taken` and `startup/window_spawned` (both
+   GUI-only; deliberately NOT `main_enter`, which every CLI fires) over 3 min;
+   ≥5 restarts or ≥6 window spawns files `heartbeat/panic` incident
+   `gui_crash_loop_detected` (15-min cooldown) — the same surface owners and
+   agents already watch, so the NEXT loop is visible the minute it starts,
+   regardless of cause. Plus: both binaries' tracing writers are lossy
+   (swallow write errors), so a dead stderr pipe can never panic the app.
+
+**Falsifier:** with a daemon holding `hot_restart_pending` and the GUI already
+on the newest version, the GUI stays up — one `daemon_pending_noop` trace per
+daemon version, zero new `restart_taken`; and if any restart/crash loop ever
+starts again, a `gui_crash_loop_detected` heartbeat incident appears within
+~3 minutes of its first minute.
 ## ⛔ [11.49] AN INTERACTIVE RESUME BLOCKED ON PROVISIONING — 89s ON THE INSTALL LOCK, THEN A FULL CLI GENERATION DOWNLOAD, ALL SILENT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
