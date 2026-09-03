@@ -95,9 +95,20 @@ fn retention_for(verb: &str, action: &str) -> Retention {
         // arm is defensive: an app that emits it anyway must not overwrite the
         // record's live action with a word that means "already consumed".
         ("web-surface", "seen") => Retention::Ignore,
-        // A picker is a native prompt awaiting a human choice, not a surface
-        // that can be rebuilt behind their back.
-        ("web-surface", "pick") => Retention::Ignore,
+        // A picker is a native prompt awaiting a human choice. It USED to be
+        // Ignore ("not a surface that can be rebuilt behind their back"), and
+        // that choice stranded the row it belongs to: after a daemon swap the
+        // relaunched app sits AT the chooser, its one live pick flies past
+        // during the GUI reconnect window, and with nothing retained the
+        // restore poll can never see it — the row stayed a bare terminal with
+        // a hidden picker for 20+ minutes (measured on the GUI host
+        // 2026-09-04, web-surface liveness stale on the ychrome row from
+        // 01:25:45 with no recovery arm). The pick is launch intent for a row
+        // whose app has not started yet, the same class an `open` already is;
+        // rebuilding it mounts the GUI-native picker, never a page. Stored
+        // under the web-surface verb, the post-choice open replaces it and a
+        // close still clears it, so a stale pick cannot outlive the app.
+        ("web-surface", "pick") => Retention::Store,
         ("sidebar", "declare") => Retention::Store,
         ("sidebar", "close") => Retention::Clear,
         // A WebAuthn ceremony asks for the user's PRESENCE. A retained copy
@@ -155,8 +166,7 @@ impl AppDeclareScanner {
             {
                 out.push(message);
             }
-            self.pending
-                .drain(..body_start + body_len + terminator_len);
+            self.pending.drain(..body_start + body_len + terminator_len);
         }
         out
     }
@@ -512,7 +522,11 @@ mod tests {
     fn osc_witness_reports_classes_once_and_never_parameters() {
         let mut witness = OscWitness::new();
         // Ordinary output: nothing.
-        assert!(witness.observe("opencode-runtime://s", "hello\r\nworld\r\n").is_empty());
+        assert!(
+            witness
+                .observe("opencode-runtime://s", "hello\r\nworld\r\n")
+                .is_empty()
+        );
         // Title + hyperlink in one chunk: both classes, no cwd, no URL.
         let fresh = witness.observe(
             "opencode-runtime://s",
@@ -520,9 +534,11 @@ mod tests {
         );
         assert_eq!(fresh, vec!["title", "hyperlink"]);
         // Second sight is silent (edge-triggered per reader).
-        assert!(witness
-            .observe("opencode-runtime://s", "\x1b]0;another\x07")
-            .is_empty());
+        assert!(
+            witness
+                .observe("opencode-runtime://s", "\x1b]0;another\x07")
+                .is_empty()
+        );
         // A new class still speaks.
         assert_eq!(
             witness.observe("opencode-runtime://s", "\x1b]52;c;QUJD\x07"),
@@ -534,7 +550,11 @@ mod tests {
     fn osc_witness_holds_a_split_opener_instead_of_misclassifying_it() {
         let mut witness = OscWitness::new();
         // `771` alone must not read as `other`: the id may continue.
-        assert!(witness.observe("opencode-runtime://s", "out\x1b]77").is_empty());
+        assert!(
+            witness
+                .observe("opencode-runtime://s", "out\x1b]77")
+                .is_empty()
+        );
         // Continuation completes 7717 → app_declare, exactly once.
         assert_eq!(
             witness.observe("opencode-runtime://s", "17;web-surface;open;e30=\x07"),
@@ -636,7 +656,9 @@ mod tests {
     // heartbeating run, a cleared record) is consumed history.
     #[test]
     fn only_a_record_still_on_open_keeps_the_replayed_open_verbatim() {
-        assert!(attach_replay_neutralizes_web_surface_open(Some("heartbeat")));
+        assert!(attach_replay_neutralizes_web_surface_open(Some(
+            "heartbeat"
+        )));
         assert!(attach_replay_neutralizes_web_surface_open(None));
         assert!(!attach_replay_neutralizes_web_surface_open(Some("open")));
     }
@@ -680,6 +702,55 @@ mod tests {
         );
     }
 
+    /// A retained pick is the row's launch intent: it must survive in the log
+    /// so the GUI's restore poll can rebuild the chooser after a daemon swap,
+    /// and it must yield to the post-choice open (same verb, latest wins) so
+    /// it never resurrects a picker the app has already moved past.
+    #[test]
+    fn a_pick_is_retained_until_the_choice_supersedes_it() {
+        let mut log = AppDeclareLog::new();
+        log.ingest(
+            AppDeclareMessage {
+                verb: "web-surface".to_string(),
+                action: "pick".to_string(),
+                payload: serde_json::json!({"session": "local://abc", "url": "http://127.0.0.1:46737/"}),
+            },
+            10,
+        );
+        let records = log.records();
+        assert_eq!(records.len(), 1, "exactly the picker record");
+        assert_eq!(records[0].verb, "web-surface");
+        assert_eq!(records[0].action, "pick", "the pick itself is retained");
+        assert_eq!(records[0].payload["url"], "http://127.0.0.1:46737/");
+
+        // The user chooses: the app's open replaces the pick (same verb).
+        log.ingest(
+            AppDeclareMessage {
+                verb: "web-surface".to_string(),
+                action: "open".to_string(),
+                payload: serde_json::json!({"url": "https://example.test/"}),
+            },
+            20,
+        );
+        let records = log.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].action, "open",
+            "the post-choice open supersedes the retained pick"
+        );
+
+        // And a close still clears the verb entirely.
+        log.ingest(
+            AppDeclareMessage {
+                verb: "web-surface".to_string(),
+                action: "close".to_string(),
+                payload: serde_json::json!({}),
+            },
+            30,
+        );
+        assert!(log.records().is_empty(), "close clears");
+    }
+
     #[test]
     fn log_keeps_the_latest_per_verb_and_a_close_clears_it() {
         let mut log = AppDeclareLog::new();
@@ -688,7 +759,6 @@ mod tests {
                 verb: "web-surface".to_string(),
                 action: "open".to_string(),
                 payload: serde_json::json!({"url": "https://one.test/"}),
-
             },
             10,
         );
@@ -754,9 +824,18 @@ mod tests {
         for (data, why) in [
             ("", "an empty chunk has nothing to discount"),
             ("hello\n", "plain output"),
-            ("\x1b[2K\x1b[G", "a spinner frame is pure control and IS the agent working"),
-            ("\x1b]0;a title\x07", "somebody else's OSC is not ours to discount"),
-            ("\x1b]7717;web-surface;pick;dGVzdA==", "an unterminated tail cannot be proven ours"),
+            (
+                "\x1b[2K\x1b[G",
+                "a spinner frame is pure control and IS the agent working",
+            ),
+            (
+                "\x1b]0;a title\x07",
+                "somebody else's OSC is not ours to discount",
+            ),
+            (
+                "\x1b]7717;web-surface;pick;dGVzdA==",
+                "an unterminated tail cannot be proven ours",
+            ),
         ] {
             assert!(
                 !super::chunk_is_only_app_declares(data),

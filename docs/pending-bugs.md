@@ -18,6 +18,49 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.48] A DAEMON SWAP LEFT A NO-ARG YCHROME ROW A BARE TERMINAL HIDING A RUNNING PICKER — THE `pick` WAS INVISIBLE TO EVERY RECOVERY ARM
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Measured on the GUI host, 2026-09-04 01:25–01:45, from the ytrace generations
+of the swap window. A same-version reinstall (00:55) armed the incumbent
+daemon's `disk_binary_replaced` retire; the swap executed at 01:25:24 and the
+successor relaunched the row's app at 01:25:37. The row was dead in the GUI
+from that instant:
+
+- `daemon/liveness swept` 01:26:55 on the ychrome row: the browsing surface's
+  heartbeats stopped at the swap instant (last_seen 01:25:23), so the sweep
+  killed it — by design, the dead-app detector doing its job.
+- The relaunched app (no-arg ychrome) sat at its profile picker and emitted
+  OSC `web-surface;pick` (straced live: one 249-byte write to the PTY) — but
+  `retention_for("web-surface", "pick")` was `Ignore`, so the successor's
+  `AppDeclareLog` held nothing: zero `app_declare_ingested` events for the
+  session, and the GUI's restore poll traced `daemon_declare_absent` every
+  ~5s for 20+ minutes.
+- `liveness stale_detected` (`has_live_web_surface`) repeated every 30s with
+  NO recovery arm behind it; the row showed the terminal view — the wrapper's
+  boot log and a hidden picker the user could not reach.
+
+The ignore was deliberate ("a picker is a native prompt awaiting a human
+choice, not a surface that can be rebuilt behind their back") and half-wrong:
+rebuilding IS wrong while the app is past the choice, but the app at the
+chooser is exactly the row's true state, and the pick is launch intent for a
+row whose app has not started yet — the same class an `open` already is.
+
+**Fix (lane `lane/trace/picker-survives-swap`):** the daemon retains `pick`
+(`Retention::Store`); the GUI's `rebuild_web_surface_from_daemon_declare` arms
+a picker rebuild — egress-resolve the control endpoint the same way the live
+OSC arm does and `upsert_web_surface_picker` (native picker, no page, no
+tabs), returning before the browsing-surface materializer. Stored under the
+web-surface verb, the post-choice `open` replaces the record and a `close`
+clears it, so a stale pick can never outlive the app's own progression; the
+30s rebuild ceiling still forces a relaunch for a dead app.
+
+**Falsifier:** on the next daemon swap (or GUI restart) with a no-arg ychrome
+row, the row's viewport shows the native profile picker — trace
+`web_surface/daemon_declare_picker_rebuild` fires once per rebuild, and
+`liveness stale_detected` for that row does not recur.
+
 ## ⛔ [11.47] A SAME-VERSION NEWER BUILD NEVER BECAME THE RUNNING DAEMON — THE IDLE GATE IT DEFERRED BEHIND NEVER OPENED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -344,8 +387,10 @@ order minus the deleted row); a second delete moves nothing else.
 
 ## ⛔ [11.43] THE VIEWPORT SWITCHES ITSELF TO THE STARTPAGE VIEW AFTER SOME TIME
 
-**Status:** FIXED IN CODE — lane `trace/startpage-hijack` (`7584907cf` + merge
-`f7bb90131`, 3.2.39, wire stamp re-cut). LIVE PROOF OWED on a 3.2.39 GUI.
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Lane `trace/startpage-hijack` (`7584907cf` + merge `f7bb90131`, 3.2.39, wire
+stamp re-cut). Live proof owed on a 3.2.39 GUI.
 
 **Root cause, measured 2026-09-02 18:17–18:25** (event-trace.g1788352723860, guihost):
 the "chore racing a snapshot" suspicion was wrong. The sequence was:
@@ -25980,6 +26025,8 @@ which is how it was root-caused.
 
 ## ⛔ [startpage-hijack-B] The preserve-active launch writes its restore as a SECOND activation — churn every attach answers twice
 
+**Status:** OPEN
+
 **Measured GUI host 2026-09-02 18:17–18:25** (same incident as the fixed half in
 `start_local_session_seated`'s activate flag — lane trace/startpage-hijack): with the
 daemon's active pointer at `None` (startpage), EVERY background attach of any row —
@@ -26007,6 +26054,8 @@ the trace writes — the writes are the witness, the STATE writes are the defect
 
 ## ⛔ [startpage-hijack-C] Removing the ACTIVE row drops the user to the startpage instead of the next row
 
+**Status:** OPEN
+
 `remove_live_session` (lib.rs) clears the active pointer to `None` when the removed row
 WAS active — `ActivationOrigin::recovery("remove_live_session")` → the GUI's viewport
 falls to the startpage. The GUI-INITIATED close has redirect logic
@@ -26031,7 +26080,9 @@ moves; not fixed alongside the activate half for exactly that reason.
 
 ## ⛔ [traffic-light] THE SIDEBAR MACHINE DOT STAYS AMBER ("cached") LONG AFTER THE DAEMON'S REMOTE-MACHINE HEALTH WENT HEALTHY
 
-**Status:** OPEN — measured 2026-09-02, guihost.
+**Status:** OPEN
+
+Measured 2026-09-02, guihost.
 
 Owner screenshots 18:05 and 18:18 show the `dev` machine row's dot amber in
 the tree while every session under it was green. The daemon's
@@ -26061,13 +26112,15 @@ before touching the vocabulary.
 
 ## ⛔ [startpage-hijack-D] POST-RESTART NULL-ACTIVE WINDOW — the first snapshot adopt yanks the restored view to the startpage
 
-**Status:** FIXED IN CODE — lane `trace/startpage-hijack` (`8a1847763`): the
-GUI now CLOSES the desync instead of adopting the null (focus the held
-session daemon-side via `FocusLive`, adopt the post-focus snapshot; pure
-decision predicate unit-tested). LIVE PROOF OWED on the next natural GUI
-restart: the trace gains `restored_active_pushed_to_daemon` in the
-post-restart window and no `apply_snapshot_adopt_daemon_view` null-adopt
-follows. One nuance measured while testing: the client-side apply has a
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Lane `trace/startpage-hijack` (`8a1847763`): the GUI now CLOSES the desync
+instead of adopting the null (focus the held session daemon-side via
+`FocusLive`, adopt the post-focus snapshot; pure decision predicate
+unit-tested). Live proof owed on the next natural GUI restart: the trace
+gains `restored_active_pushed_to_daemon` in the post-restart window and no
+`apply_snapshot_adopt_daemon_view` null-adopt follows. One nuance measured
+while testing: the client-side apply has a
 fallback that keeps a LIVE row when the daemon's active is null (the row is
 re-inserted from `active_session` and/or the first-live fallback fires), so
 the felt startpage at 18:18 came through the remove-path's Rendered+None
@@ -26101,9 +26154,36 @@ nowhere until the GUI gives it back.
 
 ## ⛔ [interrupted-orphan] THE EXPIRED-SWAP RECORD OUTLIVES EVERY THREAD THAT COULD AGE IT OUT, AND THE GATE REFUSES ON A DEAD LETTER
 
-**Status:** PARTIALLY FIXED 2026-09-02 — the expiry sweeper (own thread) and
-the gate's expiry-awareness landed on `lane/dev/interrupted-expiry`; the
-LINGER itself (root cause) is OPEN.
+**Status:** OPEN
+
+PARTIALLY FIXED 2026-09-02 — the expiry sweeper (own thread) and the gate's
+expiry-awareness landed on `lane/dev/interrupted-expiry`; the LINGER itself
+(root cause) is OPEN.
+
+**THIRD STRATUM INSTANCE, measured on the GUI host 2026-09-04 00:45–01:45
+(same night as [11.48], same trace window).** The linger now has a named
+wedge: a PERMANENT handoff refusal the sweep never learns from. Daemon
+2580255 (3.2.51, exe `(deleted)`) self-retired at 01:25:24
+(`retire_trigger: disk_binary_replaced`) and spawned successor 2657744 — as
+its own CHILD (ppid), so the incumbent's scope holds the successor too. It
+was still alive 19+ minutes later, holding 5 remote-row `ssh -tt` PTYs and
+the successor, because its `superseded_self_retire_sweep` had been refusing
+to converge since 00:47:58: `pty_handoff_refused` ×11, one per minute, all
+`"refusing to adopt local://fb365034…: this daemon already runs a live PTY
+for it"` — the successor re-spawned that key itself, so the refusal is
+PERMANENT, the key never leaves `session_keys()`, `hand_off_all_runtimes`
+can never return empty, and the retire never completes. The refusal is
+correct (adopting would duplicate a live successor-owned PTY); the missing
+half is the predecessor DROPPING its redundant copy of a key the successor
+permanently claims — it is a duplicate fd of a session that is alive on the
+successor, not a session of its own. Also witnessed in the same window: the
+GUI raced the incumbent's own handoff — it spawned a successor child that
+exited (`spawned_daemon_exit`), then its `startup_hot_swap` request was
+refused by the surviving successor as `handoff_target_regression_refused`
+(GUI 3.2.50 requesting a 3.2.50-target handoff while 3.2.51 was registered)
+and traced `startup_hot_swap_request_failed`; and the successor itself was
+born into the graveyard scope `yggterm-gui-2381266.scope` ([11.40]'s family,
+still open).
 
 Measured live on dev, 2026-09-02, TWICE the same day:
 
@@ -26155,12 +26235,13 @@ on live PTYs, archive the record to scratchpad, trace
 
 ## ⛔ [11.44-followup] THE WHEEL GATE'S SEED IS CLIENT-OBSERVED-ONLY — `normal` SELF-PERPETUATES ON PRE-MOUNT FULLSCREEN TUIS (the owner's "thinks it's a plain shell")
 
-**Status:** seed + probe LANDED (`lane/dev/wheel-gate-truth-seed`); the
-proxied-truth arm LANDED `lane/trace/wheel-proxy-truth` (fifth reading
-below). LIVE PROOF OWED on the next rotation: a fresh mount of a proxied
-fullscreen row must wheel-translate on the FIRST wheel (`cli/wheel_gate`
-decision `translate`, `cli/pty_truth_proxied` carrying the fetched
-verdict).
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Seed + probe landed (`lane/dev/wheel-gate-truth-seed`); the proxied-truth arm
+landed `lane/trace/wheel-proxy-truth` (fifth reading below). Live proof owed
+on the next rotation: a fresh mount of a proxied fullscreen row must
+wheel-translate on the FIRST wheel (`cli/wheel_gate` decision `translate`,
+`cli/pty_truth_proxied` carrying the fetched verdict).
 
 **FOURTH READING, 2026-09-03 (owner played + reported; probes + code read).**
 Wheel dead, drag-select/middle-paste work, TUI chrome copied as text on all
@@ -26219,8 +26300,10 @@ plane, notified via the campaign door.
 
 ## ⛔ [11.47] THE ANCHOR PICKER AND THE MIRROR TICK DISAGREE ABOUT "LIVE" — SCREEN-VERDICT ROWS WERE UNANCHORABLE, AND EVERY GHOST NOW CARRIES ITS CAUSE
 
-**Status:** FIX ON `lane/dev/anchor-liveness-truth`; ghost context SHIPPED in
-the same lane. Live proof owed after rotation.
+**Status:** OPEN
+
+Fix on `lane/dev/anchor-liveness-truth`; ghost context shipped in the same
+lane. Live proof owed after rotation.
 
 **Fifth reading, 2026-09-03 (probe first-readings, ACT XVI).** `mirror_tick`
 named what no instrument could: `anchor_not_live, candidates=27, viewing=
