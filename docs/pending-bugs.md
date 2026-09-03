@@ -90,6 +90,69 @@ on the newest version, the GUI stays up — one `daemon_pending_noop` trace per
 daemon version, zero new `restart_taken`; and if any restart/crash loop ever
 starts again, a `gui_crash_loop_detected` heartbeat incident appears within
 ~3 minutes of its first minute.
+
+**EYEWITNESS CORROBORATION — 2026-09-04 ~04:05 (the seat that triggered the
+03:48:52 death):** the `load_done` panic that killed the 03:43:09 GUI was
+triggered from the agent-control plane — this seat ran `server app web ensure`
+for a fresh ychrome probe row and that GUI materialized the surface, i.e. the
+first adblock-carrying webview load in the process, landing `load_done` on the
+dead pipe. Sequence measured live: ensure ~03:48:4x → panic 03:48:52 (the
+panic log's own payload is the broken-stderr panic — the hook died printing
+the `eprintln!` panic, then `panic in a function that cannot unwind` aborted)
+→ GUI gone. The seat restored the GUI at 03:52 from the desktop session's env
+plus the daemon's `YGGTERM_*` set. Two lessons ride with the pipe-safe
+logging fix: (1) `eprintln!` bypasses the lossy tracing writer entirely —
+the two write paths needed two fixes, exactly as this entry says; (2) any
+surface-materializing verb (`web ensure` and friends) is a MUTATING verb on
+the active client and belongs in the shadow-law's table of probes that must
+name their target.
+
+## ⛔ [11.51] VIDEO PLAYS WITH PERFECT MEDIA STATS AND A HOLE-RIDDEN COMPOSITOR CADENCE — "STATS FOR NERDS SHOWS NOTHING BUT IT STUTTERS"
+
+**Status:** OBSERVABILITY SHIPPED on `lane/trace/webview-frame-cadence`
+(`media/playback_window` now carries `raf_fps`/`raf_p50_ms`/`raf_p95_ms`/
+`raf_max_ms`/`raf_over_25`/`raf_blind`); ROOT CAUSE OPEN — named remedy below.
+
+Owner report 2026-09-04: youtube is choppy in ychrome with zero dropped
+frames in stats-for-nerds, and on the owner's invidious instance the player
+auto-downgrades resolution; neither happens in Helium or Zen.
+
+Measured 2026-09-04 ~03:55–04:05 (ychrome in the agent shadow client, the
+owner's test video, on youtube.com and on the invidious host):
+
+- The media pipeline is innocent. WebKit decodes on VAAPI hardware (the
+  WebProcess holds the GPU render node; 1080p60 costs ~6% of one core; the
+  `libgstva` H.264/VP9/AV1 decoders are present at rank 257 on the Radeon
+  780M), rVFC presented 60 fps with `clock_ratio` 1.00 and `waits` 0 — and
+  the invidious ladder stepped 1080→720→1080 and recovered at 38.9 s of
+  buffer. Bandwidth was never the constraint: buffer stayed ~60 s ahead
+  through a 92 s watch.
+- The choppiness is the COMPOSITOR cadence. While the video played, the
+  page's rAF gaps ran p50 16 ms / p95 32 ms / max 248 ms (13+ gaps >25 ms
+  in a 4 s window); PAUSING the video cleaned the same page's cadence to
+  p95 17 ms / max 35 ms without touching anything else. Same signature on
+  both hosts.
+- Architectural shape: the surface webview lives in the GUI process, so its
+  frame cadence queues behind the GUI main loop's other work. Helium and
+  Zen decouple compositing into a dedicated GPU/compositor process, which
+  is why neither stutters. stats-for-nerds counts DECODER drops, which is
+  why it reads clean straight through a visible stutter.
+- The invidious "auto downgrade" is downstream of the holes, not of
+  throughput: its ABR reacts to startup stalls/cadence dips (the probe
+  caught `media/stall` + `quality_change dir:-1` on the restored, busier
+  GUI); on the user's real desktop the steps don't recover.
+
+**Named remedy (next unit, wants its own design):** give the surface
+webview's presentation a path that does not queue behind GUI main-loop work.
+Candidates in order of scope: (a) find and de-fang the specific main-loop
+stalls during playback (start from the ui/block culprits inside the playback
+windows); (b) host surface webviews in a separate UI process; (c) drive
+WebKit's accelerated-compositing/DMABUF path so video frames bypass the GTK
+widget layer. Falsifier for ANY of them, now measurable: with video playing,
+`raf_p95_ms`/`raf_max_ms` must converge toward the media cadence
+(≤ ~17/34 ms at 60 Hz) instead of the 32/248 baseline this entry was
+opened with.
+
 ## ⛔ [11.49] AN INTERACTIVE RESUME BLOCKED ON PROVISIONING — 89s ON THE INSTALL LOCK, THEN A FULL CLI GENERATION DOWNLOAD, ALL SILENT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
