@@ -122,6 +122,11 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
             "cli/working_edge",
             "daemon/idle_gate_eval",
             "cli/osc_witness",
+            // The proxied-PTY-truth arm ([11.44-followup] fifth reading):
+            // the preserved owner's alt-screen verdict for a row this daemon
+            // holds only by address — the wheel gate's seed on the rows that
+            // used to starve it. Emitted once per fetch, TTL-bounded.
+            "cli/pty_truth_proxied",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }

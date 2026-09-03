@@ -26155,7 +26155,12 @@ on live PTYs, archive the record to scratchpad, trace
 
 ## ⛔ [11.44-followup] THE WHEEL GATE'S SEED IS CLIENT-OBSERVED-ONLY — `normal` SELF-PERPETUATES ON PRE-MOUNT FULLSCREEN TUIS (the owner's "thinks it's a plain shell")
 
-**Status:** FIX ON `lane/dev/wheel-gate-truth-seed`, LIVE PROOF OWED.
+**Status:** seed + probe LANDED (`lane/dev/wheel-gate-truth-seed`); the
+proxied-truth arm LANDED `lane/trace/wheel-proxy-truth` (fifth reading
+below). LIVE PROOF OWED on the next rotation: a fresh mount of a proxied
+fullscreen row must wheel-translate on the FIRST wheel (`cli/wheel_gate`
+decision `translate`, `cli/pty_truth_proxied` carrying the fetched
+verdict).
 
 **FOURTH READING, 2026-09-03 (owner played + reported; probes + code read).**
 Wheel dead, drag-select/middle-paste work, TUI chrome copied as text on all
@@ -26197,14 +26202,16 @@ addresses, not runtimes — every row is proxied until its PTY re-spawns
 under the new daemon. The seed's "daemon-true wins" arm never receives
 daemon truth; `None` falls through to the client record (`normal`), which
 is exactly the self-perpetuation the truth seed was built to kill. The
-repair is wire-correct; the DELIVERY is rotation-fragile. Fix shape, next
-unit, options weighed: (a) overlay answers from the predecessor via the
-proxy channel for the ACTIVE row only, bounded (the PEER_TRIAGE budget
-precedent) + short TTL cache (alt-screen is stable for TUIs); (b) carry
-per-runtime truth (pid/alt/cols-rows) in the handoff bequest blob so a
-successor is born knowing; (c) at mount, when seed is None, GUI asks
-`terminal_snapshot` (proxy-aware) and reads the alt bit — needs a sync
-daemon call out of the mount path, ui/block risk, least preferred. Also
+repair is wire-correct; the DELIVERY was rotation-fragile. FIXED 2026-09-04
+via option (a), the least invasive of the three weighed:
+`ServerResponse::TerminalSnapshot` carries `pty_in_alternate_screen`
+(serde-defaulted; an old owner's absence = `None` = unknown; wire shape
+re-cut at 3.2.51), the owner fills it from its own TerminalManager, and
+the answering daemon's snapshot overlay fetches it from the preserved
+owner for the ACTIVE row only — `overlay_proxied_pty_truth`, 250 ms IO
+budget, 5 s TTL cache per runtime key (a dead or old owner costs one
+probe per TTL), probe `cli/pty_truth_proxied`. The per-row loop stays
+passive: unknown is never synthesized. Also
 observed while measuring: `daemon_self_retire` for one guihost pid repeats
 every 20 s for minutes (21:56–21:59+) — the same-version cooldown's
 defer-and-re-request loop, loud on the trace; the tracefix lane owns that
