@@ -23062,6 +23062,13 @@ fn bridge_remote_runtime_session_stdio(
     // opencode and a codex, both idle-but-healthy). The 2026-07-20 wedge this
     // deadline exists for had NO output and NO snapshot — an honestly blank
     // viewport. Snapshot with visible text is the difference.
+    //
+    // ⛔ SO ARE RETAINED CHUNKS. Second measured kill (GUI host 00:25: the
+    // 4f0f1ab8 opencode row had PAINTED its session — the agent had finished a
+    // turn minutes earlier — and the deadline still fired): the paint came
+    // through the retained-chunks path (`wrote_initial_visible_chunks`), not a
+    // snapshot, so the first proof never latched. Any visible paint — snapshot
+    // OR chunks — is the daemon serving this runtime's own screen.
     let mut snapshot_proof_of_life = false;
     let registry_home = resolve_yggterm_home().ok();
     loop {
@@ -23236,6 +23243,9 @@ fn bridge_remote_runtime_session_stdio(
             }
             if chunks_have_visible_text {
                 wrote_initial_visible_chunks = true;
+                // Any visible paint is proof of life (see the field's doc): the
+                // wedge deadline must never kill a row the daemon has painted.
+                snapshot_proof_of_life = true;
                 if initial_snapshot_pending && bridge_initial_snapshot_should_use_raw_stream(path) {
                     initial_snapshot_pending = false;
                     release_deferred_stale_owner_hot_update("bridge_first_paint");
