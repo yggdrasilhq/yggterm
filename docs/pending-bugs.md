@@ -822,15 +822,22 @@ lock: `self_minting_clis_open_the_picker_on_absence_and_birth_id_clis_refuse`.
 Live-verified: the previously dead row now boots to opencode2's own TUI with
 its recent sessions in its tab bar.
 
-**What remains open (this entry):** the identity rebind. opencode2 must be
-declared self-minting (`id_assigned_at_birth: false`) and the runtime-identity
-rebind (the Issue 16 machinery, fleet-wide since the muse/antigravity fixes)
-must discover the row's real `ses_…` id from the v2 store — via the opencode
-service API (`GET /api/session` / `/api/session/active`), not the DB schema,
-which is private. Until then a COLD resume of a v2 session (PTY gone, GUI
-gone) can never work: `--session <row-uuid>` names an id the store never held.
-This rebind is also the prerequisite for the Issue 26 tab→row mirror, whose
-per-tab rows need exactly these `ses_…` ids as their CLI-side handle.
+**What remains open (this entry):** the identity rebind for the arm the
+mirror has never seen. LANDED 2026-09-03 (Issue Heading 32 in
+cli-integration.md): the restore/remount arm is CLOSED —
+`ensure_remote_runtime_agent_session` now vouches a phantom anchor resume to
+the row's own `Viewing Tab Session Id` stamp (the mirror's service-side
+focus truth; no store schema parsed), re-pointing id, launch command and
+Restore line in the same step it already ran, with `cli/launch_contract`
+`service_vouched_resume` naming every vouch on the trace. Regression locks:
+`an_anchor_resume_vouches_to_the_session_the_mirror_saw_it_viewing`,
+`an_anchor_without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom`.
+STILL OPEN here: an anchor the mirror never observed (no stamp — no mount
+since birth) cannot vouch; a COLD resume of a v2 session still cannot work
+from the uuid alone. The store-side "newest ses_ for cwd" candidate is the
+remaining idea, heuristic under N-windows-one-cwd and not yet measured.
+The Issue 26 tab mirror (shipped above) remains the SSOT for per-tab
+`ses_…` handles.
 
 **Not covered:** v1-line opencode (`opencode-ai`, abandoned) kept the old
 behavior; no store schema is parsed or written; no transcript is copied.

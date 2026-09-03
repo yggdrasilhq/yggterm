@@ -1370,3 +1370,72 @@ daemon decisions.
 * Sub-signal detail below bools (which footer needle matched) — follow-up if
   the bools prove insufficient; the needle strings stay out of the trace
   until a spec explicitly admits them.
+
+## Issue Heading 32: the phantom-resume vouch — an anchor's resume must land in the session it was viewing (2026-09-03)
+
+### The defect, measured live
+
+`ytrace tail --category cli`, dev, 2026-09-03 23:34–23:45: **five
+`cli/launch_contract` breaches** (`breach: ses_guard_degrade`,
+`declared_selector: --session`, `selector: ""`, `carries_id: false`), each
+followed seconds later by fresh-TUI chrome on `cli/osc_witness` — a fresh
+opencode2 window where the owner's conversation had been. The clusters ride
+daemon swaps (23:43:43 start → four breaches 23:44–23:45), and the mirror
+named the standing wound between them: `cli/mirror_tick` `diverged` on every
+tick (anchor bound to the row uuid, `viewing` riding a real `ses_…` id).
+
+The causal chain, all measured:
+
+1. An OpenCode ANCHOR row is keyed by its birth uuid
+   (`opencode-runtime://<uuid>`); opencode2's store has never held that id
+   (the descriptor's `id_assigned_at_birth: false`).
+2. Restore and every remount compose the anchor's resume through
+   `ensure_remote_runtime_agent_session`, which passes the row's id — the
+   uuid — to the persistent-resume composer.
+3. The ses_ guard (Issue 27's fix) correctly refuses the phantom and
+   degrades to a fresh launch. Correct refusal, wrong final answer: the
+   owner's viewed session is abandoned for an empty window, and because the
+   row never learns the `ses_` id, the loop repeats at every restart.
+
+### The repair: vouch to the row's own focus truth
+
+`ensure_remote_runtime_agent_session` now consults the anchor's
+`Viewing Tab Session Id` metadata (the mirror's per-tick focus stamp,
+Issue 30) when the requested id is not `ses_`-shaped. If the stamp names a
+service-shaped session, the resume is composed with THAT id, and the
+function's existing tail re-points the row — id, launch command, Restore
+line, registry — in the same step it already ran. The key does not move:
+the mirror keeps keying its tab rows by the service id and never adopts
+uuid keys, so anchor and tab rows stay distinct.
+
+* Probe: the vouch emits `cli/launch_contract` with breach
+  `service_vouched_resume` — the third rail the probe reserved at Issue 31,
+  silent until now.
+* No stamp (fresh anchor, mirror never saw a focus) → today's degrade
+  stands, byte-identical behaviour. A stale stamp degrades gracefully:
+  resuming the last-viewed session is still the owner's conversation,
+  never an empty window.
+
+### What this unit does NOT cover
+
+* The cold-restore arm where the anchor row was NOT persisted (no row, no
+  stamp, no vouch) — the store-side "newest ses_ for cwd" candidate stays
+  OPEN; it is heuristic under N-windows-one-cwd and needs its own measured
+  unit.
+* Per-TUI identity binding for OTHER self-minting CLIs — muse/agy bind via
+  the `live_session_marker` /proc walk; OpenCode's descriptor carries no
+  marker (its truth lives in one shared sqlite db), which is exactly why
+  the vouch rides the mirror's stamp instead.
+* Defect B (single-anchor vs N TUIs) beyond what the vouch already heals:
+  every anchor now resumes ITS OWN last-viewed session; the mirror's
+  one-anchor scope is unchanged.
+
+### Regression locks
+
+* `an_anchor_resume_vouches_to_the_session_the_mirror_saw_it_viewing` —
+  stamp present: the composed resume names the vouched `ses_` id, the
+  phantom uuid survives nowhere in the launch, the Restore line names
+  `resume-opencode <ses_…>`.
+* `an_anchor_without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom`
+  — stamp absent: no `--session` on the composed launch, no phantom id
+  carried.

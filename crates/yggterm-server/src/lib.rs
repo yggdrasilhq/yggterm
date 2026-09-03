@@ -10775,6 +10775,24 @@ impl YggtermServer {
         )
     }
 
+    /// The anchor's currently-viewed OpenCode session id, if the mirror's
+    /// focus stamp names a service-shaped session.
+    ///
+    /// Reads ONLY what the mirror already wrote (`Viewing Tab Session Id`,
+    /// refreshed every tick while the TUI is mounted) — no store probe, no
+    /// process walk. A stale stamp degrades gracefully: resuming the row's
+    /// last-viewed session is still the owner's conversation, never an empty
+    /// window. Rows without the stamp vouch nothing and take today's path.
+    fn opencode_viewing_session_vouch(&self, key: &str) -> Option<String> {
+        let session = self.sessions.get(key)?;
+        session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == crate::opencode_mirror::VIEWING_SESSION_METADATA)
+            .map(|entry| entry.value.trim().to_string())
+            .filter(|value| value.starts_with("ses_"))
+    }
+
     fn ensure_remote_runtime_agent_session(
         &mut self,
         kind: SessionKind,
@@ -10789,6 +10807,50 @@ impl YggtermServer {
         // holds a runtime row for the key is the live half of the gate below.
         let key = remote_runtime_agent_session_key(kind, session_id)
             .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
+        // ⛔ THE PHANTOM-RESUME VOUCH (Defect A, restore/remount arm — measured
+        // live 2026-09-03 23:44: five `ses_guard_degrade` fresh births in one
+        // minute around a daemon swap, one per uuid-keyed anchor). An OpenCode
+        // anchor row is A WINDOW: its key carries yggterm's birth uuid, a
+        // phantom the opencode2 store has never held, so every ensure composed
+        // a resume the ses_ guard then degraded into a FRESH empty window —
+        // the viewed session abandoned at every restart. The row already
+        // carries the mirror's per-tick focus truth as `Viewing Tab Session
+        // Id`; when it names a service-shaped id, resume THAT. The key stays
+        // the anchor's (the mirror keys its tab rows by the service id and
+        // never adopts uuid keys), and the compose below re-points id, launch
+        // command and Restore line in the same step it already ran.
+        let mut session_id = session_id.to_string();
+        if kind == SessionKind::OpenCode
+            && !session_id.starts_with("ses_")
+            && let Some(viewed) = self.opencode_viewing_session_vouch(&key)
+        {
+            use crate::codex_cli::{composed_cli_extra_args_with, split_extra_args};
+            let descriptor_extra = composed_cli_extra_args_with(
+                kind,
+                &AgentLaunchOptions::default(),
+                configured_extra_args,
+            )
+            .unwrap_or_default();
+            let selector = agent_cli_descriptor(kind)
+                .map(|descriptor| descriptor.resume_selector_token())
+                .unwrap_or_default();
+            yggterm_core::cli_plane::emit_launch_contract(
+                "daemon",
+                kind,
+                selector,
+                yggterm_core::cli_plane::CliInvocationShape {
+                    action: "resume",
+                    selector,
+                    carries_id: true,
+                    re_roots_with_cwd: false,
+                    extra_arg_tokens: split_extra_args(&descriptor_extra).len(),
+                    persistent: true,
+                },
+                yggterm_core::cli_plane::CliLaunchContractBreach::ServiceVouchedResume,
+            );
+            session_id = viewed;
+        }
+        let session_id: &str = &session_id;
         // ⛔ LIVE RUNTIME WINS OVER THE TRANSCRIPT GATE — the same rule the
         // `resume-<slug>` wrappers enforce before their own store probe (see
         // `run_remote_resume_agent`). Measured 2026-08-28: opencode2's v2
@@ -37314,12 +37376,180 @@ mod tests {
         );
     }
 
+    /// Serializes the ENV_YGGTERM_HOME redirection across tests: the var is a
+    /// process global, so two tests setting it concurrently hand each other a
+    /// stranger's temp home mid-arrange (seen live when both anchor-vouch tests
+    /// ran together).
+    fn env_yggterm_home_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn test_server() -> YggtermServer {
         YggtermServer::new(
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         )
+    }
+
+    /// ⛔ THE PHANTOM-RESUME VOUCH (Defect A restore/remount arm): an anchor
+    /// row keyed by its birth uuid, carrying the mirror's focus stamp, must
+    /// resume the session it was VIEWING — not degrade into a fresh empty
+    /// window that abandons the conversation. Measured live 2026-09-03 23:44:
+    /// five `ses_guard_degrade` births around one daemon swap.
+    #[test]
+    fn an_anchor_resume_vouches_to_the_session_the_mirror_saw_it_viewing() {
+        let _env = env_yggterm_home_test_lock();
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-oc-vouch-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+
+        let anchor_id = "d4090efe-4e12-42d9-938d-66f61801d2e7";
+        let anchor_key = format!("opencode-runtime://{anchor_id}");
+        let viewed = "ses_f9dd04cfaffeYv8F8dLF6r74FX";
+        let mut server = test_server();
+        server.insert_live_session_with_launch(
+            &anchor_key,
+            anchor_id,
+            SessionKind::OpenCode,
+            &crate::local_session_target(SessionKind::OpenCode, Some("/home/user/proj")),
+            Some("New dev OpenCode".to_string()),
+            false,
+            false,
+        );
+        if let Some(session) = server.sessions.get_mut(&anchor_key) {
+            upsert_session_metadata(
+                &mut session.metadata,
+                crate::opencode_mirror::VIEWING_SESSION_METADATA,
+                viewed.to_string(),
+            );
+        }
+
+        let ensured = server
+            .ensure_remote_runtime_agent_session_public(
+                SessionKind::OpenCode,
+                anchor_id,
+                Some("/home/user/proj"),
+                false,
+                None,
+                None,
+            )
+            .expect("ensure the anchor");
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(ensured, anchor_key, "the anchor key must not move");
+        let session = server.sessions.get(&anchor_key).expect("anchor row");
+        assert_eq!(
+            session.id, viewed,
+            "the resume must vouch to the viewed session id"
+        );
+        assert!(
+            session.launch_command.contains(viewed),
+            "the composed resume must name the viewed session: {}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains(anchor_id),
+            "the phantom birth uuid must not survive in the launch: {}",
+            session.launch_command
+        );
+        let restore = session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Restore")
+            .map(|entry| entry.value.clone())
+            .unwrap_or_default();
+        assert!(
+            restore.contains(&format!("resume-opencode {viewed}")),
+            "the Restore line must name the vouched session: {restore}"
+        );
+    }
+
+    /// No focus stamp, no vouch: the anchor keeps today's behaviour — the ses_
+    /// guard degrades the phantom to a fresh launch, never composes a resume
+    /// the service would reject.
+    #[test]
+    fn an_anchor_without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom() {
+        let _env = env_yggterm_home_test_lock();
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-oc-novouch-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+
+        let anchor_id = "4f0f1ab8-dba1-40b0-9698-02c8c88e8ccc";
+        let anchor_key = format!("opencode-runtime://{anchor_id}");
+        let mut server = test_server();
+        server.insert_live_session_with_launch(
+            &anchor_key,
+            anchor_id,
+            SessionKind::OpenCode,
+            &crate::local_session_target(SessionKind::OpenCode, Some("/home/user/proj")),
+            Some("New dev OpenCode".to_string()),
+            false,
+            false,
+        );
+
+        let ensured = server
+            .ensure_remote_runtime_agent_session_public(
+                SessionKind::OpenCode,
+                anchor_id,
+                Some("/home/user/proj"),
+                false,
+                None,
+                None,
+            )
+            .expect("ensure the anchor");
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(ensured, anchor_key);
+        let session = server.sessions.get(&anchor_key).expect("anchor row");
+        assert!(
+            !session.launch_command.contains("--session"),
+            "a phantom id must never be composed as an opencode resume: {}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains(anchor_id),
+            "the degraded fresh launch must not carry the phantom: {}",
+            session.launch_command
+        );
     }
 
     /// A summary deleted from the store must be able to reach a running server.
