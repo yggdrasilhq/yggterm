@@ -4518,8 +4518,8 @@ JSON.stringify({{
             "the ribbon must open before the card div"
         );
         assert!(
-            after_surface.contains("background:transparent"),
-            "the ribbon column must not paint the viewport background"
+            after_surface.contains("the terminal layer paints UNDER"),
+            "the ribbon strip must stay opaque over the terminal layer"
         );
     }
 
