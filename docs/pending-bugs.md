@@ -265,13 +265,22 @@ format owner with the bequest's rename; locked by
 `a_retired_artifact_of_a_live_pid_is_kept_even_when_its_version_looks_dead`
 + the dead-pid confirmation tests in `socket_sweep`.
 
-**Falsifier:** deploy a newer build at the same version to a host with active
-sessions and touch nothing. Within the self-retire poll's own interval the
-daemon trace shows `same_version_socket_bequeathed` +
-`hot_update_handoff_prepared {same_version_bequest: true}` + the successor
-bound at the canonical path, and `server status` then reports
-`running_build_id == on_disk_build_id` with no `server app update restart`
-having been run by anyone.
+**Falsifier (amended 2026-09-04 for the storm guard that landed overnight):**
+deploy a newer build at the same version to a host with active sessions and
+touch nothing. The bequest FIRED live the night it shipped — and over-fired:
+sixteen same-version bequests in one hour, six live daemons at once, 347
+client disconnects an hour and UI blocks 6–11/min, every one a same-BYTES CI
+redeploy re-arming the trigger (a `mv -f` of identical bytes is a write, not
+an update). The guard now shipped: the trigger requires DIFFERENT bytes on
+disk (`disk_replacement_differs_from_running_bytes`), and a same-version
+handoff starts a 30-minute hysteresis seeded at the successor's birth
+(`disk_binary_handoff_cooldown_deferred` names the window). So the corrected
+falsifier: after the hysteresis expires, the FIRST poll holding different
+bytes on disk shows `same_version_socket_bequeathed` +
+`hot_update_handoff_prepared {same_version_bequest: true}` with the successor
+bound at the canonical path, `server status` converges to
+`running_build_id == on_disk_build_id`, and byte-identical redeploys fire
+NOTHING.
 
 **Deployment state at fix time (2026-09-03 ~19:05):** the fix is ON DISK on
 every host (CI union 27b38abbc056, deployed 18:56), but the GUI host's RUNNING daemon
