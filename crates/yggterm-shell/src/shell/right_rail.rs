@@ -3095,8 +3095,16 @@ fn DocumentSurfaceBody(
          min-width:0; overflow:hidden; background:{}; color:{}; border-radius:11px;",
         doc.bg, doc.fg
     );
-    let ribbon_style = "display:flex; align-items:center; gap:10px; flex-wrap:wrap; \
-         padding:2px 14px 8px; flex:0 0 auto;";
+    // Opaque chrome, never transparent: the terminal layer paints UNDER
+    // this column, and a transparent strip shows the dark terminal
+    // bleeding through (the black-bar abomination, 2026-09-03). panel_alt
+    // is the same chrome the in-card bar always wore — seamless with the
+    // gaps around the card, never the viewport's background.
+    let ribbon_style = format!(
+        "display:flex; align-items:center; gap:10px; flex-wrap:wrap; \
+         padding:4px 14px 8px; flex:0 0 auto; background:{};",
+        doc.chrome
+    );
     // The ribbon: toolbar strip above the card. Subset vocabulary
     // (AppPaneSchema::ribbon) — label/toolbar/button; the body keeps
     // everything else.
