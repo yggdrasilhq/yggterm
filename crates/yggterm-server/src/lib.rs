@@ -23199,6 +23199,7 @@ fn bridge_remote_runtime_session_stdio(
                     _snapshot_last_resize_seq,
                     _runtime_spawn_id,
                     _composer_holds_draft,
+                    _pty_in_alternate_screen,
                 )) => {
                     let snapshot_text =
                         bridge_initial_snapshot_text_for_path(path, Some(snapshot.as_str()))
@@ -29562,12 +29563,12 @@ pub fn run_app_control_read_terminal_buffer(
         let screen = if retained {
             crate::daemon::terminal_retained_snapshot(&endpoint, session_path)
                 .map(|(text, running, seen, post, seq, spawn)| {
-                    (text, running, seen, post, seq, spawn, None)
+                    (text, running, seen, post, seq, spawn, None, None)
                 })
         } else {
             crate::daemon::terminal_snapshot(&endpoint, session_path)
         };
-        if let Ok((text, running, runtime_output_seen, _, _, _, _)) = screen {
+        if let Ok((text, running, runtime_output_seen, _, _, _, _, _)) = screen {
             let fallback = daemon_screen_read_terminal_buffer_payload(
                 session_path,
                 mode,

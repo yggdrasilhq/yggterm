@@ -4230,6 +4230,17 @@ pub enum ServerResponse {
         /// from the CLI's own chrome stopped carrying that distinction.
         #[serde(default)]
         composer_holds_draft: Option<bool>,
+        /// The owner daemon's vt100 verdict on this PTY — the fullscreen
+        /// truth the wheel gate's mount seed starves for on proxied rows
+        /// (measured 2026-09-03: `pty_in_alternate_screen` was null for
+        /// EVERY row in every daemon snapshot on both GUI hosts after a
+        /// takeover, because the snapshot overlay reads only the LOCAL
+        /// TerminalManager while the runtimes it answers for belong to the
+        /// predecessor). `None` = nobody could answer — an older owner that
+        /// has never heard of the field deserializes to exactly that, and
+        /// the seed falls through as it always did.
+        #[serde(default)]
+        pty_in_alternate_screen: Option<bool>,
     },
     TerminalRetainedSnapshot {
         text: String,
@@ -5010,6 +5021,12 @@ pub(crate) struct DaemonRuntime {
     server: YggtermServer,
     terminals: TerminalManager,
     preserved_terminal_owners: PreservedTerminalOwnerRegistry,
+    /// The proxied-PTY-truth TTL cache — see `overlay_proxied_pty_truth`.
+    /// `runtime key -> (fetched_at, the owner's alt-screen verdict)`; `None`
+    /// values are cached too, so a dead or old owner costs one probe per TTL
+    /// instead of one per snapshot.
+    pty_truth_cache:
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<bool>)>>,
     /// Durable per-client-scope memory of Live Sessions row slots. Observes
     /// every order change through the persist chokepoint and answers "where
     /// does this row go when it comes back?" — see `row_order_ledger.rs`.
@@ -5310,6 +5327,7 @@ impl DaemonRuntime {
             server,
             terminals: TerminalManager::new(),
             preserved_terminal_owners,
+            pty_truth_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             row_order_ledger,
             proxied_working_flags: HashMap::new(),
             discovered_working_flag_owners: HashMap::new(),
@@ -6413,6 +6431,82 @@ impl DaemonRuntime {
         }
     }
 
+    /// THE PROXIED-PTY-TRUTH ARM — the wheel gate's mount seed on rows this
+    /// daemon does not locally hold.
+    ///
+    /// ⛔ [11.44-followup] fifth reading (measured 2026-09-03/04): after a
+    /// takeover the successor holds ADDRESSES, not runtimes, so the local
+    /// TerminalManager reads in `overlay_terminal_runtime_snapshot_session`
+    /// answered `None` for EVERY row — `pty_in_alternate_screen` was null
+    /// fleet-wide on both GUI hosts — and the wheel gate's daemon-truth seed
+    /// starved exactly when fresh mounts happen: the one live `cli/wheel_gate`
+    /// firing took the plain-shell branch on the FIXED build. For the active
+    /// row (the one a mount will seed), ask the preserved owner that still
+    /// holds the PTY, over the same `TerminalSnapshot` wire the forwarding
+    /// arm already trusts.
+    ///
+    /// ⚖ Bounded by construction: ACTIVE rows only, a TTL cache per runtime
+    /// key (an alt-screen verdict is stable for a TUI that LIVES fullscreen),
+    /// and a short IO budget on the round trip — a dead or old owner costs
+    /// one failed probe per TTL, then falls through. `None` from an owner
+    /// that has never heard of the field deserializes to exactly that, and
+    /// the seed behaves byte-identically to today's.
+    fn overlay_proxied_pty_truth(&self, session: &mut SnapshotSessionView) {
+        static TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        const IO_BUDGET_MS: u64 = 250;
+        if session.pty_in_alternate_screen.is_some() {
+            return; // local truth already stamped
+        }
+        let runtime_path = self.terminal_runtime_key_for_path(&session.session_path);
+        let now = std::time::Instant::now();
+        if let Ok(cache) = self.pty_truth_cache.lock() {
+            if let Some((at, value)) = cache.get(runtime_path.as_str()) {
+                if now.duration_since(*at) < TTL {
+                    session.pty_in_alternate_screen = *value;
+                    return;
+                }
+            }
+        }
+        let Some(owner_endpoint) = self.preserved_owner_for_runtime_key(&runtime_path) else {
+            return; // not proxied, or the owner is negatively cached
+        };
+        let identity = current_client_identity();
+        let fetched = send_request_as_with_io_timeout(
+            &owner_endpoint,
+            &ServerRequest::TerminalSnapshot {
+                path: runtime_path.clone(),
+            },
+            &identity,
+            std::time::Duration::from_millis(IO_BUDGET_MS),
+        )
+        .ok()
+        .and_then(|response| match response {
+            ServerResponse::TerminalSnapshot {
+                pty_in_alternate_screen,
+                ..
+            } => pty_in_alternate_screen,
+            _ => None,
+        });
+        if let Ok(mut cache) = self.pty_truth_cache.lock() {
+            if cache.len() > 128 {
+                cache.clear();
+            }
+            cache.insert(runtime_path.clone(), (now, fetched));
+        }
+        if let Some(truth) = fetched {
+            session.pty_in_alternate_screen = Some(truth);
+            yggterm_core::perf::ytrace_emit_event(
+                "daemon",
+                yggterm_core::cli_plane::CLI_PLANE_CATEGORY,
+                "pty_truth_proxied",
+                serde_json::json!({
+                    "runtime_path": runtime_path,
+                    "pty_in_alternate_screen": truth,
+                }),
+            );
+        }
+    }
+
     fn overlay_codex_runtime_snapshot_session(
         &self,
         session: &mut SnapshotSessionView,
@@ -6700,6 +6794,12 @@ impl DaemonRuntime {
             self.overlay_terminal_runtime_snapshot_session(active_session);
             self.overlay_agent_runtime_snapshot_session(active_session);
             self.overlay_codex_runtime_snapshot_session(active_session, yggterm_home.as_deref());
+            // The wheel gate's mount seed reads `pty_in_alternate_screen` off
+            // the row the GUI is ABOUT to mount — the active one. A proxied
+            // row's truth lives on the preserved owner, so fetch it here and
+            // only here; the per-row loop below stays passive (unknown stays
+            // unknown, never synthesized).
+            self.overlay_proxied_pty_truth(active_session);
         }
         // ⛔ LIVE-ROW RECENCY IS A DAEMON FACT, NOT A SCAN ARTIFACT (owner-caught
         // fs-truth lie, 2026-09-02): stamp each live row with when its PTY was
@@ -8738,6 +8838,7 @@ impl DaemonRuntime {
                 _last_resize_seq,
                 _runtime_spawn_id,
                 _composer_holds_draft,
+                _pty_in_alternate_screen,
             )) => {
                 if !runtime_output_seen || snapshot.trim().is_empty() {
                     return false;
@@ -11842,6 +11943,7 @@ impl DaemonRuntime {
                                 last_resize_seq,
                                 runtime_spawn_id,
                                 composer_holds_draft,
+                                pty_in_alternate_screen,
                             )) => {
                                 return Ok(ServerResponse::TerminalSnapshot {
                                     text,
@@ -11854,6 +11956,7 @@ impl DaemonRuntime {
                                     // daemon does not hold the line and must
                                     // not invent one.
                                     composer_holds_draft,
+                                    pty_in_alternate_screen,
                                 });
                             }
                             Err(error) => {
@@ -11883,6 +11986,9 @@ impl DaemonRuntime {
                     composer_holds_draft: self
                         .terminals
                         .session_composer_holds_draft(&runtime_path),
+                    pty_in_alternate_screen: self
+                        .terminals
+                        .session_in_alternate_screen(&runtime_path),
                 }
             }
             ServerRequest::TerminalRetainedSnapshot { path } => {
@@ -19126,7 +19232,7 @@ pub fn terminal_read(
 pub fn terminal_snapshot(
     endpoint: &ServerEndpoint,
     path: &str,
-) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>)> {
+) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>, Option<bool>)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalSnapshot {
@@ -19141,6 +19247,7 @@ pub fn terminal_snapshot(
             last_resize_seq,
             runtime_spawn_id,
             composer_holds_draft,
+            pty_in_alternate_screen,
         } => Ok((
             text,
             running,
@@ -19149,6 +19256,7 @@ pub fn terminal_snapshot(
             last_resize_seq,
             runtime_spawn_id,
             composer_holds_draft,
+            pty_in_alternate_screen,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
@@ -37943,8 +38051,18 @@ mod tests {
         // builds of one version answering StartLocalSession with different
         // viewport outcomes is the lost-PTY latch storm this stamp exists to
         // prevent.
-        const STAMPED_AT_VERSION: &str = "3.2.39";
-        const STAMPED_SHAPE_HASH: u64 = 0x6f9ec7411a13eaaf;
+        // Re-cut for 3.2.51 (lane trace/wheel-proxy-truth): `TerminalSnapshot`
+        // gained `pty_in_alternate_screen` — the owner daemon's alt-screen
+        // verdict, the wheel gate's mount-seed truth on PROXIED rows
+        // ([11.44-followup] fifth reading: the field was null fleet-wide
+        // after every takeover because the overlay reads only the local
+        // TerminalManager, and the one live wheel_gate firing took the
+        // plain-shell branch on the fixed build). `#[serde(default)]` +
+        // Option: an older owner's absence deserializes as `None` = "nobody
+        // could answer", and the seed falls through byte-identically; an
+        // older client ignores the unknown field.
+        const STAMPED_AT_VERSION: &str = "3.2.51";
+        const STAMPED_SHAPE_HASH: u64 = 0x67707c81458f654a;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
@@ -37965,6 +38083,66 @@ mod tests {
             "STAMPED_AT_VERSION {STAMPED_AT_VERSION} is ahead of CARGO_PKG_VERSION \
              {SERVER_PROTOCOL_VERSION} — the stamp must be taken at (not beyond) the shipped version",
         );
+    }
+
+    /// ⛔ THE CROSS-VERSION CONTRACT the new field rides on: a NEW owner's
+    /// answer carries the alt-screen verdict; an OLD owner's wire — the field
+    /// absent — deserializes to `None` = "nobody could answer", never a
+    /// confident `false` that would steer the wheel gate's seed with an
+    /// invention.
+    #[test]
+    fn a_terminal_snapshot_answer_carries_the_alternate_screen_truth_across_versions() {
+        use crate::daemon::ServerResponse;
+        let answer = ServerResponse::TerminalSnapshot {
+            text: "screen".to_string(),
+            running: true,
+            runtime_output_seen: true,
+            post_resize_output_seen: false,
+            last_resize_seq: 0,
+            runtime_spawn_id: 0,
+            composer_holds_draft: None,
+            pty_in_alternate_screen: Some(true),
+        };
+        let written = serde_json::to_value(&answer).expect("serialize");
+
+        // New owner → new client: the verdict rides.
+        let parsed: ServerResponse =
+            serde_json::from_value(written.clone()).expect("new shape parses");
+        match parsed {
+            ServerResponse::TerminalSnapshot {
+                pty_in_alternate_screen,
+                ..
+            } => assert_eq!(pty_in_alternate_screen, Some(true)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // Old owner → new client: strip the field the way an older wire would
+        // lack it; absence must read as UNKNOWN, not false.
+        let mut stripped = written;
+        let strip_field = |value: &mut serde_json::Value| {
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("pty_in_alternate_screen");
+            }
+        };
+        if stripped.is_object() && stripped.as_object().unwrap().len() != 1 {
+            strip_field(&mut stripped);
+        } else if stripped.is_object() {
+            // externally tagged: the field lives one level down
+            if let Some(inner) = stripped.as_object_mut().unwrap().values_mut().next() {
+                strip_field(inner);
+            }
+        }
+        let parsed: ServerResponse = serde_json::from_value(stripped).expect("old shape parses");
+        match parsed {
+            ServerResponse::TerminalSnapshot {
+                pty_in_alternate_screen,
+                ..
+            } => assert_eq!(
+                pty_in_alternate_screen, None,
+                "an absent verdict must deserialize as unknown, never false"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }
 

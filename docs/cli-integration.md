@@ -1439,3 +1439,16 @@ uuid keys, so anchor and tab rows stay distinct.
 * `an_anchor_without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom`
   — stamp absent: no `--session` on the composed launch, no phantom id
   carried.
+
+### Issue 31 amendment (2026-09-04): `cli/pty_truth_proxied` — the seed's truth crosses the proxy
+
+`pty_in_alternate_screen` was wire-correct but rotation-fragile: the
+snapshot overlay read only the LOCAL TerminalManager, and a successor holds
+addresses, not runtimes, so the field was null fleet-wide after every
+takeover (both GUI hosts, measured). The active row's truth is now fetched
+from the preserved owner over the existing `TerminalSnapshot` wire
+(field added, shape re-cut 3.2.51; old owner = `None` = unknown) and the
+fetch announces itself as `cli/pty_truth_proxied` {runtime_path,
+pty_in_alternate_screen} — TTL-bounded to one probe per 5 s per runtime
+key, active rows only. The wheel gate's first-wheel falsifier
+([11.44-followup]) is now decidable on proxied rows.
