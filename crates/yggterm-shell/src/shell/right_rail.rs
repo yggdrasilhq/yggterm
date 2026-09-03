@@ -3282,6 +3282,76 @@ fn DocumentSurfaceBody(
                                         {shell_glyph(label, 13)}
                                     }
                                 },
+                                AppPaneWidget::RibbonBar { id, action, active, tabs, groups } => rsx! {
+                                    div {
+                                        key: "{widget_key}",
+                                        "data-document-ribbon-bar": "{id}",
+                                        style: "flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:0;",
+                                        // tab strip: text tabs, active tab carries the accent underline
+                                        div {
+                                            style: "display:flex; align-items:flex-end; gap:1px; padding:1px 6px 0; border-bottom:1px solid {doc.border};",
+                                            for tab in tabs.iter().cloned() {
+                                                button {
+                                                    key: "{id}-{tab.id}",
+                                                    style: if tab.id == *active {
+                                                        format!("padding:4px 13px 5px; background:transparent; color:{}; font-size:11.5px; border:0; border-bottom:2px solid {}; font-weight:600; cursor:pointer;", doc.fg, doc.accent)
+                                                    } else {
+                                                        format!("padding:4px 13px 5px; background:transparent; color:{}; font-size:11.5px; border:0; border-bottom:2px solid transparent; cursor:pointer;", doc.muted)
+                                                    },
+                                                    title: "{tab.label}",
+                                                    onclick: {
+                                                        let run_action = run_action.clone();
+                                                        let action = action.clone();
+                                                        let tab_id = tab.id.clone();
+                                                        move |_| run_action(action.clone(), Some(tab_id.clone()))
+                                                    },
+                                                    "{tab.label}"
+                                                }
+                                            }
+                                        },
+                                        // command row: groups with caption captions, divider-separated
+                                        div {
+                                            style: "display:flex; align-items:stretch; flex-wrap:wrap; padding:3px 8px 4px; row-gap:4px;",
+                                            for (gi, group) in groups.iter().enumerate() {
+                                                div {
+                                                    key: "{id}-group{gi}",
+                                                    style: if group.right {
+                                                        "margin-left:auto; display:flex; flex-direction:column; gap:2px; padding:1px 10px; justify-content:center;".to_string()
+                                                    } else if gi > 0 {
+                                                        format!("display:flex; flex-direction:column; gap:2px; padding:1px 10px; border-left:1px solid {}; justify-content:center;", doc.border)
+                                                    } else {
+                                                        "display:flex; flex-direction:column; gap:2px; padding:1px 10px; justify-content:center;".to_string()
+                                                    },
+                                                    div {
+                                                        style: "display:flex; gap:4px; flex-wrap:wrap;",
+                                                        for ribbon_group_button in group.buttons.iter().cloned() {
+                                                            button {
+                                                                key: "{ribbon_group_button.action}",
+                                                                "data-document-button": "{ribbon_group_button.action}",
+                                                                title: "{ribbon_group_button.title}",
+                                                                style: if ribbon_group_button.primary {
+                                                                    bar_button_primary_style.clone()
+                                                                } else {
+                                                                    format!("padding:3px 10px; border:1px solid transparent; border-radius:6px; background:transparent; color:{}; font-size:11px; cursor:pointer;", doc.fg)
+                                                                },
+                                                                onclick: {
+                                                                    let run_action = run_action.clone();
+                                                                    let action = ribbon_group_button.action.clone();
+                                                                    move |_| run_action(action.clone(), None)
+                                                                },
+                                                                {shell_glyph(&ribbon_group_button.label, 13)}
+                                                            }
+                                                        }
+                                                    },
+                                                    {(!group.label.is_empty()).then(|| {
+                                                        let label_style = format!("font-size:9px; color:{}; text-align:center;", doc.muted);
+                                                        rsx! { span { style: "{label_style}", "{group.label}" } }
+                                                    })}
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
                                 // Ribbon subset is label/toolbar/button; anything
                                 // else is the same empty span an unmatched bar
                                 // widget renders — never a hole in the strip.
@@ -4932,6 +5002,10 @@ fn AppPaneRailBody(
                                     )}
                                 }
                             },
+                            // A RibbonBar in a BODY is a schema mistake — the
+                            // ribbon region above the card owns it. Render
+                            // nothing rather than a hole.
+                            AppPaneWidget::RibbonBar { .. } => rsx! {},
                         }
                         }
                     }
