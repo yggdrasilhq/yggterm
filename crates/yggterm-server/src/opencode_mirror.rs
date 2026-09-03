@@ -452,6 +452,12 @@ impl YggtermServer {
                             &ses_id,
                         )
                     {
+                        // BUS LAW (1cb614bcf): the unit tests run the real
+                        // apply path for their return values; the fleet bus
+                        // must not receive fixture rebinds (measured live
+                        // 2026-09-04 04:04: ses_a0000.../ses_b0000... test
+                        // rebinds read as real mirror decisions on dev).
+                        #[cfg(not(test))]
                         if let Ok(home_dir) = crate::resolve_yggterm_home() {
                             yggterm_core::append_trace_event(
                                 &home_dir,
