@@ -5619,15 +5619,21 @@ frame settles — the mid-cure window is the defect, not the cure.** File this
 as the pixel-paint-cache remedy: a snapshotted last-good frame held as the
 cover, released on repaint-ack.
 **AUDIT 2026-09-04 (lane/trace/determinism-audit):** verified the
-paint-hold/pixel-paint-cache remedy is still NOT implemented — no cover
-state exists on the reveal or nudge path (grep across `yggterm-shell`:
-the only "cover" hits are unrelated). Implementation site when someone
-takes it: the `resize_repaint_nudge` emit and the paint-boundary
-hardening (`strip_leading_partial_escape_sequence`) in
-`crates/yggterm-shell/src/shell/viewport.rs` — hold at nudge emit,
-release on the first full post-nudge frame (or paint ack). Until then
-the mid-cure composite window stays open on every idle fullscreen TUI
-reveal. And the `[11.44]` mouse sibling is closed in
+paint-hold/pixel-paint-cache remedy was still NOT implemented — no cover
+state existed on the reveal or nudge path.
+**LANDED SAME DAY (lane/trace/ghost-frame-cover):** the remedy is built as
+the reveal cover — `crates/yggterm-shell/src/reveal_cover.rs` holds live
+bytes from each repaint-nudge emit (post-attach nudge, startup resize
+repair, cursor-rewound squish resync) and releases on the TUI's first
+full frame (screen-area of held bytes) or a 1 s deadline (flush, never
+drop); deadline releases ride the existing off-loop channel, so the
+keystroke path is never held behind an await. Traces:
+`reveal_cover_held` / `reveal_cover_released {reason, bytes}`. Locked by
+the `reveal_cover` gate tests (fragments held, full frame releases,
+deadline releases, stale generation ignored, rearm clears). Falsifier
+still owed live: switch into an idle fullscreen TUI and confirm the
+first post-nudge paint is the TUI's full frame with no
+`reveal_cover_released reason=deadline` dominating. And the `[11.44]` mouse sibling is closed in
 the same window (buffer-kind seed, `c133cd699`, live on 3.2.42: `xterm_buffer_
 kind` now reports per host).
 
@@ -26414,3 +26420,79 @@ so the S1/S2/S3 family splits by payload at emission, per the owner's
 on a fresh opencode switch-in reads a decision that is NOT
 `anchor_not_live` for a screen-verdict row; a ghost mismatch arrives with
 `buffer_kind`/`buffer_transitions`/`visual_reason` populated.
+
+## ⛔ [11.48] A WEB SURFACE SAT ON A DEAD LOOPBACK URL FOR ~12 MINUTES WHILE ITS APP WAS HEALTHY AND HEARTBEATING THE REAL TARGET — ONLY A DAEMON-TAKEOVER DECLARE-REPLAY HEALED IT (the "ychrome stuck at Opening…" report)
+
+**Status:** OPEN — evidence complete 2026-09-04 ~02:25–02:40, live-caught on the GUI host
+
+**Owner report with screenshot:** a ychrome row sat on the profile picker at
+`http://127.0.0.1:46737/` showing "Opening…" forever after choosing a profile.
+
+**Measured chain (all live):**
+1. Row `local://bb8c8317` launched `app:ychrome:new`; its first picker process
+   died right after the owner chose the `cfa` profile — the webview kept the
+   interstitial the picker served at the loopback control URL, and
+   `ss -tlnp` showed **nothing listening on 46737 from that moment**.
+2. The app supervision relaunched the app at 02:25:06 (wrapper 2806990 →
+   `ychrome` 2806994). The relaunched client is **healthy**: it flipped the
+   target (`profile: "cfa"`, url → the profile start page), `drive_surface`
+   heartbeats every ~4 s (daemon registry `last_heartbeat_ms_ago: 1.3`), and
+   `declare_current` re-registered with the ychrome daemon (control_url
+   `http://127.0.0.1:44581`, owned by the ychrome daemon 1402689).
+3. For ~12 minutes the GUI rendered the DEAD 46737 page and the trace plane
+   shows **zero `web_surface/*` handling for the session** — the live OSC path
+   (`TerminalJsEvent::WebSurface` "open"/"heartbeat" on the PTY stream) never
+   materialized a retarget, and no `web_surface` events appear at all in that
+   window.
+4. At ~02:37 the deferred same-version daemon takeover fired (new daemon pid
+   2807512, the [11.47]/cooldown machinery working as designed). The new
+   daemon's declare REPLAY (`sidebar_contribution/declare source=daemon_replay`)
+   reached the GUI, which ran `daemon_declare_rebuild` →
+   `app_surface_restore/restored {web: rebuilt}` → the surface came back at the
+   real target and the owner navigated on. The heal was a SIDE EFFECT of the
+   takeover, not of anything the user did.
+
+**The defect, stated generally:** a session's rendered web surface has NO
+liveness coupling to (a) the loopback backend it points at, nor (b) the
+declare/registry truth the two daemons hold. When both diverge — dead page
+here, healthy heartbeat there — the user stares at an interstitial that can
+never proceed, with no trace witness and no notification.
+
+**Fix candidates (weigh on the [11.24] lane):**
+- (a) LOOPBACK HEALTH PROBE: for a rendered surface whose url host is
+  loopback, an off-loop TCP connect probe every ~5 s; two consecutive
+  failures ⇒ trace `web_surface/loopback_backend_unreachable` + a
+  notification ("this row's web app backend is gone — its terminal holds the
+  app's output"), and consider flipping the row's view to the terminal so the
+  app's dying words are visible. Small, deterministic, no guarded-path risk.
+- (b) FOLLOW DECLARE TRUTH ON DIVERGENCE: when a live declare/heartbeat for a
+  session carries a current url that differs from the rendered surface's
+  `osc_url`, and the rendered url is a loopback control endpoint, retarget via
+  the existing `daemon_declare_rebuild` path instead of waiting for a
+  takeover replay.
+
+**Open question (decide with one probe on the next GUI restart):** did the
+relaunched app's OSC bytes reach the GUI at all? Either the stream decode
+dropped them (check the row's `terminal_io/dispatch` forward path and
+`forward_protocol_only_output` gating for a web-covered row) or the
+"open"/"heartbeat" arm ran silently and `fresh_url`/`materialize` no-op'd
+(the `surface.picker.is_some()` clause in the fresh_url filter SHOULD have
+let the brave url through for a picker surface — read that clause's actual
+runtime values on a repro). The replay-rebuild proves the guarded rebuild
+path itself works.
+
+**ADJACENT FIX LANDED while this entry was open:** `lane/trace/picker-survives-swap`
+(in 3.2.52) fixed the DAEMON-SWAP half of the picker-stuck family — the one-time
+OSC `pick` was treated as not-worth-keeping, so a takeover relaunch could fly it
+past the reconnect window and the row fell back to a bare terminal view. That
+fix retains the pick in daemon web-surface state. THIS entry remains open on
+its own halves: the dead-loopback-URL staleness (no liveness coupling) and the
+~12-minute OSC/declare divergence — neither is touched by the pick-retention
+fix.
+
+**Related ychrome-side findings (routed to the ychrome owner via board):** the
+ychrome host daemon self-reports `"stale": true` (its own self-staleness stamp
+working) while running a 5-day-old `(deleted)` binary through many deploys —
+it lacks yggterm's wave-1 disk-replacement retire law; and the picker's
+orphaned-listener design means a mid-pick app death always strands the
+webview on a dead interstitial by construction.
