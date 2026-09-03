@@ -47,6 +47,20 @@ host." Measured from the ytrace generations before touching code:
   broken pipe — one backtrace died on the UI thread inside
   `spawn_title_generation_for_target`'s tracing event. A GUI whose stderr
   pipe reader exits (any spawner wrapper) was one log line from death.
+- **LIVE FALSIFICATION, same night:** the first fix (lossy tracing writers)
+  shipped at 03:37:41; the respawner's 03:43:09 GUI (fixed bytes) still died
+  at 03:48:52 — the backtrace named the SECOND print path this time:
+  `vendor/dioxus-desktop/src/web_surface.rs` adblock `load_done`'s plain
+  `eprintln!`, inside an `unsafe extern "C"` gtk callback, where a panic is
+  "panic in a function that cannot unwind" = instant abort, no unwinding, no
+  further trace. THE LESSON: std `println!`/`eprintln!` anywhere in a
+  GUI-reachable path is a loaded gun once the stderr pipe reader dies; the
+  tracing-writer fix covered only one of the two write paths. All 7 adblock
+  `eprintln!` sites now go through a pipe-safe `log_to_stderr`
+  (lane/trace/pipe-safe-adblock-logs); a repo-wide raw-print audit for GUI
+  paths is the named follow-up (stdout-broken-pipe is 55 of panic.log's
+  entries, most from CLI/row lifetimes — those are ephemeral, the GUI ones
+  are the lethal ones).
 - Nothing detected any of it: the host health watcher stayed quiet (cool idle
   machine), and the only loud signals were `host_panic_ui_thrash` — a
   downstream symptom, 7–8 ui-blocks/min, mem 0.92, swap 7.3+ GiB.
@@ -62,7 +76,7 @@ host." Measured from the ytrace generations before touching code:
    state); >4 restarts in 10 min trip it: restarts are blocked for 30 min, a
    Warning toast fires once, and `version_convergence/restart_storm_blocked`
    (incident-shaped) lands in the trace.
-3. The detector: the daemon's host-panic watcher now counts
+3. The detector (the "immediately detect" ask): the daemon's host-panic watcher now counts
    `version_convergence/restart_taken` and `startup/window_spawned` (both
    GUI-only; deliberately NOT `main_enter`, which every CLI fires) over 3 min;
    ≥5 restarts or ≥6 window spawns files `heartbeat/panic` incident
