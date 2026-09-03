@@ -436,6 +436,15 @@ def cmd_tune(a):
     if a.remote:
         pcfg["remote"] = a.remote
         changed.append(f"remote={a.remote}")
+    if a.gates is not None:
+        pcfg["gates"] = a.gates
+        changed.append(f"gates={a.gates}")
+    if a.push is not None:
+        pcfg["push"] = (a.push == "true")
+        changed.append(f"push={pcfg['push']}")
+    if a.push_remote:
+        pcfg["push_remote"] = a.push_remote
+        changed.append(f"push_remote={a.push_remote}")
     _save_config(cfg)
     log(f"tuned {project}: {', '.join(changed) or 'no change'}")
     # verify
@@ -578,10 +587,334 @@ def cmd_hold(a):
 # ─── tick — one integration build per project ────────────────────────────────
 
 def _scratch_dir(project, ts):
-    # disk-backed per AGENTS scratch law: ~/.yggterm/scratchpad
+    # ⛔ OBSOLETE IN V2: the CI integrates IN the main checkout — no worktrees
+    # of any project (owner directive 2026-09-03). Kept only so old build
+    # records still resolve; the v2 tick never calls this.
     base = Path.home() / ".yggterm/scratchpad/ci" / project
     base.mkdir(parents=True, exist_ok=True)
     return base / f"integ-{ts}"
+
+# ─── v2: talking events, quarantine, build-in-main ──────────────────────────
+
+EVENTS = CI_STATE / "events.jsonl"
+QUARANTINE = CI_STATE / "quarantine.json"
+BOARD_THROTTLE = CI_STATE / "board-throttle.json"
+BOARD = "infra/ci"
+
+# Event kinds that are always worth a board post (agents mine failures);
+# success kinds are throttled to one digest per hour per project.
+BOARD_FAILURE_KINDS = {
+    "merge_refused", "build_failed", "gate_failed", "lane_quarantined",
+    "ci_blocked_dirty_main", "ci_refused_diverged", "push_failed",
+    "deploy_failed", "ci_refused_not_main",
+}
+
+def _emit_event(project, kind, dry=False, **fields):
+    """THE TALKING PLANE: every state transition lands here.
+
+    Appends to events.jsonl (machine plane — read with `ygg-ci events`) and,
+    for kinds an agent must notice, posts to the msgGraph board so a row that
+    never polls still sees the CI's state (the msgGraph door is always open;
+    failures are exactly what another campaign's decisions depend on).
+    """
+    event_id = "ci-" + uuid.uuid4().hex[:12]
+    rec = {
+        "event_id": event_id,
+        "at": int(time.time()),
+        "project": project,
+        "kind": kind,
+        "host": this_host(),
+    }
+    rec.update(fields)
+    try:
+        CI_STATE.mkdir(parents=True, exist_ok=True)
+        with EVENTS.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        log(f"⚠ event write failed: {e}")
+    if dry:
+        return event_id
+    if kind in BOARD_FAILURE_KINDS:
+        _board_post(project, kind, rec)
+    return event_id
+
+def _board_post(project, kind, rec):
+    try:
+        thr = {}
+        if BOARD_THROTTLE.exists():
+            thr = json.loads(BOARD_THROTTLE.read_text())
+        now = time.time()
+        # failure dedupe: identical kind+project re-posts at most hourly so a
+        # persistently red lane does not flood the board.
+        key = f"{project}:{kind}:{rec.get('lane') or rec.get('sha') or ''}"
+        if now - thr.get(key, 0) < 3600:
+            return
+        thr[key] = now
+        # hourly digest cap on success kinds (built_and_pushed)
+        if kind == "built_and_pushed":
+            skey = f"{project}:built_and_pushed"
+            if now - thr.get(skey, 0) < 3600:
+                return
+            thr[skey] = now
+        BOARD_THROTTLE.write_text(json.dumps(thr))
+        body = json.dumps({k: v for k, v in rec.items() if k not in ("event_id", "at", "host")},
+                          default=str)[:900]
+        _run(["msgboard", "post", BOARD, "--kind", "note", "--harness", "opencode",
+              "--from-row", "ygg-ci", "--ttl-days", "14",
+              "--body", f"[{kind}] {body}"], timeout=30)
+    except Exception as e:
+        log(f"⚠ board post failed: {e}")
+
+def _quarantine_load():
+    try:
+        return json.loads(QUARANTINE.read_text())
+    except Exception:
+        return {}
+
+def _quarantine_save(q):
+    CI_STATE.mkdir(parents=True, exist_ok=True)
+    QUARANTINE.write_text(json.dumps(q))
+
+def _hygiene_gate(project, pcfg, repo, main_branch):
+    """THE MAIN-CHECKOUT IS THE BUILD FLOOR — it must be integration-ready.
+
+    Blocks on anything that a merge/build would trip over (staged, modified,
+    unmerged, deleted files) and on a checkout that is not the main branch.
+    Untracked files (??) are tolerated: scratch and logs live in trees git
+    ignores, and an untracked file cannot conflict with a merge.
+    """
+    st = _run(["git", "status", "--porcelain"], cwd=str(repo), timeout=30)
+    if st.returncode != 0:
+        _emit_event(project, "ci_blocked_dirty_main", detail=f"git status failed: {st.stderr[:300]}")
+        return {"blocked": True, "why": "git status failed"}
+    hard = [l for l in st.stdout.splitlines() if l.strip() and not l.startswith("??")]
+    if hard:
+        _emit_event(project, "ci_blocked_dirty_main", dirty=hard[:12])
+        return {"blocked": True,
+                "why": f"main checkout has {len(hard)} non-untracked change(s): {hard[0][:80]}"}
+    br = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo), timeout=30)
+    branch = (br.stdout or "").strip()
+    if branch != main_branch:
+        _emit_event(project, "ci_refused_not_main", branch=branch)
+        return {"blocked": True, "why": f"checked out branch is {branch!r}, not {main_branch!r}"}
+    return {"blocked": False}
+
+def _do_tick_project(project, dry=False):
+    pcfg = _project_cfg(project)
+    repo = Path(pcfg["repo"]).expanduser()
+    upstream = pcfg.get("push_remote", pcfg.get("remote", "origin"))
+    main_branch = pcfg.get("main_branch", "main")
+    build_cmd = (pcfg.get("build", "") or "").strip()
+    deploy_cmd = (pcfg.get("deploy", "") or "").strip()
+    gates = [g for g in (pcfg.get("gates", "") or "").split() if g]
+    do_push = pcfg.get("push", True)
+
+    # host gate (warning only — the fleet may move the ci host deliberately)
+    if this_host() != pcfg.get("host", CI_HOST):
+        log(f"⚠ tick {project} on {this_host()} but ci host is {pcfg.get('host', CI_HOST)} — building anyway (tune --host)")
+
+    dis = disarm_state()
+    if dis:
+        log(f"⏸ tick {project}: DISARMED — skipping")
+        return {"status": "disarmed"}
+    hold = hold_state()
+    if hold:
+        log(f"⏸ tick {project}: HELD — skipping ({hold.get('reason')})")
+        return {"status": "held", "hold": hold}
+    subs = load_subs(project=project)
+    if not subs:
+        log(f"tick {project}: no subscriptions — nothing to do")
+        return {"status": "no-subs"}
+    if not repo.exists() or not ((repo / ".git").exists() or (repo / ".git").is_file()):
+        _emit_event(project, "ci_blocked_dirty_main", dry=dry, detail=f"repo {repo} missing or not git")
+        return {"status": "no-repo"}
+
+    # ⛔ THE MAIN-CHECKOUT HYGIENE GATE. The CI integrates IN main — a dirty
+    # floor (a crashed merge, staged files, a foreign branch checked out)
+    # would corrupt the integration. Loud event; an agent clears it.
+    hy = _hygiene_gate(project, pcfg, repo, main_branch)
+    if hy.get("blocked"):
+        log(f"⛔ tick {project}: BLOCKED — {hy['why']}")
+        return {"status": "blocked", "why": hy["why"]}
+
+    git_fetch(repo, upstream)
+    upstream_main = git_rev(repo, f"{upstream}/{main_branch}")
+    local_main = git_rev(repo, "HEAD")
+    if not upstream_main:
+        _emit_event(project, "push_failed", dry=dry, detail=f"cannot resolve {upstream}/{main_branch}")
+        return {"status": "no-main"}
+
+    # ALIGN: local behind → fast-forward; diverged → refuse (a human call).
+    if upstream_main != local_main:
+        if git_is_ancestor(repo, local_main, upstream_main):
+            r = _run(["git", "merge", "--ff-only", f"{upstream}/{main_branch}"], cwd=str(repo), timeout=120)
+            if r.returncode != 0:
+                _emit_event(project, "ci_refused_diverged", dry=dry, detail=r.stderr[:400])
+                return {"status": "ff-failed", "stderr": r.stderr[:400]}
+            local_main = git_rev(repo, "HEAD")
+            log(f"  fast-forwarded local {main_branch} to {upstream_main[:12]}")
+        elif not git_is_ancestor(repo, upstream_main, local_main):
+            _emit_event(project, "ci_refused_diverged", local=local_main, upstream=upstream_main)
+            log(f"⛔ tick {project}: local {main_branch} DIVERGED from upstream — refusing (local {local_main[:12]} vs upstream {upstream_main[:12]})")
+            return {"status": "refused-diverged"}
+
+    dirty, last = _dirty_subs(project, pcfg, subs)
+    if not dirty and last and upstream_main == local_main:
+        log(f"tick {project}: {len(subs)} subs but none dirty since {last.get('id')} — skipping")
+        return {"status": "clean", "last": last.get("id")}
+    if dry:
+        for s in subs:
+            mark = "dirty" if s in dirty else "clean"
+            tip = git_rev(repo, f"{upstream}/{s['lane']}") or s.get("tip_at_enlist") or "?"
+            log(f"  DRY {s['lane']} [{mark}] tip={tip[:12]}")
+        return {"status": "dry", "subs": len(subs), "dirty": len(dirty)}
+
+    pre_tick = local_main
+    merged, conflicts = [], []
+    quar = _quarantine_load().get(project, {})
+    quar_changed = False
+    for s in subs:
+        lane = s["lane"]
+        remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
+        tip = git_rev(repo, remote_ref)
+        if not tip:
+            conflicts.append({"lane": lane, "reason": "no-remote-branch"})
+            continue
+        if git_is_ancestor(repo, tip, local_main):
+            log(f"  skip {lane}: already in main ({tip[:12]})")
+            merged.append({"lane": lane, "tip": tip, "already_in_main": True})
+            continue
+        if quar.get(lane) == tip:
+            log(f"  ⏳ skip {lane}: quarantined (this tip already failed a build) — new tip re-arms it")
+            conflicts.append({"lane": lane, "tip": tip, "reason": "quarantined"})
+            continue
+        r = _run(["git", "merge", "--no-ff", "--no-edit", remote_ref], cwd=str(repo), timeout=120)
+        if r.returncode == 0:
+            log(f"  merged {lane} {tip[:12]}")
+            merged.append({"lane": lane, "tip": tip})
+            if lane in quar:
+                quar.pop(lane, None); quar_changed = True
+        else:
+            _run(["git", "merge", "--abort"], cwd=str(repo), timeout=30)
+            log(f"  ⛔ conflict merging {lane} — excluded: {r.stderr[:400]}")
+            conflicts.append({"lane": lane, "tip": tip, "reason": "conflict", "stderr": r.stderr[:600]})
+            _emit_event(project, "merge_refused", lane=lane, tip=tip, stderr=r.stderr[:500])
+    if quar_changed:
+        q = _quarantine_load(); q[project] = quar; _quarantine_save(q)
+
+    viable = [m for m in merged if not m.get("already_in_main")]
+    integrated_local = local_main != pre_tick  # local was ahead: push pending
+    if not viable and not integrated_local and not (conflicts and last is None):
+        log(f"tick {project}: nothing new to integrate (merged={len(merged)} conflicts={len(conflicts)})")
+        return {"status": "clean", "merged": len(merged), "conflicts": len(conflicts)}
+
+    # ── BUILD, IN MAIN. This is the owner's ordering: the build gates the push. ──
+    integ_sha = git_rev(repo, "HEAD")
+    build_ok = True
+    build_log = ""
+    if build_cmd:
+        log(f"  building {project} IN {repo} ({main_branch}@{integ_sha[:12]}): {build_cmd}")
+        r = _run(build_cmd, cwd=str(repo), timeout=3600, shell=True)
+        build_log = (r.stdout or "")[-4000:] + (r.stderr or "")[-4000:]
+        build_ok = (r.returncode == 0)
+        log("  build ok" if build_ok else f"  ⛔ build FAILED: {build_log[-1200:]}")
+    else:
+        log("  no build command — treating as ok")
+
+    gate_ok = build_ok
+    for g in gates:
+        if not build_ok:
+            break
+        log(f"  gate: {g}")
+        r = _run(g, cwd=str(repo), timeout=900, shell=True)
+        if r.returncode != 0:
+            gate_ok = False
+            build_log = (r.stdout or "")[-2000:] + (r.stderr or "")[-2000:]
+            log(f"  ⛔ gate FAILED: {g}: {build_log[-800:]}")
+
+    pushed = False
+    push_err = ""
+    if build_ok and gate_ok:
+        if do_push:
+            log(f"  pushing {main_branch} → {upstream} ({integ_sha[:12]})")
+            r = _run(["git", "push", upstream, main_branch], cwd=str(repo), timeout=600)
+            pushed = (r.returncode == 0)
+            push_err = (r.stderr or "")[-1200:]
+            if not pushed:
+                log(f"  ⛔ push FAILED: {push_err}")
+        else:
+            pushed = None  # push disabled for this repo
+    else:
+        # ⛔ BUILD/GATE FAILED: main goes back to exactly what upstream (and the
+        # fleet) had. The failing lanes are quarantined at this tip so the next
+        # tick builds the REST instead of looping red; a new tip re-arms them.
+        r = _run(["git", "reset", "--hard", pre_tick], cwd=str(repo), timeout=120)
+        log(f"  ⛔ integration failed — main reset to {pre_tick[:12]} ({r.returncode})")
+        q = _quarantine_load(); qp = q.setdefault(project, {})
+        failed_lanes = [m["lane"] for m in viable]
+        for lane in failed_lanes:
+            tip = next((m["tip"] for m in viable if m["lane"] == lane), None)
+            if tip: qp[lane] = tip
+        q[project] = qp; _quarantine_save(q)
+        kind = "build_failed" if not build_ok else "gate_failed"
+        _emit_event(project, kind, lanes=failed_lanes, reset_to=pre_tick,
+                    log_tail=build_log[-900:])
+        for m in merged:
+            if m.get("already_in_main"):
+                p = _sub_path(project, m["lane"])
+                if p.exists(): p.unlink(missing_ok=True)
+        rec = {
+            "id": f"{project}--{ts_stamp()}--{integ_sha[:12] if integ_sha else 'no-sha'}--failed",
+            "project": project, "at": int(time.time()), "host": this_host(),
+            "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts,
+            "build": build_cmd, "build_ok": build_ok, "status": "build-failed",
+            "reset_to": pre_tick, "quarantined": failed_lanes,
+        }
+        BUILDS.mkdir(parents=True, exist_ok=True)
+        (BUILDS / f"{rec['id']}.json").write_text(json.dumps(rec, indent=2))
+        return rec
+
+    # ── DEPLOY — only after the push landed upstream (hosts must never run
+    # commits that upstream does not have; that split is what the downgrade
+    # guard spent 3.2.4x fighting). ──
+    deploy_ok = None
+    if pushed is not False:
+        if deploy_cmd:
+            log(f"  deploying {project}: {deploy_cmd}")
+            r = _run(deploy_cmd, cwd=str(repo), timeout=3600, shell=True)
+            deploy_ok = (r.returncode == 0)
+            if not deploy_ok:
+                log(f"  ⛔ deploy FAILED: {(r.stderr or r.stdout or '')[-1200:]}")
+                _emit_event(project, "deploy_failed", sha=integ_sha,
+                            log_tail=((r.stderr or "") + (r.stdout or ""))[-600:])
+        if pushed:
+            _emit_event(project, "built_and_pushed", sha=integ_sha, upstream=upstream,
+                        lanes=[m["lane"] for m in viable], deploy_ok=deploy_ok)
+    status = "built" if build_ok else "build-failed"
+    if pushed is True: status = "pushed"
+    elif pushed is False: status = "push-failed"
+    if deploy_ok is True: status = "deployed"
+    elif deploy_ok is False: status = "deploy-failed"
+    for m in merged:
+        if m.get("already_in_main"):
+            p = _sub_path(project, m["lane"])
+            if p.exists(): p.unlink(missing_ok=True)
+            log(f"  auto-unsubscribed {m['lane']} (already in main)")
+    rec = {
+        "id": f"{project}--{ts_stamp()}--{integ_sha[:12] if integ_sha else 'no-sha'}",
+        "project": project, "at": int(time.time()), "host": this_host(),
+        "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts,
+        "subs": len(subs), "build": build_cmd, "build_ok": build_ok,
+        "gates": gates, "deploy": deploy_cmd, "deploy_ok": deploy_ok,
+        "pushed": pushed, "upstream": upstream, "status": status,
+    }
+    BUILDS.mkdir(parents=True, exist_ok=True)
+    (BUILDS / f"{rec['id']}.json").write_text(json.dumps(rec, indent=2))
+    log(f"tick {project} -> {status} sha={integ_sha[:12]} merged={len(merged)} conflicts={len(conflicts)} pushed={pushed}")
+    return rec
+
+def ts_stamp():
+    return time.strftime("%Y%m%d-%H%M%S")
 
 def _last_build(project):
     if not BUILDS.exists():
@@ -603,14 +936,12 @@ def _dirty_subs(project, pcfg, subs):
         for l in last["lanes"]:
             last_map[l["lane"]] = l.get("tip")
     dirty = []
-    # refresh remote tips
     if repo.exists():
         git_fetch(repo, pcfg.get("remote","origin"))
     for s in subs:
         lane = s["lane"]
         remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
         cur_tip = git_rev(repo, remote_ref) if repo.exists() else s.get("tip_at_enlist")
-        # if branch not yet pushed, treat subscribing itself as dirty once
         if cur_tip is None and s.get("tip_at_enlist") is None:
             dirty.append(s)
             continue
@@ -618,229 +949,7 @@ def _dirty_subs(project, pcfg, subs):
             dirty.append(s)
         elif cur_tip and last_map[lane] != cur_tip:
             dirty.append(s)
-    # also dirty if new subs exist that were not in last build even if tip same
     return dirty, last
-
-def _do_tick_project(project, dry=False):
-    pcfg = _project_cfg(project)
-    repo = Path(pcfg["repo"]).expanduser()
-    # host gate
-    if this_host() != pcfg.get("host", CI_HOST):
-        # still allow tick but log — fleet may have moved
-        log(f"⚠ tick for {project} on {this_host()} but ci host is {pcfg.get('host', CI_HOST)} — building anyway (override via tune --host)")
-    # guards
-    dis = disarm_state()
-    if dis:
-        log(f"⏸ tick {project}: DISARMED — skipping")
-        return {"status": "disarmed"}
-    hold = hold_state()
-    if hold:
-        log(f"⏸ tick {project}: HELD — skipping ({hold.get('reason')})")
-        return {"status": "held", "hold": hold}
-    subs = load_subs(project=project)
-    if not subs:
-        log(f"tick {project}: no subscriptions — nothing to do")
-        return {"status": "no-subs"}
-    if not repo.exists():
-        log(f"⛔ tick {project}: repo {repo} missing — cannot build")
-        return {"status": "no-repo"}
-    # worktree check
-    if not (repo / ".git").exists() and not (repo / ".git").is_file():
-        log(f"⛔ tick {project}: {repo} is not a git repo")
-        return {"status": "no-git"}
-    # dirty check
-    dirty, last = _dirty_subs(project, pcfg, subs)
-    if not dirty and last:
-        # also check if last build had conflicts that now cleared? treat as not dirty then
-        log(f"tick {project}: {len(subs)} subs but none dirty since last build {last.get('id')} — skipping")
-        return {"status": "clean", "last": last.get("id")}
-    log(f"tick {project}: {len(subs)} subs, {len(dirty)} dirty — aggregating")
-    if dry:
-        for s in subs:
-            mark = "dirty" if s in dirty else "clean"
-            remote_ref = f"{pcfg.get('remote','origin')}/{s['lane']}"
-            tip = git_rev(repo, remote_ref) or s.get("tip_at_enlist") or "?"
-            log(f"  DRY {s['lane']} [{mark}] tip={tip[:12]}")
-        return {"status": "dry", "subs": len(subs), "dirty": len(dirty)}
-    # ensure main fetch
-    fr = git_fetch(repo, pcfg.get("remote","origin"))
-    # resolve main sha
-    remote_main = f"{pcfg.get('remote','origin')}/{pcfg.get('main_branch','main')}"
-    main_sha = git_rev(repo, remote_main)
-    if not main_sha:
-        log(f"⛔ tick {project}: cannot resolve {remote_main}")
-        return {"status": "no-main"}
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    work = _scratch_dir(project, ts)
-    # worktree add --detach <work> <main_sha>
-    r = _run(["git", "worktree", "add", "--detach", str(work), main_sha], cwd=str(repo), timeout=60)
-    if r.returncode != 0:
-        # fallback: plain checkout to scratch clone? try git worktree add without detach
-        log(f"⛔ worktree add failed: {r.stderr[:600]}")
-        # try shallow clone approach: git clone --no-checkout replica?
-        return {"status": "worktree-fail", "stderr": r.stderr[:600]}
-    try:
-        # merge each lane
-        merged = []
-        conflicts = []
-        for s in subs:
-            lane = s["lane"]
-            remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
-            tip = git_rev(repo, remote_ref)
-            # also show work repo's view — fetch into work?
-            # work is separate worktree sharing same object store, so remote refs already visible
-            if not tip:
-                log(f"  ⚠ skip {lane}: no remote tip ({remote_ref} not found — not yet pushed?)")
-                conflicts.append({"lane": lane, "reason": "no-remote-branch"})
-                continue
-            # check if already in main (already landed)
-            if git_is_ancestor(repo, tip, main_sha):
-                log(f"  skip {lane}: already in main ({tip[:12]}) — will auto-unsubscribe on success")
-                # keep merged? no, already in main so nothing to merge
-                merged.append({"lane": lane, "tip": tip, "already_in_main": True})
-                continue
-            # attempt merge
-            r = _run(["git", "merge", "--no-ff", "--no-edit", remote_ref], cwd=str(work), timeout=120)
-            if r.returncode == 0:
-                log(f"  merged {lane} {tip[:12]}")
-                merged.append({"lane": lane, "tip": tip})
-            else:
-                # conflict
-                _run(["git", "merge", "--abort"], cwd=str(work), timeout=30)
-                log(f"  ⛔ conflict merging {lane} — excluded: {r.stderr[:500]}")
-                conflicts.append({"lane": lane, "tip": tip, "reason": "conflict", "stderr": r.stderr[:800]})
-        # nothing to merge and all subs are missing remote — skip build, keep worktree clean
-        viable = [m for m in merged if not m.get("already_in_main")]
-        if not viable and conflicts:
-            # all subs missing or conflicted and none merged — no build
-            integ_sha = git_rev(work, "HEAD")
-            log(f"  no viable lanes to build (all missing/empty) — skipping build/deploy")
-            rec = {
-                "id": f"{project}--{ts}--{integ_sha[:12] if integ_sha else 'no-sha'}--skipped",
-                "project": project,
-                "at": int(time.time()),
-                "host": this_host(),
-                "main": main_sha,
-                "sha": integ_sha,
-                "lanes": merged,
-                "conflicts": conflicts,
-                "subs": len(subs),
-                "build": pcfg.get("build",""),
-                "build_ok": None,
-                "deploy": pcfg.get("deploy",""),
-                "deploy_ok": None,
-                "status": "skipped-no-viable-lanes",
-            }
-            BUILDS.mkdir(parents=True, exist_ok=True)
-            (BUILDS / f"{rec['id']}.json").write_text(json.dumps(rec, indent=2))
-            log(f"tick {project} -> skipped sha={integ_sha[:12] if integ_sha else '?'} work={work}")
-            _run(["git", "worktree", "remove", "--force", str(work)], cwd=str(repo), timeout=30)
-            try:
-                import shutil
-                if work.exists():
-                    shutil.rmtree(work, ignore_errors=True)
-            except Exception:
-                pass
-            return rec
-        # built sha
-        integ_sha = git_rev(work, "HEAD")
-        # build step
-        build_cmd = pcfg.get("build", "")
-        build_ok = True
-        build_log = ""
-        if build_cmd:
-            log(f"  building {project} with: {build_cmd}")
-            r = _run(build_cmd, cwd=str(work), timeout=1800, shell=True)
-            build_log = (r.stdout or "")[-4000:] + (r.stderr or "")[-4000:]
-            if r.returncode != 0:
-                log(f"  ⛔ build FAILED ({r.returncode}): {build_log[-1500:]}")
-                build_ok = False
-            else:
-                log(f"  build ok")
-        else:
-            log("  no build command — skipping build")
-        # deploy step only if build ok and no fatal conflicts? we deploy even with partial merge, but not on build fail
-        deploy_ok = None
-        deploy_log = ""
-        if build_ok:
-            deploy_cmd = pcfg.get("deploy", "")
-            if deploy_cmd and deploy_cmd.strip():
-                # resolve deploy invocation: if relative, run from work
-                # yggterm's deploy expects FROM to point at artefacts
-                # default is scripts/deploy-fleet.sh which will build's FROM default target/release
-                # Ensure cargo artefacts are at work/target/release
-                # For worktree build, cargo target is at work/target
-                deploy_cwd = str(work)
-                # allow deploy to be bare script name: run via bash
-                full = deploy_cmd
-                # yggterm special: deploy-fleet expects --from <dir> else target/release
-                # Pass explicit --from if not present
-                if "deploy-fleet" in deploy_cmd and "--from" not in deploy_cmd:
-                    full = f"{deploy_cmd} --from {work}/target/release"
-                elif "deploy-dev" in deploy_cmd and "--from" not in deploy_cmd:
-                    full = f"{deploy_cmd} --from {work}/target/release"
-                log(f"  deploying {project} with: {full}")
-                r = _run(full, cwd=deploy_cwd, timeout=1800, shell=True)
-                deploy_log = (r.stdout or "")[-4000:] + (r.stderr or "")[-4000:]
-                deploy_ok = (r.returncode == 0)
-                if deploy_ok:
-                    log(f"  deploy ok")
-                else:
-                    log(f"  ⛔ deploy FAILED ({r.returncode}): {deploy_log[-1500:]}")
-            else:
-                log("  no deploy command — stopping after build")
-                deploy_ok = None
-        status = "built" if build_ok else "build-failed"
-        if deploy_ok is True:
-            status = "deployed"
-        elif deploy_ok is False:
-            status = "deploy-failed"
-        rec = {
-            "id": f"{project}--{ts}--{integ_sha[:12] if integ_sha else 'no-sha'}",
-            "project": project,
-            "at": int(time.time()),
-            "host": this_host(),
-            "main": main_sha,
-            "sha": integ_sha,
-            "lanes": merged,
-            "conflicts": conflicts,
-            "subs": len(subs),
-            "build": build_cmd,
-            "build_ok": build_ok,
-            "deploy": pcfg.get("deploy",""),
-            "deploy_ok": deploy_ok,
-            "status": status,
-        }
-        BUILDS.mkdir(parents=True, exist_ok=True)
-        (BUILDS / f"{rec['id']}.json").write_text(json.dumps(rec, indent=2))
-        # scratched worktree is kept for a bit for diagnosis, but worktree remove after?
-        # Keep for 1h, then prune via scratch reaper; for now just log location
-        log(f"tick {project} -> {status} sha={integ_sha[:12] if integ_sha else '?'} merged={len(merged)} conflicts={len(conflicts)} work={work}")
-        # auto-unsubscribe lanes that are already in main and were merged successfully?
-        # Only unsubscribe those flagged already_in_main, to keep integration clean
-        for m in merged:
-            if m.get("already_in_main"):
-                p = _sub_path(project, m["lane"])
-                if p.exists():
-                    p.unlink(missing_ok=True)
-                    log(f"  auto-unsubscribed {m['lane']} (already in main)")
-        # also reap scratch worktree after success? keep work dir for now, but remove git worktree link
-        _run(["git", "worktree", "remove", "--force", str(work)], cwd=str(repo), timeout=60)
-        # if work dir still exists (worktree remove leaves it if untracked files), keep target for cache? remove to save disk
-        try:
-            import shutil
-            if work.exists():
-                # keep log but drop target to save space? keep for now and let scratch reaper handle
-                pass
-        except Exception:
-            pass
-        return rec
-    finally:
-        # ensure worktree removed on failure path too
-        try:
-            _run(["git", "worktree", "remove", "--force", str(work)], cwd=str(repo), timeout=30)
-        except Exception:
-            pass
 
 def cmd_tick(a):
     # optionally host gate
@@ -860,12 +969,86 @@ def cmd_tick(a):
                 pass
         if a.json:
             print(json.dumps(results, indent=2))
-        return 0 if all(v.get("status") not in ("build-failed","deploy-failed","worktree-fail","no-main","no-repo") for v in results.values()) else 1
+        bad = {"build-failed","push-failed","deploy-failed","no-main","no-repo","blocked","refused-diverged"}
+        return 0 if all(v.get("status") not in bad for v in results.values()) else 1
     else:
         r = _do_tick_project(a.project, dry=bool(a.dry_run))
         if a.json:
             print(json.dumps(r, indent=2))
-        return 0 if r.get("status") not in ("build-failed","deploy-failed","worktree-fail","no-main","no-repo") else 1
+        bad = {"build-failed","push-failed","deploy-failed","no-main","no-repo","blocked","refused-diverged"}
+        return 0 if r.get("status") not in bad else 1
+
+def cmd_events(a):
+    """Read the CI's talking plane: every state transition, newest last."""
+    if not EVENTS.exists():
+        print("no events yet — the watcher emits on its first transition")
+        return 0
+    since = None
+    if a.since:
+        import re as _re
+        m = _re.match(r"^(\d+)([smh])$", a.since.strip())
+        secs = {"s": 1, "m": 60, "h": 3600}[m.group(2)] * int(m.group(1)) if m else 1800
+        since = time.time() - secs
+    out = []
+    for line in EVENTS.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if a.project and e.get("project") != a.project:
+            continue
+        if a.kind and e.get("kind") != a.kind:
+            continue
+        if since and e.get("at", 0) < since:
+            continue
+        out.append(e)
+    if a.json:
+        print(json.dumps(out[-a.tail:], indent=2))
+        return 0
+    for e in out[-a.tail:]:
+        t = time.strftime("%H:%M:%S", time.localtime(e.get("at", 0)))
+        body = {k: v for k, v in e.items() if k not in ("event_id", "at", "project", "host")}
+        print(f"{t} [{e.get('project')}] {e.get('kind')}: {json.dumps(body, default=str)[:220]}")
+    print(f"— {len(out)} event(s) — ids in events.jsonl; failures also posted to msgboard {BOARD}")
+    return 0
+
+def cmd_why(a):
+    """Plain-language state + the next action. The LLM-facing status."""
+    project = a.project or "yggterm"
+    pcfg = _project_cfg(project)
+    repo = Path(pcfg["repo"]).expanduser()
+    alive = watcher_alive()
+    print(f"project {project}: repo={repo} ci_host={pcfg.get('host')} watcher={'ALIVE' if alive else 'DOWN (ensure_watcher spawns on next subscribe/tick)'}")
+    dis = disarm_state(); hold = hold_state()
+    if dis: print(f"  DISARMED: {dis}")
+    if hold: print(f"  HELD: {hold}")
+    if not repo.exists():
+        print(f"  next: fix the repo path (tune --repo)")
+        return 2
+    st = _run(["git", "status", "--porcelain"], cwd=str(repo), timeout=30)
+    hard = [l for l in (st.stdout or "").splitlines() if l.strip() and not l.startswith("??")]
+    if hard:
+        print(f"  ⛔ main checkout DIRTY ({len(hard)}): {hard[0][:100]}")
+        print("     next: resolve or stash in the main checkout — the CI refuses to integrate on a dirty floor")
+        return 2
+    br = (_run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo), timeout=30).stdout or "").strip()
+    print(f"  main checkout: branch={br} clean={not hard}")
+    quar = _quarantine_load().get(project, {})
+    if quar:
+        print(f"  quarantined lanes (tip failed a build; new tip re-arms): {quar}")
+    last = _last_build(project)
+    if last:
+        print(f"  last build: {last.get('id')} status={last.get('status')} pushed={last.get('pushed')}")
+        if last.get("status") in ("build-failed",):
+            print("     next: the failing lanes are quarantined; fix their build or land a corrected tip")
+    if EVENTS.exists():
+        recent = [l for l in EVENTS.read_text().splitlines()[-40:]]
+        fails = [l for l in recent if '"kind":' in l and any(k in l for k in BOARD_FAILURE_KINDS)]
+        if fails:
+            lastf = json.loads(fails[-1])
+            print(f"  last failure: {time.strftime('%H:%M', time.localtime(lastf.get('at',0)))} {lastf.get('kind')} {json.dumps({k:v for k,v in lastf.items() if k in ('lane','sha','detail')}, default=str)[:160]}")
+    print("  verbs: events (history) · tick --dry-run (rehearse) · tune --gates/--push (config)")
+    return 0
 
 def cmd_watch(a):
     project = a.project  # None = all
@@ -951,10 +1134,23 @@ def main():
     s.add_argument("--interval", type=int, help="watch interval seconds")
     s.add_argument("--host", help="ci host (default dev)")
     s.add_argument("--remote", help="git remote name")
+    s.add_argument("--gates", help="space-separated gate scripts run after the build, before the push (e.g. 'scripts/check-privacy.sh')")
+    s.add_argument("--push", choices=["true", "false"], help="push main to the upstream after a green build (default true)")
+    s.add_argument("--push-remote", help="remote to push the integration to (default: the fetch remote)")
 
     s = sub.add_parser("status", help="is watcher alive, subs, last build")
     s.add_argument("--json", action="store_true")
     s.add_argument("--project", help="filter project for subs/last build")
+
+    s = sub.add_parser("events", help="the CI's talking plane — every state transition (merge refused, build done, pushed…)")
+    s.add_argument("--project", help="filter project")
+    s.add_argument("--kind", help="filter event kind")
+    s.add_argument("--since", help="30m / 2h / 1d window (default 30m)")
+    s.add_argument("--tail", type=int, default=40, help="last N events to print (default 40)")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("why", help="plain-language current state + the next action (agent-facing)")
+    s.add_argument("--project", help="project")
 
     s = sub.add_parser("tick", help="one integration pass over all subs")
     s.add_argument("--project", help="single project or all if omitted")
@@ -995,6 +1191,10 @@ def main():
         sys.exit(cmd_status(a))
     elif a.cmd == "tick":
         sys.exit(cmd_tick(a))
+    elif a.cmd == "events":
+        sys.exit(cmd_events(a))
+    elif a.cmd == "why":
+        sys.exit(cmd_why(a))
     elif a.cmd == "watch":
         sys.exit(cmd_watch(a))
     elif a.cmd == "disarm":
