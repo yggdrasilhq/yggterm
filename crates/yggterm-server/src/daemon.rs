@@ -21765,7 +21765,23 @@ fn run_opencode_tab_mirror_if_due(
         return;
     };
     let mut guard = lock_daemon_runtime(runtime, "opencode_tab_mirror");
-    guard.server.apply_opencode_tab_mirror(&active);
+    // Issue 31 follow-up: the mirror's liveness oracle. A row whose PTY the
+    // daemon can read a screen from is LIVE, whether or not it kept its pid
+    // bookkeeping (restored rows lose it). Computed under the same lock the
+    // mirror applies under — one daemon, one truth.
+    let screen_live: std::collections::HashSet<String> = guard
+        .server
+        .live_sessions()
+        .iter()
+        .filter(|session| {
+            let runtime_key = guard.terminal_runtime_key_for_path(&session.session_path);
+            guard.terminals.session_screen_snapshot(&runtime_key).is_some()
+        })
+        .map(|session| session.session_path.clone())
+        .collect();
+    guard
+        .server
+        .apply_opencode_tab_mirror(&active, &screen_live);
 }
 
 /// GATE #8 startup hook: run the superseded-daemon takeover once, off the
@@ -21992,7 +22008,23 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     continue;
                 };
                 if let Ok(mut guard) = runtime.try_lock() {
-                    guard.server.apply_opencode_tab_mirror(&active);
+                    let screen_live: std::collections::HashSet<String> = guard
+                        .server
+                        .live_sessions()
+                        .iter()
+                        .filter(|session| {
+                            let runtime_key =
+                                guard.terminal_runtime_key_for_path(&session.session_path);
+                            guard
+                                .terminals
+                                .session_screen_snapshot(&runtime_key)
+                                .is_some()
+                        })
+                        .map(|session| session.session_path.clone())
+                        .collect();
+                    guard
+                        .server
+                        .apply_opencode_tab_mirror(&active, &screen_live);
                 }
             })
             .expect("spawn opencode mirror loop");
