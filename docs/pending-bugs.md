@@ -8642,34 +8642,6 @@ process is still alive afterwards the `(deleted)` arm did not fire.
 **Falsifier for 2:** if a second `app launch` against a healthy GUI still yields two
 GUIs, the guard is not on the path both binaries take.
 
-## ⛔ [6.7] THE PRESENTATION-POLICY TRACE EVENT IS EMITTED BY EVERY CLI INVOCATION
-
-**Status:** OPEN
-
-*measured 2026-08-14; the instrument the presentation law names as authoritative*
-
-`presentation-policy.md` law 4 says `/proc/<pid>/environ` cannot tell you what is in
-force and the `gui/startup/linux_desktop_backend_policy` trace event is the decision
-reporting itself. That is right. But **a bare CLI invocation emits it too**:
-
-```
-policy_events_before=2   ->   yggterm --version   ->   after=4
-```
-
-Two events per invocation, carrying `display_present:false`,
-`wayland_display_present:false`, `gdk_backend:null`, `policy:null` — a description of
-a process with no display, indistinguishable at a glance from the GUI's own event.
-
-⇒ **An agent doing the sanctioned thing** — `trace tail | grep
-linux_desktop_backend_policy | tail -1` — **gets a CLI invocation's answer and
-concludes the GUI armed a null policy.** This was hit while writing the usability
-contract: the running GUI's real event had already been evicted from the ring by CLI
-copies of itself, and had to be recovered from disk by selecting on the GUI's pid.
-
-**Fix:** either do not emit the policy event when there is no display, or tag it with
-the role so the GUI's event is selectable. Until then, read it from
-`~/.yggterm/event-trace.*.jsonl` filtered by the GUI's pid.
-
 ## ⛔⛔ [6.7] EVERY DEPLOY ORPHANS A DAEMON, AND NOTHING EVER RETIRES IT
 
 **Status:** OPEN
