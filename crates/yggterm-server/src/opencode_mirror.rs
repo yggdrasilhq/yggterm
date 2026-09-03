@@ -189,6 +189,7 @@ impl YggtermServer {
     pub fn apply_opencode_tab_mirror(
         &mut self,
         active: &[OpencodeServiceSession],
+        screen_live: &std::collections::HashSet<String>,
     ) {
         let owned = owned_tabs_from(&self.sessions);
         let plan = plan_tab_sync(active, &owned);
@@ -353,7 +354,7 @@ impl YggtermServer {
             // Seat under the anchor: the opencode TUI row, if one is live.
             // Adjacency is the owner's rule — a tab appears directly below
             // the opencode row it belongs to.
-            if let Some(prefix) = self.next_opencode_tab_seat() {
+            if let Some(prefix) = self.next_opencode_tab_seat(screen_live) {
                 self.set_session_outline_prefix(&key, &prefix);
             }
         }
@@ -386,7 +387,7 @@ impl YggtermServer {
         // header, titled by the tab the human is looking at (most recently
         // viewed) — the owner's contract, 2026-08-30. A hand-titled anchor is
         // respected and left alone.
-        if let Some(anchor_key) = self.opencode_anchor_key() {
+        if let Some(anchor_key) = self.opencode_anchor_key(screen_live) {
             let explicit = self
                 .sessions
                 .get(&anchor_key)
@@ -437,7 +438,7 @@ impl YggtermServer {
             // forces emission: it is the event the 2026-09-03 four-stale-rows
             // incident needed and no instrument could give.
             let anchor_row = self.sessions.get(&anchor_key);
-            let anchor_live = anchor_row.is_some_and(Self::anchor_row_is_live);
+            let anchor_live = anchor_row.is_some_and(|a| Self::anchor_row_is_live(a, screen_live));
             let bound = anchor_row.map(|a| a.id.clone());
             let decision = if !anchor_live {
                 "anchor_not_live"
@@ -586,19 +587,24 @@ impl YggtermServer {
     /// Whether one row's liveness marks say a TUI is actually running on it.
     ///
     /// Three marks, one truth: the pid, a running launch phase, or — the mark
-    /// restored rows keep losing — the daemon's own screen verdict, which exists
-    /// only while the daemon holds a readable screen for the PTY. Split out so
-    /// the anchor picker and the mirror tick's `anchor_not_live` verdict answer
-    /// from ONE function: two encodings of "live" is how the picker chose a row
-    /// the tick called dead (measured 2026-09-03, five rows, all screen-`working`,
-    /// none pid-marked).
-    fn anchor_row_is_live(row: &crate::ManagedSessionView) -> bool {
+    /// restored rows keep losing — the DAEMON HOLDS A READABLE SCREEN for the
+    /// PTY (`screen_live`, computed by the caller from `TerminalManager`
+    /// under the same lock the mirror applies under). ⛔ `working` is NOT a
+    /// mark here: it is stamped on SNAPSHOT projections, never on the
+    /// internal rows this mirror reads — the 2026-09-03 18:46 read showed
+    /// `anchor_not_live` persisting on the FIXED build because the predicate
+    /// trusted a field the mirror can never see. Split out so the picker and
+    /// the tick answer from ONE function.
+    fn anchor_row_is_live(
+        row: &crate::ManagedSessionView,
+        screen_live: &std::collections::HashSet<String>,
+    ) -> bool {
         row.terminal_process_id.is_some()
             || matches!(
                 row.launch_phase,
                 crate::TerminalLaunchPhase::Running | crate::TerminalLaunchPhase::RemoteBootstrap
             )
-            || row.working.is_some()
+            || screen_live.contains(&row.session_path)
     }
 
     /// The live opencode TUI row (the mirror's seating anchor) and the next
@@ -617,7 +623,10 @@ impl YggtermServer {
             .collect()
     }
 
-    fn opencode_anchor_key(&self) -> Option<String> {
+    fn opencode_anchor_key(
+        &self,
+        screen_live: &std::collections::HashSet<String>,
+    ) -> Option<String> {
         // ⛔ THE ANCHOR IS THE LIVE TUI, NOT THE FIRST ROW THAT QUALIFIES.
         // The original predicate took the first OpenCode row without the
         // mirror stamp — with several uuid-keyed rows in the set (anchors of
@@ -641,14 +650,17 @@ impl YggtermServer {
         let candidates = self.opencode_anchor_candidates();
         candidates
             .iter()
-            .find(|s| Self::anchor_row_is_live(s))
+            .find(|s| Self::anchor_row_is_live(s, screen_live))
             .copied()
             .or_else(|| candidates.first().copied())
             .map(|a| a.session_path.clone())
     }
 
-    fn next_opencode_tab_seat(&self) -> Option<String> {
-        let anchor_key = self.opencode_anchor_key()?;
+    fn next_opencode_tab_seat(
+        &self,
+        screen_live: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        let anchor_key = self.opencode_anchor_key(screen_live)?;
         let anchor = self.sessions.get(&anchor_key)?;
         let base = anchor.outline_prefix.clone().unwrap_or_default();
         if base.is_empty() {
@@ -670,6 +682,11 @@ impl YggtermServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_screen_live() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
 
     fn ses(id: &str, viewed: u128) -> OpencodeServiceSession {
         OpencodeServiceSession {
@@ -806,6 +823,38 @@ mod adoption_tests {
 mod anchor_tests {
     use super::*;
 
+    fn empty_screen_live() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    /// The 2026-09-03 18:46 live read: a row the daemon screen-verdicts
+    /// `working` but that carries NO pid/phase marks (restored rows lose
+    /// them) must be ANCHORABLE — the screen-live set is its liveness proof.
+    /// Without it, anchor_not_live short-circuits the rebind forever.
+    #[test]
+    fn a_screen_verified_row_is_a_live_anchor_without_pid_marks() {
+        let (mut server, _dead, live) = server_with_two_anchors();
+        // Strip the pid/phase marks the old predicate keyed on.
+        {
+            let row = server.sessions.get_mut(&live).expect("live row");
+            row.launch_phase = crate::TerminalLaunchPhase::Queued;
+            row.terminal_process_id = None;
+        }
+        let screen_live: std::collections::HashSet<String> =
+            [live.clone()].into_iter().collect();
+        assert_eq!(
+            server.opencode_anchor_key(&screen_live),
+            Some(live.clone()),
+            "a daemon-readable screen is liveness proof on its own"
+        );
+        // And the anchor block agrees with the picker (one function).
+        let anchor_row = server.sessions.get(&live).expect("row");
+        assert!(
+            YggtermServer::anchor_row_is_live(anchor_row, &screen_live),
+            "picker and tick share the one liveness predicate"
+        );
+    }
+
     fn server_with_two_anchors() -> (crate::YggtermServer, String, String) {
         let mut server = crate::YggtermServer::new(
             false,
@@ -876,7 +925,7 @@ mod anchor_tests {
     fn the_anchor_is_the_live_tui_not_the_first_qualified_row() {
         let (server, _dead, live) = server_with_two_anchors();
         assert_eq!(
-            server.opencode_anchor_key(),
+            server.opencode_anchor_key(&empty_screen_live()),
             Some(live),
             "a RUNNING TUI outranks a dead uuid row in anchor selection",
         );
@@ -899,9 +948,9 @@ mod anchor_tests {
             viewed("ses_a0000000000000000000000001", 100),
             viewed("ses_b0000000000000000000000002", 200),
         ];
-        server.apply_opencode_tab_mirror(&active);
+        server.apply_opencode_tab_mirror(&active, &empty_screen_live());
         let anchor_key = server
-            .opencode_anchor_key()
+            .opencode_anchor_key(&empty_screen_live())
             .expect("an anchor exists");
         let anchor = server.sessions.get(&anchor_key).expect("anchor row");
         let viewing = anchor
@@ -935,12 +984,12 @@ mod anchor_tests {
             viewed_epoch_ms: viewed,
             running: true,
         };
-        server.apply_opencode_tab_mirror(&vec![viewed(
-            "ses_a0000000000000000000000001",
-            100,
-        )]);
+        server.apply_opencode_tab_mirror(
+            &vec![viewed("ses_a0000000000000000000000001", 100)],
+            &empty_screen_live(),
+        );
         let with_tabs = {
-            let anchor_key = server.opencode_anchor_key().expect("anchor");
+            let anchor_key = server.opencode_anchor_key(&empty_screen_live()).expect("anchor");
             server
                 .sessions
                 .get(&anchor_key)
@@ -952,8 +1001,8 @@ mod anchor_tests {
         assert!(with_tabs, "a viewed tab stamps the viewing entry");
         // The service's active set goes quiet (no tabs anywhere): a stale
         // "Viewing …" would now be a lie about the present.
-        server.apply_opencode_tab_mirror(&[]);
-        let anchor_key = server.opencode_anchor_key().expect("anchor");
+        server.apply_opencode_tab_mirror(&[], &empty_screen_live());
+        let anchor_key = server.opencode_anchor_key(&empty_screen_live()).expect("anchor");
         let anchor = server.sessions.get(&anchor_key).expect("anchor row");
         assert!(
             !anchor
