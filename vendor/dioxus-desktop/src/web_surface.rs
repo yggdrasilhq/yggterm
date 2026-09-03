@@ -1070,7 +1070,7 @@ mod adblock {
                 format!("{IDENTIFIER_PREFIX}{}", &hex[..32.min(hex.len())])
             }
             None => {
-                eprintln!("yggterm adblock: no SHA-256 available; compiling without a stamp");
+                log_to_stderr("yggterm adblock: no SHA-256 available; compiling without a stamp");
                 format!("{IDENTIFIER_PREFIX}unstamped-{}", std::process::id())
             }
         }
@@ -1147,7 +1147,7 @@ mod adblock {
                     let found = std::ffi::CStr::from_ptr(*cursor);
                     let text = found.to_string_lossy();
                     if text.starts_with(IDENTIFIER_PREFIX) && found != keep.as_c_str() {
-                        eprintln!("yggterm adblock: dropping stale generation {text}");
+                        log_to_stderr(&format!("yggterm adblock: dropping stale generation {text}"));
                         // ⛔ THE CALLBACK IS NOT OPTIONAL. Passing `None` here
                         // makes WebKit fail `assertion 'callback' failed` and
                         // return WITHOUT removing anything — so every stale
@@ -1198,6 +1198,19 @@ mod adblock {
         }
     }
 
+    /// A pipe-safe stderr log for gtk callback contexts. std's `eprintln!`
+    /// PANICS on a broken pipe ("failed printing to stderr"), and inside an
+    /// `unsafe extern "C"` callback a panic is "panic in a function that
+    /// cannot unwind" — an instant process abort with no unwinding. Measured
+    /// live 2026-09-04: `load_done`'s eprintln killed the GUI the moment its
+    /// stderr pipe reader exited. Diagnostics must never be lethal.
+    fn log_to_stderr(msg: &str) {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(msg.as_bytes());
+        let _ = stderr.write_all(b"\n");
+    }
+
     unsafe extern "C" fn load_done(
         source: *mut gtk::glib::gobject_ffi::GObject,
         result: *mut gtk::gio::ffi::GAsyncResult,
@@ -1213,10 +1226,10 @@ mod adblock {
             )
         };
         if !filter.is_null() {
-            eprintln!(
+            log_to_stderr(&format!(
                 "yggterm adblock: filter loaded from store in {:.3}s (no compile)",
                 compile.started.elapsed().as_secs_f64()
-            );
+            ));
             adopt(filter);
             prune_stale(compile.store, compile.identifier.clone());
             return;
@@ -1225,7 +1238,7 @@ mod adblock {
         // rules change, so it is not an error to report loudly — but the
         // GError still has to be consumed or it leaks.
         let _ = unsafe { take_error(error) };
-        eprintln!("yggterm adblock: no compiled ruleset for this content, compiling once");
+        log_to_stderr("yggterm adblock: no compiled ruleset for this content, compiling once");
         let raw = Box::into_raw(compile);
         unsafe {
             let compile = &*raw;
@@ -1256,14 +1269,14 @@ mod adblock {
         };
         if filter.is_null() {
             let message = unsafe { take_error(error) };
-            eprintln!("yggterm adblock: ruleset compile failed: {message}");
+            log_to_stderr(&format!("yggterm adblock: ruleset compile failed: {message}"));
             PENDING.with(|p| p.borrow_mut().clear());
             return;
         }
-        eprintln!(
+        log_to_stderr(&format!(
             "yggterm adblock: ruleset compiled in {:.3}s (cached for next launch)",
             compile.started.elapsed().as_secs_f64()
-        );
+        ));
         adopt(filter);
         prune_stale(compile.store, compile.identifier.clone());
     }
@@ -1280,7 +1293,7 @@ mod adblock {
         let json = match std::fs::read(ruleset) {
             Ok(bytes) => bytes,
             Err(err) => {
-                eprintln!("yggterm adblock: read {}: {err}", ruleset.display());
+                log_to_stderr(&format!("yggterm adblock: read {}: {err}", ruleset.display()));
                 return;
             }
         };
