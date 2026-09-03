@@ -74,7 +74,7 @@ bound at the canonical path, and `server status` then reports
 having been run by anyone.
 
 **Deployment state at fix time (2026-09-03 ~19:05):** the fix is ON DISK on
-every host (CI union 27b38abbc056, deployed 18:56), but jojo's RUNNING daemon
+every host (CI union 27b38abbc056, deployed 18:56), but the GUI host's RUNNING daemon
 is the pre-fix 3.2.46 build and cannot take the fixed build by waiting — its
 blockers include `not_restorable` rows, the permanent class
 ([[spec-cwd-tree-agent-cli-unified]] [11.1]: one unresolvable row pins a
