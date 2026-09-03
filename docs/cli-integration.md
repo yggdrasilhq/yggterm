@@ -1332,6 +1332,10 @@ screen text and argv strings stay out):
   a dot that blinks on recency alone reads differently from one the CLI's own
   footer drives. Edge-triggered (enter/exit vs the last pass set); quiet rows
   cost nothing.
+* **`cli/osc_witness`** — generic OSC classes per PTY reader, first-sight
+  per reader epoch (added with the implementation, `lane/dev/osc-witness`):
+  classes only, never parameters — titles carry cwds, hyperlinks carry URLs.
+  Answers the owner's "what is the CLI emitting for OSC?" with one filter.
 * **`daemon/idle_gate_eval`** — the swap-deferral DECISION mirrored from the
   existing `daemon_cold_shutdown_deferred_idle_gate` trace event (same
   change-or-heartbeat discipline) plus the same-version HotRestart-request
