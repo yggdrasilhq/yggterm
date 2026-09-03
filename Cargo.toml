@@ -42,12 +42,12 @@ ytrace = { git = "https://github.com/yggdrasilhq/ytrace", branch = "main" }
 # ⛔ ONE libyggterm version, never two. Every crate below moves to the same tag
 # in the same edit: two tags would resolve to two copies of `yggui-contract`,
 # and the types an app and its host exchange would stop being the same types.
-yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.2" }
-yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.2" }
+yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.3" }
+yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.3" }
 # emd (extended markdown) — the document model + parser. Left this tree for
 # libyggterm on 2026-08-02: it is the document engine of the app pipeline
 # (yedit, ztlkasten, breezed, charts-webapp). Spec lives with the crate.
-emd-renderer = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.2" }
+emd-renderer = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.14.3" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

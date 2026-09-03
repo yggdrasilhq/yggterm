@@ -6134,6 +6134,12 @@ struct WebSurfaceOverlayView {
     /// Keyboard-selected dropdown row: 0 = the synthesized go/search row,
     /// 1.. = address_suggestions[i-1]. None = plain Enter-on-draft.
     address_suggestion_index: Option<usize>,
+    /// Where the user's typing ends inside the inline-completed
+    /// `address_text`, while a completion is ACTIVE — the palette field
+    /// selects the tail beyond it, so the next keystroke types over it and
+    /// plain Enter accepts the whole draft. `None` = no completion; the field
+    /// is left exactly as the user typed it.
+    address_typed_len: Option<usize>,
     /// The palette field's remount revision — see
     /// `WebSurfaceState::address_draft_revision`.
     address_draft_revision: u64,
@@ -24101,6 +24107,7 @@ impl ShellState {
                 .map(|picker| picker.control_url.clone()),
             address_suggestions,
             address_suggestion_index: surface.address_suggestion_index,
+            address_typed_len: surface.address_typed_len,
             address_draft_revision: surface.address_draft_revision,
             profile: active.profile.clone(),
             vertical_tabs: self.settings.web_surface_vertical_tabs,
