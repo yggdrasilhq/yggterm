@@ -8645,254 +8645,43 @@ fn TerminalCanvas(
                                     });
                                     if non_prompt_snapshot_replay_attempts < 2 {
                                         non_prompt_snapshot_replay_attempts += 1;
-                                        match terminal_snapshot_async(
-                                            endpoint.clone(),
-                                            runtime_session_path.clone(),
-                                            &trace_home,
-                                        )
-                                        .await
                                         {
-                                            Ok((
-                                                snapshot_text,
-                                                running,
-                                                runtime_output_seen,
-                                                post_resize_output_seen,
-                                                last_resize_seq,
-                                                _runtime_spawn_id,
-                                                ..,
-                                            ))
-                                                if remote_resume_non_prompt_snapshot_is_replayable(
-                                                    &snapshot_text,
-                                                    &cursor_line_text,
-                                                    &text_tail,
-                                                ) && remote_resume_geometry_fence_allows_snapshot(
-                                                    codex_like_session,
-                                                    post_resize_output_seen,
-                                                    last_resize_seq,
-                                                ) =>
-                                            {
-                                                let snapshot_text =
-                                                    sanitize_terminal_replay_payload(&snapshot_text);
-                                                if snapshot_text.trim().is_empty() {
-                                                    continue;
-                                                }
-                                                append_trace_event(
-                                                    &trace_home,
-                                                    "ui",
-                                                    "terminal_mount",
-                                                    "retained_non_prompt_snapshot_replay",
-                                                    json!({
-                                                        "session_path": session_path.clone(),
-                                                        "attempt": non_prompt_snapshot_replay_attempts,
-                                                        "bytes": snapshot_text.len(),
-                                                        "running": running,
-                                                        "runtime_output_seen": runtime_output_seen,
-                                                        "post_resize_output_seen": post_resize_output_seen,
-                                                        "last_resize_seq": last_resize_seq,
-                                                    }),
-                                                );
-                                                let _ = eval.send(terminal_reset_command(&title, &theme));
-                                                let _ = eval.send(TerminalJsCommand::Write {
-                                                    data: snapshot_text,
-                                                });
-                                                let _ = eval.send(TerminalJsCommand::Refit);
-                                                let _ = eval.send(TerminalJsCommand::SetInputEnabled {
-                                                    enabled: true,
-                                                    focus: true,
-                                                });
-                                                set_signal_if_changed(
-                                                    terminal_resume_surface_staged,
-                                                    true,
-                                                );
-                                                set_signal_if_changed(
-                                                    terminal_has_meaningful_output,
-                                                    true,
-                                                );
-                                                set_signal_if_changed(terminal_prompt_only, false);
-                                                set_signal_if_changed(
-                                                    terminal_live_host_connected,
-                                                    true,
-                                                );
-                                                set_signal_if_changed(
-                                                    terminal_overlay_dismissed,
-                                                    true,
-                                                );
-                                                set_signal_if_changed(resume_overlay_failed, false);
-                                                set_signal_if_changed(resume_overlay_timed_out, false);
-                                                resume_visual_reveal_after_ms = None;
-                                                post_attach_read_recovery_attempts = 0;
-                                    transport_error_input_released = false;
-                                                clear_terminal_resume_notification(
-                                                    state,
-                                                    &session_path,
-                                                );
-                                                let _ = safe_shell_mut(
-                                                    state,
-                                                    "terminal_attach_retained_non_prompt_snapshot_replay",
-                                                    |shell| {
-                                                        shell
-                                                            .retain_terminal_session_path(&session_path);
-                                                        shell
-                                                            .terminal_resume_ready_paths
-                                                            .insert(session_path.clone());
-                                                        shell.terminal_attach_in_flight
-                                                            .remove(&session_path);
-                                                        shell
-                                                            .mark_terminal_open_attempt_ready_for_session(
-                                                                &session_path,
-                                                                "retained_non_prompt_snapshot_replay",
-                                                            );
-                                                        shell
-                                                            .maybe_finish_terminal_surface_request_for_session(
-                                                                &session_path,
-                                                            );
+                                            // The snapshot RPC leaves the loop
+                                            // (the [11.46] sweep): the result
+                                            // applies on its own select branch, so
+                                            // the keystroke path is never queued
+                                            // behind this round trip.
+                                            let sweep_tx = off_loop_rpc_tx.clone();
+                                            let sweep_endpoint = endpoint.clone();
+                                            let sweep_session = runtime_session_path.clone();
+                                            let sweep_trace = trace_home.clone();
+                                            let sweep_attempt = non_prompt_snapshot_replay_attempts;
+                                            let sweep_cursor_line_text = cursor_line_text.clone();
+                                            let sweep_text_tail = text_tail.clone();
+                                            let sweep_codex_like = codex_like_session;
+                                            let sweep_remote_starting = remote_starting_agent_session;
+                                            task::spawn(async move {
+                                                let result = terminal_snapshot_async(
+                                                    sweep_endpoint,
+                                                    sweep_session,
+                                                    &sweep_trace,
+                                                )
+                                                .await
+                                                .map_err(|error| format!("{error:#}"));
+                                                let _ = sweep_tx.send(
+                                                    OffLoopTerminalRpcResult::SnapshotReplaySettled {
+                                                        kind: SnapshotReplayKind::NonPrompt,
+                                                        attempt: sweep_attempt,
+                                                        cursor_line_text: sweep_cursor_line_text,
+                                                        text_tail: sweep_text_tail,
+                                                        codex_like_session: sweep_codex_like,
+                                                        remote_starting_agent_session: sweep_remote_starting,
+                                                        result,
                                                     },
                                                 );
-                                                maybe_spawn_missing_remote_machine_refreshes(state);
-                                                maybe_spawn_missing_managed_cli_refreshes(state);
-                                                read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
-                                                next_read_deadline = tokio::time::Instant::now()
-                                                    + Duration::from_millis(read_poll_ms);
-                                                continue;
-                                            }
-                                            Ok((
-                                                snapshot_text,
-                                                running,
-                                                runtime_output_seen,
-                                                post_resize_output_seen,
-                                                last_resize_seq,
-                                                _runtime_spawn_id,
-                                                ..,
-                                            )) => {
-                                                append_trace_event(
-                                                    &trace_home,
-                                                    "ui",
-                                                    "terminal_mount",
-                                                    "retained_non_prompt_snapshot_replay_rejected",
-                                                    json!({
-                                                        "session_path": session_path.clone(),
-                                                        "attempt": non_prompt_snapshot_replay_attempts,
-                                                        "bytes": snapshot_text.len(),
-                                                        "running": running,
-                                                        "runtime_output_seen": runtime_output_seen,
-                                                        "post_resize_output_seen": post_resize_output_seen,
-                                                        "last_resize_seq": last_resize_seq,
-                                                    }),
-                                                );
-                                                let _ = safe_shell_mut(
-                                                    state,
-                                                    "terminal_attach_retained_non_prompt_snapshot_rejected_telemetry",
-                                                    |shell| {
-                                                        shell.record_terminal_contract_telemetry(
-                                                            "retained_non_prompt_snapshot_rejected",
-                                                            "warn",
-                                                            &session_path,
-                                                            "non-prompt snapshot cannot become terminal truth",
-                                                            json!({
-                                                                "attempt": non_prompt_snapshot_replay_attempts,
-                                                                "bytes": snapshot_text.len(),
-                                                                "running": running,
-                                                                "runtime_output_seen": runtime_output_seen,
-                                                                "post_resize_output_seen": post_resize_output_seen,
-                                                                "last_resize_seq": last_resize_seq,
-                                                                "cursor_line_text": cursor_line_text.clone(),
-                                                                "text_tail": text_tail.clone(),
-                                                            }),
-                                                        );
-                                                    },
-                                                );
-                                            }
-                                            Err(error) => {
-                                                append_trace_event(
-                                                    &trace_home,
-                                                    "ui",
-                                                    "terminal_mount",
-                                                    "retained_non_prompt_snapshot_replay_error",
-                                                    json!({
-                                                        "session_path": session_path.clone(),
-                                                        "attempt": non_prompt_snapshot_replay_attempts,
-                                                        "error": error.to_string(),
-                                                    }),
-                                                );
-                                            }
+                                            });
                                         }
                                     }
-                                    if non_prompt_retained_recovery_attempts < 2 {
-                                        non_prompt_retained_recovery_attempts += 1;
-                                        set_signal_if_changed(terminal_resume_surface_staged, false);
-                                        set_signal_if_changed(
-                                            terminal_has_meaningful_output,
-                                            false,
-                                        );
-                                        set_signal_if_changed(terminal_prompt_only, false);
-                                        resume_visual_reveal_after_ms = None;
-                                        resume_resize_nudged = false;
-                                        resume_post_attach_redraw_nudged = false;
-                                        resume_post_attach_replay_rebased = false;
-                                        resume_post_attach_replay_deadline_ms = None;
-                                        resume_attach_ready_cursor = 0;
-                                        remote_resume_meaningful_observations = 0;
-                                        traced_attach_ready = false;
-                                        traced_first_output = false;
-                                        traced_first_meaningful_output = false;
-                                        terminal_has_visible_output = false;
-                                        prompt_gap_resize_nudges = 0;
-                                        deferred_resume_output.clear();
-                                        visual_reveal_output_sample.clear();
-                                        first_resume_connected_output_ms = None;
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "retained_non_prompt_surface_recovery_begin",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "attempt": non_prompt_retained_recovery_attempts,
-                                            }),
-                                        );
-                                        let _ = eval.send(terminal_reset_command(&title, &theme));
-                                        if let Err(recovery_error) =
-                                            terminal_attempt_resume_recovery_async(
-                                                endpoint.clone(),
-                                                runtime_session_path.clone(),
-                                                &trace_home,
-                                                "retained_non_prompt_surface",
-                                                non_prompt_retained_recovery_attempts,
-                                            )
-                                            .await
-                                        {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "retained_non_prompt_surface_recovery_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "error": recovery_error.to_string(),
-                                                    "attempt": non_prompt_retained_recovery_attempts,
-                                                }),
-                                            );
-                                        }
-                                        cursor = 0;
-                                        read_poll_ms = 60;
-                                        next_read_deadline = tokio::time::Instant::now()
-                                            + Duration::from_millis(read_poll_ms);
-                                        continue;
-                                    }
-                                    upsert_terminal_resume_notification(
-                                        state,
-                                        &session_path,
-                                        NotificationTone::Warning,
-                                        "Restoring Remote Terminal",
-                                        format!(
-                                            "Yggterm is waiting for a prompt-ready live terminal on {} before accepting input.",
-                                            session_host_label
-                                        ),
-                                    );
-                                    read_poll_ms = 120;
-                                    next_read_deadline = tokio::time::Instant::now()
-                                        + Duration::from_millis(read_poll_ms);
-                                    continue;
                                 }
                                 if blank_host_snapshot_replay_should_start(
                                     is_remote_resume_session,
@@ -8907,156 +8696,42 @@ fn TerminalCanvas(
                                     2,
                                 ) {
                                     blank_host_snapshot_replay_attempts += 1;
-                                    match terminal_snapshot_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        &trace_home,
-                                    )
-                                    .await
-                                    {
-                                        Ok((
-                                            snapshot_text,
-                                            running,
-                                            runtime_output_seen,
-                                            post_resize_output_seen,
-                                            last_resize_seq,
-                                            _runtime_spawn_id,
-                                            ..,
-                                        ))
-                                            if remote_resume_screen_snapshot_is_replayable_for_blank_host(
-                                                &snapshot_text,
-                                                remote_starting_agent_session,
-                                                codex_like_session,
-                                            ) && remote_resume_geometry_fence_allows_snapshot_replay(
-                                                &snapshot_text,
-                                                codex_like_session,
-                                                post_resize_output_seen,
-                                                last_resize_seq,
-                                            ) =>
                                         {
-                                            let snapshot_text =
-                                                sanitize_terminal_replay_payload(&snapshot_text);
-                                            if snapshot_text.trim().is_empty() {
-                                                continue;
-                                            }
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "blank_host_snapshot_replay",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "attempt": blank_host_snapshot_replay_attempts,
-                                                    "bytes": snapshot_text.len(),
-                                                    "running": running,
-                                                    "runtime_output_seen": runtime_output_seen,
-                                                    "post_resize_output_seen": post_resize_output_seen,
-                                                    "last_resize_seq": last_resize_seq,
-                                                }),
-                                            );
-                                            let _ = eval.send(terminal_reset_command(&title, &theme));
-                                            let _ = eval.send(TerminalJsCommand::Write {
-                                                data: snapshot_text,
+                                            // The snapshot RPC leaves the loop
+                                            // (the [11.46] sweep): the result
+                                            // applies on its own select branch, so
+                                            // the keystroke path is never queued
+                                            // behind this round trip.
+                                            let sweep_tx = off_loop_rpc_tx.clone();
+                                            let sweep_endpoint = endpoint.clone();
+                                            let sweep_session = runtime_session_path.clone();
+                                            let sweep_trace = trace_home.clone();
+                                            let sweep_attempt = blank_host_snapshot_replay_attempts;
+                                            let sweep_cursor_line_text = cursor_line_text.clone();
+                                            let sweep_text_tail = text_tail.clone();
+                                            let sweep_codex_like = codex_like_session;
+                                            let sweep_remote_starting = remote_starting_agent_session;
+                                            task::spawn(async move {
+                                                let result = terminal_snapshot_async(
+                                                    sweep_endpoint,
+                                                    sweep_session,
+                                                    &sweep_trace,
+                                                )
+                                                .await
+                                                .map_err(|error| format!("{error:#}"));
+                                                let _ = sweep_tx.send(
+                                                    OffLoopTerminalRpcResult::SnapshotReplaySettled {
+                                                        kind: SnapshotReplayKind::BlankHost,
+                                                        attempt: sweep_attempt,
+                                                        cursor_line_text: sweep_cursor_line_text,
+                                                        text_tail: sweep_text_tail,
+                                                        codex_like_session: sweep_codex_like,
+                                                        remote_starting_agent_session: sweep_remote_starting,
+                                                        result,
+                                                    },
+                                                );
                                             });
-                                            let _ = eval.send(TerminalJsCommand::Refit);
-                                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
-                                                enabled: true,
-                                                focus: true,
-                                            });
-                                            set_signal_if_changed(
-                                                terminal_resume_surface_staged,
-                                                true,
-                                            );
-                                            set_signal_if_changed(
-                                                terminal_has_meaningful_output,
-                                                true,
-                                            );
-                                            set_signal_if_changed(terminal_prompt_only, false);
-                                            set_signal_if_changed(
-                                                terminal_live_host_connected,
-                                                true,
-                                            );
-                                            set_signal_if_changed(
-                                                terminal_overlay_dismissed,
-                                                true,
-                                            );
-                                            set_signal_if_changed(resume_overlay_failed, false);
-                                            set_signal_if_changed(resume_overlay_timed_out, false);
-                                            resume_visual_reveal_after_ms = None;
-                                            post_attach_read_recovery_attempts = 0;
-                                    transport_error_input_released = false;
-                                            clear_terminal_resume_notification(
-                                                state,
-                                                &session_path,
-                                            );
-                                            let _ = safe_shell_mut(
-                                                state,
-                                                "terminal_attach_blank_host_snapshot_replay",
-                                                |shell| {
-                                                    shell
-                                                        .retain_terminal_session_path(&session_path);
-                                                    shell
-                                                        .terminal_resume_ready_paths
-                                                        .insert(session_path.clone());
-                                                    shell.terminal_attach_in_flight
-                                                        .remove(&session_path);
-                                                    shell
-                                                        .mark_terminal_open_attempt_ready_for_session(
-                                                            &session_path,
-                                                            "blank_host_snapshot_replay",
-                                                        );
-                                                    shell
-                                                        .maybe_finish_terminal_surface_request_for_session(
-                                                            &session_path,
-                                                        );
-                                                },
-                                            );
-                                            maybe_spawn_missing_remote_machine_refreshes(state);
-                                            maybe_spawn_missing_managed_cli_refreshes(state);
-                                            read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
-                                            next_read_deadline = tokio::time::Instant::now()
-                                                + Duration::from_millis(read_poll_ms);
-                                            continue;
                                         }
-                                        Ok((
-                                            snapshot_text,
-                                            running,
-                                            runtime_output_seen,
-                                            post_resize_output_seen,
-                                            last_resize_seq,
-                                            _runtime_spawn_id,
-                                            ..,
-                                        )) => {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "blank_host_snapshot_replay_rejected",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "attempt": blank_host_snapshot_replay_attempts,
-                                                    "bytes": snapshot_text.len(),
-                                                    "running": running,
-                                                    "runtime_output_seen": runtime_output_seen,
-                                                    "post_resize_output_seen": post_resize_output_seen,
-                                                    "last_resize_seq": last_resize_seq,
-                                                }),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "blank_host_snapshot_replay_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "attempt": blank_host_snapshot_replay_attempts,
-                                                    "error": error.to_string(),
-                                                }),
-                                            );
-                                        }
-                                    }
                                 }
                                 if stale_remote_resume_retry_blank_surface_should_recover(
                                     is_remote_resume_session,
@@ -9134,27 +8809,34 @@ fn TerminalCanvas(
                                             session_host_label
                                         ),
                                     );
-                                    if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        &trace_home,
-                                        "blank_retry_poison",
-                                        blank_retry_poison_recovery_attempts,
-                                    )
-                                    .await
-                                    {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "blank_retry_poison_recovery_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": recovery_error.to_string(),
-                                                "attempt": blank_retry_poison_recovery_attempts,
-                                            }),
-                                        );
-                                    }
+                                        {
+                                            // The recovery RPC leaves the loop
+                                            // (the [11.46] sweep); only its error
+                                            // trace waits for the result.
+                                            let sweep_tx = off_loop_rpc_tx.clone();
+                                            let sweep_endpoint = endpoint.clone();
+                                            let sweep_session = runtime_session_path.clone();
+                                            let sweep_trace = trace_home.clone();
+                                            let sweep_attempt = blank_retry_poison_recovery_attempts;
+                                            task::spawn(async move {
+                                                let result = terminal_attempt_resume_recovery_async(
+                                                    sweep_endpoint,
+                                                    sweep_session,
+                                                    &sweep_trace,
+                                                    "blank_retry_poison",
+                                                    sweep_attempt,
+                                                )
+                                                .await
+                                                .map_err(|error| format!("{error:#}"));
+                                                let _ = sweep_tx.send(
+                                                    OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                                                        error_trace: "blank_retry_poison_recovery_error",
+                                                        attempt: sweep_attempt,
+                                                        result,
+                                                    },
+                                                );
+                                            });
+                                        }
                                     cursor = 0;
                                     read_poll_ms = 60;
                                     next_read_deadline = tokio::time::Instant::now()
@@ -9207,27 +8889,34 @@ fn TerminalCanvas(
                                     deferred_resume_output.clear();
                                     visual_reveal_output_sample.clear();
                                     first_resume_connected_output_ms = None;
-                                    if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        &trace_home,
-                                        "transport_error_visible_in_host",
-                                        post_attach_read_recovery_attempts,
-                                    )
-                                    .await
-                                    {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "transport_error_visible_in_host_recovery_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": recovery_error.to_string(),
-                                                "attempt": post_attach_read_recovery_attempts,
-                                            }),
-                                        );
-                                    }
+                                        {
+                                            // The recovery RPC leaves the loop
+                                            // (the [11.46] sweep); only its error
+                                            // trace waits for the result.
+                                            let sweep_tx = off_loop_rpc_tx.clone();
+                                            let sweep_endpoint = endpoint.clone();
+                                            let sweep_session = runtime_session_path.clone();
+                                            let sweep_trace = trace_home.clone();
+                                            let sweep_attempt = post_attach_read_recovery_attempts;
+                                            task::spawn(async move {
+                                                let result = terminal_attempt_resume_recovery_async(
+                                                    sweep_endpoint,
+                                                    sweep_session,
+                                                    &sweep_trace,
+                                                    "transport_error_visible_in_host",
+                                                    sweep_attempt,
+                                                )
+                                                .await
+                                                .map_err(|error| format!("{error:#}"));
+                                                let _ = sweep_tx.send(
+                                                    OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                                                        error_trace: "transport_error_visible_in_host_recovery_error",
+                                                        attempt: sweep_attempt,
+                                                        result,
+                                                    },
+                                                );
+                                            });
+                                        }
                                     cursor = 0;
                                     read_poll_ms = 60;
                                 } else if has_transport_error
@@ -10540,6 +10229,430 @@ fn TerminalCanvas(
                                         "error": error,
                                     }),
                                 );
+                            }
+                            OffLoopTerminalRpcResult::SnapshotReplaySettled {
+                                kind,
+                                attempt,
+                                cursor_line_text,
+                                text_tail,
+                                codex_like_session,
+                                remote_starting_agent_session,
+                                result,
+                            } => {
+                                let _loop_branch = TerminalLoopBranchGuard::new(
+                                    "snapshot_replay_settled",
+                                    &session_path,
+                                );
+                                match kind {
+                                    SnapshotReplayKind::NonPrompt => {
+                                            match result {
+                                        Ok((
+                                            snapshot_text,
+                                            running,
+                                            runtime_output_seen,
+                                            post_resize_output_seen,
+                                            last_resize_seq,
+                                            _runtime_spawn_id,
+                                            ..,
+                                        ))
+                                            if remote_resume_non_prompt_snapshot_is_replayable(
+                                                &snapshot_text,
+                                                &cursor_line_text,
+                                                &text_tail,
+                                            ) && remote_resume_geometry_fence_allows_snapshot(
+                                                codex_like_session,
+                                                post_resize_output_seen,
+                                                last_resize_seq,
+                                            ) =>
+                                        {
+                                            let snapshot_text =
+                                                sanitize_terminal_replay_payload(&snapshot_text);
+                                            if snapshot_text.trim().is_empty() {
+                                                continue;
+                                            }
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "retained_non_prompt_snapshot_replay",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": attempt,
+                                                    "bytes": snapshot_text.len(),
+                                                    "running": running,
+                                                    "runtime_output_seen": runtime_output_seen,
+                                                    "post_resize_output_seen": post_resize_output_seen,
+                                                    "last_resize_seq": last_resize_seq,
+                                                }),
+                                            );
+                                            let _ = eval.send(terminal_reset_command(&title, &theme));
+                                            let _ = eval.send(TerminalJsCommand::Write {
+                                                data: snapshot_text,
+                                            });
+                                            let _ = eval.send(TerminalJsCommand::Refit);
+                                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                                enabled: true,
+                                                focus: true,
+                                            });
+                                            set_signal_if_changed(
+                                                terminal_resume_surface_staged,
+                                                true,
+                                            );
+                                            set_signal_if_changed(
+                                                terminal_has_meaningful_output,
+                                                true,
+                                            );
+                                            set_signal_if_changed(terminal_prompt_only, false);
+                                            set_signal_if_changed(
+                                                terminal_live_host_connected,
+                                                true,
+                                            );
+                                            set_signal_if_changed(
+                                                terminal_overlay_dismissed,
+                                                true,
+                                            );
+                                            set_signal_if_changed(resume_overlay_failed, false);
+                                            set_signal_if_changed(resume_overlay_timed_out, false);
+                                            resume_visual_reveal_after_ms = None;
+                                            post_attach_read_recovery_attempts = 0;
+                                transport_error_input_released = false;
+                                            clear_terminal_resume_notification(
+                                                state,
+                                                &session_path,
+                                            );
+                                            let _ = safe_shell_mut(
+                                                state,
+                                                "terminal_attach_retained_non_prompt_snapshot_replay",
+                                                |shell| {
+                                                    shell
+                                                        .retain_terminal_session_path(&session_path);
+                                                    shell
+                                                        .terminal_resume_ready_paths
+                                                        .insert(session_path.clone());
+                                                    shell.terminal_attach_in_flight
+                                                        .remove(&session_path);
+                                                    shell
+                                                        .mark_terminal_open_attempt_ready_for_session(
+                                                            &session_path,
+                                                            "retained_non_prompt_snapshot_replay",
+                                                        );
+                                                    shell
+                                                        .maybe_finish_terminal_surface_request_for_session(
+                                                            &session_path,
+                                                        );
+                                                },
+                                            );
+                                            maybe_spawn_missing_remote_machine_refreshes(state);
+                                            maybe_spawn_missing_managed_cli_refreshes(state);
+                                            read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                                            next_read_deadline = tokio::time::Instant::now()
+                                                + Duration::from_millis(read_poll_ms);
+                                            continue;
+                                        }
+                                        Ok((
+                                            snapshot_text,
+                                            running,
+                                            runtime_output_seen,
+                                            post_resize_output_seen,
+                                            last_resize_seq,
+                                            _runtime_spawn_id,
+                                            ..,
+                                        )) => {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "retained_non_prompt_snapshot_replay_rejected",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": attempt,
+                                                    "bytes": snapshot_text.len(),
+                                                    "running": running,
+                                                    "runtime_output_seen": runtime_output_seen,
+                                                    "post_resize_output_seen": post_resize_output_seen,
+                                                    "last_resize_seq": last_resize_seq,
+                                                }),
+                                            );
+                                            let _ = safe_shell_mut(
+                                                state,
+                                                "terminal_attach_retained_non_prompt_snapshot_rejected_telemetry",
+                                                |shell| {
+                                                    shell.record_terminal_contract_telemetry(
+                                                        "retained_non_prompt_snapshot_rejected",
+                                                        "warn",
+                                                        &session_path,
+                                                        "non-prompt snapshot cannot become terminal truth",
+                                                        json!({
+                                                            "attempt": attempt,
+                                                            "bytes": snapshot_text.len(),
+                                                            "running": running,
+                                                            "runtime_output_seen": runtime_output_seen,
+                                                            "post_resize_output_seen": post_resize_output_seen,
+                                                            "last_resize_seq": last_resize_seq,
+                                                            "cursor_line_text": cursor_line_text.clone(),
+                                                            "text_tail": text_tail.clone(),
+                                                        }),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                        Err(error) => {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "retained_non_prompt_snapshot_replay_error",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": attempt,
+                                                    "error": error,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                        // Fall-through of the snapshot match: the
+                                        // retained recovery used to run only when
+                                        // the snapshot did not paint — same order,
+                                        // now off-loop.
+                                    if non_prompt_retained_recovery_attempts < 2 {
+                                        non_prompt_retained_recovery_attempts += 1;
+                                        set_signal_if_changed(terminal_resume_surface_staged, false);
+                                        set_signal_if_changed(
+                                            terminal_has_meaningful_output,
+                                            false,
+                                        );
+                                        set_signal_if_changed(terminal_prompt_only, false);
+                                        resume_visual_reveal_after_ms = None;
+                                        resume_resize_nudged = false;
+                                        resume_post_attach_redraw_nudged = false;
+                                        resume_post_attach_replay_rebased = false;
+                                        resume_post_attach_replay_deadline_ms = None;
+                                        resume_attach_ready_cursor = 0;
+                                        remote_resume_meaningful_observations = 0;
+                                        traced_attach_ready = false;
+                                        traced_first_output = false;
+                                        traced_first_meaningful_output = false;
+                                        terminal_has_visible_output = false;
+                                        prompt_gap_resize_nudges = 0;
+                                        deferred_resume_output.clear();
+                                        visual_reveal_output_sample.clear();
+                                        first_resume_connected_output_ms = None;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "retained_non_prompt_surface_recovery_begin",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "attempt": non_prompt_retained_recovery_attempts,
+                                            }),
+                                        );
+                                        let _ = eval.send(terminal_reset_command(&title, &theme));
+                                        {
+                                            // The recovery RPC leaves the loop
+                                            // (the [11.46] sweep); only its error
+                                            // trace waits for the result.
+                                            let sweep_tx = off_loop_rpc_tx.clone();
+                                            let sweep_endpoint = endpoint.clone();
+                                            let sweep_session = runtime_session_path.clone();
+                                            let sweep_trace = trace_home.clone();
+                                            let sweep_attempt = non_prompt_retained_recovery_attempts;
+                                            task::spawn(async move {
+                                                let result = terminal_attempt_resume_recovery_async(
+                                                    sweep_endpoint,
+                                                    sweep_session,
+                                                    &sweep_trace,
+                                                    "retained_non_prompt_surface",
+                                                    sweep_attempt,
+                                                )
+                                                .await
+                                                .map_err(|error| format!("{error:#}"));
+                                                let _ = sweep_tx.send(
+                                                    OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                                                        error_trace: "retained_non_prompt_surface_recovery_error",
+                                                        attempt: sweep_attempt,
+                                                        result,
+                                                    },
+                                                );
+                                            });
+                                        }
+                                        cursor = 0;
+                                        read_poll_ms = 60;
+                                        next_read_deadline = tokio::time::Instant::now()
+                                            + Duration::from_millis(read_poll_ms);
+                                        continue;
+                                    }
+                                    }
+                                    SnapshotReplayKind::BlankHost => {
+                                        match result {
+                                    Ok((
+                                        snapshot_text,
+                                        running,
+                                        runtime_output_seen,
+                                        post_resize_output_seen,
+                                        last_resize_seq,
+                                        _runtime_spawn_id,
+                                        ..,
+                                    ))
+                                        if remote_resume_screen_snapshot_is_replayable_for_blank_host(
+                                            &snapshot_text,
+                                            remote_starting_agent_session,
+                                            codex_like_session,
+                                        ) && remote_resume_geometry_fence_allows_snapshot_replay(
+                                            &snapshot_text,
+                                            codex_like_session,
+                                            post_resize_output_seen,
+                                            last_resize_seq,
+                                        ) =>
+                                    {
+                                        let snapshot_text =
+                                            sanitize_terminal_replay_payload(&snapshot_text);
+                                        if snapshot_text.trim().is_empty() {
+                                            continue;
+                                        }
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "blank_host_snapshot_replay",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "attempt": attempt,
+                                                "bytes": snapshot_text.len(),
+                                                "running": running,
+                                                "runtime_output_seen": runtime_output_seen,
+                                                "post_resize_output_seen": post_resize_output_seen,
+                                                "last_resize_seq": last_resize_seq,
+                                            }),
+                                        );
+                                        let _ = eval.send(terminal_reset_command(&title, &theme));
+                                        let _ = eval.send(TerminalJsCommand::Write {
+                                            data: snapshot_text,
+                                        });
+                                        let _ = eval.send(TerminalJsCommand::Refit);
+                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                            enabled: true,
+                                            focus: true,
+                                        });
+                                        set_signal_if_changed(
+                                            terminal_resume_surface_staged,
+                                            true,
+                                        );
+                                        set_signal_if_changed(
+                                            terminal_has_meaningful_output,
+                                            true,
+                                        );
+                                        set_signal_if_changed(terminal_prompt_only, false);
+                                        set_signal_if_changed(
+                                            terminal_live_host_connected,
+                                            true,
+                                        );
+                                        set_signal_if_changed(
+                                            terminal_overlay_dismissed,
+                                            true,
+                                        );
+                                        set_signal_if_changed(resume_overlay_failed, false);
+                                        set_signal_if_changed(resume_overlay_timed_out, false);
+                                        resume_visual_reveal_after_ms = None;
+                                        post_attach_read_recovery_attempts = 0;
+                                transport_error_input_released = false;
+                                        clear_terminal_resume_notification(
+                                            state,
+                                            &session_path,
+                                        );
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_attach_blank_host_snapshot_replay",
+                                            |shell| {
+                                                shell
+                                                    .retain_terminal_session_path(&session_path);
+                                                shell
+                                                    .terminal_resume_ready_paths
+                                                    .insert(session_path.clone());
+                                                shell.terminal_attach_in_flight
+                                                    .remove(&session_path);
+                                                shell
+                                                    .mark_terminal_open_attempt_ready_for_session(
+                                                        &session_path,
+                                                        "blank_host_snapshot_replay",
+                                                    );
+                                                shell
+                                                    .maybe_finish_terminal_surface_request_for_session(
+                                                        &session_path,
+                                                    );
+                                            },
+                                        );
+                                        maybe_spawn_missing_remote_machine_refreshes(state);
+                                        maybe_spawn_missing_managed_cli_refreshes(state);
+                                        read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                                        next_read_deadline = tokio::time::Instant::now()
+                                            + Duration::from_millis(read_poll_ms);
+                                        continue;
+                                    }
+                                    Ok((
+                                        snapshot_text,
+                                        running,
+                                        runtime_output_seen,
+                                        post_resize_output_seen,
+                                        last_resize_seq,
+                                        _runtime_spawn_id,
+                                        ..,
+                                    )) => {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "blank_host_snapshot_replay_rejected",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "attempt": attempt,
+                                                "bytes": snapshot_text.len(),
+                                                "running": running,
+                                                "runtime_output_seen": runtime_output_seen,
+                                                "post_resize_output_seen": post_resize_output_seen,
+                                                "last_resize_seq": last_resize_seq,
+                                            }),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "blank_host_snapshot_replay_error",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "attempt": attempt,
+                                                "error": error,
+                                            }),
+                                        );
+                                    }
+                                }
+                                    }
+                                }
+                            }
+                            OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                                error_trace,
+                                attempt,
+                                result,
+                            } => {
+                                let _loop_branch = TerminalLoopBranchGuard::new(
+                                    "resume_recovery_settled",
+                                    &session_path,
+                                );
+                                if let Err(recovery_error) = result {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        error_trace,
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "error": recovery_error,
+                                            "attempt": attempt,
+                                        }),
+                                    );
+                                }
                             }
                             OffLoopTerminalRpcResult::RevealCoverRelease { generation } => {
                                 let _loop_branch = TerminalLoopBranchGuard::new(
@@ -16598,7 +16711,42 @@ const TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS: u64 = 120;
 /// select branch, delivered back for on-loop application. The payload carries
 /// exactly what the old inline apply half read, so the branch bodies below are
 /// the old code minus the `.await`.
+/// A full daemon terminal snapshot, ready to replay into the client.
+type SnapshotReplayPayload = (
+    String,
+    bool,
+    bool,
+    bool,
+    u64,
+    u64,
+    Option<bool>,
+    Option<bool>,
+);
+
+/// Which reveal path requested a snapshot replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotReplayKind {
+    NonPrompt,
+    BlankHost,
+}
+
 enum OffLoopTerminalRpcResult {
+    SnapshotReplaySettled {
+        kind: SnapshotReplayKind,
+        attempt: u64,
+        /// Event-time inputs the replay guards read: the select loop may
+        /// apply this result after later events have moved the live locals.
+        cursor_line_text: String,
+        text_tail: String,
+        codex_like_session: bool,
+        remote_starting_agent_session: bool,
+        result: Result<SnapshotReplayPayload, String>,
+    },
+    ResumeRecoverySettled {
+        error_trace: &'static str,
+        attempt: u64,
+        result: Result<(), String>,
+    },
     ResizeApplied {
         cols: u16,
         rows: u16,
