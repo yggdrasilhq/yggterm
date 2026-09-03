@@ -46694,6 +46694,25 @@ fn is_recoverable_local_terminal_runtime_error(error: &str) -> bool {
 }
 fn schedule_active_title_retry_after_failure(state: Signal<ShellState>, session_path: &str) {
     let session_path = session_path.to_string();
+    // Peek before the write (storm autopsy, GUI host 2026-09-03: 310
+    // `active_title_autogen_retry_schedule` writes in 15 s drove 21
+    // renders/sec with forced_wakes 0 — a whole-state-subscribed effect
+    // re-runs `maybe_request_copy_generation_for_session` on EVERY state
+    // write, and each no-op pending-set insert dirtied the signal into one
+    // more full render). A tick is already armed and the deadline stands, so
+    // re-stamping it is pure signal churn: one full render to change nothing.
+    let armed = safe_shell_read(state, "active_title_retry_after_failure_precheck", |shell| {
+        shell.server.active_session_path() == Some(session_path.as_str())
+            && shell
+                .title_autogen_retry_after_ms
+                .get(session_path.as_str())
+                .is_some_and(|retry_after_ms| *retry_after_ms > current_millis())
+            && shell.title_autogen_retry_pending.contains(session_path.as_str())
+    })
+    .unwrap_or(false);
+    if armed {
+        return;
+    }
     let delay_ms = safe_shell_mut(state, "active_title_autogen_retry_after_failure", |shell| {
         if shell.server.active_session_path() != Some(session_path.as_str()) {
             return None;
@@ -46715,6 +46734,18 @@ fn schedule_active_title_autogen_retry_tick(
     session_path: String,
     delay_ms: u64,
 ) {
+    // Same peek-before-write as above: `Signal::with_mut` dirties the root
+    // signal even when the insert is a no-op, and this function runs inside a
+    // whole-state-subscribed effect — an unguarded insert is a render that
+    // re-runs the effect that schedules the next insert, at CPU speed.
+    let already_pending =
+        safe_shell_read(state, "active_title_autogen_retry_schedule_precheck", |shell| {
+            shell.title_autogen_retry_pending.contains(session_path.as_str())
+        })
+        .unwrap_or(false);
+    if already_pending {
+        return;
+    }
     let should_schedule = safe_shell_mut(state, "active_title_autogen_retry_schedule", |shell| {
         shell
             .title_autogen_retry_pending
