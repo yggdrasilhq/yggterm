@@ -5335,6 +5335,46 @@ pub(crate) fn metadata_dynamicity_entries(
     .collect()
 }
 
+/// The Live Diagnostic group (Issue 31): the row's identity contract against
+/// the CLI's own dynamicity signal, composed from snapshot fields the GUI
+/// already holds — no new wire fields.
+///
+/// ⛔ A WITNESS, NEVER A DRIVER: nothing here feeds back into daemon
+/// decisions, and the group renders only for agent rows carrying a Viewing
+/// stamp (the mirror saw the TUI render something). A quiet row shows nothing
+/// new — absence of the group means absence of signal, not health.
+///
+/// The verdict vocabulary matches `cli/mirror_tick`'s `decision` field so the
+/// pane and the probe can be read against each other: `in sync` |
+/// `DIVERGED — row aims at <bound>, TUI shows <viewing>`.
+pub(crate) fn metadata_live_diagnostic(
+    session: &ManagedSessionView,
+) -> Vec<SessionMetadataEntry> {
+    if yggterm_core::agent_cli::agent_cli_descriptor(session.kind).is_none() {
+        return Vec::new();
+    }
+    let viewing = metadata_value(session, "Viewing Tab Session Id");
+    let viewing = viewing.trim();
+    if viewing.is_empty() {
+        return Vec::new();
+    }
+    let bound = metadata_session_identity(session)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| session.id.clone());
+    let verdict = if bound.trim() == viewing {
+        format!("in sync — row and TUI agree on {viewing}")
+    } else {
+        format!(
+            "DIVERGED — row aims at {}, TUI shows {viewing}",
+            bound.trim()
+        )
+    };
+    vec![SessionMetadataEntry {
+        label: "Identity",
+        value: verdict,
+    }]
+}
+
 /// Build the view-aware "useful" metadata panel from the rich snapshot fields
 /// (kind, host/source, pty grid, pid, working state) plus the genuinely useful
 /// daemon metadata entries (cwd, restore command, resume id, transcript stats),
@@ -5449,6 +5489,7 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
             value,
         });
     }
+    let live_diagnostic = metadata_live_diagnostic(session);
 
     let mut history = Vec::new();
     for (label, key) in [
@@ -5473,6 +5514,9 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
             MetadataConnectBlock { palette, command: connect }
         }
         MetadataGroup { title: "Runtime".to_string(), entries: runtime, palette }
+        if !live_diagnostic.is_empty() {
+            MetadataGroup { title: "Live Diagnostic".to_string(), entries: live_diagnostic, palette }
+        }
         if !history.is_empty() {
             MetadataGroup { title: "History".to_string(), entries: history, palette }
         }
