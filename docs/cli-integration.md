@@ -1484,3 +1484,134 @@ fetch announces itself as `cli/pty_truth_proxied` {runtime_path,
 pty_in_alternate_screen} — TTL-bounded to one probe per 5 s per runtime
 key, active rows only. The wheel gate's first-wheel falsifier
 ([11.44-followup]) is now decidable on proxied rows.
+
+## Issue Heading 33: the metadata-integration trace — every plane, what is and is not perfect yet (2026-09-04)
+
+Owner directive: *"Trace out all the issues that are yggterm metadata
+integration issues. yggterm should dynamically get and set metadata from cli
+sessions. CLIs can change sessions internally using slash commands and
+yggterm metadata should immediately change. Row titles and other yggterm UX
+should fetch or write to the yggterm metadata layer ... keep iterating until
+the cli integration is complete."*
+
+This section is the trace the directive asked for: the metadata plane cut
+into its six planes, each with its landed state and its open remainder.
+Anything not listed open is landed AND live-verified on dev (build
+55862e122c23, 3.2.52, 2026-09-04) unless marked otherwise.
+
+### Plane 1 — IDENTITY: which session a row is bound to
+
+Landed: the per-CLI rebind machinery — Claude Code `/clear` + the runtime-id
+poll (Issue 16), codex resume, muse/agy the `live_session_marker` proc walk
+(Issue 28), and OpenCode's mirror-tick rebind (Issue 30 amendment,
+`lane/dev/mirror-tick-rebind` 9efe69f95 + 893a9460f, LIVE: anchor
+`opencode-runtime://8a59fba6…` bound `ses_f998a9c7…`, `mirror_tick`
+`in_sync` on every tick since 03:25). The phantom-resume vouch (Issue 32,
+c9a356d59) makes a cold restore land in the session the anchor was viewing —
+live-proven 03:07. The rebind now shares ONE liveness predicate with the
+picker ([11.47]: pid | running phase | screen verdict), so screen-verdict
+rows rebind too.
+
+OPEN — Defect B: per-TUI identity for N anchors. The mirror is
+single-anchor; the viewing stamp is anchor-scoped; the other live TUIs'
+switches are seen (`candidates` on every tick) but not bound. Design unit
+with its own spec (Issue 31 explicitly reserves it).
+
+OPEN — the cold-restore arm with NO persisted row (no stamp, no vouch): the
+"newest ses_ for cwd" store candidate (Issue 32 "does NOT cover") — heuristic
+under N-windows-one-cwd; needs its own measured unit.
+
+### Plane 2 — TITLE READ: each CLI's own store
+
+Landed (Issue 29, 8151c058a): live-store readers for every CLI — CC
+(bullet-proof per owner), Qwen, agy, opencode2 (`session_v2.title`), muse,
+pi, grok, codex+litellm (first real user prompt), kimi (re-homed to
+`~/.kimi-code` `state.json`, end-to-end verified). Remote probes for every
+reader with a remote arm. The heuristic polluter (banner phrases cached as
+titles) is dead at both sites.
+
+OPEN (acknowledged drift, small): the opencode2 descriptor still says
+`Generated` while opencode2 self-titles — the reader reads the real store;
+the descriptor label is cosmetic. Also agy writes `conversation_summaries`
+LATE (measured), so a brand-new agy session can read no-title for a while —
+Plane 3's rescue is the backstop.
+
+### Plane 3 — TITLE WRITE: the LLM rescue and yggterm-owned extra metadata
+
+Landed (`lane/dev/title-rescue-all-clis`): the rescue is every CLI's now.
+`generate_title_for_transcript` / `generate_summary_for_transcript` take
+identity from the caller (chore candidate / shell trigger) and gate the path
+through the registry (`agent_cli_for_store_session_file`) — a file must be a
+declared session transcript of some registered CLI. This is the
+yggterm-extra-metadata store doing its designed job for CLIs WITHOUT a title
+concept (codex, muse): `session-titles.db` rows written by litellm, surfaced
+on the row + rail + pane. Codex-only wrappers remain only for the codex-only
+refresh-copy tool.
+
+OPEN (small, measured need TBD): muse LIVE rows whose candidate carries no
+Storage stamp fall back to the row key, fail `exists`, and wait — if muse
+rows rescue late in practice, the stamp their reader locates via
+`find_muse_session_jsonl_in` rides the candidate next.
+
+### Plane 4 — DYNAMICITY LANGUAGE: poll vs settle, per CLI
+
+Landed (Issue 30, 815e5eae3): `title_mutability` registry — OpenCode
+`Dynamic` (retiling is its whole life: auto-title, human rename, forks), the
+chore polls every tick, store-agrees keeps quiet ticks write-free; every
+other CLI `Static` until measured otherwise — extend the match with a
+measurement, never a guess. Birth-title INSERTION for detector-caught
+fallback rows (`InsertedBirthTitle`).
+
+OPEN (by design): every CLI not yet measured as a retiler stays `Static`.
+The moment one is caught retitling live, the registry grows — that is a
+measurement loop, not a defect.
+
+### Plane 5 — SWITCH DETECTION: slash commands and in-TUI switches, immediately
+
+Landed: opencode — the focus stream stamps `Viewing Tab Session Id` every
+tick and the mirror-tick rebind makes identity + resume + title follow it on
+the SAME tick (the "immediately" clause); CC `/clear` and codex resume ride
+the existing rebind; muse/agy the proc-marker walk. Probes make silence
+readable: `cli/mirror_tick` (per-tick verdict + 5-min heartbeat),
+`cli/launch_contract` (expected vs actual per composed launch),
+`cli/working_edge`, `daemon/idle_gate_eval` (Issue 31, 5f2745061 +
+0c71d8499), `cli/osc_witness`, `cli/pty_truth_proxied` (Issue 31 amendment).
+
+OPEN — the wheel-gate proxy-truth falsifier ([11.44-followup]): the arm is
+landed and live; the FIRST-WHEEL proof needs the owner's hands (fresh mount
+of a proxied fullscreen row → first wheel must `translate`). Not metadata,
+but it rides the same pty-truth wire.
+
+OPEN — [interrupted-orphan] linger root cause: expired deploy records age
+out (f6b1c5f88) but a zombie daemon can still linger serving rows off a
+deleted binary (measured on dev 2026-09-04: a 02:46 daemon outlived three
+deploys). Deploy-plane, listed because every metadata wave deploys through
+that gate.
+
+### Plane 6 — SURFACING: row titles, pane, the SSOT law
+
+Landed: the SSOT session-title law (one name per row, rail and store; cwd
+is not an agent's name; `Remote {CLI} {shorthash}` forbidden at both
+restore sites), the pane's session-id line resolving in registry order, the
+`Viewing session` / `Mirrored session` stamps, the Live Diagnostic group
+(read-only witness, never a driver), and the anchor picked as the LIVE TUI.
+
+### Bus-law incident (this trace's own finding, fixed same session)
+
+2026-09-04 04:04:52 — a CI test run put three FIXTURE rebinds on the fleet
+bus (`anchor_rebound_to_viewed_session` with `ses_a0000…/ses_b0000…` — the
+mirror unit tests' own ids). The rebind lane was written Sep 2 with an
+ungated `append_trace_event`; the 1cb614bcf bus-law sweep covered main only
+and the lane never merged, so the hole survived the rebase. Gated
+cfg(not(test)) same session (893a9460f) and verified: the same test run now
+emits zero bus events. Law restated: ANY new trace emission lands gated or
+it lands on the bus from CI within the hour.
+
+### The open queue, ordered
+
+1. Defect B — per-TUI identity for N anchors (design unit, spec first).
+2. The no-persisted-row cold-restore candidate (measured unit).
+3. Muse live-row Storage stamp on the rescue candidate (measure first).
+4. Wheel-gate first-wheel falsifier (needs owner's hands).
+5. [interrupted-orphan] linger root cause (deploy plane).
+6. opencode2 descriptor `Generated` label drift (cosmetic).
