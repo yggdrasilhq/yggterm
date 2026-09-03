@@ -18,6 +18,66 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.45] THE TITLE-RETRY ARMING LOOP — A NO-OP INSERT RENDERED 21 TIMES A SECOND UNTIL THE UI THREAD SATURATED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Owner report (2026-09-03): the GUI host "suffering severe UI blocks specially when
+using ychrome", the GUI not snappy. Measured on the GUI host, build 3.2.43, same
+method as the [11.4] falsifier reads: **221 `ui/block` in the last hour
+(3.7/min against the ≤1/min bar), p50 612 ms, max 3362 ms**, GUI process at
+31% of a core + WebKitWebProcess at 26% sustained, 693 sidebar rows.
+
+The storm autopsy (`render_fail_pattern/detected`,
+`pattern: app_render_storm_autopsy`) fired twice on the live GUI pid and named
+the driver outright: **329 renders in 15.5 s (21.2/sec) with `forced_wakes:
+0`**, and 310 of the window's 326 `ShellState` writes carried one tag —
+`active_title_autogen_retry_schedule`. Mechanism, read off the code the
+autopsy names:
+
+1. The active session's title is a bare cwd path (`/home/user/gh/yggterm` on the
+   measured window) — low-signal by `title_is_low_signal_for_copy`, so
+   `active_session_title_needs_generation` stays true. Generation can never
+   succeed (Interface LLM quota gone, [11.3]; remote rows add their own
+   unreachability), so the need is permanent.
+2. `launch.rs`'s copy-generation `use_effect` subscribes to the WHOLE `state`
+   signal, so it re-runs `maybe_request_copy_generation_for_session` on EVERY
+   state write. Retry not ready ⇒ `schedule_active_title_autogen_retry_tick`
+   ⇒ `safe_shell_mut` inserting into `title_autogen_retry_pending`.
+3. `Signal::with_mut` dirties the root signal EVEN WHEN THE INSERT IS A NO-OP
+   (the tick was already armed) — one full render of the 693-row tree, which
+   re-runs the effect, which re-arms. A render scheduling its own re-render at
+   CPU speed; no `schedule_update` anywhere, hence `forced_wakes: 0`.
+
+App rows (ychrome) are the same trap with the lid soldered shut:
+`session_accepts_generated_copy` is false for them, so a low-signal visible
+title can never clear — the loop is permanent for them, not just quota-deep.
+That is the "worse when using ychrome" half of the report; the WebKit burn is
+page content and not yggterm's to fix.
+
+Fix (the UI-block trace lane): both arming paths peek
+before they write — an already-armed tick, or a repeat failure against a live
+deadline, is a pure read — the same peek-before-write the remote-preview retry
+tick already uses. Recovery is preserved: a tick still fires, and the day a
+title lands `needs_generation` goes false and the scheduling stops. Locked by
+`title_retry_arming_writes_only_on_real_change`: it arms once, then asserts
+the write registry does not move on the re-arm, for the tick path and the
+failure path in sequence (one test, deliberately — the registry tags do not
+name the shell instance, so two parallel tests driving them interleave and
+flake). Both phases fail pre-fix: the tag count moves on the second call.
+
+Adjacent, NOT taken (same `with_mut`-as-read shape, off the hot path today —
+`hydrate_copy` is false in steady state, the autopsy shows no writes there):
+`spawn_active_session_copy_hydration`'s in-flight guard and
+`spawn_title_generation_for_target`'s `title_generation_start` both dirty the
+signal on paths that can return "already". Any future per-render caller of
+either reintroduces this exact storm; the autopsy tag names them in one grep.
+
+**Falsifier:** after the fix deploys to the GUI host, one hour of normal use shows no
+`app_render_storm_autopsy` with `active_title_autogen_retry_schedule` in the
+top mut sites, and `ui/block` back under 1/min with no severe ≥1 s — read by
+`app_version`, never pooled across the roll.
+
 ## ⛔ [11.39] A GUI RESTART LEAVES AN IDLE FULLSCREEN TUI'S VIEWPORT BLANK FOR ~40s — THE "SLOW TERMINAL REVEAL"
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
