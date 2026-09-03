@@ -8467,46 +8467,110 @@ fn terminal_eval_script_with_canvas_renderer(
         // no scrollback to move, so the wheel was dead unless the TUI armed
         // mouse tracking. When the buffer is alternate AND tracking is off,
         // the wheel must TRANSLATE to cursor keys instead of being dropped.
+        //
+        // ⭐ THE GATE'S INPUTS LIVE IN ONE FUNCTION so the wheel-gate probe
+        // witnesses the same computation the gate runs — never a second
+        // encoding of it. A probe that re-derives `kind` beside this function
+        // is how an audit ends up describing a gate that does not exist.
+        const wheelGateState = () => {{
+            // ⭐ [startpage-hijack-D sibling] THE SEED. A fresh mount's
+            // xterm starts on the normal buffer knowing nothing, while the
+            // TUI on the far end of the PTY is still fullscreen — it never
+            // re-says its buffer DECSETs for a client it cannot see. Until
+            // THIS mount witnesses a genuine buffer transition, the kind
+            // recorded by the PREVIOUS mount of this session is the best
+            // available truth; without it the wheel gate stayed closed
+            // after every switch-in (the owner's dead-mouse report).
+            //
+            // ⛔ The seed rules until a GENUINE transition, not until the
+            // first observation. The first version keyed on
+            // `lastObservedBufferKind === null`, but
+            // `trackTerminalVisualState('constructed')` observes 'normal'
+            // on the mount's first frame — the seed died within
+            // milliseconds and the gate never opened (measured live: the
+            // owner still on I-beam after the seed shipped). A live
+            // 'alternate' always wins; otherwise the seed rules while
+            // `bufferTransitionCount === 0`, which is exactly "no genuine
+            // transition witnessed this mount". On suppressed-mouse mounts
+            // no genuine transition can occur (the DECSETs are consumed at
+            // the parser), so the seed correctly persists there.
+            //
+            // ⭐ DAEMON TRUTH OUTRANKS BOTH. The seed above is still
+            // client-observed: on a row whose TUI went fullscreen before ANY
+            // mount existed, every mount observes `normal` and re-seeds
+            // `normal` forever (measured 2026-09-03: the wheel gate closed on
+            // every fresh opencode mount). The daemon's vt100 watched the
+            // PTY since birth — when it says alternate, that is PTY truth.
+            // `lastKnownBufferKindSeed` already carries the daemon verdict:
+            // the mount seeds it with the daemon's answer first.
+            let kind = currentBufferKind();
+            if (
+                kind !== 'alternate'
+                && bufferTransitionCount === 0
+                && lastKnownBufferKindSeed
+            ) {{
+                kind = lastKnownBufferKindSeed;
+            }}
+            const modes = term && term.modes ? term.modes : null;
+            const tracking = String((modes && modes.mouseTrackingMode) || 'none');
+            const gateInputEnabled = Boolean(inputEnabled);
+            const gateOwnsInput = Boolean(hostOwnsActiveTerminalInput());
+            const applies = kind === 'alternate' && tracking === 'none';
+            return {{
+                kind: String(kind || 'unknown'),
+                tracking: tracking,
+                inputEnabled: gateInputEnabled,
+                ownsInput: gateOwnsInput,
+                applies: applies,
+            }};
+        }};
         const alternateScrollApplies = () => {{
             try {{
-                // ⭐ [startpage-hijack-D sibling] THE SEED. A fresh mount's
-                // xterm starts on the normal buffer knowing nothing, while the
-                // TUI on the far end of the PTY is still fullscreen — it never
-                // re-says its buffer DECSETs for a client it cannot see. Until
-                // THIS mount witnesses a genuine buffer transition, the kind
-                // recorded by the PREVIOUS mount of this session is the best
-                // available truth; without it the wheel gate stayed closed
-                // after every switch-in (the owner's dead-mouse report).
-                //
-                // ⛔ The seed rules until a GENUINE transition, not until the
-                // first observation. The first version keyed on
-                // `lastObservedBufferKind === null`, but
-                // `trackTerminalVisualState('constructed')` observes 'normal'
-                // on the mount's first frame — the seed died within
-                // milliseconds and the gate never opened (measured live: the
-                // owner still on I-beam after the seed shipped). A live
-                // 'alternate' always wins; otherwise the seed rules while
-                // `bufferTransitionCount === 0`, which is exactly "no genuine
-                // transition witnessed this mount". On suppressed-mouse mounts
-                // no genuine transition can occur (the DECSETs are consumed at
-                // the parser), so the seed correctly persists there.
-                let kind = currentBufferKind();
-                if (
-                    kind !== 'alternate'
-                    && bufferTransitionCount === 0
-                    && lastKnownBufferKindSeed
-                ) {{
-                    kind = lastKnownBufferKindSeed;
-                }}
-                if (kind !== 'alternate') {{
-                    return false;
-                }}
-                const modes = term && term.modes ? term.modes : null;
-                const tracking = String((modes && modes.mouseTrackingMode) || 'none');
-                return tracking === 'none';
+                return Boolean(wheelGateState().applies);
             }} catch (_error) {{
                 return false;
             }}
+        }};
+        // The wheel-gate probe (Issue 31 follow-up): witness the gate's
+        // DECISION with its inputs, on change per mount. Content-free —
+        // buffer kind, tracking mode, two booleans, the verdict. A wheel
+        // that scrolls scrollback on a fullscreen TUI arrives here as
+        // `scrollback` with the closed rail visible, instead of as a mystery
+        // the owner has to report.
+        let lastWheelGateWitness = null;
+        const witnessWheelGate = (inHost) => {{
+            try {{
+                const state = wheelGateState();
+                let decision = 'ignored';
+                if (state.applies && state.inputEnabled && state.ownsInput && inHost) {{
+                    decision = 'translate';
+                }} else if (state.ownsInput && inHost) {{
+                    decision = 'scrollback';
+                }}
+                const signature = decision + '|' + state.kind + '|' + state.tracking
+                    + '|' + (state.inputEnabled ? '1' : '0') + '|' + (state.ownsInput ? '1' : '0');
+                if (signature === lastWheelGateWitness) {{
+                    return;
+                }}
+                lastWheelGateWitness = signature;
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].lastWheelGate = {{
+                        decision: decision,
+                        kind: state.kind,
+                        tracking: state.tracking,
+                        inputEnabled: state.inputEnabled,
+                        ownsInput: state.ownsInput,
+                    }};
+                }}
+                sendTerminalEvent({{
+                    kind: 'wheel_gate',
+                    decision: decision,
+                    buffer_kind: state.kind,
+                    tracking: state.tracking,
+                    input_enabled: state.inputEnabled,
+                    owns_input: state.ownsInput,
+                }});
+            }} catch (_error) {{}}
         }};
         const shouldHandleWheel = (event) => {{
             if (!event || !hostOwnsActiveTerminalInput()) {{
@@ -8645,6 +8709,10 @@ fn terminal_eval_script_with_canvas_renderer(
             event.stopPropagation();
         }};
         term.attachCustomWheelEventHandler((event) => {{
+            try {{
+                const wheelTarget = event ? event.target : null;
+                witnessWheelGate(Boolean(wheelTarget && host.contains(wheelTarget)));
+            }} catch (_error) {{}}
             if (terminalOwnsWheelInput()) {{
                 return true;
             }}

@@ -25923,3 +25923,34 @@ re-arming retry that does not depend on the poll thread. Until then every
 forced-swap linger needs the hand-resolution protocol: verify the named rows
 on live PTYs, archive the record to scratchpad, trace
 `hot_restart_repair_expired_resolved_manually`, remove.
+
+## ⛔ [11.44-followup] THE WHEEL GATE'S SEED IS CLIENT-OBSERVED-ONLY — `normal` SELF-PERPETUATES ON PRE-MOUNT FULLSCREEN TUIS (the owner's "thinks it's a plain shell")
+
+**Status:** FIX ON `lane/dev/wheel-gate-truth-seed`, LIVE PROOF OWED.
+
+**FOURTH READING, 2026-09-03 (owner played + reported; probes + code read).**
+Wheel dead, drag-select/middle-paste work, TUI chrome copied as text on all
+four opencode rows. mouse_mode_probe (live GUI trace): 1003+1006 armed,
+suppressed:true — the suppression half works as designed. The trace's
+js_debug: the wheel takes scrollback_intent/PromptFollow — the PLAIN-SHELL
+branch — while tracking is none, so `alternateScrollApplies()` is false on
+`kind`. Root: the seed (`terminal_last_buffer_kinds`, fed ONLY by
+client-observed HostHealth buffer_kind of the previous mount). A fresh xterm
+never receives 1049 — the TUI went fullscreen before the mount, and
+suppressed-mouse mounts witness no transitions — so kind stays normal,
+HostHealth records normal, the next mount seeds normal. The daemon KNOWS the
+PTY is fullscreen (its vt100 saw 1049 at birth) and never told the mount.
+
+**Repair (this lane):** `TerminalManager::session_in_alternate_screen` (vt100
+`alternate_screen()`, load-bearing fact locked by
+`the_daemon_vt100_reports_the_alternate_screen_it_was_fed`), rides the
+snapshot as `pty_in_alternate_screen` (serde-defaulted, carried through both
+shell projections), and the mount seed prefers daemon truth
+(`prefer_daemon_buffer_seed`: daemon-true wins, daemon-silence falls through,
+fail-open toward the gate). **Probe:** the wheel handler witnesses its own
+decision (`cli/wheel_gate`: decision/kind/tracking/inputEnabled/ownsInput,
+transition-only per mount, trace + ytrace bus) through one witnessed
+`wheelGateState()` the gate delegates to — never a second encoding.
+
+**Falsifier:** fresh opencode mount → first wheel emits `translate` with
+kind=alternate; wheel scrolls the conversation; scrollback_intent goes quiet.

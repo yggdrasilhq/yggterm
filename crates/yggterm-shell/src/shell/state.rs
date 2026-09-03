@@ -18800,6 +18800,7 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         // had gone deaf and the human still unable to see it — the exact gap
         // this signal exists to close.
         input_unanswered_ms: session.input_unanswered_ms,
+        pty_in_alternate_screen: session.pty_in_alternate_screen,
         agent_launch_options: Default::default(),
     }
 }
@@ -18866,6 +18867,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         // had gone deaf and the human still unable to see it — the exact gap
         // this signal exists to close.
         input_unanswered_ms: session.input_unanswered_ms,
+        pty_in_alternate_screen: session.pty_in_alternate_screen,
         agent_launch_options: Default::default(),
     }
 }
@@ -28982,6 +28984,32 @@ impl ShellState {
         self.terminal_last_buffer_kinds
             .get(session_path)
             .cloned()
+    }
+
+    /// The buffer-kind seed a fresh mount opens with: the DAEMON's fullscreen
+    /// verdict first, the client's last record second.
+    ///
+    /// A fresh xterm starts on the normal buffer knowing nothing, and a TUI
+    /// that went fullscreen before the mount never re-says its buffer DECSETs
+    /// for a client it cannot see — so the client's record reads `normal` on
+    /// exactly the rows that need `alternate`, and re-seeds `normal` across
+    /// remounts (measured 2026-09-03: the wheel gate stayed closed on every
+    /// fresh opencode mount). The daemon's vt100 watched the PTY since birth;
+    /// when it says alternate, that is PTY truth, not a guess. `None` from
+    /// the daemon is honest unknown (no live screen here) and falls through
+    /// to the client's record rather than overriding it with nothing.
+    fn mount_buffer_kind_seed(&self, session_path: &str) -> Option<String> {
+        let wanted = normalize_live_session_path(session_path);
+        let daemon_alternate = self
+            .server
+            .live_sessions()
+            .iter()
+            .find(|session| normalize_live_session_path(&session.session_path) == wanted)
+            .and_then(|session| session.pty_in_alternate_screen);
+        prefer_daemon_buffer_seed(
+            daemon_alternate,
+            self.last_known_terminal_buffer_kind(session_path),
+        )
     }
 
     fn apply_snapshot_result_without_request(
@@ -43797,8 +43825,21 @@ fn session_cwd_for_managed_session(session: &ManagedSessionView) -> Option<Strin
         .map(|entry| entry.value.clone())
         .or_else(|| session.ssh_target.clone())
 }
-fn remember_session_title_override(shell: &mut ShellState, session_path: &str, title: &str) {
-    let trimmed = title.trim();
+/// Pure preference order for the mount buffer-kind seed: daemon PTY truth
+/// outranks the client's last record; daemon silence (`None`) falls through
+/// to the record rather than overriding it with nothing. Split out so the
+/// rule is testable without a running GUI.
+pub(crate) fn prefer_daemon_buffer_seed(
+    daemon_alternate: Option<bool>,
+    client_record: Option<String>,
+) -> Option<String> {
+    if daemon_alternate == Some(true) {
+        return Some("alternate".to_string());
+    }
+    client_record
+}
+
+fn remember_session_title_override(shell: &mut ShellState, session_path: &str, title: &str) {    let trimmed = title.trim();
     if trimmed.is_empty() {
         shell.session_title_overrides.remove(session_path);
         return;

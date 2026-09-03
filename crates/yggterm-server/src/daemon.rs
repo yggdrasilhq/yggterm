@@ -6321,6 +6321,13 @@ impl DaemonRuntime {
             session.pty_cols = Some(cols);
             session.pty_rows = Some(rows);
         }
+        // The daemon's fullscreen verdict for this PTY, read off the vt100
+        // parser that watched it since birth. Rides the snapshot so a fresh
+        // client mount seeds its buffer kind from PTY truth instead of from
+        // what the previous mount happened to observe (which, on a row whose
+        // TUI went fullscreen before any mount existed, is `normal` forever).
+        session.pty_in_alternate_screen =
+            self.terminals.session_in_alternate_screen(&runtime_path);
         // Every kind with a LOCAL screen worth scraping: a plain shell plus
         // every agent CLI. Registry-derived, because the hand-list it replaced
         // is the shape a new CLI silently drops out of — and dropping out here
@@ -31142,6 +31149,7 @@ mod tests {
             ssh_prefix: None,
             pty_cols: None,
             pty_rows: None,
+            pty_in_alternate_screen: None,
             working: None,
             limit_wait: false,
             awaiting_user_choice: false,
