@@ -75,8 +75,25 @@ fn main() {
             );
             let _ = w.flush();
             let mut seen = 0u64;
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while std::time::Instant::now() < deadline {
+            // --winch-secs N caps the witness window (default 30, the
+            // pipeline tests' shape). 0 = NO deadline: the witness sleeps
+            // until SIGWINCH or stdin closes — the only usable shape for the
+            // LIVE [11.39] falsifier, where the row must sit idle for
+            // minutes before a fresh client mounts it. Measured 2026-09-05:
+            // the hardcoded 30s deadline retired the witness before the
+            // falsifier's mount ever happened (three dead-witness mounts).
+            let winch_secs: u64 = arg_value(&args, "--winch-secs")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            let deadline = if winch_secs == 0 {
+                None
+            } else {
+                Some(std::time::Instant::now() + Duration::from_secs(winch_secs))
+            };
+            while deadline
+                .map(|d| std::time::Instant::now() < d)
+                .unwrap_or(true)
+            {
                 let count = WINCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
                 if count != seen {
                     seen = count;
