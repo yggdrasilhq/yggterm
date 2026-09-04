@@ -963,6 +963,12 @@ pub enum CliLaunchContractBreach {
     SesGuardDegrade,
     StoreAbsentRebirth,
     ServiceVouchedResume,
+    /// The cold-restore candidate (Issue Heading 35): a STAMPLESS anchor's
+    /// resume vouches to the newest store session for the row's cwd — a
+    /// HEURISTIC (N-windows-one-cwd cannot be disambiguated from a birth
+    /// uuid), emitted as its own kind so the pane and the probe name the
+    /// guess instead of passing it off as focus truth.
+    StoreCandidateResume,
 }
 
 impl CliLaunchContractBreach {
@@ -971,6 +977,7 @@ impl CliLaunchContractBreach {
             Self::SesGuardDegrade => "ses_guard_degrade",
             Self::StoreAbsentRebirth => "store_absent_rebirth",
             Self::ServiceVouchedResume => "service_vouched_resume",
+            Self::StoreCandidateResume => "store_candidate_resume",
         }
     }
 }
