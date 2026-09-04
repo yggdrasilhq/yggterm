@@ -355,16 +355,27 @@ by failed resizes.
 
 ## ⛔ [11.51] VIDEO PLAYS WITH PERFECT MEDIA STATS AND A HOLE-RIDDEN COMPOSITOR CADENCE — "STATS FOR NERDS SHOWS NOTHING BUT IT STUTTERS"
 
-**Status:** OPEN
+**Status:** RESOLVED FOR NOW - LIVE-QUIET
 
 Observability shipped on `lane/trace/webview-frame-cadence`
 (`media/playback_window` now carries `raf_fps`/`raf_p50_ms`/`raf_p95_ms`/
-`raf_max_ms`/`raf_over_25`/`raf_blind`); **FIRST REMEDY UNIT SHIPPED on
-`lane/trace/media-playback-gate`** — the stall attribution below was measured
+`raf_max_ms`/`raf_over_25`/`raf_blind`); remedy units SHIPPED: the
+media-playback gate (`lane/trace/media-playback-gate`) — the stall attribution below was measured
 with the block/render traces (whole-root `component_window` renders of 85–522 ms
 inside the holes, `terminal_app_declares` dispatch bursts of 4–11 RPCs in one
 instant), and remedy (a)'s first cut is the media-playback gate: the background
 live-session snapshot refuses to fetch and refuses to apply while a surface is
+
+RESOLVED-FOR-NOW EVIDENCE (2026-09-04 morning): the batch ask shipped
+(`lane/trace/batch-declare-ask`, 3.2.57+) - live: 2079/2104
+daemon_declare_absent events carry via=batch, the singles collapsed from
+~35/min to one batched ask per tick, and the user GUI recorded ZERO
+ui/block events in the hour after rotating onto the build (down from a
+6/min thrash storm). The ui/policy refetch loop named here earlier did
+NOT reproduce post-storm (11 fetches/8h = normal cadence; a storm
+symptom, not an independent defect - re-open only if the signature
+returns). STILL OPEN if the storm returns: the batch ask runs once per
+2.5s tick whenever any row is due; remedies (b)/(c) below.
 presenting frames (`media/playback_window` with `presented > 0` renews a
 rolling atomic deadline, the input-hot gate's exact shape), bounded at one
 apply per 15 s so continuous playback cannot starve row state. Falsifier below
