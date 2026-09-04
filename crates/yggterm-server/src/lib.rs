@@ -11226,8 +11226,52 @@ impl YggtermServer {
             anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
         }
         if saved_session_exists {
-            let external_processes =
+            let mut external_processes =
                 external_agent_resume_processes_for_session(kind, session_id);
+            // THE STRANDED-ORPHAN REAP, one level up (the B2 doctrine the
+            // resume wrapper already lives by): a holder that is PROVABLY
+            // OURS (its environ marker names this session) AND orphaned to
+            // init (ppid 1 — its terminal and owning daemon are both gone)
+            // can never be observed by anyone again, and its transcript is
+            // already in the session file, so ending it loses the
+            // conversation nothing. The wrapper reaps this corpse inside
+            // its wait (`external_active_wait_recovered_stranded_orphan`);
+            // the ensure used to refuse outright, so a GUI row-open
+            // against a handover-lost runtime (the [11.57] class) stayed
+            // broken until a human ran the kill the wrapper would have
+            // run. Reap here under the SAME predicate, bounded: one
+            // SIGTERM round, one short yield, one rescan — anything still
+            // alive, and every EXTERNAL holder, still refuses exactly as
+            // before. Never an unconditional kill, never a wait long
+            // enough to hold the request loop.
+            #[cfg(target_os = "linux")]
+            if !external_processes.is_empty()
+                && stranded_orphan_holders_recoverable(&external_processes)
+            {
+                let pids = external_processes
+                    .iter()
+                    .map(|process| process.pid)
+                    .collect::<Vec<_>>();
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "remote_runtime",
+                        "external_stranded_orphan_reaped_by_ensure",
+                        json!({
+                            "session_id": session_id,
+                            "pids": pids,
+                            "policy": "stranded_orphan_holders_block_no_one",
+                        }),
+                    );
+                }
+                for pid in &pids {
+                    terminate_linux_process_tree(*pid);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                external_processes =
+                    external_agent_resume_processes_for_session(kind, session_id);
+            }
             if !external_processes.is_empty() {
                 if let Ok(home) = resolve_yggterm_home() {
                     append_trace_event(
@@ -34515,6 +34559,47 @@ mod tests {
         assert!(
             emit_start > failed_emit,
             "the verdict must not precede the per-attempt failed emits"
+        );
+    }
+
+    /// ⛔ THE ENSURE REAPS STRANDED ORPHANS BEFORE REFUSING. The [11.57] cure
+    /// was done by hand: a handover-lost runtime's own CLI sat orphaned to
+    /// init (its PTY reader dead), the ensure's external-holder guard
+    /// refused to spawn over it — correctly, for an EXTERNAL holder — and a
+    /// human had to run the kill the resume wrapper's B2 branch would have
+    /// run. The ensure now applies the SAME predicate
+    /// (`stranded_orphan_holders_recoverable`: provably ours AND ppid 1)
+    /// and the SAME remedy (terminate the process tree, rescan once,
+    /// bounded) before its refusal. An external holder, or anything that
+    /// survives the reap, still refuses with the same named message.
+    #[test]
+    fn the_ensure_reaps_stranded_orphan_holders_before_refusing() {
+        let source = include_str!("lib.rs");
+        let fn_start = source
+            .find("    fn ensure_remote_runtime_agent_session(")
+            .expect("ensure_remote_runtime_agent_session must exist");
+        let body_len = source[fn_start..]
+            .find("\n    fn ")
+            .expect("the ensure is followed by another fn");
+        let body = &source[fn_start..fn_start + body_len];
+        assert!(
+            body.contains("stranded_orphan_holders_recoverable(&external_processes)"),
+            "the ensure must consult the stranded-orphan predicate before refusing"
+        );
+        let reap = body
+            .find("external_stranded_orphan_reaped_by_ensure")
+            .expect("the reap must be traced by name");
+        let refuse = body
+            .find("external_active_refused_runtime_spawn")
+            .expect("the refusal trace must remain");
+        assert!(
+            reap < refuse,
+            "the reap must precede the refusal - anything that survives it \
+             still refuses"
+        );
+        assert!(
+            body.contains("remote_resume_external_active_message"),
+            "the refusal message must remain for holders the reap did not clear"
         );
     }
 
