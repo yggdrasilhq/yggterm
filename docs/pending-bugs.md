@@ -121,6 +121,42 @@ surface-materializing verb (`web ensure` and friends) is a MUTATING verb on
 the active client and belongs in the shadow-law's table of probes that must
 name their target.
 
+## ⛔ [11.54] EVERY GUI BIRTH BLOCKS 5-12 SECONDS ON THE AGENT-STORE WALK BEFORE THE WINDOW EXISTS — THE TREE SEED PAID FOR THE WHOLE SCAN
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Measured on the gui host, 2026-09-04/05 births: `startup/load_browser_tree`
+spans of **5.15 s and 6.22 s** (and 9-12 s on busier days — `cli/scan_total`
+8.98 s and 12.03 s on the 09-04 04:33 birth) sit ON the synchronous startup
+path: `main()` ran `store.load_codex_tree(&settings)` — the full unified walk
+of every agent store (`~/.codex`, `~/.claude`, …: `scan_all_durable_sessions`)
+— before `resolve_client_daemon_endpoint`, `warm_daemon_start`, the window, or
+any presentation. A `placeholder_session_tree` was already built one line
+earlier and thrown away, and the shell already owned the entire deferred shape
+for the load-error case (`browser_tree_loaded=false` ->
+`browser_tree_loading_in_flight` -> `spawn_initial_browser_tree_load`:
+spawn_blocking load, selection restore, render epoch, UI schedule) — the happy
+path just never used it. This is the felt half of the owner's kill-and-reopen
+class: a reopened GUI paid the whole scan before its first pixel. (The OTHER
+half, the ~3.3 s ui/block at birth, is the WebKit webview build — [11.36]
+family; this entry owns the scan.)
+
+**Fix (lane `lane/trace/instant-browser-tree-seed`):** the startup seeds the
+placeholder (`browser_tree_loaded=false`) unconditionally and lets the
+existing background loader do the walk — the window presents immediately and
+the real tree swaps in with selection restored. The
+`startup/load_browser_tree` span disappears from births;
+`startup/initial_browser_tree_load` (already the background loader's span)
+becomes its always-on replacement.
+
+**Falsifier:** on the next GUI birth, `startup/load_browser_tree` is ABSENT
+from the startup trace, `startup/initial_browser_tree_load` appears with
+`ok:true` a few seconds after launch (in the background), and the first
+`dioxus_render/component_window` lands seconds earlier than the previous
+births' pattern; the start page shows the loading state until the swap, and
+`restore_browser_tree`'s selection restore still lands on the row the user
+had active.
+
 ## ⛔ [11.53] THE PAINT-DEMAND WATCHDOG RESCUED ONE IDLE ROW EVERY SECOND FOR AN HOUR — THE DEMAND IT WAS RESCUING WAS NEVER SERVED
 
 **Status:** OPEN
