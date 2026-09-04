@@ -97,16 +97,11 @@ verified, and the file's own law is that a verified-fixed entry is
 DELETED in the same commit as its verified fix — a deletion this seat
 cannot do without asserting a verification it did not repeat:
 
-- `[11.31]` — "**Status:** FIXED — LIVE PROOF IN (2026-09-04 ~22:30, the
-  gui host, v3.2.56)" — proving lane `lane/trace/media-playback-gate`
-  family (switch-back cold-remount).
-- `[arm-matrix-red]` — "**Status:** FIXED 2026-09-02 on
-  `lane/dev/mirror-tick-rebind`" — the opencode integration lane.
-
-Delete both, narrative to the archive if wanted, and this gate goes
-green. Found red on pristine main (83af34cb5) before the vendor lane
-touched anything; the vendor lane only made the existing red VISIBLE in
-its full-suite run.
+Both are now gone, each deleted in the commit that carried its repeated
+verification: `[11.31]` with the live proof in `e17b08737` (2026-09-04),
+`[arm-matrix-red]` with the test re-run green on main (`every_arm_builds_
+the_invocation_its_descriptor_declares`, 1 passed, 2026-09-05). Gate
+green again.
 
 ## ⛔ [11.54] THE INSTALL-PROMOTION TEST ONLY PASSES ON HOSTS WITHOUT A LIVE INSTALL — THE HOME FALLBACK MAKES ITS "UNMANAGED" PREMISE FALSE
 
@@ -305,7 +300,7 @@ fixed and a stranded demand is observed to clear.
 
 ## ⛔ [11.51] VIDEO PLAYS WITH PERFECT MEDIA STATS AND A HOLE-RIDDEN COMPOSITOR CADENCE — "STATS FOR NERDS SHOWS NOTHING BUT IT STUTTERS"
 
-**Status:** RESOLVED FOR NOW - LIVE-QUIET
+**Status:** OPEN
 
 Observability shipped on `lane/trace/webview-frame-cadence`
 (`media/playback_window` now carries `raf_fps`/`raf_p50_ms`/`raf_p95_ms`/
@@ -26822,21 +26817,6 @@ it lacks yggterm's wave-1 disk-replacement retire law; and the picker's
 orphaned-listener design means a mid-pick app death always strands the
 webview on a dead interstitial by construction.
 
-## ⛔ [arm-matrix-red] THE ARM MATRIX RAN RED ON EVERY HOST SINCE THE ses_ GUARD — OPENCODE'S ARM EXERCISED AN ID SHAPE ITS SERVICE REFUSES
-
-**Status:** FIXED 2026-09-02 on `lane/dev/mirror-tick-rebind`.
-
-`every_arm_builds_the_invocation_its_descriptor_declares` asserted OpenCode's
-resume composes `opencode2 --session '<id>'` — with
-`ARM_SESSION_ID = 11111111-…` (a uuid). The ses_ guard (70329d66b, "never
-compose a resume with a non-ses_ id — degrade to a fresh launch") deliberately
-degrades exactly that shape, so the assertion has been red on every host since
-that commit landed (`opencode2 '--auto'` — measured on dev main f6b1c5f88
-before this lane). The arm's contract is what the CLI ACTUALLY accepts:
-`arm_resume_session_id(kind)` now gives the OpenCode arm a ses_-shaped fixture
-id, every other arm keeps the uuid. `locality_does_not_fork_the_invocation`
-uses the same helper, so the local/remote twin comparison stays symmetric.
-
 ## ⛔ [managed-remove-ambient] THE MANAGED-CLI REMOVAL TESTS READ THE HOST'S PATH — RED WHEREVER QWEN IS INSTALLED
 
 **Status:** OPEN
@@ -26892,7 +26872,9 @@ divergence signature (order vs map), no debugger needed.
 
 ## ⛔ [resume-external-holder-scan] RESUME COMPOSES AGAINST A TRANSCRIPT AN ORPHANED CODEX PROCESS STILL WRITES — CODEX REFUSES -32600
 
-**Status:** GUARD FIXED 2026-09-05 on `lane/trace/resume-holder-guard` — the scan was argv-only, and an interactive TUI holds its transcript purely by fd (its argv never names the session), so exactly that holder class was invisible. The scan now also walks /proc fds for any open path carrying the session id (transcript or writer lock), classifies the holder as before (environ marker / ancestry), and the existing wait + named banner (`orphaned process … kill <pid>`) covers it. Generic across CLIs — the scan is kind-parameterised and the fd arm is id-based. What stays open: making the WAIT reflexive for a live working holder (today it still waits out the 120 s deadline before naming the kill command).
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The guard fix landed on `lane/trace/resume-holder-guard` (2026-09-05): the scan was argv-only, and an interactive TUI holds its transcript purely by fd (its argv never names the session), so exactly that holder class was invisible. The scan now also walks /proc fds for any open path carrying the session id (transcript or writer lock), classifies the holder as before (environ marker / ancestry), and the existing wait + named banner (`orphaned process … kill <pid>`) covers it. Generic across CLIs — the scan is kind-parameterised and the fd arm is id-based. What stays open: making the WAIT reflexive for a live working holder (today it still waits out the 120 s deadline before naming the kill command).
 
 Measured twice live (screenshots, GUI host): a row whose bound id named a
 transcript held by ANOTHER, still-alive codex process composed
