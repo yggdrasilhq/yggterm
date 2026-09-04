@@ -10939,6 +10939,48 @@ console.log('ok');
     /// plausibly an input-block source, and that trade belongs to the input-block
     /// lane. Serving the demand a second after typing stops is the whole
     /// difference between "deferred" and "stranded".
+
+    /// ⛔ THE PAINT FUNNEL MUST NOT SPIN BEHIND A HIDDEN WINDOW. A hidden
+    /// window's rAF never fires, so a rescue-registered frame stays pending
+    /// forever, the recovery timers chain into a spin, and the demand
+    /// watchdog drums one rescue event per second for as long as the window
+    /// stays hidden — measured 1622 events / 57 min against an 18.5-minute
+    /// hidden period, the demand served the moment the window returned.
+    /// The funnel defers hidden windows (latch kept, no frames, no timers,
+    /// one trace per hidden period) and the demand watchdog stays silent
+    /// while hidden.
+    #[test]
+    fn the_visible_paint_funnel_defers_hidden_windows_without_spinning() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let funnel_ix = script
+            .find("const requestVisiblePaint = (forceFullRefresh = false) => {")
+            .expect("the paint funnel must exist");
+        let funnel = &script[funnel_ix..funnel_ix + 6000];
+        assert!(
+            funnel.contains("if (document.hidden) {"),
+            "the funnel must consult document.hidden before registering any frame              — a hidden window's rAF never fires and the funnel spins instead"
+        );
+        assert!(
+            funnel.contains("visible_paint_demand_hidden_defer"),
+            "the hidden defer must be visible in the trace exactly once per \
+             hidden period, not once per second"
+        );
+        assert!(
+            funnel.find("if (document.hidden) {").unwrap()
+                < funnel.find("requestAnimationFrame(").unwrap(),
+            "the hidden guard must sit BEFORE the rAF registration"
+        );
+        let watchdog_ix = script
+            .find("const visiblePaintDemandWatchdog")
+            .expect("demand watchdog present");
+        let body = &script[watchdog_ix..watchdog_ix + 1400];
+        assert!(
+            body.contains("if (document.hidden) { return; }"),
+            "the demand watchdog must stay silent while the window is hidden"
+        );
+    }
+
     #[test]
     fn terminal_eval_script_serves_a_stranded_full_refresh_demand() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
