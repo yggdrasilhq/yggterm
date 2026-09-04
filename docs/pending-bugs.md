@@ -26807,3 +26807,28 @@ id, holder_pid, lock_path}` at refusal, `cfg(not(test))`-gated.
 **Falsifier:** with a second codex process holding thread-writer-locks/<id
 >.lock, composing a resume for <id> must refuse within one second with the
 holder pid named — never surface codex's raw -32600.
+
+## ⛔ [identity-stale-metadata] EXHAUSTED ROWS FREEZE POISONED IDENTITY METADATA — NO PATH BACK TO THE BIRTH ID
+
+**Status:** OPEN (filed 2026-09-05 ~01:05, lane `lane/trace/agent-identity-reach`).
+
+The 00:21 flip-flop (pid-recycling collapse, fixed in the same lane) left
+three GUI-host rows bound to a transcript id (01a06d75) that belongs to
+none of them; their attempt budgets then exhausted, which stops the churn
+but also freezes the poisoned `Codex Session` metadata — the rail keeps
+advertising the wrong transcript and resume keeps hitting the live writer
+lock (-32600) even though the identity plane is now clean. The safe end
+state for a row with a drifted id and NO owner-vouched alias is the birth
+id: resume degrades to a fresh launch, the display stops lying, and the
+first truthful stamp rebinds it exactly.
+
+**Named next unit:** in the identity poll, when a repair-signature row
+(path carries the birth) finds no alias and its attempts exhaust, revert
+the row to its path-carried birth id and clear the stale `Codex Session`
+metadata (one named trace: `cli/agent_identity_reset_to_birth`). Owner
+workaround until then: close the affected rows — their real conversations
+live in other rows and a fresh spawn binds exactly.
+
+**Falsifier:** a row frozen on a wrong id with no alias must, within one
+poll of exhausting, show its birth id in `server app rows` and resume as a
+fresh launch; the stale id appears nowhere.
