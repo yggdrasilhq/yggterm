@@ -3542,15 +3542,17 @@ fn identity_poll_process_row(
         return;
     }
     // Healthy birth: the row still answers on its synthesized id.
-    // Repair: a previous poll already moved the id to a real CLI id —
-    // possibly a WRONG one (see the collapse note on `birth_id`).
-    // Such a row must stay pollable or the wrong id is permanent; the
-    // path still carries the birth id, so expose it for the alias join.
+    // Repair: the id no longer matches the path the row was born with. A
+    // previous poll may have moved it to a real CLI id (possibly a WRONG
+    // one — see the collapse note on `birth_id`), and an update-restart
+    // restore may have re-birthed it onto a FRESH synthesized id (measured
+    // live on the GUI host: the damaged rows answered on a third uuid4
+    // that is neither the path birth nor any real transcript id). Either
+    // way the path still carries the birth id, so expose the row for the
+    // alias join; without this the wrong or orphaned id is permanent.
     let birth_id = if path_session_id == session.id {
         None
-    } else if looks_like_synthesized_uuidv4_session_id(&path_session_id)
-        && !looks_like_synthesized_uuidv4_session_id(&session.id)
-    {
+    } else if looks_like_synthesized_uuidv4_session_id(&path_session_id) {
         Some(path_session_id.to_string())
     } else {
         excluded.push((key.to_string(), "path_id_neither_birth_nor_matched"));
@@ -48123,6 +48125,57 @@ terminal_window_id: None,
             "an order-lost row must stay reachable; targets={targets:?}"
         );
         assert_eq!(mine.unwrap().current_id, birth);
+    }
+
+    /// Measured live on the GUI host after the cascade: a damaged row can
+    /// answer on a THIRD synthesized id — a re-birth that is neither the
+    /// path birth nor a real transcript id. It must still repair through
+    /// the path-carried birth alias.
+    #[test]
+    fn re_birthed_row_repairs_through_the_path_birth_alias() {
+        let birth = "31d35e27-d6a3-4bd4-986e-3f798a7a9d7a";
+        let rebirth = "44444444-4444-4444-8444-444444444444";
+        let real = "019f5a3c-9b21-7e44-8c11-2f6d8a90e3b7";
+        let runtime_key = remote_scanned_session_path("dev", birth);
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.clone(),
+            id: rebirth.to_string(),
+            title: "re-birthed".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/gh/yggterm".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        let live = server.sessions.get_mut(&runtime_key).expect("mounted");
+        upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
+        // The re-birth on the live host happens AFTER restore (the ensure
+        // funnel re-mints the id when the old runtime is gone), so overwrite
+        // it the way the live daemon ended up: a fresh synthesized id that
+        // is neither the path birth nor a real transcript id.
+        live.id = rebirth.to_string();
+        let (targets, _bound, _excluded) = server.live_remote_agent_identity_poll_view();
+        let mine = targets.iter().find(|t| t.key == runtime_key);
+        assert!(mine.is_some(), "re-birthed row must stay pollable");
+        assert_eq!(mine.unwrap().birth_id.as_deref(), Some(birth));
+        // The matcher half (birth_key_alias repair) is covered by
+        // damaged_row_repairs_through_the_path_carried_birth_alias in the
+        // daemon tests.
+        let _ = real;
     }
 
     /// The other half of the divergence made loud: an order entry naming a
