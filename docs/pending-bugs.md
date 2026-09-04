@@ -26964,3 +26964,48 @@ for as long as it owns the foreground.
 
 **Code location:** the tenants walker behind `server terminal tenants`
 (foreground pgrp resolution).
+
+## ⛔ [11.60] A ROW'S OWN OUTPUT MINTS A GUI WEBVIEW — THE APP-DECLARE PLANE AUTHENTICATES SHAPE, NOT PROVENANCE (live adversarial audit, 2026-09-05)
+
+**Status:** OPEN
+
+Found during a scheduled adversarial pass against the live 3.2.61 fleet
+(2026-09-05 ~04:50-05:00, full log in journal-papers/ytrace notes). Every step
+measured in ytrace:
+
+1. A **plain shell row** (spawned `--no-activate`) printed
+   `\x1b]7717;web-surface;open;<base64 json>\x07` from `printf` — payload
+   naming the row's own session path and an attacker-chosen URL. Raw JSON is
+   refused at parse (the base64 shape gate is real; first-round forgeries were
+   `osc_witness`ed but not ingested).
+2. `app_declare_ingested {action: open, verb: web-surface,
+   retained_verbs: [web-surface]}` — the daemon RETAINED the forged open; a
+   forged `heartbeat` was also retained (keep-alive poisoning works too).
+3. **8 seconds later, passively, no user action, no ensure call:**
+   `daemon_declare_rebuild {url: <attacker url>, declare_action: heartbeat}` →
+   `web_surface/open {action: daemon_declare_rebuild}` — the restore tick
+   materialized a real GUI webview to the attacker URL. `policy_gate:
+   "absent"` did not gate the passive rebuild (the 8 s policy await exists
+   only on the explicit `ensure` path).
+4. The dead-URL page then went corpse and `restore_tick_corpse_reload` fired —
+   the [11.58] corpse arm observed live for the first time, driven by the
+   attack itself.
+
+**Why OPEN:** the declare plane reads a SHARED PTY, so byte-level provenance is
+inherently unattributable — but the consumer side currently requires nothing
+else before materializing. A row running an untrusted script can therefore mint
+a browser surface pointing anywhere, on a row the user never opened — a
+phishing/spoofing primitive whose only cost is one printf.
+
+**Fix shape (to design):** (a) ingest web-surface `open` only when the row's
+process tree matches an app-capable kind (a plain shell declaring is itself the
+signal); (b) the PASSIVE rebuild path must demand independent corroboration —
+the control endpoint answering (`policy_gate: ready`) — before building,
+not just the explicit `ensure` path; (c) an "appeared without open"
+user-visible indication for surfaces nobody opened.
+
+Context planes that HELD the same audit (do not re-attack blindly): the server
+wire plane mutes all malformed input and actively disconnects floods; the
+ytrace socket is a request plane that refuses injection (0 spoofed events
+landed); resource floods (row churn, 100 KB keystrokes, 30 parallel CLIs,
+resize storms) left the user's GUI with zero ui/block events.
