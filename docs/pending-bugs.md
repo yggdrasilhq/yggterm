@@ -18,6 +18,32 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.54] THE INSTALL-PROMOTION TEST ONLY PASSES ON HOSTS WITHOUT A LIVE INSTALL — THE HOME FALLBACK MAKES ITS "UNMANAGED" PREMISE FALSE
+
+**Status:** OPEN
+
+`cargo test -p yggterm-core --lib` red on dev, verified identical on
+pristine main (83af34cb5, 2026-09-04) — pre-existing, not brought by the
+wry 0.56.1 vendor lane, and unACKed until this entry:
+
+`install::tests::promote_direct_install_active_version_is_noop_without_managed_install`
+panics `unmanaged install should report false`
+(`crates/yggterm-core/src/install.rs:2077`).
+
+Mechanism: the test creates a bare exe under a fresh `/tmp` dir and
+expects `promote_direct_install_active_version` to report it unmanaged.
+But with `ENV_YGGTERM_DIRECT_INSTALL_ROOT` unset (the test's own guard
+insists on that), the finder takes the `resolve_yggterm_home()` fallback
+(`install.rs:557`) — the state file's canonical home is not an ancestor
+of the binary, so a `~/.yggterm/install-state.json` on ANY live-install
+host answers `Some`, the promote runs, and the assert dies. dev is such
+a host; every fleet seat likely is. This is the
+test-reads-ambient-host-state family
+([[finding-a-test-that-reads-ambient-host-state-is-not-flaky]]): the fix
+is for the test to point the env override at the temp root it created
+(or drive `find_direct_install_state_scoped` with `home_fallback: None`),
+not to weaken the finder.
+
 ## ⛔ [11.50] THE GUI RESTART-LOOPED ON A SAME-VERSION DAEMON_PENDING FOR FIVE MINUTES — EVERY RESPAWN RE-ARMED THE TRIGGER, AND A DEAD STDERR PIPE PANICKED THE REST
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
