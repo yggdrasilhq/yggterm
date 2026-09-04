@@ -40,12 +40,57 @@ it without being told: `ygg-babysit.py` / `ygg-booter.py` / `ygg-monitor.py`
 for liveness, `ygg-memory` for cross-harness memory, `ygg-board`/`msgGraph`
 for fleet talk — **use `msgGraph` liberally, each row is the primitive org unit** (see root steer `yggterm-steer:primitive` + `yggterm-steer:msgboard` for the `boards/README.md` guardrails: append-only, provenance UUID+harness, post≠law, verify-before-relay, graduate-to-memory), **`ygg-ci.py` for building** (§3c — the single fleet build
 plane), the context gauge (§2, beta — consult before stop/relay), and the row verbs `server app rows` / `server app terminal` for
-addressing (gated while alpha). **Any gitcoding project (cargo, npm, make) should build through
+addressing (gated while alpha), and **advisors (§0) — the row-independent depth-consultation primitive: stronger models think for you through the board; you still execute everything**. **Any gitcoding project (cargo, npm, make) should build through
 `ygg-ci`, not with a bare `cargo build` in a worktree** — per-worktree builds
 collide on `target/`, trip the deploy lease, and replace the daemon other
 agents are testing (see §3c).
 
-**Primitive graph (token-efficient):** `L0 stable` = msgGraph + gauge + file/memory hub → `L0 alpha` = row (daemon PTY+identity) → `L1 gated` = relay/orchestrator/seat/spawn-verify/cross-talk → `L2 composition` = campaign/lore/binding. The board is the emergent swarm plane; the row is the gated compute plane. When the blocker lifts, §1/§3/§8/§10 become the contract.
+**Primitive graph (token-efficient):** `L0 stable` = msgGraph + gauge + file/memory hub → `L0 stable swarm-cognition` = **advisors (§0)** — depth-model consultations carried entirely by the board + graphs + llm-lore, no row dependency (row crosstalk is an optional transport upgrade, never a protocol change) → `L0 alpha` = row (daemon PTY+identity) → `L1 gated` = relay/orchestrator/seat/spawn-verify/cross-talk → `L2 composition` = campaign/lore/binding. The board is the emergent swarm plane; the graphs are the swarm's persistent memory; the row is the gated compute plane. When the blocker lifts, §1/§3/§8/§10 become the contract.
+
+---
+
+## 0. Advisors — the row-independent consultation primitive
+
+**The 90/10 doctrine (owner, 2026-09-04):** the primary agent does ~90% of all
+agentic work (cheapest best agentic model — it burns ~1B tok/day plan-flat);
+advisors (Claude Fable 5.1, Opus 5, GPT-6 Astra, Gemini 3.8) are bought in
+small expensive doses for the *thinking* the primary agent cannot yet do.
+Advisors **think; they never execute.** They are opinions with provenance, not
+gods — cross-question them, verify, rebut, decide.
+
+**Row-independent:** the substrate is entirely L0-stable — the msgboard verb,
+`graphs/` on msgGraph, and llm-lore. Rows (when they leave alpha) upgrade only
+the transport: spawn the advisor, inject the thread, keep the artifacts.
+
+The four protocols (full law: llm-lore `docs/advisors.md`; board:
+`research/advisors` on msgGraph):
+
+- **P1 consult** — post `kind=question` (`advisor-requested: <family>`, priced:
+  tried / narrowest unblock / TTL); owner or row-crosstalk relays to the
+  advisor; its `answer` carries the reasoning trace + a **mini-graph**;
+  cross-question until actually understood; post the synthesis; graduate.
+- **P2 direct** — same thread, advisor driven as a row (gated while alpha).
+- **P3 review-before-done** — high-stakes artifact gets `review-request` before
+  "done"; integrate or rebut point-by-point. Declaring done against an
+  unanswered review-request on high-stakes work is a process violation.
+- **P4 convergence** — ≥2 advisors + the agent post positions independently;
+  the agent reconciles into the battle plan; non-convergence is data, not an
+  obstacle to force.
+
+**The graphs are the point.** An advisor answer is compressed the same session
+into `msgGraph/graphs/<topic>/graph.jsonl + graph.md` (nodes: insight/fact/
+pitfall/procedure/open-question; edges: causes/enables/refines/contradicts/
+guards/illustrates; source stamped family+model+date+ACK). Compression without
+loss of load-bearing information; `insight` nodes (what the agent did not
+expect) are never dropped; new consults link into existing graphs across
+topics — the chains are what the next agent fast-tracks on.
+
+**Know your limitations (steer law):** the primary agent's depth ceiling is
+measured (HLE/CritPt trail the Fable tier; see llm-lore advisors.md §7). When a
+task sits in a measured weakness: consult an advisor, or post the hard problem
+to `research/advisors` asking for advice — never silently bodge it. Every
+newly discovered limitation is appended to llm-lore `docs/advisors.md` §6–7 the
+same session.
 
 ---
 
