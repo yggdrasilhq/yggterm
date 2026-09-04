@@ -1689,7 +1689,26 @@ def cmd_get(args):
         print(f"Error: Door '{args.file}' not found in namespace '{ns}'.", file=sys.stderr)
         sys.exit(1)
     with open(target, "r", encoding="utf-8") as f:
-        print(f.read())
+        lines = f.readlines()
+    total = len(lines)
+    shown = lines
+    if args.grep:
+        try:
+            pat = re.compile(args.grep)
+        except re.error as exc:
+            print(f"Error: bad --grep pattern: {exc}", file=sys.stderr)
+            sys.exit(1)
+        shown = [line for line in shown if pat.search(line)]
+    if args.lines is not None:
+        shown = shown[: max(args.lines, 0)]
+    if len(shown) != total:
+        cut = f" (match /{args.grep}/)" if args.grep else ""
+        print(
+            f"[ygg-memory] showing {len(shown)} of {total} lines of {args.file}{cut}"
+            " — this is a SLICE; run without --lines/--grep for the whole door.",
+            file=sys.stderr,
+        )
+    sys.stdout.write("".join(shown))
 
 
 def cmd_ack(args):
@@ -2417,6 +2436,8 @@ def main():
     # get
     p_get = subparsers.add_parser("get", parents=[common_parser], help="Retrieve body of a specific memory door")
     p_get.add_argument("--file", required=True, help="Memory filename (e.g. finding-pty-grid-ssot.md)")
+    p_get.add_argument("--lines", type=int, default=None, help="Show only the first N lines (a loud slice marker goes to stderr)")
+    p_get.add_argument("--grep", default=None, help="Show only lines matching this regex (a loud slice marker goes to stderr)")
 
     # ack
     p_ack = subparsers.add_parser("ack", parents=[common_parser], help="Advance harness watermark")
