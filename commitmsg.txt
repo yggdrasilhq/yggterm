@@ -1,0 +1,13 @@
+fix(identity): retire the cwd guess - owner-alias-only binding, every self-minting CLI
+
+The cwd compatibility guess cross-wired same-directory codex rows onto one
+live transcript TWICE on 2026-09-04 (01a0349d, then 01a06bc8): its
+owner-alias fence only holds while the owner-daemon alias export is
+flowing, and that export silently zeroes on any daemon or protocol skew -
+exactly what happened at 22:57 when a fresh row cwd-bound to another row's
+vouched transcript and its resume hit the live writer lock (-32600). The
+guess is gone; matching is alias-only for Codex, Muse, and Antigravity
+alike. A row with no alias stays on its birth id and its resume degrades
+to a fresh launch - safe - until the owner stamps and vouches the exact
+bind, which the fixed pipeline delivers within a minute of the CLI
+minting.

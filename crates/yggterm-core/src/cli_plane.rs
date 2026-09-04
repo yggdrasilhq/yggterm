@@ -868,7 +868,7 @@ pub struct CliAgentIdentityDecision<'a> {
     /// `bound` | `satisfied` | `no_candidate` | `ambiguous_cwd` |
     /// `exhausted` | `unchanged`
     pub verdict: &'static str,
-    /// `birth_alias` | `birth_key_alias` | `cwd_unique` | `none`
+    /// `birth_alias` | `birth_key_alias` | `none`
     pub arm: &'static str,
     pub chosen_id: Option<&'a str>,
     pub cwd_candidates: usize,
