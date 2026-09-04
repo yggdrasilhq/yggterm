@@ -4064,6 +4064,14 @@ pub enum ServerRequest {
     TerminalAppDeclares {
         path: String,
     },
+    /// The restore poll's batch ask: the retained declares of EVERY live row
+    /// in one round trip. Read-only, like the single form. A session whose
+    /// PTY is owned by a PRESERVED owner elsewhere comes back `owner_remote`
+    /// with no records — the caller falls back to the single (proxied) ask
+    /// for exactly those rows, so locality is never lost, only deferred.
+    /// `Some(path)` on [`ServerRequest::TerminalAppDeclares`] remains
+    /// byte-compatible with daemons that predate this variant.
+    TerminalAppDeclaresAll {},
     /// On-demand tenant accounting: what is RUNNING inside each live row, what
     /// it has cost, and how long it has been squatting there. Nothing here runs
     /// on a timer — the idle cost of this feature is zero, and one `/proc`
@@ -4284,6 +4292,10 @@ pub enum ServerResponse {
         records: Vec<crate::app_declare::AppDeclareRecord>,
         running: bool,
     },
+    TerminalAppDeclaresAll {
+        #[serde(default)]
+        sessions: Vec<TerminalAppDeclareSession>,
+    },
     TerminalTenants {
         #[serde(default)]
         rows: Vec<crate::session_tenancy::RowTenantReport>,
@@ -4488,6 +4500,7 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::TerminalRetainedSnapshot { .. }
         | ServerRequest::TerminalHistory { .. }
         | ServerRequest::TerminalAppDeclares { .. }
+        | ServerRequest::TerminalAppDeclaresAll { .. }
         // Pure accounting: it reads /proc and the row's own metadata and
         // changes nothing. The shadow client is the agent's default probe
         // surface, and this verb exists precisely for an agent to audit what
@@ -12190,6 +12203,43 @@ impl DaemonRuntime {
                     running: self.terminals.session_is_running(&runtime_path),
                 }
             }
+            ServerRequest::TerminalAppDeclaresAll {} => {
+                // One round trip for the restore poll: every live row's
+                // retained declares, decided locally where this daemon holds
+                // the PTY, `owner_remote` where a preserved owner elsewhere
+                // does (the caller re-asks those singly through the owner-
+                // proxying path above — locality preserved, deferral bounded).
+                let mut sessions = Vec::new();
+                // Own the paths up front: the per-row calls below take &mut self.
+                let session_paths: Vec<String> = self
+                    .server
+                    .live_session_views()
+                    .into_iter()
+                    .map(|view| view.session_path.clone())
+                    .collect();
+                for session_path in session_paths {
+                    let runtime_path = self.terminal_runtime_key_for_path(&session_path);
+                    if self.preserved_owner_endpoint_for_request(&runtime_path).is_some() {
+                        sessions.push(TerminalAppDeclareSession {
+                            session_path,
+                            records: Vec::new(),
+                            running: true,
+                            owner_remote: true,
+                        });
+                        continue;
+                    }
+                    sessions.push(TerminalAppDeclareSession {
+                        records: self
+                            .terminals
+                            .session_app_declares(&runtime_path)
+                            .unwrap_or_default(),
+                        running: self.terminals.session_is_running(&runtime_path),
+                        session_path,
+                        owner_remote: false,
+                    });
+                }
+                ServerResponse::TerminalAppDeclaresAll { sessions }
+            }
             ServerRequest::TerminalAppDeclares { path } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
                 // A preserved-owner session's bytes are read by the daemon that
@@ -15748,6 +15798,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::TerminalRetainedSnapshot { .. } => "terminal_retained_snapshot",
         ServerRequest::TerminalHistory { .. } => "terminal_history",
         ServerRequest::TerminalAppDeclares { .. } => "terminal_app_declares",
+        ServerRequest::TerminalAppDeclaresAll { .. } => "terminal_app_declares_all",
         ServerRequest::TerminalWrite { .. } => "terminal_write",
         ServerRequest::TerminalResize { .. } => "terminal_resize",
         ServerRequest::TerminalRestart { .. } => "terminal_restart",
@@ -19626,6 +19677,21 @@ pub fn terminal_history(endpoint: &ServerEndpoint, path: &str) -> Result<(Vec<St
 }
 
 /// The declares the daemon retained for a session's app (OSC 7717).
+/// One session's slice of the [`ServerRequest::TerminalAppDeclaresAll`]
+/// answer. `owner_remote: true` means this daemon does not hold the session's
+/// PTY (a preserved owner elsewhere does) and answered nothing — the caller
+/// must use the single, owner-proxying ask for it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TerminalAppDeclareSession {
+    pub session_path: String,
+    #[serde(default)]
+    pub records: Vec<crate::app_declare::AppDeclareRecord>,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default)]
+    pub owner_remote: bool,
+}
+
 pub fn terminal_app_declares(
     endpoint: &ServerEndpoint,
     path: &str,
@@ -19639,6 +19705,20 @@ pub fn terminal_app_declares(
         ServerResponse::TerminalAppDeclares { records, running } => Ok((records, running)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal app declares response: {:?}", other),
+    }
+}
+
+/// The restore poll's batch ask: every live row's retained declares in ONE
+/// round trip. A daemon too old to know the variant answers `Error` — the
+/// caller falls back to the per-row single asks (and remembers, so the
+/// fallback is one lost tick, not a per-tick tax).
+pub fn terminal_app_declares_all(
+    endpoint: &ServerEndpoint,
+) -> Result<Vec<TerminalAppDeclareSession>> {
+    match send_request(endpoint, &ServerRequest::TerminalAppDeclaresAll {})? {
+        ServerResponse::TerminalAppDeclaresAll { sessions } => Ok(sessions),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected terminal app declares-all response: {:?}", other),
     }
 }
 
@@ -38521,8 +38601,8 @@ mod tests {
         // Option: an older owner's absence deserializes as `None` = "nobody
         // could answer", and the seed falls through byte-identically; an
         // older client ignores the unknown field.
-        const STAMPED_AT_VERSION: &str = "3.2.51";
-        const STAMPED_SHAPE_HASH: u64 = 0x67707c81458f654a;
+        const STAMPED_AT_VERSION: &str = "3.2.57";
+        const STAMPED_SHAPE_HASH: u64 = 0xa58b2ab9c739cb88;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
