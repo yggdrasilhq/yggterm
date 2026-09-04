@@ -18,6 +18,33 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.57] A REMOTE RUNTIME LOST TO A DAEMON HANDOVER IS UNOWNABLE FOREVER — THE RESIZE RE-QUEUE BURNS ITS RETRIES AGAINST A CORPSE AND THE ROW COMPOSTS ITS SCREEN
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+(The landed half is the named verdict + the GUI-side divorce classification. The structural cure — respawn-on-unownable and handover re-adoption — is filed below and needs an owner ruling; until it lands this entry stays open.)
+
+Measured 2026-09-05 ~01:20–02:15, the GUI host + the owning host (owner screenshot + live traces; the remote-agy row `remote-agy://dev/16e85426-4032-4491-8321-822b3b1cd67b`):
+
+THE SYMPTOM (the owner's "abomination" screenshot): the row's viewport holds orphaned wrap-tail fragments at row heads (`re,` `ale |` `eck,` `ire` — the tails of "procedure,"/"stale |"/"check,"/"Tripwire"), doubled and misplaced text in an app warning box, and ghost glyphs in the pane's side strips. The frame-hash probe agrees: client≠daemon at quiescence, `at_bottom:true`, persisting across three probes over 14 s and surviving both `xterm_forced_refresh` and `reveal_screen_reconcile` (4084 B written, still mismatched) — 183 probes on this row show the same stable divergence for minutes.
+
+THE MECHANISM, end to end (all measured):
+
+1. The remote TUI paints absolute-addressed frames for ITS grid; the client fits 114×50. When the TUI's width exceeds the client's, every painted row spills past the client's last column, xterm wraps the spill onto the next row — the orphan fragments ARE the spill tails, landing in the TUI's own left-margin columns — and every later cursor jump lands shifted (the doubled text).
+2. The width can never converge because the resize never arrives: the GUI host's daemon forwards `server terminal resize agy-runtime://16e85426 …` over ssh, and dev answers `terminal session not found` — SIX attempts (`not_found_retries` 1→5, `will_retry:false`), ~2 s apart, then silence.
+3. WHY not found: the runtime was adopted ONCE (`pty_handoff_adopted`, seed 5897 B @171×65). Its adoptive daemon died in a handover (dev's canonical socket rebound 01:48); the terminal map is per-process and died with it, while the live-session registry SURVIVES — eight successors re-registered the row (`launch_now:false`). The snapshot lists a session nothing can resize or answer truth for (`terminal tenants` → `no_local_runtime`); the gemini process itself is ALIVE on dev but orphaned — unlike its twin `bb085849`, which still has its `resume-agy` bridge process, this one has none.
+4. The client repair is fire-and-forget: `terminal_startup_resize_repair_error` traces and walks away, and every later trigger re-fires the whole ssh+re-queue cycle. The same mount shows `xterm_paint mount_open 80×24` + `xterm_screen reset clear_to_empty` AFTER the reveal released on a full frame, and the gen-2 reveal cover released by deadline with 0 bytes.
+
+LANDED HERE (the honest-signal half): the exhausted-not-found verdict is its own named event — `remote_pty_resize_unownable` (daemon-side, emitted once when the re-queue exhausts on that error class, with path/kind/grid/error/attempts), and the GUI-side startup repair classifies the same error class into `remote_resize_unownable_divorce` beside the frame-hash probes. Source contracts: `the_unownable_remote_resize_verdict_is_named_once` (server), `the_unownable_remote_resize_divorce_is_named_on_the_gui_side` (shell).
+
+THE CURE(S), filed for their owners:
+
+- **Owner ruling needed:** when ensure-remote-runtime answers terminal-not-found while the live-session registry still lists the row (that divergence IS the verdict), the resume path should fall to the START fork — respawn `agy --conversation <id>` at the client grid (the conversation store survives; the orphaned TUI must be terminated first). Auto-respawning a user's CLI mid-consult is a behavior decision, not a seat's call. The wire already has both halves: `EnsureRemoteRuntimeAgentSession { require_existing }` / `StartRemoteRuntimeAgentSession`.
+- **[11.56] family:** runtime re-adoption across handover is the structural fix; this entry is its remote-row half — a row whose PTY holder died is not "not found YET", it is not found FOREVER, and the re-queue's mid-switch assumption does not hold here.
+- The client-side width-divorce guard (refit or refuse-to-apply for rows with a standing divorce) wants the verdict events this lane landed as its trigger.
+
+Falsifier for the landed half: the next unownable remote resize emits `remote_pty_resize_unownable` EXACTLY once per forward call (after the five retries), and any GUI-side repair of such a row pairs it with `remote_resize_unownable_divorce`; healthy rows and transient mid-switch not-founds (the re-queue's designed case, which recovers — measured on a codex row 02:04, `ok:true` 2.5 s later) emit neither.
+
 ## ⛔ [11.56] A FORCED hot-restart HANDOFF LEFT THE NEW DAEMON OWNED:0 AND THE GUI AT ZERO ROWS FOR ~15 MINUTES — THE PRESERVED OWNER WAS NEVER ADOPTED
 
 **Status:** OPEN

@@ -8361,6 +8361,11 @@ impl DaemonRuntime {
                         let error_text = error.to_string();
                         let will_retry = error_text.contains("terminal session not found")
                             && not_found_retries < REMOTE_PTY_RESIZE_NOT_FOUND_RETRIES;
+                        // The unownable verdict gate: not-found AND the re-queue
+                        // exhausted. Everything else that refuses a retry is a
+                        // different terminal state and keeps its own text.
+                        let unownable = !will_retry
+                            && error_text.contains("terminal session not found");
                         if will_retry {
                             not_found_retries += 1;
                             let mut pending = pending
@@ -8389,6 +8394,35 @@ impl DaemonRuntime {
                             std::thread::sleep(std::time::Duration::from_millis(
                                 REMOTE_PTY_RESIZE_NOT_FOUND_RETRY_DELAY_MS,
                             ));
+                        }
+                        // THE UNOWNABLE VERDICT (width-divorce class, measured
+                        // 2026-09-05 on remote-agy 16e85426): when the retries
+                        // above are exhausted, the remote daemon does not own
+                        // this runtime key "yet" and never will on its own —
+                        // its adoptive daemon died in a handover and the
+                        // per-process terminal map died with it, while the
+                        // session registry still lists the row (everything
+                        // LOOKS alive). The grid divorce behind it is
+                        // permanent: the TUI keeps painting frames for its
+                        // stale width, the client wraps every spill past the
+                        // grid edge, and the screen composites into orphaned
+                        // wrap fragments. Name the terminal state once so it
+                        // is greppable, alertable, and honest.
+                        if unownable {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_resize",
+                                "remote_pty_resize_unownable",
+                                serde_json::json!({
+                                    "path": path,
+                                    "kind": kind,
+                                    "cols": cols,
+                                    "rows": rows,
+                                    "error": error_text,
+                                    "not_found_retries": not_found_retries,
+                                }),
+                            );
                         }
                     }
                 }

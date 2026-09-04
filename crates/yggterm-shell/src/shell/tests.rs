@@ -44,6 +44,36 @@ mod tests {
     /// precisely while the daemon was least able to answer. Every call must
     /// run inside a spawned task whose result rides `off_loop_rpc_tx`.
     #[test]
+    /// ⛔ THE WIDTH-DIVORCE IS NAMED ON THE GUI SIDE. Measured 2026-09-05
+    /// (remote-agy 16e85426): a remote resize answering "terminal session
+    /// not found" after the daemon-side re-queue is exhausted means the
+    /// remote daemon holds no runtime for this key — the TUI never learns
+    /// the client grid, keeps painting frames for its stale width, the
+    /// client wraps every spill past the grid edge, and the screen
+    /// composites into orphaned wrap fragments (the owner's abomination
+    /// screenshot) while the frame-hash probes report a persistent
+    /// mismatch nobody could attribute. The startup resize repair must
+    /// classify that error class and name the divorce beside the probes.
+    #[test]
+    fn the_unownable_remote_resize_divorce_is_named_on_the_gui_side() {
+        let source = SHELL_SOURCE;
+        let fn_start = source
+            .find("fn spawn_terminal_startup_resize_repair(")
+            .expect("spawn_terminal_startup_resize_repair must exist");
+        let body_len = source[fn_start..]
+            .find("\nfn ")
+            .expect("the repair spawner is followed by another fn");
+        let body = &source[fn_start..fn_start + body_len];
+        assert!(
+            body.contains("remote_resize_unownable_divorce"),
+            "the repair spawner's error arm must emit the named divorce event"
+        );
+        assert!(
+            body.contains("repair_error_text.contains(\"terminal session not found\")"),
+            "the divorce classification must key on the not-found error class"
+        );
+    }
+
     fn every_resume_recovery_call_runs_off_the_terminal_loop() {
         let source = SHELL_SOURCE;
         let mut calls = 0;
