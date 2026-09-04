@@ -1435,6 +1435,25 @@ fn background_apply_media_gate(now_ms: u64) -> bool {
     }
     defer
 }
+/// The READ-ONLY consult, for the snapshot SPAWN gate. ⛔ It must not stamp:
+/// the starvation bound's clock is the APPLY's clock, and the gate exists to
+/// guarantee an apply lands at least every [`MEDIA_PLAYBACK_HOT_MAX_DEFER_MS`]
+/// during continuous playback. If spawning stamped the allowance (the first
+/// cut's bug), every bound-allowed cycle consumed it at spawn and the fetch's
+/// own apply then deferred against the fresh stamp — continuous playback
+/// starved applies FOREVER while burning one wasted fetch per window. With the
+/// consult read-only the delivery argument closes on its own: the bound lapses
+/// → a fetch goes out unstamped → the apply gate's clock is even staler than
+/// at spawn → the apply lands and stamps → the next cycle defers. Exactly one
+/// apply per bound, zero wasted fetches, one decision (see the
+/// `the_bound_is_carried…` guard test for the old shape).
+fn background_apply_media_gate_readonly(now_ms: u64) -> bool {
+    background_apply_deferred_for_media(
+        now_ms,
+        media_playback_hot_until_ms(),
+        MEDIA_PLAYBACK_LAST_APPLY_MS.load(Ordering::Relaxed),
+    )
+}
 /// PURE. Does this media-probe record witness real presentation? Only a
 /// `playback_window` with `presented > 0` counts: a window whose callback
 /// never fired carries `presented: null` (the frames_blind law), and a paused
@@ -1477,6 +1496,49 @@ mod media_playback_gate_tests {
         assert!(!media_presentation_witness("media", "stall", Some(1)));
         assert!(!media_presentation_witness("media", "quality_change", Some(1)));
         assert!(!media_presentation_witness("ui", "playback_window", Some(1)));
+    }
+
+    #[test]
+    fn the_spawn_consult_is_read_only_so_the_bound_delivers_an_apply() {
+        // THE OLD SHAPE, pinned as the regression guard: a STAMPING consult at
+        // the spawn consumed the bound, and the fetch's own apply then
+        // deferred against the fresh stamp — so during continuous playback an
+        // apply could never land again (the fetches kept going out; every one
+        // was wasted).
+        MEDIA_PLAYBACK_HOT_UNTIL_MS.store(0, Ordering::Relaxed);
+        MEDIA_PLAYBACK_LAST_APPLY_MS.store(0, Ordering::Relaxed);
+        mark_media_playback_hot(14_000);
+        assert!(
+            !background_apply_media_gate(16_100),
+            "the stamping gate, consulted at a spawn-shaped moment: the bound lapsed, this goes out — and stamps"
+        );
+        assert_eq!(MEDIA_PLAYBACK_LAST_APPLY_MS.load(Ordering::Relaxed), 16_100);
+        mark_media_playback_hot(18_000);
+        assert!(
+            background_apply_media_gate(18_600),
+            "…and the fetch's own apply now defers against that stamp: starvation"
+        );
+        // THE NEW SHAPE: the spawn consult is READ-ONLY, so the bound survives
+        // to the apply, which lands and stamps — exactly one apply per bound.
+        MEDIA_PLAYBACK_HOT_UNTIL_MS.store(0, Ordering::Relaxed);
+        MEDIA_PLAYBACK_LAST_APPLY_MS.store(0, Ordering::Relaxed);
+        mark_media_playback_hot(14_000);
+        assert!(!background_apply_media_gate_readonly(16_100));
+        assert_eq!(
+            MEDIA_PLAYBACK_LAST_APPLY_MS.load(Ordering::Relaxed),
+            0,
+            "the spawn consult must not move the bound's clock"
+        );
+        mark_media_playback_hot(18_000);
+        assert!(
+            !background_apply_media_gate(18_600),
+            "the clock is even staler at apply time: the apply lands"
+        );
+        assert_eq!(MEDIA_PLAYBACK_LAST_APPLY_MS.load(Ordering::Relaxed), 18_600);
+        // …and the next cycle defers until the bound lapses again.
+        assert!(background_apply_media_gate_readonly(19_600));
+        MEDIA_PLAYBACK_HOT_UNTIL_MS.store(0, Ordering::Relaxed);
+        MEDIA_PLAYBACK_LAST_APPLY_MS.store(0, Ordering::Relaxed);
     }
 
     #[test]
@@ -37879,11 +37941,24 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             // no special case. Budgeted and one-shot per (session, runtime), so
             // on the overwhelming majority of ticks this decides "nothing" off
             // a read-only pass and spawns no task.
-            spawn(restore_app_surfaces_tick(
-                state,
-                trace_home.clone(),
-                Rc::clone(&restore_attempts),
-            ));
+            //
+            // ⛔ A shadow viewer skips this entirely. The poll is O(live rows)
+            // — one retained-declare ask per row per backoff ceiling — and a
+            // shadow running it only duplicates work the active client already
+            // does, for surfaces a shadow holds by courtesy alone: it renders
+            // what it is explicitly shown (`app open --client`), and the role
+            // gate refuses it every ownership request anyway. Measured on the
+            // 359-row desktop during the 2026-09-04 UI-thrash storm: two
+            // clients polling doubled the declare traffic (~35
+            // `daemon_declare_absent` asks/min each, `terminal_app_declares`
+            // dispatches with ui_wait up to 526 ms) for zero shadow benefit.
+            if !client_is_shadow_viewer() {
+                spawn(restore_app_surfaces_tick(
+                    state,
+                    trace_home.clone(),
+                    Rc::clone(&restore_attempts),
+                ));
+            }
             // Webview edit-plane fault deltas → the incident stream. Reads two
             // atomics; writes nothing reactive.
             {
@@ -42140,7 +42215,10 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 || !shell_has_live_session_snapshot_refresh_target(shell)
                 || now_ms < shell.next_live_session_snapshot_after_ms
                 || now_ms < terminal_input_hot_until_ms()
-                || background_apply_media_gate(now_ms)
+                // READ-ONLY on purpose — see the fn's doc: the spawn must
+                // not consume the starvation allowance, or the fetch's own
+                // apply gets re-deferred and the bound never delivers.
+                || background_apply_media_gate_readonly(now_ms)
             {
                 return LiveSnapshotGateDecision::Idle;
             }
