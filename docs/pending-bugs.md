@@ -18,6 +18,56 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.55] TWO ENTRIES CLAIM VERIFIED-FIXED AND STILL OCCUPY THE QUEUE — THE GATE STAYS RED UNTIL THEIR LANES DELETE THEM
+
+**Status:** OPEN
+
+`cargo test -p yggterm-core --test docs_ssot` runs
+`scripts/check-docs-ssot.sh`, which demands the exact status vocabulary.
+Four out-of-vocabulary status lines were conformed mechanically on the
+wry vendor lane (status moved to body prose, no claim changed). The last
+two reds CANNOT be conformed from another seat: both claim the fix is
+verified, and the file's own law is that a verified-fixed entry is
+DELETED in the same commit as its verified fix — a deletion this seat
+cannot do without asserting a verification it did not repeat:
+
+- `[11.31]` — "**Status:** FIXED — LIVE PROOF IN (2026-09-04 ~22:30, the
+  gui host, v3.2.56)" — proving lane `lane/trace/media-playback-gate`
+  family (switch-back cold-remount).
+- `[arm-matrix-red]` — "**Status:** FIXED 2026-09-02 on
+  `lane/dev/mirror-tick-rebind`" — the opencode integration lane.
+
+Delete both, narrative to the archive if wanted, and this gate goes
+green. Found red on pristine main (83af34cb5) before the vendor lane
+touched anything; the vendor lane only made the existing red VISIBLE in
+its full-suite run.
+
+## ⛔ [11.54] THE INSTALL-PROMOTION TEST ONLY PASSES ON HOSTS WITHOUT A LIVE INSTALL — THE HOME FALLBACK MAKES ITS "UNMANAGED" PREMISE FALSE
+
+**Status:** OPEN
+
+`cargo test -p yggterm-core --lib` red on dev, verified identical on
+pristine main (83af34cb5, 2026-09-04) — pre-existing, not brought by the
+wry 0.56.1 vendor lane, and unACKed until this entry:
+
+`install::tests::promote_direct_install_active_version_is_noop_without_managed_install`
+panics `unmanaged install should report false`
+(`crates/yggterm-core/src/install.rs:2077`).
+
+Mechanism: the test creates a bare exe under a fresh `/tmp` dir and
+expects `promote_direct_install_active_version` to report it unmanaged.
+But with `ENV_YGGTERM_DIRECT_INSTALL_ROOT` unset (the test's own guard
+insists on that), the finder takes the `resolve_yggterm_home()` fallback
+(`install.rs:557`) — the state file's canonical home is not an ancestor
+of the binary, so a `~/.yggterm/install-state.json` on ANY live-install
+host answers `Some`, the promote runs, and the assert dies. dev is such
+a host; every fleet seat likely is. This is the
+test-reads-ambient-host-state family
+([[finding-a-test-that-reads-ambient-host-state-is-not-flaky]]): the fix
+is for the test to point the env override at the temp root it created
+(or drive `find_direct_install_state_scoped` with `home_fallback: None`),
+not to weaken the finder.
+
 ## ⛔ [11.50] THE GUI RESTART-LOOPED ON A SAME-VERSION DAEMON_PENDING FOR FIVE MINUTES — EVERY RESPAWN RE-ARMED THE TRIGGER, AND A DEAD STDERR PIPE PANICKED THE REST
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -230,7 +280,9 @@ by failed resizes.
 
 ## ⛔ [11.51] VIDEO PLAYS WITH PERFECT MEDIA STATS AND A HOLE-RIDDEN COMPOSITOR CADENCE — "STATS FOR NERDS SHOWS NOTHING BUT IT STUTTERS"
 
-**Status:** OBSERVABILITY SHIPPED on `lane/trace/webview-frame-cadence`
+**Status:** OPEN
+
+Observability shipped on `lane/trace/webview-frame-cadence`
 (`media/playback_window` now carries `raf_fps`/`raf_p50_ms`/`raf_p95_ms`/
 `raf_max_ms`/`raf_over_25`/`raf_blind`); **FIRST REMEDY UNIT SHIPPED on
 `lane/trace/media-playback-gate`** — the stall attribution below was measured
@@ -26658,7 +26710,9 @@ on a fresh opencode switch-in reads a decision that is NOT
 
 ## ⛔ [11.48] A WEB SURFACE SAT ON A DEAD LOOPBACK URL FOR ~12 MINUTES WHILE ITS APP WAS HEALTHY AND HEARTBEATING THE REAL TARGET — ONLY A DAEMON-TAKEOVER DECLARE-REPLAY HEALED IT (the "ychrome stuck at Opening…" report)
 
-**Status:** OPEN — evidence complete 2026-09-04 ~02:25–02:40, live-caught on the GUI host
+**Status:** OPEN
+
+Evidence complete 2026-09-04 ~02:25–02:40, live-caught on the GUI host.
 
 **Owner report with screenshot:** a ychrome row sat on the profile picker at
 `http://127.0.0.1:46737/` showing "Opening…" forever after choosing a profile.
@@ -26749,7 +26803,9 @@ uses the same helper, so the local/remote twin comparison stays symmetric.
 
 ## ⛔ [managed-remove-ambient] THE MANAGED-CLI REMOVAL TESTS READ THE HOST'S PATH — RED WHEREVER QWEN IS INSTALLED
 
-**Status:** OPEN — measured on dev 2026-09-02, main f6b1c5f88.
+**Status:** OPEN
+
+Measured on dev 2026-09-02, main f6b1c5f88.
 
 `removing_an_absent_cli_is_a_reported_no_op` (and the generations twin) build
 isolated `provision_test_paths`, but the removal's resolver consults the REAL
@@ -26762,7 +26818,9 @@ must neuter PATH. Same class as [[finding-a-test-that-reads-ambient-host-state-i
 
 ## ⛔ [identity-order-divergence] COLLAPSE-DAMAGED REMOTE CODEX ROWS ARE ABSENT FROM live_session_order — THE IDENTITY POLL CANNOT REACH THEM
 
-**Status:** REACHABILITY CLOSED 2026-09-04 late on `lane/trace/agent-identity-reach` — the poll view now sweeps the sessions map for live self-minting rows the order does not name (sorted, deterministic) and names a dead order key `order_key_missing_from_sessions` instead of skipping it silently. The rows are REACHED; what stays open below is the order-ledger reconciliation itself (presentation plane) and the second measured wound: the rows can answer on a THIRD synthesized id (ensure-funnel re-mint), which the widened repair signature (path-v4 birth, any drifted id) now covers. The cwd guess itself was RETIRED the same night after re-cross-wiring rows (01a06bc8) while the alias export silently zeroed — binding is owner-alias-only now.
+**Status:** OPEN
+
+Reachability closed 2026-09-04 late on `lane/trace/agent-identity-reach` — the poll view now sweeps the sessions map for live self-minting rows the order does not name (sorted, deterministic) and names a dead order key `order_key_missing_from_sessions` instead of skipping it silently. The rows are REACHED; what stays open below is the order-ledger reconciliation itself (presentation plane) and the second measured wound: the rows can answer on a THIRD synthesized id (ensure-funnel re-mint), which the widened repair signature (path-v4 birth, any drifted id) now covers. The cwd guess itself was RETIRED the same night after re-cross-wiring rows (01a06bc8) while the alias export silently zeroed — binding is owner-alias-only now.
 Follow-up to Issue Heading 35 (docs/cli-integration.md) — the collapse
 MECHANISM is fixed and live-verified (owner host stamps fire — first
 birth-key `codex_runtime_identity_refreshed` events ever at 21:43 incl.

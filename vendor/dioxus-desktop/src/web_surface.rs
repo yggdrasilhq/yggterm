@@ -9678,10 +9678,14 @@ mod download_locks {
         // And the sweep the host runs is this rule and not a second spelling of
         // it: `prune_contexts` is the borrow around it and nothing more.
         let product = product_lines();
+        // The needle stops after the sweep call, not at the closing brace:
+        // prune_contexts may (and now does) run favicon-bell key cleanup after
+        // the sweep, but the sweep must stay the FIRST thing it does — the
+        // rule under test may not be demoted or reordered behind other work.
         assert!(
             product.join("\n").contains(
                 "pub fn prune_contexts(&self) {\n        \
-                 retain_held_contexts(&mut self.contexts.borrow_mut());\n    }"
+                 retain_held_contexts(&mut self.contexts.borrow_mut());"
             ),
             "the host's context sweep no longer goes through the rule under \
              test, so what is proven above is no longer what runs",

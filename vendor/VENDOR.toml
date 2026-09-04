@@ -14,7 +14,7 @@
 
 [wry]
 upstream = "https://github.com/tauri-apps/wry"
-version = "0.55.0"
+version = "0.56.1"
 inline_files = [
   "src/inject_initialization_scripts.rs",
   "src/lib.rs",
@@ -45,10 +45,30 @@ inline_files = [
 additive_files = [
   "src/web_surface.rs",
   "src/web_surface_clipboard_image_paste.rs",
+  "src/web_surface_media_trace.rs",
 ]
+# 0.7.10 was evaluated 2026-09-04 and NOT taken: it is source-identical to
+# 0.7.9 — its only deltas are its own version bump, Cargo.lock churn, and a
+# wry requirement DOWNGRADE to ^0.53.5 (upstream 0.8.0-alpha pairs wry ^0.55.1).
+# We keep the 0.7.9 source with our own wry 0.56.1 pairing; the wry version
+# requirement in our vendored Cargo.toml is an inline edit of ours.
+# Also inline-edited (recorded 2026-09-04, drift caught by §4.1): the
+# [dependencies.wry] version requirement and the wry feature passthroughs
+# ("protocol" removed upstream in 0.56; "fullscreen"/"transparent" now
+# unconditional, dioxus-desktop's own features of those names kept as no-ops).
 
 [dioxus-interpreter-js]
 upstream = "https://github.com/DioxusLabs/dioxus"
 version = "0.7.9"
-inline_files = []
+inline_files = [
+  "src/ts/native.ts",
+  "src/js/native.js",
+]
 additive_files = []
+# The inline edit is the edit-batch flush backstop (EDITS_FLUSH_FALLBACK_MS,
+# editFault reporting, one-bad-buffer-must-not-eat-siblings with stack-depth
+# restore). native.js is the build-generated binding of native.ts — edit the
+# .ts, then let build.rs regenerate. src/js/hash.txt is lazy-js_bundle's
+# DERIVED hash state, committed upstream; it changes with native.js and is
+# not an edit of ours. 0.7.10 was evaluated 2026-09-04 and NOT taken:
+# source-identical to 0.7.9 (version bump + wry-pin churn only).
