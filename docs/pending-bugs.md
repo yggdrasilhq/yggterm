@@ -127,8 +127,36 @@ name their target.
 
 (Observability shipped on `lane/trace/paint-demand-strand`: the rescue trace
 now speaks 5 times, then once per 30 rescues, each line carrying the
-gate snapshot. The root-cause half — which gate refuses, and why the demand
-stands 18+ minutes — reads its answer off the next strand event.)
+gate snapshot.)
+
+**ROOT CAUSE, code-verified 2026-09-04 ~01:00 (`lane/trace/paint-demand-hidden-defer`): rAF starvation on a hidden window.** The paint funnel consults
+`document.hidden` nowhere: while the window is hidden its rAF never fires, so
+the frame a rescue registers stays pending forever, `visiblePaintFramePending`
+wedges the funnel into the recovery-timer chain, and the demand watchdog —
+whose `setInterval` still fires ~1/s while hidden — drums one rescue per
+second for exactly as long as the window stays hidden. The 18.5-minute
+"outstanding" was an 18.5-minute hidden period; the demand was served by the
+pending frame the moment the window returned (the drumbeat stops at exactly
+that boundary). **Attribution correction to this entry's first reading:** the
+heavy paint (atlas clear + whole-grid redraw) could NOT execute while hidden
+— it is rAF-gated — so the harm was the trace drumbeat and the wedged funnel
+spin, not 1 Hz full repaints. The strand snapshot from the first shipped
+instrument was never observed because every event predated it.
+
+**Fix (same lane):** the funnel defers hidden windows — the latch is KEPT
+(deferred, not stranded; the demand watchdog's first tick after reveal
+re-enters the funnel and the pending frame serves the demand), no frames are
+registered and no recovery timers spin while `document.hidden`, and the
+hidden period is traced ONCE (`visible_paint_demand_hidden_defer`) instead of
+once per second. The demand watchdog itself stays silent while hidden. Source
+contract `the_visible_paint_funnel_defers_hidden_windows_without_spinning`.
+
+**Falsifier (supersedes the first):** the next hidden-period demand shows
+ZERO `visible_paint_demand_rescue` events while hidden and exactly one
+`visible_paint_demand_hidden_defer` per hidden period; a strand
+(`visible_paint_demand_rescue` with all-clear gates: `input_hot=false`,
+`frame_like_ms=0`) on a VISIBLE row is now a genuinely NEW defect and closes
+the entry's remaining open half when root-caused.
 
 Measured on the gui host, 2026-09-04 (v3.2.58 GUI, pid of the 21:46 birth):
 **1622 `terminal_mount/js_debug` events of `visible_paint_demand_rescue`** from

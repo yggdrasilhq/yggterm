@@ -5807,6 +5807,15 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
         }};
         let visiblePaintFramePending = false;
+        // One trace per hidden period: while the window is hidden its rAF
+        // never fires, so a standing full-refresh demand CANNOT be served —
+        // it is deferred (the latched demand survives; the demand watchdog's
+        // first tick after reveal re-enters the funnel and the pending frame
+        // finally runs). Logged once per hidden period, not once per second
+        // (measured 2026-09-04: the unguarded funnel logged a rescue every
+        // second for 57 minutes, 1622 events, while a demand waited out an
+        // 18.5-minute hidden window and was served on reveal).
+        let visiblePaintHiddenDeferredLogged = false;
         let pendingVisiblePaintForceFullRefresh = false;
         let visiblePaintRecoveryTimer = null;
         let lastVisiblePaintRunAtMs = 0;
@@ -7371,6 +7380,28 @@ fn terminal_eval_script_with_canvas_renderer(
                 pendingVisiblePaintForceFullRefreshSinceMs = Date.now();
             }}
             syncVisiblePaintDemandToHostEntry();
+            // ⛔ A HIDDEN WINDOW HAS NO FRAMES TO RE-ENTER THIS FUNNEL WITH.
+            // requestAnimationFrame never fires while the window is hidden, so
+            // a frame registered here stays pending forever, every later
+            // attempt degrades into the recovery-timer spin, and the demand
+            // watchdog drums a rescue every second (measured 2026-09-04:
+            // 1622 events / 57 min, demand served the moment the window
+            // returned). Keep the LATCH — deferred, not stranded; the demand
+            // watchdog's first tick after reveal re-enters and the pending
+            // frame finally serves it — but never register frames or spin
+            // timers while there is no compositor to present them.
+            if (document.hidden) {{
+                if (!visiblePaintHiddenDeferredLogged
+                    && pendingVisiblePaintForceFullRefresh) {{
+                    visiblePaintHiddenDeferredLogged = true;
+                    sendTerminalEvent({{
+                        kind: 'debug',
+                        message: `visible_paint_demand_hidden_defer host=${{hostId}}`
+                            + ` outstanding_ms=${{Date.now() - (pendingVisiblePaintForceFullRefreshSinceMs || Date.now())}}`
+                    }});
+                }}
+                return;
+            }}
             // Daemon handover: every repaint here is a full-window blit on a
             // software-GL host, and the frame it would present is the re-resume
             // churn behind the veil. Drop the FRAME — never the demand: the
@@ -7387,6 +7418,7 @@ fn terminal_eval_script_with_canvas_renderer(
             visiblePaintFramePending = true;
             requestAnimationFrame(() => {{
                 visiblePaintFramePending = false;
+                visiblePaintHiddenDeferredLogged = false;
                 const requestedForceFullRefresh = Boolean(pendingVisiblePaintForceFullRefresh);
                 pendingVisiblePaintForceFullRefresh = false;
                 const now = Date.now();
@@ -8330,6 +8362,7 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{
                 if (!pendingVisiblePaintForceFullRefresh) {{ return; }}
                 if (handoverPaintSuspended) {{ return; }}
+                if (document.hidden) {{ return; }}
                 if (terminalInputHot()) {{ return; }}
                 const since = Number(pendingVisiblePaintForceFullRefreshSinceMs || 0);
                 if (since <= 0) {{ return; }}
