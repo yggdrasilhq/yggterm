@@ -10930,6 +10930,28 @@ impl YggtermServer {
     /// non-ses_, and the emission names it a heuristic so nobody mistakes it
     /// for focus truth.
     fn opencode_store_candidate_vouch(&self, cwd: Option<&str>) -> Option<String> {
+        let answer = self.opencode_store_candidate_vouch_inner(cwd);
+        // The ladder names its own decision (Issue 33 falsifier round): a
+        // silent None is indistinguishable from a store that answered empty,
+        // and the 2026-09-04 epoch-type falsification was invisible for
+        // exactly that reason. Shapes only — cwd presence, never the path.
+        #[cfg(not(test))]
+        if let Ok(home) = resolve_yggterm_home() {
+            yggterm_core::append_trace_event(
+                &home,
+                "daemon",
+                "cli",
+                "store_candidate",
+                serde_json::json!({
+                    "cwd_present": cwd.is_some(),
+                    "answered": answer.is_some(),
+                }),
+            );
+        }
+        answer
+    }
+
+    fn opencode_store_candidate_vouch_inner(&self, cwd: Option<&str>) -> Option<String> {
         let cwd = cwd?.trim_end_matches('/');
         if cwd.is_empty() {
             return None;
