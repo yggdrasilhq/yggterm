@@ -1990,3 +1990,74 @@ the fence). The store measurements behind the flip:
 * Store-backed viewing/title fallbacks for the service-starvation case
   (`/api/session/active` empty, measured 2026-09-04) — Issue 34's repair
   lane.
+
+## Issue Heading 37: the unpaintable edge — every TUI loses the card's right and bottom strip, and the mock that will end such riddles (2026-09-05)
+
+Owner report: "All CLIs have a right edge and bottom edge that the TUI
+cannot take control of. Even in plain shell mode." Measured live the same
+hour on a row on the GUI host (build 3.2.60): the terminal CARD was
+**921x904 px** while the xterm canvas painted **912x900** — a 9px right +
+4px bottom strip no PTY cell could ever reach. Filled the grid with a
+non-theme background (`printf '\033[48;2;190;40;40m%*s' 9000 ""`) and
+pixel-sampled the faithful screenshot: fill `rgb(190,40,40)` stops at the
+canvas edge; the strip stays at the card's `rgb(38,42,51)`. Invisible in
+plain-shell mode only because the card happens to wear the theme background
+— every fullscreen TUI that paints its own background wears the shell's
+edge like a mat, and every inline CLI also gave up a whole column to the
+reservation.
+
+### Three compounding reservations
+
+1. **The scrollbar gutter (8px).** `.xterm-screen` narrowed itself by
+   `--yggterm-scrollbar-gutter` so the native viewport scrollbar kept a
+   hit-testable slot (XTERM-BUG: scrollbar-not-draggable, 2026-05-28), and
+   the grid proposal subtracted the same number
+   (right-edge-glyph-clipped) — self-consistent, and both wrong together.
+   Alternate-screen TUIs had the gutter released (gutter-steals-tui-width);
+   every normal-screen CLI kept paying it.
+2. **The integer-cell raster.** The canvas renderer rasters each cell at
+   `floor(css cell)`: with fractional font metrics (8.01x18.08 px), 114x50
+   cells paint a 912x900 raster inside a 913x904 screen box — the
+   sub-cell remainder per axis is stranded.
+3. **The 2px bottom guard** (`__yggtermXtermFitBottomGuardPx`, the
+   2026-05-02 fit/backpressure fix) shaves the proposed height.
+
+### The fix — the card is the grid
+
+Landed as `lane/dev/terminal-fullbleed` (commit 3a8ba1880, guard-locked in
+`terminal_grid_is_full_bleed_and_the_scrollbar_is_an_overlay`):
+
+* The grid is proposed from the FULL host box (`rightGutterPx = 0`);
+  `.xterm-screen` is 100% — the paint box and the grid are one box, and the
+  old drift law survives inverted: nothing may re-narrow the paint box.
+* Every render canvas under `.xterm-screen` is CSS-stretched to the screen
+  box (sub-1% scale — imperceptible; mouse mapping faithful to within a
+  pixel because the stretched cell equals xterm's own css cell).
+* The native scrollbar is hidden (`scrollbar-width: none` + WebKit
+  `display:none`), and the shell draws a draggable **overlay thumb** above
+  the grid (`ensureXtermScrollThumb`/`syncXtermScrollThumb`, geometry from
+  the `terminal_scrollbar_overlay::scroll_thumb_geometry` decision module):
+  same look as the old native thumb (36px min target, 8px slot,
+  color-only states), synced per paint, hidden when there is no scrollback
+  and on the alternate screen. Scrolling itself never changed — wheel and
+  programmatic `scrollTop` work with a zero-width scrollbar.
+
+Registry: `docs/xterm-bugs.md` `terminal-edge-unpaintable` (with the
+reproduction), `scrollbar-not-draggable` marked SUPERSEDED,
+`right-edge-glyph-clipped` finally documented (HISTORICAL — it was anchored
+in code 2026-05-28 but never registered; the stale-registry gap is its own
+lesson). Falsifier after deploy: `bg-fill` any row, screenshot, pixel-sample
+the card corner — fill color to every edge; `frame_hash_probe` silent at
+quiescence.
+
+### The mock that ends the class
+
+The falsifier above should not need a hand-typed printf. It ships as
+`bg-fill` in **`tools/mock-tui-opentui/`** — a deterministic agent-CLI TUI
+built on the ops-compiled bytes of Anomaly's OpenTUI engine family (the
+framework opencode v2 renders with), scenario-keyed, stdin-drivable, and
+bound to the stimulus/witness law: the mock emits NOTHING into the trace
+plane; every scenario's claim is falsified through yggterm's own probes.
+Spec + scenario↔riddle↔witness matrix:
+`docs/spec-mock-tui-opentui.md` (Issue 28–37 classes are the roadmap; the
+dream is the whole integration matrix falsifiable in CI without a live CLI).

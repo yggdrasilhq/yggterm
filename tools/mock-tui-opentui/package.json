@@ -1,0 +1,16 @@
+{
+  "name": "yggterm-mock-tui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The deterministic agent-CLI TUI yggterm can interrogate — stimulus for the cli-integration falsifiers (docs/spec-mock-tui-opentui.md)",
+  "bin": {
+    "mock-tui": "src/mock-tui.js"
+  },
+  "scripts": {
+    "start": "node src/mock-tui.js",
+    "list": "node src/mock-tui.js --list"
+  },
+  "optionalDependencies": {
+    "@opentui/core": "^0.5.10"
+  }
+}
