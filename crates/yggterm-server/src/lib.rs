@@ -34480,6 +34480,44 @@ mod tests {
     }
 
 
+    /// ⛔ THE UNOWNABLE REMOTE RESIZE IS NAMED, ONCE. Measured 2026-09-05
+    /// (remote-agy 16e85426): after a daemon handover lost the runtime's
+    /// adoptive process, every remote resize re-ran the full not-found
+    /// re-queue (5 attempts, ~10 s of futile ssh) and then fell silent —
+    /// the last event read like every other failure, the grid divorce
+    /// behind it was permanent, and the row composted its screen with
+    /// orphaned wrap fragments while every instrument called the session
+    /// healthy. The exhausted-not-found verdict must be its own named
+    /// event, so the state is greppable and alertable.
+    #[test]
+    fn the_unownable_remote_resize_verdict_is_named_once() {
+        let source = include_str!("daemon.rs");
+        assert!(
+            source.contains("\"remote_pty_resize_unownable\""),
+            "the exhausted-not-found resize verdict must emit the named \
+             remote_pty_resize_unownable event"
+        );
+        let verdict_start = source
+            .find("let unownable = !will_retry")
+            .expect("the verdict gate must be spelled on will_retry");
+        let gate = &source[verdict_start..verdict_start + 400];
+        assert!(
+            gate.contains("contains(\"terminal session not found\")"),
+            "the verdict must fire only for the not-found class — every \
+             other terminal error keeps its own text"
+        );
+        let emit_start = source
+            .find("\"remote_pty_resize_unownable\"")
+            .expect("the verdict emit must exist");
+        let failed_emit = source
+            .find("\"remote_pty_resize_failed\"")
+            .expect("the failed emit must exist");
+        assert!(
+            emit_start > failed_emit,
+            "the verdict must not precede the per-attempt failed emits"
+        );
+    }
+
     /// Fleet projection must preserve the core scanner's verdict rather than
     /// re-derive a title or row scheme at the transport seam.
     #[test]

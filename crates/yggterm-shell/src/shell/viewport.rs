@@ -18089,6 +18089,7 @@ fn spawn_terminal_startup_resize_repair(
                 );
             }
             Err(error) => {
+                let repair_error_text = error.to_string();
                 append_trace_event(
                     &trace_home,
                     "ui",
@@ -18099,9 +18100,34 @@ fn spawn_terminal_startup_resize_repair(
                         "cols": cols,
                         "rows": rows,
                         "source": source,
-                        "error": error.to_string(),
+                        "error": repair_error_text,
                     }),
                 );
+                // THE WIDTH-DIVORCE CLASS (measured 2026-09-05, remote-agy row
+                // 16e85426): a remote resize answering "terminal session not
+                // found" after the daemon-side re-queue is exhausted is not a
+                // transient — the remote daemon holds no runtime for this key
+                // (its adoptive daemon died in a handover), so the TUI never
+                // learns the client grid and keeps painting frames for its
+                // stale width; the client wraps every spill past the grid
+                // edge and the screen composites into orphaned wrap
+                // fragments. Name the divorce here on the GUI side, beside
+                // the frame-hash mismatch probes, so one grep pairs the
+                // persistent hash divergence with its cause.
+                if repair_error_text.contains("terminal session not found") {
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "remote_resize_unownable_divorce",
+                        json!({
+                            "session_path": visible_session_path,
+                            "cols": cols,
+                            "rows": rows,
+                            "source": source,
+                        }),
+                    );
+                }
             }
         }
     });
