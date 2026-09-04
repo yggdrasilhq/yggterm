@@ -1859,20 +1859,20 @@ fn main() -> Result<()> {
     let terminal_appearance = terminal_identity_appearance_for_settings(&settings).to_string();
     yggterm_server::sync_terminal_identity_appearance(&terminal_appearance);
     let tree = placeholder_session_tree(store.sessions_root().to_path_buf(), settings.theme);
-    let browser_tree_span = PerfSpan::start(&startup_home, "startup", "load_browser_tree");
-    let (browser_tree, browser_tree_loaded) = match store.load_codex_tree(&settings) {
-        Ok(tree) => (tree, true),
-        Err(error) => {
-            tracing::warn!(error=%error, "failed to load browser tree for warm start");
-            (
-                placeholder_session_tree(store.home_dir().to_path_buf(), settings.theme),
-                false,
-            )
-        }
-    };
-    browser_tree_span.finish(serde_json::json!({
-        "loaded": browser_tree_loaded,
-    }));
+    // ⛔ THE SEED IS NEVER WORTH A 5-12 SECOND STARTUP STALL. This used to run
+    // `store.load_codex_tree(&settings)` synchronously — a full walk of every
+    // agent store (~/.codex, ~/.claude, …) — before the daemon was resolved,
+    // the window existed, or anything was presented (measured on the gui host:
+    // `load_browser_tree` spans of 5.15 s and 6.22 s on recent births, 9-12 s
+    // on busy ones). The shell already owns the deferred shape for the error
+    // case (`browser_tree_loaded=false` -> `browser_tree_loading_in_flight` ->
+    // `spawn_initial_browser_tree_load`, a spawn_blocking load that swaps the
+    // real tree in with selection restore and a render epoch) — seed the
+    // placeholder and let that machinery do the work off the startup path.
+    let (browser_tree, browser_tree_loaded) = (
+        placeholder_session_tree(store.home_dir().to_path_buf(), settings.theme),
+        false,
+    );
     let settings_path = store.settings_path();
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
