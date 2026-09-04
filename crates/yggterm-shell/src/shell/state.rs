@@ -1371,6 +1371,149 @@ fn mark_terminal_input_hot(now_ms: u64) {
 fn terminal_input_hot_until_ms() -> u64 {
     TERMINAL_INPUT_HOT_UNTIL_MS.load(Ordering::Relaxed)
 }
+// "Media playback hot" is the same shape as "input hot", with the opposite
+// trigger: while a web surface is actively PRESENTING media, background
+// snapshot applies defer so their whole-root re-renders stop landing in the
+// video's frame budget. Measured before this gate existed (live ychrome
+// playback, pending-bugs [11.51]): the page's rAF cadence ran p95 ~26 ms with
+// holes to 276 ms while playing and cleaned to 17/35 ms paused, and the block
+// trace named whole-root `component_window` renders (one at 522 ms) inside the
+// holes — every presented frame crosses the UI thread, so a render there is a
+// torn video frame. The witness is the media probe's own `playback_window`
+// record (presented > 0): it arrives ~1/s per playing surface, on the UI
+// thread, in the drain below — no new channel, no polling. A hidden page's
+// rVFC never fires, so a stashed/background surface cannot hold the gate hot.
+static MEDIA_PLAYBACK_HOT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// Rolling: every presented frame renews the deadline, so playback holds it
+/// continuously; the last renewal expires this long after the last record.
+const MEDIA_PLAYBACK_HOT_SUPPRESS_MS: u64 = 3_000;
+/// ⛔ THE STARVATION BOUND. The input gate renews only on real keystrokes, so
+/// it self-expires; playback renews ITSELF for as long as the film runs. A
+/// two-hour video must not starve row state for two hours — at least one
+/// apply goes through this often even mid-playback. Worst-case staleness while
+/// watching: sidebar status lines lag by this much. Chosen above the input
+/// gate's 2 s because video is minutes-to-hours continuous while a typing
+/// pause is sub-second.
+const MEDIA_PLAYBACK_HOT_MAX_DEFER_MS: u64 = 15_000;
+static MEDIA_PLAYBACK_LAST_APPLY_MS: AtomicU64 = AtomicU64::new(0);
+fn mark_media_playback_hot(now_ms: u64) {
+    MEDIA_PLAYBACK_HOT_UNTIL_MS.fetch_max(
+        now_ms.saturating_add(MEDIA_PLAYBACK_HOT_SUPPRESS_MS),
+        Ordering::Relaxed,
+    );
+}
+fn media_playback_hot_until_ms() -> u64 {
+    MEDIA_PLAYBACK_HOT_UNTIL_MS.load(Ordering::Relaxed)
+}
+/// PURE. True = this background apply should defer for media presentation.
+/// `now_ms < hot_until` is "a surface presented a frame recently"; while that
+/// holds, defers only until [`MEDIA_PLAYBACK_HOT_MAX_DEFER_MS`] has passed
+/// since the last apply that was allowed through.
+fn background_apply_deferred_for_media(
+    now_ms: u64,
+    hot_until_ms: u64,
+    last_allowed_ms: u64,
+) -> bool {
+    if now_ms < hot_until_ms {
+        now_ms.saturating_sub(last_allowed_ms) < MEDIA_PLAYBACK_HOT_MAX_DEFER_MS
+    } else {
+        false
+    }
+}
+/// Consult-and-stamp the media gate. Returns true when the caller should defer
+/// this apply; returns and stamps false otherwise (the stamp IS the starvation
+/// bound's clock — it must move every time an apply is allowed, whether or not
+/// media was hot when it was).
+fn background_apply_media_gate(now_ms: u64) -> bool {
+    let defer = background_apply_deferred_for_media(
+        now_ms,
+        media_playback_hot_until_ms(),
+        MEDIA_PLAYBACK_LAST_APPLY_MS.load(Ordering::Relaxed),
+    );
+    if !defer {
+        MEDIA_PLAYBACK_LAST_APPLY_MS.store(now_ms, Ordering::Relaxed);
+    }
+    defer
+}
+/// PURE. Does this media-probe record witness real presentation? Only a
+/// `playback_window` with `presented > 0` counts: a window whose callback
+/// never fired carries `presented: null` (the frames_blind law), and a paused
+/// element arms no window at all — neither may hold the gate hot.
+fn media_presentation_witness(category: &str, name: &str, presented: Option<u64>) -> bool {
+    category == "media" && name == "playback_window" && presented.is_some_and(|n| n > 0)
+}
+
+#[cfg(test)]
+mod media_playback_gate_tests {
+    use super::*;
+
+    #[test]
+    fn media_gate_defers_only_while_hot_and_within_the_starvation_bound() {
+        // Cold (the deadline is in the past): never defers, however stale the
+        // allowance clock is.
+        assert!(!background_apply_deferred_for_media(10_000, 0, 0));
+        // Hot with the allowance clock never moved: defer.
+        assert!(background_apply_deferred_for_media(10_000, 12_000, 0));
+        // Hot, but nothing has been allowed through for ≥ MAX_DEFER: the
+        // starvation bound lets this one through — a film must not starve row
+        // state for its whole runtime.
+        assert!(!background_apply_deferred_for_media(20_000, 22_000, 4_000));
+        // The bound is INCLUSIVE at the boundary.
+        assert!(!background_apply_deferred_for_media(25_000, 26_000, 10_000));
+        // Just under it: still deferred.
+        assert!(background_apply_deferred_for_media(24_999, 26_000, 10_000));
+    }
+
+    #[test]
+    fn only_presented_playback_windows_are_a_media_witness() {
+        assert!(media_presentation_witness("media", "playback_window", Some(300)));
+        assert!(media_presentation_witness("media", "playback_window", Some(1)));
+        // Blind window: the callback never fired — null is "cannot see", never
+        // a zero, and it must not hold the gate hot.
+        assert!(!media_presentation_witness("media", "playback_window", None));
+        // A paused element arms no window; zero presented frames is not playback.
+        assert!(!media_presentation_witness("media", "playback_window", Some(0)));
+        // Other media records are events, not presentation cadence.
+        assert!(!media_presentation_witness("media", "stall", Some(1)));
+        assert!(!media_presentation_witness("media", "quality_change", Some(1)));
+        assert!(!media_presentation_witness("ui", "playback_window", Some(1)));
+    }
+
+    #[test]
+    fn the_media_gate_stamps_its_allowance_so_playback_cannot_starve_applies() {
+        MEDIA_PLAYBACK_HOT_UNTIL_MS.store(0, Ordering::Relaxed);
+        MEDIA_PLAYBACK_LAST_APPLY_MS.store(0, Ordering::Relaxed);
+        // Playback begins: each presented frame renews the deadline.
+        mark_media_playback_hot(1_000);
+        assert_eq!(
+            media_playback_hot_until_ms(),
+            1_000 + MEDIA_PLAYBACK_HOT_SUPPRESS_MS
+        );
+        assert!(
+            background_apply_media_gate(2_000),
+            "hot with the allowance clock unmoved → defer"
+        );
+        // Still hot, but nothing has been allowed through for ≥ MAX_DEFER:
+        mark_media_playback_hot(16_000);
+        assert!(
+            !background_apply_media_gate(16_600),
+            "the starvation bound lets one through"
+        );
+        assert_eq!(
+            MEDIA_PLAYBACK_LAST_APPLY_MS.load(Ordering::Relaxed),
+            16_600,
+            "the allowed apply moves the bound's clock"
+        );
+        // …so the next tick defers again — one apply per bound, not zero.
+        assert!(background_apply_media_gate(17_000));
+        // Playback stops; the gate goes cold and stamps on every allow.
+        assert!(!background_apply_media_gate(9_000_000));
+        assert_eq!(
+            MEDIA_PLAYBACK_LAST_APPLY_MS.load(Ordering::Relaxed),
+            9_000_000
+        );
+    }
+}
 // Inline tree rename focuses asynchronously after context-menu and sidebar
 // interactions. Treat Enter as the commit action so transient WebView focus
 // churn during controlled input updates cannot commit a half-typed label.
@@ -14685,6 +14828,20 @@ async fn web_surface_native_reconcile_loop(
                         undecodable += 1;
                         continue;
                     };
+                    // The media-playback witness, for the media-playback gate
+                    // (see `mark_media_playback_hot`): a `playback_window` with
+                    // presented frames means a surface presented video within
+                    // the last second — the one signal that background applies
+                    // are now landing in a video's frame budget. rVFC does not
+                    // fire on a hidden page, so a stashed surface cannot hold
+                    // this hot.
+                    if media_presentation_witness(
+                        &record.category,
+                        &record.name,
+                        record.payload.get("presented").and_then(|v| v.as_u64()),
+                    ) {
+                        mark_media_playback_hot(current_millis());
+                    }
                     if let Some(payload) = record.payload.as_object_mut() {
                         payload.insert("row".to_string(), json!(session_path));
                         payload.insert("tab".to_string(), json!(tab_id));
@@ -17626,6 +17783,7 @@ struct ShellState {
     next_live_session_snapshot_interval_ms: u64,
     background_live_session_snapshot_apply_count: u64,
     background_live_session_snapshot_skipped_input_hot_count: u64,
+    background_live_session_snapshot_skipped_media_hot_count: u64,
     background_live_session_snapshot_skipped_noop_count: u64,
     latest_runtime_status: Option<ServerRuntimeStatus>,
     /// Version convergence — see `spec-bidirectional-version-convergence.md`.
@@ -20029,6 +20187,7 @@ impl ShellState {
             next_live_session_snapshot_interval_ms: LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS,
             background_live_session_snapshot_apply_count: 0,
             background_live_session_snapshot_skipped_input_hot_count: 0,
+            background_live_session_snapshot_skipped_media_hot_count: 0,
             background_live_session_snapshot_skipped_noop_count: 0,
             latest_runtime_status: None,
             version_convergence_last_seen_daemon_version: None,
@@ -41981,6 +42140,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 || !shell_has_live_session_snapshot_refresh_target(shell)
                 || now_ms < shell.next_live_session_snapshot_after_ms
                 || now_ms < terminal_input_hot_until_ms()
+                || background_apply_media_gate(now_ms)
             {
                 return LiveSnapshotGateDecision::Idle;
             }
@@ -42060,18 +42220,40 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                         if let Some(pending) = shell.version_convergence_pending_restart() {
                             shell.pending_update_restart = Some(pending.clone());
                         }
-                        let input_hot = current_millis() < terminal_input_hot_until_ms();
-                        if input_hot
+                        let now_apply_ms = current_millis();
+                        let input_hot = now_apply_ms < terminal_input_hot_until_ms();
+                        // The gate above already refuses to SPAWN a fetch while
+                        // media is presenting; this second consult covers the
+                        // race where playback started while the fetch was in
+                        // flight (a fetch is 2-5 s, playback can start any
+                        // time). One wasted fetch per starvation window at
+                        // worst; the counters make it visible.
+                        let media_defer = background_apply_media_gate(now_apply_ms);
+                        if (input_hot || media_defer)
                             && !background_snapshot_changes_active_runtime_identity(
                                 shell, &snapshot,
                             )
                         {
-                            shell.background_live_session_snapshot_skipped_input_hot_count = shell
-                                .background_live_session_snapshot_skipped_input_hot_count
-                                .saturating_add(1);
-                            let due_at_ms = terminal_input_hot_until_ms()
-                                .saturating_add(LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS);
-                            let now_ms = current_millis();
+                            let due_at_ms = if input_hot {
+                                terminal_input_hot_until_ms()
+                                    .saturating_add(LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS)
+                            } else {
+                                now_apply_ms.saturating_add(
+                                    LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
+                                )
+                            };
+                            if media_defer {
+                                shell.background_live_session_snapshot_skipped_media_hot_count =
+                                    shell
+                                        .background_live_session_snapshot_skipped_media_hot_count
+                                        .saturating_add(1);
+                            } else {
+                                shell.background_live_session_snapshot_skipped_input_hot_count =
+                                    shell
+                                        .background_live_session_snapshot_skipped_input_hot_count
+                                        .saturating_add(1);
+                            }
+                            let now_ms = now_apply_ms;
                             schedule_live_session_snapshot_due_at(
                                 shell,
                                 now_ms,
@@ -61136,7 +61318,9 @@ fn describe_app_state_snapshot(
         "terminal_input_hot": notification_now_ms < terminal_input_hot_until_ms(),
         "background_live_session_snapshot_apply_count": shell.background_live_session_snapshot_apply_count,
         "background_live_session_snapshot_skipped_input_hot_count": shell.background_live_session_snapshot_skipped_input_hot_count,
+        "background_live_session_snapshot_skipped_media_hot_count": shell.background_live_session_snapshot_skipped_media_hot_count,
         "background_live_session_snapshot_skipped_noop_count": shell.background_live_session_snapshot_skipped_noop_count,
+        "media_playback_hot_until_ms": media_playback_hot_until_ms(),
     });
     let daemon_update_state = daemon_update_state_json(shell.latest_runtime_status.as_ref());
     let session_view_contract_violations =
@@ -61536,7 +61720,9 @@ fn describe_app_state_snapshot(
             "terminal_input_hot": notification_now_ms < terminal_input_hot_until_ms(),
             "background_live_session_snapshot_apply_count": shell.background_live_session_snapshot_apply_count,
             "background_live_session_snapshot_skipped_input_hot_count": shell.background_live_session_snapshot_skipped_input_hot_count,
+            "background_live_session_snapshot_skipped_media_hot_count": shell.background_live_session_snapshot_skipped_media_hot_count,
             "background_live_session_snapshot_skipped_noop_count": shell.background_live_session_snapshot_skipped_noop_count,
+            "media_playback_hot_until_ms": media_playback_hot_until_ms(),
             "background_refresh_after_ms": shell.background_refresh_after_ms,
             "terminal_busy_hint_until_ms": shell.terminal_busy_hint_until_ms,
             "update_call_to_action": {

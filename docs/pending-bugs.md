@@ -125,7 +125,18 @@ name their target.
 
 **Status:** OBSERVABILITY SHIPPED on `lane/trace/webview-frame-cadence`
 (`media/playback_window` now carries `raf_fps`/`raf_p50_ms`/`raf_p95_ms`/
-`raf_max_ms`/`raf_over_25`/`raf_blind`); ROOT CAUSE OPEN — named remedy below.
+`raf_max_ms`/`raf_over_25`/`raf_blind`); **FIRST REMEDY UNIT SHIPPED on
+`lane/trace/media-playback-gate`** — the stall attribution below was measured
+with the block/render traces (whole-root `component_window` renders of 85–522 ms
+inside the holes, `terminal_app_declares` dispatch bursts of 4–11 RPCs in one
+instant), and remedy (a)'s first cut is the media-playback gate: the background
+live-session snapshot refuses to fetch and refuses to apply while a surface is
+presenting frames (`media/playback_window` with `presented > 0` renews a
+rolling atomic deadline, the input-hot gate's exact shape), bounded at one
+apply per 15 s so continuous playback cannot starve row state. Falsifier below
+is unchanged and now measurable on the shipped `raf_*` fields. REMAINING OPEN:
+the other background writers in the causes list (title generation,
+copy-scan, the declare-dispatch burst width), and remedies (b)/(c).
 
 Owner report 2026-09-04: youtube is choppy in ychrome with zero dropped
 frames in stats-for-nerds, and on the owner's invidious instance the player
