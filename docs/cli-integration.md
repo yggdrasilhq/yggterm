@@ -1706,3 +1706,71 @@ stamp.
   Issue 33 hedge below ("falls back to the row key") described a path the
   candidate builder never takes; live muse rows on dev carry birth titles
   ("New dev Muse Code") exactly as this predicts until they work.
+
+## Issue Heading 35: the self-minting identity collapse — all codex rows on one shared transcript, resume refused (2026-09-04)
+
+Measured live (the GUI host + the owner host, trace + /proc + snapshot evidence):
+every opened codex row pointed at ONE random session (`01a0349d…`, an Aug-24
+transcript), no previous session could be reconnected, and even a fresh codex
+spawn was pointed at it — resume refused because another process held the
+thread (`~/.codex/thread-writer-locks/<id>.lock`).
+
+### The chain, each link measured
+
+1. **Stamp starvation (owner host).** `refresh_live_codex_runtime_identities_
+   for_persistence` skipped any live codex row whose terminal-map pid was
+   absent — exactly the state after every daemon handover (successor holds
+   addresses, the PTY belongs to a preserved owner). A bare `continue`, zero
+   trace: 0 `codex_runtime_identity_refreshed` events for a birth-keyed row
+   since at least 3.2.33, while the tenants verb resolves the same rows fine.
+   ⇒ `"Codex Session"` metadata never stamped ⇒ the birth-alias export
+   (`local-codex-identities`) carried ZERO aliases.
+2. **The cwd guess cross-wires (GUI host).** With no aliases, the identity
+   poll's codex cwd fallback bound every same-directory row to the
+   lexicographically-first unclaimed live identity. Its `claimed` set only
+   lives one tick, so N rows polled at N ticks all took the same transcript —
+   which was itself only "live" because the first wrong resume had opened it.
+   Self-reinforcing.
+3. **The freeze.** Each rebind rewrote `session.id`, the builder's
+   `path id == session id` gate then excluded the row from every later poll:
+   exactly one poll chance per row, wrong id permanent. Resume composed
+   `codex resume <wrong-id>` against a locked thread → refusal.
+
+### The fix (this lane)
+
+* Stamp chore resolves the terminal pid through the preserved owner's
+  snapshot (existing wire, 60 s memo per key) and NAMES every row it still
+  cannot measure: `cli/agent_identity_probe_unresolved {session_path, reason:
+  terminal_pid_unknown|no_transcript_fd}`, edge-triggered. Expected picker
+  waits and starvation are now distinguishable.
+* Poll builder keeps repairable rows pollable: when the path id is a
+  synthesized UUIDv4 and the current id is not, the row stays in the poll
+  with `birth_id = Some(path id)` — the repair key the collapse had erased.
+  The builder also exports the full live bound-id set per slug.
+* Matcher: alias arm retries the birth-key arm (`birth_key_alias`); the cwd
+  guess refuses identities the owner aliased to its own rows
+  (`birth_session_id.is_some()`) and identities bound to any other live
+  remote row; a row bound to a live transcript aliased back to its birth is
+  SATISFIED — it no longer burns attempts.
+* Probes (all self-minting CLIs: Codex, Muse, Antigravity): edge-triggered
+  `cli/agent_identity_decision {slug, session_path, verdict:
+  bound|satisfied|no_candidate|exhausted, arm: birth_alias|birth_key_alias|
+  cwd_unique|none, chosen_id, cwd_candidates}` — a future cross-wire is a
+  stream of events within one tick, not silence.
+
+### Repair of damaged rows
+
+After the owner host's daemon rotates, its next persist stamps the true
+transcript per row (via the preserved-owner pid path); the alias export then
+maps real→birth; the GUI host's poll matches through `birth_key_alias` and
+rebinds each damaged row to the transcript its own process actually holds.
+Rows whose codex has minted nothing yet fall back to the birth id and the
+fresh-launch degrade — safe, and they bind on the first poll after mint.
+
+### Falsifier
+
+Spawn two codex rows in one cwd on the GUI host against the owner host:
+`ytrace query --name agent_identity_decision` must show per-row decisions,
+distinct `chosen_id`s (or honest `no_candidate`), and ZERO two rows sharing
+one id; `identities_with_birth_alias` in `cli/identity_poll` must be > 0
+once the owner daemon has rotated.
