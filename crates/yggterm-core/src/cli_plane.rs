@@ -906,6 +906,28 @@ pub fn emit_agent_identity_probe_unresolved(component: &str, session_path: &str,
     );
 }
 
+/// A stamp REFUSED because another live row already carries the same
+/// transcript id — one transcript, one row. Edge-triggered per
+/// (row, id, holder); the pid-recycling flip-flop of 2026-09-04 wore this
+/// exact shape before the refusal existed.
+pub fn emit_agent_identity_stamp_duplicate(
+    component: &str,
+    session_path: &str,
+    codex_session_id: &str,
+    holder: &str,
+) {
+    crate::perf::ytrace_emit_event(
+        component,
+        CLI_PLANE_CATEGORY,
+        "agent_identity_stamp_duplicate",
+        json!({
+            "session_path": session_path,
+            "codex_session_id": codex_session_id,
+            "holder": holder,
+        }),
+    );
+}
+
 /// One mirror tick's identity decision, for a CLI whose TUI renders sessions
 /// the row was not born with.
 ///

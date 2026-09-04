@@ -1,0 +1,20 @@
+fix(identity): a pid is not a process - revalidate the codex identity cache; one transcript, one row
+
+Second collapse of the night, measured at 00:21: dev's stamp chore serves
+identities from a blind pid-to-identity cache ("a codex process owns one
+session for its whole life" - true of the PROCESS, not of the pid KEY).
+After the takeover cascade the kernel recycled pids, the cache served a
+dead codex's transcript to a DIFFERENT row, several rows got stamped with
+ONE session id (01a06d75), the owner-alias export flip-flopped per tick on
+first-write-wins, and the GUI host's alias arm - the exact arm the cwd
+retirement just made primary - bound three different rows to that one
+transcript on three consecutive ticks. Convergence again, wearing the
+authoritative arm.
+
+- the cache is revalidated before serving: the pid must STILL hold the
+  cached rollout open (one /proc fd readdir), else it is re-resolved
+- the stamp chore refuses to write a duplicate: one transcript, one row;
+  a would-be duplicate is refused and named
+  (cli/agent_identity_stamp_duplicate, edge-triggered) with the holder row
+- test: the holder scan sees another live row's claim and never the
+  requester's own
