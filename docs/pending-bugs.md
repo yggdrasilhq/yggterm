@@ -121,6 +121,47 @@ surface-materializing verb (`web ensure` and friends) is a MUTATING verb on
 the active client and belongs in the shadow-law's table of probes that must
 name their target.
 
+## ⛔ [11.52] A REMOTE ROW'S PTY RESIZE DIES INSIDE THE BINARY-UPLOAD FALLBACK — THE GRID CORRECTION NEVER TOUCHES THE GRID
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Measured on the gui host, 2026-09-04 19:38 (v3.2.56, the current build): a
+remote codex row's switch-in (`suspend_wake_bridge_respawn` → runtime
+respawn → `codex_squish_repair`) fired five PTY resizes in four seconds
+(19:38:13–19:38:17; `remote-session://dev/bf4c20d1…` ×4 and `…01a043ae…` ×1)
+and every one failed with `will_retry: false` and the error **"failed to
+upload yggterm binary to dev"**. A grid correction never touched the grid:
+the resize runs the remote `server terminal resize` through
+`run_remote_yggterm_command_with_timeout`, whose failure path matches the
+over-broad `should_fallback_to_python` list, resets the remote-binary cache,
+re-resolves — and a re-resolve that decides to provision uploads the binary
+to the remote host. The transient first error was thrown away, the upload
+became the final error, and the row painted for a screen that no longer
+matched its PTY through the whole reveal (the squish family [11.34] lives
+exactly here). History in the same events: 492 of 513
+`remote_pty_resize_failed` events carried "retrying remote yggterm command
+after cache reset: … terminal session not found …" — the pre-fix
+double-billing where an app-level answer paid a cache reset + re-resolve per
+failure; the "a daemon answer is not a missing binary" classifier fix
+(2026-09-04, lib.rs) killed that class on 3.2.53+ and none of today's
+current-build events are retry-wrapped. The remaining class is this one: the
+resize itself must never run provisioning.
+
+**Fix (lane `lane/trace/remote-resize-no-fallback`):** the resize calls the
+new `run_remote_yggterm_command_no_fallback` — resolve from the warm cache
+(no ssh when fresh; stale-while-revalidate as before), run ONCE, return the
+error as-is: no cache reset, no re-resolve, no upload, no retry. The
+daemon-side `terminal session not found` re-queue (the switch-timing remedy)
+is untouched, and provisioning stays with the background refresh ([11.49]).
+Source contract `the_remote_pty_resize_never_runs_the_fallback_machinery`.
+
+**Falsifier:** the next switch-in of a remote codex/agy row must show
+`remote_pty_resize_forwarded` with `ok: true` (or, on a genuine daemon
+outage, the FIRST error's own text — never an upload error);
+`remote_pty_resize_failed` must stop carrying "failed to upload yggterm
+binary"; and `codex_squish_repair` on switch-in should stop being preceded
+by failed resizes.
+
 ## ⛔ [11.51] VIDEO PLAYS WITH PERFECT MEDIA STATS AND A HOLE-RIDDEN COMPOSITOR CADENCE — "STATS FOR NERDS SHOWS NOTHING BUT IT STUTTERS"
 
 **Status:** OBSERVABILITY SHIPPED on `lane/trace/webview-frame-cadence`
@@ -848,9 +889,9 @@ original GUI is gone.
 
 ## ⛔ [11.31] A LIVE HOST CANCELLED AS "INACTIVE" LOSES ITS READY PROOF FOREVER — EVERY SWITCH-BACK COLD-REMOUNTS (the 2026-08-29 UI-block storm on the GUI host)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** FIXED — LIVE PROOF IN (2026-09-04 ~22:30, the gui host, v3.2.56). The falsifier below is answered with a nuance worth keeping: the `bootstrap_reset` TRACE still fires on switch-backs, but the cold SPAWN it used to drive is cancelled — every `bootstrap_reset` whose host is already live is followed by `bootstrap_spawn_skipped_inactive_retained_host` (measured live at 19:38:22, switch-back to a remote codex row), and `terminal_open_attempt/ready` carries reason `ready_on_inactive_cancel_host_already_live` (21 of the last 300 ready events). Every surviving `bootstrap_reset` with `mount_epoch > 1` pairs with a genuine respawn cause (`suspend_wake_bridge_respawn`, `bootstrap_owner_superseded_during_loop`), not an innocent switch — the grid-cold-remount defect class is dead on current builds.
 
-The observation that would falsify it: on the next build, a switch away and
+The original observation: on the next build, a switch away and
 back to any row whose first mount was cancelled by the inactive-skip must NOT
 emit `bootstrap_reset` on the switch-back — `ytrace` count of
 `terminal_mount/bootstrap_reset` per row-switch returns to ~0, and the
