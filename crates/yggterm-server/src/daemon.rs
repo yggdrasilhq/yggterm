@@ -14466,6 +14466,33 @@ fn build_background_copy_updates(
             } else {
                 None
             };
+            // PUSH (Issue Heading 37): muse code does NOT self-title — the
+            // generated title is pushed into muse's own session index so the
+            // CLI's picker and yggterm's row agree. USER home (the
+            // store-candidate lesson: not resolve_yggterm_home). Codex has no
+            // title store — yggterm's metadata layer stays its only carrier.
+            if let Some(generated) = title.as_deref()
+                && candidate.session_path.starts_with("muse-runtime://")
+                && let Some(user_home) = dirs::home_dir()
+            {
+                if yggterm_core::agent_cli::push_title_to_muse_store(
+                    &user_home,
+                    &candidate.session_id,
+                    generated,
+                ) == Some(true)
+                {
+                    append_trace_event(
+                        &resolve_yggterm_home().unwrap_or_default(),
+                        "daemon",
+                        "title",
+                        "pushed_to_cli_store",
+                        serde_json::json!({
+                            "slug": "muse",
+                            "session_id": candidate.session_id,
+                        }),
+                    );
+                }
+            }
             let summary = if summary_missing && !rate_limited_this_tick {
                 match store.generate_summary_for_transcript(
                     settings,
