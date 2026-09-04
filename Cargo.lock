@@ -7202,7 +7202,7 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "yggterm"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -7224,7 +7224,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -7248,7 +7248,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "anyhow",
  "thiserror 2.0.20",
@@ -7257,11 +7257,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "3.2.60"
+version = "3.2.61"
 
 [[package]]
 name = "yggterm-platform"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "anyhow",
  "objc2",
@@ -7275,7 +7275,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-server"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "anyhow",
  "base64",
@@ -7301,7 +7301,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-shell"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7350,7 +7350,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-webprobe"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "gtk",
  "serde_json",
@@ -7383,7 +7383,7 @@ dependencies = [
 
 [[package]]
 name = "ynpm"
-version = "3.2.60"
+version = "3.2.61"
 dependencies = [
  "anyhow",
  "serde",
