@@ -37909,7 +37909,7 @@ mod tests {
         let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
             .expect("fixture store");
         conn.execute_batch(
-            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);",
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER, time_viewed INTEGER, time_archived INTEGER);",
         )
         .expect("fixture table");
         for (id, directory, viewed) in [
@@ -37918,9 +37918,10 @@ mod tests {
             // The decoy: a NEWER session for a DIFFERENT cwd must not win.
             ("ses_decoy00000000000000000000003", "/home/user/other", "900"),
         ] {
+            let epoch: i64 = viewed.parse().expect("fixture epoch");
             conn.execute(
                 "INSERT INTO session_v2 (id, directory, time_updated, time_viewed, time_archived) VALUES (?1, ?2, ?3, ?4, NULL)",
-                rusqlite::params![id, directory, viewed, viewed],
+                rusqlite::params![id, directory, epoch, epoch],
             )
             .expect("fixture row");
         }
@@ -38003,12 +38004,12 @@ mod tests {
         let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
             .expect("fixture store");
         conn.execute_batch(
-            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);",
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER, time_viewed INTEGER, time_archived INTEGER);",
         )
         .expect("fixture table");
         conn.execute(
             "INSERT INTO session_v2 (id, directory, time_updated, time_viewed, time_archived) VALUES (?1, ?2, ?3, ?4, NULL)",
-            rusqlite::params!["ses_store0000000000000000000001", "/home/user/proj", "900", "900"],
+            rusqlite::params!["ses_store0000000000000000000001", "/home/user/proj", 900, 900],
         )
         .expect("fixture row");
         drop(conn);

@@ -5410,37 +5410,60 @@ pub fn opencode_store_newest_session_for_directory(home: &Path, directory: &str)
         if present == 0 {
             continue;
         }
-        let viewed_col = if selects_viewed { ", time_viewed" } else { "" };
+        let viewed_col = if selects_viewed { ", time_viewed, time_archived" } else { ", time_archived" };
         let sql = format!(
-            "SELECT id, time_updated{viewed_col} FROM {table} WHERE directory = ?1 AND (time_archived IS NULL OR time_archived = '')"
+            "SELECT id, time_updated{viewed_col} FROM {table} WHERE directory = ?1"
         );
         let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
         };
+        // ⛔ TYPE-AGNOSTIC COLUMNS, measured live (dev, 2026-09-04): the store
+        // holds INTEGER epochs, and the first cut read them as
+        // Option<String> — every row errored on conversion, the lazy
+        // query_map + flatten() silently dropped every row, the query
+        // "answered none", and the candidate arm degraded exactly when a
+        // real session existed. Read the storage class, then parse; never
+        // let a column-type surprise become a silent empty answer.
         let Ok(rows) = stmt.query_map(rusqlite::params![trimmed], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
+                row.get::<_, rusqlite::types::Value>(1)?,
                 if selects_viewed {
-                    row.get::<_, Option<String>>(2)?
+                    row.get::<_, rusqlite::types::Value>(2)?
                 } else {
-                    None
+                    rusqlite::types::Value::Null
                 },
+                row.get::<_, rusqlite::types::Value>(if selects_viewed { 3 } else { 2 })?,
             ))
         }) else {
             continue;
         };
         let mut best: Option<(i128, String)> = None;
-        for row in rows.flatten() {
-            let (id, updated, viewed) = row;
+        for row in rows {
+            // An erroring row is FORWARDED (counted as a skipped candidate),
+            // never silently flattened away — a store this unreadable must
+            // answer none only when no row survived, by the same law the
+            // holds-session probe keeps.
+            let Ok((id, updated, viewed, archived)) = row else {
+                continue;
+            };
             if !id.starts_with("ses_") {
                 continue;
             }
-            let epoch_ms = |v: &Option<String>| -> i128 {
-                v.as_deref()
-                    .and_then(|s| s.trim().parse::<i128>().ok())
-                    .unwrap_or(0)
+            let epoch_ms = |v: &rusqlite::types::Value| -> i128 {
+                match v {
+                    rusqlite::types::Value::Integer(i) => *i as i128,
+                    rusqlite::types::Value::Real(f) => *f as i128,
+                    rusqlite::types::Value::Text(t) => t.trim().parse::<i128>().unwrap_or(0),
+                    _ => 0,
+                }
             };
+            // Archived = a REAL archived-at epoch (integer 0/NULL/never-set
+            // strings are "not archived"). The live store holds SQL NULL on
+            // live sessions — measured alongside the integer epochs.
+            if epoch_ms(&archived) > 0 {
+                continue;
+            }
             let recency = epoch_ms(&viewed).max(epoch_ms(&updated));
             if recency <= 0 {
                 continue;
@@ -8849,12 +8872,18 @@ mod newest_session_tests {
     #[test]
     fn newest_prefers_the_later_of_viewed_and_updated_and_skips_archived() {
         let home = temp_home("pref");
+        // ⛔ INTEGER epochs — the LIVE store's measured representation. The
+        // first cut of this query read the columns as TEXT (its fixtures
+        // inserted '100'/'200' strings and passed), and the real db's
+        // integers errored every row into a silent empty answer. The fixture
+        // must carry the store's REAL storage class; the mixed-type test
+        // below locks the reading, not the assumption.
         seed(
             &home,
-            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);
-             INSERT INTO session_v2 VALUES ('ses_viewed', '/p', '200', '500', NULL);
-             INSERT INTO session_v2 VALUES ('ses_updated', '/p', '900', '100', NULL);
-             INSERT INTO session_v2 VALUES ('ses_archived', '/p', '9999', '9999', 'now');",
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER, time_viewed INTEGER, time_archived INTEGER);
+             INSERT INTO session_v2 VALUES ('ses_viewed', '/p', 200, 500, NULL);
+             INSERT INTO session_v2 VALUES ('ses_updated', '/p', 900, 100, NULL);
+             INSERT INTO session_v2 VALUES ('ses_archived', '/p', 9999, 9999, 9999);",
         );
         assert_eq!(
             opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
@@ -8864,12 +8893,31 @@ mod newest_session_tests {
     }
 
     #[test]
+    fn newest_reads_epoch_columns_whatever_storage_class_they_carry() {
+        let home = temp_home("mixed");
+        // The falsified-live shape: one row INTEGER (the live store), one row
+        // TEXT (the assumption the first cut was written against) — BOTH must
+        // be readable candidates.
+        seed(
+            &home,
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);
+             INSERT INTO session_v2 VALUES ('ses_int', '/p', 900, 900, NULL);
+             INSERT INTO session_v2 VALUES ('ses_text', '/p', '100', '100', NULL);",
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
+            Some("ses_int"),
+            "an INTEGER-epoch row must be readable as a candidate"
+        );
+    }
+
+    #[test]
     fn newest_falls_back_to_the_v1_table_and_prefers_v2_when_it_answers() {
         let home = temp_home("v1");
         seed(
             &home,
-            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_archived TEXT);
-             INSERT INTO session VALUES ('ses_v1', '/p', '700', NULL);",
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER, time_archived INTEGER);
+             INSERT INTO session VALUES ('ses_v1', '/p', 700, NULL);",
         );
         assert_eq!(
             opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
@@ -8878,8 +8926,8 @@ mod newest_session_tests {
         );
         seed(
             &home,
-            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);
-             INSERT INTO session_v2 VALUES ('ses_v2', '/p', '10', '10', NULL);",
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER, time_viewed INTEGER, time_archived INTEGER);
+             INSERT INTO session_v2 VALUES ('ses_v2', '/p', 10, 10, NULL);",
         );
         assert_eq!(
             opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
@@ -8893,9 +8941,9 @@ mod newest_session_tests {
         let home = temp_home("refuse");
         seed(
             &home,
-            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);
-             INSERT INTO session_v2 VALUES ('ses_here', '/p', '100', '100', NULL);
-             INSERT INTO session_v2 VALUES ('not_ses', '/p', '900', '900', NULL);",
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER, time_viewed INTEGER, time_archived INTEGER);
+             INSERT INTO session_v2 VALUES ('ses_here', '/p', 100, 100, NULL);
+             INSERT INTO session_v2 VALUES ('not_ses', '/p', 900, 900, NULL);",
         );
         assert_eq!(
             opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
