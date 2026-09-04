@@ -50,13 +50,13 @@ wayland-client = { version = "0.31.14", features = ["system"] }
 wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
-wry = "0.55.0"
+wry = "0.56.1"
 x11rb = "0.13.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "0.38"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Com", "Win32_System_Com_StructuredStorage"] }
-wry = "0.55.0"
+wry = "0.56.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3.2", features = ["NSProcessInfo", "NSString"] }

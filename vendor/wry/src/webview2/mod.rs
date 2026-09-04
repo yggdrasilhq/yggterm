@@ -30,8 +30,8 @@ use self::drag_drop::DragDropController;
 use super::Theme;
 use crate::{
   custom_protocol_workaround, proxy::ProxyConfig, Error, MemoryUsageLevel, NewWindowFeatures,
-  NewWindowOpener, NewWindowResponse, PageLoadEvent, Rect, RequestAsyncResponder, Result,
-  WebViewAttributes, RGBA,
+  NewWindowOpener, NewWindowResponse, PageLoadEvent, PermissionKind, PermissionResponse, Rect,
+  RequestAsyncResponder, Result, WebViewAttributes, RGBA,
 };
 
 type EventRegistrationToken = i64;
@@ -135,7 +135,13 @@ impl InnerWebView {
     } else {
       Self::create_environment(&attributes, pl_attrs.clone())?
     };
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito, background_color)?;
+    let controller = Self::create_controller(
+      hwnd,
+      &env,
+      attributes.incognito,
+      background_color,
+      pl_attrs.profile_name.as_deref(),
+    )?;
     let webview = Self::init_webview(
       parent,
       hwnd,
@@ -369,6 +375,7 @@ impl InnerWebView {
     env: &ICoreWebView2Environment,
     incognito: bool,
     background_color: Option<(u8, u8, u8, u8)>,
+    profile_name: Option<&str>,
   ) -> Result<ICoreWebView2Controller> {
     let (tx, rx) = mpsc::channel();
 
@@ -405,6 +412,11 @@ impl InnerWebView {
         }
 
         controller_opts.SetIsInPrivateModeEnabled(incognito)?;
+
+        if let Some(name) = profile_name {
+          controller_opts.SetProfileName(&HSTRING::from(name))?;
+        }
+
         env10.CreateCoreWebView2ControllerWithOptions(hwnd, &controller_opts, &handler)?;
       } else {
         env.CreateCoreWebView2Controller(hwnd, &handler)?
@@ -514,6 +526,58 @@ impl InnerWebView {
       }
     }
 
+    // Permission handler
+    if let Some(permission_handler) = attributes.permission_handler.take() {
+      unsafe {
+        webview.add_PermissionRequested(
+          &PermissionRequestedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else { return Ok(()) };
+
+            let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+            args.PermissionKind(&mut kind)?;
+
+            // Convert WebView2 permission kind to our PermissionKind
+            let permission_kind = match kind {
+              COREWEBVIEW2_PERMISSION_KIND_MICROPHONE => PermissionKind::Microphone,
+              COREWEBVIEW2_PERMISSION_KIND_CAMERA => PermissionKind::Camera,
+              COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION => PermissionKind::Geolocation,
+              COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS => PermissionKind::Notifications,
+              COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ => PermissionKind::ClipboardRead,
+              COREWEBVIEW2_PERMISSION_KIND_LOCAL_FONTS => PermissionKind::LocalFonts,
+              COREWEBVIEW2_PERMISSION_KIND_OTHER_SENSORS => PermissionKind::Sensors,
+              COREWEBVIEW2_PERMISSION_KIND_MIDI_SYSTEM_EXCLUSIVE_MESSAGES => PermissionKind::Midi,
+              COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS => {
+                PermissionKind::AutomaticDownloads
+              }
+              COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE => PermissionKind::FileSystemAccess,
+              COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY => PermissionKind::Autoplay,
+              COREWEBVIEW2_PERMISSION_KIND_WINDOW_MANAGEMENT => PermissionKind::WindowManagement,
+              _ => PermissionKind::Other,
+            };
+
+            // Call user's permission handler
+            let response = permission_handler(permission_kind);
+
+            // Apply the response
+            match response {
+              PermissionResponse::Allow => {
+                args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+              }
+              PermissionResponse::Deny => {
+                args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+              }
+              PermissionResponse::Default => {
+                // Do nothing, let WebView2 show default prompt
+              }
+            }
+
+            Ok(())
+          })),
+          &mut token,
+        )?;
+      }
+    }
+
     // Navigation
     if let Some(mut url) = attributes.url {
       if let Some((protocol, _)) = url.split_once("://") {
@@ -544,7 +608,8 @@ impl InnerWebView {
       controller.SetIsVisible(attributes.visible)?;
 
       if attributes.focused {
-        controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)?;
+        // Ignore this error since it fails when the window is minimized
+        let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
       }
     }
 
@@ -909,7 +974,14 @@ impl InnerWebView {
 
         #[cfg(feature = "tracing")]
         let _span = tracing::info_span!(parent: None, "wry::ipc::handle").entered();
-        ipc_handler(Request::builder().uri(url).body(js).unwrap());
+
+        match Request::builder().uri(url).body(js) {
+          Ok(request) => ipc_handler(request),
+          Err(_error) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!("WebView received invalid IPC request: {_error}")
+          }
+        }
 
         Ok(())
       })),
@@ -1223,33 +1295,31 @@ impl InnerWebView {
     dwrefdata: usize,
   ) -> LRESULT {
     match msg {
-      WM_SIZE => {
-        if wparam.0 != SIZE_MINIMIZED as usize {
-          let controller = dwrefdata as *mut ICoreWebView2Controller;
+      WM_SIZE if wparam.0 != SIZE_MINIMIZED as usize => {
+        let controller = dwrefdata as *mut ICoreWebView2Controller;
 
-          let Ok(PhysicalSize { width, height }) = Self::parent_bounds(hwnd) else {
-            return DefSubclassProc(hwnd, msg, wparam, lparam);
-          };
+        let Ok(PhysicalSize { width, height }) = Self::parent_bounds(hwnd) else {
+          return DefSubclassProc(hwnd, msg, wparam, lparam);
+        };
 
-          let _ = (*controller).SetBounds(RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
-          });
+        let _ = (*controller).SetBounds(RECT {
+          left: 0,
+          top: 0,
+          right: width,
+          bottom: height,
+        });
 
-          let mut hwnd = HWND::default();
-          if (*controller).ParentWindow(&mut hwnd).is_ok() {
-            let _ = SetWindowPos(
-              hwnd,
-              None,
-              0,
-              0,
-              width,
-              height,
-              SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
-            );
-          }
+        let mut hwnd = HWND::default();
+        if (*controller).ParentWindow(&mut hwnd).is_ok() {
+          let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+          );
         }
       }
 
@@ -1258,27 +1328,21 @@ impl InnerWebView {
         let _ = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
       }
 
-      msg if msg == WM_MOVE || msg == WM_MOVING => {
+      WM_MOVE | WM_MOVING => {
         let controller = dwrefdata as *mut ICoreWebView2Controller;
         let _ = (*controller).NotifyParentWindowPositionChanged();
       }
 
-      msg if msg == WM_DESTROY || msg == PARENT_DESTROY_MESSAGE => {
-        // check if `dwrefdata` is null to avoid double-freeing the controller
-        if !(dwrefdata as *mut ()).is_null() {
-          drop(Box::from_raw(dwrefdata as *mut ICoreWebView2Controller));
-
-          // update `dwrefdata` to null to avoid double-freeing the controller
-          let _ = SetWindowSubclass(
-            hwnd,
-            Some(Self::parent_subclass_proc),
-            PARENT_SUBCLASS_ID as _,
-            std::ptr::null::<()>() as _,
-          );
-        }
+      WM_DESTROY | PARENT_DESTROY_MESSAGE => {
+        let _ = RemoveWindowSubclass(
+          hwnd,
+          Some(Self::parent_subclass_proc),
+          PARENT_SUBCLASS_ID as _,
+        );
+        drop(Box::from_raw(dwrefdata as *mut ICoreWebView2Controller));
       }
 
-      _ => (),
+      _ => {}
     }
 
     DefSubclassProc(hwnd, msg, wparam, lparam)
@@ -1374,6 +1438,11 @@ impl InnerWebView {
     &self.id
   }
 
+  #[inline]
+  pub fn hwnd(&self) -> HWND {
+    self.hwnd
+  }
+
   pub fn eval(
     &self,
     js: &str,
@@ -1411,6 +1480,26 @@ impl InnerWebView {
 
   pub fn reload(&self) -> Result<()> {
     unsafe { self.webview.Reload() }.map_err(Into::into)
+  }
+
+  pub fn go_forward(&self) -> Result<()> {
+    unsafe { self.webview.GoForward() }.map_err(Into::into)
+  }
+
+  pub fn go_back(&self) -> Result<()> {
+    unsafe { self.webview.GoBack() }.map_err(Into::into)
+  }
+
+  pub fn can_go_forward(&self) -> Result<bool> {
+    let mut can_go_forward = FALSE;
+    unsafe { self.webview.CanGoForward(&mut can_go_forward) }.map_err(Into::<Error>::into)?;
+    Ok(can_go_forward.into())
+  }
+
+  pub fn can_go_back(&self) -> Result<bool> {
+    let mut can_go_back = FALSE;
+    unsafe { self.webview.CanGoBack(&mut can_go_back) }.map_err(Into::<Error>::into)?;
+    Ok(can_go_back.into())
   }
 
   pub fn bounds(&self) -> Result<Rect> {

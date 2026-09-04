@@ -63,10 +63,10 @@ devtools = [
     "dep:dioxus-devtools",
     "dioxus-signals",
 ]
-fullscreen = ["wry/fullscreen"]
+fullscreen = []
 gnu = []
 tokio_runtime = ["dep:tokio"]
-transparent = ["wry/transparent"]
+transparent = []
 
 [lib]
 name = "dioxus_desktop"
@@ -228,10 +228,9 @@ version = "0.1.41"
 version = "1.0"
 
 [dependencies.wry]
-version = "0.55.0"
+version = "0.56.1"
 features = [
     "os-webview",
-    "protocol",
 ]
 default-features = false
 
@@ -313,10 +312,9 @@ version = "0.2.7"
 version = "0.1.1"
 
 [target.'cfg(target_os = "linux")'.dependencies.wry]
-version = "0.55.0"
+version = "0.56.1"
 features = [
     "os-webview",
-    "protocol",
     "linux-body",
 ]
 default-features = false
