@@ -26746,7 +26746,7 @@ must neuter PATH. Same class as [[finding-a-test-that-reads-ambient-host-state-i
 
 ## ⛔ [identity-order-divergence] COLLAPSE-DAMAGED REMOTE CODEX ROWS ARE ABSENT FROM live_session_order — THE IDENTITY POLL CANNOT REACH THEM
 
-**Status:** OPEN (filed 2026-09-04 late, lane `lane/trace/agent-identity-collapse`).
+**Status:** REACHABILITY CLOSED 2026-09-04 late on `lane/trace/agent-identity-reach` — the poll view now sweeps the sessions map for live self-minting rows the order does not name (sorted, deterministic) and names a dead order key `order_key_missing_from_sessions` instead of skipping it silently. The rows are REACHED; what stays open below is the order-ledger reconciliation itself (presentation plane) and the second measured wound: the rows can answer on a THIRD synthesized id (ensure-funnel re-mint), which the widened repair signature (path-v4 birth, any drifted id) now covers. The cwd guess itself was RETIRED the same night after re-cross-wiring rows (01a06bc8) while the alias export silently zeroed — binding is owner-alias-only now.
 Follow-up to Issue Heading 35 (docs/cli-integration.md) — the collapse
 MECHANISM is fixed and live-verified (owner host stamps fire — first
 birth-key `codex_runtime_identity_refreshed` events ever at 21:43 incl.
