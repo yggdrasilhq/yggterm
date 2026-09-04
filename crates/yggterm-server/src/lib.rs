@@ -10984,7 +10984,13 @@ impl YggtermServer {
         if cwd.is_empty() {
             return None;
         }
-        let home = resolve_yggterm_home().ok()?;
+        // ⛔ The USER home, not resolve_yggterm_home(): opencode2 writes its
+        // store under ~/.local/share/opencode — the first cut resolved
+        // ~/.yggterm and queried a db that does not exist, so the tier
+        // answered none on every live restore (falsified live 2026-09-04,
+        // cli/store_candidate cwd_present:true answered:false). Same
+        // expansion the remote probe scripts use (os.path.expanduser).
+        let home = dirs::home_dir()?;
         yggterm_core::agent_cli::opencode_store_newest_session_for_directory(&home, cwd)
     }
 
