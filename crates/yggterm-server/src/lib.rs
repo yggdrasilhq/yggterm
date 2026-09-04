@@ -7665,6 +7665,34 @@ impl YggtermServer {
     /// poll while its `claimed` set only lives for one tick, so without the
     /// full bound set it re-claimed the same transcript for a new row every
     /// tick (the 2026-09-04 collapse: all codex rows on one shared id).
+    /// The live codex row ALREADY carrying `session_id` as its real
+    /// transcript id, if any — storage key of that row. The stamp chore
+    /// refuses to write a duplicate: one transcript, one row. `exclude_key`
+    /// is the row asking to be stamped.
+    pub(crate) fn live_codex_session_holding_session_id(
+        &self,
+        session_id: &str,
+        exclude_key: &str,
+    ) -> Option<String> {
+        for key in &self.live_session_order {
+            if key == exclude_key {
+                continue;
+            }
+            let Some(session) = self.sessions.get(key) else {
+                continue;
+            };
+            if session.kind != SessionKind::Codex {
+                continue;
+            }
+            if session.id == session_id
+                || session_metadata_value(session, "Codex Session").as_deref() == Some(session_id)
+            {
+                return Some(key.clone());
+            }
+        }
+        None
+    }
+
     pub(crate) fn live_remote_agent_identity_poll_view(
         &self,
     ) -> (Vec<RemoteAgentIdentityPollTarget>, Vec<(String, &'static str)>) {
@@ -48156,6 +48184,61 @@ terminal_window_id: None,
         // daemon tests.
         let _ = real;
     }
+
+    #[test]
+    fn duplicate_codex_stamp_refuses_when_another_live_row_holds_the_id() {
+        let b1 = "11111111-1111-4111-8111-111111111111";
+        let b2 = "22222222-2222-4222-8222-222222222222";
+        let real = "019f5a3c-9b21-7e44-8c11-2f6d8a90e3b7";
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        for (key, birth) in [
+            (remote_scanned_session_path("dev", b1), b1),
+            (remote_scanned_session_path("dev", b2), b2),
+        ] {
+            server.restore_live_session(PersistedLiveSession {
+                app_launch: None,
+                key: key.clone(),
+                id: birth.to_string(),
+                title: "row".to_string(),
+                kind: SessionKind::Codex,
+                keep_alive: true,
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                cwd: Some("/home/user/gh/yggterm".to_string()),
+                remote_launch_action: Some("start-codex".to_string()),
+                storage_path: None,
+                restore_reason: None,
+                created_by: None,
+                ephemeral: None,
+                agent_launch_options: Default::default(),
+                title_is_explicit: false,
+                outline_prefix: None,
+            });
+            let live = server.sessions.get_mut(&key).expect("mounted");
+            upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
+        }
+        assert_eq!(
+            server.live_codex_session_holding_session_id(real, "unrelated"),
+            None
+        );
+        let k1 = remote_scanned_session_path("dev", b1);
+        let live = server.sessions.get_mut(&k1).expect("mounted");
+        upsert_session_metadata(&mut live.metadata, "Codex Session", real.to_string());
+        let k2 = remote_scanned_session_path("dev", b2);
+        assert_eq!(
+            server.live_codex_session_holding_session_id(real, &k2).as_deref(),
+            Some(k1.as_str())
+        );
+        assert_eq!(
+            server.live_codex_session_holding_session_id(real, &k1),
+            None
+        );
+    }
+
 
     /// The other half of the divergence made loud: an order entry naming a
     /// key the sessions map does not hold is NAMED, never silent.

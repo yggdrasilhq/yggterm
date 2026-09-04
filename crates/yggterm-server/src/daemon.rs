@@ -6598,17 +6598,30 @@ impl DaemonRuntime {
     }
 
     fn codex_runtime_identity_for_pid(&self, pid: u32) -> Option<CodexRuntimeProcessIdentity> {
-        self.codex_process_identity_cache
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&pid).cloned())
-            .or_else(|| {
-                let identity = codex_runtime_process_identity_from_root_pid(pid)?;
-                if let Ok(mut cache) = self.codex_process_identity_cache.lock() {
-                    cache.insert(pid, identity.clone());
+        // ⛔ A PID IS NOT A PROCESS. The cache below was blind by design —
+        // "a codex process owns one session for its whole life" — but the
+        // KEY is the pid, and the kernel recycles pids. Measured live
+        // 2026-09-04 late: after the takeover cascade, a recycled pid made
+        // this cache serve a DEAD codex's transcript to a DIFFERENT row, the
+        // stamp chore stamped several rows with one session id, and the
+        // owner-alias export flip-flopped per tick — the whole collapse
+        // again, wearing the alias arm. Revalidate: the cached identity only
+        // stands while the pid STILL holds that exact rollout open.
+        if let Ok(mut cache) = self.codex_process_identity_cache.lock() {
+            if let Some(cached) = cache.get(&pid) {
+                let still_holds = crate::codex_storage_path_from_process_fds(pid)
+                    .is_some_and(|open| open == cached.storage_path);
+                if still_holds {
+                    return Some(cached.clone());
                 }
-                Some(identity)
-            })
+                cache.remove(&pid);
+            }
+        }
+        let identity = codex_runtime_process_identity_from_root_pid(pid)?;
+        if let Ok(mut cache) = self.codex_process_identity_cache.lock() {
+            cache.insert(pid, identity.clone());
+        }
+        Some(identity)
     }
 
     fn refresh_live_codex_runtime_identities_for_persistence(&mut self) -> usize {
@@ -6643,6 +6656,17 @@ impl DaemonRuntime {
                 continue;
             };
             Self::note_identity_probe_resolved(&key);
+            // One transcript, one row. A stamp that would duplicate an id
+            // another live row already carries is a cross-wire in the making
+            // (the pid-recycling collapse of 2026-09-04) — refuse it and name
+            // both rows instead of writing the poison.
+            if let Some(holder) = self
+                .server
+                .live_codex_session_holding_session_id(&identity.session_id, &key)
+            {
+                Self::note_identity_stamp_duplicate(&key, &identity.session_id, &holder);
+                continue;
+            }
             if self.server.apply_codex_runtime_identity_to_live_session(
                 &key,
                 &identity,
@@ -6725,6 +6749,38 @@ impl DaemonRuntime {
                 "daemon",
                 session_path,
                 reason,
+            );
+        }
+    }
+
+    /// Edge-triggered naming of a refused duplicate stamp: two live rows
+    /// resolving to ONE transcript id is a cross-wire in the making (pid
+    /// recycling fed the 2026-09-04 late-night flip-flop), so it is refused
+    /// before the metadata is written and both rows are named.
+    fn note_identity_stamp_duplicate(session_path: &str, codex_session_id: &str, holder: &str) {
+        static LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+            std::sync::OnceLock::new();
+        let last = LAST.get_or_init(std::sync::Mutex::default);
+        let key = format!("{session_path}\u{1}{codex_session_id}");
+        let emit = match last.lock() {
+            Ok(mut guard) => {
+                if guard.len() > 1024 {
+                    guard.clear();
+                }
+                guard
+                    .insert(key.clone(), holder.to_string())
+                    .as_deref()
+                    != Some(holder)
+            }
+            Err(_) => true,
+        };
+        if emit {
+            #[cfg(not(test))]
+            yggterm_core::cli_plane::emit_agent_identity_stamp_duplicate(
+                "daemon",
+                session_path,
+                codex_session_id,
+                holder,
             );
         }
     }
