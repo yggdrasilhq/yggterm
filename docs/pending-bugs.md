@@ -210,42 +210,6 @@ surface-materializing verb (`web ensure` and friends) is a MUTATING verb on
 the active client and belongs in the shadow-law's table of probes that must
 name their target.
 
-## ⛔ [11.54] EVERY GUI BIRTH BLOCKS 5-12 SECONDS ON THE AGENT-STORE WALK BEFORE THE WINDOW EXISTS — THE TREE SEED PAID FOR THE WHOLE SCAN
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Measured on the gui host, 2026-09-04/05 births: `startup/load_browser_tree`
-spans of **5.15 s and 6.22 s** (and 9-12 s on busier days — `cli/scan_total`
-8.98 s and 12.03 s on the 09-04 04:33 birth) sit ON the synchronous startup
-path: `main()` ran `store.load_codex_tree(&settings)` — the full unified walk
-of every agent store (`~/.codex`, `~/.claude`, …: `scan_all_durable_sessions`)
-— before `resolve_client_daemon_endpoint`, `warm_daemon_start`, the window, or
-any presentation. A `placeholder_session_tree` was already built one line
-earlier and thrown away, and the shell already owned the entire deferred shape
-for the load-error case (`browser_tree_loaded=false` ->
-`browser_tree_loading_in_flight` -> `spawn_initial_browser_tree_load`:
-spawn_blocking load, selection restore, render epoch, UI schedule) — the happy
-path just never used it. This is the felt half of the owner's kill-and-reopen
-class: a reopened GUI paid the whole scan before its first pixel. (The OTHER
-half, the ~3.3 s ui/block at birth, is the WebKit webview build — [11.36]
-family; this entry owns the scan.)
-
-**Fix (lane `lane/trace/instant-browser-tree-seed`):** the startup seeds the
-placeholder (`browser_tree_loaded=false`) unconditionally and lets the
-existing background loader do the walk — the window presents immediately and
-the real tree swaps in with selection restored. The
-`startup/load_browser_tree` span disappears from births;
-`startup/initial_browser_tree_load` (already the background loader's span)
-becomes its always-on replacement.
-
-**Falsifier:** on the next GUI birth, `startup/load_browser_tree` is ABSENT
-from the startup trace, `startup/initial_browser_tree_load` appears with
-`ok:true` a few seconds after launch (in the background), and the first
-`dioxus_render/component_window` lands seconds earlier than the previous
-births' pattern; the start page shows the loading state until the swap, and
-`restore_browser_tree`'s selection restore still lands on the row the user
-had active.
-
 ## ⛔ [11.53] THE PAINT-DEMAND WATCHDOG RESCUED ONE IDLE ROW EVERY SECOND FOR AN HOUR — THE DEMAND IT WAS RESCUING WAS NEVER SERVED
 
 **Status:** OPEN
@@ -311,47 +275,6 @@ occurrence names its own refusing gate.
 events in its first 5 seconds and then one per ~30 s (not 1/s), each with the
 gate snapshot; the root-cause half closes when the snapshot's refusing gate is
 fixed and a stranded demand is observed to clear.
-
-## ⛔ [11.52] A REMOTE ROW'S PTY RESIZE DIES INSIDE THE BINARY-UPLOAD FALLBACK — THE GRID CORRECTION NEVER TOUCHES THE GRID
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Measured on the gui host, 2026-09-04 19:38 (v3.2.56, the current build): a
-remote codex row's switch-in (`suspend_wake_bridge_respawn` → runtime
-respawn → `codex_squish_repair`) fired five PTY resizes in four seconds
-(19:38:13–19:38:17; `remote-session://dev/bf4c20d1…` ×4 and `…01a043ae…` ×1)
-and every one failed with `will_retry: false` and the error **"failed to
-upload yggterm binary to dev"**. A grid correction never touched the grid:
-the resize runs the remote `server terminal resize` through
-`run_remote_yggterm_command_with_timeout`, whose failure path matches the
-over-broad `should_fallback_to_python` list, resets the remote-binary cache,
-re-resolves — and a re-resolve that decides to provision uploads the binary
-to the remote host. The transient first error was thrown away, the upload
-became the final error, and the row painted for a screen that no longer
-matched its PTY through the whole reveal (the squish family [11.34] lives
-exactly here). History in the same events: 492 of 513
-`remote_pty_resize_failed` events carried "retrying remote yggterm command
-after cache reset: … terminal session not found …" — the pre-fix
-double-billing where an app-level answer paid a cache reset + re-resolve per
-failure; the "a daemon answer is not a missing binary" classifier fix
-(2026-09-04, lib.rs) killed that class on 3.2.53+ and none of today's
-current-build events are retry-wrapped. The remaining class is this one: the
-resize itself must never run provisioning.
-
-**Fix (lane `lane/trace/remote-resize-no-fallback`):** the resize calls the
-new `run_remote_yggterm_command_no_fallback` — resolve from the warm cache
-(no ssh when fresh; stale-while-revalidate as before), run ONCE, return the
-error as-is: no cache reset, no re-resolve, no upload, no retry. The
-daemon-side `terminal session not found` re-queue (the switch-timing remedy)
-is untouched, and provisioning stays with the background refresh ([11.49]).
-Source contract `the_remote_pty_resize_never_runs_the_fallback_machinery`.
-
-**Falsifier:** the next switch-in of a remote codex/agy row must show
-`remote_pty_resize_forwarded` with `ok: true` (or, on a genuine daemon
-outage, the FIRST error's own text — never an upload error);
-`remote_pty_resize_failed` must stop carrying "failed to upload yggterm
-binary"; and `codex_squish_repair` on switch-in should stop being preceded
-by failed resizes.
 
 ## ⛔ [11.51] VIDEO PLAYS WITH PERFECT MEDIA STATS AND A HOLE-RIDDEN COMPOSITOR CADENCE — "STATS FOR NERDS SHOWS NOTHING BUT IT STUTTERS"
 
