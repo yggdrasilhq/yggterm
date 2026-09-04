@@ -10950,7 +10950,9 @@ console.log('ok');
         let ix = script
             .find("const visiblePaintDemandWatchdog")
             .expect("demand watchdog present");
-        let body = &script[ix..ix + 1400];
+        // Window wide enough for the strand instrumentation (throttle + the
+        // gate snapshot each throttled rescue carries, [11.53]).
+        let body = &script[ix..ix + 2600];
         assert!(
             body.contains("if (!pendingVisiblePaintForceFullRefresh) { return; }"),
             "it must cost nothing while no repair is owed"

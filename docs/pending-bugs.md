@@ -121,6 +121,44 @@ surface-materializing verb (`web ensure` and friends) is a MUTATING verb on
 the active client and belongs in the shadow-law's table of probes that must
 name their target.
 
+## ⛔ [11.53] THE PAINT-DEMAND WATCHDOG RESCUED ONE IDLE ROW EVERY SECOND FOR AN HOUR — THE DEMAND IT WAS RESCUING WAS NEVER SERVED
+
+**Status:** OPEN
+
+(Observability shipped on `lane/trace/paint-demand-strand`: the rescue trace
+now speaks 5 times, then once per 30 rescues, each line carrying the
+gate snapshot. The root-cause half — which gate refuses, and why the demand
+stands 18+ minutes — reads its answer off the next strand event.)
+
+Measured on the gui host, 2026-09-04 (v3.2.58 GUI, pid of the 21:46 birth):
+**1622 `terminal_mount/js_debug` events of `visible_paint_demand_rescue`** from
+one local host between 21:48:08 and 22:45:35 — exactly one per second — with
+`outstanding_ms` climbing monotonically 1937 → **1,111,349 ms (18.5
+minutes)**: the same full-refresh demand, re-armed by every rescue call and
+NEVER served. Every tick ran `requestVisiblePaint(true)` — a full-refresh
+attempt (atlas clear + whole-grid redraw when it executes) on an idle row,
+the render-churn family at 1 Hz, plus the trace drumbeat that motivated the
+ytrace 0.2.3 ceiling raise. The interplay: the forced-refresh execution arm
+requires `!input_hot` INSIDE the rAF; when it defers it re-arms the demand
+while keeping the ORIGINAL `pendingVisiblePaintForceFullRefreshSinceMs`
+(the "deferred, not stranded" law — correct), so a demand that no gate will
+ever serve stays overdue forever and the watchdog re-rescues at 1 Hz forever.
+Which gate refuses is NOT in the trace: the rescue event carried only
+`outstanding_ms`.
+
+**Fix (this lane):** the watchdog still attempts the repair every tick (the
+streak resets the moment the demand is served — self-healing unchanged), but
+the trace now speaks 30× less: first rescue, then one event per 30
+consecutive rescues, each carrying the STRAND SNAPSHOT — `input_hot`,
+`frame_like_ms` (the agent-CLI hide-cursor suppression window),
+`since_full_refresh_ms` (the forced-refresh rate limit), `streak`. The next
+occurrence names its own refusing gate.
+
+**Falsifier:** the next long-lived demand shows ≤5 `visible_paint_demand_rescue`
+events in its first 5 seconds and then one per ~30 s (not 1/s), each with the
+gate snapshot; the root-cause half closes when the snapshot's refusing gate is
+fixed and a stranded demand is observed to clear.
+
 ## ⛔ [11.52] A REMOTE ROW'S PTY RESIZE DIES INSIDE THE BINARY-UPLOAD FALLBACK — THE GRID CORRECTION NEVER TOUCHES THE GRID
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -886,56 +924,6 @@ no process spawned by the daemon lands in a `yggterm-gui-*` scope whose
 original GUI is gone.
 
 
-
-## ⛔ [11.31] A LIVE HOST CANCELLED AS "INACTIVE" LOSES ITS READY PROOF FOREVER — EVERY SWITCH-BACK COLD-REMOUNTS (the 2026-08-29 UI-block storm on the GUI host)
-
-**Status:** FIXED — LIVE PROOF IN (2026-09-04 ~22:30, the gui host, v3.2.56). The falsifier below is answered with a nuance worth keeping: the `bootstrap_reset` TRACE still fires on switch-backs, but the cold SPAWN it used to drive is cancelled — every `bootstrap_reset` whose host is already live is followed by `bootstrap_spawn_skipped_inactive_retained_host` (measured live at 19:38:22, switch-back to a remote codex row), and `terminal_open_attempt/ready` carries reason `ready_on_inactive_cancel_host_already_live` (21 of the last 300 ready events). Every surviving `bootstrap_reset` with `mount_epoch > 1` pairs with a genuine respawn cause (`suspend_wake_bridge_respawn`, `bootstrap_owner_superseded_during_loop`), not an innocent switch — the grid-cold-remount defect class is dead on current builds.
-
-The original observation: on the next build, a switch away and
-back to any row whose first mount was cancelled by the inactive-skip must NOT
-emit `bootstrap_reset` on the switch-back — `ytrace` count of
-`terminal_mount/bootstrap_reset` per row-switch returns to ~0, and the
-`ready_on_inactive_cancel_host_already_live` reason appears in
-`terminal_open_attempt/ready` events.
-
-**Root cause, measured on the GUI host 2026-08-29 (owner caught it live: "I
-just had a mega ui block and had to close and start yggterm").** The 10:47 roll relaunched
-the GUI on 3.2.12; from 11:05 to 11:33 the incident storm ran at 2-second
-repeating block gaps with blocks/min climbing 1→14 while the owner clicked
-between rows (mouse clicks — the keystroke count in the window was zero), and
-the GUI was killed at 11:33:55. The chain: a row's first mount began its open
-attempt, the mount itself succeeded (`mount_open` ~400 ms in), and the daemon
-forward streamed meaningful output — but the strict fast-ready refused to latch
-because the polled runtime-status manifest did not yet list the brand-new PTY.
-The attempt sat Pending; when the owner clicked another row, the inactive-skip
-cancel fired 16 s later with the reason "this session stopped being the active
-terminal before its host could mount" — false, and destructive: no Ready ever
-latched, so `terminal_sessions_reached_ready` (the sticky set) and
-`ready_at_ms` stayed empty, `terminal_session_host_reusable_for_reveal` stayed
-false forever, retained-live clause C stayed dead, and EVERY later click on
-that row took the full cold path — `bootstrap_reset` + xterm recreate + veil +
-backlog replay, ~220–400 ms of UI-thread stall each (`ui_block gap_ms=222`,
-`input/loop_block held_ms=172` per switch, measured in the same trace). Two
-cooperating frames made it a storm: the felt latency invited more clicking, and
-the two-row alternation re-triggered the path each time. The mount-identity
-`:1` stability in the trace is the epoch map's `or_insert(1)` default, not
-host reuse — nothing was reused.
-
-**Landed (this commit):** `cancel_terminal_open_attempt_for_inactive_session`
-now refuses to discard an attempt whose host record is still present and which
-has already observed first meaningful (daemon-forwarded) output — it latches
-Ready instead (`ready_on_inactive_cancel_host_already_live`). The daemon's
-forwarded bytes are the PTY's own data path, not a polled observer, so they
-prove the thing the stale manifest could not. The reveal machinery is
-unchanged; clause C simply becomes reachable, which is what
-[[finding-hot-switch-latency-remount]] already designed and what this trace
-showed never engaging. Locked by
-`cancelling_an_inactive_attempt_with_a_live_host_latches_ready_not_cancelled`
-(scaffold reproduces the exact Pending-with-live-output state, asserts the
-ready latch, the sticky proof, and clause C recognizing the host on the
-switch-back). Residual, not fixed here: the strict fast-ready itself still
-waits on the manifest for a genuinely cold first mount — the felt first-open
-latency is unchanged, only the permanent cold-remount tax is gone.
 
 ## ⛔ [11.36] A 40-SECOND WHOLE-PROCESS GUI FREEZE HAS NO SURVIVING WITNESS — THE BLOCK INCIDENT NOW CARRIES THE KERNEL COUNTERS THAT VERDICT IT (the GUI host)
 

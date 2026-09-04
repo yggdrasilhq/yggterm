@@ -4799,6 +4799,14 @@ fn terminal_eval_script_with_canvas_renderer(
         let skippedPerfEventCount = 0;
         let terminalInputHotUntilMs = 0;
         let visiblePaintDemandRescueCount = 0;
+        // Consecutive rescues of the SAME standing demand. The demand is
+        // re-armed by every rescue call, so a demand no inner gate will serve
+        // used to drive a rescue tick every second for as long as the row
+        // lived (measured 2026-09-04: 1622 events, one demand outstanding
+        // 18.5 min). The streak throttles the TRACE and names the refusing
+        // gates; the paint ATTEMPT still rides every tick so the repair stays
+        // self-healing the moment its gate clears.
+        let visiblePaintDemandRescueStreak = 0;
         let forcedRefreshCount = 0;
         let forcedAtlasClearCount = 0;
         let forcedRefreshSkippedCount = 0;
@@ -7472,6 +7480,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     ) {{
                         lastVisiblePaintFullRefreshAtMs = now;
                         pendingVisiblePaintForceFullRefreshSinceMs = 0;
+                        visiblePaintDemandRescueStreak = 0;
                         syncVisiblePaintDemandToHostEntry();
                         forcedRefreshCount += 1;
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
@@ -8327,14 +8336,28 @@ fn terminal_eval_script_with_canvas_renderer(
                 const outstandingMs = Date.now() - since;
                 if (outstandingMs < VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS) {{ return; }}
                 visiblePaintDemandRescueCount += 1;
+                visiblePaintDemandRescueStreak += 1;
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].visiblePaintDemandRescueCount =
                         visiblePaintDemandRescueCount;
                 }}
-                sendTerminalEvent({{
-                    kind: 'debug',
-                    message: `visible_paint_demand_rescue host=${{hostId}} outstanding_ms=${{outstandingMs}}`
-                }});
+                // ⛔ TRACE THROTTLE (measured 2026-09-04: 1622 events, one
+                // demand outstanding 18.5 min): speak 5 times, then once per 30
+                // rescues, each line naming every gate that could refuse; the
+                // attempt below still rides every tick, and the streak resets
+                // when the demand is finally served.
+                if (visiblePaintDemandRescueStreak <= 5 || visiblePaintDemandRescueStreak % 30 === 0) {{
+                    const frameLikeMs = Math.max(0, Number(recentFrameLikeWriteUntilMs || 0) - Date.now());
+                    const sinceFullRefreshMs = lastVisiblePaintFullRefreshAtMs > 0
+                        ? Date.now() - lastVisiblePaintFullRefreshAtMs
+                        : -1;
+                    sendTerminalEvent({{
+                        kind: 'debug',
+                        message: `visible_paint_demand_rescue host=${{hostId}} outstanding_ms=${{outstandingMs}} streak=${{visiblePaintDemandRescueStreak}}`
+                            + ` input_hot=${{terminalInputHot()}} frame_like_ms=${{frameLikeMs}}`
+                            + ` since_full_refresh_ms=${{sinceFullRefreshMs}}`
+                    }});
+                }}
                 requestVisiblePaint(true);
             }} catch (_error) {{}}
         }}, 1000);
