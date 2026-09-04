@@ -1836,3 +1836,75 @@ stale stragglers (measured 2026-08-29).
 * Other CLIs' cold-restore candidates — muse/agy hold per-conversation
   artifacts the proc-marker walk already covers; a store scan for them
   would need its own measured unit.
+
+### Issue Heading 36 — LIVE FALSIFIER RUN (2026-09-04/05, dev): the claim was falsified twice, fixed twice, then proven
+
+The owner directive for this round: *"dynamically trace if the
+implementation is flawless — we need observability to falsify the claim."*
+The landed store-candidate tier had green unit tests; the live run
+falsified it anyway, twice. Both defects were invisible to the test suite
+by construction, and the run produced the observability that makes the arm
+falsifiable from now on.
+
+The falsifier table (claim → pass → falsified):
+
+| # | Claim | Pass reads as | Falsified if |
+|---|-------|---------------|--------------|
+| F1 | anchor rebind follows the TUI switch | `mirror_tick` in_sync/rebound | perpetual diverged/anchor_not_live |
+| F2 | per-row identity follows the window title (34) | `row_rebound_to_title_session` | title emits, row keeps birth uuid |
+| F3 | stampless cold restore → newest store session (36) | `launch_contract store_candidate_resume` + resumed conversation | `ses_guard_degrade` where the store has sessions |
+| F4 | focus vouch restores the viewed session (32) | `service_vouched_resume` | fresh window on a stamped row |
+| F5 | untitled rows get the LLM rescue (29) | `title/generation_begin` on working rows | endless no_title_in_store |
+| F6 | bus law (tests never write the fleet bus) | zero fixture ids during CI runs | ses_a0000/ses_b0000 reappear |
+
+Results:
+
+* **F1/F4 — PASS (live)**: anchor `8a59fba6…` bound `ses_f998a9c7…` with
+  `mirror_tick` `in_sync` across the day; `service_vouched_resume` fired
+  10x around rotations, each compose carrying the viewed `ses_` id.
+* **F3 — FALSIFIED TWICE, then PROVEN.** A controlled experiment (two
+  agent-owned opencode anchors in a scratch cwd, sessions minted, TUIs
+  killed, then `resume-opencode <phantom> <cwd>`):
+  1. Falsified on the epoch-type bug: the store holds INTEGER epochs; the
+     first cut read `Option<String>`, every row errored, the lazy
+     query_map + flatten() silently dropped them → candidate none →
+     degrade. The unit fixtures inserted TEXT epochs — the tests encoded
+     the wrong assumption and stayed green. Fixed type-agnostically
+     (`rusqlite::types::Value`), fixtures now carry the live storage class,
+     plus a mixed-type lock test (lane/dev/store-epoch-types).
+  2. Falsified again on the home-resolution bug: the tier resolved
+     `resolve_yggterm_home()` = `~/.yggterm` and queried a db that does not
+     exist. The new `cli/store_candidate {cwd_present, answered}` probe
+     made the silent None visible (`cwd_present: true, answered: false`),
+     the fix reads the USER home (`dirs::home_dir()`)
+     (lane/dev/candidate-user-home).
+  3. PROVEN after both fixes: `cli/store_candidate {cwd_present: true,
+     answered: true}` → `launch_contract {breach: store_candidate_resume,
+     action: resume, selector: "--session"}` → the row's id became
+     `ses_f9270512…` (the newest store session for the cwd) and the
+     composed launch carries `--session 'ses_f9270512…'`.
+* **F2 — FALSIFIED (design gap, repair spec'd)**: the title class emits and
+  the tracker is live, but the binding resolves the title against the
+  SERVICE's active-session list — and `/api/session/active` returned an
+  EMPTY set on the live host (with real TUIs running), starving the binding
+  (`active_tabs: 0` on every tick). Repair direction: fall back to the
+  sqlite store for the title→id resolution, exactly as this issue's
+  candidate tier does — the service list is a live cache, the store is the
+  durable truth. Same starvation blinds the anchor's `viewing` signal
+  (`no_viewing` loops when the active set is empty); a store-backed viewing
+  fallback (`time_viewed` recency) is the follow-up spec.
+* **F5/F6 — no counter-evidence in the window** (F5 needs a working untitled
+  muse/pi row to trigger; F6 held — no fixture ids on the bus since the
+  gate).
+
+The run also surfaced, for the trace campaign's plane: TWO daemons
+interleaving mirror_tick on dev for ~2h (pids 1494010/1715695, candidate
+counts 5 vs 7 — the linger class again), and an opencode2 service whose
+active-set reporting went empty fleet-live — the exact feed both the
+anchor viewing signal and (pre-repair) the title binding depend on.
+
+Law this run adds to the campaign method: **a unit fixture that encodes the
+implementer's assumption proves nothing about the live store — measure the
+store's real representation first, and give every silent decision arm its
+own probe** (`cli/store_candidate` exists because a silent None cost a full
+falsification cycle to localize).
