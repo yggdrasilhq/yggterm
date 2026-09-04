@@ -1098,6 +1098,8 @@ and Muse also fail.*
 | OpenCode2 | **yes** (`session_v2.title`, real self-titles) | scanner only — descriptor said `Generated` (drift) |
 | Grok Build | yes (`summary.json` `generated_title`, often empty) | scan only |
 | Codex / Codex-LiteLLM | **no** — owner spec 2026-06-06: yggterm OWNS these | scan only (first prompt / LLM) |
+
+⛔ (2026-09-05, OWNER TITLING LAW — corrects this whole map: ONLY codex and muse code do not self-title; every other CLI sets its own title first and yggterm READS it. The registry flip + the harmonization contract are Issue Heading 37.)
 | Muse | first prompt only (`session-index.db.title`; `New session` when empty) | local reader + remote probe |
 | Pi | no (transcript jsonl only) | scan only |
 | Kimi | none found (`~/.kimi/kimi.json` is a work_dirs map) | dedicated scanner only |
@@ -1908,3 +1910,83 @@ implementer's assumption proves nothing about the live store — measure the
 store's real representation first, and give every silent decision arm its
 own probe** (`cli/store_candidate` exists because a silent None cost a full
 falsification cycle to localize).
+
+## Issue Heading 37: the owner titling law — retrieval and push, harmonized per CLI (2026-09-05)
+
+Owner directive, with the live screenshot that motivated it: *"metadata is
+not harmoniously integrated. We have a title but the cli itself titles it.
+We should instead read it. retrieval and pushing both should work. But cli
+sets the title first IF that CLI is known to title. Currently ALL CLIs
+except codex and muse code does not self title sessions (note this info in
+cli integration campaign). So we should harmoniously play with the said cli
+system."*
+
+The screenshot: an Antigravity row wearing
+"You are being consulted as an independent depth advisor (Gemini 3.8 Flash)
+…" — yggterm's prompt-line guess — while the agy picker on the same TUI
+showed the CLI's OWN authored title, "Swarm Memory Schema Review".
+
+### The titling map, as the owner states it
+
+**ONLY codex and muse code do not self-title. Every other CLI sets its own
+title first; yggterm READS it.** This CORRECTS the Issue 29 measured map
+(where OpenCode was labelled `Generated` — the descriptor drift already
+acknowledged there — and where pi/kimi/grok sat on the Generated side of
+the fence). The store measurements behind the flip:
+
+* **antigravity** — Store (was already): `conversation_summaries.title`
+  carries agy's own authored titles ("Swarm Memory Schema Review",
+  "CLI Integration And Debugging", … 1059 rows). ⛔ The write is LATE: the
+  live conversation's row lands minutes after the picker already shows the
+  title — and the first cut of the reader fell back to
+  prompt-first-line when the row was missing, which is exactly the garbage
+  in the screenshot, settled by the Static mutability. The fallback is
+  REMOVED: no summaries row ⇒ the row keeps its birth title and the poll
+  continues until agy authors one (late-write tolerance).
+* **opencode** — Store: `session_v2.title`, real self-titles, retitles for
+  life (Dynamic, measured 2026-09-02). The `Generated` label was the
+  acknowledged Issue 29 drift.
+* **kimi** — Store: `state.json` title (first prompt; `isCustomTitle` on
+  rename; measured end-to-end 2026-08-30).
+* **pi** — Store: the transcript header/prompt is pi's own titling; there
+  is no late authored rewrite, so reading it is stable.
+* **grok-build** — Store: `summary.json` `generated_title` when the CLI
+  writes it.
+* **codex, codex-litellm** — Generated (yggterm owns the title; the rollout
+  store has no title column to push into — yggterm's metadata layer is the
+  only carrier, noted as the push limit for the codex family).
+* **muse** — Generated (muse code does not self-title: a zero-prompt
+  session sits at "New session" forever — 28 such rows measured in
+  `session-index.db` on dev).
+
+### The contract, as landed
+
+* **The registry is the law, and a test locks it**:
+  `title_authority_matches_the_owner_titling_law` asserts every descriptor
+  against the owner map; the map changes only with the owner's word.
+* **Retrieval** (CliTitlesFirst = `Store`): the live store readers serve the
+  CLI's own title; the copy chore EXCLUDES Store kinds from generation
+  (`self_generates_copy()` = `title_is_store_authoritative()`), so yggterm
+  never generates over the CLI's word. For agy the prompt-line fallback is
+  gone — an untitled-by-agy session is untitled on the row (birth title),
+  never a prompt guess.
+* **Push** (yggterm titles = `Generated`): when the chore generates a title
+  for a MUSE row, it is pushed into muse's own index
+  (`push_title_to_muse_store` → `sessions.title` by session_id; the user's
+  `session_name` rename field is never touched) — muse's picker and
+  yggterm's row then agree, and the trace records `title/pushed_to_cli_store`.
+  Codex has no title store: yggterm's metadata layer stays its only carrier.
+* **USER home law** (from the Issue 36 falsifier round): every CLI-store
+  path resolves `dirs::home_dir()` — never `resolve_yggterm_home()`.
+
+### What this issue does NOT cover
+
+* The muse `session_name` push (the user's rename field) — deliberately
+  untouched; a generated title must never overwrite an explicit rename.
+* The agy session-id vs summaries-conversation-id mapping (the screenshot
+  row's id had no summaries row while the picker showed the title — the
+  summaries write for that conversation was still pending; when it lands,
+  the read path adopts it).
+* Store-backed viewing/title fallbacks for the service-starvation case
+  (`/api/session/active` empty, measured 2026-09-04) — Issue 34's repair
+  lane.

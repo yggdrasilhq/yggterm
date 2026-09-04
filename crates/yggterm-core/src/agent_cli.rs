@@ -2312,7 +2312,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // No auto-title anywhere in the source; `/name` and `--name` are the
         // only writers, so an untitled pi session has nothing for yggterm to
         // respect and the LLM chore owns it.
-        title_authority: TitleAuthority::Generated,
+        title_authority: TitleAuthority::Store, // OWNER TITLING LAW (2026-09-05): every
+        // CLI except codex and muse code self-titles; yggterm READS this CLI's title and
+        // never generates over it. pi titles via its own transcript header; the reader reads it.
         // `pi --session-id <id>` creates the session if it is missing
         // (`src/main.ts`), the closest analogue to Claude Code's birth id.
         id_assigned_at_birth: true,
@@ -2444,7 +2446,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // A title agent EXISTS in the tree but is not wired into the v2 runner
         // (an explicit TODO there), and creation writes the placeholder
         // `New session - <iso>`. So the store is not authoritative today.
-        title_authority: TitleAuthority::Generated,
+        title_authority: TitleAuthority::Store, // OWNER TITLING LAW (2026-09-05): every
+        // CLI except codex and muse code self-titles; yggterm READS this CLI's title and
+        // never generates over it. opencode2 auto-titles in session_v2.title for the life of the session (measured 2026-09-02; the Generated label was the Issue 29 descriptor drift).
         // ⛔ The CLI REFUSES an unknown `--session <id>` outright; a caller
         // must mint the session over opencode's own RPC first. So yggterm may
         // not assume a birth id.
@@ -2694,7 +2698,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `None` here and why that is NOT the hole the store-authority lock
         // hunts: there is nothing to read. This flips back only if the CLI
         // starts writing a title, in the same commit as the reader for it.
-        title_authority: TitleAuthority::Generated,
+        title_authority: TitleAuthority::Store, // OWNER TITLING LAW (2026-09-05): every
+        // CLI except codex and muse code self-titles; yggterm READS this CLI's title and
+        // never generates over it. kimi writes state.json title (first prompt; isCustomTitle on rename) — measured end-to-end 2026-08-30.
         // `kimi -r <unknown-id>` CREATES that session rather than failing, so a
         // caller-supplied id at birth is honoured. Its id is a directory name
         // verbatim, with no format validation.
@@ -3202,7 +3208,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // table, and the brand's actual colour rather than a nearest match.
         brand_color: "#000000",
         menu_hint: 'g',
-        title_authority: TitleAuthority::Generated,
+        title_authority: TitleAuthority::Store, // OWNER TITLING LAW (2026-09-05): every
+        // CLI except codex and muse code self-titles; yggterm READS this CLI's title and
+        // never generates over it. grok writes summary.json generated_title.
         // MEASURED: `-s, --session-id <SESSION_ID>` — "Use a specific session
         // UUID for a **new** conversation (must be a valid UUID and must not
         // already exist under the target session directory)". So the fact is
@@ -5477,6 +5485,29 @@ pub fn opencode_store_newest_session_for_directory(home: &Path, directory: &str)
         }
     }
     None
+}
+
+/// PUSH the harmonized title INTO muse's own index (Issue Heading 37): muse
+/// code does NOT self-title — a zero-prompt session sits at "New session"
+/// forever (28 such rows measured on dev 2026-09-05) — so yggterm's
+/// generated title is pushed into `sessions.title`, the same column the
+/// reader reads back. That closes the loop: muse's own picker and yggterm's
+/// row agree, which is the harmonization the owner asked for. Write is by
+/// session_id, `title` only; `session_name` (the user's own rename field)
+/// is never touched. `None` = no store / unwritable / no such row.
+pub fn push_title_to_muse_store(home: &Path, session_id: &str, title: &str) -> Option<bool> {
+    if session_id.trim().is_empty() || title.trim().is_empty() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open(home.join(".local/share/muse/session-index.db")).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(400)).ok()?;
+    let updated = conn
+        .execute(
+            "UPDATE sessions SET title = ?2 WHERE session_id = ?1",
+            rusqlite::params![session_id, title.trim()],
+        )
+        .ok()?;
+    Some(updated > 0)
 }
 
 /// Does Antigravity hold `session_id`?
@@ -8848,6 +8879,29 @@ mod tests {
 
 
 #[cfg(test)]
+/// ⛔ THE OWNER TITLING LAW (2026-09-05), as a registry lock: ONLY codex and
+/// muse code lack a self-titling mechanism — every other CLI sets its own
+/// title first and yggterm READS it (retrieval); yggterm generates and PUSHES
+/// only for the two. A descriptor that drifts from this map fails here, and
+/// the map itself changes only with the owner's word (noted in
+/// docs/cli-integration.md Issue Heading 37).
+#[test]
+fn title_authority_matches_the_owner_titling_law() {
+    let yggterm_titles = ["codex", "codex-litellm", "muse"];
+    for descriptor in AGENT_CLIS.iter() {
+        let want = if yggterm_titles.contains(&descriptor.slug) {
+            TitleAuthority::Generated
+        } else {
+            TitleAuthority::Store
+        };
+        assert_eq!(
+            descriptor.title_authority, want,
+            "{} drifts from the owner titling law",
+            descriptor.slug,
+        );
+    }
+}
+
 mod newest_session_tests {
     use super::*;
     use rusqlite::Connection;
@@ -8934,6 +8988,44 @@ mod newest_session_tests {
             Some("ses_v2"),
             "v2 answered: the stale v1 table must not override it"
         );
+    }
+
+    #[test]
+    fn muse_push_writes_the_title_the_reader_reads_back() {
+        let home = temp_home("musepush");
+        let dir = home.join(".local/share/muse");
+        std::fs::create_dir_all(&dir).expect("muse store dir");
+        let conn = Connection::open(dir.join("session-index.db")).expect("fixture store");
+        conn.execute_batch(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, title TEXT);
+             INSERT INTO sessions VALUES ('ses_muse000000000000000000001', 'New session');",
+        )
+        .expect("fixture rows");
+        drop(conn);
+
+        // The push closes the harmonization loop: what yggterm generates, the
+        // CLI's own index carries.
+        assert_eq!(
+            push_title_to_muse_store(&home, "ses_muse000000000000000000001", "Fintax Orchestrator Design"),
+            Some(true)
+        );
+        let conn = Connection::open(dir.join("session-index.db")).expect("re-open");
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM sessions WHERE session_id = ?1",
+                ["ses_muse000000000000000000001"],
+                |r| r.get(0),
+            )
+            .expect("read back");
+        assert_eq!(title, "Fintax Orchestrator Design");
+
+        // A row the store does not hold reports not-found, never a fake yes.
+        assert_eq!(
+            push_title_to_muse_store(&home, "ses_absent0000000000000000001", "X"),
+            Some(false)
+        );
+        // An empty title is refused rather than written.
+        assert_eq!(push_title_to_muse_store(&home, "ses_muse000000000000000000001", "  "), None);
     }
 
     #[test]
