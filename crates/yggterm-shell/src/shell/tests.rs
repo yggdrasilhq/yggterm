@@ -15513,11 +15513,11 @@ console.log('ok');
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(
             !script.contains("viewport.style.scrollbarWidth = 'none';"),
-            "stretchXtermRoot must NOT inline-set scrollbar-width:none; CSS owns scrollbar styling (XTERM-BUG: scrollbar-not-draggable)"
+            "stretchXtermRoot must NOT inline-set scrollbar-width:none; CSS owns scrollbar styling (XTERM-BUG: terminal-edge-unpaintable)"
         );
         assert!(
             script.contains("viewport.style.removeProperty('scrollbar-width');"),
-            "stretchXtermRoot must clear any stale inline scrollbar-width so CSS thin scrollbar wins"
+            "stretchXtermRoot must clear any stale inline scrollbar-width so the CSS rule wins"
         );
         assert!(
             !script.contains("viewport.style.marginRight = compensatedMarginRight;"),
@@ -15525,15 +15525,24 @@ console.log('ok');
         );
         assert!(
             script.contains("viewport.style.marginRight = '0px';"),
-            "stretchXtermRoot must keep the viewport scrollbar inside the host bounds"
+            "stretchXtermRoot must keep the viewport inside the host bounds"
+        );
+        // XTERM-BUG: terminal-edge-unpaintable — the native scrollbar is
+        // HIDDEN (a visible one needs a reserved layout strip, which was the
+        // unpaintable right edge); the draggable affordance is the
+        // shell-drawn overlay thumb, styled by CSS and driven by JS.
+        assert!(
+            script.contains("scrollbar-width: none !important;"),
+            "CSS must hide the native scrollbar — a visible one re-reserves the strip no TUI can paint"
         );
         assert!(
-            script.contains("scrollbar-width: thin !important;"),
-            "CSS must declare scrollbar-width: thin so the sleek scrollbar renders"
+            !script.contains(".xterm-viewport::-webkit-scrollbar-thumb {"),
+            "no native WebKit thumb may be styled — it is display:none; the shell thumb replaced it"
         );
         assert!(
-            script.contains(".xterm-viewport::-webkit-scrollbar-thumb"),
-            "CSS must provide a WebKit scrollbar thumb so dragging is visually possible on Chromium/WebKit"
+            script.contains(".yggterm-xterm-scroll-thumb {")
+                && script.contains("const ensureXtermScrollThumb"),
+            "the shell-drawn overlay thumb must exist and be styled — hiding the native scrollbar must not kill the drag affordance"
         );
     }
     #[test]
@@ -20661,56 +20670,54 @@ console.log('ok');
 
     #[test]
     fn the_grid_is_proposed_against_the_box_that_paints_it() {
-        // XTERM-BUG: right-edge-glyph-clipped. `.xterm-screen` is narrowed by
-        // the scrollbar gutter and clips (`overflow: hidden`), so a grid sized
-        // against the FULL host width buys a column the user can never read.
-        // Measured live on guihost at 3.0.45 before the fix: cols 170 x 8px = 1360px
-        // of canvas inside a 1353px screen. The lock is that ONE expression owns
-        // that number and BOTH the paint box and the grid read it.
+        // XTERM-BUG: terminal-edge-unpaintable. The grid AND the paint box are
+        // the FULL host now: the scrollbar is a shell-drawn overlay, so the
+        // reserved gutter was a strip no TUI cell could paint (measured live
+        // on guihost at 3.2.60: a 921x904 card painting a 912x900 canvas — a 9px
+        // right + 4px bottom edge every CLI showed). The old drift lock
+        // survives inverted: NOTHING may re-narrow the paint box, both sizing
+        // paths propose from the same full box, and the overlay thumb reads
+        // its width through the one runtime variable.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(
             script.contains("const terminalScrollbarGutterPx = () => {"),
-            "the right gutter needs exactly one owner in the mount script"
+            "the thumb width still has exactly one owner in the mount script"
         );
         // XTERM-BUG: gutter-steals-tui-width — on the ALTERNATE screen the
-        // gutter must be ZERO (a full-screen TUI repaints its own right edge;
+        // overlay thumb must hide (a full-screen TUI owns its right edge;
         // scrollback does not exist), and the D-pad must stand down with it.
         assert!(
             script.contains("active.type === 'alternate'") && script.contains("'alternate_screen'"),
             "the alternate screen must release the gutter and hide the scroll D-pad"
         );
         assert!(
-            script.contains("var(--yggterm-scrollbar-gutter, 8px)"),
-            "the paint box must read the gutter through the runtime variable so an alternate-screen transition retracts it live"
+            script.contains("const rightGutterPx = 0;"),
+            "the grid proposal must use the FULL host width — a reserved column is a strip no TUI can paint"
         );
         assert!(
-            script.contains("Number(content.width || 0) - rightGutterPx"),
-            "the grid proposal must subtract the reserved right gutter, or the last column lands under the clip"
+            !script.contains("calc(100% - var(--yggterm-scrollbar-gutter"),
+            "the .xterm-screen paint box must not re-narrow by the gutter"
         );
         assert!(
-            script.contains("const rightGutterPx = terminalScrollbarGutterPx();"),
-            "the grid proposal must read the gutter from its owner, not a second literal"
+            !script.contains("screen.style.width = `calc(100% -"),
+            "the runtime restretch must not re-narrow the screen either"
         );
         assert!(
-            script.contains("width: calc(100% - var(--yggterm-scrollbar-gutter, 8px)) !important;"),
-            "the .xterm-screen paint box must read the gutter through the runtime variable — the same number the grid owner computes"
+            script.contains("width: var(--yggterm-scrollbar-gutter, 8px) !important;"),
+            "the overlay thumb reads its width through the runtime variable so an alternate-screen transition retracts it live"
         );
-        assert!(
-            script.contains("screen.style.width = `calc(100% - ${terminalScrollbarGutterPx()}px)`;"),
-            "the runtime restretch must read the gutter from the same owner too"
-        );
-        // The literal is what let the two drift apart in the first place: the
-        // paint box said 8px and the fit said nothing at all. If a hardcoded
-        // `calc(100% - Npx)` returns to this script, so does the clipped glyph.
+        // The literal is what let the two drift apart in the first place. If a
+        // hardcoded `calc(100% - Npx)` returns to this script, so does the
+        // clipped glyph / the unpaintable edge.
         let literal_gutter = format!("calc(100% - {}px)", 8);
         assert!(
             !script.contains(literal_gutter.as_str()),
             "a hardcoded screen-width gutter is how the paint box and the grid diverged"
         );
         assert!(
-            XTERM_FIT_JS.contains("__yggtermXtermScrollbarGutterPx || 8"),
-            "the fit-addon fallback must reserve the same gutter as the primary sizing path"
+            !XTERM_FIT_JS.contains("__yggtermXtermScrollbarGutterPx || 8"),
+            "the fit-addon fallback must propose from the full width too — a reserved gutter here disagrees with the primary path by a column"
         );
     }
 
@@ -67215,5 +67222,57 @@ mod web_surface_immersion_locks {
         eprintln!("REPRO label = {:?}", rows[0].label);
         eprintln!("REPRO session_title = {:?}", rows[0].session_title);
         assert_eq!(rows[0].label, "New dev OpenCode", "the birth title must replace the preserved lie");
+    }
+
+    /// XTERM-BUG: terminal-edge-unpaintable — the full-bleed locks. The
+    /// terminal used to reserve an 8px scrollbar gutter (screen narrowed, grid
+    /// proposed against the narrowed box) and the canvas rastered at integer
+    /// cells inside a fractional-cell screen, so a 9px right + 4px bottom edge
+    /// of every terminal card was unpaintable by any TUI (measured live on
+    /// guihost at 3.2.60: 921x904 card, 912x900 canvas). The scrollbar is now a
+    /// shell-drawn overlay and the grid is full-bleed; these assertions fail
+    /// if any of the three movers regresses.
+    #[test]
+    fn terminal_grid_is_full_bleed_and_the_scrollbar_is_an_overlay() {
+        let source = SHELL_SOURCE;
+        // 1. The grid proposal no longer subtracts a gutter.
+        assert!(
+            source.contains("const rightGutterPx = 0;"),
+            "proposedTerminalFitDimensions must propose the grid against the FULL host width — a reserved column is a strip no TUI can paint"
+        );
+        assert!(
+            !source.contains("width: calc(100% - var(--yggterm-scrollbar-gutter"),
+            "the .xterm-screen rule must be width 100% — a narrowed screen is the unpaintable right edge"
+        );
+        assert!(
+            !source.contains("screen.style.width = `calc(100% -"),
+            "stretchXtermRoot must not re-narrow the screen by the gutter"
+        );
+        // 2. The render canvases stretch to the screen box (the raster's
+        // integer-cell floor may not strand the fractional remainder).
+        assert!(
+            source.contains(".xterm-screen canvas {{\n                    width: 100% !important;"),
+            "the canvas stretch rule is missing — the raster floor re-opens a right/bottom edge"
+        );
+        // 3. The native scrollbar is hidden and the shell-drawn thumb is wired.
+        assert!(
+            source.contains("scrollbar-width: none !important;"),
+            "the native scrollbar must be hidden — a visible one needs the reserved strip back"
+        );
+        assert!(
+            source.contains("const ensureXtermScrollThumb")
+                && source.contains("const syncXtermScrollThumb"),
+            "the overlay thumb (ensure/sync) is missing — scrolling affordance died with the native scrollbar"
+        );
+        assert!(
+            source.contains("syncXtermScrollThumb();"),
+            "emitPaint must sync the thumb, or scrollback growth leaves it stale"
+        );
+        // 4. The Rust decision module exists and is the named mirror.
+        let decision = include_str!("../terminal_scrollbar_overlay.rs");
+        assert!(
+            decision.contains("pub(crate) fn scroll_thumb_geometry"),
+            "terminal_scrollbar_overlay::scroll_thumb_geometry is the named decision mirror of syncXtermScrollThumb"
+        );
     }
 }

@@ -41,7 +41,9 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 | [remote-cc-replay-codex-only](#remote-cc-replay-codex-only) | Resumed Claude Code (remote-cc) viewport renders without its prompt box / blanks on mount+remount because the retained-replay readiness gate only recognizes Codex prompts | FIX PENDING LIVE VERIFY 2026-05-31 |
 | [xterm-pipeline-latency](#xterm-pipeline-latency) | Interactive feel ~6fps vs ghostty/VSCode: DOM renderer forced + 160ms write-frame latch over xterm's own scheduler | FRAME BUDGET SHIPPED+VERIFIED 2026-05-31 (160→16ms); canvas renderer deferred (readiness heuristic) |
-| [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 |
+| [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 — SUPERSEDED 2026-09-05 by [terminal-edge-unpaintable](#terminal-edge-unpaintable) |
+| [terminal-edge-unpaintable](#terminal-edge-unpaintable) | A right + bottom edge of every terminal card no TUI can paint (reserved scrollbar gutter + integer-cell raster floor) | FIXED 2026-09-05 — grid full-bleed, canvas stretched, shell-drawn overlay thumb |
+| [right-edge-glyph-clipped](#right-edge-glyph-clipped) | Grid proposed against full width while the screen clipped to a narrowed box — last column partially invisible | HISTORICAL (2026-05-28, never registry-documented) — SUPERSEDED 2026-09-05 by [terminal-edge-unpaintable](#terminal-edge-unpaintable) |
 | [content-scooped-on-session-switch](#content-scooped-on-session-switch) | Switching sessions: middle rows disappear, top + bottom remaining text presented as continuous | OPEN, telemetry added |
 | [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | FIXED & VERIFIED LIVE 2026-05-28 on guihost 2.7.62 — local shell base_y 893→893, codex base_y 144→144 across kill+launch. Earlier reopen was misdiagnosed: the example_org "only viewport" symptom was a stale resume-codex wiring issue on that specific session, not a scrollback retention gap. |
 | [surface-recovery-false-positive-on-transient](#surface-recovery-false-positive-on-transient) | "Shadow" blank flash + multi-second re-gate, and (worse) input-disable → re-resume → exhaust → session yanked closed, all triggered by a TUI's normal clear+redraw transient misread as a broken/empty/non-prompt surface | FIXED 2026-06-03 (settle-gates) — empty-surface 2.8.11, non-prompt 4-point fix |
@@ -638,7 +640,7 @@ Escape hatches that also work but are expensive: resize, focus toggle.
 
 ## scrollbar-not-draggable
 
-**STATUS:** FIXED 2026-05-28
+**STATUS:** FIXED 2026-05-28 — **SUPERSEDED 2026-09-05** by [terminal-edge-unpaintable](#terminal-edge-unpaintable): the native scrollbar this fix made draggable is now hidden entirely (a visible native scrollbar needs a reserved layout strip, and that strip was the unpaintable right edge). The drag affordance is the shell-drawn overlay thumb (`ensureXtermScrollThumb`); the inline-style and negative-margin locks below still hold and are still tested.
 
 ### Symptom
 The sleek thin scrollbar (added for fast drag-scroll in long sessions)
@@ -2468,3 +2470,113 @@ what makes `open` fail.
 
 `[[finding-a-claim-proven-on-one-lane-is-not-proven]]` — the entry's "remote"
 framing survived only because nobody ran the local lane.
+---
+
+## terminal-edge-unpaintable
+
+**STATUS:** FIXED 2026-09-05
+
+### Symptom
+Every CLI — fullscreen TUIs and plain shells alike — shows a right and a
+bottom edge inside the terminal card that the TUI cannot take control of.
+With the theme background the strip is invisible (the shell paints the card
+in the theme background), but any program that paints its own background
+(opencode/claude/codex in fullscreen, a bg-color fill, an image protocol)
+stops short of the card's right and bottom edges: the shell's edge shows
+around the TUI's frame like a mat.
+
+### Reproduction
+1. Open any row, fill the grid with a non-theme background:
+   `printf '\033[48;2;190;40;40m%*s' 9000 ""`.
+2. `server app screenshot` (the faithful xterm composite) and pixel-sample
+   the card corner. Before fix (measured live on guihost at 3.2.60): a
+   921x904 card painting a 912x900 canvas — the last ~9px on the right and
+   4px on the bottom stay at the card background `rgb(38,42,51)` while the
+   fill paints `rgb(190,40,40)`.
+
+### Root cause (three compounding reservations)
+1. **The scrollbar gutter** — `.xterm-screen` narrowed itself by
+   `--yggterm-scrollbar-gutter` (8px) so the native viewport scrollbar kept
+   a hit-testable slot (XTERM-BUG: scrollbar-not-draggable), and the grid
+   proposal subtracted the same gutter (XTERM-BUG: right-edge-glyph-clipped)
+   so the grid and paint box agreed — at 913px, not 921px. Alternate-screen
+   TUIs got the gutter released (XTERM-BUG: gutter-steals-tui-width); every
+   inline/normal-screen CLI kept paying it.
+2. **The integer-cell raster** — the canvas renderer rasters each cell at
+   `floor(css cell x dpr)`; with fractional font metrics (8.01x18.08 CSS)
+   the canvas paints cols x 8 by rows x 18 (912x900) inside a screen box
+   sized by the fractional metrics (913x904), stranding the difference.
+3. **The 2px bottom guard** — `__yggtermXtermFitBottomGuardPx` shaves the
+   fit height (the 2026-05-02 fit/backpressure fix), adding its pixels to
+   the bottom remainder.
+
+### Workaround / fix
+The scrollbar stopped being a layout resident:
+- The grid is proposed from the FULL host width (`rightGutterPx = 0`) and
+  `.xterm-screen` is full host width — the paint box and the grid are the
+  same box again, and no strip is reserved for anyone.
+- Every render canvas under `.xterm-screen` is CSS-stretched to the screen
+  box, so the raster's integer floor cannot strand a sub-cell remainder
+  (sub-1% scale; mouse mapping stays faithful because the stretched cell
+  equals xterm's own css cell to within a pixel).
+- The native scrollbar is hidden (`scrollbar-width: none` + WebKit pseudo
+  `display:none`) and the shell draws a draggable overlay thumb above the
+  grid (`ensureXtermScrollThumb`/`syncXtermScrollThumb`, geometry mirrored
+  from `terminal_scrollbar_overlay::scroll_thumb_geometry`), synced per
+  paint, hidden with no scrollback and on the alternate screen.
+The bottom guard REMAINS in the fit (predates this entry; with the stretch
+its pixels are painted through).
+
+### Code locations
+- `crates/yggterm-shell/src/shell/terminal_scripts.rs` —
+  `proposedTerminalFitDimensions` (full-width grid), the `.xterm-screen` /
+  canvas-stretch CSS, `syncScrollbarGutterVar` (now thumb-width only),
+  `stretchXtermRoot` (screen 100%), `ensureXtermScrollThumb` /
+  `syncXtermScrollThumb`, the hidden-scrollbar CSS.
+- `crates/yggterm-shell/src/terminal_scrollbar_overlay.rs` — the thumb
+  geometry decision + unit tests.
+- `assets/xterm/addon-fit.js` — the fallback fit proposes full width too.
+- `crates/yggterm-shell/src/shell/tests.rs` —
+  `terminal_grid_is_full_bleed_and_the_scrollbar_is_an_overlay`,
+  `the_grid_is_proposed_against_the_box_that_paints_it` (rewritten),
+  `terminal_eval_script_scrollbar_is_draggable_not_pushed_off_screen`
+  (rewritten).
+- `tools/xterm-harness` — the vendored addon is exercised by `npm test`.
+
+### Telemetry
+None yet. A future probe could emit the canvas vs host box pair on mount
+(the two rects whose divergence WAS this bug).
+
+---
+
+## right-edge-glyph-clipped
+
+**STATUS:** HISTORICAL — anchored in code 2026-05-28 but never given its
+registry section until now; SUPERSEDED 2026-09-05 by
+[terminal-edge-unpaintable](#terminal-edge-unpaintable).
+
+### Symptom
+"Sometimes a letter is missing on the rightmost edge, and widening the
+window brings it back."
+
+### Root cause
+The grid proposal divided the FULL host width by the cell width while
+`.xterm-screen` clipped to the narrowed (gutter-subtracted) box — the grid
+bought a column the paint box could not show: measured live on guihost at
+3.0.45, 170 cols x 8px = 1360px of canvas inside a 1353px screen, the last
+column a 1px sliver.
+
+### Workaround / fix (historical)
+Both the paint box and the grid proposal read ONE number
+(`terminalScrollbarGutterPx`) so they could not drift; the grid was
+proposed against the narrowed box. That made the reservation self-consistent
+— and made the reservation itself the terminal-edge-unpaintable bug. The
+2026-09-05 full-bleed fix removes the reservation entirely; the drift lock
+survives inverted in
+`the_grid_is_proposed_against_the_box_that_paints_it` (nothing may re-narrow
+the paint box).
+
+### Code locations
+- `crates/yggterm-shell/src/shell/terminal_scripts.rs` — the (now-0) gutter
+  read in `proposedTerminalFitDimensions`.
+- `assets/xterm/addon-fit.js` — the matching fallback reservation (removed).

@@ -68,15 +68,11 @@
       if (dimensions.css.cell.width === 0 || dimensions.css.cell.height === 0) {
         return undefined;
       }
-      // XTERM-BUG: right-edge-glyph-clipped — yggterm narrows `.xterm-screen`
-      // by a fixed gutter so the right-edge scrollbar stays hit-testable, and
-      // that box CLIPS. This addon is only the exception fallback for
-      // `proposedTerminalFitDimensions`, so it must reserve the SAME gutter or
-      // the two sizing paths disagree by a column. Upstream's overview-ruler
-      // guess (14) is not the number yggterm actually reserves.
-      const scrollbarWidth = this._terminal.options.scrollback === 0
-        ? 0
-        : Math.max(0, Number(root.__yggtermXtermScrollbarGutterPx || 8));
+      // XTERM-BUG: terminal-edge-unpaintable — the grid is proposed against
+      // the FULL parent width. The scrollbar is a shell-drawn overlay now (no
+      // reserved gutter), so subtracting one here would make this fallback
+      // disagree with `proposedTerminalFitDimensions` by a column. The
+      // bottom guard stays: it predates this fix and both paths share it.
       const parentStyle = window.getComputedStyle(parent);
       const elementStyle = window.getComputedStyle(element);
       const parentHeight = elementSize(parent, parentStyle, "height");
@@ -89,7 +85,7 @@
         + numberFromStyle(elementStyle, "padding-left");
       const bottomGuardPx = Math.max(0, Number(root.__yggtermXtermFitBottomGuardPx || 2));
       const availableHeight = Math.max(0, parentHeight - verticalPadding - bottomGuardPx);
-      const availableWidth = Math.max(0, parentWidth - horizontalPadding - scrollbarWidth);
+      const availableWidth = Math.max(0, parentWidth - horizontalPadding);
       return {
         cols: Math.max(2, Math.floor(availableWidth / dimensions.css.cell.width)),
         rows: Math.max(1, Math.floor(availableHeight / dimensions.css.cell.height)),
